@@ -1,264 +1,167 @@
+from __future__ import annotations
+
+from typing import Any, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+from cls_reducer import CLSReducer
+from fused_token_encoder import FusedTokenEncoder, as_obs_dict
+from structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
 from torch.distributions import Categorical
 
-from cls_reducer import CLSReducer
-from lookups import ACT_SIZE, OBS_DIM
+from lookups import ACT_SIZE
+
+# Type alias for the recurrent state
+State = Tuple[torch.Tensor, torch.Tensor]
 
 
-class ValueHead(nn.Module):
-    def __init__(self, in_features: int, hidden_features: int, scale: float = 0.1):
+class PolicyHead(nn.Module):
+    def __init__(self, in_features: int, out_features: int, hidden_dim: int = 512):
         super().__init__()
-        self.scale = scale
         self.net = nn.Sequential(
-            nn.Linear(in_features, hidden_features),
+            nn.Linear(in_features, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_features, hidden_features),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(hidden_features, 1),
+            nn.Linear(hidden_dim // 2, out_features),
         )
         self._init_weights()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # if tracking gradients, scale the gradient flowing back to the backbone
-        if x.requires_grad:
-            x = x.detach() + self.scale * (x - x.detach())
-
-        return self.net(x)
 
     @torch.no_grad()
     def _init_weights(self):
         for i, module in enumerate(self.net):
             if isinstance(module, nn.Linear):
-                if i == len(self.net) - 1:
-                    init.orthogonal_(module.weight, gain=0.1)
-                else:
-                    init.orthogonal_(module.weight, gain=1.0)
+                # init output layer with minimal variance at the start
+                gain = 0.01 if i == len(self.net) - 1 else 1.0
+                init.orthogonal_(module.weight, gain=gain)
                 init.zeros_(module.bias)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
-# Needs all inputs to be on the same device as the model
-class PolicyNet(nn.Module):
+
+class ActorPolicy(nn.Module):
+    """Stateful actor policy path."""
+
     def __init__(
         self,
-        obs_dim=OBS_DIM,
-        act_size=ACT_SIZE,
-        d_model=512,
-        nhead=8,
-        nlayer=3,
-        n_hg=4,
+        d_model: int,
+        nhead: int,
+        nlayer: int,
+        act_size: int,
+        seq_len: int = SEQUENCE_LENGTH,
     ):
         super().__init__()
-        self.seq_len, self.feat_dim = obs_dim
         self.act_size = act_size
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.reducer = CLSReducer(
-            self.seq_len, self.feat_dim, d_model, nhead, nlayer, 4 * d_model, n_hg
+            seq_len=seq_len,
+            d_model=d_model,
+            nhead=nhead,
+            nlayer=nlayer,
+            use_history=True,
         )
 
-        # act embedding for autoregressive conditioning (P(a2 | z, a1))
+        # Autoregressive embedding for P(a2 | z, a1)
         d_act_emb = d_model // 4
         self.action_embedding = nn.Embedding(act_size, d_act_emb)
-
-        # Policy Head 1 (Pokemon 1): P(a1 | z)
-        self.policy_head1 = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, act_size),
-        )
-
-        # Policy Head 2 (Pokemon 2): P(a2 | z, a1_emb)
-        self.policy_head2 = nn.Sequential(
-            nn.Linear(d_model + d_act_emb, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, act_size),
-        )
-
-        # outputs scalar value from the state V(s)
-        self.value_head = ValueHead(in_features=d_model, hidden_features=d_model // 2, scale=0.1)
-
-        self.to(self.device)
-        self._init_weights()
-
-    @torch.no_grad()
-    def _init_weights(self):
-        for module in self.reducer.modules():
-            if isinstance(module, nn.Linear):
-                init.orthogonal_(module.weight, gain=1.0)
-                init.zeros_(module.bias)
-
         init.normal_(self.action_embedding.weight, mean=0, std=0.02)
 
-        for head in [self.policy_head1, self.policy_head2]:
-            for i, module in enumerate(head):
-                if isinstance(module, nn.Linear):
-                    if i == len(head) - 1:
-                        init.orthogonal_(module.weight, gain=0.1)
-                    else:
-                        init.orthogonal_(module.weight, gain=1.0)
-                    init.zeros_(module.bias)
+        self.head1 = PolicyHead(d_model, act_size)  # P(a1 | z)
+        self.head2 = PolicyHead(d_model + d_act_emb, act_size)  # P(a2 | z, a1)
 
     def forward(
         self,
-        obs: torch.Tensor,
-        state: tuple[torch.Tensor, torch.Tensor] | None = None,
-        action_mask: torch.Tensor | None = None,
-        sample_actions: bool = True,
-        actions: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor,
-        tuple[torch.Tensor, torch.Tensor],
-    ]:
-        # Add batch dimension if missing
-        if obs.dim() == 2:
-            obs = obs.unsqueeze(0)
-        B, S, F = obs.shape
+        tokens: torch.Tensor,
+        state: Optional[State] = None,
+        action_mask: Optional[torch.Tensor] = None,
+        actions: Optional[torch.Tensor] = None,
+        sample: bool = True,
+        is_tp: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], State]:
+        B = tokens.size(0)
+        device = tokens.device
 
-        if S != self.seq_len or F != self.feat_dim:
-            raise ValueError(f"Got shape ({S}, {F}). Expected({self.seq_len}, {self.feat_dim})")
+        z, next_state = self.reducer(tokens, state)
+        logits1 = self.head1(z)
 
-        is_tp = obs[:, 41, 18] > 0.5
-
-        z, next_state = self.reducer(obs, state)
-        value = self.value_head(z).squeeze(-1)
-
-        logits1 = self.policy_head1(z)  # (B, act_size)
-
-        # eval / bc (action provided)
+        # action eval
         if actions is not None:
             a1 = actions[:, 0]
             a1_emb = self.action_embedding(a1)
-            logits2 = self.policy_head2(torch.cat([z, a1_emb], dim=-1))
+            logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
             logits = torch.stack([logits1, logits2], dim=1)
 
             if action_mask is not None:
-                logits = self._apply_masks(logits, action_mask)
                 logits = self._apply_sequential_masks(logits, a1, action_mask, is_tp)
 
-            return logits, None, None, value, next_state
+            dist1 = Categorical(logits=logits[:, 0])
+            dist2 = Categorical(logits=logits[:, 1])
+            log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
 
-        # no sampling requested (returns p1 logits and placeholder p2)
-        if not sample_actions:
+            return logits, log_probs, None, next_state
+
+        # inference mode
+        if not sample:
+            # Return logits with placeholder for second action if not sampling or evaluating
             logits = torch.stack([logits1, torch.zeros_like(logits1)], dim=1)
-            return logits, None, None, value, next_state
+            return logits, torch.zeros(B, device=device), None, next_state
 
-        # sampling mode
-        if action_mask is not None:
-            l1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
-        else:
-            l1 = logits1
+        # Sampling with sequential constraints
+        m1 = action_mask[:, 0] if action_mask is not None else None
+        l1 = logits1 if m1 is None else logits1.masked_fill(m1 == 0, float("-inf"))
 
-        cat1 = Categorical(logits=l1)
-        a1 = cat1.sample()
-        log_prob1 = cat1.log_prob(a1)
+        dist1 = Categorical(logits=l1)
+        a1 = dist1.sample()
 
         a1_emb = self.action_embedding(a1)
-        logits2 = self.policy_head2(torch.cat([z, a1_emb], dim=-1))
+        logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
 
         logits = torch.stack([logits1, logits2], dim=1)
         if action_mask is not None:
-            logits = self._apply_masks(logits, action_mask)
             logits = self._apply_sequential_masks(logits, a1, action_mask, is_tp)
 
-        cat2 = Categorical(logits=logits[:, 1])
-        a2 = cat2.sample()
-        log_prob2 = cat2.log_prob(a2)
+        dist2 = Categorical(logits=logits[:, 1])
+        a2 = dist2.sample()
 
-        return (
-            logits,
-            log_prob1 + log_prob2,  # joint log prob
-            torch.stack([a1, a2], -1),
-            value,
-            next_state,
-        )
+        log_probs = dist1.log_prob(a1) + dist2.log_prob(a2)
+        sampled_actions = torch.stack([a1, a2], dim=-1)
 
-    def get_policy_masked_logits(
-        self,
-        obs: torch.Tensor,
-        action_taken: torch.Tensor,
-        action_mask: torch.Tensor | None,
-        state: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ):
-        logits, _, _, _, _ = self(
-            obs, state, action_mask, sample_actions=False, actions=action_taken
-        )
-        return logits
-
-    def evaluate_actions(
-        self,
-        obs: torch.Tensor,
-        actions: torch.Tensor,
-        action_mask: torch.Tensor | None = None,
-        state: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]
-    ]:
-        logits, _, _, value, next_state = self(
-            obs, state, action_mask, sample_actions=False, actions=actions
-        )
-
-        if action_mask is not None:
-            # Compute support sizes for normalized entropy
-            valid_count_1 = (logits[:, 0] > float("-inf")).sum(-1).float().clamp_min(1.0)
-            valid_count_2 = (logits[:, 1] > float("-inf")).sum(-1).float().clamp_min(1.0)
-            max_entropy = torch.log(valid_count_1) + torch.log(valid_count_2)
-        else:
-            max_entropy = (
-                torch.log(torch.tensor(self.act_size, device=logits.device, dtype=torch.float32))
-                * 2
-            )
-
-        cat1 = Categorical(logits=logits[:, 0])
-        cat2 = Categorical(logits=logits[:, 1])
-
-        log_prob1 = cat1.log_prob(actions[:, 0])
-        log_prob2 = cat2.log_prob(actions[:, 1])
-        log_prob = log_prob1 + log_prob2
-
-        entropy = cat1.entropy() + cat2.entropy()
-
-        normalized_entropy = torch.where(
-            max_entropy > 0,
-            entropy / max_entropy.clamp_min(torch.finfo(entropy.dtype).eps),
-            torch.zeros_like(entropy),
-        )
-
-        return log_prob, entropy, normalized_entropy, value, next_state
-
-    def _apply_masks(self, logits: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
-        # Replace logits of illegal actions with -inf so they have zero probability
-        mask = action_mask == 0
-        return logits.masked_fill(mask, float("-inf"))
+        return logits, log_probs, sampled_actions, next_state
 
     def _apply_sequential_masks(
         self,
         logits: torch.Tensor,
         action1: torch.Tensor,
         action_mask: torch.Tensor,
-        is_tp: torch.Tensor,
-    ):
-        is_tp = is_tp.bool()
+        is_tp: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B = logits.size(0)
+        device = logits.device
+
+        # Apply base action masks
+        logits = logits.masked_fill(action_mask == 0, float("-inf"))
+
+        if is_tp is None:
+            is_tp = torch.zeros(B, device=device, dtype=torch.bool)
+        else:
+            is_tp = is_tp.bool()
+
         mask2 = action_mask[:, 1].clone().bool()
 
         # If Pokemon 1 switches to slot idx, Pokemon 2 cannot switch to the same slot
         switch_mask = (1 <= action1) & (action1 <= 6) & (~is_tp)
         mask2[switch_mask, action1[switch_mask]] = 0
 
-        # If Pokemon 1 uses terastallize, Pokemon 2 cannot also tera
-        tera_mask = (26 < action1) & (action1 <= 46) & (~is_tp)
-        mask2[tera_mask, 27:47] = 0
+        # Only one Mega per turn.
+        # Mega moves are 27-46.
+        mega_mask = (action1 >= 27) & (action1 <= 46) & (~is_tp)
+        mask2[mega_mask, 27:47] = False
 
         # If Pokemon 1 passes, Pokemon 2 cannot pass as well unless no valid moves left
         pass_mask = (action1 == 0) & (~is_tp)
-        mask2[pass_mask, 0] = 0
+        mask2[pass_mask, 0] = False
 
         # Ensure all 4 selected Pokemon are unique (no overlap between Lead and Back)
         if is_tp.any():
@@ -268,10 +171,11 @@ class PolicyNet(nn.Module):
             p1_1 = tp_actions // 6 + 1
             p2_1 = tp_actions % 6 + 1
 
-            all_a = torch.arange(36, device=logits.device)
+            all_a = torch.arange(36, device=device)
             p1_2 = all_a // 6 + 1
             p2_2 = all_a % 6 + 1
 
+            # Mask any second pick that re-uses a pokemon from the first pick
             overlap = (
                 (p1_2.unsqueeze(0) == p1_1.unsqueeze(1))
                 | (p1_2.unsqueeze(0) == p2_1.unsqueeze(1))
@@ -283,14 +187,177 @@ class PolicyNet(nn.Module):
 
         # If no valid action remains, force pass action to be valid for Pokemon 2
         no_valid = mask2.sum(-1) == 0
-        mask2[no_valid, 0] = 1
+        mask2[no_valid, 0] = True
 
-        return torch.stack(
-            [
-                logits[:, 0],  # first row actions unchanged
-                logits[:, 1].masked_fill(
-                    ~mask2.bool(), float("-inf")
-                ),  # masked row for second pokemon
-            ],
-            dim=1,
+        l2 = logits[:, 1].masked_fill(~mask2, float("-inf"))
+        return torch.stack([logits[:, 0], l2], dim=1)
+
+
+class ValueNet(nn.Module):
+    """Stateless critic value path with internal head and gradient scaling."""
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        nlayer: int,
+        seq_len: int = SEQUENCE_LENGTH,
+        hidden_dim: int = 1024,  # double that of policy heads
+        scale: float = 0.1,
+    ):
+        super().__init__()
+        self.scale = scale
+        self.reducer = CLSReducer(
+            seq_len=seq_len,
+            d_model=d_model,
+            nhead=nhead,
+            nlayer=nlayer,
+            use_history=False,
         )
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        self._init_weights()
+
+    @torch.no_grad()
+    def _init_weights(self):
+        for i, module in enumerate(self.net):
+            if isinstance(module, nn.Linear):
+                init.orthogonal_(module.weight, gain=1.0)
+                init.zeros_(module.bias)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        z, _ = self.reducer(tokens, None)
+
+        # scale the gradient flowing back to the trunk
+        # may not be needed anymore given the deeper split
+        if z.requires_grad and self.scale < 1.0:
+            z = z.detach() + self.scale * (z - z.detach())
+
+        return self.net(z).squeeze(-1)
+
+
+class PolicyNet(nn.Module):
+    """
+    Refactored Pokemon Policy Network with explicit Actor/Critic split.
+    Name kept the same to be consistent with training loop. Might be fixed later.
+
+    The Policy path is stateful (recurrent), while the Value path is stateless.
+    Both share a common FusedTokenEncoder for efficiency.
+    """
+
+    def __init__(
+        self,
+        obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH),
+        act_size=ACT_SIZE,
+        d_model=768,
+        nhead=8,
+        nlayer=3,
+        critic_nlayer: int | None = None,
+    ):
+        super().__init__()
+        self.seq_len, self.feat_dim = obs_dim
+        self.act_size = act_size
+        self.d_model = d_model
+
+        # Shared structured front-end
+        self.encoder = FusedTokenEncoder(d_model, nhead, d_model * 4)
+
+        # Stateful Actor
+        self.actor = ActorPolicy(d_model, nhead, nlayer, act_size, self.seq_len)
+
+        # Stateless Critic
+        critic_nlayer = critic_nlayer or nlayer
+        self.critic = ValueNet(d_model, nhead, critic_nlayer, self.seq_len)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
+
+    def _get_is_tp(self, obs: Any) -> torch.Tensor:
+        obs_dict = as_obs_dict(obs)
+        numerical = obs_dict["numerical"]
+        if numerical.dim() == 2:
+            numerical = numerical.unsqueeze(0)
+        # Global Field is index 25, feature 6 is team_preview flag
+        return (numerical[:, 25, 6] > 0.5).to(self.device)
+
+    def forward(
+        self,
+        obs: Any,
+        state: Optional[State] = None,
+        action_mask: Optional[torch.Tensor] = None,
+        sample_actions: bool = True,
+        actions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, State]:
+        """
+        Main forward pass. Matches original PolicyNet signature for compatibility.
+        """
+        tokens = self.encoder(obs)
+        is_tp = self._get_is_tp(obs)
+
+        if action_mask is not None:
+            action_mask = action_mask.to(self.device)
+            if action_mask.dim() == 2:
+                action_mask = action_mask.unsqueeze(0)
+
+        if actions is not None:
+            actions = actions.to(self.device)
+            if actions.dim() == 1:
+                actions = actions.unsqueeze(0)
+
+        logits, log_probs, sampled_actions, next_state = self.actor(
+            tokens, state, action_mask, actions, sample_actions, is_tp
+        )
+        value = self.critic(tokens)
+
+        return logits, log_probs, sampled_actions, value, next_state
+
+    def evaluate_actions(
+        self,
+        obs: Any,
+        actions: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        state: Optional[State] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, State]:
+        """
+        Evaluate actions for PPO updates.
+        Returns (log_prob, entropy, normalized_entropy, value, next_state).
+        """
+        logits, log_prob, _, value, next_state = self(
+            obs, state, action_mask, sample_actions=False, actions=actions
+        )
+
+        dist1 = Categorical(logits=logits[:, 0])
+        dist2 = Categorical(logits=logits[:, 1])
+        entropy = dist1.entropy() + dist2.entropy()
+
+        # normalized entropy (relative to valid action support)
+        # mainly for logging, not used right now for the entropy loss
+        if action_mask is not None:
+            v1 = (logits[:, 0] > float("-inf")).sum(-1).float().clamp_min(1.0)
+            v2 = (logits[:, 1] > float("-inf")).sum(-1).float().clamp_min(1.0)
+            max_entropy = torch.log(v1) + torch.log(v2)
+        else:
+            max_entropy = torch.log(torch.tensor(self.act_size, device=self.device).float()) * 2
+
+        norm_entropy = torch.where(
+            max_entropy > 0, entropy / max_entropy.clamp_min(1e-8), torch.zeros_like(entropy)
+        )
+
+        return log_prob, entropy, norm_entropy, value, next_state
+
+    def get_policy_masked_logits(
+        self,
+        obs: Any,
+        action_taken: torch.Tensor,
+        action_mask: Optional[torch.Tensor],
+        state: Optional[State] = None,
+    ):
+        logits, _, _, _, _ = self(
+            obs, state, action_mask, sample_actions=False, actions=action_taken
+        )
+        return logits

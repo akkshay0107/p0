@@ -1,193 +1,188 @@
-import re
-from functools import lru_cache
-from pathlib import Path
+from __future__ import annotations
+
+from typing import Any, Iterable
 
 import torch
 from poke_env.battle import AbstractBattle, DoubleBattle
-from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
-from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
-from transformers import BertModel, BertTokenizerFast
 
-from lookups import (
-    ACT_SIZE,
-    EFFECT_DESCRIPTION,
-    EXTRA_SZ,
-    ITEM_DESCRIPTION,
-    MOVES,
-    POKEMON,
-    POKEMON_DESCRIPTION,
-    STATUS_DESCRIPTION,
-    TINYBERT_SZ,
+try:
+    from lookups import ACT_SIZE
+except ImportError:  # pragma: no cover - keeps the builder usable during refactors
+    ACT_SIZE = 47
+
+from structured_observation import (
+    CATEGORICAL_WIDTH,
+    MAX_VOLATILES,
+    MOVE_SLOTS,
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
+    TEAM_SIZE,
+    SideId,
+    StructuredObservation,
+    TokenType,
 )
-
-
-# Pre-compiled constants and regexes for optimization
-SLOT_STATUS_DESC = {
-    -1: "This Pokemon is DROPPED. It is not part of the battle.",
-    0: "This pokemon MAY or MAY NOT be in the back as a switch.",
-    1: "This pokemon IS ACTIVE. It is currently on the field.",
-    2: "This pokemon is IN THE BACK. It is able to switch in.",
-    3: "This pokemon has FAINTED. It no longer participates in the battle.",
-    4: "This pokemon CANNOT BE SWITCHED IN. May or may not be in team.",
-}
-DEFAULT_SLOT_STATUS_DESC = "We do not know about this pokemon."
+from tokenizer import PokemonTokenizer, tokenizer
 
 SLOT_STATUS_IDX = {-1: 0, 0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 
-# Regex patterns for _get_turn_summary
-MOVE_RE = re.compile(r"\|move\|([^|]+)\|([^|]+)")
-DAMAGE_RE = re.compile(r"\|-damage\|([^|]+)\|([^|]+)")
-FAINT_RE = re.compile(r"\|faint\|([^|]+)")
-STATUS_RE = re.compile(r"\|-status\|([^|]+)\|([^|]+)")
-BOOST_RE = re.compile(r"\|-(boost|unboost)\|([^|]+)\|([^|]+)\|([^|]+)")
-ABILITY_RE = re.compile(r"\|-ability\|([^|]+)\|([^|]+)")
-TERA_RE = re.compile(r"\|-terastallize\|([^|]+)\|([^|]+)")
-CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
+WEATHER_TO_ID = {
+    Weather.RAINDANCE: "rain",
+    Weather.SUNNYDAY: "sun",
+    Weather.SANDSTORM: "sand",
+    Weather.SNOW: "snow",
+}
+
+FIELD_TO_ID = {
+    Field.TRICK_ROOM: "trickroom",
+    Field.GRASSY_TERRAIN: "grassyterrain",
+    Field.PSYCHIC_TERRAIN: "psychicterrain",
+    Field.ELECTRIC_TERRAIN: "electricterrain",
+    Field.MISTY_TERRAIN: "mistyterrain",
+}
+
+SIDE_CONDITION_TO_ID = {
+    SideCondition.TAILWIND: "tailwind",
+    SideCondition.AURORA_VEIL: "auroraveil",
+    SideCondition.REFLECT: "reflect",
+    SideCondition.LIGHT_SCREEN: "lightscreen",
+    SideCondition.SAFEGUARD: "safeguard",
+}
+
+GLOBAL_CONDITION_IDS = {
+    "none": 0,
+    "rain": 1,
+    "sun": 2,
+    "sand": 3,
+    "snow": 4,
+    "trickroom": 5,
+    "grassyterrain": 6,
+    "psychicterrain": 7,
+    "electricterrain": 8,
+    "mistyterrain": 9,
+}
+
+SIDE_CONDITION_IDS = {
+    "none": 0,
+    "tailwind": 1,
+    "auroraveil": 2,
+    "reflect": 3,
+    "lightscreen": 4,
+    "safeguard": 5,
+}
 
 
-def _to_id_str(s: str) -> str:
-    return CLEAN_ID_RE.sub("", s.lower())
+def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) -> float:
+    if start_turn < 0:
+        return 0.0
+    return max(0.0, duration - (battle.turn - start_turn)) / float(duration)
 
 
 def _get_last_move(battle: DoubleBattle, pokemon: Pokemon) -> str | None:
-    # Check current turn's events first
-    for event in reversed(battle.current_observation.events):
-        if event[1] == "move":
-            try:
-                event_mon = battle.get_pokemon(event[2])
-                if event_mon == pokemon:
-                    move_name = event[3]
-                    return _to_id_str(move_name)
-            except Exception:
-                continue
-
-    # Check observations from previous turns
-    for turn in range(battle.turn, 0, -1):
-        if turn not in battle.observations:
+    observations = [getattr(battle, "current_observation", None)]
+    observations.extend(battle.observations.get(turn) for turn in range(battle.turn, 0, -1))
+    for obs in observations:
+        if obs is None:
             continue
-        obs = battle.observations[turn]
         for event in reversed(obs.events):
-            if event[1] == "move":
+            if len(event) > 3 and event[1] == "move":
                 try:
-                    event_mon = battle.get_pokemon(event[2])
-                    if event_mon == pokemon:
-                        move_name = event[3]
-                        return _to_id_str(move_name)
+                    if battle.get_pokemon(event[2]) == pokemon:
+                        return PokemonTokenizer.normalize_id(event[3])
                 except Exception:
                     continue
     return None
 
 
-def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) -> float:
-    # normalized turns left
-    if start_turn < 0:
-        return 0
-    val = max(0, duration - (battle.turn - start_turn))
-    return val / float(duration)
+def _safe_fraction(num: float | int | None, den: float | int | None) -> float:
+    if not den:
+        return 0.0
+    return float(num or 0.0) / float(den)
 
 
-def _get_pokemon_obs(
-    pokemon: Pokemon | None, battle: DoubleBattle, cond: int, orig_idx: int
-) -> tuple[tuple[str, str], list[float]]:
-    """
-    cond indicates whether we know if pokemon is active, benched, dropped, fainted or unknown
-    -1 = dropped
-    0 = unknown
-    1 = active
-    2 = benched
-    3 = fainted
-    4 = stuck out (dropped from own team / pokemon inside is trapped)
-    """
-    last_move_id = _get_last_move(battle, pokemon) if pokemon and cond == 1 else None
-
-    # Text input for each pokemon
-    pokemon_str = _get_pokemon_text(pokemon, cond, last_move_id)
-
-    # Extra inputs for each pokemon (roughly normalized to [0,1])
-    pokemon_row = [0.0] * EXTRA_SZ
+def _iter_move_slots(pokemon: Pokemon | None) -> list[Any | None]:
     if pokemon is None:
-        # If no pokemon, we still set the slot status to unknown (index 1)
-        role_idx = SLOT_STATUS_IDX.get(cond, 1)
-        pokemon_row[55 + role_idx] = 1.0
-        return pokemon_str, pokemon_row
+        return [None] * MOVE_SLOTS
+    moves = list(pokemon.moves.values())[:MOVE_SLOTS]
+    return moves + [None] * (MOVE_SLOTS - len(moves))
 
-    # Types One-Hot (0-53)
-    # Type 1 (0-17)
-    if pokemon.type_1:
-        pokemon_row[pokemon.type_1.value - 1] = 1.0
-    # Type 2 (18-35)
-    if pokemon.type_2:
-        pokemon_row[18 + pokemon.type_2.value - 1] = 1.0
-    # Tera Type (36-53)
-    if pokemon.is_terastallized:
-        pokemon_row[36 + pokemon.tera_type.value - 1] = 1.0
 
-    # Tera Flag (54)
-    pokemon_row[54] = 1.0 if pokemon.is_terastallized else 0.0
+def _pokemon_categorical(
+    pokemon: Pokemon | None,
+    tok: PokemonTokenizer,
+) -> list[int]:
+    if pokemon is None:
+        return [0] * CATEGORICAL_WIDTH
 
-    # Slot Status One-Hot (55-60)
-    role_idx = SLOT_STATUS_IDX.get(cond, 1)
-    pokemon_row[55 + role_idx] = 1.0
+    move_slots = _iter_move_slots(pokemon)
+    move_ids = [tok.move_id(move) if move is not None else 0 for move in move_slots]
+    move_type_ids = [tok.move_type_id(move) if move is not None else 0 for move in move_slots]
+    volatile_ids = tok.volatile_ids(getattr(pokemon, "effects", None))
 
-    # Numerical Stats (61-82)
-    # HP (61)
-    pokemon_row[61] = pokemon.current_hp_fraction if pokemon.current_hp is not None else 0.0
+    return [
+        tok.roster_id(pokemon),
+        tok.species_id(pokemon),
+        tok.ability_id(pokemon),
+        tok.item_id(pokemon),
+        tok.type_id(getattr(pokemon, "type_1", None)),
+        tok.type_id(getattr(pokemon, "type_2", None)),
+        *move_ids,
+        *move_type_ids,
+        tok.status_id(getattr(pokemon, "status", None)),
+        *volatile_ids,
+    ]
 
-    # Base Stats (62-67)
-    stats = ["hp", "atk", "def", "spa", "spd", "spe"]
-    for i, stat in enumerate(stats):
-        pokemon_row[62 + i] = pokemon.base_stats[stat] / 200.0
 
-    # Boosts (68-74)
-    boosts = ["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]
-    for i, boost in enumerate(boosts):
-        pokemon_row[68 + i] = pokemon.boosts[boost] / 6.0
+def _pokemon_numeric(
+    pokemon: Pokemon | None,
+    battle: DoubleBattle,
+    cond: int,
+    orig_idx: int,
+) -> list[float]:
+    row = [0.0] * NUMERICAL_WIDTH
+    row[SLOT_STATUS_IDX.get(cond, 1)] = 1.0
 
-    # PP (75-78)
-    for i, move in enumerate(pokemon.moves):
-        if i < 4:
-            pokemon_row[75 + i] = pokemon.moves[move].current_pp / pokemon.moves[move].max_pp
+    if pokemon is None:
+        return row
 
-    # Misc Stats (79-82)
-    pokemon_row[79] = min(pokemon.protect_counter, 4) / 4.0
-    pokemon_row[80] = float(pokemon.first_turn)
-    pokemon_row[81] = pokemon.weight / 300.0
-    pokemon_row[82] = (orig_idx + 1) / 6.0
+    row[6] = float(getattr(pokemon, "current_hp_fraction", 0.0) or 0.0)
 
-    # 5. Last Move One-Hot (83-87)
-    if last_move_id and pokemon:
-        move_ids = list(pokemon.moves.keys())
+    base_stats = getattr(pokemon, "base_stats", {}) or {}
+    for i, stat in enumerate(["hp", "atk", "def", "spa", "spd", "spe"]):
+        row[7 + i] = float(base_stats.get(stat, 0.0)) / 200.0
+
+    boosts = getattr(pokemon, "boosts", {}) or {}
+    for i, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
+        row[13 + i] = float(boosts.get(stat, 0.0)) / 6.0
+
+    for i, move in enumerate(_iter_move_slots(pokemon)):
+        if move is not None:
+            row[20 + i] = _safe_fraction(getattr(move, "current_pp", 0), getattr(move, "max_pp", 0))
+
+    row[24] = min(float(getattr(pokemon, "protect_counter", 0.0) or 0.0), 4.0) / 4.0
+    row[25] = float(bool(getattr(pokemon, "first_turn", False)))
+    row[26] = min(float(getattr(pokemon, "weight", 0.0) or 0.0), 300.0) / 300.0
+    row[27] = 0.0 if orig_idx < 0 else (orig_idx + 1) / float(TEAM_SIZE)
+    row[28] = float(bool(getattr(pokemon, "fainted", False)))
+    row[29] = float(cond == 1)
+    row[30] = float(cond == 2)
+    row[31] = float(_can_mega(pokemon))
+    row[32] = float(_is_mega_form(pokemon))
+
+    last_move_id = _get_last_move(battle, pokemon) if cond == 1 else None
+    if last_move_id:
+        move_ids = [PokemonTokenizer.normalize_id(move_id) for move_id in pokemon.moves.keys()]
         if last_move_id in move_ids:
-            move_idx = move_ids.index(last_move_id)
-            if move_idx < 4:
-                pokemon_row[83 + move_idx] = 1.0
-            else:
-                pokemon_row[87] = 1.0
-        else:
-            pokemon_row[87] = 1.0
-    else:
-        pokemon_row[87] = 1.0
+            row[33] = (move_ids.index(last_move_id) + 1) / float(MOVE_SLOTS)
 
-    # 6. Status one-hot and counter (88-97)
-    statuses = [Status.BRN, Status.FRZ, Status.PAR, Status.PSN, Status.SLP]
-    for i, s in enumerate(statuses):
-        if pokemon.status == s:
-            pokemon_row[88 + i] = 1.0
-            pokemon_row[93 + i] = min(getattr(pokemon, "status_counter", 0), 5) / 5.0
-
-    # 7. Effects one-hot and counter (98-103)
-    curr_effects = pokemon.effects
-    effects = [Effect.CONFUSION, Effect.TAUNT, Effect.ENCORE]
-    for i, e in enumerate(effects):
-        if e in curr_effects:
-            pokemon_row[98 + i] = 1.0
-            pokemon_row[101 + i] = curr_effects[e] / 5.0
-
-    return pokemon_str, pokemon_row
+    row[34] = min(float(getattr(pokemon, "status_counter", 0.0) or 0.0), 5.0) / 5.0
+    row[35] = min(max(len(getattr(pokemon, "effects", {}) or {}), 0), MAX_VOLATILES) / float(
+        MAX_VOLATILES
+    )
+    return row
 
 
 def _get_ordered_pokemon(
@@ -196,34 +191,32 @@ def _get_ordered_pokemon(
     active = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
     team = battle.opponent_team if is_opponent else battle.team
 
-    def get_orig_idx(mon):
+    def get_orig_idx(mon: Pokemon | None) -> int:
         if mon is None or is_opponent:
             return -1
-        for i, m in enumerate(battle.team.values()):
-            if m == mon:
+        for i, team_mon in enumerate(battle.team.values()):
+            if team_mon == mon:
                 return i
         return -1
 
     if battle.teampreview:
-        res = [(m, get_orig_idx(m)) for m in team.values()]
-        return (res + [(None, -1)] * 6)[:6]
+        res = [(mon, get_orig_idx(mon)) for mon in team.values()]
+        return (res + [(None, -1)] * TEAM_SIZE)[:TEAM_SIZE]
 
-    # Pack actives first, then the rest of the team to avoid None slots if mon exists
-    res = []
-    for m in active:
-        if m is not None:
-            res.append((m, get_orig_idx(m)))
+    res: list[tuple[Pokemon | None, int]] = []
+    for mon in active:
+        if mon is not None:
+            res.append((mon, get_orig_idx(mon)))
 
-    assigned = {m for m, i in res}
-    others_list = [m for m in team.values() if m not in assigned]
+    assigned = {mon for mon, _ in res}
+    others = [mon for mon in team.values() if mon not in assigned]
 
     if is_opponent:
-        res += [(m, -1) for m in others_list]
+        res += [(mon, -1) for mon in others]
     else:
-        # My team: prioritize bench (fainted or switchable) over dropped
         possible_switches = {mon for switches in battle.available_switches for mon in switches}
         bench, dropped = [], []
-        for mon in others_list:
+        for mon in others:
             idx = get_orig_idx(mon)
             if mon.fainted or mon in possible_switches:
                 bench.append((mon, idx))
@@ -231,43 +224,216 @@ def _get_ordered_pokemon(
                 dropped.append((mon, idx))
         res += bench + dropped
 
-    return (res + [(None, -1)] * 6)[:6]
+    return (res + [(None, -1)] * TEAM_SIZE)[:TEAM_SIZE]
 
 
-def _get_locals(battle: DoubleBattle):
-    """
-    Returns turn remain counts for various field and side effects.
-    """
-    # Global effects
-    trick_room_turns = _get_turns_left(battle, battle.fields.get(Field.TRICK_ROOM, -1))
-    grassy_terrain_turns = _get_turns_left(battle, battle.fields.get(Field.GRASSY_TERRAIN, -1))
-    psychic_terrain_turns = _get_turns_left(battle, battle.fields.get(Field.PSYCHIC_TERRAIN, -1))
+def _slot_condition(
+    battle: DoubleBattle, mon: Pokemon | None, seq_idx: int, is_opponent: bool
+) -> int:
+    if mon is None:
+        return 0
+    if battle.teampreview:
+        return 2
+    if seq_idx < 2:
+        return 1
+    if mon.fainted:
+        return 3
+    if is_opponent:
+        return 2
+    possible_switches = {switch for switches in battle.available_switches for switch in switches}
+    return 2 if mon in possible_switches else -1
 
-    rain_turns = _get_turns_left(battle, battle._weather.get(Weather.RAINDANCE, -1))
-    sun_turns = _get_turns_left(battle, battle._weather.get(Weather.SUNNYDAY, -1))
-    snow_turns = _get_turns_left(battle, battle._weather.get(Weather.SNOW, -1))
 
-    global_effects = [
-        trick_room_turns,
-        grassy_terrain_turns,
-        psychic_terrain_turns,
-        sun_turns,
-        rain_turns,
-        snow_turns,
-    ]
+def _global_field_token(battle: DoubleBattle) -> tuple[list[int], list[float]]:
+    condition_ids = []
+    durations = []
 
-    p1_row = global_effects + [
-        _get_turns_left(battle, battle.side_conditions.get(SideCondition.TAILWIND, -1), duration=4),
-        _get_turns_left(battle, battle.side_conditions.get(SideCondition.AURORA_VEIL, -1)),
-    ]
+    for weather, start_turn in getattr(battle, "_weather", {}).items():
+        name = WEATHER_TO_ID.get(weather)
+        if name:
+            condition_ids.append(GLOBAL_CONDITION_IDS[name])
+            durations.append(_get_turns_left(battle, start_turn))
 
-    p2_row = global_effects + [
-        _get_turns_left(
-            battle,
-            battle.opponent_side_conditions.get(SideCondition.TAILWIND, -1),
-            duration=4,
-        ),
-        _get_turns_left(battle, battle.opponent_side_conditions.get(SideCondition.AURORA_VEIL, -1)),
-    ]
+    for field, start_turn in battle.fields.items():
+        name = FIELD_TO_ID.get(field)
+        if name:
+            condition_ids.append(GLOBAL_CONDITION_IDS[name])
+            durations.append(_get_turns_left(battle, start_turn))
 
-    return p1_row, p2_row
+    condition_ids = condition_ids[:6] + [0] * max(0, 6 - len(condition_ids))
+    durations = durations[:6] + [0.0] * max(0, 6 - len(durations))
+    numerical = durations + [float(battle.teampreview), battle.turn / 16.0]
+    return condition_ids + [0] * (CATEGORICAL_WIDTH - len(condition_ids)), numerical + [0.0] * (
+        NUMERICAL_WIDTH - len(numerical)
+    )
+
+
+def _side_token(
+    battle: DoubleBattle,
+    conditions: dict[SideCondition, int],
+) -> tuple[list[int], list[float]]:
+    condition_ids = []
+    durations = []
+    for condition, start_turn in conditions.items():
+        name = SIDE_CONDITION_TO_ID.get(condition)
+        if name:
+            condition_ids.append(SIDE_CONDITION_IDS[name])
+            duration = 4 if condition == SideCondition.TAILWIND else 5
+            durations.append(_get_turns_left(battle, start_turn, duration=duration))
+
+    condition_ids = condition_ids[:6] + [0] * max(0, 6 - len(condition_ids))
+    durations = durations[:6] + [0.0] * max(0, 6 - len(durations))
+    return condition_ids + [0] * (CATEGORICAL_WIDTH - len(condition_ids)), durations + [0.0] * (
+        NUMERICAL_WIDTH - len(durations)
+    )
+
+
+def from_battle(
+    battle: AbstractBattle,
+    tok: PokemonTokenizer | None = None,
+    *,
+    as_dict: bool = False,
+) -> StructuredObservation | dict[str, torch.Tensor]:
+    assert isinstance(battle, DoubleBattle)
+    tok = tok or tokenizer
+
+    token_types = [TokenType.CLS]
+    sides = [SideId.NONE]
+    slots = [0]
+    categorical = [[0] * CATEGORICAL_WIDTH]
+    numerical = [[0.0] * NUMERICAL_WIDTH]
+
+    for side, is_opponent in ((SideId.ALLY, False), (SideId.OPPONENT, True)):
+        for idx, (mon, orig_idx) in enumerate(_get_ordered_pokemon(battle, is_opponent)):
+            cond = _slot_condition(battle, mon, idx, is_opponent)
+            slot_id = idx + 1
+
+            token_types.append(TokenType.POKEMON_SUPER)
+            sides.append(side)
+            slots.append(slot_id)
+            categorical.append(_pokemon_categorical(mon, tok))
+            numerical.append([0.0] * NUMERICAL_WIDTH)
+
+            token_types.append(TokenType.POKEMON_NUMERIC)
+            sides.append(side)
+            slots.append(slot_id)
+            categorical.append([0] * CATEGORICAL_WIDTH)
+            numerical.append(_pokemon_numeric(mon, battle, cond, orig_idx))
+
+    global_cat, global_num = _global_field_token(battle)
+    token_types.append(TokenType.GLOBAL_FIELD)
+    sides.append(SideId.NONE)
+    slots.append(0)
+    categorical.append(global_cat)
+    numerical.append(global_num)
+
+    ally_cat, ally_num = _side_token(battle, battle.side_conditions)
+    token_types.append(TokenType.ALLY_SIDE)
+    sides.append(SideId.ALLY)
+    slots.append(0)
+    categorical.append(ally_cat)
+    numerical.append(ally_num)
+
+    opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions)
+    token_types.append(TokenType.OPPONENT_SIDE)
+    sides.append(SideId.OPPONENT)
+    slots.append(0)
+    categorical.append(opp_cat)
+    numerical.append(opp_num)
+
+    obs = StructuredObservation(
+        token_type_ids=torch.tensor(token_types, dtype=torch.long),
+        side_ids=torch.tensor(sides, dtype=torch.long),
+        slot_ids=torch.tensor(slots, dtype=torch.long),
+        categorical=torch.tensor(categorical, dtype=torch.long),
+        numerical=torch.tensor(numerical, dtype=torch.float32),
+    )
+
+    if obs.token_type_ids.numel() != SEQUENCE_LENGTH:
+        raise RuntimeError(f"Structured observation length drifted to {obs.token_type_ids.numel()}")
+
+    return obs.as_dict() if as_dict else obs
+
+
+def _is_mega_form(pokemon: Pokemon | None) -> bool:
+    if pokemon is None:
+        return False
+    species = PokemonTokenizer.normalize_id(getattr(pokemon, "species", ""))
+    return "mega" in species or species.endswith("primal")
+
+
+def _can_mega(pokemon: Pokemon | None) -> bool:
+    if pokemon is None:
+        return False
+    for attr in ("can_mega_evolve", "can_mega", "can_mega_evo"):
+        value = getattr(pokemon, attr, None)
+        if value is not None:
+            return bool(value)
+    item = PokemonTokenizer.normalize_id(getattr(pokemon, "item", ""))
+    return (item in {"redorb", "blueorb"} or "ite" in item) and not _is_mega_form(pokemon)
+
+
+def _team_has_mega(team: Iterable[Pokemon]) -> bool:
+    return any(_is_mega_form(mon) for mon in team if mon is not None)
+
+
+def _battle_can_mega(battle: DoubleBattle, pos: int) -> bool:
+    attrs = ("can_mega_evolve", "can_mega", "can_mega_evo")
+    for attr in attrs:
+        value = getattr(battle, attr, None)
+        if isinstance(value, (list, tuple)) and pos < len(value):
+            return bool(value[pos])
+        if isinstance(value, dict):
+            return bool(value.get(pos, False))
+    active = battle.active_pokemon[pos] if pos < len(battle.active_pokemon) else None
+    return _can_mega(active) and not _team_has_mega(battle.team.values())
+
+
+def get_action_mask(battle: AbstractBattle) -> torch.Tensor:
+    assert isinstance(battle, DoubleBattle)
+    if battle.teampreview:
+        mask = [0] * ACT_SIZE
+        for action in range(36):
+            p1 = action // 6 + 1
+            p2 = action % 6 + 1
+            if p1 < p2 and p1 <= len(battle.team) and p2 <= len(battle.team):
+                mask[action] = 1
+        return torch.tensor([mask, mask], dtype=torch.uint8)
+
+    def single_action_mask(pos: int) -> list[int]:
+        switch_space = [
+            i + 1
+            for i, pokemon in enumerate(battle.team.values())
+            if not battle.trapped[pos]
+            and pokemon.base_species in [p.base_species for p in battle.available_switches[pos]]
+        ]
+        active_mon = battle.active_pokemon[pos]
+        if battle._wait or (any(battle.force_switch) and not battle.force_switch[pos]):
+            actions = [0]
+        elif all(battle.force_switch) and len(battle.available_switches[pos]) == 1:
+            actions = switch_space + [0]
+        elif active_mon is None:
+            actions = switch_space
+        else:
+            available_move_ids = {move.id for move in battle.available_moves[pos]}
+            move_spaces = [
+                [
+                    7 + 5 * i + target + 2
+                    for target in battle.get_possible_showdown_targets(move, active_mon)
+                ]
+                for i, move in enumerate(active_mon.moves.values())
+                if move.id in available_move_ids
+            ]
+            move_space = [action for target_actions in move_spaces for action in target_actions]
+            mega_space = [action + 20 for action in move_space if _battle_can_mega(battle, pos)]
+            if (
+                not move_space
+                and len(battle.available_moves[pos]) == 1
+                and battle.available_moves[pos][0].id in {"struggle", "recharge"}
+            ):
+                move_space = [9]
+            actions = switch_space + move_space + mega_space
+        actions = actions or [0]
+        return [int(action in actions) for action in range(ACT_SIZE)]
+
+    return torch.tensor([single_action_mask(0), single_action_mask(1)], dtype=torch.uint8)
