@@ -25,7 +25,7 @@ from poke_env.teambuilder import Teambuilder
 
 import observation_builder
 from lookups import ACT_SIZE
-from teams import RandomTeamFromPool
+from team_picker import RandomTeamFromPool
 
 
 class VGCEnvPlayer(_EnvPlayer):

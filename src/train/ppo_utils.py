@@ -16,7 +16,7 @@ def unwrap_policy(policy: PolicyNet) -> PolicyNet:
 
 
 def reducer_of(model: PolicyNet):
-    return unwrap_policy(model).reducer
+    return unwrap_policy(model).actor.reducer
 
 
 def initial_state(model: PolicyNet, batch_size: int, device: torch.device):

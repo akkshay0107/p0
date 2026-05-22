@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -13,11 +14,16 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 from torch.distributions import Categorical
 
+# Add model and train directories to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "model"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "train"))
+
 import observation_builder
-from env import Gen9VGCEnv
 from policy import PolicyNet
-from ppo_utils import initial_state, load_checkpoint
-from teams import RandomTeamFromPool
+from ppo_utils import load_checkpoint
+
+from env import MegaEnv
+from team_picker import RandomTeamFromPool
 
 
 class RLPlayer(Player):
@@ -54,43 +60,62 @@ class RLPlayer(Player):
 
     def _top_p(self, obs, action_mask, is_tp: bool):
         if self.state is None:
-            self.state = initial_state(self.policy, 1, self.policy.device)
+            # Re-implementing initial_state locally to match the refactored PolicyNet
+            reducer = self.policy.actor.reducer
+            batch_size = 1
+            device = self.policy.device
+            cls = reducer.cls_base.detach().expand(batch_size, -1, -1).squeeze(1).to(device)
+            hg = reducer.hg_init.detach().expand(batch_size, -1, -1).to(device)
+            self.state = (cls, hg)
 
-        # Get backbone embedding
-        z, self.state = self.policy.reducer(obs, self.state)
+        with torch.no_grad():
+            # Shared front-end encoding
+            tokens = self.policy.encoder(obs)
 
-        # Pokemon 1: P(a1 | z)
-        logits1 = self.policy.policy_head1(z)
-        if action_mask is not None:
-            logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
+            # Stateful Actor step
+            z, self.state = self.policy.actor.reducer(tokens, self.state)
 
-        p1_logits_top_p = self._apply_top_p(logits1)
-        cat1 = Categorical(logits=p1_logits_top_p)
-        action1 = cat1.sample()  # (B,)
+            # Pokemon 1: P(a1 | z)
+            logits1 = self.policy.actor.head1(z)
+            if action_mask is not None:
+                logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
 
-        # Pokemon 2: P(a2 | z, a1)
-        a1_emb = self.policy.action_embedding(action1)
-        logits2 = self.policy.policy_head2(torch.cat([z, a1_emb], dim=-1))
+            p1_logits_top_p = self._apply_top_p(logits1)
+            cat1 = Categorical(logits=p1_logits_top_p)
+            action1 = cat1.sample()  # (B,)
 
-        # Combine and apply sequential masks
-        logits = torch.stack([logits1, logits2], dim=1)
-        if action_mask is not None:
-            is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
-            logits = self.policy._apply_masks(logits, action_mask)
-            logits = self.policy._apply_sequential_masks(logits, action1, action_mask, is_tp_t)
+            # Pokemon 2: P(a2 | z, a1)
+            a1_emb = self.policy.actor.action_embedding(action1)
+            logits2 = self.policy.actor.head2(torch.cat([z, a1_emb], dim=-1))
 
-        p2_logits_top_p = self._apply_top_p(logits[:, 1])
-        cat2 = Categorical(logits=p2_logits_top_p)
-        action2 = cat2.sample()  # (B,)
+            # Combine and apply sequential masks
+            logits = torch.stack([logits1, logits2], dim=1)
+            if action_mask is not None:
+                is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
+                logits = self.policy.actor._apply_sequential_masks(
+                    logits, action1, action_mask, is_tp_t
+                )
 
-        return torch.stack([action1, action2], dim=-1)
+            p2_logits_top_p = self._apply_top_p(logits[:, 1])
+            cat2 = Categorical(logits=p2_logits_top_p)
+            action2 = cat2.sample()  # (B,)
+
+            return torch.stack([action1, action2], dim=-1)
 
     def _get_action(self, battle: AbstractBattle, is_tp: bool):
         obs = self.get_observation(battle)
         action_mask = observation_builder.get_action_mask(battle)
+
+        # Ensure obs is batched and moved to device
+        if hasattr(obs, "unsqueeze"):
+            obs = obs.unsqueeze(0).to(self.policy.device)
+        else:
+            # Handle dictionary observation
+            obs = {k: v.unsqueeze(0).to(self.policy.device) for k, v in obs.items()}
+
         with torch.no_grad():
             actions = self._top_p(
-                obs.unsqueeze(0).to(self.policy.device),
+                obs,
                 action_mask.unsqueeze(0).to(self.policy.device),
                 is_tp,
             )
@@ -100,7 +125,7 @@ class RLPlayer(Player):
         assert isinstance(battle, DoubleBattle)
         if battle._wait:
             return DefaultBattleOrder()
-        return Gen9VGCEnv.action_to_order(self._get_action(battle, False), battle)
+        return MegaEnv.action_to_order(self._get_action(battle, False), battle)
 
     def get_observation(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
@@ -108,14 +133,14 @@ class RLPlayer(Player):
 
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
-        # Team preview is the start of the battle, so we reset the state here
+        # Reset state at the beginning of each battle's Team Preview
         self.state = None
         action = self._get_action(battle, True)
-        order = Gen9VGCEnv.action_to_order(action, battle)
+        order = MegaEnv.action_to_order(action, battle)
         return order.message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
-        # Reset state at the end of the battle to prevent memory leaks or state carry-over
+        # Reset state to prevent leaks or state carry-over across battles
         self.state = None
 
 
@@ -223,6 +248,7 @@ def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
 
 
 def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> PolicyNet:
+    # Use recommended dimensions if unspecified
     policy = PolicyNet()
 
     if checkpoint_path is None:
