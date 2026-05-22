@@ -1,4 +1,3 @@
-import random
 from pathlib import Path
 from typing import Optional, Union
 from weakref import WeakKeyDictionary
@@ -6,9 +5,7 @@ from weakref import WeakKeyDictionary
 import numpy as np
 import numpy.typing as npt
 from gymnasium.spaces import MultiDiscrete
-from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon, PokemonType, Weather
-from poke_env.battle.move_category import MoveCategory
-from poke_env.battle.side_condition import SideCondition
+from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon
 from poke_env.environment.env import ObsType, PokeEnv, _EnvPlayer
 from poke_env.player.battle_order import (
     BattleOrder,
@@ -30,114 +27,6 @@ import observation_builder
 from lookups import ACT_SIZE
 from teams import RandomTeamFromPool
 
-_SHAPING_PENALTY = 0.10
-_PROTECT_MOVES = {"protect", "detect"}
-_GHOST_PIERCING_ABILITIES = {"mindseye", "scrappy"}
-_GHOST_IMMUNITY_TYPES = {PokemonType.NORMAL, PokemonType.FIGHTING}
-
-
-def _target_has_defensive_escape(target: Pokemon, battle: DoubleBattle) -> bool:
-    if target.fainted:
-        return False
-
-    active_species = {
-        mon.base_species for mon in battle.opponent_active_pokemon if mon and not mon.fainted
-    }
-    can_switch = any(
-        mon is not target
-        and not mon.fainted
-        and not mon.active
-        and mon.base_species not in active_species
-        for mon in battle.opponent_team.values()
-    )
-    can_tera = not battle.opponent_used_tera and not target.is_terastallized
-    return can_switch or can_tera
-
-
-def _move_is_blocked_by_immunity(move, attacker: Pokemon, target: Pokemon) -> bool:
-    if target.fainted:
-        return False
-    if target.damage_multiplier(move) != 0:
-        return False
-    if (
-        attacker.ability in _GHOST_PIERCING_ABILITIES
-        and move.type in _GHOST_IMMUNITY_TYPES
-        and PokemonType.GHOST in target.types
-    ):
-        return False
-    return True
-
-
-def _compute_shaping_penalty(action: npt.NDArray, battle: DoubleBattle) -> float:
-    if battle.teampreview:
-        return 0.0
-
-    penalties = 0
-    for pos in range(2):
-        a = int(action[pos])
-        if not 7 <= a <= 46:
-            continue
-
-        active_mon = battle.active_pokemon[pos]
-        if active_mon is None:
-            continue
-
-        move_idx = (a - 7) % 20 // 5
-        available_moves = battle.available_moves[pos]
-        moves = (
-            available_moves
-            if len(available_moves) == 1 and available_moves[0].id in {"struggle", "recharge"}
-            else list(active_mon.moves.values())
-        )
-        if move_idx >= len(moves):
-            continue
-
-        move = moves[move_idx]
-        is_tera = a >= 27
-        target_idx = (a - 7) % 5 - 2
-        if target_idx == 0:
-            targets = [op for op in battle.opponent_active_pokemon if op and not op.fainted]
-        elif target_idx in {1, 2}:
-            target = battle.opponent_active_pokemon[target_idx - 1]
-            targets = [target] if target and not target.fainted else []
-        else:
-            targets = []
-
-        if move.id == "tailwind":
-            tailwind_start = battle.side_conditions.get(SideCondition.TAILWIND, -1)
-            penalties += int(tailwind_start >= 0 and 4 - (battle.turn - tailwind_start) > 0)
-
-        if is_tera and move.id in _PROTECT_MOVES:
-            penalties += 1
-
-        if move.category != MoveCategory.STATUS and not is_tera:
-            penalties += int(
-                bool(targets)
-                and all(
-                    _move_is_blocked_by_immunity(move, active_mon, t)
-                    and not _target_has_defensive_escape(t, battle)
-                    for t in targets
-                )
-            )
-
-        if move.id == "auroraveil":
-            veil_start = battle.side_conditions.get(SideCondition.AURORA_VEIL, -1)
-            penalties += int(
-                Weather.SNOWSCAPE not in battle.weather
-                or (veil_start >= 0 and 5 - (battle.turn - veil_start) > 0)
-            )
-
-        if active_mon.ability == "prankster" and move.category == MoveCategory.STATUS:
-            penalties += int(
-                bool(targets)
-                and all(
-                    PokemonType.DARK in t.types and not _target_has_defensive_escape(t, battle)
-                    for t in targets
-                )
-            )
-
-    return -_SHAPING_PENALTY * penalties
-
 
 class VGCEnvPlayer(_EnvPlayer):
     async def _handle_battle_request(
@@ -151,9 +40,9 @@ class VGCEnvPlayer(_EnvPlayer):
             await super()._handle_battle_request(battle, maybe_default_order)
 
 
-# modified Gen9VGCEnv from poke-env
-# to remove all other gimmicks but tera
-class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
+# modified from poke-env
+# to remove all other gimmicks but mega evolution
+class MegaEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
     def __init__(
         self,
         account_configuration1: Optional[AccountConfiguration] = None,
@@ -251,10 +140,10 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
         12 <= element <= 16: move 2
         17 <= element <= 21: move 3
         22 <= element <= 26: move 4
-        27 <= element <= 31: move 1 and terastallize
-        32 <= element <= 36: move 2 and terastallize
-        37 <= element <= 41: move 3 and terastallize
-        42 <= element <= 46: move 4 and terastallize
+        27 <= element <= 31: move 1 and mega evolution
+        32 <= element <= 36: move 2 and mega evolution
+        37 <= element <= 41: move 3 and mega evolution
+        42 <= element <= 46: move 4 and mega evolution
 
         :param action: The action to take.
         :type action: ndarray[int64]
@@ -294,7 +183,7 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
         elif action[0] == -1 or action[1] == -1:
             return ForfeitBattleOrder()
         try:
-            order1 = Gen9VGCEnv._action_to_order_individual(action[0], battle, fake, 0)
+            order1 = MegaEnv._action_to_order_individual(action[0], battle, fake, 0)
         except ValueError as e:
             if strict:
                 raise e
@@ -304,7 +193,7 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
                 order = Player.choose_random_doubles_move(battle)
                 order1 = order.first_order if not isinstance(order, DefaultBattleOrder) else order
         try:
-            order2 = Gen9VGCEnv._action_to_order_individual(action[1], battle, fake, 1)
+            order2 = MegaEnv._action_to_order_individual(action[1], battle, fake, 1)
         except ValueError as e:
             if strict:
                 raise e
@@ -363,7 +252,7 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
             order = Player.create_order(
                 mvs[(action - 7) % 20 // 5],
                 move_target=(action.item() - 7) % 5 - 2,
-                terastallize=(action - 7) // 20 == 1,
+                mega=(action - 7) // 20 == 1,
             )
         if not fake and str(order) not in [str(o) for o in battle.valid_orders[pos]]:
             raise ValueError(
@@ -433,11 +322,11 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
             else:
                 if battle.logger is not None:
                     battle.logger.warning(error_msg)
-                return Gen9VGCEnv.order_to_action(
+                return MegaEnv.order_to_action(
                     Player.choose_random_doubles_move(battle), battle, fake, strict
                 )
         try:
-            action1 = Gen9VGCEnv._order_to_action_individual(order.first_order, battle, fake, 0)
+            action1 = MegaEnv._order_to_action_individual(order.first_order, battle, fake, 0)
         except ValueError as e:
             if strict:
                 raise e
@@ -445,14 +334,14 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
                 if battle.logger is not None:
                     battle.logger.warning(str(e) + " Defaulting to random move.")
                 order = Player.choose_random_doubles_move(battle)
-                action1 = Gen9VGCEnv._order_to_action_individual(
+                action1 = MegaEnv._order_to_action_individual(
                     (order.first_order if not isinstance(order, DefaultBattleOrder) else order),
                     battle,
                     fake,
                     0,
                 )
         try:
-            action2 = Gen9VGCEnv._order_to_action_individual(order.second_order, battle, fake, 1)
+            action2 = MegaEnv._order_to_action_individual(order.second_order, battle, fake, 1)
         except ValueError as e:
             if strict:
                 raise e
@@ -460,7 +349,7 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
                 if battle.logger is not None:
                     battle.logger.warning(str(e) + " Defaulting to random move.")
                 order = Player.choose_random_doubles_move(battle)
-                action2 = Gen9VGCEnv._order_to_action_individual(
+                action2 = MegaEnv._order_to_action_individual(
                     (order.second_order if not isinstance(order, DefaultBattleOrder) else order),
                     battle,
                     fake,
@@ -499,7 +388,7 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
             )
             action = [m.id for m in mvs].index(order.order.id)
             target = order.move_target + 2
-            if order.terastallize:
+            if order.mega:
                 gimmick = 1
             else:
                 gimmick = 0
@@ -507,7 +396,7 @@ class Gen9VGCEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
         return np.int64(action)
 
 
-class SimEnv(Gen9VGCEnv):
+class SimEnv(MegaEnv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -536,25 +425,6 @@ class SimEnv(Gen9VGCEnv):
 
     def get_legal_tp_actions(self):
         return [np.array([i, j], dtype=np.int64) for i in range(36) for j in range(36)]
-
-    def step(self, actions):
-        p1_pen = (
-            _compute_shaping_penalty(actions[self.agent1.username], self.battle1)
-            if self.battle1
-            else 0.0
-        )
-        p2_pen = (
-            _compute_shaping_penalty(actions[self.agent2.username], self.battle2)
-            if self.battle2
-            else 0.0
-        )
-
-        obs, rewards, terminated, truncated, info = super().step(actions)
-
-        rewards[self.agent1.username] = rewards.get(self.agent1.username, 0.0) + p1_pen
-        rewards[self.agent2.username] = rewards.get(self.agent2.username, 0.0) + p2_pen
-
-        return obs, rewards, terminated, truncated, info
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         if not battle.finished:
