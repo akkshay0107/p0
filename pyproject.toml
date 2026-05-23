@@ -6,15 +6,24 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "poke-env==0.11.0",
-    "torch>=2.7.0",
     "numpy>=1.21.6",
     "gymnasium>=0.26.3",
-    "transformers[torch]>=4.57.1",
     "tensorboard>=2.20.0",
 ]
 
 [project.optional-dependencies]
-cpu = []
+cpu = ["torch>=2.11"]
+cuda = ["torch>=2.11"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -23,7 +32,7 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cpu", marker = "extra == 'cpu'" },
+  { index = "pytorch-cpu", extra = "cpu" },
 ]
 
 [tool.pyright]
