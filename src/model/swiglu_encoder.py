@@ -71,7 +71,7 @@ class SwiGLUEncoderLayer(nn.Module):
         )
 
         # B, H, S, D -> B, S, H, D and then combine H, D into d_model
-        x = x.transpose(1, 2).contiguous().view(B, S, self.d_model)
+        x = x.transpose(1, 2).reshape(B, S, self.d_model)
         return self.out_proj(x)
 
     def _ffn(self, x: torch.Tensor) -> torch.Tensor:

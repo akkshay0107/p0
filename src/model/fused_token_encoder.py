@@ -104,6 +104,9 @@ class FusedTokenEncoder(nn.Module):
             num_layers=1,
         )
         self.mon_fusion_token = nn.Parameter(torch.empty(1, 1, d_model))
+
+        # cache component ids instead of creating them every forward pass
+        self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
         self._init_weights()
 
     @torch.no_grad()
@@ -140,22 +143,20 @@ class FusedTokenEncoder(nn.Module):
 
         status = self.status_proj(self.status_emb(categorical[..., 13]))
 
+        # masked mean over volatile slots; zero-vector when no volatiles present
         v_cat = categorical[..., 14:20]
         v_mask = v_cat != 0
         v_emb = self.volatile_proj(self.volatile_emb(v_cat))
         v_sum = (v_emb * v_mask.unsqueeze(-1).float()).sum(dim=-2)
-        v_count = v_mask.sum(dim=-1, keepdim=True).float()
-        no_v = self.volatile_proj(self.volatile_emb(torch.zeros_like(v_cat[..., 0])))
-        volatile = torch.where(v_count > 0, v_sum / v_count.clamp_min(1.0), no_v)
+        v_count = v_mask.sum(dim=-1, keepdim=True).float().clamp_min(1.0)
+        volatile = v_sum / v_count
 
         # combine all components into (N, NUM_COMPONENTS, d_model)
         components = torch.stack(
             [species, ability, item, type_summary, moveset, status, volatile],
             dim=-2,
         )
-        components = components + self.component_emb(
-            torch.arange(NUM_COMPONENTS, device=categorical.device)
-        )
+        components = components + self.component_emb(self._component_ids)
 
         # input from boolean masking is always (N, C), so components is (N, NUM_COMPONENTS, d_model)
         # prepend the fusion token (cls) and run through the mon_fusion transformer
@@ -166,29 +167,23 @@ class FusedTokenEncoder(nn.Module):
         # extract cls "super token"
         return fused[:, 0]
 
-    def _embed_global_field(
-        self, categorical: torch.Tensor, numerical: torch.Tensor
-    ) -> torch.Tensor:
+    def _embed_global_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
+        """Returns the categorical-side embedding only (numeric added in forward)."""
         g_cat = categorical[..., :6].clamp_max(NUM_GLOBAL_CONDITIONS - 1)
         g_mask = g_cat != 0
         g_emb = self.global_condition_proj(self.global_condition_emb(g_cat))
         g_sum = (g_emb * g_mask.unsqueeze(-1).float()).sum(dim=-2)
-        g_count = g_mask.sum(dim=-1, keepdim=True).float()
-        no_g = self.global_condition_proj(
-            self.global_condition_emb(torch.zeros_like(g_cat[..., 0]))
-        )
-        global_field = torch.where(g_count > 0, g_sum / g_count.clamp_min(1.0), no_g)
-        return global_field + self.field_numeric_proj(numerical)
+        g_count = g_mask.sum(dim=-1, keepdim=True).float().clamp_min(1.0)
+        return g_sum / g_count  # zero-vector when no conditions present (#2)
 
-    def _embed_side_field(self, categorical: torch.Tensor, numerical: torch.Tensor) -> torch.Tensor:
+    def _embed_side_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
+        """Returns the categorical-side embedding only (numeric added in forward)."""
         s_cat = categorical[..., :6].clamp_max(NUM_SIDE_CONDITIONS - 1)
         s_mask = s_cat != 0
         s_emb = self.side_condition_proj(self.side_condition_emb(s_cat))
         s_sum = (s_emb * s_mask.unsqueeze(-1).float()).sum(dim=-2)
-        s_count = s_mask.sum(dim=-1, keepdim=True).float()
-        no_s = self.side_condition_proj(self.side_condition_emb(torch.zeros_like(s_cat[..., 0])))
-        side_field = torch.where(s_count > 0, s_sum / s_count.clamp_min(1.0), no_s)
-        return side_field + self.field_numeric_proj(numerical)
+        s_count = s_mask.sum(dim=-1, keepdim=True).float().clamp_min(1.0)
+        return s_sum / s_count  # zero-vector when no conditions present (#2)
 
     def forward(self, obs: Any) -> torch.Tensor:
         obs_dict = as_obs_dict(obs)
@@ -232,16 +227,25 @@ class FusedTokenEncoder(nn.Module):
             x[numeric_mask] = self.numeric_proj(numerical[numeric_mask])
 
         global_mask = token_type_ids == TokenType.GLOBAL_FIELD
-        if global_mask.any():
-            x[global_mask] = self._embed_global_field(
-                categorical[global_mask], numerical[global_mask]
-            )
-
         side_mask = (token_type_ids == TokenType.ALLY_SIDE) | (
             token_type_ids == TokenType.OPPONENT_SIDE
         )
-        if side_mask.any():
-            x[side_mask] = self._embed_side_field(categorical[side_mask], numerical[side_mask])
+        field_mask = global_mask | side_mask
+        if field_mask.any():
+            # one batched layer norm and linear pass for all 3 field tokens
+            field_num = self.field_numeric_proj(numerical[field_mask])
+
+            # categorical embeddings still differ by token type — fill per type
+            field_cat_emb = torch.zeros_like(field_num)
+            global_in_field = global_mask[field_mask]
+            if global_in_field.any():
+                field_cat_emb[global_in_field] = self._embed_global_field_cond(
+                    categorical[global_mask]
+                )
+            side_in_field = side_mask[field_mask]
+            if side_in_field.any():
+                field_cat_emb[side_in_field] = self._embed_side_field_cond(categorical[side_mask])
+            x[field_mask] = field_cat_emb + field_num
 
         return (
             x

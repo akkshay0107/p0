@@ -163,27 +163,21 @@ class ActorPolicy(nn.Module):
         pass_mask = (action1 == 0) & (~is_tp)
         mask2[pass_mask, 0] = False
 
-        # Ensure all 4 selected Pokemon are unique (no overlap between Lead and Back)
-        if is_tp.any():
-            tp_indices = torch.where(is_tp)[0]
-            tp_actions = action1[tp_indices]
-
-            p1_1 = tp_actions // 6 + 1
-            p2_1 = tp_actions % 6 + 1
-
-            all_a = torch.arange(36, device=device)
-            p1_2 = all_a // 6 + 1
-            p2_2 = all_a % 6 + 1
-
-            # Mask any second pick that re-uses a pokemon from the first pick
-            overlap = (
-                (p1_2.unsqueeze(0) == p1_1.unsqueeze(1))
-                | (p1_2.unsqueeze(0) == p2_1.unsqueeze(1))
-                | (p2_2.unsqueeze(0) == p1_1.unsqueeze(1))
-                | (p2_2.unsqueeze(0) == p2_1.unsqueeze(1))
-            )
-
-            mask2[tp_indices.unsqueeze(1), all_a] &= ~overlap
+        # Ensure all 4 selected Pokemon are unique (no overlap between Lead and Back).
+        # compute overlap for all B rows simultaneously, gate with is_tp.
+        # eliminates the is_tp.any() GPU->CPU sync
+        all_a = torch.arange(36, device=device)
+        p1_1 = action1 // 6 + 1  # (B,) — meaningful only for tp rows
+        p2_1 = action1 % 6 + 1  # (B,)
+        p1_2 = all_a // 6 + 1  # (36,)
+        p2_2 = all_a % 6 + 1  # (36,)
+        tp_overlap = (
+            (p1_2[None] == p1_1[:, None])
+            | (p1_2[None] == p2_1[:, None])
+            | (p2_2[None] == p1_1[:, None])
+            | (p2_2[None] == p2_1[:, None])
+        )  # (B, 36)
+        mask2[:, :36] = mask2[:, :36] & ~(is_tp[:, None] & tp_overlap)
 
         # If no valid action remains, force pass action to be valid for Pokemon 2
         no_valid = mask2.sum(-1) == 0
@@ -277,14 +271,6 @@ class PolicyNet(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
 
-    def _get_is_tp(self, obs: Any) -> torch.Tensor:
-        obs_dict = as_obs_dict(obs)
-        numerical = obs_dict["numerical"]
-        if numerical.dim() == 2:
-            numerical = numerical.unsqueeze(0)
-        # Global Field is index 25, feature 6 is team_preview flag
-        return (numerical[:, 25, 6] > 0.5).to(self.device)
-
     def forward(
         self,
         obs: Any,
@@ -296,8 +282,14 @@ class PolicyNet(nn.Module):
         """
         Main forward pass. Matches original PolicyNet signature for compatibility.
         """
-        tokens = self.encoder(obs)
-        is_tp = self._get_is_tp(obs)
+        obs_dict = as_obs_dict(obs)
+        tokens = self.encoder(obs_dict)
+
+        # avoid duplicate is_tp calculation
+        numerical = obs_dict["numerical"]
+        if numerical.dim() == 2:
+            numerical = numerical.unsqueeze(0)
+        is_tp = (numerical[:, 25, 6] > 0.5).to(self.device)
 
         if action_mask is not None:
             action_mask = action_mask.to(self.device)

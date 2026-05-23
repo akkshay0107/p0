@@ -70,6 +70,10 @@ SIDE_CONDITION_IDS = {
     "safeguard": 5,
 }
 
+# TODO: probably the biggest bottleneck in throughput trajectory
+# try to profile a battle -> action forward pass and then
+# optimize this implementation entirely
+
 
 def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) -> float:
     if start_turn < 0:
@@ -77,6 +81,9 @@ def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) ->
     return max(0.0, duration - (battle.turn - start_turn)) / float(duration)
 
 
+# TODO: definitely buggy
+# have to fix it so that it respects switching out resetting to no move and
+# doesnt unnecessarily scan the entire history
 def _get_last_move(battle: DoubleBattle, pokemon: Pokemon) -> str | None:
     observations = [getattr(battle, "current_observation", None)]
     observations.extend(battle.observations.get(turn) for turn in range(battle.turn, 0, -1))
