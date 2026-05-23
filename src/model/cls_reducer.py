@@ -3,7 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from structured_observation import SEQUENCE_LENGTH
+
+from src.model.structured_observation import SEQUENCE_LENGTH
 
 
 class CLSReducer(nn.Module):

@@ -9,7 +9,7 @@ from poke_env.battle.effect import Effect
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.status import Status
 
-from structured_observation import MAX_VOLATILES
+from src.model.structured_observation import MAX_VOLATILES
 
 CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
 

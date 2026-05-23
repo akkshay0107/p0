@@ -5,12 +5,12 @@ from typing import Any, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from cls_reducer import CLSReducer
-from fused_token_encoder import FusedTokenEncoder, as_obs_dict
-from structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
 from torch.distributions import Categorical
 
-from lookups import ACT_SIZE
+from src.lookups import ACT_SIZE
+from src.model.cls_reducer import CLSReducer
+from src.model.fused_token_encoder import FusedTokenEncoder, as_obs_dict
+from src.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
 
 # Type alias for the recurrent state
 State = Tuple[torch.Tensor, torch.Tensor]

@@ -4,8 +4,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
-from policy import PolicyNet
-from ppo_utils import initial_state
+from src.model.policy import PolicyNet
+from src.train.ppo_utils import initial_state
 
 BATCH_SIZE = 8  # number of episodes per gradient update
 

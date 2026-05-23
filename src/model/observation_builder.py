@@ -9,12 +9,8 @@ from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.weather import Weather
 
-try:
-    from lookups import ACT_SIZE
-except ImportError:  # pragma: no cover - keeps the builder usable during refactors
-    ACT_SIZE = 47
-
-from structured_observation import (
+from src.lookups import ACT_SIZE
+from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
     MAX_VOLATILES,
     MOVE_SLOTS,
@@ -25,7 +21,7 @@ from structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from tokenizer import PokemonTokenizer, tokenizer
+from src.model.tokenizer import PokemonTokenizer, tokenizer
 
 SLOT_STATUS_IDX = {-1: 0, 0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
 

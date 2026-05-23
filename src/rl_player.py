@@ -14,16 +14,11 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 from torch.distributions import Categorical
 
-# Add model and train directories to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent / "model"))
-sys.path.insert(0, str(Path(__file__).resolve().parent / "train"))
-
-import observation_builder
-from policy import PolicyNet
-from ppo_utils import load_checkpoint
-
-from env import MegaEnv
-from team_picker import RandomTeamFromPool
+from src.env import MegaEnv
+from src.model import observation_builder
+from src.model.policy import PolicyNet
+from src.team_picker import RandomTeamFromPool
+from src.train.ppo_utils import load_checkpoint
 
 
 class RLPlayer(Player):

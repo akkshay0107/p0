@@ -23,9 +23,9 @@ from poke_env.ps_client import (
 )
 from poke_env.teambuilder import Teambuilder
 
-import observation_builder
-from lookups import ACT_SIZE
-from team_picker import RandomTeamFromPool
+from src.lookups import ACT_SIZE
+from src.model import observation_builder
+from src.team_picker import RandomTeamFromPool
 
 
 class VGCEnvPlayer(_EnvPlayer):

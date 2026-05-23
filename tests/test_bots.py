@@ -1,15 +1,12 @@
 import argparse
 import asyncio
-import sys
 from pathlib import Path
 
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 
-sys.path.insert(1, str(Path(__file__).resolve().parent.parent / "src"))
-
-from heuristic import FuzzyHeuristic
-from teams import RandomTeamFromPool
+from src.heuristic.heuristic import FuzzyHeuristic
+from src.team_picker import RandomTeamFromPool
 
 
 async def main(n_battles: int):

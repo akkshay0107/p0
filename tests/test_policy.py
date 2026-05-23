@@ -1,20 +1,16 @@
 import argparse
 import asyncio
-import sys
 from pathlib import Path
 
 import torch
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 
-# Add src to path
-sys.path.insert(1, str(Path(__file__).resolve().parent.parent / "src"))
-
-from heuristic import FuzzyHeuristic
-from policy import PolicyNet
-from ppo_utils import load_checkpoint
-from rl_player import RLPlayer
-from teams import RandomTeamFromPool
+from src.heuristic.heuristic import FuzzyHeuristic
+from src.model.policy import PolicyNet
+from src.rl_player import RLPlayer
+from src.team_picker import RandomTeamFromPool
+from src.train.ppo_utils import load_checkpoint
 
 
 async def main(n_battles: int, checkpoint_path: str):

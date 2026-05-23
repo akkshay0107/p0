@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-from structured_observation import CATEGORICAL_WIDTH, NUMERICAL_WIDTH, SEQUENCE_LENGTH, TokenType
+from src.model.structured_observation import (
+    CATEGORICAL_WIDTH,
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
+    TokenType,
+)
 
 
 def _load_vocab_sizes() -> dict[str, int]:

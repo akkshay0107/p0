@@ -19,10 +19,10 @@ from poke_env.player import (
     SingleBattleOrder,
 )
 
-import observation_builder
-from env import Gen9VGCEnv
-from heuristic import FuzzyHeuristic
-from teams import RandomTeamFromPool
+from src.env import MegaEnv
+from src.heuristic.heuristic import FuzzyHeuristic
+from src.model import observation_builder
+from src.team_picker import RandomTeamFromPool
 
 
 def _modify_mask(action_mask: torch.Tensor, action1):
@@ -89,7 +89,7 @@ class ReplayRecordingPlayer(Player, ABC):
         self.current_episode.append(
             {"obs": obs, "mask": action_mask, "action": torch.from_numpy(action_np)}
         )
-        return Gen9VGCEnv.action_to_order(action_np, battle)
+        return MegaEnv.action_to_order(action_np, battle)
 
     async def _handle_battle_request(
         self, battle: AbstractBattle, maybe_default_order: bool = False
@@ -101,7 +101,7 @@ class ReplayRecordingPlayer(Player, ABC):
             self.current_episode.append(
                 {"obs": obs, "mask": action_mask, "action": torch.from_numpy(action_np)}
             )
-            order = Gen9VGCEnv.action_to_order(action_np, battle)
+            order = MegaEnv.action_to_order(action_np, battle)
             await self.ps_client.send_message(order.message, battle.battle_tag)
         else:
             await super()._handle_battle_request(battle, maybe_default_order)
@@ -131,7 +131,7 @@ class StrategyRecordingPlayer(ReplayRecordingPlayer):
             if isinstance(order, Awaitable):
                 order = await order
 
-        action = Gen9VGCEnv.order_to_action(order, battle, fake=True, strict=False)
+        action = MegaEnv.order_to_action(order, battle, fake=True, strict=False)
 
         if not battle.teampreview:
             if action[0] < 0:

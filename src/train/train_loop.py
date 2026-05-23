@@ -15,11 +15,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
-import observation_builder
-from env import SimEnv
-from lookups import ACT_SIZE, OBS_DIM
-from policy import PolicyNet
-from ppo_utils import (
+from src.env import SimEnv
+from src.lookups import ACT_SIZE, OBS_DIM
+from src.model import observation_builder
+from src.model.policy import PolicyNet
+from src.train.ppo_utils import (
     OpponentPool,
     RolloutBuffer,
     initial_state,

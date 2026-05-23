@@ -18,8 +18,8 @@ from poke_env.player import (
     Player,
 )
 
-import observation_builder
-from env import Gen9VGCEnv
+from src.env import MegaEnv
+from src.model import observation_builder
 
 
 class FuzzyHeuristic(Player):
@@ -1134,12 +1134,12 @@ class FuzzyHeuristic(Player):
 
         if not scores:
             o0 = (
-                Gen9VGCEnv._action_to_order_individual(actions0[0], battle, fake=False, pos=0)
+                MegaEnv._action_to_order_individual(actions0[0], battle, fake=False, pos=0)
                 if actions0
                 else PassBattleOrder()
             )
             o1 = (
-                Gen9VGCEnv._action_to_order_individual(actions1[0], battle, fake=False, pos=1)
+                MegaEnv._action_to_order_individual(actions1[0], battle, fake=False, pos=1)
                 if actions1
                 else PassBattleOrder()
             )
@@ -1159,8 +1159,8 @@ class FuzzyHeuristic(Player):
             idx = torch.distributions.Categorical(logits=logits).sample().item()
 
         chosen_pair = pairs[top_indices[idx].item()]  # type: ignore
-        o0 = Gen9VGCEnv._action_to_order_individual(chosen_pair[0], battle, fake=False, pos=0)
-        o1 = Gen9VGCEnv._action_to_order_individual(chosen_pair[1], battle, fake=False, pos=1)
+        o0 = MegaEnv._action_to_order_individual(chosen_pair[0], battle, fake=False, pos=0)
+        o1 = MegaEnv._action_to_order_individual(chosen_pair[1], battle, fake=False, pos=1)
         return DoubleBattleOrder(o0, o1)
 
     @staticmethod
@@ -1366,8 +1366,7 @@ if __name__ == "__main__":
 
     from poke_env import AccountConfiguration, LocalhostServerConfiguration
 
-    sys.path.append(str(Path(__file__).parent))
-    from teams import RandomTeamFromPool
+    from src.team_picker import RandomTeamFromPool
 
     async def main():
         root_dir = Path(__file__).resolve().parent.parent

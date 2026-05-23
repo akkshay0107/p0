@@ -1,13 +1,7 @@
-import sys
-from pathlib import Path
-
 import torch
 
-# Add src to path
-sys.path.insert(1, str(Path(__file__).resolve().parent.parent / "src"))
-
-from lookups import ACT_SIZE, OBS_DIM
-from policy import PolicyNet
+from src.lookups import ACT_SIZE, OBS_DIM
+from src.model.policy import PolicyNet
 
 
 def test_full_gradient_flow():

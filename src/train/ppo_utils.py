@@ -7,8 +7,8 @@ from typing import Self
 
 import torch
 
-from lookups import ACT_SIZE, OBS_DIM
-from policy import PolicyNet
+from src.lookups import ACT_SIZE, OBS_DIM
+from src.model.policy import PolicyNet
 
 
 def unwrap_policy(policy: PolicyNet) -> PolicyNet:
