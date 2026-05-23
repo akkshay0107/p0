@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from src.lookups import ACT_SIZE
@@ -5,18 +6,18 @@ from src.model.policy import PolicyNet
 from src.model.structured_observation import CATEGORICAL_WIDTH, NUMERICAL_WIDTH, SEQUENCE_LENGTH
 
 
-def test_policy_net_forward_pass():
-    print("create PolicyNet")
-    # smaller dim than actual
-    net = PolicyNet(
+@pytest.fixture
+def policy_net():
+    return PolicyNet(
         obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH),
         act_size=ACT_SIZE,
         d_model=128,
         nhead=4,
         nlayer=2,
     )
-    print("created PolicyNet successfully")
 
+
+def test_policy_net_forward_pass(policy_net):
     B = 16
     # dummy observation
     obs = {
@@ -27,18 +28,31 @@ def test_policy_net_forward_pass():
         "slot_ids": torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
     }
 
-    print("forward pass start")
     with torch.no_grad():
-        logits, log_probs, sampled_actions, value, next_state = net(obs)
+        logits, log_probs, sampled_actions, value, next_state = policy_net(obs)
 
-    # Assert output shapes are correct
-    assert logits.shape == (B, 2, ACT_SIZE), (
-        f"Expected logits shape ({B}, 2, {ACT_SIZE}), got {logits.shape}"
-    )
-    assert log_probs.shape == (B,), f"Expected log_probs shape ({B},), got {log_probs.shape}"
-    assert sampled_actions.shape == (B, 2), (
-        f"Expected sampled_actions shape ({B}, 2), got {sampled_actions.shape}"
-    )
-    assert value.shape == (B,), f"Expected value shape ({B},), got {value.shape}"
+    # output shapes
+    assert logits.shape == (B, 2, ACT_SIZE)
+    assert log_probs.shape == (B,)
+    assert sampled_actions.shape == (B, 2)
+    assert value.shape == (B,)
 
-    print("forward pass complete")
+    # recurrent state check
+    cls, hg = next_state
+    # cls is enc[:, 0] which is (B, d_model)
+    assert cls.shape == (B, 128)
+    assert hg.shape == (B, 4, 128)  # n_hg is 4
+
+
+def test_policy_net_forward_tokens(policy_net):
+    B = 16
+    tokens = torch.randn((B, SEQUENCE_LENGTH, 128))
+    is_tp = torch.zeros(B, dtype=torch.bool)
+
+    with torch.no_grad():
+        logits, log_probs, sampled_actions, value, next_state = policy_net.forward_tokens(
+            tokens, is_tp
+        )
+
+    assert logits.shape == (B, 2, ACT_SIZE)
+    assert value.shape == (B,)

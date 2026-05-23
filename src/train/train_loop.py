@@ -18,6 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 from src.env import SimEnv
 from src.lookups import ACT_SIZE, OBS_DIM
 from src.model import observation_builder
+from src.model.fused_token_encoder import as_obs_dict
 from src.model.policy import PolicyNet
 from src.train.ppo_utils import (
     OpponentPool,
@@ -289,8 +290,6 @@ def _run_batched_ppo(
 ) -> tuple[torch.Tensor, dict[str, float], int]:
     """
     Run PPO BPTT over a minibatch of variable-length episodes.
-    Expects episodes to already be sorted by length so the active recurrent
-    batch is always a contiguous prefix that shrinks as shorter games finish.
     """
     if not episodes:
         return (
@@ -309,13 +308,21 @@ def _run_batched_ppo(
     lengths = torch.tensor([ep["length"] for ep in episodes], device=device)
     max_steps = int(lengths[0].item())
 
-    obs = [ep["obs"] for ep in episodes]
-    actions = [ep["actions"] for ep in episodes]
-    old_log_probs = [ep["log_probs"] for ep in episodes]
-    advantages = [ep["advantages"] for ep in episodes]
-    returns = [ep["returns"] for ep in episodes]
-    action_masks = [ep["action_masks"] for ep in episodes]
-    is_tp = [ep["is_team_preview"] for ep in episodes]
+    # pre-encode all observations in the batch in one large pass
+    all_obs = torch.cat([ep["obs"] for ep in episodes], dim=0).to(device)
+    all_tokens = policy.encoder(as_obs_dict(all_obs))
+    tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
+
+    # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
+    def pack(fields):
+        return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
+
+    actions_p = pack([ep["actions"] for ep in episodes])
+    old_log_probs_p = pack([ep["log_probs"] for ep in episodes])
+    advantages_p = pack([ep["advantages"] for ep in episodes])
+    returns_p = pack([ep["returns"] for ep in episodes])
+    action_masks_p = pack([ep["action_masks"] for ep in episodes])
+    is_tp_p = pack([ep["is_team_preview"] for ep in episodes])
 
     state = initial_state(policy, batch_size, device)
     total_loss = torch.tensor(0.0, device=device)
@@ -346,24 +353,19 @@ def _run_batched_ppo(
         if active_n == 0:
             break
 
-        obs_t = torch.cat([ep_obs[t : t + 1] for ep_obs in obs[:active_n]], dim=0)
-        actions_t = torch.cat([ep_actions[t : t + 1] for ep_actions in actions[:active_n]], dim=0)
-        old_log_probs_t = torch.cat(
-            [ep_log_probs[t : t + 1] for ep_log_probs in old_log_probs[:active_n]], dim=0
-        )
-        advantages_t = torch.cat(
-            [ep_advantages[t : t + 1] for ep_advantages in advantages[:active_n]], dim=0
-        )
-        returns_t = torch.cat([ep_returns[t : t + 1] for ep_returns in returns[:active_n]], dim=0)
-        action_masks_t = torch.cat(
-            [ep_action_masks[t : t + 1] for ep_action_masks in action_masks[:active_n]], dim=0
-        )
-        is_tp_t = torch.cat([ep_is_tp[t : t + 1] for ep_is_tp in is_tp[:active_n]], dim=0)
+        tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
+        actions_t = actions_p[:active_n, t]
+        old_log_probs_t = old_log_probs_p[:active_n, t]
+        advantages_t = advantages_p[:active_n, t]
+        returns_t = returns_p[:active_n, t]
+        action_masks_t = action_masks_p[:active_n, t]
+        is_tp_t = is_tp_p[:active_n, t]
 
         curr_state = (state[0][:active_n], state[1][:active_n])
         curr_log_prob, curr_entropy, curr_normalized_entropy, curr_val, next_state = (
-            policy.evaluate_actions(
-                obs_t,
+            policy.evaluate_actions_tokens(
+                tokens_t,
+                is_tp_t,
                 actions_t,
                 action_masks_t,
                 state=curr_state,

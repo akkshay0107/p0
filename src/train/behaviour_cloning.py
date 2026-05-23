@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
+from src.model.fused_token_encoder import as_obs_dict
 from src.model.policy import PolicyNet
 from src.train.ppo_utils import initial_state
 
@@ -41,35 +42,48 @@ def _run_episode(
 ) -> tuple[torch.Tensor, int, int]:
     """
     Run one episode with BPTT. Carries recurrent state step-to-step.
-    Returns:
-        loss:    total cross-entropy loss over the episode steps (scalar tensor, grad attached)
-        correct: number of correctly predicted actions
-        total:   total number of actions evaluated
+    Uses pre-encoding for optimization.
     """
+    if not episode:
+        return torch.tensor(0.0, device=device), 0, 0
+
     if state is None:
         state = initial_state(policy, 1, device)
+
+    # Pre-encode all observations in the episode
+    all_obs = torch.cat([sample["obs"].unsqueeze(0) for sample in episode], dim=0).to(device)
+    all_tokens = policy.encoder(as_obs_dict(all_obs))
+
+    # Pre-extract other fields
+    all_masks = torch.cat([sample["mask"].unsqueeze(0) for sample in episode], dim=0).to(device)
+    all_targets = torch.cat([sample["action"].unsqueeze(0) for sample in episode], dim=0).to(device)
+    all_is_tp = (all_obs.numerical[:, 25, 6] > 0.5).to(device)
 
     loss = torch.tensor(0.0, device=device)
     correct = 0
     total = 0
 
-    for sample in episode:
-        # Unsqueeze to add batch dimension (B=1) as expected by PolicyNet
-        obs = sample["obs"].to(device, non_blocking=True).unsqueeze(0)
-        mask = sample["mask"].to(device, non_blocking=True).unsqueeze(0)
-        target = sample["action"].to(device, non_blocking=True).unsqueeze(0)
+    for t in range(len(episode)):
+        tokens_t = all_tokens[t : t + 1]
+        mask_t = all_masks[t : t + 1]
+        target_t = all_targets[t : t + 1]
+        is_tp_t = all_is_tp[t : t + 1]
 
-        log_prob, _, _, _, next_state = policy.evaluate_actions(obs, target, mask, state)
+        log_prob, _, _, _, next_state = policy.evaluate_actions_tokens(
+            tokens_t, is_tp_t, target_t, mask_t, state
+        )
         loss -= log_prob.mean()
 
         with torch.no_grad():
-            logits = policy.get_policy_masked_logits(obs, target, mask, state)
+            logits, _, _, _, _ = policy.forward_tokens(
+                tokens_t, is_tp_t, state, mask_t, sample_actions=False, actions=target_t
+            )
             preds = torch.stack(
                 [logits[:, 0].argmax(dim=-1), logits[:, 1].argmax(dim=-1)],
                 dim=-1,
             )
-            correct += (preds == target).sum().item()
-            total += target.numel()
+            correct += (preds == target_t).sum().item()
+            total += target_t.numel()
 
         state = next_state
 

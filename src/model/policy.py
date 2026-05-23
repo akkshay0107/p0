@@ -301,6 +301,22 @@ class PolicyNet(nn.Module):
             if actions.dim() == 1:
                 actions = actions.unsqueeze(0)
 
+        return self.forward_tokens(
+            tokens, is_tp, state, action_mask, sample_actions, actions
+        )
+
+    def forward_tokens(
+        self,
+        tokens: torch.Tensor,
+        is_tp: torch.Tensor,
+        state: Optional[State] = None,
+        action_mask: Optional[torch.Tensor] = None,
+        sample_actions: bool = True,
+        actions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, State]:
+        """
+        Forward pass using already encoded tokens.
+        """
         logits, log_probs, sampled_actions, next_state = self.actor(
             tokens, state, action_mask, actions, sample_actions, is_tp
         )
@@ -319,8 +335,25 @@ class PolicyNet(nn.Module):
         Evaluate actions for PPO updates.
         Returns (log_prob, entropy, normalized_entropy, value, next_state).
         """
-        logits, log_prob, _, value, next_state = self(
-            obs, state, action_mask, sample_actions=False, actions=actions
+        obs_dict = as_obs_dict(obs)
+        tokens = self.encoder(obs_dict)
+        is_tp = (obs_dict["numerical"][:, 25, 6] > 0.5).to(self.device)
+
+        return self.evaluate_actions_tokens(tokens, is_tp, actions, action_mask, state)
+
+    def evaluate_actions_tokens(
+        self,
+        tokens: torch.Tensor,
+        is_tp: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        state: Optional[State] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, State]:
+        """
+        Evaluate actions using already encoded tokens.
+        """
+        logits, log_prob, _, value, next_state = self.forward_tokens(
+            tokens, is_tp, state, action_mask, sample_actions=False, actions=actions
         )
 
         dist1 = Categorical(logits=logits[:, 0])
@@ -328,16 +361,19 @@ class PolicyNet(nn.Module):
         entropy = dist1.entropy() + dist2.entropy()
 
         # normalized entropy (relative to valid action support)
-        # mainly for logging, not used right now for the entropy loss
         if action_mask is not None:
             v1 = (logits[:, 0] > float("-inf")).sum(-1).float().clamp_min(1.0)
             v2 = (logits[:, 1] > float("-inf")).sum(-1).float().clamp_min(1.0)
             max_entropy = torch.log(v1) + torch.log(v2)
         else:
-            max_entropy = torch.log(torch.tensor(self.act_size, device=self.device).float()) * 2
+            max_entropy = (
+                torch.log(torch.tensor(self.act_size, device=self.device).float()) * 2
+            )
 
         norm_entropy = torch.where(
-            max_entropy > 0, entropy / max_entropy.clamp_min(1e-8), torch.zeros_like(entropy)
+            max_entropy > 0,
+            entropy / max_entropy.clamp_min(1e-8),
+            torch.zeros_like(entropy),
         )
 
         return log_prob, entropy, norm_entropy, value, next_state
