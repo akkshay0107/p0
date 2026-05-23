@@ -119,7 +119,6 @@ def _pokemon_categorical(
     volatile_ids = tok.volatile_ids(getattr(pokemon, "effects", None))
 
     return [
-        tok.roster_id(pokemon),
         tok.species_id(pokemon),
         tok.ability_id(pokemon),
         tok.item_id(pokemon),

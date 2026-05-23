@@ -9,7 +9,7 @@ TEAM_SIZE = 6
 MOVE_SLOTS = 4
 MAX_VOLATILES = 6
 SEQUENCE_LENGTH = 1 + TEAM_SIZE * 2 * 2 + 3
-CATEGORICAL_WIDTH = 21
+CATEGORICAL_WIDTH = 20
 NUMERICAL_WIDTH = 36
 
 
@@ -28,7 +28,7 @@ class SideId(IntEnum):
     OPPONENT = 2
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class StructuredObservation:
     """Fixed battle token structure consumed by the learned encoder."""
 

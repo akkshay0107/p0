@@ -44,7 +44,6 @@ class PokemonTokenizer:
         self.volatiles = vocab.get("volatiles", {})
         self.status = vocab.get("status", {})
         self.types = vocab.get("types", {})
-        self.roster = vocab.get("roster", {})
 
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> PokemonTokenizer:
@@ -77,16 +76,6 @@ class PokemonTokenizer:
                 ids.append(idx)
         ids = sorted(set(ids))[:MAX_VOLATILES]
         return ids + [0] * (MAX_VOLATILES - len(ids))
-
-    def roster_id(self, pokemon: Pokemon | None) -> int:
-        if pokemon is None:
-            return 0
-        species = self.normalize_id(getattr(pokemon, "base_species", None) or pokemon.species)
-        item = self.normalize_id(getattr(pokemon, "item", None))
-        ability = self.normalize_id(getattr(pokemon, "ability", None))
-        moves = sorted(self.normalize_id(move_id) for move_id in pokemon.moves.keys())
-        signature = f"{species}:{item}:{ability}:{','.join(moves)}"
-        return self.roster.get(signature, 0)
 
     def species_id(self, pokemon: Pokemon | None) -> int:
         if pokemon is None:

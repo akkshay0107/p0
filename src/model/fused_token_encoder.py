@@ -14,6 +14,14 @@ from src.model.structured_observation import (
     SEQUENCE_LENGTH,
     TokenType,
 )
+from src.model.swiglu_encoder import SwiGLUTransformerEncoder
+
+NUM_GLOBAL_CONDITIONS = 10
+NUM_SIDE_CONDITIONS = 6
+NUM_COMPONENTS = 7
+NUM_TOKEN_TYPES = 6
+NUM_SIDES = 3
+NUM_SLOTS = 7
 
 
 def _load_vocab_sizes() -> dict[str, int]:
@@ -41,30 +49,40 @@ class FusedTokenEncoder(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
+        d_raw = 64  # lower dim for reduced memory
 
         sizes = _load_vocab_sizes()
-        self.roster_emb = nn.Embedding(sizes.get("roster", 1), d_model)
-        self.species_emb = nn.Embedding(sizes.get("species", 1), d_model)
-        self.ability_emb = nn.Embedding(sizes.get("abilities", 1), d_model)
-        self.item_emb = nn.Embedding(sizes.get("items", 1), d_model)
-        self.move_emb = nn.Embedding(sizes.get("moves", 1), d_model)
-        self.type_emb = nn.Embedding(sizes.get("types", 1), d_model)
-        self.status_emb = nn.Embedding(sizes.get("status", 1), d_model)
-        self.volatile_emb = nn.Embedding(sizes.get("volatiles", 1), d_model)
+        self.species_emb = nn.Embedding(sizes.get("species", 1), d_raw)
+        self.ability_emb = nn.Embedding(sizes.get("abilities", 1), d_raw)
+        self.item_emb = nn.Embedding(sizes.get("items", 1), d_raw)
+        self.move_emb = nn.Embedding(sizes.get("moves", 1), d_raw)
+        self.type_emb = nn.Embedding(sizes.get("types", 1), d_raw)
+        self.status_emb = nn.Embedding(sizes.get("status", 1), d_raw)
+        self.volatile_emb = nn.Embedding(sizes.get("volatiles", 1), d_raw)
 
-        self.global_condition_emb = nn.Embedding(10, d_model)
-        self.side_condition_emb = nn.Embedding(6, d_model)
-        self.component_emb = nn.Embedding(8, d_model)
-        self.token_type_emb = nn.Embedding(6, d_model)
-        self.side_emb = nn.Embedding(3, d_model)
-        self.slot_emb = nn.Embedding(7, d_model)
+        self.global_condition_emb = nn.Embedding(NUM_GLOBAL_CONDITIONS, d_raw)
+        self.side_condition_emb = nn.Embedding(NUM_SIDE_CONDITIONS, d_raw)
 
+        self.species_proj = nn.Linear(d_raw, d_model)
+        self.ability_proj = nn.Linear(d_raw, d_model)
+        self.item_proj = nn.Linear(d_raw, d_model)
+        self.status_proj = nn.Linear(d_raw, d_model)
+        self.volatile_proj = nn.Linear(d_raw, d_model)
+        self.global_condition_proj = nn.Linear(d_raw, d_model)
+        self.side_condition_proj = nn.Linear(d_raw, d_model)
+        self.component_emb = nn.Embedding(NUM_COMPONENTS, d_model)
+        self.token_type_emb = nn.Embedding(NUM_TOKEN_TYPES, d_model)
+        self.side_emb = nn.Embedding(NUM_SIDES, d_model)
+        self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
+
+        # each move gets a move embedding and a type embedding
+        # considering explicitly adding a phys / spe / sta marker
         self.move_proj = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
+            nn.Linear(2 * d_raw, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
-        self.type_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU())
+        self.type_proj = nn.Sequential(nn.Linear(d_raw, d_model), nn.GELU())
         self.moveset_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU())
         self.numeric_proj = nn.Sequential(
             nn.LayerNorm(NUMERICAL_WIDTH),
@@ -79,17 +97,11 @@ class FusedTokenEncoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        fusion_layer = nn.TransformerEncoderLayer(
+        self.mon_fusion = SwiGLUTransformerEncoder(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            dropout=0.0,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
-        )
-        self.mon_fusion = nn.TransformerEncoder(
-            fusion_layer, num_layers=1, enable_nested_tensor=False
+            num_layers=1,
         )
         self.mon_fusion_token = nn.Parameter(torch.empty(1, 1, d_model))
         self._init_weights()
@@ -106,45 +118,77 @@ class FusedTokenEncoder(nn.Module):
         init.normal_(self.mon_fusion_token, std=emb_gain)
 
     def _embed_pokemon_super(self, categorical: torch.Tensor) -> torch.Tensor:
-        roster = self.roster_emb(categorical[..., 0])
-        species = self.species_emb(categorical[..., 1])
-        ability = self.ability_emb(categorical[..., 2])
-        item = self.item_emb(categorical[..., 3])
+        # see _pokemon_categorical in observation_builder
+        # for the order of the categorical features
+        species = self.species_proj(self.species_emb(categorical[..., 0]))
+        ability = self.ability_proj(self.ability_emb(categorical[..., 1]))
+        item = self.item_proj(self.item_emb(categorical[..., 2]))
 
-        type_summary = self.type_proj(self.type_emb(categorical[..., 4:6]).sum(dim=-2))
+        # proj before sum with the hope that sum in the higher dim space
+        # is able to represent the true combination of types
+        # used for all permutation invariant combinations below.
+        type_summary = self.type_proj(self.type_emb(categorical[..., 3:5])).sum(dim=-2)
 
         move_parts = torch.cat(
             [
-                self.move_emb(categorical[..., 6:10]),
-                self.type_emb(categorical[..., 10:14]),
+                self.move_emb(categorical[..., 5:9]),
+                self.type_emb(categorical[..., 9:13]),
             ],
             dim=-1,
         )
-        moveset = self.moveset_proj(self.move_proj(move_parts).mean(dim=-2))
+        moveset = self.moveset_proj(self.move_proj(move_parts)).mean(dim=-2)
 
-        status = self.status_emb(categorical[..., 14])
-        volatile = self.volatile_emb(categorical[..., 15:21]).mean(dim=-2)
+        status = self.status_proj(self.status_emb(categorical[..., 13]))
 
+        v_cat = categorical[..., 14:20]
+        v_mask = v_cat != 0
+        v_emb = self.volatile_proj(self.volatile_emb(v_cat))
+        v_sum = (v_emb * v_mask.unsqueeze(-1).float()).sum(dim=-2)
+        v_count = v_mask.sum(dim=-1, keepdim=True).float()
+        no_v = self.volatile_proj(self.volatile_emb(torch.zeros_like(v_cat[..., 0])))
+        volatile = torch.where(v_count > 0, v_sum / v_count.clamp_min(1.0), no_v)
+
+        # combine all components into (N, NUM_COMPONENTS, d_model)
         components = torch.stack(
-            [species, roster, ability, item, type_summary, moveset, status, volatile],
+            [species, ability, item, type_summary, moveset, status, volatile],
             dim=-2,
         )
-        components = components + self.component_emb(torch.arange(8, device=categorical.device))
+        components = components + self.component_emb(
+            torch.arange(NUM_COMPONENTS, device=categorical.device)
+        )
 
-        B, S, _, D = components.shape
-        fusion_token = self.mon_fusion_token.expand(B, S, -1, -1)
-        fused = self.mon_fusion(torch.cat([fusion_token, components], dim=-2).flatten(0, 1))
-        return fused[:, 0].view(B, S, D)
+        # input from boolean masking is always (N, C), so components is (N, NUM_COMPONENTS, d_model)
+        # prepend the fusion token (cls) and run through the mon_fusion transformer
+        N = components.shape[0]
+        fusion_token = self.mon_fusion_token.expand(N, 1, -1)
+        fused = self.mon_fusion(torch.cat([fusion_token, components], dim=1))
 
-    def _embed_fields(
+        # extract cls "super token"
+        return fused[:, 0]
+
+    def _embed_global_field(
         self, categorical: torch.Tensor, numerical: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        global_field = self.global_condition_emb(categorical[..., :6].clamp_max(9)).mean(dim=-2)
-        global_field = global_field + self.field_numeric_proj(numerical)
+    ) -> torch.Tensor:
+        g_cat = categorical[..., :6].clamp_max(NUM_GLOBAL_CONDITIONS - 1)
+        g_mask = g_cat != 0
+        g_emb = self.global_condition_proj(self.global_condition_emb(g_cat))
+        g_sum = (g_emb * g_mask.unsqueeze(-1).float()).sum(dim=-2)
+        g_count = g_mask.sum(dim=-1, keepdim=True).float()
+        no_g = self.global_condition_proj(
+            self.global_condition_emb(torch.zeros_like(g_cat[..., 0]))
+        )
+        global_field = torch.where(g_count > 0, g_sum / g_count.clamp_min(1.0), no_g)
+        return global_field + self.field_numeric_proj(numerical)
 
-        side_field = self.side_condition_emb(categorical[..., :6].clamp_max(5)).mean(dim=-2)
-        side_field = side_field + self.field_numeric_proj(numerical)
-        return global_field, side_field
+    def _embed_side_field(self, categorical: torch.Tensor, numerical: torch.Tensor) -> torch.Tensor:
+        s_cat = categorical[..., :6].clamp_max(NUM_SIDE_CONDITIONS - 1)
+        s_mask = s_cat != 0
+        s_emb = self.side_condition_proj(self.side_condition_emb(s_cat))
+        s_sum = (s_emb * s_mask.unsqueeze(-1).float()).sum(dim=-2)
+        s_count = s_mask.sum(dim=-1, keepdim=True).float()
+        no_s = self.side_condition_proj(self.side_condition_emb(torch.zeros_like(s_cat[..., 0])))
+        side_field = torch.where(s_count > 0, s_sum / s_count.clamp_min(1.0), no_s)
+        return side_field + self.field_numeric_proj(numerical)
 
     def forward(self, obs: Any) -> torch.Tensor:
         obs_dict = as_obs_dict(obs)
@@ -176,34 +220,28 @@ class FusedTokenEncoder(nn.Module):
         side_ids = side_ids.to(device)
         slot_ids = slot_ids.to(device)
 
-        pokemon_super = self._embed_pokemon_super(categorical)
-        pokemon_numeric = self.numeric_proj(numerical)
-        global_field, side_field = self._embed_fields(categorical, numerical)
+        x = torch.zeros(B, S, self.d_model, device=device, dtype=self.mon_fusion_token.dtype)
 
-        x = torch.zeros(B, S, self.d_model, device=device, dtype=pokemon_super.dtype)
-        x = torch.where(
-            (token_type_ids == TokenType.POKEMON_SUPER).unsqueeze(-1),
-            pokemon_super,
-            x,
+        # sparse execution: only compute embeddings for the slots that actually need them
+        super_mask = token_type_ids == TokenType.POKEMON_SUPER
+        if super_mask.any():
+            x[super_mask] = self._embed_pokemon_super(categorical[super_mask])
+
+        numeric_mask = token_type_ids == TokenType.POKEMON_NUMERIC
+        if numeric_mask.any():
+            x[numeric_mask] = self.numeric_proj(numerical[numeric_mask])
+
+        global_mask = token_type_ids == TokenType.GLOBAL_FIELD
+        if global_mask.any():
+            x[global_mask] = self._embed_global_field(
+                categorical[global_mask], numerical[global_mask]
+            )
+
+        side_mask = (token_type_ids == TokenType.ALLY_SIDE) | (
+            token_type_ids == TokenType.OPPONENT_SIDE
         )
-        x = torch.where(
-            (token_type_ids == TokenType.POKEMON_NUMERIC).unsqueeze(-1),
-            pokemon_numeric,
-            x,
-        )
-        x = torch.where(
-            (token_type_ids == TokenType.GLOBAL_FIELD).unsqueeze(-1),
-            global_field,
-            x,
-        )
-        x = torch.where(
-            (
-                (token_type_ids == TokenType.ALLY_SIDE)
-                | (token_type_ids == TokenType.OPPONENT_SIDE)
-            ).unsqueeze(-1),
-            side_field,
-            x,
-        )
+        if side_mask.any():
+            x[side_mask] = self._embed_side_field(categorical[side_mask], numerical[side_mask])
 
         return (
             x

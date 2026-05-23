@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from src.model.structured_observation import SEQUENCE_LENGTH
+from src.model.swiglu_encoder import SwiGLUEncoderLayer, SwiGLUTransformerEncoder
 
 
 class CLSReducer(nn.Module):
@@ -31,29 +32,19 @@ class CLSReducer(nn.Module):
         self.register_buffer("hg_init", torch.zeros(1, self.n_hg, d_model))
 
         if use_history:
-            self.history_transformer = nn.TransformerEncoderLayer(
+            self.history_transformer = SwiGLUEncoderLayer(
                 d_model=d_model,
                 nhead=nhead,
                 dim_feedforward=dim_feedforward,
-                dropout=0.0,
-                batch_first=True,
-                norm_first=True,
-                activation="gelu",
             )
         else:
             self.history_transformer = None
 
-        enc_layer = nn.TransformerEncoderLayer(
+        self.encoder = SwiGLUTransformerEncoder(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            dropout=0.0,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(
-            enc_layer, num_layers=nlayer, enable_nested_tensor=False
+            num_layers=nlayer,
         )
         self._init_weights()
 

@@ -70,7 +70,7 @@ def extract_species(raw: str) -> str:
 
 
 def main():
-    script_dir = Path(__file__).resolve().parent
+    script_dir = Path(__file__).resolve().parent.parent
     teams_dir = script_dir.parent / "teams"
     data_dir = script_dir.parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +79,6 @@ def main():
     items_set = set()
     abilities_set = set()
     moves_set = set()
-    roster_set = set()
 
     volatiles_set = {
         "encore",
@@ -132,13 +131,6 @@ def main():
                     moves_set.add(move)
                     current_moves.append(move)
 
-            # roster identity: stable signature of each pokemon set
-            # not particularly necessary. might remove later
-            if species_id:
-                move_str = ",".join(sorted(current_moves))
-                roster_id = f"{species_id}:{item_id}:{ability_id}:{move_str}"
-                roster_set.add(roster_id)
-
     vocab = {
         "species": {name: idx + 1 for idx, name in enumerate(sorted(species_set))},
         "items": {name: idx + 1 for idx, name in enumerate(sorted(items_set))},
@@ -171,7 +163,6 @@ def main():
                 ]
             )
         },
-        "roster": {name: idx + 1 for idx, name in enumerate(sorted(roster_set))},
     }
 
     out_path = data_dir / "vocab.json"
@@ -183,8 +174,7 @@ def main():
         f"Species: {len(vocab['species'])}, "
         f"Items: {len(vocab['items'])}, "
         f"Abilities: {len(vocab['abilities'])}, "
-        f"Moves: {len(vocab['moves'])}, "
-        f"Roster: {len(vocab['roster'])}"
+        f"Moves: {len(vocab['moves'])}"
     )
 
 
