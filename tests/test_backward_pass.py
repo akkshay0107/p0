@@ -52,14 +52,15 @@ def dummy_obs():
     categorical[:, 1:25, 13:17] = torch.randint(1, 4, (B, 24, 4))
     # status (17): 1-6
     categorical[:, 1:25, 17] = torch.randint(1, 7, (B, 24))
-    # volatiles (18-23): 1-6
-    categorical[:, 1:25, 18:24] = torch.randint(1, 7, (B, 24, 6))
+    # volatiles (18-23): 1-5
+    categorical[:, 1:25, 18:24] = torch.randint(1, 6, (B, 24, 6))
 
-    # global_condition_emb has size 10 (0-9)
-    categorical[:, 25, :6] = torch.randint(1, 10, (B, 6))
+    # weather_emb has size 5 (0-4), trickroom_emb has size 2 (0-1)
+    categorical[:, 25, 0] = torch.randint(1, 5, (B,))
+    categorical[:, 25, 1] = torch.randint(1, 2, (B,))
 
-    # side_condition_emb has size 6 (0-5)
-    categorical[:, 26:28, :6] = torch.randint(1, 6, (B, 2, 6))
+    # side_condition_emb has size 3 (0-2)
+    categorical[:, 26:28, :2] = torch.randint(1, 3, (B, 2, 2))
 
     # Numerical features
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
@@ -150,7 +151,8 @@ def test_gradient_flow(dummy_obs):
         "category_emb",
         "status_emb",
         "volatile_emb",
-        "global_condition_emb",
+        "weather_emb",
+        "trickroom_emb",
         "side_condition_emb",
         "token_type_emb",
         "side_emb",

@@ -16,8 +16,6 @@ from src.model.structured_observation import (
 )
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 
-NUM_GLOBAL_CONDITIONS = 10
-NUM_SIDE_CONDITIONS = 6
 NUM_COMPONENTS = 7
 NUM_TOKEN_TYPES = 6
 NUM_SIDES = 3
@@ -61,15 +59,17 @@ class FusedTokenEncoder(nn.Module):
         self.status_emb = nn.Embedding(sizes.get("status", 1), d_raw)
         self.volatile_emb = nn.Embedding(sizes.get("volatiles", 1), d_raw)
 
-        self.global_condition_emb = nn.Embedding(NUM_GLOBAL_CONDITIONS, d_raw)
-        self.side_condition_emb = nn.Embedding(NUM_SIDE_CONDITIONS, d_raw)
+        self.weather_emb = nn.Embedding(sizes.get("weathers", 1), d_raw)
+        self.trickroom_emb = nn.Embedding(sizes.get("trickroom", 1), d_raw)
+        self.side_condition_emb = nn.Embedding(sizes.get("side_conditions", 1), d_raw)
 
         self.species_proj = nn.Linear(d_raw, d_model)
         self.ability_proj = nn.Linear(d_raw, d_model)
         self.item_proj = nn.Linear(d_raw, d_model)
         self.status_proj = nn.Linear(d_raw, d_model)
         self.volatile_proj = nn.Linear(d_raw, d_model)
-        self.global_condition_proj = nn.Linear(d_raw, d_model)
+        self.weather_proj = nn.Linear(d_raw, d_model)
+        self.trickroom_proj = nn.Linear(d_raw, d_model)
         self.side_condition_proj = nn.Linear(d_raw, d_model)
         self.component_emb = nn.Embedding(NUM_COMPONENTS, d_model)
         self.token_type_emb = nn.Embedding(NUM_TOKEN_TYPES, d_model)
@@ -170,16 +170,13 @@ class FusedTokenEncoder(nn.Module):
 
     def _embed_global_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
         """Returns the categorical-side embedding only (numeric added in forward)."""
-        g_cat = categorical[..., :6].clamp_max(NUM_GLOBAL_CONDITIONS - 1)
-        g_mask = g_cat != 0
-        g_emb = self.global_condition_proj(self.global_condition_emb(g_cat))
-        g_sum = (g_emb * g_mask.unsqueeze(-1).float()).sum(dim=-2)
-        g_count = g_mask.sum(dim=-1, keepdim=True).float().clamp_min(1.0)
-        return g_sum / g_count  # zero-vector when no conditions present (#2)
+        weather_emb = self.weather_proj(self.weather_emb(categorical[..., 0]))
+        trickroom_emb = self.trickroom_proj(self.trickroom_emb(categorical[..., 1]))
+        return weather_emb + trickroom_emb
 
     def _embed_side_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
         """Returns the categorical-side embedding only (numeric added in forward)."""
-        s_cat = categorical[..., :6].clamp_max(NUM_SIDE_CONDITIONS - 1)
+        s_cat = categorical[..., :2]
         s_mask = s_cat != 0
         s_emb = self.side_condition_proj(self.side_condition_emb(s_cat))
         s_sum = (s_emb * s_mask.unsqueeze(-1).float()).sum(dim=-2)

@@ -7,7 +7,6 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.battle.field import Field
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
-from poke_env.battle.weather import Weather
 
 from src.lookups import ACT_SIZE
 from src.model.structured_observation import (
@@ -22,53 +21,6 @@ from src.model.structured_observation import (
     TokenType,
 )
 from src.model.tokenizer import PokemonTokenizer, tokenizer
-
-SLOT_STATUS_IDX = {-1: 0, 0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
-
-WEATHER_TO_ID = {
-    Weather.RAINDANCE: "rain",
-    Weather.SUNNYDAY: "sun",
-    Weather.SANDSTORM: "sand",
-    Weather.SNOW: "snow",
-}
-
-FIELD_TO_ID = {
-    Field.TRICK_ROOM: "trickroom",
-    Field.GRASSY_TERRAIN: "grassyterrain",
-    Field.PSYCHIC_TERRAIN: "psychicterrain",
-    Field.ELECTRIC_TERRAIN: "electricterrain",
-    Field.MISTY_TERRAIN: "mistyterrain",
-}
-
-SIDE_CONDITION_TO_ID = {
-    SideCondition.TAILWIND: "tailwind",
-    SideCondition.AURORA_VEIL: "auroraveil",
-    SideCondition.REFLECT: "reflect",
-    SideCondition.LIGHT_SCREEN: "lightscreen",
-    SideCondition.SAFEGUARD: "safeguard",
-}
-
-GLOBAL_CONDITION_IDS = {
-    "none": 0,
-    "rain": 1,
-    "sun": 2,
-    "sand": 3,
-    "snow": 4,
-    "trickroom": 5,
-    "grassyterrain": 6,
-    "psychicterrain": 7,
-    "electricterrain": 8,
-    "mistyterrain": 9,
-}
-
-SIDE_CONDITION_IDS = {
-    "none": 0,
-    "tailwind": 1,
-    "auroraveil": 2,
-    "reflect": 3,
-    "lightscreen": 4,
-    "safeguard": 5,
-}
 
 # TODO: probably the biggest bottleneck in throughput trajectory
 # try to profile a battle -> action forward pass and then
@@ -147,7 +99,7 @@ def _pokemon_numeric(
     orig_idx: int,
 ) -> list[float]:
     row = [0.0] * NUMERICAL_WIDTH
-    row[SLOT_STATUS_IDX.get(cond, 1)] = 1.0
+    row[cond + 1] = 1.0
 
     if pokemon is None:
         return row
@@ -248,48 +200,63 @@ def _slot_condition(
     return 2 if mon in possible_switches else -1
 
 
-def _global_field_token(battle: DoubleBattle) -> tuple[list[int], list[float]]:
-    condition_ids = []
-    durations = []
-
+def _global_field_token(
+    battle: DoubleBattle, tok: PokemonTokenizer
+) -> tuple[list[int], list[float]]:
+    # categorical slots:
+    # slot 0: weather ID
+    # slot 1: Trick Room ID
+    # terrain and gravity to be added later
+    weather_id = 0
+    weather_duration = 0.0
     for weather, start_turn in getattr(battle, "_weather", {}).items():
-        name = WEATHER_TO_ID.get(weather)
-        if name:
-            condition_ids.append(GLOBAL_CONDITION_IDS[name])
-            durations.append(_get_turns_left(battle, start_turn))
+        idx = tok.weathers.get(weather, 0)
+        if idx:
+            weather_id = idx
+            weather_duration = _get_turns_left(battle, start_turn)
+            break  # Only one weather can be active at a time
 
-    for field, start_turn in battle.fields.items():
-        name = FIELD_TO_ID.get(field)
-        if name:
-            condition_ids.append(GLOBAL_CONDITION_IDS[name])
-            durations.append(_get_turns_left(battle, start_turn))
+    trickroom_id = 0
+    trickroom_duration = 0.0
+    if Field.TRICK_ROOM in battle.fields:
+        start_turn = battle.fields[Field.TRICK_ROOM]
+        trickroom_id = tok.id_for("trickroom", "trickroom")
+        trickroom_duration = _get_turns_left(battle, start_turn)
 
-    condition_ids = condition_ids[:6] + [0] * max(0, 6 - len(condition_ids))
-    durations = durations[:6] + [0.0] * max(0, 6 - len(durations))
-    numerical = durations + [float(battle.teampreview), battle.turn / 16.0]
-    return condition_ids + [0] * (CATEGORICAL_WIDTH - len(condition_ids)), numerical + [0.0] * (
-        NUMERICAL_WIDTH - len(numerical)
-    )
+    categorical = [weather_id, trickroom_id] + [0] * (CATEGORICAL_WIDTH - 2)
+    numerical = [
+        weather_duration,
+        trickroom_duration,
+        float(battle.teampreview),
+        battle.turn / 16.0,
+    ]
+    numerical = numerical + [0.0] * (NUMERICAL_WIDTH - len(numerical))
+    return categorical, numerical
 
 
 def _side_token(
     battle: DoubleBattle,
     conditions: dict[SideCondition, int],
+    tok: PokemonTokenizer,
 ) -> tuple[list[int], list[float]]:
-    condition_ids = []
-    durations = []
+    active_conds = []
     for condition, start_turn in conditions.items():
-        name = SIDE_CONDITION_TO_ID.get(condition)
-        if name:
-            condition_ids.append(SIDE_CONDITION_IDS[name])
+        idx = tok.side_conditions.get(condition, 0)
+        if idx:
             duration = 4 if condition == SideCondition.TAILWIND else 5
-            durations.append(_get_turns_left(battle, start_turn, duration=duration))
+            turns_left = _get_turns_left(battle, start_turn, duration=duration)
+            active_conds.append((idx, turns_left))
 
-    condition_ids = condition_ids[:6] + [0] * max(0, 6 - len(condition_ids))
-    durations = durations[:6] + [0.0] * max(0, 6 - len(durations))
-    return condition_ids + [0] * (CATEGORICAL_WIDTH - len(condition_ids)), durations + [0.0] * (
-        NUMERICAL_WIDTH - len(durations)
-    )
+    # similar processing to volatiles set
+    active_conds.sort(key=lambda x: x[0])
+    active_conds = active_conds[:2]
+
+    condition_ids = [c[0] for c in active_conds] + [0] * (2 - len(active_conds))
+    durations = [c[1] for c in active_conds] + [0.0] * (2 - len(active_conds))
+
+    categorical = condition_ids + [0] * (CATEGORICAL_WIDTH - len(condition_ids))
+    numerical = durations + [0.0] * (NUMERICAL_WIDTH - len(durations))
+    return categorical, numerical
 
 
 def from_battle(
@@ -327,7 +294,7 @@ def from_battle(
             numerical[idx] = _pokemon_numeric(mon, battle, cond, orig_idx)
             idx += 1
 
-    global_cat, global_num = _global_field_token(battle)
+    global_cat, global_num = _global_field_token(battle, tok)
     token_types[idx] = TokenType.GLOBAL_FIELD
     sides[idx] = SideId.NONE
     slots[idx] = 0
@@ -335,7 +302,7 @@ def from_battle(
     numerical[idx] = global_num
     idx += 1
 
-    ally_cat, ally_num = _side_token(battle, battle.side_conditions)
+    ally_cat, ally_num = _side_token(battle, battle.side_conditions, tok)
     token_types[idx] = TokenType.ALLY_SIDE
     sides[idx] = SideId.ALLY
     slots[idx] = 0
@@ -343,7 +310,7 @@ def from_battle(
     numerical[idx] = ally_num
     idx += 1
 
-    opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions)
+    opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions, tok)
     token_types[idx] = TokenType.OPPONENT_SIDE
     sides[idx] = SideId.OPPONENT
     slots[idx] = 0

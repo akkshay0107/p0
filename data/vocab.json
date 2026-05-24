@@ -156,8 +156,7 @@
     "disable": 2,
     "encore": 3,
     "leechseed": 4,
-    "substitute": 5,
-    "taunt": 6
+    "throatchop": 5
   },
   "status": {
     "burn": 1,
@@ -166,6 +165,19 @@
     "poison": 4,
     "sleep": 5,
     "toxic": 6
+  },
+  "side_conditions": {
+    "auroraveil": 1,
+    "tailwind": 2
+  },
+  "weathers": {
+    "rain": 1,
+    "sand": 2,
+    "snow": 3,
+    "sun": 4
+  },
+  "trickroom": {
+    "trickroom": 1
   },
   "categories": {
     "physical": 1,

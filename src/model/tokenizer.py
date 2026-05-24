@@ -9,6 +9,8 @@ from typing import Any
 from poke_env.battle.effect import Effect
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.status import Status
+from poke_env.battle.side_condition import SideCondition
+from poke_env.battle.weather import Weather
 
 from src.model.structured_observation import MAX_VOLATILES
 
@@ -34,8 +36,27 @@ class PokemonTokenizer:
                 Effect.DISABLE: "disable",
                 Effect.ENCORE: "encore",
                 Effect.LEECH_SEED: "leechseed",
-                Effect.SUBSTITUTE: "substitute",
-                Effect.TAUNT: "taunt",
+                Effect.THROAT_CHOP: "throatchop",
+            }.items()
+        }
+
+        self._side_conditions_str = vocab.get("side_conditions", {})
+        self.side_conditions = {
+            cond_enum: self._side_conditions_str.get(cond_str, 0)
+            for cond_enum, cond_str in {
+                SideCondition.TAILWIND: "tailwind",
+                SideCondition.AURORA_VEIL: "auroraveil",
+            }.items()
+        }
+
+        self._weathers_str = vocab.get("weathers", {})
+        self.weathers = {
+            weather_enum: self._weathers_str.get(weather_str, 0)
+            for weather_enum, weather_str in {
+                Weather.RAINDANCE: "rain",
+                Weather.SUNNYDAY: "sun",
+                Weather.SANDSTORM: "sand",
+                Weather.SNOW: "snow",
             }.items()
         }
 

@@ -80,15 +80,19 @@ def main():
     abilities_set = set()
     moves_set = set()
 
+    # hard coded (cant infer directly from teamlist) sets below
     volatiles_set = {
         "encore",
-        "taunt",
         "disable",
         "leechseed",
-        "substitute",
         "confusion",
+        "throatchop",
     }
     status_set = {"paralysis", "poison", "burn", "sleep", "freeze", "toxic"}
+    side_conditions_set = {"tailwind", "auroraveil"}
+    weathers_set = {"rain", "sun", "sand", "snow"}
+    trickroom_set = {"trickroom"}
+    # terrain_set needed for later once terrain setters get added to team list
 
     moves_set.update({"struggle", "recharge"})
 
@@ -138,6 +142,9 @@ def main():
         "moves": {name: idx + 1 for idx, name in enumerate(sorted(moves_set))},
         "volatiles": {name: idx + 1 for idx, name in enumerate(sorted(volatiles_set))},
         "status": {name: idx + 1 for idx, name in enumerate(sorted(status_set))},
+        "side_conditions": {name: idx + 1 for idx, name in enumerate(sorted(side_conditions_set))},
+        "weathers": {name: idx + 1 for idx, name in enumerate(sorted(weathers_set))},
+        "trickroom": {name: idx + 1 for idx, name in enumerate(sorted(trickroom_set))},
         "categories": {
             "physical": 1,
             "special": 2,
