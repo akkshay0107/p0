@@ -81,17 +81,20 @@ def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) ->
     return max(0.0, duration - (battle.turn - start_turn)) / float(duration)
 
 
-# TODO: definitely buggy
-# have to fix it so that it respects switching out resetting to no move and
-# doesnt unnecessarily scan the entire history
 def _get_last_move(battle: DoubleBattle, pokemon: Pokemon) -> str | None:
     for event in reversed(battle._replay_data):
-        if len(event) > 3 and event[1] == "move":
-            try:
-                if battle.get_pokemon(event[2]) == pokemon:
-                    return PokemonTokenizer.normalize_id(event[3])
-            except Exception:
-                continue
+        if len(event) > 2:
+            ev_type = event[1]
+            if ev_type in ("move", "switch", "drag", "replace"):
+                try:
+                    if battle.get_pokemon(event[2]) == pokemon:
+                        if ev_type == "move" and len(event) > 3:
+                            return PokemonTokenizer.normalize_id(event[3])
+                        else:
+                            # pokemon hasn't used a move since switching in
+                            return None
+                except Exception:
+                    continue
     return None
 
 
@@ -298,49 +301,55 @@ def from_battle(
     assert isinstance(battle, DoubleBattle)
     tok = tok or tokenizer
 
-    token_types = [TokenType.CLS]
-    sides = [SideId.NONE]
-    slots = [0]
-    categorical = [[0] * CATEGORICAL_WIDTH]
-    numerical = [[0.0] * NUMERICAL_WIDTH]
+    token_types = [TokenType.CLS] + [0] * (SEQUENCE_LENGTH - 1)
+    sides = [SideId.NONE] + [0] * (SEQUENCE_LENGTH - 1)
+    slots = [0] * SEQUENCE_LENGTH
+    categorical = [[0] * CATEGORICAL_WIDTH for _ in range(SEQUENCE_LENGTH)]
+    numerical = [[0.0] * NUMERICAL_WIDTH for _ in range(SEQUENCE_LENGTH)]
 
+    idx = 1
     for side, is_opponent in ((SideId.ALLY, False), (SideId.OPPONENT, True)):
-        for idx, (mon, orig_idx) in enumerate(_get_ordered_pokemon(battle, is_opponent)):
-            cond = _slot_condition(battle, mon, idx, is_opponent)
-            slot_id = idx + 1
+        for slot_idx, (mon, orig_idx) in enumerate(_get_ordered_pokemon(battle, is_opponent)):
+            cond = _slot_condition(battle, mon, slot_idx, is_opponent)
+            slot_id = slot_idx + 1
 
-            token_types.append(TokenType.POKEMON_SUPER)
-            sides.append(side)
-            slots.append(slot_id)
-            categorical.append(_pokemon_categorical(mon, tok))
-            numerical.append([0.0] * NUMERICAL_WIDTH)
+            token_types[idx] = TokenType.POKEMON_SUPER
+            sides[idx] = side
+            slots[idx] = slot_id
+            categorical[idx] = _pokemon_categorical(mon, tok)
+            # numerical is already 0.0 initialized
+            idx += 1
 
-            token_types.append(TokenType.POKEMON_NUMERIC)
-            sides.append(side)
-            slots.append(slot_id)
-            categorical.append([0] * CATEGORICAL_WIDTH)
-            numerical.append(_pokemon_numeric(mon, battle, cond, orig_idx))
+            token_types[idx] = TokenType.POKEMON_NUMERIC
+            sides[idx] = side
+            slots[idx] = slot_id
+            # categorical is already 0 initialized
+            numerical[idx] = _pokemon_numeric(mon, battle, cond, orig_idx)
+            idx += 1
 
     global_cat, global_num = _global_field_token(battle)
-    token_types.append(TokenType.GLOBAL_FIELD)
-    sides.append(SideId.NONE)
-    slots.append(0)
-    categorical.append(global_cat)
-    numerical.append(global_num)
+    token_types[idx] = TokenType.GLOBAL_FIELD
+    sides[idx] = SideId.NONE
+    slots[idx] = 0
+    categorical[idx] = global_cat
+    numerical[idx] = global_num
+    idx += 1
 
     ally_cat, ally_num = _side_token(battle, battle.side_conditions)
-    token_types.append(TokenType.ALLY_SIDE)
-    sides.append(SideId.ALLY)
-    slots.append(0)
-    categorical.append(ally_cat)
-    numerical.append(ally_num)
+    token_types[idx] = TokenType.ALLY_SIDE
+    sides[idx] = SideId.ALLY
+    slots[idx] = 0
+    categorical[idx] = ally_cat
+    numerical[idx] = ally_num
+    idx += 1
 
     opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions)
-    token_types.append(TokenType.OPPONENT_SIDE)
-    sides.append(SideId.OPPONENT)
-    slots.append(0)
-    categorical.append(opp_cat)
-    numerical.append(opp_num)
+    token_types[idx] = TokenType.OPPONENT_SIDE
+    sides[idx] = SideId.OPPONENT
+    slots[idx] = 0
+    categorical[idx] = opp_cat
+    numerical[idx] = opp_num
+    idx += 1
 
     obs = StructuredObservation(
         token_type_ids=torch.tensor(token_types, dtype=torch.long),
@@ -402,12 +411,13 @@ def get_action_mask(battle: AbstractBattle) -> torch.Tensor:
         return torch.tensor([mask, mask], dtype=torch.uint8)
 
     def single_action_mask(pos: int) -> list[int]:
+        available_base_species = {p.base_species for p in battle.available_switches[pos]}
         switch_space = [
             i + 1
             for i, pokemon in enumerate(battle.team.values())
-            if not battle.trapped[pos]
-            and pokemon.base_species in [p.base_species for p in battle.available_switches[pos]]
+            if not battle.trapped[pos] and pokemon.base_species in available_base_species
         ]
+
         active_mon = battle.active_pokemon[pos]
         if battle._wait or (any(battle.force_switch) and not battle.force_switch[pos]):
             actions = [0]
@@ -434,7 +444,12 @@ def get_action_mask(battle: AbstractBattle) -> torch.Tensor:
             ):
                 move_space = [9]
             actions = switch_space + move_space + mega_space
+
         actions = actions or [0]
-        return [int(action in actions) for action in range(ACT_SIZE)]
+
+        mask = [0] * ACT_SIZE
+        for a in actions:
+            mask[a] = 1
+        return mask
 
     return torch.tensor([single_action_mask(0), single_action_mask(1)], dtype=torch.uint8)

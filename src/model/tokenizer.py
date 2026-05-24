@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -54,10 +55,15 @@ class PokemonTokenizer:
             return cls(json.load(f))
 
     @staticmethod
+    @lru_cache(maxsize=None)
+    def _cached_normalize(s: str) -> str:
+        return CLEAN_ID_RE.sub("", s.lower())
+
+    @staticmethod
     def normalize_id(name: Any) -> str:
         if name is None:
             return ""
-        return CLEAN_ID_RE.sub("", str(name).lower())
+        return PokemonTokenizer._cached_normalize(str(name))
 
     def id_for(self, table: str, name: Any) -> int:
         vocab_table = self.vocab.get(table, {})
