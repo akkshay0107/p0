@@ -3,7 +3,6 @@ import asyncio
 import logging
 import os
 import signal
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -140,7 +139,7 @@ class RLPlayer(Player):
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_BATTLE_FORMAT = "gen9vgc2025regh"
+DEFAULT_BATTLE_FORMAT = "gen9championsvgc2026regma"
 DEFAULT_CHALLENGE_LIMIT = 1_000_000
 DEFAULT_CHECKPOINT_CANDIDATES = (Path("checkpoints/ppo_checkpoint.pt"),)
 

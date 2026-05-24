@@ -32,7 +32,7 @@ async def main(n_battles: int, checkpoint_path: str):
         return
 
     team = RandomTeamFromPool(team_files)
-    fmt = "gen9vgc2025regh"
+    fmt = "gen9championsvgc2026regma"
 
     # Load policy
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -168,7 +168,7 @@ async def main():
         if path.is_file() and not path.name.startswith(".")
     ]
     team = RandomTeamFromPool(team_files)
-    fmt = "gen9vgc2025regh"
+    fmt = "gen9championsvgc2026regma"
 
     def get_kwargs(name):
         return {

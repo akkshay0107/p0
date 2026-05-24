@@ -85,18 +85,13 @@ def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) ->
 # have to fix it so that it respects switching out resetting to no move and
 # doesnt unnecessarily scan the entire history
 def _get_last_move(battle: DoubleBattle, pokemon: Pokemon) -> str | None:
-    observations = [getattr(battle, "current_observation", None)]
-    observations.extend(battle.observations.get(turn) for turn in range(battle.turn, 0, -1))
-    for obs in observations:
-        if obs is None:
-            continue
-        for event in reversed(obs.events):
-            if len(event) > 3 and event[1] == "move":
-                try:
-                    if battle.get_pokemon(event[2]) == pokemon:
-                        return PokemonTokenizer.normalize_id(event[3])
-                except Exception:
-                    continue
+    for event in reversed(battle._replay_data):
+        if len(event) > 3 and event[1] == "move":
+            try:
+                if battle.get_pokemon(event[2]) == pokemon:
+                    return PokemonTokenizer.normalize_id(event[3])
+            except Exception:
+                continue
     return None
 
 

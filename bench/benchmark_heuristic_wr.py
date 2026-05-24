@@ -26,7 +26,7 @@ async def main(n_battles: int):
         return
 
     team = RandomTeamFromPool(team_files)
-    fmt = "gen9vgc2025regh"
+    fmt = "gen9championsvgc2026regma"
 
     def create_player(player_class, name, **kwargs):
         return player_class(

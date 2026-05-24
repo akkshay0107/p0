@@ -1168,9 +1168,8 @@ class FuzzyHeuristic(Player):
         return re.sub(r"[^a-z0-9]", "", s.lower())
 
     def _get_last_move(self, battle: DoubleBattle, pokemon: Pokemon) -> Move | None:
-        # Check current turn's events first
-        for event in reversed(battle.current_observation.events):
-            if event[1] == "move":
+        for event in reversed(battle._replay_data):
+            if len(event) > 3 and event[1] == "move":
                 try:
                     event_mon = battle.get_pokemon(event[2])
                     if event_mon == pokemon:
@@ -1179,22 +1178,6 @@ class FuzzyHeuristic(Player):
                         return pokemon.moves.get(move_id)
                 except Exception:
                     continue
-
-        # Check observations from previous turns
-        for turn in range(battle.turn, 0, -1):
-            if turn not in battle.observations:
-                continue
-            obs = battle.observations[turn]
-            for event in reversed(obs.events):
-                if event[1] == "move":
-                    try:
-                        event_mon = battle.get_pokemon(event[2])
-                        if event_mon == pokemon:
-                            move_name = event[3]
-                            move_id = self._to_id_str(move_name)
-                            return pokemon.moves.get(move_id)
-                    except Exception:
-                        continue
         return None
 
     # Helper checks
@@ -1310,7 +1293,7 @@ class FuzzyHeuristic(Player):
         move_type: PokemonType | None = None,
     ) -> float:
         move_type = move.type if move_type is None else move_type
-        is_original_stab = move_type in mon.original_types
+        is_original_stab = move_type in mon.base_types
 
         if not mon.is_terastallized:
             return mon.stab_multiplier if is_original_stab else 1.0
@@ -1361,7 +1344,6 @@ class FuzzyHeuristic(Player):
 
 if __name__ == "__main__":
     import asyncio
-    import sys
     from pathlib import Path
 
     from poke_env import AccountConfiguration, LocalhostServerConfiguration
@@ -1387,7 +1369,7 @@ if __name__ == "__main__":
             return
 
         team = RandomTeamFromPool(team_files)
-        fmt = "gen9vgc2025regh"
+        fmt = "gen9championsvgc2026regma"
 
         bot_player = FuzzyHeuristic(
             account_configuration=AccountConfiguration("FuzzyBot", None),

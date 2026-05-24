@@ -6,7 +6,7 @@ import numpy as np
 import numpy.typing as npt
 from gymnasium.spaces import MultiDiscrete
 from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon
-from poke_env.environment.env import ObsType, PokeEnv, _EnvPlayer
+from poke_env.environment.env import PokeEnv, _EnvPlayer
 from poke_env.player.battle_order import (
     BattleOrder,
     DefaultBattleOrder,
@@ -42,13 +42,13 @@ class VGCEnvPlayer(_EnvPlayer):
 
 # modified from poke-env
 # to remove all other gimmicks but mega evolution
-class MegaEnv(PokeEnv[ObsType, npt.NDArray[np.int64]]):
+class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
     def __init__(
         self,
         account_configuration1: Optional[AccountConfiguration] = None,
         account_configuration2: Optional[AccountConfiguration] = None,
         avatar: Optional[int] = None,
-        battle_format: str = "gen9vgc2025regh",
+        battle_format: str = "gen9championsvgc2026regma",
         log_level: Optional[int] = None,
         save_replays: Union[bool, str] = False,
         server_configuration: Optional[ServerConfiguration] = LocalhostServerConfiguration,
@@ -416,7 +416,7 @@ class SimEnv(MegaEnv):
                 f"ws://localhost:{server_port}/showdown/websocket",
                 "https://play.pokemonshowdown.com/action.php?",
             ),
-            battle_format="gen9vgc2025regh",
+            battle_format="gen9championsvgc2026regma",
             accept_open_team_sheet=True,
             start_timer_on_battle_start=True,
             log_level=25,
