@@ -48,10 +48,12 @@ def dummy_obs():
     categorical[:, 1:25, 5:9] = torch.randint(1, 70, (B, 24, 4))
     # move_types (9-12): 1-18
     categorical[:, 1:25, 9:13] = torch.randint(1, 19, (B, 24, 4))
-    # status (13): 1-6
-    categorical[:, 1:25, 13] = torch.randint(1, 7, (B, 24))
-    # volatiles (14-19): 1-6
-    categorical[:, 1:25, 14:20] = torch.randint(1, 7, (B, 24, 6))
+    # move_categories (13-16): 1-3
+    categorical[:, 1:25, 13:17] = torch.randint(1, 4, (B, 24, 4))
+    # status (17): 1-6
+    categorical[:, 1:25, 17] = torch.randint(1, 7, (B, 24))
+    # volatiles (18-23): 1-6
+    categorical[:, 1:25, 18:24] = torch.randint(1, 7, (B, 24, 6))
 
     # global_condition_emb has size 10 (0-9)
     categorical[:, 25, :6] = torch.randint(1, 10, (B, 6))
@@ -145,6 +147,7 @@ def test_gradient_flow(dummy_obs):
         "item_emb",
         "move_emb",
         "type_emb",
+        "category_emb",
         "status_emb",
         "volatile_emb",
         "global_condition_emb",

@@ -57,6 +57,7 @@ class FusedTokenEncoder(nn.Module):
         self.item_emb = nn.Embedding(sizes.get("items", 1), d_raw)
         self.move_emb = nn.Embedding(sizes.get("moves", 1), d_raw)
         self.type_emb = nn.Embedding(sizes.get("types", 1), d_raw)
+        self.category_emb = nn.Embedding(sizes.get("categories", 1), d_raw)
         self.status_emb = nn.Embedding(sizes.get("status", 1), d_raw)
         self.volatile_emb = nn.Embedding(sizes.get("volatiles", 1), d_raw)
 
@@ -75,10 +76,9 @@ class FusedTokenEncoder(nn.Module):
         self.side_emb = nn.Embedding(NUM_SIDES, d_model)
         self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
 
-        # each move gets a move embedding and a type embedding
-        # considering explicitly adding a phys / spe / sta marker
+        # each move gets a move embedding, a type embedding, and a category embedding
         self.move_proj = nn.Sequential(
-            nn.Linear(2 * d_raw, d_model),
+            nn.Linear(3 * d_raw, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -136,15 +136,16 @@ class FusedTokenEncoder(nn.Module):
             [
                 self.move_emb(categorical[..., 5:9]),
                 self.type_emb(categorical[..., 9:13]),
+                self.category_emb(categorical[..., 13:17]),
             ],
             dim=-1,
         )
         moveset = self.moveset_proj(self.move_proj(move_parts)).mean(dim=-2)
 
-        status = self.status_proj(self.status_emb(categorical[..., 13]))
+        status = self.status_proj(self.status_emb(categorical[..., 17]))
 
         # masked mean over volatile slots; zero-vector when no volatiles present
-        v_cat = categorical[..., 14:20]
+        v_cat = categorical[..., 18:24]
         v_mask = v_cat != 0
         v_emb = self.volatile_proj(self.volatile_emb(v_cat))
         v_sum = (v_emb * v_mask.unsqueeze(-1).float()).sum(dim=-2)

@@ -44,6 +44,7 @@ class PokemonTokenizer:
         self.volatiles = vocab.get("volatiles", {})
         self.status = vocab.get("status", {})
         self.types = vocab.get("types", {})
+        self.categories = vocab.get("categories", {})
 
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> PokemonTokenizer:
@@ -100,6 +101,12 @@ class PokemonTokenizer:
 
     def move_type_id(self, move: Any) -> int:
         return self.type_id(getattr(move, "type", None))
+
+    def move_category_id(self, move: Any) -> int:
+        if move is None:
+            return 0
+        category = getattr(move, "category", None)
+        return self.categories.get(self.normalize_id(getattr(category, "name", category)), 0)
 
 
 tokenizer = PokemonTokenizer.from_file()

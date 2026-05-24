@@ -123,6 +123,9 @@ def _pokemon_categorical(
     move_slots = _iter_move_slots(pokemon)
     move_ids = [tok.move_id(move) if move is not None else 0 for move in move_slots]
     move_type_ids = [tok.move_type_id(move) if move is not None else 0 for move in move_slots]
+    move_category_ids = [
+        tok.move_category_id(move) if move is not None else 0 for move in move_slots
+    ]
     volatile_ids = tok.volatile_ids(getattr(pokemon, "effects", None))
 
     return [
@@ -133,6 +136,7 @@ def _pokemon_categorical(
         tok.type_id(getattr(pokemon, "type_2", None)),
         *move_ids,
         *move_type_ids,
+        *move_category_ids,
         tok.status_id(getattr(pokemon, "status", None)),
         *volatile_ids,
     ]

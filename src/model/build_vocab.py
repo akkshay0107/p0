@@ -138,6 +138,11 @@ def main():
         "moves": {name: idx + 1 for idx, name in enumerate(sorted(moves_set))},
         "volatiles": {name: idx + 1 for idx, name in enumerate(sorted(volatiles_set))},
         "status": {name: idx + 1 for idx, name in enumerate(sorted(status_set))},
+        "categories": {
+            "physical": 1,
+            "special": 2,
+            "status": 3,
+        },
         "types": {
             name: idx + 1
             for idx, name in enumerate(

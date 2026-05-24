@@ -167,6 +167,11 @@
     "sleep": 5,
     "toxic": 6
   },
+  "categories": {
+    "physical": 1,
+    "special": 2,
+    "status": 3
+  },
   "types": {
     "normal": 1,
     "fire": 2,
