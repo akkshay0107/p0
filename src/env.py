@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Optional, Union
 from weakref import WeakKeyDictionary
@@ -26,6 +27,27 @@ from poke_env.teambuilder import Teambuilder
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.team_picker import RandomTeamFromPool
+
+
+# filter out logging about internal mismatch
+class MismatchWarningFilter(logging.Filter):
+    def filter(self, record):
+        if record.msg and "is active, but it's not" in str(record.msg):
+            return False
+        return True
+
+
+_original_get_logger = logging.getLogger
+
+
+def get_logger_wrapped(name=None):
+    logger = _original_get_logger(name)
+    if not any(isinstance(f, MismatchWarningFilter) for f in logger.filters):
+        logger.addFilter(MismatchWarningFilter())
+    return logger
+
+
+logging.getLogger = get_logger_wrapped
 
 
 class VGCEnvPlayer(_EnvPlayer):
