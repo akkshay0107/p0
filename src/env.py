@@ -1,5 +1,7 @@
+import asyncio
 import logging
 from pathlib import Path
+from threading import Thread
 from typing import Optional, Union
 from weakref import WeakKeyDictionary
 
@@ -86,6 +88,9 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         strict: bool = True,
     ):
         self._challenge_timeout = challenge_timeout
+        self._loop = asyncio.new_event_loop()
+        Thread(target=self._loop.run_forever, daemon=True).start()
+
         self.agent1 = VGCEnvPlayer(
             account_configuration=account_configuration1
             or AccountConfiguration.generate(self.__class__.__name__, rand=True),
@@ -101,7 +106,9 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             open_timeout=open_timeout,
             ping_interval=ping_interval,
             ping_timeout=ping_timeout,
+            loop=self._loop,
             team=team,
+            choose_on_teampreview=True,
         )
         self.agent2 = VGCEnvPlayer(
             account_configuration=account_configuration2
@@ -118,7 +125,9 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             open_timeout=open_timeout,
             ping_interval=ping_interval,
             ping_timeout=ping_timeout,
+            loop=self._loop,
             team=team,
+            choose_on_teampreview=True,
         )
         self.agents: list[str] = []
         self.possible_agents = [self.agent1.username, self.agent2.username]

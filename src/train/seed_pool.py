@@ -15,7 +15,7 @@ def _get_dataset(replays_base: Path, subdir: str) -> ReplayDataset | None:
 
 
 def main():
-    root_dir = Path(__file__).resolve().parent.parent
+    root_dir = Path(__file__).resolve().parent.parent.parent
     replays_base = root_dir / "replays"
     backup_dir = root_dir / "backups"
     backup_dir.mkdir(exist_ok=True)

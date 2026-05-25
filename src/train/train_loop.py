@@ -35,7 +35,7 @@ _buffer_lock = threading.Lock()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("training.log"), logging.StreamHandler(sys.stdout)],
+    handlers=[logging.FileHandler("training.log", mode="w"), logging.StreamHandler(sys.stdout)],
 )
 
 shutdown_requested = False
@@ -88,6 +88,8 @@ def split_state(state, idx: int):
     return cls[idx : idx + 1], hg[idx : idx + 1]
 
 
+# TODO: move to a vectorized env and try to conform to the
+# poke-env 0.15.0 standards. Needs some effort to refactor
 @torch.inference_mode()
 def collect_rollout(
     env,
@@ -112,7 +114,7 @@ def collect_rollout(
     final_rewards = None
 
     while True:
-        obs1 = obs[agent1].unsqueeze(0).to(policy.device, non_blocking=True)
+        obs1 = obs[agent1]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
         mask1 = (
             observation_builder.get_action_mask(env.battle1)
             .unsqueeze(0)
@@ -121,7 +123,7 @@ def collect_rollout(
 
         # store both sides of the game if self play
         if is_self_play:
-            obs2 = obs[agent2].unsqueeze(0).to(policy.device, non_blocking=True)
+            obs2 = obs[agent2]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
             mask2 = (
                 observation_builder.get_action_mask(env.battle2)
                 .unsqueeze(0)
@@ -148,7 +150,11 @@ def collect_rollout(
             next_state1 = split_state(next_combined_state, 0)
             next_state2 = split_state(next_combined_state, 1)
         else:
-            obs2 = obs[agent2].unsqueeze(0).to(opponent_policy.device, non_blocking=True)
+            obs2 = (
+                obs[agent2]["observation"]
+                .unsqueeze(0)
+                .to(opponent_policy.device, non_blocking=True)
+            )
             mask2 = (
                 observation_builder.get_action_mask(env.battle2)
                 .unsqueeze(0)
