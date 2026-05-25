@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+from poke_env.data import GenData
+
 
 def normalize_id(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
@@ -75,6 +77,8 @@ def main():
     data_dir = script_dir.parent / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    gen_data = GenData.from_gen(9)
+
     species_set = set()
     items_set = set()
     abilities_set = set()
@@ -121,7 +125,11 @@ def main():
                 items_set.add(item_id)
                 mega_form = infer_mega_form(species_name, item)
                 if mega_form:
-                    species_set.add(normalize_id(mega_form))
+                    mega_id = normalize_id(mega_form)
+                    species_set.add(mega_id)
+                    if mega_id in gen_data.pokedex:
+                        for ability in gen_data.pokedex[mega_id].get("abilities", {}).values():
+                            abilities_set.add(normalize_id(ability))
 
             ability_id = ""
             current_moves = []
