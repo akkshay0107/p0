@@ -289,7 +289,7 @@ class PolicyNet(nn.Module):
         numerical = obs_dict["numerical"]
         if numerical.dim() == 2:
             numerical = numerical.unsqueeze(0)
-        is_tp = (numerical[:, 25, 6] > 0.5).to(self.device)
+        is_tp = (numerical[:, 25, 2] > 0.5).to(self.device)
 
         if action_mask is not None:
             action_mask = action_mask.to(self.device)
@@ -337,7 +337,7 @@ class PolicyNet(nn.Module):
         """
         obs_dict = as_obs_dict(obs)
         tokens = self.encoder(obs_dict)
-        is_tp = (obs_dict["numerical"][:, 25, 6] > 0.5).to(self.device)
+        is_tp = (obs_dict["numerical"][:, 25, 2] > 0.5).to(self.device)
 
         return self.evaluate_actions_tokens(tokens, is_tp, actions, action_mask, state)
 

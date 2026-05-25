@@ -1,13 +1,10 @@
-import asyncio
 import logging
 from pathlib import Path
-from threading import Thread
 from typing import Optional, Union
-from weakref import WeakKeyDictionary
 
 import numpy as np
 import numpy.typing as npt
-from gymnasium.spaces import MultiDiscrete
+from gymnasium.spaces import Box, MultiDiscrete
 from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon
 from poke_env.environment.env import PokeEnv, _EnvPlayer
 from poke_env.player.battle_order import (
@@ -87,63 +84,43 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         fake: bool = False,
         strict: bool = True,
     ):
-        self._challenge_timeout = challenge_timeout
-        self._loop = asyncio.new_event_loop()
-        Thread(target=self._loop.run_forever, daemon=True).start()
+        super().__init__(
+            account_configuration1=account_configuration1,
+            account_configuration2=account_configuration2,
+            avatar=avatar,
+            battle_format=battle_format,
+            log_level=log_level,
+            save_replays=save_replays,
+            server_configuration=server_configuration,
+            accept_open_team_sheet=accept_open_team_sheet,
+            start_timer_on_battle_start=start_timer_on_battle_start,
+            start_listening=start_listening,
+            open_timeout=open_timeout,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            challenge_timeout=challenge_timeout,
+            team=team,
+            choose_on_teampreview=True,
+            fake=fake,
+            strict=strict,
+        )
+        # monkey patch
+        self.agent1.__class__ = VGCEnvPlayer
+        self.agent2.__class__ = VGCEnvPlayer
 
-        self.agent1 = VGCEnvPlayer(
-            account_configuration=account_configuration1
-            or AccountConfiguration.generate(self.__class__.__name__, rand=True),
-            avatar=avatar,
-            battle_format=battle_format,
-            log_level=log_level,
-            max_concurrent_battles=1,
-            save_replays=save_replays,
-            server_configuration=server_configuration,
-            accept_open_team_sheet=accept_open_team_sheet,
-            start_timer_on_battle_start=start_timer_on_battle_start,
-            start_listening=start_listening,
-            open_timeout=open_timeout,
-            ping_interval=ping_interval,
-            ping_timeout=ping_timeout,
-            loop=self._loop,
-            team=team,
-            choose_on_teampreview=True,
-        )
-        self.agent2 = VGCEnvPlayer(
-            account_configuration=account_configuration2
-            or AccountConfiguration.generate(self.__class__.__name__, rand=True),
-            avatar=avatar,
-            battle_format=battle_format,
-            log_level=log_level,
-            max_concurrent_battles=1,
-            save_replays=save_replays,
-            server_configuration=server_configuration,
-            accept_open_team_sheet=accept_open_team_sheet,
-            start_timer_on_battle_start=start_timer_on_battle_start,
-            start_listening=start_listening,
-            open_timeout=open_timeout,
-            ping_interval=ping_interval,
-            ping_timeout=ping_timeout,
-            loop=self._loop,
-            team=team,
-            choose_on_teampreview=True,
-        )
-        self.agents: list[str] = []
-        self.possible_agents = [self.agent1.username, self.agent2.username]
-        self.battle1: Optional[AbstractBattle] = None
-        self.battle2: Optional[AbstractBattle] = None
-        self.agent1_to_move = False
-        self.agent2_to_move = False
         self.fake = fake
         self.strict = strict
-        self._np_random: Optional[np.random.Generator] = None
-        self._reward_buffer: WeakKeyDictionary[AbstractBattle, float] = WeakKeyDictionary()
-        self._challenge_task = None
 
         self.action_spaces = {
             agent: MultiDiscrete([ACT_SIZE, ACT_SIZE]) for agent in self.possible_agents
         }
+        self.observation_spaces = {
+            agent: Box(low=-np.inf, high=np.inf, shape=(1,)) for agent in self.possible_agents
+        }
+
+    @staticmethod
+    def get_action_mask(battle: AbstractBattle) -> list[int]:
+        return observation_builder.get_action_mask(battle).tolist()
 
     @staticmethod
     def action_to_order(

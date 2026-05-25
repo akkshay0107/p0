@@ -17,7 +17,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
 from src.lookups import ACT_SIZE, OBS_DIM
-from src.model import observation_builder
 from src.model.fused_token_encoder import as_obs_dict
 from src.model.policy import PolicyNet
 from src.train.ppo_utils import (
@@ -116,7 +115,7 @@ def collect_rollout(
     while True:
         obs1 = obs[agent1]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
         mask1 = (
-            observation_builder.get_action_mask(env.battle1)
+            torch.from_numpy(obs[agent1]["action_mask"])
             .unsqueeze(0)
             .to(policy.device, non_blocking=True)
         )
@@ -125,7 +124,7 @@ def collect_rollout(
         if is_self_play:
             obs2 = obs[agent2]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
             mask2 = (
-                observation_builder.get_action_mask(env.battle2)
+                torch.from_numpy(obs[agent2]["action_mask"])
                 .unsqueeze(0)
                 .to(policy.device, non_blocking=True)
             )
@@ -156,7 +155,7 @@ def collect_rollout(
                 .to(opponent_policy.device, non_blocking=True)
             )
             mask2 = (
-                observation_builder.get_action_mask(env.battle2)
+                torch.from_numpy(obs[agent2]["action_mask"])
                 .unsqueeze(0)
                 .to(opponent_policy.device, non_blocking=True)
             )

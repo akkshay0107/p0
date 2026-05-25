@@ -57,7 +57,7 @@ def _run_episode(
     # Pre-extract other fields
     all_masks = torch.cat([sample["mask"].unsqueeze(0) for sample in episode], dim=0).to(device)
     all_targets = torch.cat([sample["action"].unsqueeze(0) for sample in episode], dim=0).to(device)
-    all_is_tp = (all_obs.numerical[:, 25, 6] > 0.5).to(device)
+    all_is_tp = (all_obs.numerical[:, 25, 2] > 0.5).to(device)
 
     loss = torch.tensor(0.0, device=device)
     correct = 0
