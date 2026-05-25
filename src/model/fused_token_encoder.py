@@ -176,7 +176,7 @@ class FusedTokenEncoder(nn.Module):
 
     def _embed_side_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
         """Returns the categorical-side embedding only (numeric added in forward)."""
-        s_cat = categorical[..., :2]
+        s_cat = categorical[..., :4]
         s_mask = s_cat != 0
         s_emb = self.side_condition_proj(self.side_condition_emb(s_cat))
         s_sum = (s_emb * s_mask.unsqueeze(-1).float()).sum(dim=-2)

@@ -240,19 +240,25 @@ def _side_token(
     tok: PokemonTokenizer,
 ) -> tuple[list[int], list[float]]:
     active_conds = []
-    for condition, start_turn in conditions.items():
-        idx = tok.side_conditions.get(condition, 0)
-        if idx:
+    for condition, val in conditions.items():
+        cond_mapping = tok.side_conditions.get(condition)
+        if isinstance(cond_mapping, dict):
+            idx = cond_mapping.get(val, 0)
+            if idx:
+                turns_left = float(val) / 2.0
+                active_conds.append((idx, turns_left))
+        elif isinstance(cond_mapping, int) and cond_mapping > 0:
+            idx = cond_mapping
             duration = 4 if condition == SideCondition.TAILWIND else 5
-            turns_left = _get_turns_left(battle, start_turn, duration=duration)
+            turns_left = _get_turns_left(battle, val, duration=duration)
             active_conds.append((idx, turns_left))
 
     # similar processing to volatiles set
     active_conds.sort(key=lambda x: x[0])
-    active_conds = active_conds[:2]
+    active_conds = active_conds[:4]
 
-    condition_ids = [c[0] for c in active_conds] + [0] * (2 - len(active_conds))
-    durations = [c[1] for c in active_conds] + [0.0] * (2 - len(active_conds))
+    condition_ids = [c[0] for c in active_conds] + [0] * (4 - len(active_conds))
+    durations = [c[1] for c in active_conds] + [0.0] * (4 - len(active_conds))
 
     categorical = condition_ids + [0] * (CATEGORICAL_WIDTH - len(condition_ids))
     numerical = durations + [0.0] * (NUMERICAL_WIDTH - len(durations))

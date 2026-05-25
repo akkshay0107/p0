@@ -59,8 +59,8 @@ def dummy_obs():
     categorical[:, 25, 0] = torch.randint(1, 5, (B,))
     categorical[:, 25, 1] = torch.randint(1, 2, (B,))
 
-    # side_condition_emb has size 3 (0-2)
-    categorical[:, 26:28, :2] = torch.randint(1, 3, (B, 2, 2))
+    # side_condition_emb has size 5 (0-4)
+    categorical[:, 26:28, :4] = torch.randint(1, 5, (B, 2, 4))
 
     # Numerical features
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))

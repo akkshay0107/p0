@@ -93,7 +93,7 @@ def main():
         "throatchop",
     }
     status_set = {"paralysis", "poison", "burn", "sleep", "freeze", "toxic"}
-    side_conditions_set = {"tailwind", "auroraveil"}
+    side_conditions_set = {"tailwind", "auroraveil", "toxicspikes1", "toxicspikes2"}
     weathers_set = {"rain", "sun", "sand", "snow"}
     trickroom_set = {"trickroom"}
     # terrain_set needed for later once terrain setters get added to team list

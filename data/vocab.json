@@ -202,7 +202,9 @@
   },
   "side_conditions": {
     "auroraveil": 1,
-    "tailwind": 2
+    "tailwind": 2,
+    "toxicspikes1": 3,
+    "toxicspikes2": 4
   },
   "weathers": {
     "rain": 1,

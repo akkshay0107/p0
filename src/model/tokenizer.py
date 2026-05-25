@@ -8,8 +8,8 @@ from typing import Any
 
 from poke_env.battle.effect import Effect
 from poke_env.battle.pokemon import Pokemon
-from poke_env.battle.status import Status
 from poke_env.battle.side_condition import SideCondition
+from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
 from src.model.structured_observation import MAX_VOLATILES
@@ -42,11 +42,12 @@ class PokemonTokenizer:
 
         self._side_conditions_str = vocab.get("side_conditions", {})
         self.side_conditions = {
-            cond_enum: self._side_conditions_str.get(cond_str, 0)
-            for cond_enum, cond_str in {
-                SideCondition.TAILWIND: "tailwind",
-                SideCondition.AURORA_VEIL: "auroraveil",
-            }.items()
+            SideCondition.TAILWIND: self._side_conditions_str.get("tailwind", 0),
+            SideCondition.AURORA_VEIL: self._side_conditions_str.get("auroraveil", 0),
+            SideCondition.TOXIC_SPIKES: {
+                1: self._side_conditions_str.get("toxicspikes1", 0),
+                2: self._side_conditions_str.get("toxicspikes2", 0),
+            }
         }
 
         self._weathers_str = vocab.get("weathers", {})
