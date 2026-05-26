@@ -15,7 +15,7 @@ from poke_env.battle import (
     Weather,
 )
 from poke_env.battle.move_category import MoveCategory
-from poke_env.calc.damage_calc_gen9 import calculate_damage
+from poke_env.calc.damage_calc_gen9 import calculate_damage as original_calculate_damage
 from poke_env.player import (
     BattleOrder,
     DefaultBattleOrder,
@@ -110,6 +110,20 @@ TOP_K = 3
 FIRST_TURN_SWITCH_PENALTY = -30.0
 MEGA_EVOLUTION_BONUS = 50.0
 
+WEATHER_OVERRIDE_BONUS = 15.0
+WEATHER_BENEFICIARY_ACTIVE_BONUS = 12.0
+WEATHER_BENEFICIARY_BENCH_BONUS = 6.0
+WEATHER_HOSTILE_PENALTY = -6.0
+WEATHER_MOVE_POWER_BONUS = 8.0
+WEATHER_MOVE_POWER_PENALTY = -6.0
+SOLAR_BEAM_SUN_BONUS = 6.0
+SOLAR_BEAM_NO_SUN_PENALTY = -15.0
+HURRICANE_RAIN_BONUS = 8.0
+HURRICANE_SUN_PENALTY = -10.0
+ELECTRO_SHOT_RAIN_BONUS = 12.0
+BLIZZARD_SNOW_BONUS = 8.0
+
+
 # stat increases assumed for calcs
 ASSUMED_HP_BONUS = 107
 ASSUMED_STAT_MAX_BONUS = 52
@@ -122,6 +136,37 @@ THREAT_KO_BONUS = 1.0
 THREAT_STATS_BONUS = 0.2
 THREAT_MAX_CAP = 1.5
 HIGH_OFFENSE_THRESHOLD = 130
+
+
+def calculate_damage(
+    attacker_id: str, defender_id: str, move: Move, battle: DoubleBattle, *args, **kwargs
+):
+    # wrapper to apply fairy aura since poke_env damage calc doesn't support it
+    dmg = original_calculate_damage(attacker_id, defender_id, move, battle, *args, **kwargs)
+    if move.type == PokemonType.FAIRY:
+        has_fairy_aura = False
+        for mon in battle.all_active_pokemons:
+            if mon and not mon.fainted:
+                ability = getattr(mon, "ability", "")
+                if ability:
+                    ability = ability.lower().replace(" ", "").replace("-", "")
+                species = getattr(mon, "species", "")
+                if species:
+                    species = species.lower().replace(" ", "").replace("-", "")
+                if (
+                    ability == "fairyaura"
+                    or "floettemega" in species
+                    or "floetteeternalmega" in species
+                ):
+                    has_fairy_aura = True
+                    break
+        if has_fairy_aura:
+            # 1.33x multiplier to min and max damage
+            if isinstance(dmg, tuple) and len(dmg) == 2:
+                dmg = (dmg[0] * 1.33, dmg[1] * 1.33)
+            else:
+                dmg *= 1.33
+    return dmg
 
 
 class FuzzyHeuristic(Player):
@@ -203,9 +248,9 @@ class FuzzyHeuristic(Player):
             for opp in battle.opponent_active_pokemon
         )
 
-    def get_actual_speed(self, mon: Pokemon) -> float:
-        spe = mon.stats.get("spe", 100)
-        boost = mon.boosts.get("spe", 0)
+    def get_actual_speed(self, mon: Pokemon, battle: DoubleBattle = None) -> float:
+        spe = mon.stats["spe"] or 100
+        boost = mon.boosts["spe"] or 0
         if boost > 0:
             spe *= (2.0 + boost) / 2.0
         elif boost < 0:
@@ -214,11 +259,150 @@ class FuzzyHeuristic(Player):
 
         if mon.status == Status.PAR:
             spe *= 0.5
+
+        if battle is not None:
+            # tailwind speed modifier
+            # check if mon is ours or opponent's to apply correct tailwind
+            is_opponent = False
+            if battle.opponent_active_pokemon and mon in battle.opponent_active_pokemon:
+                is_opponent = True
+            elif battle.opponent_team and mon.species in battle.opponent_team:
+                # fallback check
+                is_opponent = True
+
+            if is_opponent:
+                if SideCondition.TAILWIND in battle.opponent_side_conditions:
+                    spe *= 2.0
+            else:
+                if SideCondition.TAILWIND in battle.side_conditions:
+                    spe *= 2.0
+
+            # weather speed modifier
+            if battle.weather:
+                if mon.ability == "chlorophyll" and Weather.SUNNYDAY in battle.weather:
+                    spe *= 2.0
+                elif mon.ability == "sandrush" and Weather.SANDSTORM in battle.weather:
+                    spe *= 2.0
+
         return spe
 
     def get_team_avg_speed(self, team_mons: List[Pokemon]) -> float:
         speeds = [self.get_actual_speed(mon) for mon in team_mons if mon and not mon.fainted]
         return sum(speeds) / max(1, len(speeds))
+
+    def _get_mega_weather_ability(self, species: str) -> str | None:
+        # returns the weather setting ability of a mega evolved species
+        spec = species.lower().replace(" ", "").replace("-", "")
+        if spec == "charizardmegay":
+            return "drought"
+        elif spec == "froslassmega":
+            return "snowwarning"
+        elif spec == "tyranitarmega":
+            return "sandstream"
+        return None
+
+    def _weather_for_ability(self, ability: str) -> Weather | None:
+        # returns the Weather enum corresponding to a weather setting ability
+        if not ability:
+            return None
+        abil = ability.lower().replace(" ", "").replace("-", "")
+        if abil == "drizzle":
+            return Weather.RAINDANCE
+        elif abil == "drought":
+            return Weather.SUNNYDAY
+        elif abil == "sandstream":
+            return Weather.SANDSTORM
+        elif abil == "snowwarning":
+            return Weather.SNOW
+        return None
+
+    def _mon_benefits_from_weather(self, mon: Pokemon, weather: Weather) -> bool:
+        if not mon or mon.fainted:
+            return False
+
+        ability = getattr(mon, "ability", "")
+        if ability:
+            ability = ability.lower().replace(" ", "").replace("-", "")
+        if weather == Weather.SUNNYDAY and ability == "chlorophyll":
+            return True
+        if weather == Weather.SANDSTORM and ability == "sandrush":
+            return True
+
+        # check type
+        types = [mon.type_1, mon.type_2]
+        if weather == Weather.RAINDANCE and PokemonType.WATER in types:
+            return True
+        if weather == Weather.SUNNYDAY and PokemonType.FIRE in types:
+            return True
+        if weather == Weather.SANDSTORM and (
+            PokemonType.ROCK in types or PokemonType.GROUND in types or PokemonType.STEEL in types
+        ):
+            return True
+        if (weather == Weather.SNOW or weather == Weather.SNOWSCAPE) and PokemonType.ICE in types:
+            return True
+
+        # check moves
+        for move in mon.moves.values():
+            move_id = move.id.lower()
+            if weather == Weather.SUNNYDAY:
+                if move_id in ["solarbeam", "weatherball", "heatwave", "flareblitz", "overheat"]:
+                    return True
+            elif weather == Weather.RAINDANCE:
+                if move_id in [
+                    "hurricane",
+                    "electroshot",
+                    "weatherball",
+                    "hydropump",
+                    "wavecrash",
+                    "aquajet",
+                    "scald",
+                    "flipturn",
+                    "liquidation",
+                ]:
+                    return True
+            elif weather == Weather.SNOW or weather == Weather.SNOWSCAPE:
+                if move_id in ["blizzard"]:
+                    return True
+
+        return False
+
+    def _count_weather_beneficiaries(self, team: dict, weather: Weather) -> int:
+        count = 0
+        for mon in team.values():
+            if mon and not mon.fainted:
+                if self._mon_benefits_from_weather(mon, weather):
+                    count += 1
+        return count
+
+    def _is_weather_hostile(self, battle: DoubleBattle) -> bool:
+        if not battle.weather or Weather.UNKNOWN in battle.weather:
+            return False
+
+        current_weather = None
+        for w in [
+            Weather.RAINDANCE,
+            Weather.SUNNYDAY,
+            Weather.SANDSTORM,
+            Weather.SNOWSCAPE,
+            Weather.SNOW,
+        ]:
+            if w in battle.weather:
+                current_weather = w
+                break
+
+        if current_weather is None:
+            return False
+
+        our_count = self._count_weather_beneficiaries(battle.team, current_weather)
+        opp_count = self._count_weather_beneficiaries(battle.opponent_team, current_weather)
+
+        # if the opponent has more beneficiaries, then it is hostile
+        if opp_count > our_count:
+            return True
+        if opp_count > 0 and our_count == 0:
+            return True
+
+        return False
 
     def get_threat_level(
         self, opp_mon: Pokemon, active_mons: List[Pokemon], battle: DoubleBattle
@@ -228,12 +412,12 @@ class FuzzyHeuristic(Player):
             return 0.0
 
         threat = 0.0
-        opp_speed = self.get_actual_speed(opp_mon)
+        opp_speed = self.get_actual_speed(opp_mon, battle)
         is_tr = Field.TRICK_ROOM in battle.fields
 
         for ally in active_mons:
             if ally and not ally.fainted:
-                ally_speed = self.get_actual_speed(ally)
+                ally_speed = self.get_actual_speed(ally, battle)
                 is_faster = (opp_speed > ally_speed and not is_tr) or (
                     opp_speed < ally_speed and is_tr
                 )
@@ -320,8 +504,8 @@ class FuzzyHeuristic(Player):
             t_defender_id = self._get_active_identifier(t_opp, battle, True)
             try:
                 dmg, _ = calculate_damage(
-                    attacker_identifier=attacker_id,
-                    defender_identifier=t_defender_id,
+                    attacker_id=attacker_id,
+                    defender_id=t_defender_id,
                     move=move,
                     battle=battle,
                 )
@@ -347,8 +531,8 @@ class FuzzyHeuristic(Player):
                     total_dmg_score += PRIORITY_KO_BONUS
 
             if move.priority > 0 and active_mon.current_hp_fraction < 0.3:
-                our_speed = self.get_actual_speed(active_mon)
-                opp_speed = self.get_actual_speed(t_opp)
+                our_speed = self.get_actual_speed(active_mon, battle)
+                opp_speed = self.get_actual_speed(t_opp, battle)
                 if our_speed < opp_speed:
                     total_dmg_score += PRIORITY_LOW_HP_BONUS
 
@@ -358,8 +542,8 @@ class FuzzyHeuristic(Player):
         score += total_dmg_score
 
         if move.id == "suckerpunch":
-            our_speed = self.get_actual_speed(active_mon)
-            opp_speed = self.get_actual_speed(opp_active)
+            our_speed = self.get_actual_speed(active_mon, battle)
+            opp_speed = self.get_actual_speed(opp_active, battle)
 
             if our_speed > opp_speed:
                 score += -20.0
@@ -420,7 +604,62 @@ class FuzzyHeuristic(Player):
         ):
             score += KNOCK_OFF_ITEM_BONUS
 
+        # weather bonuses/penalties for moves
+        weather = battle.weather
+        if weather and Weather.UNKNOWN not in weather:
+            is_rain = Weather.RAINDANCE in weather
+            is_sun = Weather.SUNNYDAY in weather
+            is_snow = Weather.SNOW in weather
+
+            if move.id == "solarbeam":
+                if is_sun:
+                    score += SOLAR_BEAM_SUN_BONUS
+                else:
+                    score += SOLAR_BEAM_NO_SUN_PENALTY
+            elif move.id == "hurricane":
+                if is_rain:
+                    score += HURRICANE_RAIN_BONUS
+                elif is_sun:
+                    score += HURRICANE_SUN_PENALTY
+            elif move.id == "electroshot":
+                if is_rain:
+                    score += ELECTRO_SHOT_RAIN_BONUS
+                else:
+                    score += SOLAR_BEAM_NO_SUN_PENALTY
+            elif move.id == "blizzard":
+                if is_snow:
+                    score += BLIZZARD_SNOW_BONUS
+            elif move.id == "weatherball":
+                score += WEATHER_MOVE_POWER_BONUS
+
+            # check type-based weather boosts
+            if move.type == PokemonType.WATER:
+                if is_rain:
+                    score += WEATHER_MOVE_POWER_BONUS
+                elif is_sun:
+                    score += WEATHER_MOVE_POWER_PENALTY
+            elif move.type == PokemonType.FIRE:
+                if is_sun:
+                    score += WEATHER_MOVE_POWER_BONUS
+                elif is_rain:
+                    score += WEATHER_MOVE_POWER_PENALTY
+        else:
+            # no weather active
+            if move.id in ["solarbeam", "electroshot"]:
+                score += SOLAR_BEAM_NO_SUN_PENALTY
+
         acc = move.accuracy if move.accuracy is not None else 1.0
+        # adjust accuracy dynamically for weather-dependent moves
+        if weather and Weather.UNKNOWN not in weather:
+            is_rain = Weather.RAINDANCE in weather
+            is_snow = (
+                Weather.SNOW in weather or Weather.SNOWSCAPE in weather or Weather.HAIL in weather
+            )
+            if move.id == "hurricane" and is_rain:
+                acc = 1.0
+            elif move.id == "blizzard" and is_snow:
+                acc = 1.0
+
         score *= acc
         return score
 
@@ -510,10 +749,10 @@ class FuzzyHeuristic(Player):
                 helps = False
                 for ally in battle.active_pokemon:
                     if ally and not ally.fainted:
-                        ally_speed = self.get_actual_speed(ally)
+                        ally_speed = self.get_actual_speed(ally, battle)
                         for opp in battle.opponent_active_pokemon:
                             if opp and not opp.fainted:
-                                opp_speed = self.get_actual_speed(opp)
+                                opp_speed = self.get_actual_speed(opp, battle)
                                 if ally_speed < opp_speed or (ally_speed < opp_speed * 1.5):
                                     helps = True
                 if helps:
@@ -672,9 +911,21 @@ class FuzzyHeuristic(Player):
         elif move.id == "raindance":
             if Weather.RAINDANCE in battle.weather:
                 return -50.0
-            has_water = any(PokemonType.WATER in m.types for m in battle.team.values() if m)
-            if has_water:
+
+            if self._is_weather_hostile(battle):
+                score += WEATHER_OVERRIDE_BONUS
+            else:
                 score += RAIN_DANCE_BONUS
+
+            our_bens = self._count_weather_beneficiaries(battle.team, Weather.RAINDANCE)
+            score += our_bens * WEATHER_BENEFICIARY_ACTIVE_BONUS
+
+            opp_bens = self._count_weather_beneficiaries(battle.opponent_team, Weather.RAINDANCE)
+            score -= opp_bens * WEATHER_BENEFICIARY_ACTIVE_BONUS
+
+            # redundant since sableye only setter
+            if active_mon.ability == "prankster":
+                score += 5.0
 
         elif move.id == "partingshot":
             score += PARTING_SHOT_BONUS
@@ -757,18 +1008,28 @@ class FuzzyHeuristic(Player):
 
             weather_abilities = {"drought", "sandstream", "drizzle", "snowwarning"}
             if switch_mon.ability in weather_abilities:
-                if not battle.weather:
+                target_weather = self._weather_for_ability(switch_mon.ability)
+                if target_weather and (not battle.weather or target_weather not in battle.weather):
                     score += SWITCH_WEATHER_ABILITY_BONUS
-                elif switch_mon.ability == "drought" and Weather.SUNNYDAY not in battle.weather:
-                    score += SWITCH_WEATHER_ABILITY_BONUS
-                elif switch_mon.ability == "sandstream" and Weather.SANDSTORM not in battle.weather:
-                    score += SWITCH_WEATHER_ABILITY_BONUS
-                elif switch_mon.ability == "drizzle" and Weather.RAINDANCE not in battle.weather:
-                    score += SWITCH_WEATHER_ABILITY_BONUS
-                elif switch_mon.ability == "snowwarning" and (
-                    Weather.SNOW not in battle.weather and Weather.HAIL not in battle.weather
-                ):
-                    score += SWITCH_WEATHER_ABILITY_BONUS
+
+                    if self._is_weather_hostile(battle):
+                        score += WEATHER_OVERRIDE_BONUS
+
+                    for m in battle.team.values():
+                        if m and not m.fainted and m != switch_mon:
+                            if self._mon_benefits_from_weather(m, target_weather):
+                                if m in battle.active_pokemon:
+                                    score += WEATHER_BENEFICIARY_ACTIVE_BONUS
+                                else:
+                                    score += WEATHER_BENEFICIARY_BENCH_BONUS
+
+                    for m in battle.opponent_team.values():
+                        if m and not m.fainted:
+                            if self._mon_benefits_from_weather(m, target_weather):
+                                if m in battle.opponent_active_pokemon:
+                                    score -= WEATHER_BENEFICIARY_ACTIVE_BONUS
+                                else:
+                                    score -= WEATHER_BENEFICIARY_BENCH_BONUS
 
             if switch_mon.ability == "intimidate":
                 has_defiant = any(
@@ -807,6 +1068,31 @@ class FuzzyHeuristic(Player):
                     score = self.score_status_move(move, order, slot, battle)
                 if order.mega:
                     score += MEGA_EVOLUTION_BONUS
+
+                    mega_weather_abilities = {"drought", "sandstream", "drizzle", "snowwarning"}
+                    if active_mon.ability in mega_weather_abilities:
+                        target_weather = self._weather_for_ability(active_mon.ability)
+                        if target_weather and (
+                            not battle.weather or target_weather not in battle.weather
+                        ):
+                            if self._is_weather_hostile(battle):
+                                score += WEATHER_OVERRIDE_BONUS
+
+                            for m in battle.team.values():
+                                if m and not m.fainted and m != active_mon:
+                                    if self._mon_benefits_from_weather(m, target_weather):
+                                        if m in battle.active_pokemon:
+                                            score += WEATHER_BENEFICIARY_ACTIVE_BONUS
+                                        else:
+                                            score += WEATHER_BENEFICIARY_BENCH_BONUS
+
+                            for m in battle.opponent_team.values():
+                                if m and not m.fainted:
+                                    if self._mon_benefits_from_weather(m, target_weather):
+                                        if m in battle.opponent_active_pokemon:
+                                            score -= WEATHER_BENEFICIARY_ACTIVE_BONUS
+                                        else:
+                                            score -= WEATHER_BENEFICIARY_BENCH_BONUS
                 return score
             finally:
                 if order.mega:
@@ -857,10 +1143,8 @@ class FuzzyHeuristic(Player):
                 if target_mon and not target_mon.fainted:
                     try:
                         dmg, _ = calculate_damage(
-                            attacker_identifier=self._get_active_identifier(active1, battle, False),
-                            defender_identifier=self._get_active_identifier(
-                                target_mon, battle, True
-                            ),
+                            attacker_id=self._get_active_identifier(active1, battle, False),
+                            defender_id=self._get_active_identifier(target_mon, battle, True),
                             move=move1,
                             battle=battle,
                         )
@@ -883,10 +1167,8 @@ class FuzzyHeuristic(Player):
                 if target_mon and not target_mon.fainted:
                     try:
                         dmg, _ = calculate_damage(
-                            attacker_identifier=self._get_active_identifier(active0, battle, False),
-                            defender_identifier=self._get_active_identifier(
-                                target_mon, battle, True
-                            ),
+                            attacker_id=self._get_active_identifier(active0, battle, False),
+                            defender_id=self._get_active_identifier(target_mon, battle, True),
                             move=move0,
                             battle=battle,
                         )
@@ -936,22 +1218,14 @@ class FuzzyHeuristic(Player):
                     if target_mon and not target_mon.fainted:
                         try:
                             dmg0, _ = calculate_damage(
-                                attacker_identifier=self._get_active_identifier(
-                                    active0, battle, False
-                                ),
-                                defender_identifier=self._get_active_identifier(
-                                    target_mon, battle, True
-                                ),
+                                attacker_id=self._get_active_identifier(active0, battle, False),
+                                defender_id=self._get_active_identifier(target_mon, battle, True),
                                 move=move0,
                                 battle=battle,
                             )
                             dmg1, _ = calculate_damage(
-                                attacker_identifier=self._get_active_identifier(
-                                    active1, battle, False
-                                ),
-                                defender_identifier=self._get_active_identifier(
-                                    target_mon, battle, True
-                                ),
+                                attacker_id=self._get_active_identifier(active1, battle, False),
+                                defender_id=self._get_active_identifier(target_mon, battle, True),
                                 move=move1,
                                 battle=battle,
                             )
@@ -976,12 +1250,10 @@ class FuzzyHeuristic(Player):
                             try:
                                 attacker_mon = active0 if attacker_idx == 0 else active1
                                 dmg, _ = calculate_damage(
-                                    attacker_identifier=self._get_active_identifier(
+                                    attacker_id=self._get_active_identifier(
                                         attacker_mon, battle, False
                                     ),
-                                    defender_identifier=self._get_active_identifier(
-                                        opp, battle, True
-                                    ),
+                                    defender_id=self._get_active_identifier(opp, battle, True),
                                     move=move,
                                     battle=battle,
                                 )
