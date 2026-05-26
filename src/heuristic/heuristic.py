@@ -123,6 +123,15 @@ HURRICANE_SUN_PENALTY = -10.0
 ELECTRO_SHOT_RAIN_BONUS = 12.0
 BLIZZARD_SNOW_BONUS = 8.0
 
+# team preview scoring constants
+TP_MEGA_BONUS = 30.0
+TP_LEAD_WEATHER_SYNERGY = 20.0  # bonus for leading weather setter + beneficiary
+TP_LEAD_TAILWIND_ATTACKER = 10.0
+TP_LEAD_TR_SETTER = 10.0
+TP_LEAD_FAKE_OUT = 8.0
+TP_LEAD_INTIMIDATE = 6.0
+TP_TYPE_MATCHUP_WEIGHT = 2.0  # multiplier for type coverage score
+
 
 # stat increases assumed for calcs
 ASSUMED_HP_BONUS = 107
@@ -1345,6 +1354,205 @@ class FuzzyHeuristic(Player):
 
         return chosen_joint
 
+    def _score_team_combination(
+        self, combination: List[Pokemon], opponent_team: List[Pokemon]
+    ) -> float:
+        score = 0.0
+
+        has_mega = any(mon.item and "ite" in mon.item.lower() for mon in combination)
+        if has_mega:
+            score += TP_MEGA_BONUS
+
+        def get_set_weather(mon: Pokemon) -> Weather | None:
+            if mon.ability in ["drizzle", "drought", "sandstream", "snowwarning"]:
+                return self._weather_for_ability(mon.ability)
+            if mon.item and "ite" in mon.item.lower():
+                spec = mon.species.lower().replace(" ", "").replace("-", "")
+                mega_ability = None
+                if spec == "charizard" and "charizarditey" in mon.item.lower():
+                    mega_ability = "drought"
+                elif spec == "froslass":
+                    mega_ability = "snowwarning"
+                elif spec == "tyranitar":
+                    mega_ability = "sandstream"
+                if mega_ability:
+                    return self._weather_for_ability(mega_ability)
+            return None
+
+        opp_has_weather_setter = {}
+        for w in [Weather.RAINDANCE, Weather.SUNNYDAY, Weather.SANDSTORM, Weather.SNOW]:
+            opp_has_weather_setter[w] = False
+            for opp_mon in opponent_team:
+                if opp_mon.ability in ["drizzle", "drought", "sandstream", "snowwarning"]:
+                    if self._weather_for_ability(opp_mon.ability) == w:
+                        opp_has_weather_setter[w] = True
+                if opp_mon.item and "ite" in opp_mon.item.lower():
+                    spec = opp_mon.species.lower().replace(" ", "").replace("-", "")
+                    mega_ability = None
+                    if spec == "charizard" and "charizarditey" in opp_mon.item.lower():
+                        mega_ability = "drought"
+                    elif spec == "froslass":
+                        mega_ability = "snowwarning"
+                    elif spec == "tyranitar":
+                        mega_ability = "sandstream"
+                    if mega_ability and self._weather_for_ability(mega_ability) == w:
+                        opp_has_weather_setter[w] = True
+
+        set_weathers = set()
+        for mon in combination:
+            w = get_set_weather(mon)
+            if w:
+                set_weathers.add(w)
+
+        def get_off_types(mon: Pokemon) -> List[PokemonType]:
+            t_list = []
+            for move in mon.moves.values():
+                if move.type and move.category != MoveCategory.STATUS:
+                    t_list.append(move.type)
+            if not t_list:
+                if mon.type_1:
+                    t_list.append(mon.type_1)
+                if mon.type_2:
+                    t_list.append(mon.type_2)
+            return list(set(t_list))
+
+        def get_opp_off_types(opp_mon: Pokemon) -> List[PokemonType]:
+            t_list = []
+            for move in opp_mon.moves.values():
+                if move.type and move.category != MoveCategory.STATUS:
+                    t_list.append(move.type)
+            if not t_list:
+                if opp_mon.type_1:
+                    t_list.append(opp_mon.type_1)
+                if opp_mon.type_2:
+                    t_list.append(opp_mon.type_2)
+            return list(set(t_list))
+
+        off_score = 0.0
+        for opp_mon in opponent_team:
+            max_mult = 0.0
+            for our_mon in combination:
+                for off_type in get_off_types(our_mon):
+                    try:
+                        mult = opp_mon.damage_multiplier(off_type)
+                        if mult > max_mult:
+                            max_mult = mult
+                    except Exception:
+                        pass
+            if max_mult >= 2.0:
+                off_score += 3.0
+            elif max_mult >= 1.0:
+                off_score += 1.0
+            else:
+                off_score -= 2.0
+
+        def_score = 0.0
+        for opp_mon in opponent_team:
+            opp_types = get_opp_off_types(opp_mon)
+            for our_mon in combination:
+                for o_type in opp_types:
+                    try:
+                        mult = our_mon.damage_multiplier(o_type)
+                        if mult < 1.0:
+                            def_score += 1.0
+                        elif mult > 1.0:
+                            def_score -= 1.0
+                    except Exception:
+                        pass
+
+        score += (off_score + def_score) * TP_TYPE_MATCHUP_WEIGHT
+        return score
+
+    def _score_lead_synergy(self, lead0: Pokemon, lead1: Pokemon) -> float:
+        score = 0.0
+
+        def get_set_weather(mon: Pokemon) -> Weather | None:
+            if mon.ability in ["drizzle", "drought", "sandstream", "snowwarning"]:
+                return self._weather_for_ability(mon.ability)
+            if mon.item and "ite" in mon.item.lower():
+                spec = mon.species.lower().replace(" ", "").replace("-", "")
+                mega_ability = None
+                if spec == "charizard" and "charizarditey" in mon.item.lower():
+                    mega_ability = "drought"
+                elif spec == "froslass":
+                    mega_ability = "snowwarning"
+                elif spec == "tyranitar":
+                    mega_ability = "sandstream"
+                if mega_ability:
+                    return self._weather_for_ability(mega_ability)
+            return None
+
+        lead0_weather = get_set_weather(lead0)
+        lead1_weather = get_set_weather(lead1)
+
+        if lead0_weather and self._mon_benefits_from_weather(lead1, lead0_weather):
+            score += TP_LEAD_WEATHER_SYNERGY
+        if lead1_weather and self._mon_benefits_from_weather(lead0, lead1_weather):
+            score += TP_LEAD_WEATHER_SYNERGY
+
+        lead0_has_tw = "tailwind" in lead0.moves
+        lead1_has_tw = "tailwind" in lead1.moves
+        lead0_is_attacker = any(m.category != MoveCategory.STATUS for m in lead0.moves.values())
+        lead1_is_attacker = any(m.category != MoveCategory.STATUS for m in lead1.moves.values())
+
+        if (lead0_has_tw and lead1_is_attacker) or (lead1_has_tw and lead0_is_attacker):
+            score += TP_LEAD_TAILWIND_ATTACKER
+
+        lead0_has_tr = "trickroom" in lead0.moves
+        lead1_has_tr = "trickroom" in lead1.moves
+        if lead0_has_tr or lead1_has_tr:
+            score += TP_LEAD_TR_SETTER
+
+        lead0_has_fo = "fakeout" in lead0.moves
+        lead1_has_fo = "fakeout" in lead1.moves
+        if lead0_has_fo or lead1_has_fo:
+            score += TP_LEAD_FAKE_OUT
+
+        lead0_has_int = lead0.ability == "intimidate"
+        lead1_has_int = lead1.ability == "intimidate"
+        if lead0_has_int or lead1_has_int:
+            score += TP_LEAD_INTIMIDATE
+
+        return score
+
     def teampreview(self, battle: AbstractBattle) -> str:
-        # TODO: in a bit
-        return self.random_teampreview(battle)
+        import itertools
+
+        my_mons = list(battle.team.values())
+        opp_mons = list(battle.opponent_team.values())
+
+        # rank all 15 choices of 4 pokemon
+        scored_combos = []
+        for combo in itertools.combinations(my_mons, 4):
+            score = self._score_team_combination(list(combo), opp_mons)
+            scored_combos.append((score, list(combo)))
+
+        scored_combos.sort(key=lambda x: x[0], reverse=True)
+        top_3_combos = scored_combos[:3]
+
+        # for each of top 3 combos, pick top 2 lead pairs
+        selected_permutations = []
+        for _, combo in top_3_combos:
+            lead_scores = []
+            for lead in itertools.combinations(combo, 2):
+                l0, l1 = lead
+                lead_score = self._score_lead_synergy(l0, l1)
+                back = [m for m in combo if m != l0 and m != l1]
+                lead_scores.append((lead_score, [l0, l1, back[0], back[1]]))
+
+            # sort and pick the top 2 lead pairs
+            lead_scores.sort(key=lambda x: x[0], reverse=True)
+            selected_permutations.extend([perm for _, perm in lead_scores[:2]])
+
+        if not selected_permutations:
+            return self.random_teampreview(battle)
+
+        chosen_perm = random.choice(selected_permutations)
+
+        indices = []
+        for mon in chosen_perm:
+            idx = my_mons.index(mon) + 1
+            indices.append(idx)
+            mon._selected_in_teampreview = True
+
+        return "/team " + "".join(str(i) for i in indices)
