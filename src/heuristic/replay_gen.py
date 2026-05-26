@@ -43,17 +43,22 @@ def _modify_mask(action_mask: torch.Tensor, action1):
 
 
 class ReplayRecordingPlayer(Player, ABC):
-    def __init__(self, save_dir, *args, **kwargs):
+    def __init__(self, save_dir, shard_size=12, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.save_dir = save_dir
-        self.current_episode = []
+        self.shard_size = shard_size
+        self.current_episodes = {}
         self.shard = []
 
-    def complete_episode(self):
-        # move current episode steps to the shard buffer
-        if self.current_episode:
-            self.shard.append(list(self.current_episode))
-            self.current_episode = []
+    def _battle_finished_callback(self, battle: AbstractBattle):
+        super()._battle_finished_callback(battle)
+        tag = battle.battle_tag
+        if tag in self.current_episodes:
+            steps = self.current_episodes.pop(tag)
+            if steps:
+                self.shard.append(steps)
+        if len(self.shard) >= self.shard_size:
+            self.save_shard()
 
     def save_shard(self):
         # save all buffered episodes in the shard to a single file
@@ -88,10 +93,13 @@ class ReplayRecordingPlayer(Player, ABC):
         action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
 
         action_np = await self.get_action(battle, action_mask)
-        self.current_episode.append(
+        tag = battle.battle_tag
+        if tag not in self.current_episodes:
+            self.current_episodes[tag] = []
+        self.current_episodes[tag].append(
             {"obs": obs, "mask": action_mask, "action": torch.from_numpy(action_np)}
         )
-        return MegaEnv.action_to_order(action_np, battle)
+        return MegaEnv.action_to_order(action_np, battle, strict=False)
 
     async def _handle_battle_request(
         self, battle: AbstractBattle, maybe_default_order: bool = False
@@ -101,10 +109,13 @@ class ReplayRecordingPlayer(Player, ABC):
             action_mask_list = MegaEnv.get_action_mask(battle)
             action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
             action_np = await self.get_action(battle, action_mask)
-            self.current_episode.append(
+            tag = battle.battle_tag
+            if tag not in self.current_episodes:
+                self.current_episodes[tag] = []
+            self.current_episodes[tag].append(
                 {"obs": obs, "mask": action_mask, "action": torch.from_numpy(action_np)}
             )
-            order = MegaEnv.action_to_order(action_np, battle)
+            order = MegaEnv.action_to_order(action_np, battle, strict=False)
             await self.ps_client.send_message(order.message, battle.battle_tag)
         else:
             await super()._handle_battle_request(battle, maybe_default_order)
@@ -119,8 +130,8 @@ class ReplayRecordingPlayer(Player, ABC):
 
 
 class StrategyRecordingPlayer(ReplayRecordingPlayer):
-    def __init__(self, strategy_player: Player, save_dir, *args, **kwargs):
-        super().__init__(save_dir, *args, **kwargs)
+    def __init__(self, strategy_player: Player, save_dir, shard_size=12, *args, **kwargs):
+        super().__init__(save_dir, shard_size, *args, **kwargs)
         self.strategy_player = strategy_player
 
     async def get_action(self, battle: DoubleBattle, action_mask: torch.Tensor) -> np.ndarray:
@@ -134,7 +145,7 @@ class StrategyRecordingPlayer(ReplayRecordingPlayer):
             if isinstance(order, Awaitable):
                 order = await order
 
-        action = MegaEnv.order_to_action(order, battle, fake=True, strict=False)
+        action = MegaEnv.order_to_action(order, battle, fake=True)
 
         if not battle.teampreview:
             if action[0] < 0:
@@ -180,6 +191,7 @@ async def main():
             "server_configuration": LocalhostServerConfiguration,
             "team": team,
             "accept_open_team_sheet": True,
+            "max_concurrent_battles": 16,
         }
 
     # Initialize Strategies (start_listening=False as they are wrapped)
@@ -187,23 +199,26 @@ async def main():
     sh_strat = SimpleHeuristicsPlayer(start_listening=False, **get_kwargs("SHStrat"))
     mbp_strat = MaxBasePowerPlayer(start_listening=False, **get_kwargs("MBPStrat"))
 
+    n = args.n
+    shard_size = max(1, n // 8)
+
     rec_players = {
         "fuzzy": StrategyRecordingPlayer(
             strategy_player=fuzzy_strat,
             save_dir="./replays/fuzzy_heuristic",
-            max_concurrent_battles=1,
+            shard_size=shard_size,
             **get_kwargs("RecFuzzy"),
         ),
         "sh": StrategyRecordingPlayer(
             strategy_player=sh_strat,
             save_dir="./replays/simple_heuristic",
-            max_concurrent_battles=1,
+            shard_size=shard_size,
             **get_kwargs("RecSH"),
         ),
         "mbp": StrategyRecordingPlayer(
             strategy_player=mbp_strat,
             save_dir="./replays/max_base_power",
-            max_concurrent_battles=1,
+            shard_size=shard_size,
             **get_kwargs("RecMBP"),
         ),
     }
@@ -216,14 +231,15 @@ async def main():
         "random": RandomPlayer(**get_kwargs("OppRandom")),
     }
 
-    n = args.n
     fuzzy_bound = int(0.4 * n)
     sh_bound = int(0.75 * n)
     mbp_bound = int(0.90 * n)
-    shard_size = max(1, args.n // 8)
 
     for name, player in rec_players.items():
         print(f"\n--- Generating replays for {name.upper()} ---")
+
+        # Count battles per opponent type
+        opp_counts = {}
         for i in range(n):
             if i <= fuzzy_bound:
                 opp_type = "fuzzy"
@@ -233,6 +249,11 @@ async def main():
                 opp_type = "mbp"
             else:
                 opp_type = "random"
+            opp_counts[opp_type] = opp_counts.get(opp_type, 0) + 1
+
+        for opp_type, count in opp_counts.items():
+            if count <= 0:
+                continue
 
             # use another recording player if types differ
             if opp_type in rec_players and opp_type != name:
@@ -240,21 +261,8 @@ async def main():
             else:
                 opp = opponents[opp_type]
 
-            print(f"Battle {i + 1}/{n}: {player.username} vs {opp.username} ({opp_type})")
-            await player.battle_against(opp, n_battles=1)
-
-            player.complete_episode()
-            if isinstance(opp, ReplayRecordingPlayer):
-                opp.complete_episode()
-
-            # save for player / opp only if shard size is reached
-            if len(player.shard) >= shard_size:
-                player.save_shard()
-            if isinstance(opp, ReplayRecordingPlayer) and len(opp.shard) >= shard_size:
-                opp.save_shard()
-
-        # save remaining episodes for this player
-        player.save_shard()
+            print(f"Starting {count} battles: {player.username} vs {opp.username} ({opp_type})")
+            await player.battle_against(opp, n_battles=count)
 
     # final cleanup
     for p in rec_players.values():

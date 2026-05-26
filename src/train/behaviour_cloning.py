@@ -1,14 +1,16 @@
 import random
 from pathlib import Path
+from typing import cast
 
 import torch
 from torch.utils.data import Dataset
 
 from src.model.fused_token_encoder import as_obs_dict
 from src.model.policy import PolicyNet
+from src.model.structured_observation import StructuredObservation
 from src.train.ppo_utils import initial_state
 
-BATCH_SIZE = 8  # number of episodes per gradient update
+BATCH_SIZE = 32  # number of episodes per gradient update
 
 
 class ReplayDataset(Dataset):
@@ -34,66 +36,100 @@ class ReplayDataset(Dataset):
         return self.episodes[idx]
 
 
-def _run_episode(
+def _run_batched_bc(
     policy: PolicyNet,
-    episode: list,
+    episodes: list,
     device: torch.device,
-    state=None,
-) -> tuple[torch.Tensor, int, int]:
+) -> tuple[torch.Tensor, int, int, int]:
     """
-    Run one episode with BPTT. Carries recurrent state step-to-step.
-    Uses pre-encoding for optimization.
+    Run Behavior Cloning BPTT over a minibatch of variable-length episodes.
+    Returns (total_loss, correct_predictions, total_predictions, total_steps).
     """
-    if not episode:
-        return torch.tensor(0.0, device=device), 0, 0
+    if not episodes:
+        return torch.tensor(0.0, device=device), 0, 0, 0
 
-    if state is None:
-        state = initial_state(policy, 1, device)
+    episodes = sorted(episodes, key=len, reverse=True)
+    batch_size = len(episodes)
+    lengths = torch.tensor([len(ep) for ep in episodes], device=device)
+    max_steps = int(lengths[0].item())
 
-    # Pre-encode all observations in the episode
-    all_obs = torch.cat([sample["obs"].unsqueeze(0) for sample in episode], dim=0).to(device)
+    all_obs_tensors = []
+    for ep in episodes:
+        all_obs_tensors.append(torch.cat([sample["obs"].unsqueeze(0) for sample in ep], dim=0))
+    all_obs = cast(StructuredObservation, torch.cat(all_obs_tensors, dim=0).to(device))
     all_tokens = policy.encoder(as_obs_dict(all_obs))
 
-    # Pre-extract other fields
-    all_masks = torch.cat([sample["mask"].unsqueeze(0) for sample in episode], dim=0).to(device)
-    all_targets = torch.cat([sample["action"].unsqueeze(0) for sample in episode], dim=0).to(device)
-    all_is_tp = (all_obs.numerical[:, 25, 2] > 0.5).to(device)
+    tokens_list = torch.split(all_tokens, [len(ep) for ep in episodes])
 
-    loss = torch.tensor(0.0, device=device)
+    def pack(fields):
+        return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
+
+    all_masks_list = [
+        torch.cat([sample["mask"].unsqueeze(0) for sample in ep], dim=0) for ep in episodes
+    ]
+    all_targets_list = [
+        torch.cat([sample["action"].unsqueeze(0) for sample in ep], dim=0) for ep in episodes
+    ]
+
+    masks_p = pack(all_masks_list)
+    targets_p = pack(all_targets_list)
+
+    all_is_tp = all_obs.numerical[:, 25, 2] > 0.5
+    is_tp_split = torch.split(all_is_tp, [len(ep) for ep in episodes])
+    is_tp_p = pack(is_tp_split)
+
+    state = initial_state(policy, batch_size, device)
+    total_loss = torch.tensor(0.0, device=device)
     correct = 0
     total = 0
+    total_steps = 0
 
-    for t in range(len(episode)):
-        tokens_t = all_tokens[t : t + 1]
-        mask_t = all_masks[t : t + 1]
-        target_t = all_targets[t : t + 1]
-        is_tp_t = all_is_tp[t : t + 1]
+    for t in range(max_steps):
+        active_n = int((lengths > t).sum().item())
+        if active_n == 0:
+            break
 
+        tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
+        masks_t = masks_p[:active_n, t]
+        targets_t = targets_p[:active_n, t]
+        is_tp_t = is_tp_p[:active_n, t]
+
+        curr_state = (state[0][:active_n], state[1][:active_n])
         log_prob, _, _, _, next_state = policy.evaluate_actions_tokens(
-            tokens_t, is_tp_t, target_t, mask_t, state
+            tokens_t, is_tp_t, targets_t, masks_t, state=curr_state
         )
-        loss -= log_prob.mean()
+
+        loss = -log_prob.sum()
+        total_loss = total_loss + loss
+        total_steps += active_n
 
         with torch.no_grad():
             logits, _, _, _, _ = policy.forward_tokens(
-                tokens_t, is_tp_t, state, mask_t, sample_actions=False, actions=target_t
+                tokens_t, is_tp_t, curr_state, masks_t, sample_actions=False, actions=targets_t
             )
             preds = torch.stack(
                 [logits[:, 0].argmax(dim=-1), logits[:, 1].argmax(dim=-1)],
                 dim=-1,
             )
-            correct += (preds == target_t).sum().item()
-            total += target_t.numel()
+            correct += (preds == targets_t).sum().item()
+            total += targets_t.numel()
 
-        state = next_state
+        state_cls, state_hg = next_state
+        if active_n < batch_size:
+            padded_cls = torch.cat([state_cls, state[0][active_n:]], dim=0)
+            padded_hg = torch.cat([state_hg, state[1][active_n:]], dim=0)
+            state = (padded_cls, padded_hg)
+        else:
+            state = next_state
 
-    return loss, correct, total
+    return total_loss, int(correct), total, total_steps
 
 
 def _evaluate_episodes(
     policy: PolicyNet,
     episodes: list,
     device: torch.device,
+    batch_size: int = 32,
 ) -> tuple[float, int, int]:
     total_loss = 0.0
     correct = 0
@@ -101,14 +137,17 @@ def _evaluate_episodes(
     tot_steps = 0
 
     with torch.inference_mode():
-        for episode in episodes:
-            ep_loss, ep_correct, ep_total = _run_episode(policy, episode, device)
-            total_loss += ep_loss.item()
-            correct += ep_correct
-            total += ep_total
-            tot_steps += len(episode)
+        for batch_start in range(0, len(episodes), batch_size):
+            batch = episodes[batch_start : batch_start + batch_size]
+            batch_loss, batch_correct, batch_total, batch_steps = _run_batched_bc(
+                policy, batch, device
+            )
+            total_loss += batch_loss.item()
+            correct += batch_correct
+            total += batch_total
+            tot_steps += batch_steps
 
-    return total_loss / tot_steps, correct, total
+    return total_loss / tot_steps if tot_steps > 0 else 0.0, correct, total
 
 
 def train_behavior_cloning(
@@ -157,21 +196,18 @@ def train_behavior_cloning(
             batch = train_episodes[batch_start : batch_start + batch_size]
             optimizer.zero_grad(set_to_none=True)
 
-            batch_loss = torch.tensor(0.0, device=device)
-            total_steps = 0
-            for episode in batch:
-                ep_loss, correct, total = _run_episode(policy, episode, device)
-                batch_loss += ep_loss
-                total_steps += len(episode)
+            batch_loss, correct, total, steps = _run_batched_bc(policy, batch, device)
+
+            if steps > 0:
+                scaled_loss = batch_loss / steps
+                scaled_loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                optimizer.step()
+
                 train_correct += correct
                 train_total += total
-
-            (batch_loss / total_steps).backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            optimizer.step()
-
-            train_loss_sum += (batch_loss / total_steps).item()
-            num_updates += 1
+                train_loss_sum += scaled_loss.item()
+                num_updates += 1
 
         if train_total > 0:
             print(
