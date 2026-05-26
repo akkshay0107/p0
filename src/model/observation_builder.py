@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
-
 import torch
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.battle.field import Field
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
 
-from src.lookups import ACT_SIZE
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
     MAX_VOLATILES,
@@ -21,10 +18,6 @@ from src.model.structured_observation import (
     TokenType,
 )
 from src.model.tokenizer import PokemonTokenizer, tokenizer
-
-# TODO: probably the biggest bottleneck in throughput trajectory
-# try to profile a battle -> action forward pass and then
-# optimize this implementation entirely
 
 
 def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) -> float:
@@ -71,23 +64,31 @@ def _pokemon_categorical(
         return [0] * CATEGORICAL_WIDTH
 
     move_slots = _iter_move_slots(pokemon)
-    move_ids = [tok.move_id(move) if move is not None else 0 for move in move_slots]
-    move_type_ids = [tok.move_type_id(move) if move is not None else 0 for move in move_slots]
-    move_category_ids = [
-        tok.move_category_id(move) if move is not None else 0 for move in move_slots
-    ]
-    volatile_ids = tok.volatile_ids(getattr(pokemon, "effects", None))
+    move_ids = []
+    move_type_ids = []
+    move_category_ids = []
+    for move in move_slots:
+        if move is not None:
+            move_ids.append(tok.move_id(move))
+            move_type_ids.append(tok.move_type_id(move))
+            move_category_ids.append(tok.move_category_id(move))
+        else:
+            move_ids.append(0)
+            move_type_ids.append(0)
+            move_category_ids.append(0)
+
+    volatile_ids = tok.volatile_ids(pokemon.effects)
 
     return [
         tok.species_id(pokemon),
         tok.ability_id(pokemon),
         tok.item_id(pokemon),
-        tok.type_id(getattr(pokemon, "type_1", None)),
-        tok.type_id(getattr(pokemon, "type_2", None)),
+        tok.type_id(pokemon.type_1),
+        tok.type_id(pokemon.type_2),
         *move_ids,
         *move_type_ids,
         *move_category_ids,
-        tok.status_id(getattr(pokemon, "status", None)),
+        tok.status_id(pokemon.status),
         *volatile_ids,
     ]
 
@@ -97,6 +98,7 @@ def _pokemon_numeric(
     battle: DoubleBattle,
     cond: int,
     orig_idx: int,
+    active_idx: int | None = None,
 ) -> list[float]:
     row = [0.0] * NUMERICAL_WIDTH
     row[cond + 1] = 1.0
@@ -104,28 +106,28 @@ def _pokemon_numeric(
     if pokemon is None:
         return row
 
-    row[6] = float(getattr(pokemon, "current_hp_fraction", 0.0) or 0.0)
+    row[6] = float(pokemon.current_hp_fraction)
 
-    base_stats = getattr(pokemon, "base_stats", {}) or {}
+    base_stats = pokemon.base_stats
     for i, stat in enumerate(["hp", "atk", "def", "spa", "spd", "spe"]):
-        row[7 + i] = float(base_stats.get(stat, 0.0)) / 200.0
+        row[7 + i] = float(base_stats[stat]) / 200.0
 
-    boosts = getattr(pokemon, "boosts", {}) or {}
+    boosts = pokemon.boosts
     for i, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
-        row[13 + i] = float(boosts.get(stat, 0.0)) / 6.0
+        row[13 + i] = float(boosts[stat]) / 6.0
 
     for i, move in enumerate(_iter_move_slots(pokemon)):
         if move is not None:
-            row[20 + i] = _safe_fraction(getattr(move, "current_pp", 0), getattr(move, "max_pp", 0))
+            row[20 + i] = _safe_fraction(move.current_pp, move.max_pp)
 
-    row[24] = min(float(getattr(pokemon, "protect_counter", 0.0) or 0.0), 4.0) / 4.0
-    row[25] = float(bool(getattr(pokemon, "first_turn", False)))
-    row[26] = min(float(getattr(pokemon, "weight", 0.0) or 0.0), 300.0) / 300.0
+    row[24] = min(float(pokemon.protect_counter), 4.0) / 4.0
+    row[25] = float(pokemon.first_turn)
+    row[26] = min(pokemon.weight, 300.0) / 300.0
     row[27] = 0.0 if orig_idx < 0 else (orig_idx + 1) / float(TEAM_SIZE)
-    row[28] = float(bool(getattr(pokemon, "fainted", False)))
+    row[28] = float(pokemon.fainted)
     row[29] = float(cond == 1)
     row[30] = float(cond == 2)
-    row[31] = float(_can_mega(pokemon))
+    row[31] = float(_can_mega(pokemon, battle, active_idx))
     row[32] = float(_is_mega_form(pokemon))
 
     last_move_id = _get_last_move(battle, pokemon) if cond == 1 else None
@@ -134,16 +136,14 @@ def _pokemon_numeric(
         if last_move_id in move_ids:
             row[33] = (move_ids.index(last_move_id) + 1) / float(MOVE_SLOTS)
 
-    row[34] = min(float(getattr(pokemon, "status_counter", 0.0) or 0.0), 5.0) / 5.0
-    row[35] = min(max(len(getattr(pokemon, "effects", {}) or {}), 0), MAX_VOLATILES) / float(
-        MAX_VOLATILES
-    )
+    row[34] = min(float(pokemon.status_counter), 5.0) / 5.0
+    row[35] = min(len(pokemon.effects), MAX_VOLATILES) / float(MAX_VOLATILES)
     return row
 
 
 def _get_ordered_pokemon(
     battle: DoubleBattle, is_opponent: bool
-) -> list[tuple[Pokemon | None, int]]:
+) -> list[tuple[Pokemon | None, int, int | None]]:
     active = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
     team = battle.opponent_team if is_opponent else battle.team
 
@@ -156,31 +156,31 @@ def _get_ordered_pokemon(
         return -1
 
     if battle.teampreview:
-        res = [(mon, get_orig_idx(mon)) for mon in team.values()]
-        return (res + [(None, -1)] * TEAM_SIZE)[:TEAM_SIZE]
+        res = [(mon, get_orig_idx(mon), None) for mon in team.values()]
+        return (res + [(None, -1, None)] * TEAM_SIZE)[:TEAM_SIZE]
 
-    res: list[tuple[Pokemon | None, int]] = []
-    for mon in active:
+    res: list[tuple[Pokemon | None, int, int | None]] = []
+    for active_idx, mon in enumerate(active):
         if mon is not None:
-            res.append((mon, get_orig_idx(mon)))
+            res.append((mon, get_orig_idx(mon), None if is_opponent else active_idx))
 
-    assigned = {mon for mon, _ in res}
+    assigned = {mon for mon, _, _ in res}
     others = [mon for mon in team.values() if mon not in assigned]
 
     if is_opponent:
-        res += [(mon, -1) for mon in others]
+        res += [(mon, -1, None) for mon in others]
     else:
         possible_switches = {mon for switches in battle.available_switches for mon in switches}
         bench, dropped = [], []
         for mon in others:
             idx = get_orig_idx(mon)
             if mon.fainted or mon in possible_switches:
-                bench.append((mon, idx))
+                bench.append((mon, idx, None))
             else:
-                dropped.append((mon, idx))
+                dropped.append((mon, idx, None))
         res += bench + dropped
 
-    return (res + [(None, -1)] * TEAM_SIZE)[:TEAM_SIZE]
+    return (res + [(None, -1, None)] * TEAM_SIZE)[:TEAM_SIZE]
 
 
 def _slot_condition(
@@ -209,7 +209,7 @@ def _global_field_token(
     # terrain and gravity to be added later
     weather_id = 0
     weather_duration = 0.0
-    for weather, start_turn in getattr(battle, "_weather", {}).items():
+    for weather, start_turn in battle.weather.items():
         idx = tok.weathers.get(weather, 0)
         if idx:
             weather_id = idx
@@ -282,7 +282,9 @@ def from_battle(
 
     idx = 1
     for side, is_opponent in ((SideId.ALLY, False), (SideId.OPPONENT, True)):
-        for slot_idx, (mon, orig_idx) in enumerate(_get_ordered_pokemon(battle, is_opponent)):
+        for slot_idx, (mon, orig_idx, active_idx) in enumerate(
+            _get_ordered_pokemon(battle, is_opponent)
+        ):
             cond = _slot_condition(battle, mon, slot_idx, is_opponent)
             slot_id = slot_idx + 1
 
@@ -297,7 +299,7 @@ def from_battle(
             sides[idx] = side
             slots[idx] = slot_id
             # categorical is already 0 initialized
-            numerical[idx] = _pokemon_numeric(mon, battle, cond, orig_idx)
+            numerical[idx] = _pokemon_numeric(mon, battle, cond, orig_idx, active_idx)
             idx += 1
 
     global_cat, global_num = _global_field_token(battle, tok)
@@ -341,88 +343,15 @@ def from_battle(
 def _is_mega_form(pokemon: Pokemon | None) -> bool:
     if pokemon is None:
         return False
-    species = PokemonTokenizer.normalize_id(getattr(pokemon, "species", ""))
+    species = PokemonTokenizer.normalize_id(pokemon.species)
     return "mega" in species or species.endswith("primal")
 
 
-def _can_mega(pokemon: Pokemon | None) -> bool:
+def _can_mega(pokemon: Pokemon | None, battle: DoubleBattle, active_idx: int | None = None) -> bool:
     if pokemon is None:
         return False
-    for attr in ("can_mega_evolve", "can_mega", "can_mega_evo"):
-        value = getattr(pokemon, attr, None)
-        if value is not None:
-            return bool(value)
-    item = PokemonTokenizer.normalize_id(getattr(pokemon, "item", ""))
+    if active_idx is not None:
+        return battle.can_mega_evolve[active_idx]
+    # fallback if the above doesnt work
+    item = PokemonTokenizer.normalize_id(pokemon.item)
     return (item in {"redorb", "blueorb"} or "ite" in item) and not _is_mega_form(pokemon)
-
-
-def _team_has_mega(team: Iterable[Pokemon]) -> bool:
-    return any(_is_mega_form(mon) for mon in team if mon is not None)
-
-
-def _battle_can_mega(battle: DoubleBattle, pos: int) -> bool:
-    attrs = ("can_mega_evolve", "can_mega", "can_mega_evo")
-    for attr in attrs:
-        value = getattr(battle, attr, None)
-        if isinstance(value, (list, tuple)) and pos < len(value):
-            return bool(value[pos])
-        if isinstance(value, dict):
-            return bool(value.get(pos, False))
-    active = battle.active_pokemon[pos] if pos < len(battle.active_pokemon) else None
-    return _can_mega(active) and not _team_has_mega(battle.team.values())
-
-
-def get_action_mask(battle: AbstractBattle) -> torch.Tensor:
-    assert isinstance(battle, DoubleBattle)
-    if battle.teampreview:
-        mask = [0] * ACT_SIZE
-        for action in range(36):
-            p1 = action // 6 + 1
-            p2 = action % 6 + 1
-            if p1 < p2 and p1 <= len(battle.team) and p2 <= len(battle.team):
-                mask[action] = 1
-        return torch.tensor([mask, mask], dtype=torch.uint8)
-
-    def single_action_mask(pos: int) -> list[int]:
-        available_base_species = {p.base_species for p in battle.available_switches[pos]}
-        switch_space = [
-            i + 1
-            for i, pokemon in enumerate(battle.team.values())
-            if not battle.trapped[pos] and pokemon.base_species in available_base_species
-        ]
-
-        active_mon = battle.active_pokemon[pos]
-        if battle._wait or (any(battle.force_switch) and not battle.force_switch[pos]):
-            actions = [0]
-        elif all(battle.force_switch) and len(battle.available_switches[pos]) == 1:
-            actions = switch_space + [0]
-        elif active_mon is None:
-            actions = switch_space
-        else:
-            available_move_ids = {move.id for move in battle.available_moves[pos]}
-            move_spaces = [
-                [
-                    7 + 5 * i + target + 2
-                    for target in battle.get_possible_showdown_targets(move, active_mon)
-                ]
-                for i, move in enumerate(active_mon.moves.values())
-                if move.id in available_move_ids
-            ]
-            move_space = [action for target_actions in move_spaces for action in target_actions]
-            mega_space = [action + 20 for action in move_space if _battle_can_mega(battle, pos)]
-            if (
-                not move_space
-                and len(battle.available_moves[pos]) == 1
-                and battle.available_moves[pos][0].id in {"struggle", "recharge"}
-            ):
-                move_space = [9]
-            actions = switch_space + move_space + mega_space
-
-        actions = actions or [0]
-
-        mask = [0] * ACT_SIZE
-        for a in actions:
-            mask[a] = 1
-        return mask
-
-    return torch.tensor([single_action_mask(0), single_action_mask(1)], dtype=torch.uint8)
