@@ -21,6 +21,7 @@ from poke_env.player import (
 
 from src.env import MegaEnv
 from src.heuristic.heuristic import FuzzyHeuristic
+from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.team_picker import RandomTeamFromPool
 
@@ -83,7 +84,8 @@ class ReplayRecordingPlayer(Player, ABC):
             return DefaultBattleOrder()
 
         obs = self.get_observation(battle)
-        action_mask = observation_builder.get_action_mask(battle)
+        action_mask_list = MegaEnv.get_action_mask(battle)
+        action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
 
         action_np = await self.get_action(battle, action_mask)
         self.current_episode.append(
@@ -96,7 +98,8 @@ class ReplayRecordingPlayer(Player, ABC):
     ):
         if battle.teampreview:
             obs = self.get_observation(battle)
-            action_mask = observation_builder.get_action_mask(battle)
+            action_mask_list = MegaEnv.get_action_mask(battle)
+            action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
             action_np = await self.get_action(battle, action_mask)
             self.current_episode.append(
                 {"obs": obs, "mask": action_mask, "action": torch.from_numpy(action_np)}
@@ -180,7 +183,7 @@ async def main():
         }
 
     # Initialize Strategies (start_listening=False as they are wrapped)
-    fuzzy_strat = FuzzyHeuristic(k=3, start_listening=False, **get_kwargs("FuzzyStrat"))
+    fuzzy_strat = FuzzyHeuristic(start_listening=False, **get_kwargs("FuzzyStrat"))
     sh_strat = SimpleHeuristicsPlayer(start_listening=False, **get_kwargs("SHStrat"))
     mbp_strat = MaxBasePowerPlayer(start_listening=False, **get_kwargs("MBPStrat"))
 
@@ -207,15 +210,15 @@ async def main():
 
     # non-recording opponents for self-play and random matchups
     opponents = {
-        "fuzzy": FuzzyHeuristic(k=3, **get_kwargs("OppFuzzy")),
+        "fuzzy": FuzzyHeuristic(**get_kwargs("OppFuzzy")),
         "sh": SimpleHeuristicsPlayer(**get_kwargs("OppSH")),
         "mbp": MaxBasePowerPlayer(**get_kwargs("OppMBP")),
         "random": RandomPlayer(**get_kwargs("OppRandom")),
     }
 
     n = args.n
-    fuzzy_bound = int(0.35 * n)
-    sh_bound = int(0.70 * n)
+    fuzzy_bound = int(0.4 * n)
+    sh_bound = int(0.75 * n)
     mbp_bound = int(0.90 * n)
     shard_size = max(1, args.n // 8)
 

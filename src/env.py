@@ -119,8 +119,67 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         }
 
     @staticmethod
+    def single_action_mask(battle: DoubleBattle, pos: int) -> list[int]:
+        available_base_species = {p.base_species for p in battle.available_switches[pos]}
+        switch_space = [
+            i + 1
+            for i, pokemon in enumerate(battle.team.values())
+            if not battle.trapped[pos] and pokemon.base_species in available_base_species
+        ]
+
+        active_mon = battle.active_pokemon[pos]
+        if battle._wait or (any(battle.force_switch) and not battle.force_switch[pos]):
+            actions = [0]
+        elif all(battle.force_switch) and len(battle.available_switches[pos]) == 1:
+            actions = switch_space + [0]
+        elif active_mon is None:
+            actions = switch_space
+        else:
+            available_move_ids = {move.id for move in battle.available_moves[pos]}
+            move_spaces = [
+                [
+                    7 + 5 * i + target + 2
+                    for target in battle.get_possible_showdown_targets(move, active_mon)
+                ]
+                for i, move in enumerate(active_mon.moves.values())
+                if move.id in available_move_ids
+            ]
+            move_space = [action for target_actions in move_spaces for action in target_actions]
+            mega_space = [action + 20 for action in move_space if battle.can_mega_evolve[pos]]
+            if (
+                not move_space
+                and len(battle.available_moves[pos]) == 1
+                and battle.available_moves[pos][0].id in {"struggle", "recharge"}
+            ):
+                move_space = [9]
+            actions = switch_space + move_space + mega_space
+
+        return actions or [0]
+
+    @staticmethod
     def get_action_mask(battle: AbstractBattle) -> list[int]:
-        return observation_builder.get_action_mask(battle).tolist()
+        assert isinstance(battle, DoubleBattle)
+        # first half for lead, second half for back in TP
+        # first half for p1, second half for p2 in battle
+        mask = [0] * 2 * ACT_SIZE
+
+        if battle.teampreview:
+            for action in range(36):
+                p1 = action // 6 + 1
+                p2 = action % 6 + 1
+                if p1 < p2 and p1 <= len(battle.team) and p2 <= len(battle.team):
+                    mask[action] = 1
+                    mask[ACT_SIZE + action] = 1
+            return mask
+
+        p1_actions = MegaEnv.single_action_mask(battle, 0)
+        p2_actions = MegaEnv.single_action_mask(battle, 1)
+        for a in p1_actions:
+            mask[a] = 1
+        for a in p2_actions:
+            mask[ACT_SIZE + a] = 1
+
+        return mask
 
     @staticmethod
     def action_to_order(
@@ -430,9 +489,6 @@ class SimEnv(MegaEnv):
             log_level=25,
             team=team,
         )
-
-    def get_legal_tp_actions(self):
-        return [np.array([i, j], dtype=np.int64) for i in range(36) for j in range(36)]
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         if not battle.finished:

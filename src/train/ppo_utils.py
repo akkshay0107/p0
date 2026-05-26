@@ -48,8 +48,8 @@ class PPOConfig:
     warmup_episodes: int = 100
     min_lr: float = 1e-6
 
-    checkpoint_path: Path = Path(__file__).parent.parent / "checkpoints" / "ppo_checkpoint.pt"
-    pool_dir: Path = Path(__file__).parent.parent / "checkpoints" / "pool"
+    checkpoint_path: Path = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "ppo_checkpoint.pt"
+    pool_dir: Path = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "pool"
     pool_size: int = 40
     snapshot_interval: int = 50
     # EMA smoothing factor for per-opponent win-rate tracking (lower = smoother).

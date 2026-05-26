@@ -116,6 +116,7 @@ def collect_rollout(
         obs1 = obs[agent1]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
         mask1 = (
             torch.from_numpy(obs[agent1]["action_mask"])
+            .reshape(2, ACT_SIZE)
             .unsqueeze(0)
             .to(policy.device, non_blocking=True)
         )
@@ -125,6 +126,7 @@ def collect_rollout(
             obs2 = obs[agent2]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
             mask2 = (
                 torch.from_numpy(obs[agent2]["action_mask"])
+                .reshape(2, ACT_SIZE)
                 .unsqueeze(0)
                 .to(policy.device, non_blocking=True)
             )
@@ -156,6 +158,7 @@ def collect_rollout(
             )
             mask2 = (
                 torch.from_numpy(obs[agent2]["action_mask"])
+                .reshape(2, ACT_SIZE)
                 .unsqueeze(0)
                 .to(opponent_policy.device, non_blocking=True)
             )

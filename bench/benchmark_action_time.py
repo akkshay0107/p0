@@ -12,7 +12,8 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.player import SimpleHeuristicsPlayer
 from torch.distributions import Categorical
 
-from src.model import observation_builder
+from src.env import MegaEnv
+from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
 from src.model.tokenizer import tokenizer
 from src.rl_player import RLPlayer
@@ -93,7 +94,8 @@ class ProfiledRLPlayer(RLPlayer):
 
             # action mask fetch
             start_mask = get_time()
-            action_mask = observation_builder.get_action_mask(battle)
+            action_mask_list = MegaEnv.get_action_mask(battle)
+            action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
             TimeTracker.action_mask_time += get_time() - start_mask
 
             # cpu to gpu moving stage (underrepresented if device is cpu)

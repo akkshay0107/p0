@@ -14,6 +14,7 @@ from poke_env.player import DefaultBattleOrder, Player
 from torch.distributions import Categorical
 
 from src.env import MegaEnv
+from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
 from src.team_picker import RandomTeamFromPool
@@ -98,7 +99,8 @@ class RLPlayer(Player):
 
     def _get_action(self, battle: AbstractBattle, is_tp: bool):
         obs = self.get_observation(battle)
-        action_mask = observation_builder.get_action_mask(battle)
+        action_mask_list = MegaEnv.get_action_mask(battle)
+        action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
 
         # Ensure obs is batched and moved to device
         if hasattr(obs, "unsqueeze"):
