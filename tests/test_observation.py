@@ -1,7 +1,6 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
 
 import pytest
 import torch
@@ -19,6 +18,7 @@ from poke_env.player import RandomPlayer
 from src.model.observation_builder import (
     _get_ordered_pokemon,
     _global_field_token,
+    _iter_move_slots,
     _pokemon_categorical,
     _pokemon_numeric,
     _side_token,
@@ -175,7 +175,7 @@ def sample_team():
 def test_pokemon_categorical_real():
     """Verify that _pokemon_categorical maps all features correctly to vocabulary IDs using real Pokemon."""
     # None Pokemon returns 24 zeros
-    assert _pokemon_categorical(None, tokenizer) == [0] * CATEGORICAL_WIDTH
+    assert _pokemon_categorical(None, tokenizer, _iter_move_slots(None)) == [0] * CATEGORICAL_WIDTH
 
     # Active Pokemon with custom moves and effects
     moves = {"closecombat": 10, "airslash": 15}
@@ -191,25 +191,25 @@ def test_pokemon_categorical_real():
         status=Status.BRN,
     )
 
-    cat = _pokemon_categorical(mon, tokenizer)
+    cat = _pokemon_categorical(mon, tokenizer, _iter_move_slots(mon))
     assert len(cat) == CATEGORICAL_WIDTH
 
     # Species, Ability, Item, Type 1, Type 2
     assert cat[0] == tokenizer.species_id(mon)
     assert cat[1] == tokenizer.ability_id(mon)
     assert cat[2] == tokenizer.item_id(mon)
-    assert cat[3] == tokenizer.type_id("Fire")
-    assert cat[4] == tokenizer.type_id("Flying")
+    assert cat[3] == tokenizer.type_id(PokemonType.from_name("Fire"))
+    assert cat[4] == tokenizer.type_id(PokemonType.from_name("Flying"))
 
     # 4 Moves (padded)
-    assert cat[5] == tokenizer.move_id("closecombat")
-    assert cat[6] == tokenizer.move_id("airslash")
+    assert cat[5] == tokenizer.move_id(Move("closecombat", 9))
+    assert cat[6] == tokenizer.move_id(Move("airslash", 9))
     assert cat[7] == 0
     assert cat[8] == 0
 
     # 4 Move Types (padded)
-    assert cat[9] == tokenizer.type_id("Fighting")
-    assert cat[10] == tokenizer.type_id("Flying")
+    assert cat[9] == tokenizer.type_id(Move("closecombat", 9).type)
+    assert cat[10] == tokenizer.type_id(Move("airslash", 9).type)
     assert cat[11] == 0
     assert cat[12] == 0
 
@@ -232,7 +232,7 @@ def test_pokemon_numeric_real():
     battle = make_real_battle()
 
     # None Pokemon returns mostly zeros except for condition flag (e.g. cond=1 -> row[2] = 1.0)
-    none_row = _pokemon_numeric(None, battle, cond=1, orig_idx=-1)
+    none_row = _pokemon_numeric(None, battle, cond=1, orig_idx=-1, move_slots=_iter_move_slots(None))
     assert len(none_row) == NUMERICAL_WIDTH
     assert none_row[2] == 1.0
     assert sum(none_row) == 1.0
@@ -265,11 +265,11 @@ def test_pokemon_numeric_real():
     ]
     for w, val in weights_and_expected:
         mon._weightkg = w
-        row = _pokemon_numeric(mon, battle, cond=1, orig_idx=2)
+        row = _pokemon_numeric(mon, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon))
         assert abs(row[25] - val) < 1e-5
 
     mon._weightkg = 75
-    row = _pokemon_numeric(mon, battle, cond=1, orig_idx=2)
+    row = _pokemon_numeric(mon, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon))
     assert row[5] == 0.8  # HP fraction
     assert abs(row[6] - 78.0 / 160.0) < 1e-5  # Charizard base HP is 78
     assert abs(row[7] - 84.0 / 160.0) < 1e-5  # Charizard base Atk is 84
@@ -290,11 +290,11 @@ def test_pokemon_numeric_real():
     assert row[42] == 1.0  # Preparing (preparing_move is not None)
 
     battle._can_mega_evolve = [True, False]
-    row_mega_active = _pokemon_numeric(mon, battle, cond=1, orig_idx=2, active_idx=0)
+    row_mega_active = _pokemon_numeric(mon, battle, cond=1, orig_idx=2, active_idx=0, move_slots=_iter_move_slots(mon))
     assert row_mega_active[30] == 1.0
 
     mon_mega = make_real_pokemon(species="charizardmegay")
-    row_mega_form = _pokemon_numeric(mon_mega, battle, cond=1, orig_idx=2)
+    row_mega_form = _pokemon_numeric(mon_mega, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_mega))
     assert row_mega_form[31] == 1.0
 
     # Last move slot matching
@@ -303,7 +303,7 @@ def test_pokemon_numeric_real():
         moves={"airslash": 10},
         last_move_id="airslash",
     )
-    row_last_move = _pokemon_numeric(mon_last, battle, cond=1, orig_idx=2)
+    row_last_move = _pokemon_numeric(mon_last, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_last))
     assert row_last_move[32] == 1.0  # First move slot matched last_move
 
 

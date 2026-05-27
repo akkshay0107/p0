@@ -14,7 +14,6 @@ def test_tokenizer_normalization():
     assert PokemonTokenizer.normalize_id("Leech Seed") == "leechseed"
     assert PokemonTokenizer.normalize_id("  Thunderbolt  ") == "thunderbolt"
     assert PokemonTokenizer.normalize_id(None) == ""
-    assert PokemonTokenizer.normalize_id(123) == "123"
 
 
 def test_tokenizer_id_for():
@@ -110,13 +109,14 @@ def test_tokenizer_pokemon_attributes():
     assert tokenizer.item_id(p4) == 5
     assert tokenizer.item_id(None) == 0
 
-    assert tokenizer.type_id("Fire") == 2
+    assert tokenizer.type_id(PokemonType.FIRE) == 2
     assert tokenizer.type_id(PokemonType.WATER) == 3
     assert tokenizer.type_id(None) == 0
 
     m1 = Move("closecombat", 9)
     assert tokenizer.move_id(m1) == 11
-    assert tokenizer.move_id("aquajet") == 2
+    m_aquajet = Move("aquajet", 9)
+    assert tokenizer.move_id(m_aquajet) == 2
     assert tokenizer.move_id(None) == 0
 
     assert tokenizer.move_type_id(m1) == 7

@@ -4,10 +4,11 @@ import json
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from poke_env.battle.effect import Effect
+from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
+from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
@@ -76,6 +77,10 @@ class PokemonTokenizer:
         self.types = vocab.get("types", {})
         self.categories = vocab.get("categories", {})
 
+        # pre-bake the trickroom token ID so _global_field_token never does a runtime vocab lookup
+        _trickroom_vocab = vocab.get("trickroom", {})
+        self.trickroom_id: int = _trickroom_vocab.get("trickroom", 0)
+
         # fast path to avoid computing if no volatile status effect
         self._EMPTY_VOLATILES = [0] * MAX_VOLATILES
 
@@ -92,12 +97,12 @@ class PokemonTokenizer:
         return CLEAN_ID_RE.sub("", s.lower())
 
     @staticmethod
-    def normalize_id(name: Any) -> str:
+    def normalize_id(name: str | None) -> str:
         if name is None:
             return ""
-        return PokemonTokenizer._cached_normalize(str(name))
+        return PokemonTokenizer._cached_normalize(name)
 
-    def id_for(self, table: str, name: Any) -> int:
+    def id_for(self, table: str, name: str | None) -> int:
         vocab_table = self.vocab.get(table, {})
         return vocab_table.get(self.normalize_id(name), 0)
 
@@ -106,7 +111,7 @@ class PokemonTokenizer:
             return 0
         return self.status.get(status, 0)
 
-    def volatile_ids(self, effects: dict[Any, Any] | None) -> list[int]:
+    def volatile_ids(self, effects: dict[Effect, int] | None) -> list[int]:
         if not effects:
             return self._EMPTY_VOLATILES
 
@@ -115,7 +120,7 @@ class PokemonTokenizer:
             idx = self.volatiles.get(effect)
             if idx is None:
                 # fallback for unrecognized effects (for now since vocab not finalized)
-                name = self.normalize_id(getattr(effect, "name", effect))
+                name = self.normalize_id(effect.name)
                 idx = self._volatiles_str.get(name, 0)
 
             if idx:
@@ -124,7 +129,7 @@ class PokemonTokenizer:
         if not ids:
             return self._EMPTY_VOLATILES
 
-        ids = sorted(set(ids))[:MAX_VOLATILES]
+        ids = sorted(ids)[:MAX_VOLATILES]
         return ids + [0] * (MAX_VOLATILES - len(ids))
 
     def species_id(self, pokemon: Pokemon | None) -> int:
@@ -143,27 +148,25 @@ class PokemonTokenizer:
             return 0
         return self.items.get(self.normalize_id(pokemon.item), 0)
 
-    def type_id(self, type_obj: Any) -> int:
+    def type_id(self, type_obj: PokemonType | None) -> int:
         if type_obj is None:
             return 0
-        return self.types.get(self.normalize_id(getattr(type_obj, "name", type_obj)), 0)
+        return self.types.get(self.normalize_id(type_obj.name), 0)
 
-    def move_id(self, move: Any) -> int:
+    def move_id(self, move: Move | None) -> int:
         if move is None:
             return 0
-        move_key = getattr(move, "id", move)
-        return self.moves.get(self.normalize_id(move_key), 0)
+        return self.moves.get(self.normalize_id(move.id), 0)
 
-    def move_type_id(self, move: Any) -> int:
+    def move_type_id(self, move: Move | None) -> int:
         if move is None:
             return 0
-        return self.type_id(getattr(move, "type", None))
+        return self.type_id(move.type)
 
-    def move_category_id(self, move: Any) -> int:
+    def move_category_id(self, move: Move | None) -> int:
         if move is None:
             return 0
-        category = getattr(move, "category", None)
-        return self.categories.get(self.normalize_id(getattr(category, "name", category)), 0)
+        return self.categories.get(self.normalize_id(move.category.name), 0)
 
 
 tokenizer = PokemonTokenizer.from_file()
