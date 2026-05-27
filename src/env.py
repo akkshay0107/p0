@@ -121,10 +121,17 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
     @staticmethod
     def single_action_mask(battle: DoubleBattle, pos: int) -> list[int]:
         available_base_species = {p.base_species for p in battle.available_switches[pos]}
+        # either ps doesnt track or poke-env doesnt update
+        # the trapped variable on the second active pokemon
+        # maybe trapped works here since its only shadow tag
+        # is the only ability in the vocab that can cause the
+        # maybe_trapped to be true (in which case the pokemon)
+        # is trapped actually
         switch_space = [
             i + 1
             for i, pokemon in enumerate(battle.team.values())
-            if not battle.trapped[pos] and pokemon.base_species in available_base_species
+            if not (battle.trapped[pos] or battle.maybe_trapped[pos])
+            and pokemon.base_species in available_base_species
         ]
 
         active_mon = battle.active_pokemon[pos]

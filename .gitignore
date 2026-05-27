@@ -36,3 +36,6 @@ runs/
 *.log
 .ppoconfig
 backups/
+
+# Scratch dir for small experiments
+scratch/

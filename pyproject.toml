@@ -38,6 +38,7 @@ torch = [
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+reportPrivateImportUsage = false
 
 [tool.ruff]
 line-length = 100
