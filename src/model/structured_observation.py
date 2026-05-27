@@ -10,7 +10,7 @@ MOVE_SLOTS = 4
 MAX_VOLATILES = 6
 SEQUENCE_LENGTH = 1 + TEAM_SIZE * 2 * 2 + 3
 CATEGORICAL_WIDTH = 24
-NUMERICAL_WIDTH = 36
+NUMERICAL_WIDTH = 43
 
 
 class TokenType(IntEnum):
@@ -77,17 +77,13 @@ class StructuredObservation:
             numerical=self.numerical[index],
         )
 
-    @classmethod
-    def __torch_function__(cls, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        if func is torch.cat:
-            observations = args[0]
-            dim = kwargs.get("dim", 0)
-            return StructuredObservation(
-                token_type_ids=torch.cat([obs.token_type_ids for obs in observations], dim=dim),
-                side_ids=torch.cat([obs.side_ids for obs in observations], dim=dim),
-                slot_ids=torch.cat([obs.slot_ids for obs in observations], dim=dim),
-                categorical=torch.cat([obs.categorical for obs in observations], dim=dim),
-                numerical=torch.cat([obs.numerical for obs in observations], dim=dim),
-            )
-        return NotImplemented
+    # replaced the generic torch function since I dont think I need anything other than cat
+    @staticmethod
+    def cat(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
+        return StructuredObservation(
+            token_type_ids=torch.cat([obs.token_type_ids for obs in observations], dim=dim),
+            side_ids=torch.cat([obs.side_ids for obs in observations], dim=dim),
+            slot_ids=torch.cat([obs.slot_ids for obs in observations], dim=dim),
+            categorical=torch.cat([obs.categorical for obs in observations], dim=dim),
+            numerical=torch.cat([obs.numerical for obs in observations], dim=dim),
+        )
