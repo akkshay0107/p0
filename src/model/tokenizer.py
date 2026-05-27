@@ -157,7 +157,7 @@ class PokemonTokenizer:
     def move_type_id(self, move: Any) -> int:
         if move is None:
             return 0
-        return self.types.get(self.normalize_id(getattr(move, "type", None)), 0)
+        return self.type_id(getattr(move, "type", None))
 
     def move_category_id(self, move: Any) -> int:
         if move is None:
