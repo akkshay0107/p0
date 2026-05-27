@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import torch
 from poke_env.battle import AbstractBattle, DoubleBattle
+from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
 
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
-    MAX_VOLATILES,
     MOVE_SLOTS,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
@@ -24,23 +24,6 @@ def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) ->
     if start_turn < 0:
         return 0.0
     return max(0.0, duration - (battle.turn - start_turn)) / float(duration)
-
-
-def _get_last_move(battle: DoubleBattle, pokemon: Pokemon) -> str | None:
-    for event in reversed(battle._replay_data):
-        if len(event) > 2:
-            ev_type = event[1]
-            if ev_type in ("move", "switch", "drag", "replace"):
-                try:
-                    if battle.get_pokemon(event[2]) == pokemon:
-                        if ev_type == "move" and len(event) > 3:
-                            return PokemonTokenizer.normalize_id(event[3])
-                        else:
-                            # pokemon hasn't used a move since switching in
-                            return None
-                except Exception:
-                    continue
-    return None
 
 
 def _safe_fraction(num: float | int | None, den: float | int | None) -> float:
@@ -106,38 +89,76 @@ def _pokemon_numeric(
     if pokemon is None:
         return row
 
-    row[6] = float(pokemon.current_hp_fraction)
+    row[5] = float(pokemon.current_hp_fraction)
 
     base_stats = pokemon.base_stats
     for i, stat in enumerate(["hp", "atk", "def", "spa", "spd", "spe"]):
-        row[7 + i] = float(base_stats[stat]) / 200.0
+        row[6 + i] = float(base_stats[stat]) / 160.0
 
     boosts = pokemon.boosts
     for i, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
-        row[13 + i] = float(boosts[stat]) / 6.0
+        row[12 + i] = float(boosts[stat]) / 6.0
 
     for i, move in enumerate(_iter_move_slots(pokemon)):
         if move is not None:
-            row[20 + i] = _safe_fraction(move.current_pp, move.max_pp)
+            row[19 + i] = _safe_fraction(move.current_pp, move.max_pp)
 
-    row[24] = min(float(pokemon.protect_counter), 4.0) / 4.0
-    row[25] = float(pokemon.first_turn)
-    row[26] = min(pokemon.weight, 300.0) / 300.0
-    row[27] = 0.0 if orig_idx < 0 else (orig_idx + 1) / float(TEAM_SIZE)
-    row[28] = float(pokemon.fainted)
-    row[29] = float(cond == 1)
-    row[30] = float(cond == 2)
-    row[31] = float(_can_mega(pokemon, battle, active_idx))
-    row[32] = float(_is_mega_form(pokemon))
+    row[23] = min(float(pokemon.protect_counter), 4.0) / 4.0
+    row[24] = float(pokemon.first_turn)
 
-    last_move_id = _get_last_move(battle, pokemon) if cond == 1 else None
-    if last_move_id:
+    # embedding based on low kick tables (since that is what matters)
+    weight = pokemon.weight
+    if weight < 10.0:
+        row[25] = 0.0
+    elif weight < 25.0:
+        row[25] = 0.2
+    elif weight < 50.0:
+        row[25] = 0.4
+    elif weight < 100.0:
+        row[25] = 0.6
+    elif weight < 200.0:
+        row[25] = 0.8
+    else:
+        row[25] = 1.0
+
+    row[26] = 0.0 if orig_idx < 0 else (orig_idx + 1) / float(TEAM_SIZE)
+    row[27] = float(pokemon.fainted)
+    row[28] = float(cond == 1)
+    row[29] = float(cond == 2)
+    row[30] = float(_can_mega(pokemon, battle, active_idx))
+    row[31] = float(_is_mega_form(pokemon))
+
+    last_move = pokemon.last_move if (pokemon is not None and cond == 1) else None
+    if last_move:
+        last_move_id = PokemonTokenizer.normalize_id(last_move.id)
         move_ids = [PokemonTokenizer.normalize_id(move_id) for move_id in pokemon.moves.keys()]
         if last_move_id in move_ids:
-            row[33] = (move_ids.index(last_move_id) + 1) / float(MOVE_SLOTS)
+            move_idx = move_ids.index(last_move_id)
+            if move_idx < 4:
+                row[32 + move_idx] = 1.0
 
-    row[34] = min(float(pokemon.status_counter), 5.0) / 5.0
-    row[35] = min(len(pokemon.effects), MAX_VOLATILES) / float(MAX_VOLATILES)
+    row[36] = min(float(pokemon.status_counter), 5.0) / 5.0
+
+    volatiles = [
+        Effect.CONFUSION,
+        Effect.DISABLE,
+        Effect.ENCORE,
+        Effect.LEECH_SEED,
+        Effect.THROAT_CHOP,
+    ]
+    max_durations = {
+        Effect.CONFUSION: 4.0,
+        Effect.DISABLE: 4.0,
+        Effect.ENCORE: 3.0,
+        Effect.LEECH_SEED: 1.0,
+        Effect.THROAT_CHOP: 2.0,
+    }
+    for i, effect in enumerate(volatiles):
+        val = pokemon.effects.get(effect, 0)
+        max_dur = max_durations.get(effect, 1.0)
+        row[37 + i] = min(float(val), max_dur) / max_dur
+
+    row[42] = float(pokemon.preparing)
     return row
 
 
@@ -230,7 +251,6 @@ def _global_field_token(
         float(battle.teampreview),
         battle.turn / 16.0,
     ]
-    numerical = numerical + [0.0] * (NUMERICAL_WIDTH - len(numerical))
     return categorical, numerical
 
 
@@ -238,31 +258,38 @@ def _side_token(
     battle: DoubleBattle,
     conditions: dict[SideCondition, int],
     tok: PokemonTokenizer,
+    fainted_count: int,
 ) -> tuple[list[int], list[float]]:
-    active_conds = []
-    for condition, val in conditions.items():
-        cond_mapping = tok.side_conditions.get(condition)
-        if isinstance(cond_mapping, dict):
-            idx = cond_mapping.get(val, 0)
-            if idx:
-                turns_left = float(val) / 2.0
-                active_conds.append((idx, turns_left))
-        elif isinstance(cond_mapping, int) and cond_mapping > 0:
-            idx = cond_mapping
-            duration = 4 if condition == SideCondition.TAILWIND else 5
-            turns_left = _get_turns_left(battle, val, duration=duration)
-            active_conds.append((idx, turns_left))
+    auroraveil_id = tok.side_conditions.get(SideCondition.AURORA_VEIL, 0)
+    if isinstance(auroraveil_id, dict):
+        auroraveil_id = 0
+    tailwind_id = tok.side_conditions.get(SideCondition.TAILWIND, 0)
+    if isinstance(tailwind_id, dict):
+        tailwind_id = 0
 
-    # similar processing to volatiles set
-    active_conds.sort(key=lambda x: x[0])
-    active_conds = active_conds[:4]
+    toxic_spikes_dict = tok.side_conditions.get(SideCondition.TOXIC_SPIKES, {})
+    if isinstance(toxic_spikes_dict, int):
+        toxic_spikes_dict = {}
 
-    condition_ids = [c[0] for c in active_conds] + [0] * (4 - len(active_conds))
-    durations = [c[1] for c in active_conds] + [0.0] * (4 - len(active_conds))
+    cat = [0] * CATEGORICAL_WIDTH
+    num = [0.0] * 4
 
-    categorical = condition_ids + [0] * (CATEGORICAL_WIDTH - len(condition_ids))
-    numerical = durations + [0.0] * (NUMERICAL_WIDTH - len(durations))
-    return categorical, numerical
+    if SideCondition.AURORA_VEIL in conditions:
+        cat[0] = auroraveil_id
+        num[0] = _get_turns_left(battle, conditions[SideCondition.AURORA_VEIL], duration=5)
+
+    if SideCondition.TAILWIND in conditions:
+        cat[1] = tailwind_id
+        num[1] = _get_turns_left(battle, conditions[SideCondition.TAILWIND], duration=4)
+
+    if SideCondition.TOXIC_SPIKES in conditions:
+        layers = conditions[SideCondition.TOXIC_SPIKES]
+        cat[2] = toxic_spikes_dict.get(layers, 0)
+        num[2] = float(layers) / 2.0
+
+    num[3] = float(fainted_count) / float(TEAM_SIZE)
+
+    return cat, num
 
 
 def from_battle(
@@ -307,23 +334,25 @@ def from_battle(
     sides[idx] = SideId.NONE
     slots[idx] = 0
     categorical[idx] = global_cat
-    numerical[idx] = global_num
+    numerical[idx][: len(global_num)] = global_num
     idx += 1
 
-    ally_cat, ally_num = _side_token(battle, battle.side_conditions, tok)
+    ally_fainted = sum(1 for mon in battle.team.values() if mon.fainted)
+    ally_cat, ally_num = _side_token(battle, battle.side_conditions, tok, ally_fainted)
     token_types[idx] = TokenType.ALLY_SIDE
     sides[idx] = SideId.ALLY
     slots[idx] = 0
     categorical[idx] = ally_cat
-    numerical[idx] = ally_num
+    numerical[idx][: len(ally_num)] = ally_num
     idx += 1
 
-    opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions, tok)
+    opp_fainted = sum(1 for mon in battle.opponent_team.values() if mon.fainted)
+    opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions, tok, opp_fainted)
     token_types[idx] = TokenType.OPPONENT_SIDE
     sides[idx] = SideId.OPPONENT
     slots[idx] = 0
     categorical[idx] = opp_cat
-    numerical[idx] = opp_num
+    numerical[idx][: len(opp_num)] = opp_num
     idx += 1
 
     obs = StructuredObservation(
