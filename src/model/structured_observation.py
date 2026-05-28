@@ -77,7 +77,6 @@ class StructuredObservation:
             numerical=self.numerical[index],
         )
 
-    # replaced the generic torch function since I dont think I need anything other than cat
     @staticmethod
     def cat(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
         return StructuredObservation(
@@ -86,4 +85,14 @@ class StructuredObservation:
             slot_ids=torch.cat([obs.slot_ids for obs in observations], dim=dim),
             categorical=torch.cat([obs.categorical for obs in observations], dim=dim),
             numerical=torch.cat([obs.numerical for obs in observations], dim=dim),
+        )
+
+    @staticmethod
+    def stack(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
+        return StructuredObservation(
+            token_type_ids=torch.stack([obs.token_type_ids for obs in observations], dim=dim),
+            side_ids=torch.stack([obs.side_ids for obs in observations], dim=dim),
+            slot_ids=torch.stack([obs.slot_ids for obs in observations], dim=dim),
+            categorical=torch.stack([obs.categorical for obs in observations], dim=dim),
+            numerical=torch.stack([obs.numerical for obs in observations], dim=dim),
         )

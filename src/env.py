@@ -139,7 +139,7 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             actions = [0]
         elif all(battle.force_switch) and len(battle.available_switches[pos]) == 1:
             actions = switch_space + [0]
-        elif active_mon is None:
+        elif active_mon is None or active_mon.fainted:
             actions = switch_space
         else:
             available_move_ids = {move.id for move in battle.available_moves[pos]}
