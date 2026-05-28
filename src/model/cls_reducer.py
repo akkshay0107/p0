@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from src.model.structured_observation import SEQUENCE_LENGTH
-from src.model.swiglu_encoder import SwiGLUEncoderLayer, SwiGLUTransformerEncoder
+from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 
 class CLSReducer(nn.Module):
@@ -30,15 +30,6 @@ class CLSReducer(nn.Module):
 
         self.cls_base = nn.Parameter(torch.empty(1, 1, d_model))
         self.register_buffer("hg_init", torch.zeros(1, self.n_hg, d_model))
-
-        if use_history:
-            self.history_transformer = SwiGLUEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-            )
-        else:
-            self.history_transformer = None
 
         self.encoder = SwiGLUTransformerEncoder(
             d_model=d_model,
@@ -73,25 +64,18 @@ class CLSReducer(nn.Module):
 
         cls_tok = self.cls_base.expand(B, -1, -1)
 
-        if self.use_history:
-            if state is None:
-                cls_prev = cls_tok
-                hg_prev = self.hg_init.expand(B, -1, -1)
-            else:
-                cls_prev, hg_prev = state
-                cls_prev = cls_prev.to(tokens.device)
-                hg_prev = hg_prev.to(tokens.device)
-                if cls_prev.dim() == 2:
-                    cls_prev = cls_prev.unsqueeze(1)
-
-            assert self.history_transformer is not None
-            hg_in = torch.cat([hg_prev, cls_prev, cls_tok], dim=1)
-            hg = self.history_transformer(hg_in)[:, : self.n_hg]
-            seq = torch.cat([cls_tok, hg, tokens[:, 1:]], dim=1)
+        if state is None:
+            hg_prev = self.hg_init.expand(B, -1, -1)
         else:
-            hg = self.hg_init.expand(B, -1, -1)
-            seq = torch.cat([cls_tok, tokens[:, 1:]], dim=1)
+            _, hg_prev = state
+            hg_prev = hg_prev.to(tokens.device)
 
+        # hg_prev empty if use history false
+        seq = torch.cat([cls_tok, hg_prev, tokens[:, 1:]], dim=1)
         enc = self.encoder(seq)
+
         cls = enc[:, 0]
+        # empty if use history is false (n_hg = 0)
+        hg = enc[:, 1 : 1 + self.n_hg]
+
         return cls, (cls, hg)
