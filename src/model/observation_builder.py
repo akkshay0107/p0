@@ -61,18 +61,9 @@ def _pokemon_categorical(
     if pokemon is None:
         return [0] * CATEGORICAL_WIDTH
 
-    move_ids = []
-    move_type_ids = []
-    move_category_ids = []
-    for move in move_slots:
-        if move is not None:
-            move_ids.append(tok.move_id(move))
-            move_type_ids.append(tok.move_type_id(move))
-            move_category_ids.append(tok.move_category_id(move))
-        else:
-            move_ids.append(0)
-            move_type_ids.append(0)
-            move_category_ids.append(0)
+    move_ids = [tok.move_id(m) if m else 0 for m in move_slots]
+    move_type_ids = [tok.move_type_id(m) if m else 0 for m in move_slots]
+    move_category_ids = [tok.move_category_id(m) if m else 0 for m in move_slots]
 
     volatile_ids = tok.volatile_ids(pokemon.effects)
 
@@ -107,12 +98,21 @@ def _pokemon_numeric(
     row[5] = float(pokemon.current_hp_fraction)
 
     base_stats = pokemon.base_stats
-    for i, stat in enumerate(["hp", "atk", "def", "spa", "spd", "spe"]):
-        row[6 + i] = float(base_stats[stat]) / 160.0
+    row[6] = float(base_stats["hp"]) / 160.0
+    row[7] = float(base_stats["atk"]) / 160.0
+    row[8] = float(base_stats["def"]) / 160.0
+    row[9] = float(base_stats["spa"]) / 160.0
+    row[10] = float(base_stats["spd"]) / 160.0
+    row[11] = float(base_stats["spe"]) / 160.0
 
     boosts = pokemon.boosts
-    for i, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
-        row[12 + i] = float(boosts[stat]) / 6.0
+    row[12] = float(boosts["atk"]) / 6.0
+    row[13] = float(boosts["def"]) / 6.0
+    row[14] = float(boosts["spa"]) / 6.0
+    row[15] = float(boosts["spd"]) / 6.0
+    row[16] = float(boosts["spe"]) / 6.0
+    row[17] = float(boosts["accuracy"]) / 6.0
+    row[18] = float(boosts["evasion"]) / 6.0
 
     for i, move in enumerate(move_slots):
         if move is not None:
@@ -173,7 +173,7 @@ def _pad_team(
 
 
 def _get_ordered_pokemon(
-    battle: DoubleBattle, is_opponent: bool
+    battle: DoubleBattle, is_opponent: bool, possible_switches: set[Pokemon] | None = None
 ) -> list[tuple[Pokemon | None, int, int | None]]:
     # returns list of (pokemon, orig_id, active_id)
     active = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
@@ -201,9 +201,8 @@ def _get_ordered_pokemon(
         res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
         return _pad_team(res)
 
-    possible_switches: set[Pokemon] = {
-        mon for switches in battle.available_switches for mon in switches
-    }
+    if possible_switches is None:
+        possible_switches = {mon for switches in battle.available_switches for mon in switches}
 
     res = []
     assigned = set()
@@ -333,7 +332,7 @@ def from_battle(
     idx = 1
     for side, is_opponent in ((SideId.ALLY, False), (SideId.OPPONENT, True)):
         for slot_idx, (mon, orig_idx, active_idx) in enumerate(
-            _get_ordered_pokemon(battle, is_opponent)
+            _get_ordered_pokemon(battle, is_opponent, possible_switches if not is_opponent else None)
         ):
             cond = _slot_condition(
                 battle, mon, slot_idx, is_opponent, possible_switches if not is_opponent else None
@@ -363,7 +362,7 @@ def from_battle(
     numerical[idx] = global_num + [0.0] * (NUMERICAL_WIDTH - len(global_num))
     idx += 1
 
-    ally_fainted = sum(1 for mon in battle.team.values() if mon.fainted)
+    ally_fainted = sum(mon.fainted for mon in battle.team.values())
     ally_cat, ally_num = _side_token(battle, battle.side_conditions, tok, ally_fainted)
     token_types[idx] = TokenType.ALLY_SIDE
     sides[idx] = SideId.ALLY
@@ -372,7 +371,7 @@ def from_battle(
     numerical[idx] = ally_num + [0.0] * (NUMERICAL_WIDTH - len(ally_num))
     idx += 1
 
-    opp_fainted = sum(1 for mon in battle.opponent_team.values() if mon.fainted)
+    opp_fainted = sum(mon.fainted for mon in battle.opponent_team.values())
     opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions, tok, opp_fainted)
     token_types[idx] = TokenType.OPPONENT_SIDE
     sides[idx] = SideId.OPPONENT

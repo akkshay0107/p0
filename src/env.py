@@ -28,6 +28,24 @@ from src.model import observation_builder
 from src.team_picker import RandomTeamFromPool
 
 
+def _build_tp_mask(team_size: int) -> list[int]:
+    # since both actions can lie between 0 and ACT_SIZE (47)
+    # first action used to decide lead
+    # second action used to decide back
+    # (p1, p2) [index in team list] choice gets encoded as 6*p1 + p2
+    mask = [0] * 2 * ACT_SIZE
+    for action in range(36):
+        p1 = action // 6 + 1
+        p2 = action % 6 + 1
+        if p1 < p2:
+            mask[action] = 1  # for lead
+            mask[ACT_SIZE + action] = 1  # for back
+    return mask
+
+
+_TEAM_PREVIEW_MASK = _build_tp_mask(6)  # never using a team that doesnt have 6 mons
+
+
 # filter out logging about internal mismatch
 class MismatchWarningFilter(logging.Filter):
     def filter(self, record):
@@ -166,18 +184,12 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
     @staticmethod
     def get_action_mask(battle: AbstractBattle) -> list[int]:
         assert isinstance(battle, DoubleBattle)
-        # first half for lead, second half for back in TP
+        if battle.teampreview:
+            # mask is always the same
+            return _TEAM_PREVIEW_MASK.copy()
+
         # first half for p1, second half for p2 in battle
         mask = [0] * 2 * ACT_SIZE
-
-        if battle.teampreview:
-            for action in range(36):
-                p1 = action // 6 + 1
-                p2 = action % 6 + 1
-                if p1 < p2 and p1 <= len(battle.team) and p2 <= len(battle.team):
-                    mask[action] = 1
-                    mask[ACT_SIZE + action] = 1
-            return mask
 
         p1_actions = MegaEnv.single_action_mask(battle, 0)
         p2_actions = MegaEnv.single_action_mask(battle, 1)

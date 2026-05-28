@@ -7,6 +7,7 @@ from pathlib import Path
 
 from poke_env.battle.effect import Effect
 from poke_env.battle.move import Move
+from poke_env.battle.move_category import MoveCategory
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
@@ -48,12 +49,12 @@ class PokemonTokenizer:
             SideCondition.TOXIC_SPIKES: {
                 1: self._side_conditions_str.get("toxicspikes1", 0),
                 2: self._side_conditions_str.get("toxicspikes2", 0),
-            }
+            },
         }
 
-        self._weathers_str = vocab.get("weathers", {})
+        _weathers_str = vocab.get("weathers", {})
         self.weathers = {
-            weather_enum: self._weathers_str.get(weather_str, 0)
+            weather_enum: _weathers_str.get(weather_str, 0)
             for weather_enum, weather_str in {
                 Weather.RAINDANCE: "rain",
                 Weather.SUNNYDAY: "sun",
@@ -62,8 +63,9 @@ class PokemonTokenizer:
             }.items()
         }
 
+        _status_str = vocab.get("status", {})
         self.status = {
-            status_enum: vocab.get("status", {}).get(status_str, 0)
+            status_enum: _status_str.get(status_str, 0)
             for status_enum, status_str in {
                 Status.BRN: "burn",
                 Status.FRZ: "freeze",
@@ -74,8 +76,11 @@ class PokemonTokenizer:
             }.items()
         }
 
-        self.types = vocab.get("types", {})
-        self.categories = vocab.get("categories", {})
+        _types_str = vocab.get("types", {})
+        self.types = {t: _types_str.get(t.name.lower(), 0) for t in PokemonType}
+
+        _categories_str = vocab.get("categories", {})
+        self.categories = {c: _categories_str.get(c.name.lower(), 0) for c in MoveCategory}
 
         # pre-bake the trickroom token ID so _global_field_token never does a runtime vocab lookup
         _trickroom_vocab = vocab.get("trickroom", {})
@@ -151,12 +156,12 @@ class PokemonTokenizer:
     def type_id(self, type_obj: PokemonType | None) -> int:
         if type_obj is None:
             return 0
-        return self.types.get(self.normalize_id(type_obj.name), 0)
+        return self.types.get(type_obj, 0)
 
     def move_id(self, move: Move | None) -> int:
         if move is None:
             return 0
-        return self.moves.get(self.normalize_id(move.id), 0)
+        return self.moves.get(move.id, 0)
 
     def move_type_id(self, move: Move | None) -> int:
         if move is None:
@@ -166,7 +171,7 @@ class PokemonTokenizer:
     def move_category_id(self, move: Move | None) -> int:
         if move is None:
             return 0
-        return self.categories.get(self.normalize_id(move.category.name), 0)
+        return self.categories.get(move.category, 0)
 
 
 tokenizer = PokemonTokenizer.from_file()

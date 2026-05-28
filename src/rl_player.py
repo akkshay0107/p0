@@ -18,7 +18,7 @@ from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
 from src.team_picker import RandomTeamFromPool
-from src.train.ppo_utils import load_checkpoint
+from src.train.utils import load_checkpoint
 
 
 class RLPlayer(Player):
