@@ -1,14 +1,10 @@
 import logging
 import os
-import queue
 import random
 import signal
 import subprocess
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -17,19 +13,18 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
 from src.lookups import ACT_SIZE, OBS_DIM
-from src.model.fused_token_encoder import as_obs_dict
 from src.model.policy import PolicyNet
-from src.train.ppo_utils import (
-    OpponentPool,
-    RolloutBuffer,
+from src.train.config import PPOConfig, load_config
+from src.train.opponent_pool import OpponentPool
+from src.train.rollout import RolloutBuffer, collect_rollouts
+from src.train.utils import (
     initial_state,
     load_checkpoint,
-    load_config,
     save_checkpoint,
 )
+from src.train.vec_env import ThreadVecEnv
 
 config = load_config()
-_buffer_lock = threading.Lock()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,245 +51,12 @@ policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE)
 optimizer = optim.AdamW(policy.parameters(), lr=config.lr, eps=1e-6, weight_decay=1e-4)
 
 
-def lr_lambda(episode):
-    if episode < config.warmup_episodes:
-        return 1.0
-    decay_total = config.num_episodes - config.warmup_episodes
-    if decay_total <= 0:
-        return 1.0
-    decay_progress = (episode - config.warmup_episodes) / decay_total
-    end_factor = config.min_lr / config.lr
-    return max(end_factor, 1.0 - (1.0 - end_factor) * decay_progress)
-
-
-scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-if config.compile_policy and policy.device.type == "cuda":
-    policy = cast(PolicyNet, torch.compile(policy))
-
-
-def state_to_cpu(state):
-    cls, hg = state
-    return cls.detach().cpu(), hg.detach().cpu()
-
-
-def cat_states(state_a, state_b):
-    return torch.cat([state_a[0], state_b[0]], dim=0), torch.cat([state_a[1], state_b[1]], dim=0)
-
-
-def split_state(state, idx: int):
-    cls, hg = state
-    return cls[idx : idx + 1], hg[idx : idx + 1]
-
-
-# TODO: move to a vectorized env and try to conform to the
-# poke-env 0.15.0 standards. Needs some effort to refactor
-@torch.inference_mode()
-def collect_rollout(
-    env,
-    buffer: RolloutBuffer,
-    opponent_policy: PolicyNet,
-    is_self_play: bool = False,
-    episode: int = 0,
-) -> tuple[bool, bool]:
-    obs, _ = env.reset()
-    agent1 = env.agent1.username
-    agent2 = env.agent2.username
-
-    traj1 = []
-    traj2 = []
-
-    state1 = initial_state(policy, 1, policy.device)
-    if is_self_play:
-        state2 = initial_state(policy, 1, policy.device)
-    else:
-        state2 = initial_state(opponent_policy, 1, opponent_policy.device)
-
-    final_rewards = None
-
-    while True:
-        obs1 = obs[agent1]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
-        mask1 = (
-            torch.from_numpy(obs[agent1]["action_mask"])
-            .reshape(2, ACT_SIZE)
-            .unsqueeze(0)
-            .to(policy.device, non_blocking=True)
-        )
-
-        # store both sides of the game if self play
-        if is_self_play:
-            obs2 = obs[agent2]["observation"].unsqueeze(0).to(policy.device, non_blocking=True)
-            mask2 = (
-                torch.from_numpy(obs[agent2]["action_mask"])
-                .reshape(2, ACT_SIZE)
-                .unsqueeze(0)
-                .to(policy.device, non_blocking=True)
-            )
-
-            combined_obs = torch.cat([obs1, obs2], dim=0)
-            combined_masks = torch.cat([mask1, mask2], dim=0)
-            combined_state = cat_states(state1, state2)
-
-            _, combined_log_probs, combined_actions, combined_values, next_combined_state = policy(
-                combined_obs,
-                combined_state,
-                combined_masks,
-                sample_actions=True,
-            )
-
-            action1 = combined_actions[0:1]
-            action2 = combined_actions[1:2]
-            log_probs1 = combined_log_probs[0:1]
-            log_probs2 = combined_log_probs[1:2]
-            values1 = combined_values[0:1]
-            values2 = combined_values[1:2]
-            next_state1 = split_state(next_combined_state, 0)
-            next_state2 = split_state(next_combined_state, 1)
-        else:
-            obs2 = (
-                obs[agent2]["observation"]
-                .unsqueeze(0)
-                .to(opponent_policy.device, non_blocking=True)
-            )
-            mask2 = (
-                torch.from_numpy(obs[agent2]["action_mask"])
-                .reshape(2, ACT_SIZE)
-                .unsqueeze(0)
-                .to(opponent_policy.device, non_blocking=True)
-            )
-
-            _, log_probs1, action1, values1, next_state1 = policy(
-                obs1,
-                state1,
-                mask1,
-                sample_actions=True,
-            )
-            _, _, action2, _, next_state2 = opponent_policy(
-                obs2,
-                state2,
-                mask2,
-                sample_actions=True,
-            )
-
-        actions = {
-            agent1: action1[0].cpu().numpy(),
-            agent2: action2[0].cpu().numpy(),
-        }
-
-        is_tp1 = env.battle1.teampreview
-        is_tp2 = env.battle2.teampreview if is_self_play else None
-
-        if shutdown_requested:
-            break
-        next_obs, rewards, terminated, truncated, _ = env.step(actions)
-
-        done = bool(
-            terminated[agent1] or truncated[agent1] or terminated[agent2] or truncated[agent2]
-        )
-
-        traj1.append(
-            {
-                "obs": obs1.cpu(),
-                "actions": action1.cpu(),
-                "log_probs": log_probs1.cpu(),
-                "values": values1.cpu(),
-                "rewards": torch.tensor([rewards[agent1]], dtype=torch.float32),
-                "dones": torch.tensor([done], dtype=torch.float32),
-                "action_masks": mask1.cpu(),
-                "is_team_preview": torch.tensor([is_tp1], dtype=torch.bool),
-            }
-        )
-
-        if is_self_play:
-            traj2.append(
-                {
-                    "obs": obs2.cpu(),
-                    "actions": action2.cpu(),
-                    "log_probs": log_probs2.cpu(),
-                    "values": values2.cpu(),
-                    "rewards": torch.tensor([rewards[agent2]], dtype=torch.float32),
-                    "dones": torch.tensor([done], dtype=torch.float32),
-                    "action_masks": mask2.cpu(),
-                    "is_team_preview": torch.tensor([is_tp2], dtype=torch.bool),
-                }
-            )
-
-        if done or shutdown_requested:
-            final_rewards = rewards
-            break
-
-        obs = next_obs
-        state1 = next_state1
-        state2 = next_state2
-
-    if shutdown_requested:
-        # If interrupted, we don't return a valid win/loss as the game didn't finish.
-        return False, is_self_play
-
-    with _buffer_lock:
-        buffer.add_episode(traj1)
-        if is_self_play:
-            buffer.add_episode(traj2)
-
-    winner = bool(final_rewards[agent1] > final_rewards[agent2])
-    return winner, is_self_play
-
-
-def collect_all_rollouts(
-    envs, buffer: RolloutBuffer, executor, pool: OpponentPool, episode: int = 0
-):
-    env_queue = queue.Queue()
-    for env in envs:
-        env_queue.put(env)
-
-    # Pre-sample one opponent per rollout slot.
-    sampled_opponents = []
-    for _ in range(config.rollouts_per_episode):
-        if random.random() < config.self_play_prob:
-            sampled_opponents.append((policy, "latest"))
-        else:
-            sampled_opponents.append(pool.sample())
-
-    def worker(opponent_policy: PolicyNet, opponent_id: str):
-        env = env_queue.get()
-        try:
-            won, was_self_play = collect_rollout(
-                env,
-                buffer,
-                opponent_policy,
-                is_self_play=(opponent_id == "latest"),
-                episode=episode,
-            )
-            return opponent_id, won, was_self_play
-        finally:
-            env_queue.put(env)
-
-    pool_wins = 0
-    pool_total = 0
-
-    futures = [
-        executor.submit(worker, opp_policy, opp_id) for opp_policy, opp_id in sampled_opponents
-    ]
-
-    for f in as_completed(futures):
-        if shutdown_requested:
-            # Cancel all pending futures if possible
-            for future in futures:
-                future.cancel()
-            break
-        opp_id, won, was_self_play = f.result()
-        if not was_self_play:
-            pool_wins += int(won)
-            pool_total += 1
-            pool.update_win_rate(opp_id, won)
-
-    return {
-        "pool_win_rate": pool_wins / pool_total if pool_total > 0 else 0.0,
-    }
-
-
 def _run_batched_ppo(
-    episodes: list[dict], device: torch.device, episode: int
+    episodes: list[dict],
+    policy: PolicyNet,
+    config: PPOConfig,
+    device: torch.device,
+    episode: int,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
     """
     Run PPO BPTT over a minibatch of variable-length episodes.
@@ -316,9 +78,9 @@ def _run_batched_ppo(
     lengths = torch.tensor([ep["length"] for ep in episodes], device=device)
     max_steps = int(lengths[0].item())
 
-    # pre-encode all observations in the batch in one large pass
-    all_obs = torch.cat([ep["obs"] for ep in episodes], dim=0).to(device)
-    all_tokens = policy.encoder(as_obs_dict(all_obs))
+    keys = episodes[0]["obs"].keys()
+    all_obs = {k: torch.cat([ep["obs"][k] for ep in episodes], dim=0) for k in keys}
+    all_tokens = policy.encoder(all_obs)
     tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
 
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
@@ -345,16 +107,7 @@ def _run_batched_ppo(
     }
     total_steps = 0
 
-    # annealed entropy coefficient
-    anneal_steps = config.num_episodes - config.entropy_anneal_start
-    if episode <= config.entropy_anneal_start or anneal_steps <= 0:
-        curr_ent_coef = config.entropy_coef
-    else:
-        progress = (episode - config.entropy_anneal_start) / anneal_steps
-        curr_ent_coef = (
-            config.entropy_coef - (config.entropy_coef - config.entropy_coef_floor) * progress
-        )
-        curr_ent_coef = max(curr_ent_coef, config.entropy_coef_floor)
+    curr_ent_coef = config.entropy_coef
 
     for t in range(max_steps):
         active_n = int((lengths > t).sum().item())
@@ -419,19 +172,25 @@ def _run_batched_ppo(
 
             metrics["normalized_entropy"] += curr_normalized_entropy.sum().item()
 
-            # schulman kl approx (was having negative kl in early steps)
             metrics["kl_div"] += ((ratio - 1) - log_ratio).sum().item() if not is_warmup else 0.0
             metrics["clip_frac"] += (
                 ((ratio - 1.0).abs() > config.clip_range).float().sum().item()
                 if not is_warmup
                 else 0.0
             )
-            metrics["entropy_coef"] = curr_ent_coef  # same for all steps in minibatch
+            metrics["entropy_coef"] = curr_ent_coef
 
     return total_loss, metrics, total_steps
 
 
-def ppo_update(episodes: list, episode: int) -> dict:
+def ppo_update(
+    episodes: list,
+    policy: PolicyNet,
+    optimizer: torch.optim.Optimizer,
+    config: PPOConfig,
+    episode: int,
+    shutdown_requested: bool = False,
+) -> dict:
     policy.train()
     t0 = time.time()
 
@@ -473,7 +232,9 @@ def ppo_update(episodes: list, episode: int) -> dict:
 
             optimizer.zero_grad(set_to_none=True)
 
-            batch_loss, batch_metrics, batch_steps = _run_batched_ppo(batch, policy.device, episode)
+            batch_loss, batch_metrics, batch_steps = _run_batched_ppo(
+                batch, policy, config, policy.device, episode
+            )
 
             tot_policy_loss += batch_metrics["policy_loss"]
             tot_value_loss += batch_metrics["value_loss"]
@@ -559,13 +320,13 @@ def ppo_update(episodes: list, episode: int) -> dict:
 
 def main():
     showdown_procs = []
-    envs = []
-    executor = None
+    vec_env = None
     tb_writer = None
 
     # to guarantee executor shutdown
     try:
-        for i in range(config.num_envs):
+        # one showdown server per thread
+        for i in range(config.n_envs):
             port = 8000 + i
             proc = subprocess.Popen(
                 ["node", "pokemon-showdown", "start", "--no-security", str(port)],
@@ -575,23 +336,19 @@ def main():
             )
             showdown_procs.append(proc)
 
-        # Give the servers a moment to start
         time.sleep(10)
 
-        envs = [
-            SimEnv.build_env(env_id=i, server_port=8000 + (i % config.num_envs))
-            for i in range(config.n_jobs)
-        ]
+        envs = [SimEnv.build_env(env_id=i, server_port=8000 + i) for i in range(config.n_envs)]
+
+        vec_env = ThreadVecEnv(envs)
         buffer = RolloutBuffer()
-        executor = ThreadPoolExecutor(max_workers=config.n_jobs)
 
         config.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         config.pool_dir.mkdir(parents=True, exist_ok=True)
 
         tb_writer = SummaryWriter(log_dir="runs/ppo_training")
 
-        start = load_checkpoint(config.checkpoint_path, policy, optimizer, scheduler)
-
+        start = load_checkpoint(config.checkpoint_path, policy, optimizer)
         if start is not None:
             logging.info(f"Resuming training from episode {start + 1}")
         else:
@@ -608,43 +365,70 @@ def main():
         pool = OpponentPool.load_or_create(config.pool_dir, config)
         if len(pool) == 0:
             logging.info("Opponent pool empty, seeding with current policy as ep0")
-            pool.add(policy, "ep0")
+            pool.add(policy, "ep0", 0.5)
             pool.save_state()
 
         logging.info(f"Opponent pool: {pool}")
 
+        vec_env.reset()
+        state1 = initial_state(policy, config.n_envs, policy.device)
+        state2 = initial_state(policy, config.n_envs, policy.device)
+        trajectories1 = [[] for _ in range(config.n_envs)]
+        trajectories2 = [[] for _ in range(config.n_envs)]
+        env_opponents = ["self"] * config.n_envs
+        active_pool_policies = {}
+
         for episode in range(start, config.num_episodes):
             if shutdown_requested:
                 logging.warning("Shutdown requested, saving checkpoint and exiting")
-                save_checkpoint(config.checkpoint_path, episode, policy, optimizer, scheduler)
+                save_checkpoint(config.checkpoint_path, episode, policy, optimizer)
                 break
 
-            buffer.reset()
-            policy.eval()
+            for target_mode in ["self_play", "pbt"]:
+                buffer.reset()
+                policy.eval()
 
-            t0_rollout = time.time()
-            rollout_stats = collect_all_rollouts(envs, buffer, executor, pool, episode=episode)
-            rollout_time = time.time() - t0_rollout
+                t0_rollout = time.time()
+                pool_wr, state1, state2 = collect_rollouts(
+                    vec_env,
+                    policy,
+                    buffer,
+                    pool,
+                    config,
+                    active_pool_policies,
+                    trajectories1,
+                    trajectories2,
+                    state1,
+                    state2,
+                    env_opponents,
+                    target_mode,
+                )
+                rollout_time = time.time() - t0_rollout
 
-            if not buffer.trajectories:
-                logging.warning("No trajectories collected, skipping update")
-                continue
+                if not buffer.trajectories:
+                    logging.warning("No trajectories collected, skipping update")
+                    continue
 
-            rollout_data = buffer.get_batches(policy.device, config)
-            stats = ppo_update(rollout_data, episode)
-            scheduler.step()
+                num_trajectories = len(buffer.trajectories)
+                avg_traj_length = sum(ep["length"] for ep in buffer.trajectories) / num_trajectories
+                avg_traj_time = rollout_time / num_trajectories
+
+                rollout_data = buffer.get_batches(policy.device, config)
+                stats = ppo_update(
+                    rollout_data, policy, optimizer, config, episode, shutdown_requested
+                )
 
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
-                pool.add(policy, snap_id)
+                pool.add(policy, snap_id, pool_wr)
                 pool.save_state()
                 logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
 
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = optimizer.param_groups[0]["lr"]
             is_warmup = episode < config.warmup_episodes
             tag = "Warmup" if is_warmup else "Train"
 
-            tb_writer.add_scalar(f"{tag}/WinRate/Pool", rollout_stats["pool_win_rate"], episode + 1)
+            tb_writer.add_scalar(f"{tag}/WinRate/Pool", pool_wr, episode + 1)
             tb_writer.add_scalar(f"{tag}/Loss/Policy", stats["policy_loss"], episode + 1)
             tb_writer.add_scalar(f"{tag}/Loss/Value", stats["value_loss"], episode + 1)
             tb_writer.add_scalar(f"{tag}/Loss/Entropy", stats["entropy_loss"], episode + 1)
@@ -667,37 +451,38 @@ def main():
             tb_writer.add_scalar(f"{tag}/Training/LearningRate", current_lr, episode + 1)
             tb_writer.add_scalar(f"{tag}/Timing/Rollout", rollout_time, episode + 1)
             tb_writer.add_scalar(f"{tag}/Timing/Update", stats["time"], episode + 1)
-            tb_writer.add_scalar(
-                f"{tag}/Buffer/NumTrajectories", len(buffer.trajectories), episode + 1
-            )
+            tb_writer.add_scalar(f"{tag}/Buffer/NumTrajectories", num_trajectories, episode + 1)
+            tb_writer.add_scalar(f"{tag}/Buffer/AvgTrajectoryLength", avg_traj_length, episode + 1)
+            tb_writer.add_scalar(f"{tag}/Buffer/AvgTrajectoryTime", avg_traj_time, episode + 1)
 
+            # slightly shorter list of things logged to the screen.
             logging.info(
                 f"Ep {episode + 1}/{config.num_episodes} ({tag[:1]}) | "
-                f"Pool WR: {rollout_stats['pool_win_rate']:.1%} | "
-                f"P-Loss: {stats['policy_loss']:.4f} | "
-                f"V-Loss: {stats['value_loss']:.4f} | "
+                f"Pi: {stats['policy_loss']:.4f} | "
+                f"V: {stats['value_loss']:.4f} | "
                 f"Entropy: {-stats['entropy_loss']:.4f} | "
                 f"NormEnt: {stats['normalized_entropy']:.2%} | "
-                f"Grad: {stats['grad_norm']:.2f} | "
                 f"Clip: {stats['clip_fraction']:.2%} | "
-                f"ExpVar: {stats['explained_variance']:.4f} | "
-                f"KL: {stats['kl_divergence']:.4f}"
+                f"KL: {stats['kl_divergence']:.4f} | "
+                f"ATT: {avg_traj_time:.2f}"
             )
 
             if (episode + 1) % 10 == 0:
-                save_checkpoint(config.checkpoint_path, episode + 1, policy, optimizer, scheduler)
+                save_checkpoint(config.checkpoint_path, episode + 1, policy, optimizer)
                 logging.info("Checkpoint saved.")
 
     finally:
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+        if vec_env is not None:
+            vec_env.shutdown()
         if tb_writer is not None:
             tb_writer.close()
-        for env in envs:
-            try:
-                env.close()
-            except Exception:
-                pass
+
+        if vec_env is not None:
+            for env in vec_env.envs:
+                try:
+                    env.close()
+                except Exception:
+                    pass
 
         for proc in showdown_procs:
             proc.terminate()

@@ -117,10 +117,16 @@ class OpponentPool:
 
     def sample(self, device: str) -> tuple[PolicyNet, str]:
         """Returns a frozen policy (loaded to device) from the pool sampled using win rates as weights."""
+        opponent_id = self.sample_id()
+        return self.load_policy(opponent_id, device), opponent_id
+
+    def sample_id(self) -> str:
+        """Returns an opponent ID sampled using win rates as weights."""
         if not self.opponent_ids:
             raise RuntimeError("OpponentPool is empty. Call pool.add() before pool.sample().")
 
         floor = self.config.pool_wr_floor
         weights = [max(floor, self.win_rates[oid]) for oid in self.opponent_ids]
         (opponent_id,) = random.choices(self.opponent_ids, weights=weights, k=1)
-        return self.load_policy(opponent_id, device), opponent_id
+        return opponent_id
+

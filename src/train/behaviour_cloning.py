@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from src.model.fused_token_encoder import as_obs_dict
 from src.model.policy import PolicyNet
 from src.model.structured_observation import StructuredObservation
-from src.train.ppo_utils import initial_state
+from src.train.utils import initial_state
 
 BATCH_SIZE = 32  # number of episodes per gradient update
 

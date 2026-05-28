@@ -5,9 +5,10 @@ from pathlib import Path
 @dataclass
 class PPOConfig:
     num_episodes: int = 12500
-    n_envs = 16
-    self_play_steps = 640
-    pool_play_steps = 640
+    n_envs: int = 16
+    self_play_steps: int = 640
+    pool_play_steps: int = 640
+    n_pool_opponents: int = 4
 
     lr: float = 3e-5
     batch_size: int = 32
@@ -15,6 +16,7 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     value_coef: float = 0.5
+    entropy_coef: float = 0.04
     max_grad_norm: float = 1.0
     target_kl: float = 0.05  # for early kl stopping
     ppo_epochs: int = 4  # number of ppo loops per episode
