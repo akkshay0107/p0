@@ -43,15 +43,18 @@ class OpponentPool:
             self.win_rates = state.get("win_rates", {})
 
         # sync with pool directory (in case json got deleted)
-        for pt_file in sorted(self.pool_dir.glob("*.pt")):
+        # sort by creation time to maintain order
+        existing_files = sorted(self.pool_dir.glob("*.pt"), key=lambda p: p.stat().st_ctime)
+        existing_ids = {pt.stem for pt in existing_files}
+
+        for pt_file in existing_files:
             opponent_id = pt_file.stem
             if opponent_id not in self.opponent_ids:
                 self.opponent_ids.append(opponent_id)
                 if opponent_id not in self.win_rates:
                     self.win_rates[opponent_id] = 0.5
 
-        # repair json file to match the models in the pool
-        existing_ids = {pt.stem for pt in self.pool_dir.glob("*.pt")}
+        # remove entries that do not exist in pool dir anymore
         self.opponent_ids = [oid for oid in self.opponent_ids if oid in existing_ids]
         self.win_rates = {oid: wr for oid, wr in self.win_rates.items() if oid in existing_ids}
 
@@ -62,40 +65,62 @@ class OpponentPool:
         pool._load_state()
         return pool
 
-    # TODO: add a gating rule that can decide whether the latest
-    # model should enter the pool or not. Ideally should return
-    # true if new policy added, else false
-    def add(self, policy: PolicyNet, opponent_id: str) -> bool:
-        raise NotImplementedError("")
+    def add(self, policy: PolicyNet, id: str, pool_wr: float) -> bool:
+        if id in self.opponent_ids or pool_wr < 0.5:
+            return False
 
-    def load_policy(self, opponent_id: str) -> PolicyNet:
-        checkpoint = torch.load(
-            self.pool_dir / f"{opponent_id}.pt",
-            weights_only=True,
+        # evict lowest wr policy
+        if len(self.opponent_ids) >= self.config.pool_size:
+            evict_id = min(self.opponent_ids, key=lambda opp_id: self.win_rates[opp_id])
+            if pool_wr <= self.win_rates[evict_id]:
+                return False
+
+            evict_path = self.pool_dir / f"{evict_id}.pt"
+            if evict_path.exists():
+                evict_path.unlink()
+
+            self.opponent_ids.remove(evict_id)
+            del self.win_rates[evict_id]
+
+        save_path = self.pool_dir / f"{id}.pt"
+        torch.save(
+            {
+                "model_state_dict": policy.state_dict(),
+            },
+            save_path,
         )
-        net = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE)
-        net.load_state_dict(checkpoint["model_state_dict"])
-        net.eval()
-        return net
 
-    def update_win_rate(self, opponent_id: str, won: int, num_games: int) -> None:
+        self.opponent_ids.append(id)
+        self.win_rates[id] = pool_wr
+        return True
+
+    def load_policy(self, opponent_id: str, device: str) -> PolicyNet:
+        path = self.pool_dir / f"{opponent_id}.pt"
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint for opponent '{opponent_id}' not found at {path}")
+
+        checkpoint = torch.load(path, weights_only=True, map_location=device)
+        net = PolicyNet()
+        net.load_state_dict(checkpoint["model_state_dict"])
+        return net.to(device).eval()
+
+    def update_win_rate(self, opponent_id: str, agent_wins: int, num_games: int = 1) -> None:
         if opponent_id not in self.win_rates:
             return
 
-        # won => number of games the latest policy won
-        # equivalent to games lost by the opp id against latest policy
-        observed_wr = 1.0 - won / num_games
+        # agent_wins <=> games lost by the opp id against latest policy
+        observed_wr = 1.0 - agent_wins / num_games
         curr_wr = self.win_rates[opponent_id]
 
         alpha = self.config.pool_win_rate_smoothing
         self.win_rates[opponent_id] = (1 - alpha) * curr_wr + alpha * observed_wr
 
-    def sample(self) -> tuple[PolicyNet, str]:
-        """Returns a frozen policy from the pool sampled using win rates as weights."""
+    def sample(self, device: str) -> tuple[PolicyNet, str]:
+        """Returns a frozen policy (loaded to device) from the pool sampled using win rates as weights."""
         if not self.opponent_ids:
             raise RuntimeError("OpponentPool is empty. Call pool.add() before pool.sample().")
 
         floor = self.config.pool_wr_floor
         weights = [max(floor, self.win_rates[oid]) for oid in self.opponent_ids]
         (opponent_id,) = random.choices(self.opponent_ids, weights=weights, k=1)
-        return self.load_policy(opponent_id), opponent_id
+        return self.load_policy(opponent_id, device), opponent_id
