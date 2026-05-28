@@ -1,9 +1,57 @@
+import numpy as np
 import torch
 
+from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
+from src.model.structured_observation import CATEGORICAL_WIDTH, NUMERICAL_WIDTH, SEQUENCE_LENGTH
 from src.train.config import PPOConfig
 from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
+
+
+def create_trajectory_buffers(n_envs, max_steps=100, device="cpu"):
+    return {
+        "step_counts": torch.zeros(n_envs, dtype=torch.long, device=device),
+        "categorical": torch.zeros(
+            (n_envs, max_steps, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long, device=device
+        ),
+        "numerical": torch.zeros(
+            (n_envs, max_steps, SEQUENCE_LENGTH, NUMERICAL_WIDTH),
+            dtype=torch.float32,
+            device=device,
+        ),
+        "token_type_ids": torch.zeros(
+            (n_envs, max_steps, SEQUENCE_LENGTH), dtype=torch.long, device=device
+        ),
+        "side_ids": torch.zeros(
+            (n_envs, max_steps, SEQUENCE_LENGTH), dtype=torch.long, device=device
+        ),
+        "slot_ids": torch.zeros(
+            (n_envs, max_steps, SEQUENCE_LENGTH), dtype=torch.long, device=device
+        ),
+        "actions": torch.zeros((n_envs, max_steps, 2), dtype=torch.long, device=device),
+        "log_probs": torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
+        "values": torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
+        "rewards": torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
+        "dones": torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
+        "action_masks": torch.zeros(
+            (n_envs, max_steps, 2, ACT_SIZE), dtype=torch.bool, device=device
+        ),
+        "is_team_preview": torch.zeros((n_envs, max_steps), dtype=torch.bool, device=device),
+    }
+
+
+def compute_gae(rewards, values, dones, gamma, gae_lambda):
+    T = len(rewards)
+    adv = np.zeros_like(rewards)
+    gae = 0.0
+    for t in reversed(range(T)):
+        next_value = values[t + 1] if t + 1 < T else 0.0
+        nonterminal = 1.0 - dones[t]
+        delta = rewards[t] + gamma * next_value * nonterminal - values[t]
+        gae = delta + gamma * gae_lambda * nonterminal * gae
+        adv[t] = gae
+    return adv
 
 
 class RolloutBuffer:
@@ -24,19 +72,9 @@ class RolloutBuffer:
         "is_team_preview",
     )
 
-    def add_episode(self, trajectory: list[dict]):
-        if not trajectory:
+    def add_episode(self, episode: dict):
+        if not episode or "length" not in episode or episode["length"] == 0:
             return
-        episode = {}
-        for f in self._FIELDS:
-            if f == "obs":
-                keys = trajectory[0]["obs"].keys()
-                episode["obs"] = {
-                    k: torch.cat([step["obs"][k] for step in trajectory], dim=0) for k in keys
-                }
-            else:
-                episode[f] = torch.cat([step[f] for step in trajectory], dim=0)
-        episode["length"] = len(trajectory)
         self.trajectories.append(episode)
 
     def get_batches(self, device: torch.device, config: PPOConfig):
@@ -44,31 +82,26 @@ class RolloutBuffer:
         all_advantages = []
 
         for ep in self.trajectories:
-            rewards = ep["rewards"].float()
-            values = ep["values"].float()
-            dones = ep["dones"].float()
+            rewards = ep["rewards"]
+            values = ep["values"]
+            dones = ep["dones"]
             T = ep["length"]
 
-            adv = torch.zeros_like(rewards)
-            gae = torch.zeros(1, dtype=torch.float32)
-
-            for t in reversed(range(T)):
-                next_value = values[t + 1] if t + 1 < T else torch.zeros_like(values[t])
-                nonterminal = 1.0 - dones[t]
-                delta = rewards[t] + config.gamma * next_value * nonterminal - values[t]
-                gae = delta + config.gamma * config.gae_lambda * nonterminal * gae
-                adv[t] = gae
-
-            ret = adv + values
+            adv_np = compute_gae(
+                rewards.numpy(), values.numpy(), dones.numpy(), config.gamma, config.gae_lambda
+            )
+            adv = torch.from_numpy(adv_np).to(device)
+            values_dev = values.to(device)
+            ret = adv + values_dev
 
             episode_data = {
                 "obs": {k: v.to(device) for k, v in ep["obs"].items()},
                 "actions": ep["actions"].to(device),
                 "log_probs": ep["log_probs"].to(device),
                 "action_masks": ep["action_masks"].to(device),
-                "values": values.to(device),
-                "advantages": adv.to(device),
-                "returns": ret.to(device),
+                "values": values_dev,
+                "advantages": adv,
+                "returns": ret,
                 "is_team_preview": ep["is_team_preview"].to(device),
                 "length": T,
             }
@@ -93,8 +126,8 @@ def collect_rollouts(
     pool: OpponentPool,
     config: PPOConfig,
     active_pool_policies: dict[str, PolicyNet],
-    trajectories1: list[list[dict]],
-    trajectories2: list[list[dict]],
+    trajectories1: dict,
+    trajectories2: dict,
     state1: tuple[torch.Tensor, torch.Tensor],
     state2: tuple[torch.Tensor, torch.Tensor],
     env_opponents: list[str],
@@ -118,6 +151,11 @@ def collect_rollouts(
     pool_total = 0
 
     steps = config.self_play_steps if target_mode == "self_play" else config.pool_play_steps
+
+    step_counts1 = trajectories1["step_counts"]
+    step_counts2 = trajectories2["step_counts"]
+
+    idx_all = torch.arange(n_envs)
 
     for step in range(steps):
         obs1_dict = vec_env.get_batched_obs1(device)
@@ -183,49 +221,104 @@ def collect_rollouts(
             env_actions
         )
 
+        # batch insert for first trajectory
+        s1 = step_counts1
+        trajectories1["categorical"][idx_all, s1] = obs1_cpu_dict["categorical"]
+        trajectories1["numerical"][idx_all, s1] = obs1_cpu_dict["numerical"]
+        trajectories1["token_type_ids"][idx_all, s1] = obs1_cpu_dict["token_type_ids"]
+        trajectories1["side_ids"][idx_all, s1] = obs1_cpu_dict["side_ids"]
+        trajectories1["slot_ids"][idx_all, s1] = obs1_cpu_dict["slot_ids"]
+        trajectories1["actions"][idx_all, s1] = actions1.cpu()
+        trajectories1["log_probs"][idx_all, s1] = log_probs1.cpu()
+        trajectories1["values"][idx_all, s1] = values1.cpu()
+        trajectories1["rewards"][idx_all, s1] = torch.tensor(rewards1, dtype=torch.float32)
+        trajectories1["dones"][idx_all, s1] = torch.tensor(dones, dtype=torch.float32)
+        trajectories1["action_masks"][idx_all, s1] = mask1_t.cpu().bool()
+        trajectories1["is_team_preview"][idx_all, s1] = torch.tensor(is_tp1s, dtype=torch.bool)
+        step_counts1 += 1
+
+        # batch insert for traj 2 (only in self play)
+        self_play_mask = torch.tensor([env_opponents[i] == "self" for i in range(n_envs)])
+        if self_play_mask.any():
+            sp_idx = idx_all[self_play_mask]
+            s2 = step_counts2[sp_idx]
+            trajectories2["categorical"][sp_idx, s2] = obs2_batched["categorical"][sp_idx].cpu()
+            trajectories2["numerical"][sp_idx, s2] = obs2_batched["numerical"][sp_idx].cpu()
+            trajectories2["token_type_ids"][sp_idx, s2] = obs2_batched["token_type_ids"][
+                sp_idx
+            ].cpu()
+            trajectories2["side_ids"][sp_idx, s2] = obs2_batched["side_ids"][sp_idx].cpu()
+            trajectories2["slot_ids"][sp_idx, s2] = obs2_batched["slot_ids"][sp_idx].cpu()
+            trajectories2["actions"][sp_idx, s2] = actions2[sp_idx].cpu()
+            trajectories2["log_probs"][sp_idx, s2] = log_probs2[sp_idx].cpu()
+            trajectories2["values"][sp_idx, s2] = values2[sp_idx].cpu()
+            trajectories2["rewards"][sp_idx, s2] = torch.tensor(rewards2, dtype=torch.float32)[
+                sp_idx
+            ]
+            trajectories2["dones"][sp_idx, s2] = torch.tensor(dones, dtype=torch.float32)[sp_idx]
+            trajectories2["action_masks"][sp_idx, s2] = mask2_t[sp_idx].cpu().bool()
+            trajectories2["is_team_preview"][sp_idx, s2] = torch.tensor(is_tp2s, dtype=torch.bool)[
+                sp_idx
+            ]
+            step_counts2[sp_idx] += 1
+
         for i in range(n_envs):
-            single_obs1 = {k: v[i].unsqueeze(0) for k, v in obs1_cpu_dict.items()}
-            single_obs2 = {k: obs2_batched[k][i].unsqueeze(0).cpu() for k in single_obs1.keys()}
-
-            trajectories1[i].append(
-                {
-                    "obs": single_obs1,
-                    "actions": actions1[i : i + 1].cpu(),
-                    "log_probs": log_probs1[i : i + 1].cpu(),
-                    "values": values1[i : i + 1].cpu(),
-                    "rewards": torch.tensor([rewards1[i]], dtype=torch.float32),
-                    "dones": torch.tensor([dones[i]], dtype=torch.float32),
-                    "action_masks": mask1_t[i : i + 1].cpu(),
-                    "is_team_preview": torch.tensor([is_tp1s[i]], dtype=torch.bool),
-                }
-            )
-
-            if env_opponents[i] == "self":
-                trajectories2[i].append(
-                    {
-                        "obs": single_obs2,
-                        "actions": actions2[i : i + 1].cpu(),
-                        "log_probs": log_probs2[i : i + 1].cpu(),
-                        "values": values2[i : i + 1].cpu(),
-                        "rewards": torch.tensor([rewards2[i]], dtype=torch.float32),
-                        "dones": torch.tensor([dones[i]], dtype=torch.float32),
-                        "action_masks": mask2_t[i : i + 1].cpu(),
-                        "is_team_preview": torch.tensor([is_tp2s[i]], dtype=torch.bool),
-                    }
-                )
-
             if dones[i]:
-                buffer.add_episode(trajectories1[i])
+                # fetch episode through step count
+                length1 = step_counts1[i].item()
+                if length1 > 0:
+                    ep1 = {
+                        "obs": {
+                            "categorical": trajectories1["categorical"][i, :length1].clone(),
+                            "numerical": trajectories1["numerical"][i, :length1].clone(),
+                            "token_type_ids": trajectories1["token_type_ids"][i, :length1].clone(),
+                            "side_ids": trajectories1["side_ids"][i, :length1].clone(),
+                            "slot_ids": trajectories1["slot_ids"][i, :length1].clone(),
+                        },
+                        "actions": trajectories1["actions"][i, :length1].clone(),
+                        "log_probs": trajectories1["log_probs"][i, :length1].clone(),
+                        "values": trajectories1["values"][i, :length1].clone(),
+                        "rewards": trajectories1["rewards"][i, :length1].clone(),
+                        "dones": trajectories1["dones"][i, :length1].clone(),
+                        "action_masks": trajectories1["action_masks"][i, :length1].clone(),
+                        "is_team_preview": trajectories1["is_team_preview"][i, :length1].clone(),
+                        "length": length1,
+                    }
+                    buffer.add_episode(ep1)
+                step_counts1[i] = 0
+
                 if env_opponents[i] == "self":
-                    buffer.add_episode(trajectories2[i])
-                elif env_opponents[i] != "self":
+                    length2 = step_counts2[i].item()
+                    if length2 > 0:
+                        ep2 = {
+                            "obs": {
+                                "categorical": trajectories2["categorical"][i, :length2].clone(),
+                                "numerical": trajectories2["numerical"][i, :length2].clone(),
+                                "token_type_ids": trajectories2["token_type_ids"][
+                                    i, :length2
+                                ].clone(),
+                                "side_ids": trajectories2["side_ids"][i, :length2].clone(),
+                                "slot_ids": trajectories2["slot_ids"][i, :length2].clone(),
+                            },
+                            "actions": trajectories2["actions"][i, :length2].clone(),
+                            "log_probs": trajectories2["log_probs"][i, :length2].clone(),
+                            "values": trajectories2["values"][i, :length2].clone(),
+                            "rewards": trajectories2["rewards"][i, :length2].clone(),
+                            "dones": trajectories2["dones"][i, :length2].clone(),
+                            "action_masks": trajectories2["action_masks"][i, :length2].clone(),
+                            "is_team_preview": trajectories2["is_team_preview"][
+                                i, :length2
+                            ].clone(),
+                            "length": length2,
+                        }
+                        buffer.add_episode(ep2)
+                step_counts2[i] = 0
+
+                if env_opponents[i] != "self":
                     won = bool(rewards1[i] > rewards2[i])
                     pool_wins += int(won)
                     pool_total += 1
                     pool.update_win_rate(env_opponents[i], won)
-
-                trajectories1[i] = []
-                trajectories2[i] = []
 
                 next_state1[0][i : i + 1] = 0
                 next_state1[1][i : i + 1] = 0

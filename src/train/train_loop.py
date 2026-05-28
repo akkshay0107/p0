@@ -370,11 +370,13 @@ def main():
 
         logging.info(f"Opponent pool: {pool}")
 
+        from src.train.rollout import create_trajectory_buffers
+
         vec_env.reset()
         state1 = initial_state(policy, config.n_envs, policy.device)
         state2 = initial_state(policy, config.n_envs, policy.device)
-        trajectories1 = [[] for _ in range(config.n_envs)]
-        trajectories2 = [[] for _ in range(config.n_envs)]
+        trajectories1 = create_trajectory_buffers(config.n_envs)
+        trajectories2 = create_trajectory_buffers(config.n_envs)
         env_opponents = ["self"] * config.n_envs
         active_pool_policies = {}
 
