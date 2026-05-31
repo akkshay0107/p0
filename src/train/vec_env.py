@@ -116,15 +116,12 @@ class ThreadVecEnv:
         reward1 = rewards[agent1]
         reward2 = rewards[agent2] if agent2 in rewards else 0.0
 
-        is_tp1 = env.battle1.teampreview if env.battle1 is not None else False
-        is_tp2 = env.battle2.teampreview if env.battle2 is not None else False
-
         if done:
             _, mask1, mask2, _ = self._reset_env(env_id, env)
-            return env_id, mask1, mask2, reward1, reward2, done, is_tp1, is_tp2, info
+            return env_id, mask1, mask2, reward1, reward2, done, info
 
         self._write_obs(env_id, obs1, obs2)
-        return env_id, mask1, mask2, reward1, reward2, done, is_tp1, is_tp2, info
+        return env_id, mask1, mask2, reward1, reward2, done, info
 
     def step(self, actions: list[dict]):
         futures = [
@@ -140,13 +137,11 @@ class ThreadVecEnv:
         rewards1 = np.array([r[3] for r in results], dtype=np.float32)
         rewards2 = np.array([r[4] for r in results], dtype=np.float32)
         dones = np.array([r[5] for r in results], dtype=bool)
-        is_tp1s = np.array([r[6] for r in results], dtype=bool)
-        is_tp2s = np.array([r[7] for r in results], dtype=bool)
-        infos = [r[8] for r in results]
+        infos = [r[6] for r in results]
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
-        return masks1, masks2, rewards1, rewards2, dones, is_tp1s, is_tp2s, infos
+        return masks1, masks2, rewards1, rewards2, dones, infos
 
     def get_batched_obs1(self, device: torch.device):
         return {k: v.to(device, non_blocking=True) for k, v in self.obs1_buffers.items()}

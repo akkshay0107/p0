@@ -504,7 +504,7 @@ class SimEnv(MegaEnv):
             ),
             battle_format="gen9championsvgc2026regma",
             accept_open_team_sheet=True,
-            start_timer_on_battle_start=True,
+            start_timer_on_battle_start=False,
             log_level=25,
             team=team,
         )

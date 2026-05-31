@@ -216,10 +216,15 @@ def collect_rollouts(
         ]
 
         obs1_cpu_dict = {k: v.cpu().clone() for k, v in obs1_dict.items()}
-
-        next_masks1, next_masks2, rewards1, rewards2, dones, is_tp1s, is_tp2s, infos = vec_env.step(
-            env_actions
+        obs2_cpu_dict = {k: v.cpu().clone() for k, v in obs2_batched.items()}
+        is_tp1s = np.array(
+            [vec_env.envs[i].battle1.teampreview for i in range(n_envs)], dtype=bool
         )
+        is_tp2s = np.array(
+            [vec_env.envs[i].battle2.teampreview for i in range(n_envs)], dtype=bool
+        )
+
+        next_masks1, next_masks2, rewards1, rewards2, dones, infos = vec_env.step(env_actions)
 
         # batch insert for first trajectory
         s1 = step_counts1
@@ -242,13 +247,11 @@ def collect_rollouts(
         if self_play_mask.any():
             sp_idx = idx_all[self_play_mask]
             s2 = step_counts2[sp_idx]
-            trajectories2["categorical"][sp_idx, s2] = obs2_batched["categorical"][sp_idx].cpu()
-            trajectories2["numerical"][sp_idx, s2] = obs2_batched["numerical"][sp_idx].cpu()
-            trajectories2["token_type_ids"][sp_idx, s2] = obs2_batched["token_type_ids"][
-                sp_idx
-            ].cpu()
-            trajectories2["side_ids"][sp_idx, s2] = obs2_batched["side_ids"][sp_idx].cpu()
-            trajectories2["slot_ids"][sp_idx, s2] = obs2_batched["slot_ids"][sp_idx].cpu()
+            trajectories2["categorical"][sp_idx, s2] = obs2_cpu_dict["categorical"][sp_idx]
+            trajectories2["numerical"][sp_idx, s2] = obs2_cpu_dict["numerical"][sp_idx]
+            trajectories2["token_type_ids"][sp_idx, s2] = obs2_cpu_dict["token_type_ids"][sp_idx]
+            trajectories2["side_ids"][sp_idx, s2] = obs2_cpu_dict["side_ids"][sp_idx]
+            trajectories2["slot_ids"][sp_idx, s2] = obs2_cpu_dict["slot_ids"][sp_idx]
             trajectories2["actions"][sp_idx, s2] = actions2[sp_idx].cpu()
             trajectories2["log_probs"][sp_idx, s2] = log_probs2[sp_idx].cpu()
             trajectories2["values"][sp_idx, s2] = values2[sp_idx].cpu()
