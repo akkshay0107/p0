@@ -8,7 +8,7 @@ from poke_env import LocalhostServerConfiguration
 from poke_env.battle import DoubleBattle, Pokemon
 from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
-from poke_env.battle.move import Move
+from poke_env.battle.move import Move, MoveCategory
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
@@ -214,8 +214,8 @@ def test_pokemon_categorical_real():
     assert cat[12] == 0
 
     # 4 Move Categories (padded)
-    assert cat[13] == tokenizer.categories.get("physical")
-    assert cat[14] == tokenizer.categories.get("special")
+    assert cat[13] == tokenizer.categories.get(MoveCategory.PHYSICAL)
+    assert cat[14] == tokenizer.categories.get(MoveCategory.SPECIAL)
     assert cat[15] == 0
     assert cat[16] == 0
 
