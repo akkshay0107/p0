@@ -2,6 +2,7 @@ import logging
 import os
 import random
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -325,18 +326,63 @@ def main():
 
     # to guarantee executor shutdown
     try:
+        # build showdown once instead of potentially having multiple suprocesses
+        # trying to build into dist at the same time
+        logging.info("Building pokemon-showdown...")
+        try:
+            subprocess.run(
+                ["node", "build"],
+                cwd="pokemon-showdown",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            logging.info("Pokemon-showdown built successfully.")
+        except Exception as e:
+            logging.error(f"Failed to build pokemon-showdown: {e}")
+            raise e
+
+        # clean up other processes occupying the port
+        for i in range(config.n_envs):
+            port = 8000 + i
+            try:
+                subprocess.run(
+                    ["fuser", "-k", f"{port}/tcp"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+
         # one showdown server per thread
         for i in range(config.n_envs):
             port = 8000 + i
             proc = subprocess.Popen(
-                ["node", "pokemon-showdown", "start", "--no-security", str(port)],
+                ["node", "pokemon-showdown", "start", "--no-security", "--skip-build", str(port)],
                 cwd="pokemon-showdown",
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             showdown_procs.append(proc)
 
-        time.sleep(10)
+        # wait and check for all showdown servers to be listening
+        # rather than a flat timeout
+        start_time = time.time()
+        timeout = 30.0  # auto fail if not listening in these many secs
+        pending_ports = [8000 + i for i in range(config.n_envs)]
+        while pending_ports and (time.time() - start_time) < timeout:
+            for port in list(pending_ports):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                        pending_ports.remove(port)
+                except OSError:
+                    pass
+            if pending_ports:
+                time.sleep(0.5)
+
+        if pending_ports:
+            raise RuntimeError(f"Showdown servers failed to start on ports: {pending_ports}")
+        logging.info("All showdown servers are ready.")
 
         envs = [SimEnv.build_env(env_id=i, server_port=8000 + i) for i in range(config.n_envs)]
 
