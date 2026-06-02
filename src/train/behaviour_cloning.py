@@ -5,7 +5,7 @@ from typing import cast
 import torch
 from torch.utils.data import Dataset
 
-from src.model.fused_token_encoder import as_obs_dict
+# removed as_obs_dict
 from src.model.policy import PolicyNet
 from src.model.structured_observation import StructuredObservation
 from src.train.utils import initial_state
@@ -55,11 +55,13 @@ def _run_batched_bc(
 
     all_obs_tensors = []
     for ep in episodes:
-        all_obs_tensors.append(torch.cat([sample["obs"].unsqueeze(0) for sample in ep], dim=0))
-    all_obs = cast(StructuredObservation, torch.cat(all_obs_tensors, dim=0).to(device))
-    all_tokens = policy.encoder(as_obs_dict(all_obs))
+        all_obs_tensors.append(StructuredObservation.cat([sample["obs"].unsqueeze(0) for sample in ep], dim=0))
+    all_obs = StructuredObservation.cat(all_obs_tensors, dim=0).to(device)
+    all_tokens = policy.encoder(all_obs)
+    all_padding_masks = policy._get_padding_mask(all_obs.numerical)
 
     tokens_list = torch.split(all_tokens, [len(ep) for ep in episodes])
+    padding_mask_list = torch.split(all_padding_masks, [len(ep) for ep in episodes])
 
     def pack(fields):
         return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
@@ -90,13 +92,19 @@ def _run_batched_bc(
             break
 
         tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
+        padding_mask_t = torch.stack([pm[t] for pm in padding_mask_list[:active_n]], dim=0)
         masks_t = masks_p[:active_n, t]
         targets_t = targets_p[:active_n, t]
         is_tp_t = is_tp_p[:active_n, t]
 
         curr_state = (state[0][:active_n], state[1][:active_n])
         log_prob, _, _, _, next_state = policy.evaluate_actions_tokens(
-            tokens_t, is_tp_t, targets_t, masks_t, state=curr_state
+            tokens_t,
+            is_tp_t,
+            targets_t,
+            masks_t,
+            state=curr_state,
+            padding_mask=padding_mask_t,
         )
 
         loss = -log_prob.sum()
@@ -105,7 +113,13 @@ def _run_batched_bc(
 
         with torch.no_grad():
             logits, _, _, _, _ = policy.forward_tokens(
-                tokens_t, is_tp_t, curr_state, masks_t, sample_actions=False, actions=targets_t
+                tokens_t,
+                is_tp_t,
+                curr_state,
+                masks_t,
+                sample_actions=False,
+                actions=targets_t,
+                padding_mask=padding_mask_t,
             )
             preds = torch.stack(
                 [logits[:, 0].argmax(dim=-1), logits[:, 1].argmax(dim=-1)],

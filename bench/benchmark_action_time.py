@@ -100,10 +100,7 @@ class ProfiledRLPlayer(RLPlayer):
 
             # cpu to gpu moving stage (underrepresented if device is cpu)
             start_prep = get_time()
-            if hasattr(obs, "unsqueeze"):
-                obs_t = obs.unsqueeze(0).to(self.policy.device)
-            else:
-                obs_t = {k: v.unsqueeze(0).to(self.policy.device) for k, v in obs.items()}
+            obs_t = obs.unsqueeze(0).to(self.policy.device)
             action_mask_t = action_mask.unsqueeze(0).to(self.policy.device)
             TimeTracker.tensor_prep_time += get_time() - start_prep
 
@@ -136,7 +133,11 @@ class ProfiledRLPlayer(RLPlayer):
         start_inference = get_time()
         with torch.no_grad():
             tokens = self.policy.encoder(obs)
-            z, self.state = self.policy.actor.reducer(tokens, self.state)
+            numerical = obs.numerical
+            if numerical.dim() == 2:
+                numerical = numerical.unsqueeze(0)
+            padding_mask = self.policy._get_padding_mask(numerical)
+            z, self.state = self.policy.actor.reducer(tokens, self.state, padding_mask)
             # Pokemon 1: P(a1 | z)
             logits1 = self.policy.actor.head1(z)
             if action_mask is not None:

@@ -38,15 +38,6 @@ class StructuredObservation:
     categorical: torch.Tensor
     numerical: torch.Tensor
 
-    def as_dict(self) -> dict[str, torch.Tensor]:
-        return {
-            "token_type_ids": self.token_type_ids,
-            "side_ids": self.side_ids,
-            "slot_ids": self.slot_ids,
-            "categorical": self.categorical,
-            "numerical": self.numerical,
-        }
-
     def to(self, *args, **kwargs) -> StructuredObservation:
         return StructuredObservation(
             token_type_ids=self.token_type_ids.to(*args, **kwargs),
@@ -95,4 +86,28 @@ class StructuredObservation:
             slot_ids=torch.stack([obs.slot_ids for obs in observations], dim=dim),
             categorical=torch.stack([obs.categorical for obs in observations], dim=dim),
             numerical=torch.stack([obs.numerical for obs in observations], dim=dim),
+        )
+
+    @staticmethod
+    def empty_batch(batch_size: int, pin_memory: bool = False) -> StructuredObservation:
+        return StructuredObservation(
+            token_type_ids=torch.zeros(
+                (batch_size, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=pin_memory
+            ),
+            side_ids=torch.zeros(
+                (batch_size, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=pin_memory
+            ),
+            slot_ids=torch.zeros(
+                (batch_size, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=pin_memory
+            ),
+            categorical=torch.zeros(
+                (batch_size, SEQUENCE_LENGTH, CATEGORICAL_WIDTH),
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            ),
+            numerical=torch.zeros(
+                (batch_size, SEQUENCE_LENGTH, NUMERICAL_WIDTH),
+                dtype=torch.float32,
+                pin_memory=pin_memory,
+            ),
         )

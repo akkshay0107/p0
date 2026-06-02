@@ -3,7 +3,6 @@ import logging
 from pathlib import Path
 
 import pytest
-import torch
 from poke_env import LocalhostServerConfiguration
 from poke_env.battle import DoubleBattle, Pokemon
 from poke_env.battle.effect import Effect
@@ -30,12 +29,11 @@ from src.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     SideId,
+    StructuredObservation,
     TokenType,
 )
 from src.model.tokenizer import tokenizer
 from src.team_picker import RandomTeamFromPool
-
-# --- HELPERS TO INSTANTIATE REAL POKE_ENV OBJECTS ---
 
 
 def make_real_pokemon(
@@ -232,7 +230,9 @@ def test_pokemon_numeric_real():
     battle = make_real_battle()
 
     # None Pokemon returns mostly zeros except for condition flag (e.g. cond=1 -> row[2] = 1.0)
-    none_row = _pokemon_numeric(None, battle, cond=1, orig_idx=-1, move_slots=_iter_move_slots(None))
+    none_row = _pokemon_numeric(
+        None, battle, cond=1, orig_idx=-1, move_slots=_iter_move_slots(None)
+    )
     assert len(none_row) == NUMERICAL_WIDTH
     assert none_row[2] == 1.0
     assert sum(none_row) == 1.0
@@ -290,11 +290,15 @@ def test_pokemon_numeric_real():
     assert row[42] == 1.0  # Preparing (preparing_move is not None)
 
     battle._can_mega_evolve = [True, False]
-    row_mega_active = _pokemon_numeric(mon, battle, cond=1, orig_idx=2, active_idx=0, move_slots=_iter_move_slots(mon))
+    row_mega_active = _pokemon_numeric(
+        mon, battle, cond=1, orig_idx=2, active_idx=0, move_slots=_iter_move_slots(mon)
+    )
     assert row_mega_active[30] == 1.0
 
     mon_mega = make_real_pokemon(species="charizardmegay")
-    row_mega_form = _pokemon_numeric(mon_mega, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_mega))
+    row_mega_form = _pokemon_numeric(
+        mon_mega, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_mega)
+    )
     assert row_mega_form[31] == 1.0
 
     # Last move slot matching
@@ -303,7 +307,9 @@ def test_pokemon_numeric_real():
         moves={"airslash": 10},
         last_move_id="airslash",
     )
-    row_last_move = _pokemon_numeric(mon_last, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_last))
+    row_last_move = _pokemon_numeric(
+        mon_last, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_last)
+    )
     assert row_last_move[32] == 1.0  # First move slot matched last_move
 
 
@@ -456,11 +462,6 @@ def test_from_battle_real_end_to_end():
     assert obs.side_ids[26] == SideId.ALLY
     assert obs.side_ids[27] == SideId.OPPONENT
 
-    obs_dict = from_battle(battle, tokenizer, as_dict=True)
-    assert isinstance(obs_dict, dict)
-    assert "categorical" in obs_dict
-    assert isinstance(obs_dict["categorical"], torch.Tensor)
-
 
 @pytest.mark.asyncio
 async def test_observation_builder_live(showdown_server, battle_format, sample_team):
@@ -475,7 +476,7 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
     class CapturePlayer(RandomPlayer):
         def teampreview(self, battle):
             try:
-                obs = from_battle(battle, tokenizer, as_dict=True)
+                obs = from_battle(battle, tokenizer)
                 captured_battles.append((battle.turn, battle.teampreview, obs))
             except Exception as e:
                 captured_errors.append(f"teampreview: {e}")
@@ -483,7 +484,7 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
 
         def choose_move(self, battle):
             try:
-                obs = from_battle(battle, tokenizer, as_dict=True)
+                obs = from_battle(battle, tokenizer)
                 captured_battles.append((battle.turn, battle.teampreview, obs))
             except Exception as e:
                 captured_errors.append(f"choose_move: {e}")
@@ -518,12 +519,10 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
     seen_normal_turn = False
 
     for _, is_teampreview, obs in captured_battles:
-        assert isinstance(obs, dict)
-        assert "categorical" in obs
-        assert "numerical" in obs
+        assert isinstance(obs, StructuredObservation)
 
-        cat = obs["categorical"]
-        num = obs["numerical"]
+        cat = obs.categorical
+        num = obs.numerical
 
         assert cat.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
         assert num.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)

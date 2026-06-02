@@ -15,6 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from src.env import SimEnv
 from src.lookups import ACT_SIZE, OBS_DIM
 from src.model.policy import PolicyNet
+from src.model.structured_observation import StructuredObservation
 from src.train.config import PPOConfig, load_config
 from src.train.opponent_pool import OpponentPool
 from src.train.rollout import RolloutBuffer, collect_rollouts
@@ -79,12 +80,11 @@ def _run_batched_ppo(
     lengths = torch.tensor([ep["length"] for ep in episodes], device=device)
     max_steps = int(lengths[0].item())
 
-    keys = episodes[0]["obs"].keys()
-    all_obs = {k: torch.cat([ep["obs"][k] for ep in episodes], dim=0) for k in keys}
+    all_obs = StructuredObservation.cat([ep["obs"] for ep in episodes], dim=0)
     all_tokens = policy.encoder(all_obs)
     tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
 
-    all_padding_masks = policy._get_padding_mask(all_obs["numerical"])
+    all_padding_masks = policy._get_padding_mask(all_obs.numerical)
     padding_mask_list = torch.split(all_padding_masks, [ep["length"] for ep in episodes])
 
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]

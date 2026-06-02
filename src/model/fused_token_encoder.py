@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
@@ -12,6 +11,7 @@ from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
+    StructuredObservation,
     TokenType,
 )
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
@@ -27,15 +27,6 @@ def _load_vocab_sizes() -> dict[str, int]:
     with path.open("r", encoding="utf-8") as f:
         vocab = json.load(f)
     return {name: len(values) + 1 for name, values in vocab.items()}
-
-
-def as_obs_dict(obs: Any) -> Mapping[str, torch.Tensor]:
-    if isinstance(obs, Mapping):
-        return obs
-    as_dict = getattr(obs, "as_dict", None)
-    if callable(as_dict):
-        return as_dict()
-    raise TypeError("Structured observation must be a mapping or expose as_dict().")
 
 
 class FusedTokenEncoder(nn.Module):
@@ -183,13 +174,12 @@ class FusedTokenEncoder(nn.Module):
         s_count = s_mask.sum(dim=-1, keepdim=True).float().clamp_min(1.0)
         return s_sum / s_count  # zero-vector when no conditions present (#2)
 
-    def forward(self, obs: Any) -> torch.Tensor:
-        obs_dict = as_obs_dict(obs)
-        categorical = obs_dict["categorical"].long()
-        numerical = obs_dict["numerical"].float()
-        token_type_ids = obs_dict["token_type_ids"].long()
-        side_ids = obs_dict["side_ids"].long()
-        slot_ids = obs_dict["slot_ids"].long()
+    def forward(self, obs: StructuredObservation) -> torch.Tensor:
+        categorical = obs.categorical.long()
+        numerical = obs.numerical.float()
+        token_type_ids = obs.token_type_ids.long()
+        side_ids = obs.side_ids.long()
+        slot_ids = obs.slot_ids.long()
 
         if categorical.dim() == 2:
             categorical = categorical.unsqueeze(0)

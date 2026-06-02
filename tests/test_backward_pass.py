@@ -7,6 +7,7 @@ from src.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     SideId,
+    StructuredObservation,
     TokenType,
 )
 
@@ -67,13 +68,13 @@ def dummy_obs():
     # Set the is_tp flag (numerical[:, 25, 6]) randomly
     numerical[:, 25, 6] = 1.0
 
-    return {
-        "token_type_ids": token_type_ids,
-        "side_ids": side_ids,
-        "slot_ids": slot_ids,
-        "categorical": categorical,
-        "numerical": numerical,
-    }
+    return StructuredObservation(
+        token_type_ids=token_type_ids,
+        side_ids=side_ids,
+        slot_ids=slot_ids,
+        categorical=categorical,
+        numerical=numerical,
+    )
 
 
 def test_gradient_flow(dummy_obs):
@@ -82,7 +83,7 @@ def test_gradient_flow(dummy_obs):
     policy = PolicyNet(d_model=64, nhead=2, nlayer=1).to(device)
     policy.train()
 
-    obs = {k: v.to(device) for k, v in dummy_obs.items()}
+    obs = dummy_obs.to(device)
 
     # allow all actions for now
     action_mask = torch.ones((2, 2, 47), dtype=torch.uint8).to(device)
@@ -177,7 +178,7 @@ def test_gradient_flow(dummy_obs):
 
 def test_value_head_scaling(dummy_obs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    obs = {k: v.to(device) for k, v in dummy_obs.items()}
+    obs = dummy_obs.to(device)
 
     # Create two identical policies except for the scale
     torch.manual_seed(1)

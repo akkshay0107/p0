@@ -3,7 +3,7 @@ import torch
 
 from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
-from src.model.structured_observation import CATEGORICAL_WIDTH, NUMERICAL_WIDTH, SEQUENCE_LENGTH
+from src.model.structured_observation import CATEGORICAL_WIDTH, NUMERICAL_WIDTH, SEQUENCE_LENGTH, StructuredObservation
 from src.train.config import PPOConfig
 from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
@@ -95,7 +95,7 @@ class RolloutBuffer:
             ret = adv + values_dev
 
             episode_data = {
-                "obs": {k: v.to(device) for k, v in ep["obs"].items()},
+                "obs": ep["obs"].to(device),
                 "actions": ep["actions"].to(device),
                 "log_probs": ep["log_probs"].to(device),
                 "action_masks": ep["action_masks"].to(device),
@@ -158,13 +158,13 @@ def collect_rollouts(
     idx_all = torch.arange(n_envs)
 
     for step in range(steps):
-        obs1_dict = vec_env.get_batched_obs1(device)
+        obs1 = vec_env.get_batched_obs1(device)
         mask1_t = torch.from_numpy(masks1).to(device, non_blocking=True)
         obs2_batched = vec_env.get_batched_obs2(device)
         mask2_t = torch.from_numpy(masks2).to(device, non_blocking=True)
 
         _, log_probs1, actions1, values1, next_state1 = policy(
-            obs1_dict,
+            obs1,
             state1,
             mask1_t,
             sample_actions=True,
@@ -186,7 +186,7 @@ def collect_rollouts(
 
         for opp_id, env_indices in opp_groups.items():
             idx_tensor = torch.tensor(env_indices, device=device)
-            group_obs2 = {k: v[idx_tensor] for k, v in obs2_batched.items()}
+            group_obs2 = obs2_batched[idx_tensor]
             group_mask2 = mask2_t[idx_tensor]
             group_state2 = (state2[0][idx_tensor], state2[1][idx_tensor])
 
@@ -215,8 +215,8 @@ def collect_rollouts(
             for i in range(n_envs)
         ]
 
-        obs1_cpu_dict = {k: v.cpu().clone() for k, v in obs1_dict.items()}
-        obs2_cpu_dict = {k: v.cpu().clone() for k, v in obs2_batched.items()}
+        obs1_cpu = obs1.cpu()
+        obs2_cpu = obs2_batched.cpu()
         is_tp1s = np.array([vec_env.envs[i].battle1.teampreview for i in range(n_envs)], dtype=bool)
         is_tp2s = np.array([vec_env.envs[i].battle2.teampreview for i in range(n_envs)], dtype=bool)
 
@@ -224,11 +224,11 @@ def collect_rollouts(
 
         # batch insert for first trajectory
         s1 = step_counts1
-        trajectories1["categorical"][idx_all, s1] = obs1_cpu_dict["categorical"]
-        trajectories1["numerical"][idx_all, s1] = obs1_cpu_dict["numerical"]
-        trajectories1["token_type_ids"][idx_all, s1] = obs1_cpu_dict["token_type_ids"]
-        trajectories1["side_ids"][idx_all, s1] = obs1_cpu_dict["side_ids"]
-        trajectories1["slot_ids"][idx_all, s1] = obs1_cpu_dict["slot_ids"]
+        trajectories1["categorical"][idx_all, s1] = obs1_cpu.categorical
+        trajectories1["numerical"][idx_all, s1] = obs1_cpu.numerical
+        trajectories1["token_type_ids"][idx_all, s1] = obs1_cpu.token_type_ids
+        trajectories1["side_ids"][idx_all, s1] = obs1_cpu.side_ids
+        trajectories1["slot_ids"][idx_all, s1] = obs1_cpu.slot_ids
         trajectories1["actions"][idx_all, s1] = actions1.cpu()
         trajectories1["log_probs"][idx_all, s1] = log_probs1.cpu()
         trajectories1["values"][idx_all, s1] = values1.cpu()
@@ -243,11 +243,11 @@ def collect_rollouts(
         if self_play_mask.any():
             sp_idx = idx_all[self_play_mask]
             s2 = step_counts2[sp_idx]
-            trajectories2["categorical"][sp_idx, s2] = obs2_cpu_dict["categorical"][sp_idx]
-            trajectories2["numerical"][sp_idx, s2] = obs2_cpu_dict["numerical"][sp_idx]
-            trajectories2["token_type_ids"][sp_idx, s2] = obs2_cpu_dict["token_type_ids"][sp_idx]
-            trajectories2["side_ids"][sp_idx, s2] = obs2_cpu_dict["side_ids"][sp_idx]
-            trajectories2["slot_ids"][sp_idx, s2] = obs2_cpu_dict["slot_ids"][sp_idx]
+            trajectories2["categorical"][sp_idx, s2] = obs2_cpu.categorical[sp_idx]
+            trajectories2["numerical"][sp_idx, s2] = obs2_cpu.numerical[sp_idx]
+            trajectories2["token_type_ids"][sp_idx, s2] = obs2_cpu.token_type_ids[sp_idx]
+            trajectories2["side_ids"][sp_idx, s2] = obs2_cpu.side_ids[sp_idx]
+            trajectories2["slot_ids"][sp_idx, s2] = obs2_cpu.slot_ids[sp_idx]
             trajectories2["actions"][sp_idx, s2] = actions2[sp_idx].cpu()
             trajectories2["log_probs"][sp_idx, s2] = log_probs2[sp_idx].cpu()
             trajectories2["values"][sp_idx, s2] = values2[sp_idx].cpu()
@@ -267,13 +267,13 @@ def collect_rollouts(
                 length1 = step_counts1[i].item()
                 if length1 > 0:
                     ep1 = {
-                        "obs": {
-                            "categorical": trajectories1["categorical"][i, :length1].clone(),
-                            "numerical": trajectories1["numerical"][i, :length1].clone(),
-                            "token_type_ids": trajectories1["token_type_ids"][i, :length1].clone(),
-                            "side_ids": trajectories1["side_ids"][i, :length1].clone(),
-                            "slot_ids": trajectories1["slot_ids"][i, :length1].clone(),
-                        },
+                        "obs": StructuredObservation(
+                            token_type_ids=trajectories1["token_type_ids"][i, :length1].clone(),
+                            side_ids=trajectories1["side_ids"][i, :length1].clone(),
+                            slot_ids=trajectories1["slot_ids"][i, :length1].clone(),
+                            categorical=trajectories1["categorical"][i, :length1].clone(),
+                            numerical=trajectories1["numerical"][i, :length1].clone(),
+                        ),
                         "actions": trajectories1["actions"][i, :length1].clone(),
                         "log_probs": trajectories1["log_probs"][i, :length1].clone(),
                         "values": trajectories1["values"][i, :length1].clone(),
@@ -290,24 +290,20 @@ def collect_rollouts(
                     length2 = step_counts2[i].item()
                     if length2 > 0:
                         ep2 = {
-                            "obs": {
-                                "categorical": trajectories2["categorical"][i, :length2].clone(),
-                                "numerical": trajectories2["numerical"][i, :length2].clone(),
-                                "token_type_ids": trajectories2["token_type_ids"][
-                                    i, :length2
-                                ].clone(),
-                                "side_ids": trajectories2["side_ids"][i, :length2].clone(),
-                                "slot_ids": trajectories2["slot_ids"][i, :length2].clone(),
-                            },
+                            "obs": StructuredObservation(
+                                token_type_ids=trajectories2["token_type_ids"][i, :length2].clone(),
+                                side_ids=trajectories2["side_ids"][i, :length2].clone(),
+                                slot_ids=trajectories2["slot_ids"][i, :length2].clone(),
+                                categorical=trajectories2["categorical"][i, :length2].clone(),
+                                numerical=trajectories2["numerical"][i, :length2].clone(),
+                            ),
                             "actions": trajectories2["actions"][i, :length2].clone(),
                             "log_probs": trajectories2["log_probs"][i, :length2].clone(),
                             "values": trajectories2["values"][i, :length2].clone(),
                             "rewards": trajectories2["rewards"][i, :length2].clone(),
                             "dones": trajectories2["dones"][i, :length2].clone(),
                             "action_masks": trajectories2["action_masks"][i, :length2].clone(),
-                            "is_team_preview": trajectories2["is_team_preview"][
-                                i, :length2
-                            ].clone(),
+                            "is_team_preview": trajectories2["is_team_preview"][i, :length2].clone(),
                             "length": length2,
                         }
                         buffer.add_episode(ep2)

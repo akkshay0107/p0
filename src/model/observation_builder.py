@@ -313,9 +313,7 @@ def _side_token(
 def from_battle(
     battle: AbstractBattle,
     tok: PokemonTokenizer | None = None,
-    *,
-    as_dict: bool = False,
-) -> StructuredObservation | dict[str, torch.Tensor]:
+) -> StructuredObservation:
     assert isinstance(battle, DoubleBattle)
     tok = tok or tokenizer
 
@@ -332,7 +330,9 @@ def from_battle(
     idx = 1
     for side, is_opponent in ((SideId.ALLY, False), (SideId.OPPONENT, True)):
         for slot_idx, (mon, orig_idx, active_idx) in enumerate(
-            _get_ordered_pokemon(battle, is_opponent, possible_switches if not is_opponent else None)
+            _get_ordered_pokemon(
+                battle, is_opponent, possible_switches if not is_opponent else None
+            )
         ):
             cond = _slot_condition(
                 battle, mon, slot_idx, is_opponent, possible_switches if not is_opponent else None
@@ -391,7 +391,7 @@ def from_battle(
     if obs.token_type_ids.numel() != SEQUENCE_LENGTH:
         raise RuntimeError(f"Structured observation length drifted to {obs.token_type_ids.numel()}")
 
-    return obs.as_dict() if as_dict else obs
+    return obs
 
 
 def _is_mega_form(pokemon: Pokemon | None) -> bool:

@@ -17,6 +17,7 @@ from src.env import MegaEnv
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
+from src.model.structured_observation import StructuredObservation
 from src.team_picker import RandomTeamFromPool
 from src.train.utils import load_checkpoint
 
@@ -66,9 +67,13 @@ class RLPlayer(Player):
         with torch.no_grad():
             # Shared front-end encoding
             tokens = self.policy.encoder(obs)
+            numerical = obs.numerical
+            if numerical.dim() == 2:
+                numerical = numerical.unsqueeze(0)
+            padding_mask = self.policy._get_padding_mask(numerical)
 
             # Stateful Actor step
-            z, self.state = self.policy.actor.reducer(tokens, self.state)
+            z, self.state = self.policy.actor.reducer(tokens, self.state, padding_mask)
 
             # Pokemon 1: P(a1 | z)
             logits1 = self.policy.actor.head1(z)
@@ -103,11 +108,7 @@ class RLPlayer(Player):
         action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
 
         # Ensure obs is batched and moved to device
-        if hasattr(obs, "unsqueeze"):
-            obs = obs.unsqueeze(0).to(self.policy.device)
-        else:
-            # Handle dictionary observation
-            obs = {k: v.unsqueeze(0).to(self.policy.device) for k, v in obs.items()}
+        obs = obs.unsqueeze(0).to(self.policy.device)
 
         with torch.no_grad():
             actions = self._top_p(

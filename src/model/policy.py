@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -9,8 +9,8 @@ from torch.distributions import Categorical
 
 from src.lookups import ACT_SIZE
 from src.model.cls_reducer import CLSReducer
-from src.model.fused_token_encoder import FusedTokenEncoder, as_obs_dict
-from src.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
+from src.model.fused_token_encoder import FusedTokenEncoder
+from src.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH, StructuredObservation
 
 # Type alias for the recurrent state
 State = Tuple[torch.Tensor, torch.Tensor]
@@ -289,7 +289,7 @@ class PolicyNet(nn.Module):
 
     def forward(
         self,
-        obs: Any,
+        obs: StructuredObservation,
         state: Optional[State] = None,
         action_mask: Optional[torch.Tensor] = None,
         sample_actions: bool = True,
@@ -298,11 +298,10 @@ class PolicyNet(nn.Module):
         """
         Main forward pass. Matches original PolicyNet signature for compatibility.
         """
-        obs_dict = as_obs_dict(obs)
-        tokens = self.encoder(obs_dict)
+        tokens = self.encoder(obs)
 
         # avoid duplicate is_tp calculation
-        numerical = obs_dict["numerical"]
+        numerical = obs.numerical
         if numerical.dim() == 2:
             numerical = numerical.unsqueeze(0)
         is_tp = (numerical[:, 25, 2] > 0.5).to(self.device)
@@ -344,7 +343,7 @@ class PolicyNet(nn.Module):
 
     def evaluate_actions(
         self,
-        obs: Any,
+        obs: StructuredObservation,
         actions: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
         state: Optional[State] = None,
@@ -353,9 +352,8 @@ class PolicyNet(nn.Module):
         Evaluate actions for PPO updates.
         Returns (log_prob, entropy, normalized_entropy, value, next_state).
         """
-        obs_dict = as_obs_dict(obs)
-        tokens = self.encoder(obs_dict)
-        numerical = obs_dict["numerical"]
+        tokens = self.encoder(obs)
+        numerical = obs.numerical
         if numerical.dim() == 2:
             numerical = numerical.unsqueeze(0)
         is_tp = (numerical[:, 25, 2] > 0.5).to(self.device)
@@ -409,7 +407,7 @@ class PolicyNet(nn.Module):
 
     def get_policy_masked_logits(
         self,
-        obs: Any,
+        obs: StructuredObservation,
         action_taken: torch.Tensor,
         action_mask: Optional[torch.Tensor],
         state: Optional[State] = None,

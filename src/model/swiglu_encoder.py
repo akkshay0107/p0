@@ -97,11 +97,10 @@ class SwiGLUEncoderLayer(nn.Module):
 class SwiGLUTransformerEncoder(nn.Module):
     """
     Near-direct replacement for nn.TransformerEncoder in the specific setup:
-    - cloned identical layers
     - no final encoder norm
     - batch_first=True inputs
     - no nested tensor path
-    - no masks
+    - only src_key_padding_mask
     """
 
     def __init__(

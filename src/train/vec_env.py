@@ -30,44 +30,24 @@ class ThreadVecEnv:
         self.last_masks2 = None
 
     def _create_buffers(self):
-        return {
-            "token_type_ids": torch.zeros(
-                (self.n_envs, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=self.use_pinned
-            ),
-            "side_ids": torch.zeros(
-                (self.n_envs, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=self.use_pinned
-            ),
-            "slot_ids": torch.zeros(
-                (self.n_envs, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=self.use_pinned
-            ),
-            "categorical": torch.zeros(
-                (self.n_envs, SEQUENCE_LENGTH, CATEGORICAL_WIDTH),
-                dtype=torch.long,
-                pin_memory=self.use_pinned,
-            ),
-            "numerical": torch.zeros(
-                (self.n_envs, SEQUENCE_LENGTH, NUMERICAL_WIDTH),
-                dtype=torch.float32,
-                pin_memory=self.use_pinned,
-            ),
-        }
+        return StructuredObservation.empty_batch(self.n_envs, pin_memory=self.use_pinned)
 
     def _write_obs(
         self, env_id: int, obs1: StructuredObservation, obs2: StructuredObservation | None
     ):
         if obs1 is not None:
-            self.obs1_buffers["token_type_ids"][env_id].copy_(obs1.token_type_ids)
-            self.obs1_buffers["side_ids"][env_id].copy_(obs1.side_ids)
-            self.obs1_buffers["slot_ids"][env_id].copy_(obs1.slot_ids)
-            self.obs1_buffers["categorical"][env_id].copy_(obs1.categorical)
-            self.obs1_buffers["numerical"][env_id].copy_(obs1.numerical)
+            self.obs1_buffers.token_type_ids[env_id].copy_(obs1.token_type_ids)
+            self.obs1_buffers.side_ids[env_id].copy_(obs1.side_ids)
+            self.obs1_buffers.slot_ids[env_id].copy_(obs1.slot_ids)
+            self.obs1_buffers.categorical[env_id].copy_(obs1.categorical)
+            self.obs1_buffers.numerical[env_id].copy_(obs1.numerical)
 
         if obs2 is not None:
-            self.obs2_buffers["token_type_ids"][env_id].copy_(obs2.token_type_ids)
-            self.obs2_buffers["side_ids"][env_id].copy_(obs2.side_ids)
-            self.obs2_buffers["slot_ids"][env_id].copy_(obs2.slot_ids)
-            self.obs2_buffers["categorical"][env_id].copy_(obs2.categorical)
-            self.obs2_buffers["numerical"][env_id].copy_(obs2.numerical)
+            self.obs2_buffers.token_type_ids[env_id].copy_(obs2.token_type_ids)
+            self.obs2_buffers.side_ids[env_id].copy_(obs2.side_ids)
+            self.obs2_buffers.slot_ids[env_id].copy_(obs2.slot_ids)
+            self.obs2_buffers.categorical[env_id].copy_(obs2.categorical)
+            self.obs2_buffers.numerical[env_id].copy_(obs2.numerical)
 
     def _reset_env(self, env_id: int, env: SimEnv):
         obs, info = env.reset()
@@ -144,10 +124,10 @@ class ThreadVecEnv:
         return masks1, masks2, rewards1, rewards2, dones, infos
 
     def get_batched_obs1(self, device: torch.device):
-        return {k: v.to(device, non_blocking=True) for k, v in self.obs1_buffers.items()}
+        return self.obs1_buffers.to(device, non_blocking=True)
 
     def get_batched_obs2(self, device: torch.device):
-        return {k: v.to(device, non_blocking=True) for k, v in self.obs2_buffers.items()}
+        return self.obs2_buffers.to(device, non_blocking=True)
 
     def shutdown(self):
         self.executor.shutdown(wait=False, cancel_futures=True)
