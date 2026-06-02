@@ -52,6 +52,7 @@ class CLSReducer(nn.Module):
         self,
         tokens: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor] | None = None,
+        padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if tokens.dim() == 2:
             tokens = tokens.unsqueeze(0)
@@ -72,7 +73,14 @@ class CLSReducer(nn.Module):
 
         # hg_prev empty if use history false
         seq = torch.cat([cls_tok, hg_prev, tokens[:, 1:]], dim=1)
-        enc = self.encoder(seq)
+
+        enc_mask = None
+        if padding_mask is not None:
+            enc_mask = torch.zeros(B, seq.size(1), dtype=torch.bool, device=seq.device)
+            # CLS and HG tokens are never padded. tokens[:, 1:] corresponds to padding_mask[:, 1:]
+            enc_mask[:, 1 + self.n_hg:] = padding_mask[:, 1:]
+
+        enc = self.encoder(seq, src_key_padding_mask=enc_mask)
 
         cls = enc[:, 0]
         # empty if use history is false (n_hg = 0)

@@ -217,12 +217,8 @@ def collect_rollouts(
 
         obs1_cpu_dict = {k: v.cpu().clone() for k, v in obs1_dict.items()}
         obs2_cpu_dict = {k: v.cpu().clone() for k, v in obs2_batched.items()}
-        is_tp1s = np.array(
-            [vec_env.envs[i].battle1.teampreview for i in range(n_envs)], dtype=bool
-        )
-        is_tp2s = np.array(
-            [vec_env.envs[i].battle2.teampreview for i in range(n_envs)], dtype=bool
-        )
+        is_tp1s = np.array([vec_env.envs[i].battle1.teampreview for i in range(n_envs)], dtype=bool)
+        is_tp2s = np.array([vec_env.envs[i].battle2.teampreview for i in range(n_envs)], dtype=bool)
 
         next_masks1, next_masks2, rewards1, rewards2, dones, infos = vec_env.step(env_actions)
 

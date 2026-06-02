@@ -79,11 +79,12 @@ class ActorPolicy(nn.Module):
         actions: Optional[torch.Tensor] = None,
         sample: bool = True,
         is_tp: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], State]:
         B = tokens.size(0)
         device = tokens.device
 
-        z, next_state = self.reducer(tokens, state)
+        z, next_state = self.reducer(tokens, state, padding_mask)
         logits1 = self.head1(z)
 
         # action eval
@@ -224,8 +225,10 @@ class ValueNet(nn.Module):
                 init.orthogonal_(module.weight, gain=1.0)
                 init.zeros_(module.bias)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        z, _ = self.reducer(tokens, None)
+    def forward(
+        self, tokens: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        z, _ = self.reducer(tokens, None, padding_mask)
 
         # scale the gradient flowing back to the trunk
         # may not be needed anymore given the deeper split
@@ -272,6 +275,18 @@ class PolicyNet(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    def _get_padding_mask(self, numerical: torch.Tensor) -> torch.Tensor:
+        B, S = numerical.shape[:2]
+        padding_mask = torch.zeros(B, S, dtype=torch.bool, device=self.device)
+        # pokemon numeric tokens are at indices 2, 4, 6..24
+        idx_num = torch.arange(2, 25, 2, device=self.device)
+        idx_sup = idx_num - 1  # mask out corresponding super token as well
+        # numerical[..., 27] is the fainted flag
+        is_fainted = numerical[:, idx_num, 27] > 0.5
+        padding_mask[:, idx_num] = is_fainted
+        padding_mask[:, idx_sup] = is_fainted
+        return padding_mask
+
     def forward(
         self,
         obs: Any,
@@ -291,6 +306,7 @@ class PolicyNet(nn.Module):
         if numerical.dim() == 2:
             numerical = numerical.unsqueeze(0)
         is_tp = (numerical[:, 25, 2] > 0.5).to(self.device)
+        padding_mask = self._get_padding_mask(numerical)
 
         if action_mask is not None:
             action_mask = action_mask.to(self.device)
@@ -302,7 +318,9 @@ class PolicyNet(nn.Module):
             if actions.dim() == 1:
                 actions = actions.unsqueeze(0)
 
-        return self.forward_tokens(tokens, is_tp, state, action_mask, sample_actions, actions)
+        return self.forward_tokens(
+            tokens, is_tp, state, action_mask, sample_actions, actions, padding_mask
+        )
 
     def forward_tokens(
         self,
@@ -312,14 +330,15 @@ class PolicyNet(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         sample_actions: bool = True,
         actions: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, State]:
         """
         Forward pass using already encoded tokens.
         """
         logits, log_probs, sampled_actions, next_state = self.actor(
-            tokens, state, action_mask, actions, sample_actions, is_tp
+            tokens, state, action_mask, actions, sample_actions, is_tp, padding_mask
         )
-        value = self.critic(tokens)
+        value = self.critic(tokens, padding_mask)
 
         return logits, log_probs, sampled_actions, value, next_state
 
@@ -336,9 +355,15 @@ class PolicyNet(nn.Module):
         """
         obs_dict = as_obs_dict(obs)
         tokens = self.encoder(obs_dict)
-        is_tp = (obs_dict["numerical"][:, 25, 2] > 0.5).to(self.device)
+        numerical = obs_dict["numerical"]
+        if numerical.dim() == 2:
+            numerical = numerical.unsqueeze(0)
+        is_tp = (numerical[:, 25, 2] > 0.5).to(self.device)
+        padding_mask = self._get_padding_mask(numerical)
 
-        return self.evaluate_actions_tokens(tokens, is_tp, actions, action_mask, state)
+        return self.evaluate_actions_tokens(
+            tokens, is_tp, actions, action_mask, state, padding_mask
+        )
 
     def evaluate_actions_tokens(
         self,
@@ -347,12 +372,19 @@ class PolicyNet(nn.Module):
         actions: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
         state: Optional[State] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, State]:
         """
         Evaluate actions using already encoded tokens.
         """
         logits, log_prob, _, value, next_state = self.forward_tokens(
-            tokens, is_tp, state, action_mask, sample_actions=False, actions=actions
+            tokens,
+            is_tp,
+            state,
+            action_mask,
+            sample_actions=False,
+            actions=actions,
+            padding_mask=padding_mask,
         )
 
         dist1 = Categorical(logits=logits[:, 0])

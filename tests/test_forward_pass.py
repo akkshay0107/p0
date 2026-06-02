@@ -56,3 +56,61 @@ def test_policy_net_forward_tokens(policy_net):
 
     assert logits.shape == (B, 2, ACT_SIZE)
     assert value.shape == (B,)
+
+
+def test_policy_net_padding_mask_real(policy_net):
+    import sys
+    from pathlib import Path
+
+    from poke_env.battle.status import Status
+
+    sys.path.append(str(Path(__file__).parent))
+    from test_observation import make_real_battle, make_real_pokemon
+
+    from src.model.observation_builder import from_battle
+    from src.model.tokenizer import tokenizer
+
+    p1 = make_real_pokemon(species="charizard", status=None)
+    p2_fainted = make_real_pokemon(species="camerupt", status=Status.FNT)
+    p_bench = make_real_pokemon(species="pikachu")
+
+    battle = make_real_battle(
+        active_pokemon=[p1, p2_fainted],
+        opponent_active_pokemon=[None, None],
+        team=[p1, p2_fainted, p_bench],
+        opponent_team=[],
+        teampreview=False,
+    )
+
+    obs = from_battle(battle, tokenizer, as_dict=True)
+
+    numerical = obs["numerical"]
+    if numerical.dim() == 2:
+        numerical = numerical.unsqueeze(0)
+
+    padding_mask = policy_net._get_padding_mask(numerical)
+
+    assert padding_mask.shape == (1, SEQUENCE_LENGTH)
+
+    # 0: CLS
+    # 1: P1 Super, 2: P1 Numeric
+    # 3: P2 Super, 4: P2 Numeric
+    # 5: Bench Super, 6: Bench Numeric
+    # Since P2 is fainted, indices 3 and 4 should be True (ignored)
+    assert padding_mask[0, 1].item() is False  # p1 super
+    assert padding_mask[0, 2].item() is False  # p1 numeric
+
+    assert padding_mask[0, 3].item() is True  # p2_fainted super
+    assert padding_mask[0, 4].item() is True  # p2_fainted numeric
+
+    assert padding_mask[0, 5].item() is False  # p_bench super
+    assert padding_mask[0, 6].item() is False  # p_bench numeric
+
+    assert padding_mask[0, 25].item() is False
+    assert padding_mask[0, 26].item() is False
+    assert padding_mask[0, 27].item() is False
+
+    with torch.no_grad():
+        batched_obs = {k: v.unsqueeze(0) for k, v in obs.items()}
+        logits, log_probs, sampled_actions, value, next_state = policy_net(batched_obs)
+        assert logits.shape == (1, 2, ACT_SIZE)

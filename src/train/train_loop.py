@@ -84,6 +84,9 @@ def _run_batched_ppo(
     all_tokens = policy.encoder(all_obs)
     tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
 
+    all_padding_masks = policy._get_padding_mask(all_obs["numerical"])
+    padding_mask_list = torch.split(all_padding_masks, [ep["length"] for ep in episodes])
+
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
     def pack(fields):
         return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
@@ -116,6 +119,7 @@ def _run_batched_ppo(
             break
 
         tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
+        padding_mask_t = torch.stack([pm[t] for pm in padding_mask_list[:active_n]], dim=0)
         actions_t = actions_p[:active_n, t]
         old_log_probs_t = old_log_probs_p[:active_n, t]
         advantages_t = advantages_p[:active_n, t]
@@ -131,6 +135,7 @@ def _run_batched_ppo(
                 actions_t,
                 action_masks_t,
                 state=curr_state,
+                padding_mask=padding_mask_t,
             )
         )
 

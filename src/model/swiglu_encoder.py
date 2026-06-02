@@ -10,7 +10,6 @@ class SwiGLUEncoderLayer(nn.Module):
     - norm_first=True
     - dropout=0.0
     - self-attention only
-    - no masks
     - packed SwiGLU FFN
     """
 
@@ -53,7 +52,9 @@ class SwiGLUEncoderLayer(nn.Module):
         self.w13 = nn.Linear(d_model, 2 * swiglu_hidden, bias=bias)
         self.w2 = nn.Linear(swiglu_hidden, d_model, bias=bias)
 
-    def _self_attention(self, x: torch.Tensor) -> torch.Tensor:
+    def _self_attention(
+        self, x: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         B, S, _ = x.shape
 
         qkv = self.qkv_proj(x)
@@ -61,11 +62,15 @@ class SwiGLUEncoderLayer(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # 3, B, H, S, D
         q, k, v = qkv.unbind(0)  # each become B, H, S, D
 
+        attn_mask = None
+        if src_key_padding_mask is not None:
+            attn_mask = ~(src_key_padding_mask.view(B, 1, 1, S))
+
         x = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=False,
         )
@@ -82,8 +87,9 @@ class SwiGLUEncoderLayer(nn.Module):
     def forward(
         self,
         src: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = src + self._self_attention(self.norm1(src))
+        x = src + self._self_attention(self.norm1(src), src_key_padding_mask)
         x = x + self._ffn(self.norm2(x))
         return x
 
@@ -127,8 +133,9 @@ class SwiGLUTransformerEncoder(nn.Module):
     def forward(
         self,
         src: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = src
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, src_key_padding_mask=src_key_padding_mask)
         return x
