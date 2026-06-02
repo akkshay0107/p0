@@ -3,7 +3,8 @@ import sys
 from pathlib import Path
 
 from src.train.behaviour_cloning import ReplayDataset, train_behavior_cloning
-from src.train.ppo_utils import OpponentPool, PPOConfig
+from src.train.config import PPOConfig
+from src.train.opponent_pool import OpponentPool
 
 
 def _get_dataset(replays_base: Path, subdir: str) -> ReplayDataset | None:
@@ -46,7 +47,7 @@ def main():
         if ds_mbp:
             policy = train_behavior_cloning(ds_mbp, **bc_kwargs)
             if policy:
-                pool.add(policy, "seed_max_base_power")
+                pool.add(policy, "seed_max_base_power", pool_wr=0.5)
                 added_seeds.append("seed_max_base_power")
                 shutil.copy(
                     config.pool_dir / "seed_max_base_power.pt",
@@ -62,7 +63,7 @@ def main():
         if ds_sh:
             policy = train_behavior_cloning(ds_sh, **bc_kwargs)
             if policy:
-                pool.add(policy, "seed_simple_heuristic")
+                pool.add(policy, "seed_simple_heuristic", pool_wr=0.5)
                 added_seeds.append("seed_simple_heuristic")
                 shutil.copy(
                     config.pool_dir / "seed_simple_heuristic.pt",
@@ -78,7 +79,7 @@ def main():
         if ds_fuzzy:
             policy = train_behavior_cloning(ds_fuzzy, **bc_kwargs)
             if policy:
-                pool.add(policy, "seed_fuzzy_heuristic")
+                pool.add(policy, "seed_fuzzy_heuristic", pool_wr=0.5)
                 added_seeds.append("seed_fuzzy_heuristic")
                 shutil.copy(
                     config.pool_dir / "seed_fuzzy_heuristic.pt",

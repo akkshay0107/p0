@@ -268,8 +268,9 @@ class PolicyNet(nn.Module):
         critic_nlayer = critic_nlayer or nlayer
         self.critic = ValueNet(d_model, nhead, critic_nlayer, self.seq_len)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(self.device)
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def forward(
         self,
@@ -301,9 +302,7 @@ class PolicyNet(nn.Module):
             if actions.dim() == 1:
                 actions = actions.unsqueeze(0)
 
-        return self.forward_tokens(
-            tokens, is_tp, state, action_mask, sample_actions, actions
-        )
+        return self.forward_tokens(tokens, is_tp, state, action_mask, sample_actions, actions)
 
     def forward_tokens(
         self,
@@ -366,9 +365,7 @@ class PolicyNet(nn.Module):
             v2 = (logits[:, 1] > float("-inf")).sum(-1).float().clamp_min(1.0)
             max_entropy = torch.log(v1) + torch.log(v2)
         else:
-            max_entropy = (
-                torch.log(torch.tensor(self.act_size, device=self.device).float()) * 2
-            )
+            max_entropy = torch.log(torch.tensor(self.act_size, device=self.device).float()) * 2
 
         norm_entropy = torch.where(
             max_entropy > 0,

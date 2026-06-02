@@ -54,17 +54,7 @@ class MismatchWarningFilter(logging.Filter):
         return True
 
 
-_original_get_logger = logging.getLogger
-
-
-def get_logger_wrapped(name=None):
-    logger = _original_get_logger(name)
-    if not any(isinstance(f, MismatchWarningFilter) for f in logger.filters):
-        logger.addFilter(MismatchWarningFilter())
-    return logger
-
-
-logging.getLogger = get_logger_wrapped
+logging.getLogger("poke_env").addFilter(MismatchWarningFilter())
 
 
 class VGCEnvPlayer(_EnvPlayer):
