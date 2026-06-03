@@ -135,12 +135,14 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         # is the only ability in the vocab that can cause the
         # maybe_trapped to be true (in which case the pokemon)
         # is trapped actually
-        switch_space = [
-            i + 1
-            for i, pokemon in enumerate(battle.team.values())
-            if not (battle.trapped[pos] or battle.maybe_trapped[pos])
-            and pokemon.base_species in available_base_species
-        ]
+        if battle.trapped[pos] or battle.maybe_trapped[pos]:
+            switch_space = []
+        else:
+            switch_space = [
+                i + 1
+                for i, pokemon in enumerate(battle.team.values())
+                if pokemon.base_species in available_base_species
+            ]
 
         active_mon = battle.active_pokemon[pos]
         if battle._wait or (any(battle.force_switch) and not battle.force_switch[pos]):
@@ -151,16 +153,15 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             actions = switch_space
         else:
             available_move_ids = {move.id for move in battle.available_moves[pos]}
-            move_spaces = [
-                [
-                    7 + 5 * i + target + 2
-                    for target in battle.get_possible_showdown_targets(move, active_mon)
-                ]
+            move_space = [
+                7 + 5 * i + target + 2
                 for i, move in enumerate(active_mon.moves.values())
                 if move.id in available_move_ids
+                for target in battle.get_possible_showdown_targets(move, active_mon)
             ]
-            move_space = [action for target_actions in move_spaces for action in target_actions]
-            mega_space = [action + 20 for action in move_space if battle.can_mega_evolve[pos]]
+            mega_space = (
+                [action + 20 for action in move_space] if battle.can_mega_evolve[pos] else []
+            )
             if (
                 not move_space
                 and len(battle.available_moves[pos]) == 1

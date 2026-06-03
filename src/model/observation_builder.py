@@ -43,7 +43,7 @@ def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) ->
 def _safe_fraction(num: float | int | None, den: float | int | None) -> float:
     if not den:
         return 0.0
-    return float(num or 0.0) / float(den)
+    return (num or 0) / den
 
 
 def _iter_move_slots(pokemon: Pokemon | None) -> list[Move | None]:
@@ -98,28 +98,28 @@ def _pokemon_numeric(
     row[5] = float(pokemon.current_hp_fraction)
 
     base_stats = pokemon.base_stats
-    row[6] = float(base_stats["hp"]) / 160.0
-    row[7] = float(base_stats["atk"]) / 160.0
-    row[8] = float(base_stats["def"]) / 160.0
-    row[9] = float(base_stats["spa"]) / 160.0
-    row[10] = float(base_stats["spd"]) / 160.0
-    row[11] = float(base_stats["spe"]) / 160.0
+    row[6] = base_stats["hp"] / 160.0
+    row[7] = base_stats["atk"] / 160.0
+    row[8] = base_stats["def"] / 160.0
+    row[9] = base_stats["spa"] / 160.0
+    row[10] = base_stats["spd"] / 160.0
+    row[11] = base_stats["spe"] / 160.0
 
     boosts = pokemon.boosts
-    row[12] = float(boosts["atk"]) / 6.0
-    row[13] = float(boosts["def"]) / 6.0
-    row[14] = float(boosts["spa"]) / 6.0
-    row[15] = float(boosts["spd"]) / 6.0
-    row[16] = float(boosts["spe"]) / 6.0
-    row[17] = float(boosts["accuracy"]) / 6.0
-    row[18] = float(boosts["evasion"]) / 6.0
+    row[12] = boosts["atk"] / 6.0
+    row[13] = boosts["def"] / 6.0
+    row[14] = boosts["spa"] / 6.0
+    row[15] = boosts["spd"] / 6.0
+    row[16] = boosts["spe"] / 6.0
+    row[17] = boosts["accuracy"] / 6.0
+    row[18] = boosts["evasion"] / 6.0
 
     for i, move in enumerate(move_slots):
         if move is not None:
             row[19 + i] = _safe_fraction(move.current_pp, move.max_pp)
 
-    row[23] = min(float(pokemon.protect_counter), 4.0) / 4.0
-    row[24] = float(pokemon.first_turn)
+    row[23] = min(pokemon.protect_counter, 4) / 4.0
+    row[24] = pokemon.first_turn
 
     # embedding based on low kick tables (since that is what matters)
     weight = pokemon.weight
@@ -137,11 +137,11 @@ def _pokemon_numeric(
         row[25] = 1.0
 
     row[26] = 0.0 if orig_idx < 0 else (orig_idx + 1) / float(TEAM_SIZE)
-    row[27] = float(pokemon.fainted)
-    row[28] = float(cond == 1)
-    row[29] = float(cond == 2)
-    row[30] = float(_can_mega(pokemon, battle, active_idx))
-    row[31] = float(_is_mega_form(pokemon))
+    row[27] = pokemon.fainted
+    row[28] = cond == 1
+    row[29] = cond == 2
+    row[30] = _can_mega(pokemon, battle, active_idx)
+    row[31] = _is_mega_form(pokemon)
 
     if cond == 1 and pokemon.last_move:
         last_move_id = pokemon.last_move.id
@@ -150,14 +150,14 @@ def _pokemon_numeric(
                 row[32 + move_idx] = 1.0
                 break
 
-    row[36] = min(float(pokemon.status_counter), 5.0) / 5.0
+    row[36] = min(pokemon.status_counter, 5) / 5.0
 
     for i, effect in enumerate(_VOLATILE_ORDER):
         val = pokemon.effects.get(effect, 0)
         max_dur = _VOLATILE_MAX_DURATIONS[effect]
-        row[37 + i] = min(float(val), max_dur) / max_dur
+        row[37 + i] = min(val, max_dur) / max_dur
 
-    row[42] = float(pokemon.preparing)
+    row[42] = pokemon.preparing
     return row
 
 
@@ -362,7 +362,7 @@ def from_battle(
     numerical[idx] = global_num + [0.0] * (NUMERICAL_WIDTH - len(global_num))
     idx += 1
 
-    ally_fainted = sum(mon.fainted for mon in battle.team.values())
+    ally_fainted = sum([1 for mon in battle.team.values() if mon.fainted])
     ally_cat, ally_num = _side_token(battle, battle.side_conditions, tok, ally_fainted)
     token_types[idx] = TokenType.ALLY_SIDE
     sides[idx] = SideId.ALLY
@@ -371,7 +371,7 @@ def from_battle(
     numerical[idx] = ally_num + [0.0] * (NUMERICAL_WIDTH - len(ally_num))
     idx += 1
 
-    opp_fainted = sum(mon.fainted for mon in battle.opponent_team.values())
+    opp_fainted = sum([1 for mon in battle.opponent_team.values() if mon.fainted])
     opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions, tok, opp_fainted)
     token_types[idx] = TokenType.OPPONENT_SIDE
     sides[idx] = SideId.OPPONENT
