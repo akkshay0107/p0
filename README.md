@@ -1,144 +1,111 @@
-## p0: Reinforcement Learning for Gen 9 Pokémon VGC
+# p0: Reinforcement Learning for Pokémon Champions
 
-This repository implements a multi-stage reinforcement learning framework for playing Pokémon Gen 9 VGC (Regulation H) for a fixed metagame. The training procedure combines trajectory bootstrapping via Behavioural Cloning with Proximal Policy Optimization (PPO) in a league based self play setup (partially inspired by AlphaStar and OpenAI Five).
+## The Idea
+
+`p0` is a self-play reinforcement learning agent designed to play Pokémon VGC (Champions Regulation M-A) at a highly competent level without human data. Instead of learning completely from scratch, the system uses a hybrid approach. It first bootstraps a neural network policy via Behavioural Cloning from rule-based heuristics. From there, it transitions into Proximal Policy Optimization (PPO), learning through self-play and a league-based format against historical snapshots of itself to master team combinations, positioning, and prediction.
 
 ---
 
-## Setup and Installation
+## Module Breakdown
 
-### Prerequisites
+The project is structured into three main modules:
 
-The project relies on a local instance of the Pokémon Showdown server. Initialize the submodules to fetch the source:
+### 1. `src/` (Source)
+
+The core implementation of the environment, model, heuristic bots, and the training pipeline.
+
+- **`model/`**: Defines the neural network architecture. Contains the custom tokenizer, structured observation builders, the fused SwiGLU token encoder, and the dual actor-critic policy networks.
+- **`train/`**: Houses the PPO training loop, rollout buffers, vectorized environment management (spinning up local Node.js Showdown servers), behavioural cloning scripts, and the opponent pool (league) system.
+- **`heuristic/`**: Contains rule-based baseline agents and scripts used for generating initial high-quality replays for Behavioural Cloning.
+
+### 2. `bench/` (Benchmarks)
+
+Scripts to benchmark system and model performance. This includes measuring inference times (action prediction and encoder throughput) as well as evaluating win rates for heuristic bots and policy models.
+
+### 3. `tests/` (Tests)
+
+A comprehensive unit testing suite. Ensures the correctness of observation parsing, neural network forward/backward passes, strict sequence masking, and tokenization logic.
+
+---
+
+## Model Architecture Choices
+
+The model is designed specifically to handle open team sheets (and trained on open team sheet Bo1 games). It has fallbacks for unknown items, but I wouldn't recommend trying it out outside this specific case.
+
+- **Fused Token Encoder (Backbone)**: Categorical variable embeddings (species, moves, items, types, abilities, volatile status) are projected and summed together per slot alongside learned token-type, slot, and side embeddings. Numerical states are concatenated and normalized. A SwiGLU Transformer layer fuses these components into distinct tokens.
+- **Shared Trunk, Split Heads**: The Actor and Critic share the `FusedTokenEncoder` backbone for computational efficiency but branch off into separate paths.
+- **Actor (Stateful)**: The actor path uses a recurrent memory design. Memory/History tokens are passed between turns (managed by a `CLSReducer`) to provide temporal context across a match.
+- **Autoregressive Doubles Policy**: Because two actions must be selected in VGC Doubles, the actor predicts them autoregressively. It first predicts the action for Pokémon 1 ($P(a_1|z)$). This selected action is embedded and fed sequentially to predict the action for Pokémon 2 ($P(a_2|z, a_1)$). Sequential masking is applied to prevent illegal combinations (e.g., both Pokémon switching into the same slot, or attempting to mega-evolve twice).
+- **Critic (Stateless)**: Provides a value estimate from the observation. There is optional code to scale down critic gradients into the shared features.
+
+---
+
+## Training Loop
+
+The script automatically manages building, spinning up, and tearing down local `pokemon-showdown` servers on multiple ports to gather rollouts in parallel. The training loop runs using Proximal Policy Optimization (PPO) over a vectorized threaded environment (`ThreadVecEnv`).
+
+- **League-Based Self-Play**: To prevent policy collapse and catastrophic forgetting, the system uses an `OpponentPool`. Trajectories are gathered by playing not just the current version of the agent, but also by playing against past checkpoints (snapshots) randomly sampled with FPSP from the pool.
+- **Variable-Length BPTT**: The loop handles variable-length episodes and supports BPTT over minibatches.
+
+---
+
+## Workflow Guide
+
+Steps 2 and 3 below are optional if you would like to start off self play from a purely random intialized bot.
+
+### 1. Setup & Installation
+
+First, clone the repository and initialize the git submodules (required for Pokémon Showdown):
 
 ```bash
 git submodule update --init --recursive
 ```
 
-### Environment Configuration
-
-`uv` is used for Python 3.13 environment and dependency management:
+Install the Python dependencies using `uv`. By default, this installs the CUDA-enabled version of PyTorch:
 
 ```bash
 uv python install 3.13
-uv sync
+uv sync --extra cuda
 ```
 
-Install the Node.js dependencies for the Pokémon Showdown server:
+_(If you are limited to CPU-only, use `uv sync --extra cpu` instead)._
+
+Next, install the Node.js dependencies required by the local Pokémon Showdown server:
 
 ```bash
 cd pokemon-showdown && npm install && cd ..
 ```
 
-### Execution Workflow
+### 2. Replay Generation
 
-A full training run follows a sequential pipeline:
+Generate offline replays by pitting heuristic rule-based bots against each other. This creates the foundational dataset for the model to learn the basics. This runs entirely on the CPU and takes a while (~20 mins with n = 5000 battles) to generate replays. It ends up generating more than the number asked due to recording both sides in mirror bot matches.
 
-1. Start a local Showdown server.
-
-   ```bash
-   cd pokemon-showdown && node pokemon-showdown start --no-security
-   ```
-
-2. Generate replays from heuristics.
-
-   ```bash
-   uv run python src/replay_gen.py -n 500
-   ```
-
-   After this step, you can stop the local showdown from step 1.
-
-3. Create the initial pool of policies through behaviour cloning across the heuristic data.
-
-   ```bash
-   uv run python src/seed_pool.py
-   ```
-
-4. Launch the PPO training loop. This script manages its own pokemon-showdown server processes.
-   ```bash
-   uv run python src/train_loop.py
-   ```
-
----
-
-## Training Procedure
-
-### 1. Replay Generation
-
-The pipeline begins by recording battles between various heuristic agents (Fuzzy Heuristics, Simple Heuristics, and Max Base Power). MaxBasePower and SimpleHeuristic come from the implementation in poke-env and FuzzyHeuristic can be found in `src/heuristic.py`. They aren't particularly good (an average human player should be able to beat them comfortably) but they provide a base for weeding out poor moves (such as KOing your own teammate unnecessarily).
-
-### 2. Behavioural Cloning Bootstrapping
-
-The replays from the previous step are used in supervised learning to "seed" the neural network. By training the model to predict the actions of these heuristics, we get a semi-decent starting pool of policies to start out the league with and don't waste compute trying to explore extremely poor moves.
-
-### 3. League-Based PPO Training
-
-The agent is optimized via Proximal Policy Optimization (PPO) within a league-based environment. The objective of the pool of opponents is to search for more general strategies rather than a chain of policies that learn to exploit the previous model. As of right now, the latest policy faces the following opponents:
-
-- **Latest Self**: The current version of the training policy (50% probability).
-- **Opponent Pool**: Historical snapshots of the agent and initial seeds. FPSP used for sampling, where the agent is more likely to face opponents that currently have a good win rate against the previous few policies. Once the pool is large enough, the policy with the lowest win rate is evicted.
-
----
-
-## Architecture Summary
-
-### Observation structure
-
-The observation to the model is a static embedding produced by passing text inputs from observed features in the ongoing battle into **TinyBERT** and using the concatenation of the CLS token and the mean. It consists of:
-
-- H1, H2, H3: Text summary embeddings of the outcomes of the last 3 turns
-- Field State: Text embedding of the global and local effects on the field (Weather, Terrain, Trick Room, Tailwind, etc).
-- Global Info: Text embedding containing any other global info. Contains only the terastallization info for now, but has the space to potentially encode more info.
-- Player and Opponents pokemon: 2 text embeddings per pokemon for both player and opponent. Contains info about ability, type, moveset, etc.
-
-The remaining features are purely numerical, but also extracted from the poke-env Battle object.
-
-- Field Nums: Turns of each type of global / local field effect.
-- Player and Opponents pokemon nums: Base stats, boosts, status condition (one hot), etc.
-
-### Hybrid State Representation
-
-The model can be thought of as a spatio-temporal model, using an Encoder only Transformer to attend to the spatial features (pokemon + field info) from the static encoding + one time dependent hidden state token (HG).
-
-Over the time axis, the model acts as an RNN, updating the hidden state (HG) with the new information from the latest turn.
-
-The update logic follows:
-
-```math
-\Large \text{HG}_t = g(\text{HG}_{t-1}, \text{CLS}_{t-1}, \text{H1}_t)
+```bash
+uv run python p0/src/heuristic/replay_gen.py -n 2500
 ```
 
-```math
-\Large \text{CLS}_t = f(\text{HG}_t, \text{O}_t)
+### 3. Behavioural Cloning Bootstrapping
+
+Train the initial neural network policy using supervised learning to predict the actions taken by the heuristics in the generated replays. This bootstraps the initial `OpponentPool` and gives the model a competent starting point before RL begins.
+
+```bash
+uv run python p0/src/train/seed_pool.py
 ```
 
-The CLS token becomes the internal state representation for the turn, and also the shared backbone, from which the policy and value network split.
+### 4. PPO Training Loop
 
-### Autoregressive Doubles Policy
+Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins league-based self-play.
 
-Doubles coordination is modeled as a sequential decision process:
+```bash
+uv run python p0/src/train/train_loop.py
+```
 
-1. **First Action Prediction**: The policy predicts the action for the first Pokémon slot, $P(a_1 \mid z)$
-2. **Conditional Action Prediction**: The first action is embedded and used to condition the prediction for the second slot autoregressively, $P(a_2 \mid z, a_1)$.
-3. **Sequential Masking**: Legal move filtering is applied at each step, preventing coordination errors such as double-terastallization or invalid switch-ins.
-
-The value head is pretty standard, a small MLP with GELU as the activation function with a single scalar output at the end of it. In the latest policy, it also has a custom grad scaler that scales down the value losses before the enter the shared backbone to reduce value interference with the shared backbone.
-
-**NOTE:** In the old policy, the model was not autoregressive, instead it generated $P(a_1 \mid z)$ and $P(a_2 \mid z)$ independently and applied sequential masking to prevent illegal moves from happening. It lead to a decent model, but ran into the coordination issues. The old policy also did not do the grad scaling from the value loss.
+_Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Loss, etc.) are exported to TensorBoard. You can view them by running `tensorboard --logdir p0/runs/ppo_training/`._
 
 ---
 
-### Configuration
+## Utility Scripts
 
-Hyperparameters (learning rates, entropy coefficients, batch sizes) can be modified via a `.ppoconfig` file in the root directory. If absent, the system defaults to the parameters defined in `src/ppo_utils.py`.
-
-### Analytics
-
-- **TensorBoard**: Training metrics (Win Rate, KL Divergence, Explained Variance) are logged to `runs/ppo_training/`.
-- **Logging**: A text output of the same is saved to `training.log`.
-- **Checkpoints**: The primary PPO checkpoint is stored at `checkpoints/ppo_checkpoint.pt`, with opponent snapshots archived in `checkpoints/pool/`. `checkpoints/pool/pool_state.json` gives you more information about how the latest checkpoint is doing against the other policies in the pool.
-
----
-
-### Results
-
-Will be added soon. Unfortunately, due to the nature of the closed metagame, I will not be able to find a stable elo rating for this on the ladder + the fact that Reg H no longer is a format on the official Pokemon Showdown server.
+- **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
+- **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and `.ppoconfig` into a `tar.gz` archive. I use it for moving stuff between remote servers.
+- **`reset_pool.sh`**: Clears out the current `OpponentPool` (snapshots inside `checkpoints/pool/`) while retaining the foundational heuristic seed models. If you want to reset the training phase without redoing replay gen / behaviour cloning.
