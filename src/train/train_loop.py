@@ -222,6 +222,7 @@ def ppo_update(
     epochs_done = 0
 
     early_stop = False
+    last_entropy_coef = config.entropy_coef
     for epoch_idx in range(config.ppo_epochs):
         if shutdown_requested or early_stop:
             break

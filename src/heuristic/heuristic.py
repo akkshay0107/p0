@@ -182,6 +182,17 @@ class FuzzyHeuristic(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def _get_stat(self, mon: Pokemon, stat_name: str, default: int = 100) -> int:
+        if mon.stats and mon.stats.get(stat_name) is not None:
+            val = mon.stats.get(stat_name)
+            if val is not None:
+                return val
+        if hasattr(mon, "_stats") and mon._stats and mon._stats.get(stat_name) is not None:
+            val = mon._stats.get(stat_name)
+            if val is not None:
+                return val
+        return default
+
     def _get_active_identifier(self, mon: Pokemon, battle: DoubleBattle, is_opponent: bool) -> str:
         role = battle.opponent_role if is_opponent else battle.player_role
         active_list = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
@@ -257,8 +268,8 @@ class FuzzyHeuristic(Player):
             for opp in battle.opponent_active_pokemon
         )
 
-    def get_actual_speed(self, mon: Pokemon, battle: DoubleBattle = None) -> float:
-        spe = mon.stats["spe"] or 100
+    def get_actual_speed(self, mon: Pokemon, battle: DoubleBattle | None = None) -> float:
+        spe = float(self._get_stat(mon, "spe", 100))
         boost = mon.boosts["spe"] or 0
         if boost > 0:
             spe *= (2.0 + boost) / 2.0
@@ -464,8 +475,8 @@ class FuzzyHeuristic(Player):
                         threat += THREAT_KO_BONUS
 
         # consider offensive presence (base stats roughly)
-        opp_atk = opp_mon.stats.get("atk", DEFAULT_BASE_STAT)
-        opp_spa = opp_mon.stats.get("spa", DEFAULT_BASE_STAT)
+        opp_atk = self._get_stat(opp_mon, "atk", DEFAULT_BASE_STAT)
+        opp_spa = self._get_stat(opp_mon, "spa", DEFAULT_BASE_STAT)
         if max(opp_atk, opp_spa) > HIGH_OFFENSE_THRESHOLD:
             threat += THREAT_STATS_BONUS
 
@@ -477,6 +488,8 @@ class FuzzyHeuristic(Player):
         score = 0.0
         target = order.move_target
         active_mon = battle.active_pokemon[slot]
+        if active_mon is None or active_mon.fainted:
+            return FAINTED_TARGET_PENALTY
 
         if move.priority > 0 and self.is_armor_tail_active(battle):
             return -100.0
@@ -503,6 +516,7 @@ class FuzzyHeuristic(Player):
             targets = [opp_idx]
 
         total_dmg_score = 0.0
+        dmg_fraction = 0.0
         active_allies = [m for m in battle.active_pokemon if m and not m.fainted]
 
         for t_idx in targets:
@@ -577,10 +591,10 @@ class FuzzyHeuristic(Player):
         if move.self_switch:
             is_threatened = False
             if active_mon:
-                our_speed = active_mon.stats.get("spe", DEFAULT_BASE_STAT)
+                our_speed = self._get_stat(active_mon, "spe", DEFAULT_BASE_STAT)
                 for opp in battle.opponent_active_pokemon:
                     if opp and not opp.fainted:
-                        opp_speed = opp.stats.get("spe", DEFAULT_BASE_STAT)
+                        opp_speed = self._get_stat(opp, "spe", DEFAULT_BASE_STAT)
                         opp_types = self.get_expected_opponent_types(opp)
                         for t_name in opp_types:
                             try:
@@ -703,11 +717,11 @@ class FuzzyHeuristic(Player):
             else:
                 is_threatened = False
                 threat_is_faster = False
-                our_speed = active_mon.stats.get("spe", DEFAULT_BASE_STAT)
+                our_speed = self._get_stat(active_mon, "spe", DEFAULT_BASE_STAT)
 
                 for opp in battle.opponent_active_pokemon:
                     if opp and not opp.fainted:
-                        opp_speed = opp.stats.get("spe", DEFAULT_BASE_STAT)
+                        opp_speed = self._get_stat(opp, "spe", DEFAULT_BASE_STAT)
                         opp_types = self.get_expected_opponent_types(opp)
 
                         has_se_threat = False
@@ -776,10 +790,10 @@ class FuzzyHeuristic(Player):
             slower_count = 0
             for ally in battle.active_pokemon:
                 if ally and not ally.fainted:
-                    ally_speed = ally.stats.get("spe", DEFAULT_BASE_STAT)
+                    ally_speed = self._get_stat(ally, "spe", DEFAULT_BASE_STAT)
                     for opp in battle.opponent_active_pokemon:
                         if opp and not opp.fainted:
-                            opp_speed = opp.stats.get("spe", DEFAULT_BASE_STAT)
+                            opp_speed = self._get_stat(opp, "spe", DEFAULT_BASE_STAT)
                             if ally_speed < opp_speed:
                                 slower_count += 1
 
@@ -801,8 +815,8 @@ class FuzzyHeuristic(Player):
             if is_prankster and target_is_dark:
                 return -100.0
 
-            is_physical = opp_active.stats.get("atk", DEFAULT_BASE_STAT) > opp_active.stats.get(
-                "spa", DEFAULT_BASE_STAT
+            is_physical = self._get_stat(opp_active, "atk", DEFAULT_BASE_STAT) > self._get_stat(
+                opp_active, "spa", DEFAULT_BASE_STAT
             )
             if is_physical:
                 score += WILL_O_WISP_PHYSICAL
@@ -965,7 +979,7 @@ class FuzzyHeuristic(Player):
                 return SWITCH_SHADOW_TAG_BLOCKED
 
             score = 0.0
-            if not is_forced_switch:
+            if active_mon is not None and not is_forced_switch:
                 score += SWITCH_BASE_PENALTY
                 if active_mon.first_turn and battle.turn > 1:
                     score += FIRST_TURN_SWITCH_PENALTY
@@ -977,7 +991,7 @@ class FuzzyHeuristic(Player):
 
             score += switch_mon.current_hp_fraction * SWITCH_HP_FACTOR
 
-            if not is_forced_switch:
+            if active_mon is not None and not is_forced_switch:
                 is_threatened_with_ko = False
                 for opp in battle.opponent_active_pokemon:
                     if opp and not opp.fainted:
@@ -1066,7 +1080,7 @@ class FuzzyHeuristic(Player):
 
             if order.mega and active_mon.item:
                 active_mon.mega_evolve(active_mon.item)
-                active_mon._stats = None
+                setattr(active_mon, "_stats", None)
                 self.populate_pokemon_stats(active_mon)
 
             try:
@@ -1108,7 +1122,7 @@ class FuzzyHeuristic(Player):
                     active_mon._update_from_pokedex(original_species, store_species=False)
                     active_mon.temporary_ability = original_temp_ability
                     if original_stats:
-                        active_mon._stats = original_stats
+                        setattr(active_mon, "_stats", original_stats)
 
         return 0.0
 

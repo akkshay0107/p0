@@ -10,7 +10,7 @@ from src.heuristic.heuristic import FuzzyHeuristic
 from src.model.policy import PolicyNet
 from src.rl_player import RLPlayer
 from src.team_picker import RandomTeamFromPool
-from src.train.ppo_utils import load_checkpoint
+from src.train.utils import load_checkpoint
 
 
 async def main(n_battles: int, checkpoint_path: str):
@@ -37,7 +37,6 @@ async def main(n_battles: int, checkpoint_path: str):
     # Load policy
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy = PolicyNet().to(device)
-    policy.device = device
 
     if checkpoint_file.exists():
         print(f"Loading checkpoint from: {checkpoint_file}")
@@ -74,7 +73,7 @@ async def main(n_battles: int, checkpoint_path: str):
         ("Random", create_player(RandomPlayer, "Random")),
         ("MaxBP", create_player(MaxBasePowerPlayer, "MaxBP")),
         ("SimpleH", create_player(SimpleHeuristicsPlayer, "SimpleH")),
-        ("FuzzyH", create_player(FuzzyHeuristic, "FuzzyH", k=1)),
+        ("FuzzyH", create_player(FuzzyHeuristic, "FuzzyH")),
     ]
 
     print(

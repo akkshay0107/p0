@@ -11,6 +11,8 @@ from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 class CLSReducer(nn.Module):
     """Battle-level CLS reducer over already encoded token embeddings."""
 
+    hg_init: torch.Tensor
+
     def __init__(
         self,
         seq_len: int = SEQUENCE_LENGTH,
@@ -78,7 +80,7 @@ class CLSReducer(nn.Module):
         if padding_mask is not None:
             enc_mask = torch.zeros(B, seq.size(1), dtype=torch.bool, device=seq.device)
             # CLS and HG tokens are never padded. tokens[:, 1:] corresponds to padding_mask[:, 1:]
-            enc_mask[:, 1 + self.n_hg:] = padding_mask[:, 1:]
+            enc_mask[:, 1 + self.n_hg :] = padding_mask[:, 1:]
 
         enc = self.encoder(seq, src_key_padding_mask=enc_mask)
 
