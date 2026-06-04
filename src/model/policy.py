@@ -228,13 +228,12 @@ class ValueNet(nn.Module):
     def forward(
         self, tokens: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        z, _ = self.reducer(tokens, None, padding_mask)
-
         # scale the gradient flowing back to the trunk
         # may not be needed anymore given the deeper split
-        if z.requires_grad and self.scale < 1.0:
-            z = z.detach() + self.scale * (z - z.detach())
+        if tokens.requires_grad and self.scale < 1.0:
+            tokens = tokens.detach() + self.scale * (tokens - tokens.detach())
 
+        z, _ = self.reducer(tokens, None, padding_mask)
         return self.net(z).squeeze(-1)
 
 
