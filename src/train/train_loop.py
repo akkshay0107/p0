@@ -79,9 +79,13 @@ def _run_batched_ppo(
     batch_size = len(episodes)
     lengths = torch.tensor([ep["length"] for ep in episodes], device=device)
     max_steps = int(lengths[0].item())
+    is_warmup = episode < config.warmup_episodes
 
     all_obs = StructuredObservation.cat([ep["obs"] for ep in episodes], dim=0)
     all_tokens, all_aux = policy.encoder(all_obs, aux=True)
+    if is_warmup:
+        all_tokens = all_tokens.detach()
+        all_aux = all_aux.detach()
     tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
     aux_list = torch.split(all_aux, [ep["length"] for ep in episodes])
 
@@ -160,7 +164,6 @@ def _run_batched_ppo(
             is_tp_mask, config.teampreview_entropy_mult, 1.0
         )
 
-        is_warmup = episode < config.warmup_episodes
         step_loss = config.value_coef * step_value_loss
 
         if not is_warmup:
@@ -175,6 +178,8 @@ def _run_batched_ppo(
         total_loss = total_loss + step_loss.sum()
         total_steps += active_n
 
+        if is_warmup:
+            next_state = (next_state[0].detach(), next_state[1].detach())
         state = next_state
 
         with torch.no_grad():
@@ -480,9 +485,12 @@ def main():
 
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
-                pool.add(policy, snap_id, pool_wr)
-                pool.save_state()
-                logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
+                added = pool.add(policy, snap_id, pool_wr)
+                if added:
+                    pool.save_state()
+                    logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
+                else:
+                    logging.info(f"Snapshot '{snap_id}' not added to opponent pool (win rate: {pool_wr:.4f}). Pool: {pool}")
 
             current_lr = optimizer.param_groups[0]["lr"]
             is_warmup = episode < config.warmup_episodes

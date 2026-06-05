@@ -285,9 +285,6 @@ class ActorPolicy(nn.Module):
         B = logits.size(0)
         device = logits.device
 
-        # Apply base action masks
-        logits = logits.masked_fill(action_mask == 0, float("-inf"))
-
         if is_tp is None:
             is_tp = torch.zeros(B, device=device, dtype=torch.bool)
         else:
@@ -328,8 +325,9 @@ class ActorPolicy(nn.Module):
         no_valid = mask2.sum(-1) == 0
         mask2[no_valid, 0] = True
 
+        l1 = logits[:, 0].masked_fill(action_mask[:, 0] == 0, float("-inf"))
         l2 = logits[:, 1].masked_fill(~mask2, float("-inf"))
-        return torch.stack([logits[:, 0], l2], dim=1)
+        return torch.stack([l1, l2], dim=1)
 
 
 class ValueNet(nn.Module):

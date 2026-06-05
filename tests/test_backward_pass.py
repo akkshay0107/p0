@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -10,6 +11,8 @@ from src.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
+from src.train.config import PPOConfig
+from src.train.train_loop import _run_batched_ppo
 
 
 @pytest.fixture
@@ -221,6 +224,37 @@ def test_value_head_scaling(dummy_obs):
             # ratio should match scale above
             ratio = g2[mask] / g1[mask]
             torch.testing.assert_close(ratio, torch.full_like(ratio, 0.1), rtol=1e-3, atol=1e-3)
+
+
+def test_ppo_warmup(dummy_obs):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    policy = PolicyNet(d_model=64, nhead=2, nlayer=1).to(device)
+    policy.train()
+
+    episode = {
+        "obs": dummy_obs[0].unsqueeze(0),
+        "actions": torch.tensor([[1, 2]], dtype=torch.long),
+        "log_probs": torch.zeros(1),
+        "advantages": torch.ones(1),
+        "returns": torch.ones(1),
+        "values": torch.zeros(1),
+        "action_masks": torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
+        "is_team_preview": torch.zeros(1, dtype=torch.bool),
+        "length": 1,
+    }
+    config = PPOConfig(warmup_episodes=10)
+
+    loss, _, steps = _run_batched_ppo([episode], policy, config, device, episode=0)
+    assert steps == 1
+
+    policy.zero_grad(set_to_none=True)
+    loss.backward()
+
+    assert all(p.grad is None for p in policy.encoder.parameters())
+    assert all(p.grad is None for p in policy.actor.parameters())
+    assert any(
+        p.grad is not None and not torch.all(p.grad == 0) for p in policy.critic.parameters()
+    )
 
 
 if __name__ == "__main__":

@@ -65,6 +65,21 @@ def test_policy_net_forward_tokens(policy_net):
     assert value.shape == (B,)
 
 
+def test_sequential_mask_fallback(policy_net):
+    logits = torch.randn((1, 2, ACT_SIZE))
+    action_mask = torch.zeros((1, 2, ACT_SIZE), dtype=torch.bool)
+    action_mask[:, 0, 0] = True
+    action1 = torch.tensor([0])
+    is_tp = torch.tensor([False])
+
+    masked_logits = policy_net.actor._apply_sequential_masks(
+        logits, action1, action_mask, is_tp
+    )
+
+    assert torch.isfinite(masked_logits[0, 1, 0])
+    assert torch.isneginf(masked_logits[0, 1, 1:]).all()
+
+
 def test_policy_net_padding_mask_real(policy_net):
     import sys
     from pathlib import Path
