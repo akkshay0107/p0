@@ -3,7 +3,12 @@ import torch
 
 from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
-from src.model.structured_observation import CATEGORICAL_WIDTH, NUMERICAL_WIDTH, SEQUENCE_LENGTH, StructuredObservation
+from src.model.structured_observation import (
+    CATEGORICAL_WIDTH,
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
+    StructuredObservation,
+)
 from src.train.config import PPOConfig
 from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
@@ -37,7 +42,6 @@ def create_trajectory_buffers(n_envs, max_steps=100, device="cpu"):
         "action_masks": torch.zeros(
             (n_envs, max_steps, 2, ACT_SIZE), dtype=torch.bool, device=device
         ),
-        "is_team_preview": torch.zeros((n_envs, max_steps), dtype=torch.bool, device=device),
     }
 
 
@@ -69,7 +73,6 @@ class RolloutBuffer:
         "rewards",
         "dones",
         "action_masks",
-        "is_team_preview",
     )
 
     def add_episode(self, episode: dict):
@@ -102,7 +105,6 @@ class RolloutBuffer:
                 "values": values_dev,
                 "advantages": adv,
                 "returns": ret,
-                "is_team_preview": ep["is_team_preview"].to(device),
                 "length": T,
             }
             all_episodes.append(episode_data)
@@ -215,11 +217,8 @@ def collect_rollouts(
             for i in range(n_envs)
         ]
 
-        obs1_cpu = obs1.cpu()
-        obs2_cpu = obs2_batched.cpu()
-        is_tp1s = np.array([vec_env.envs[i].battle1.teampreview for i in range(n_envs)], dtype=bool)
-        is_tp2s = np.array([vec_env.envs[i].battle2.teampreview for i in range(n_envs)], dtype=bool)
-
+        obs1_cpu = obs1.clone().cpu()
+        obs2_cpu = obs2_batched.clone().cpu()
         next_masks1, next_masks2, rewards1, rewards2, dones, infos = vec_env.step(env_actions)
 
         # batch insert for first trajectory
@@ -235,7 +234,6 @@ def collect_rollouts(
         trajectories1["rewards"][idx_all, s1] = torch.tensor(rewards1, dtype=torch.float32)
         trajectories1["dones"][idx_all, s1] = torch.tensor(dones, dtype=torch.float32)
         trajectories1["action_masks"][idx_all, s1] = mask1_t.cpu().bool()
-        trajectories1["is_team_preview"][idx_all, s1] = torch.tensor(is_tp1s, dtype=torch.bool)
         step_counts1 += 1
 
         # batch insert for traj 2 (only in self play)
@@ -256,9 +254,6 @@ def collect_rollouts(
             ]
             trajectories2["dones"][sp_idx, s2] = torch.tensor(dones, dtype=torch.float32)[sp_idx]
             trajectories2["action_masks"][sp_idx, s2] = mask2_t[sp_idx].cpu().bool()
-            trajectories2["is_team_preview"][sp_idx, s2] = torch.tensor(is_tp2s, dtype=torch.bool)[
-                sp_idx
-            ]
             step_counts2[sp_idx] += 1
 
         for i in range(n_envs):
@@ -280,7 +275,6 @@ def collect_rollouts(
                         "rewards": trajectories1["rewards"][i, :length1].clone(),
                         "dones": trajectories1["dones"][i, :length1].clone(),
                         "action_masks": trajectories1["action_masks"][i, :length1].clone(),
-                        "is_team_preview": trajectories1["is_team_preview"][i, :length1].clone(),
                         "length": length1,
                     }
                     buffer.add_episode(ep1)
@@ -303,7 +297,6 @@ def collect_rollouts(
                             "rewards": trajectories2["rewards"][i, :length2].clone(),
                             "dones": trajectories2["dones"][i, :length2].clone(),
                             "action_masks": trajectories2["action_masks"][i, :length2].clone(),
-                            "is_team_preview": trajectories2["is_team_preview"][i, :length2].clone(),
                             "length": length2,
                         }
                         buffer.add_episode(ep2)

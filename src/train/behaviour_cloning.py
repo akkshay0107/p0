@@ -77,10 +77,6 @@ def _run_batched_bc(
     masks_p = pack(all_masks_list)
     targets_p = pack(all_targets_list)
 
-    all_is_tp = all_obs.numerical[:, 25, 2] > 0.5
-    is_tp_split = torch.split(all_is_tp, [len(ep) for ep in episodes])
-    is_tp_p = pack(is_tp_split)
-
     state = initial_state(policy, batch_size, device)
     total_loss = torch.tensor(0.0, device=device)
     correct = 0
@@ -98,7 +94,7 @@ def _run_batched_bc(
         padding_mask_t = torch.stack([pm[t] for pm in padding_mask_list[:active_n]], dim=0)
         masks_t = masks_p[:active_n, t]
         targets_t = targets_p[:active_n, t]
-        is_tp_t = is_tp_p[:active_n, t]
+        is_tp_t = numerical_t[:, 25, 2] > 0.5
 
         curr_state = (state[0][:active_n], state[1][:active_n])
         log_prob, _, _, _, next_state = policy.evaluate_actions_tokens(

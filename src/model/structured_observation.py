@@ -38,6 +38,15 @@ class StructuredObservation:
     categorical: torch.Tensor
     numerical: torch.Tensor
 
+    def clone(self) -> StructuredObservation:
+        return StructuredObservation(
+            token_type_ids=self.token_type_ids.clone(),
+            side_ids=self.side_ids.clone(),
+            slot_ids=self.slot_ids.clone(),
+            categorical=self.categorical.clone(),
+            numerical=self.numerical.clone(),
+        )
+
     def to(self, *args, **kwargs) -> StructuredObservation:
         return StructuredObservation(
             token_type_ids=self.token_type_ids.to(*args, **kwargs),

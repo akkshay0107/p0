@@ -239,7 +239,6 @@ def test_ppo_warmup(dummy_obs):
         "returns": torch.ones(1),
         "values": torch.zeros(1),
         "action_masks": torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
-        "is_team_preview": torch.zeros(1, dtype=torch.bool),
         "length": 1,
     }
     config = PPOConfig(warmup_episodes=10)

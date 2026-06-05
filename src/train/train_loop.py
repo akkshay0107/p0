@@ -102,7 +102,6 @@ def _run_batched_ppo(
     advantages_p = pack([ep["advantages"] for ep in episodes])
     returns_p = pack([ep["returns"] for ep in episodes])
     action_masks_p = pack([ep["action_masks"] for ep in episodes])
-    is_tp_p = pack([ep["is_team_preview"] for ep in episodes])
 
     state = initial_state(policy, batch_size, device)
     total_loss = torch.tensor(0.0, device=device)
@@ -133,7 +132,7 @@ def _run_batched_ppo(
         advantages_t = advantages_p[:active_n, t]
         returns_t = returns_p[:active_n, t]
         action_masks_t = action_masks_p[:active_n, t]
-        is_tp_t = is_tp_p[:active_n, t]
+        is_tp_t = numerical_t[:, 25, 2] > 0.5
 
         curr_state = (state[0][:active_n], state[1][:active_n])
         curr_log_prob, curr_entropy, curr_normalized_entropy, curr_val, next_state = (
@@ -148,6 +147,20 @@ def _run_batched_ppo(
                 padding_mask=padding_mask_t,
             )
         )
+
+        if not torch.isfinite(curr_log_prob).all():
+            non_finite_idx = (~torch.isfinite(curr_log_prob)).nonzero(as_tuple=True)[0]
+            for idx in non_finite_idx:
+                logging.error(
+                    f"DEBUG: Non-finite log_prob at step {t}, episode element {idx}.\n"
+                    f"  actions_t: {actions_t[idx].tolist()}\n"
+                    f"  action_masks_t (p1): {action_masks_t[idx, 0].nonzero().squeeze(-1).tolist()}\n"
+                    f"  action_masks_t (p2): {action_masks_t[idx, 1].nonzero().squeeze(-1).tolist()}\n"
+                    f"  is_tp_t: {is_tp_t[idx].item()}\n"
+                    f"  numerical_t[:, 25, :4]: {numerical_t[idx, 25, :4].tolist()}\n"
+                    f"  old_log_prob: {old_log_probs_t[idx].item()}\n"
+                    f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
+                )
 
         log_ratio = curr_log_prob - old_log_probs_t
         ratio = torch.exp(log_ratio)
@@ -449,12 +462,15 @@ def main():
                 save_checkpoint(config.checkpoint_path, episode, policy, optimizer)
                 break
 
+            buffer.reset()
+            rollout_time = 0.0
+            pool_wr = 0.0
+
             for target_mode in ["self_play", "pbt"]:
-                buffer.reset()
                 policy.eval()
 
                 t0_rollout = time.time()
-                pool_wr, state1, state2 = collect_rollouts(
+                mode_pool_wr, state1, state2 = collect_rollouts(
                     vec_env,
                     policy,
                     buffer,
@@ -468,20 +484,20 @@ def main():
                     env_opponents,
                     target_mode,
                 )
-                rollout_time = time.time() - t0_rollout
+                rollout_time += time.time() - t0_rollout
+                if target_mode == "pbt":
+                    pool_wr = mode_pool_wr
 
-                if not buffer.trajectories:
-                    logging.warning("No trajectories collected, skipping update")
-                    continue
+            if not buffer.trajectories:
+                logging.warning("No trajectories collected, skipping update")
+                continue
 
-                num_trajectories = len(buffer.trajectories)
-                avg_traj_length = sum(ep["length"] for ep in buffer.trajectories) / num_trajectories
-                avg_traj_time = rollout_time / num_trajectories
+            num_trajectories = len(buffer.trajectories)
+            avg_traj_length = sum(ep["length"] for ep in buffer.trajectories) / num_trajectories
+            avg_traj_time = rollout_time / num_trajectories
 
-                rollout_data = buffer.get_batches(policy.device, config)
-                stats = ppo_update(
-                    rollout_data, policy, optimizer, config, episode, shutdown_requested
-                )
+            rollout_data = buffer.get_batches(policy.device, config)
+            stats = ppo_update(rollout_data, policy, optimizer, config, episode, shutdown_requested)
 
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
@@ -490,7 +506,9 @@ def main():
                     pool.save_state()
                     logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
                 else:
-                    logging.info(f"Snapshot '{snap_id}' not added to opponent pool (win rate: {pool_wr:.4f}). Pool: {pool}")
+                    logging.info(
+                        f"Snapshot '{snap_id}' not added to opponent pool (win rate: {pool_wr:.4f}). Pool: {pool}"
+                    )
 
             current_lr = optimizer.param_groups[0]["lr"]
             is_warmup = episode < config.warmup_episodes
