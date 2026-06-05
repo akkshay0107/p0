@@ -81,11 +81,13 @@ def _run_batched_ppo(
     max_steps = int(lengths[0].item())
 
     all_obs = StructuredObservation.cat([ep["obs"] for ep in episodes], dim=0)
-    all_tokens = policy.encoder(all_obs)
+    all_tokens, all_aux = policy.encoder(all_obs, aux=True)
     tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
+    aux_list = torch.split(all_aux, [ep["length"] for ep in episodes])
 
     all_padding_masks = policy._get_padding_mask(all_obs.numerical)
     padding_mask_list = torch.split(all_padding_masks, [ep["length"] for ep in episodes])
+    numerical_list = torch.split(all_obs.numerical, [ep["length"] for ep in episodes])
 
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
     def pack(fields):
@@ -119,7 +121,9 @@ def _run_batched_ppo(
             break
 
         tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
+        aux_t = torch.stack([a[t] for a in aux_list[:active_n]], dim=0)
         padding_mask_t = torch.stack([pm[t] for pm in padding_mask_list[:active_n]], dim=0)
+        numerical_t = torch.stack([num[t] for num in numerical_list[:active_n]], dim=0)
         actions_t = actions_p[:active_n, t]
         old_log_probs_t = old_log_probs_p[:active_n, t]
         advantages_t = advantages_p[:active_n, t]
@@ -131,6 +135,8 @@ def _run_batched_ppo(
         curr_log_prob, curr_entropy, curr_normalized_entropy, curr_val, next_state = (
             policy.evaluate_actions_tokens(
                 tokens_t,
+                aux_t,
+                numerical_t,
                 is_tp_t,
                 actions_t,
                 action_masks_t,

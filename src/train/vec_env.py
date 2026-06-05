@@ -6,9 +6,6 @@ import torch
 from src.env import SimEnv
 from src.lookups import ACT_SIZE
 from src.model.structured_observation import (
-    CATEGORICAL_WIDTH,
-    NUMERICAL_WIDTH,
-    SEQUENCE_LENGTH,
     StructuredObservation,
 )
 

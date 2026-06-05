@@ -17,7 +17,6 @@ from src.env import MegaEnv
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
-from src.model.structured_observation import StructuredObservation
 from src.team_picker import RandomTeamFromPool
 from src.train.utils import load_checkpoint
 
@@ -56,7 +55,6 @@ class RLPlayer(Player):
 
     def _top_p(self, obs, action_mask, is_tp: bool):
         if self.state is None:
-            # Re-implementing initial_state locally to match the refactored PolicyNet
             reducer = self.policy.actor.reducer
             batch_size = 1
             device = self.policy.device
@@ -65,14 +63,12 @@ class RLPlayer(Player):
             self.state = (cls, hg)
 
         with torch.no_grad():
-            # Shared front-end encoding
-            tokens = self.policy.encoder(obs)
+            tokens, aux = self.policy.encoder(obs, aux=True)
             numerical = obs.numerical
             if numerical.dim() == 2:
                 numerical = numerical.unsqueeze(0)
             padding_mask = self.policy._get_padding_mask(numerical)
 
-            # Stateful Actor step
             z, self.state = self.policy.actor.reducer(tokens, self.state, padding_mask)
 
             # Pokemon 1: P(a1 | z)
@@ -85,13 +81,13 @@ class RLPlayer(Player):
             action1 = cat1.sample()  # (B,)
 
             # Pokemon 2: P(a2 | z, a1)
-            a1_emb = self.policy.actor.action_embedding(action1)
+            is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
+            a1_emb = self.policy.actor._build_action_context(action1, is_tp_t, tokens, aux, numerical)
             logits2 = self.policy.actor.head2(torch.cat([z, a1_emb], dim=-1))
 
             # Combine and apply sequential masks
             logits = torch.stack([logits1, logits2], dim=1)
             if action_mask is not None:
-                is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
                 logits = self.policy.actor._apply_sequential_masks(
                     logits, action1, action_mask, is_tp_t
                 )
@@ -107,9 +103,7 @@ class RLPlayer(Player):
         action_mask_list = MegaEnv.get_action_mask(battle)
         action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
 
-        # Ensure obs is batched and moved to device
         obs = obs.unsqueeze(0).to(self.policy.device)
-
         with torch.no_grad():
             actions = self._top_p(
                 obs,

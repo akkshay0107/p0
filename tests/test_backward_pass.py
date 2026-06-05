@@ -102,10 +102,22 @@ def test_gradient_flow(dummy_obs):
     missing_grads = []
     zero_grads = []
 
-    # there is technically a chance that one of these parameters
-    # could genuinely have a zero gradient, but that is really
-    # unprobably to the point if it does its mostly due to a bug
+    # not all used every turn
+    conditional_params = [
+        "actor.pass_emb",
+        "actor.switch_meta_emb",
+        "actor.move_meta_emb",
+        "actor.mega_meta_emb",
+        "actor.target_ally_emb",
+        "actor.target_opp_emb",
+        "actor.target_self_multi_emb",
+        "actor.move_proj",
+        "actor.tp_meta_emb",
+    ]
+
     for name, param in policy.named_parameters():
+        if any(cond in name for cond in conditional_params):
+            continue
         if param.requires_grad:
             if param.grad is None:
                 missing_grads.append(name)

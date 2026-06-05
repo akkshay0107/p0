@@ -63,17 +63,154 @@ class ActorPolicy(nn.Module):
             use_history=True,
         )
 
-        # Autoregressive embedding for P(a2 | z, a1)
+        # embedding components for P(a2 | z, a1)
         d_act_emb = d_model // 4
-        self.action_embedding = nn.Embedding(act_size, d_act_emb)
-        init.normal_(self.action_embedding.weight, mean=0, std=0.02)
 
+        self.pass_emb = nn.Parameter(torch.empty(d_act_emb))
+        self.tp_meta_emb = nn.Parameter(torch.empty(d_act_emb))
+        self.switch_meta_emb = nn.Parameter(torch.empty(d_act_emb))
+        self.move_meta_emb = nn.Parameter(torch.empty(d_act_emb))
+        self.mega_meta_emb = nn.Parameter(torch.empty(d_act_emb))
+
+        self.target_ally_emb = nn.Parameter(torch.empty(d_act_emb))
+        self.target_opp_emb = nn.Parameter(torch.empty(d_act_emb))
+        self.target_self_multi_emb = nn.Parameter(torch.empty(d_act_emb))
+
+        def make_proj() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(d_model, d_act_emb), nn.GELU(), nn.Linear(d_act_emb, d_act_emb)
+            )
+
+        self.actor_proj = make_proj()
+        self.target_proj = make_proj()
+        self.move_proj = make_proj()
+
+        for p in [
+            self.pass_emb,
+            self.tp_meta_emb,
+            self.switch_meta_emb,
+            self.move_meta_emb,
+            self.mega_meta_emb,
+            self.target_ally_emb,
+            self.target_opp_emb,
+            self.target_self_multi_emb,
+        ]:
+            init.normal_(p, mean=0, std=0.02)
+
+        for seq_module in [self.actor_proj, self.target_proj, self.move_proj]:
+            for module in seq_module.modules():
+                if isinstance(module, nn.Linear):
+                    init.orthogonal_(module.weight, gain=1.0)
+                    init.zeros_(module.bias)
+
+        self.ctx_norm = nn.LayerNorm(d_act_emb)
         self.head1 = PolicyHead(d_model, act_size)  # P(a1 | z)
         self.head2 = PolicyHead(d_model + d_act_emb, act_size)  # P(a2 | z, a1)
+
+    def _build_action_context(
+        self,
+        a1: torch.Tensor,
+        is_tp: torch.Tensor,
+        tokens: torch.Tensor,
+        aux: torch.Tensor,
+        numerical: torch.Tensor,
+    ) -> torch.Tensor:
+        B = a1.size(0)
+        device = a1.device
+
+        d_act_emb = self.pass_emb.size(0)
+        ctx = torch.zeros(B, d_act_emb, device=device)
+
+        tp_mask = is_tp.bool()
+        if tp_mask.any():
+            b_idx = tp_mask.nonzero(as_tuple=True)[0]
+            a1_tp = a1[b_idx]
+
+            idx_p1 = (a1_tp // 6) * 2 + 1
+            idx_p2 = (a1_tp % 6) * 2 + 1
+
+            tok_p1 = tokens[b_idx, idx_p1, :]
+            tok_p2 = tokens[b_idx, idx_p2, :]
+
+            ctx[b_idx] = self.actor_proj(tok_p1) + self.target_proj(tok_p2) + self.tp_meta_emb
+
+        battle_mask = ~tp_mask
+        if battle_mask.any():
+            b_idx = battle_mask.nonzero(as_tuple=True)[0]
+            a1_b = a1[b_idx]
+
+            actor_tok = tokens[b_idx, 1, :]
+            actor_emb = self.actor_proj(actor_tok)
+
+            pass_mask = a1_b == 0
+            if pass_mask.any():
+                ctx[b_idx[pass_mask]] = actor_emb[pass_mask] + self.pass_emb
+
+            switch_mask = (a1_b >= 1) & (a1_b <= 6)
+            if switch_mask.any():
+                s_idx = b_idx[switch_mask]
+                slot_idx = a1_b[switch_mask]
+
+                ally_indices = torch.tensor([1, 3, 5, 7, 9, 11], device=device)
+                orig_ids = torch.round(numerical[s_idx.unsqueeze(-1), ally_indices, 26] * 6).long()
+
+                matches = orig_ids == slot_idx.unsqueeze(-1)
+                has_match = matches.any(dim=-1)
+                match_idx = matches.float().argmax(dim=-1)
+                actual_seq_idx = ally_indices[match_idx]
+
+                incoming_tok = tokens[s_idx, actual_seq_idx, :]
+                matched_ctx = (
+                    actor_emb[switch_mask] + self.target_proj(incoming_tok) + self.switch_meta_emb
+                )
+                # fallback: if orig_idx lookup fails, omit target projection
+                fallback_ctx = actor_emb[switch_mask] + self.switch_meta_emb
+                ctx[s_idx] = torch.where(has_match.unsqueeze(-1), matched_ctx, fallback_ctx)
+
+            move_mask = a1_b >= 7
+            if move_mask.any():
+                m_idx = b_idx[move_mask]
+                a1_m = a1_b[move_mask]
+
+                is_mega = a1_m >= 27
+                move_idx = ((a1_m - 7) % 20) // 5
+                target_idx = (a1_m - 7) % 5  # 0: ally2, 1: ally1, 2: multi, 3: opp1, 4: opp2
+
+                meta_emb = torch.where(
+                    is_mega.unsqueeze(-1), self.mega_meta_emb, self.move_meta_emb
+                )
+                move_emb = aux[m_idx, move_idx, :]
+
+                seq_indices = torch.tensor([3, 1, 0, 13, 15], device=device)
+                target_toks = tokens[m_idx, seq_indices[target_idx], :]
+                target_toks_proj = self.target_proj(target_toks)
+
+                target_toks_proj = torch.where(
+                    (target_idx == 2).unsqueeze(-1),
+                    torch.zeros_like(target_toks_proj),
+                    target_toks_proj,
+                )
+
+                target_meta_embs = torch.stack(
+                    [
+                        self.target_ally_emb,
+                        self.target_ally_emb,
+                        self.target_self_multi_emb,
+                        self.target_opp_emb,
+                        self.target_opp_emb,
+                    ]
+                )
+
+                target_ctx = target_toks_proj + target_meta_embs[target_idx]
+                ctx[m_idx] = actor_emb[move_mask] + self.move_proj(move_emb) + target_ctx + meta_emb
+
+        return self.ctx_norm(ctx)
 
     def forward(
         self,
         tokens: torch.Tensor,
+        aux: torch.Tensor,
+        numerical: torch.Tensor,
         state: Optional[State] = None,
         action_mask: Optional[torch.Tensor] = None,
         actions: Optional[torch.Tensor] = None,
@@ -90,7 +227,11 @@ class ActorPolicy(nn.Module):
         # action eval
         if actions is not None:
             a1 = actions[:, 0]
-            a1_emb = self.action_embedding(a1)
+
+            if is_tp is None:
+                is_tp = torch.zeros(B, device=device, dtype=torch.bool)
+
+            a1_emb = self._build_action_context(a1, is_tp, tokens, aux, numerical)
             logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
             logits = torch.stack([logits1, logits2], dim=1)
 
@@ -116,7 +257,10 @@ class ActorPolicy(nn.Module):
         dist1 = Categorical(logits=l1)
         a1 = dist1.sample()
 
-        a1_emb = self.action_embedding(a1)
+        if is_tp is None:
+            is_tp = torch.zeros(B, device=device, dtype=torch.bool)
+
+        a1_emb = self._build_action_context(a1, is_tp, tokens, aux, numerical)
         logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
 
         logits = torch.stack([logits1, logits2], dim=1)
@@ -297,7 +441,7 @@ class PolicyNet(nn.Module):
         """
         Main forward pass. Matches original PolicyNet signature for compatibility.
         """
-        tokens = self.encoder(obs)
+        tokens, aux = self.encoder(obs, aux=True)
 
         # avoid duplicate is_tp calculation
         numerical = obs.numerical
@@ -317,12 +461,14 @@ class PolicyNet(nn.Module):
                 actions = actions.unsqueeze(0)
 
         return self.forward_tokens(
-            tokens, is_tp, state, action_mask, sample_actions, actions, padding_mask
+            tokens, aux, numerical, is_tp, state, action_mask, sample_actions, actions, padding_mask
         )
 
     def forward_tokens(
         self,
         tokens: torch.Tensor,
+        aux: torch.Tensor,
+        numerical: torch.Tensor,
         is_tp: torch.Tensor,
         state: Optional[State] = None,
         action_mask: Optional[torch.Tensor] = None,
@@ -334,7 +480,7 @@ class PolicyNet(nn.Module):
         Forward pass using already encoded tokens.
         """
         logits, log_probs, sampled_actions, next_state = self.actor(
-            tokens, state, action_mask, actions, sample_actions, is_tp, padding_mask
+            tokens, aux, numerical, state, action_mask, actions, sample_actions, is_tp, padding_mask
         )
         value = self.critic(tokens, padding_mask)
 
@@ -351,7 +497,7 @@ class PolicyNet(nn.Module):
         Evaluate actions for PPO updates.
         Returns (log_prob, entropy, normalized_entropy, value, next_state).
         """
-        tokens = self.encoder(obs)
+        tokens, aux = self.encoder(obs, aux=True)
         numerical = obs.numerical
         if numerical.dim() == 2:
             numerical = numerical.unsqueeze(0)
@@ -359,12 +505,14 @@ class PolicyNet(nn.Module):
         padding_mask = self._get_padding_mask(numerical)
 
         return self.evaluate_actions_tokens(
-            tokens, is_tp, actions, action_mask, state, padding_mask
+            tokens, aux, numerical, is_tp, actions, action_mask, state, padding_mask
         )
 
     def evaluate_actions_tokens(
         self,
         tokens: torch.Tensor,
+        aux: torch.Tensor,
+        numerical: torch.Tensor,
         is_tp: torch.Tensor,
         actions: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
@@ -376,6 +524,8 @@ class PolicyNet(nn.Module):
         """
         logits, log_prob, _, value, next_state = self.forward_tokens(
             tokens,
+            aux,
+            numerical,
             is_tp,
             state,
             action_mask,

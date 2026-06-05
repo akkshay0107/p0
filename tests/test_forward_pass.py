@@ -3,7 +3,12 @@ import torch
 
 from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
-from src.model.structured_observation import CATEGORICAL_WIDTH, NUMERICAL_WIDTH, SEQUENCE_LENGTH, StructuredObservation
+from src.model.structured_observation import (
+    CATEGORICAL_WIDTH,
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
+    StructuredObservation,
+)
 
 
 @pytest.fixture
@@ -47,11 +52,13 @@ def test_policy_net_forward_pass(policy_net):
 def test_policy_net_forward_tokens(policy_net):
     B = 16
     tokens = torch.randn((B, SEQUENCE_LENGTH, 128))
+    aux = torch.randn((B, 4, 128))
+    numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
     is_tp = torch.zeros(B, dtype=torch.bool)
 
     with torch.no_grad():
         logits, log_probs, sampled_actions, value, next_state = policy_net.forward_tokens(
-            tokens, is_tp
+            tokens, aux, numerical, is_tp
         )
 
     assert logits.shape == (B, 2, ACT_SIZE)

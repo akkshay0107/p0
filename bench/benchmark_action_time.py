@@ -132,7 +132,7 @@ class ProfiledRLPlayer(RLPlayer):
 
         start_inference = get_time()
         with torch.no_grad():
-            tokens = self.policy.encoder(obs)
+            tokens, aux = self.policy.encoder(obs, aux=True)
             numerical = obs.numerical
             if numerical.dim() == 2:
                 numerical = numerical.unsqueeze(0)
@@ -154,13 +154,13 @@ class ProfiledRLPlayer(RLPlayer):
 
             start_inference = get_time()
             # Pokemon 2: P(a2 | z, a1)
-            a1_emb = self.policy.actor.action_embedding(action1)
+            is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
+            a1_emb = self.policy.actor._build_action_context(action1, is_tp_t, tokens, aux, numerical)
             logits2 = self.policy.actor.head2(torch.cat([z, a1_emb], dim=-1))
 
             # Combine and apply sequential masks
             logits = torch.stack([logits1, logits2], dim=1)
             if action_mask is not None:
-                is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
                 logits = self.policy.actor._apply_sequential_masks(
                     logits, action1, action_mask, is_tp_t
                 )

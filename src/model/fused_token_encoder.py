@@ -111,7 +111,9 @@ class FusedTokenEncoder(nn.Module):
                 init.normal_(module.weight, std=emb_gain)
         init.normal_(self.mon_fusion_token, std=emb_gain)
 
-    def _embed_pokemon_super(self, categorical: torch.Tensor) -> torch.Tensor:
+    def _embed_pokemon_super(
+        self, categorical: torch.Tensor, aux: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # see _pokemon_categorical in observation_builder
         # for the order of the categorical features
         species = self.species_proj(self.species_emb(categorical[..., 0]))
@@ -131,7 +133,8 @@ class FusedTokenEncoder(nn.Module):
             ],
             dim=-1,
         )
-        moveset = self.moveset_proj(self.move_proj(move_parts)).mean(dim=-2)
+        move_embs = self.move_proj(move_parts)
+        moveset = self.moveset_proj(move_embs).mean(dim=-2)
 
         status = self.status_proj(self.status_emb(categorical[..., 17]))
 
@@ -156,7 +159,11 @@ class FusedTokenEncoder(nn.Module):
         fusion_token = self.mon_fusion_token.expand(N, 1, -1)
         fused = self.mon_fusion(torch.cat([fusion_token, components], dim=1))
 
-        # extract cls "super token"
+        # fused[:, 0] is the cls => "super token" for a pokemon
+        # aux channel returns move_embs which is needed downstream for action embedding
+        # kept it as a conditional for now, but realistically should be default
+        if aux:
+            return fused[:, 0], move_embs
         return fused[:, 0]
 
     def _embed_global_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
@@ -174,7 +181,9 @@ class FusedTokenEncoder(nn.Module):
         s_count = s_mask.sum(dim=-1, keepdim=True).float().clamp_min(1.0)
         return s_sum / s_count  # zero-vector when no conditions present (#2)
 
-    def forward(self, obs: StructuredObservation) -> torch.Tensor:
+    def forward(
+        self, obs: StructuredObservation, aux: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         categorical = obs.categorical.long()
         numerical = obs.numerical.float()
         token_type_ids = obs.token_type_ids.long()
@@ -204,11 +213,26 @@ class FusedTokenEncoder(nn.Module):
         slot_ids = slot_ids.to(device)
 
         x = torch.zeros(B, S, self.d_model, device=device, dtype=self.mon_fusion_token.dtype)
+        aux_tensor = None  # unbound warning
 
         # sparse execution: only compute embeddings for the slots that actually need them
         super_mask = token_type_ids == TokenType.POKEMON_SUPER
-        if super_mask.any():
-            x[super_mask] = self._embed_pokemon_super(categorical[super_mask])
+        if aux:
+            aux_tensor = torch.zeros(B, 4, self.d_model, device=device, dtype=x.dtype)
+            active_mask = torch.zeros_like(super_mask)
+            active_mask[:, 1] = super_mask[:, 1]
+            other_super_mask = super_mask & ~active_mask
+
+            if active_mask.any():
+                super_out, aux_moves = self._embed_pokemon_super(categorical[active_mask], aux=True)
+                x[active_mask] = super_out
+                aux_tensor[active_mask[:, 1]] = aux_moves
+
+            if other_super_mask.any():
+                x[other_super_mask] = self._embed_pokemon_super(categorical[other_super_mask])  # type: ignore
+        else:
+            if super_mask.any():
+                x[super_mask] = self._embed_pokemon_super(categorical[super_mask])  # type: ignore
 
         numeric_mask = token_type_ids == TokenType.POKEMON_NUMERIC
         if numeric_mask.any():
@@ -235,9 +259,12 @@ class FusedTokenEncoder(nn.Module):
                 field_cat_emb[side_in_field] = self._embed_side_field_cond(categorical[side_mask])
             x[field_mask] = field_cat_emb + field_num
 
-        return (
+        out_tokens = (
             x
             + self.token_type_emb(token_type_ids)
             + self.side_emb(side_ids)
             + self.slot_emb(slot_ids)
         )
+        if aux:
+            return out_tokens, aux_tensor  # type: ignore
+        return out_tokens
