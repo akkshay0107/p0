@@ -115,94 +115,88 @@ class ActorPolicy(nn.Module):
         aux: torch.Tensor,
         numerical: torch.Tensor,
     ) -> torch.Tensor:
+        # slightly wasteful but avoids CPU checks for assigning to mask
         B = a1.size(0)
         device = a1.device
+        batch_idx = torch.arange(B, device=device)
 
-        d_act_emb = self.pass_emb.size(0)
-        ctx = torch.zeros(B, d_act_emb, device=device)
+        is_tp = is_tp.bool()
+        is_pass = (a1 == 0) & ~is_tp
+        is_switch = (a1 >= 1) & (a1 <= 6) & ~is_tp
+        is_move = (a1 >= 7) & ~is_tp
+        is_mega = (a1 >= 27) & ~is_tp
 
-        tp_mask = is_tp.bool()
-        if tp_mask.any():
-            b_idx = tp_mask.nonzero(as_tuple=True)[0]
-            a1_tp = a1[b_idx]
+        # actor embedding always comes at slot 1
+        # since we order it in the obs builder
+        actor_emb = self.actor_proj(tokens[:, 1, :])
 
-            idx_p1 = (a1_tp // 6) * 2 + 1
-            idx_p2 = (a1_tp % 6) * 2 + 1
+        # context embeddings for team preview
+        idx_p1 = (a1 // 6) * 2 + 1
+        idx_p2 = (a1 % 6) * 2 + 1
+        tok_p1 = tokens[batch_idx, idx_p1, :]
+        tok_p2 = tokens[batch_idx, idx_p2, :]
 
-            tok_p1 = tokens[b_idx, idx_p1, :]
-            tok_p2 = tokens[b_idx, idx_p2, :]
+        # set embedding for the lead pokemon
+        # manual deepset impl
+        tp_ctx = (
+            nn.functional.gelu(self.actor_proj(tok_p1) + self.actor_proj(tok_p2)) + self.tp_meta_emb
+        )
 
-            ctx[b_idx] = self.actor_proj(tok_p1) + self.target_proj(tok_p2) + self.tp_meta_emb
+        pass_ctx = actor_emb + self.pass_emb
 
-        battle_mask = ~tp_mask
-        if battle_mask.any():
-            b_idx = battle_mask.nonzero(as_tuple=True)[0]
-            a1_b = a1[b_idx]
+        # switch context embeds pokemon switching out + pokemon switching in
+        slot_idx = a1.clamp(1, 6)
+        ally_indices = torch.tensor([1, 3, 5, 7, 9, 11], device=device)
+        orig_ids = torch.round(numerical[:, ally_indices + 1, 26] * 6).long()
+        matches = orig_ids == slot_idx.unsqueeze(-1)
+        valid_match = matches.any(dim=-1)
+        match_idx = matches.float().argmax(dim=-1)
 
-            actor_tok = tokens[b_idx, 1, :]
-            actor_emb = self.actor_proj(actor_tok)
+        # force a index error if switch invalid
+        match_idx = torch.where(
+            is_switch & ~valid_match, torch.tensor(1000, device=device), match_idx
+        )
 
-            pass_mask = a1_b == 0
-            if pass_mask.any():
-                ctx[b_idx[pass_mask]] = actor_emb[pass_mask] + self.pass_emb
+        actual_seq_idx = ally_indices[match_idx]
+        incoming_tok = tokens[batch_idx, actual_seq_idx, :]
+        switch_ctx = actor_emb + self.switch_meta_emb + self.target_proj(incoming_tok)
 
-            switch_mask = (a1_b >= 1) & (a1_b <= 6)
-            if switch_mask.any():
-                s_idx = b_idx[switch_mask]
-                slot_idx = a1_b[switch_mask]
+        # move context embedding
+        # if move is single target => actor emb + target emb
+        # else => actor emb + learned token for self / multi target
+        # mega token added if mega too
+        a1_m = a1.clamp_min(7) - 7
+        move_idx = (a1_m % 20) // 5
+        target_idx = a1_m % 5
 
-                ally_indices = torch.tensor([1, 3, 5, 7, 9, 11], device=device)
-                orig_ids = torch.round(numerical[s_idx.unsqueeze(-1), ally_indices, 26] * 6).long()
+        seq_indices = torch.tensor([3, 1, 0, 13, 15], device=device)
+        target_toks = tokens[batch_idx, seq_indices[target_idx], :]
+        target_toks_proj = self.target_proj(target_toks)
 
-                matches = orig_ids == slot_idx.unsqueeze(-1)
-                has_match = matches.any(dim=-1)
-                match_idx = matches.float().argmax(dim=-1)
-                actual_seq_idx = ally_indices[match_idx]
+        target_toks_proj = torch.where(
+            (target_idx == 2).unsqueeze(-1),
+            torch.zeros_like(target_toks_proj),
+            target_toks_proj,
+        )
 
-                incoming_tok = tokens[s_idx, actual_seq_idx, :]
-                matched_ctx = (
-                    actor_emb[switch_mask] + self.target_proj(incoming_tok) + self.switch_meta_emb
-                )
-                # fallback: if orig_idx lookup fails, omit target projection
-                fallback_ctx = actor_emb[switch_mask] + self.switch_meta_emb
-                ctx[s_idx] = torch.where(has_match.unsqueeze(-1), matched_ctx, fallback_ctx)
+        is_ally = target_idx < 2
+        is_opp = target_idx > 2
+        target_meta = torch.where(
+            is_ally.unsqueeze(-1),
+            self.target_ally_emb,
+            torch.where(is_opp.unsqueeze(-1), self.target_opp_emb, self.target_self_multi_emb),
+        )
 
-            move_mask = a1_b >= 7
-            if move_mask.any():
-                m_idx = b_idx[move_mask]
-                a1_m = a1_b[move_mask]
+        move_meta = torch.where(is_mega.unsqueeze(-1), self.mega_meta_emb, self.move_meta_emb)
+        move_emb = aux[batch_idx, move_idx, :]
+        move_ctx = actor_emb + self.move_proj(move_emb) + target_toks_proj + target_meta + move_meta
 
-                is_mega = a1_m >= 27
-                move_idx = ((a1_m - 7) % 20) // 5
-                target_idx = (a1_m - 7) % 5  # 0: ally2, 1: ally1, 2: multi, 3: opp1, 4: opp2
-
-                meta_emb = torch.where(
-                    is_mega.unsqueeze(-1), self.mega_meta_emb, self.move_meta_emb
-                )
-                move_emb = aux[m_idx, move_idx, :]
-
-                seq_indices = torch.tensor([3, 1, 0, 13, 15], device=device)
-                target_toks = tokens[m_idx, seq_indices[target_idx], :]
-                target_toks_proj = self.target_proj(target_toks)
-
-                target_toks_proj = torch.where(
-                    (target_idx == 2).unsqueeze(-1),
-                    torch.zeros_like(target_toks_proj),
-                    target_toks_proj,
-                )
-
-                target_meta_embs = torch.stack(
-                    [
-                        self.target_ally_emb,
-                        self.target_ally_emb,
-                        self.target_self_multi_emb,
-                        self.target_opp_emb,
-                        self.target_opp_emb,
-                    ]
-                )
-
-                target_ctx = target_toks_proj + target_meta_embs[target_idx]
-                ctx[m_idx] = actor_emb[move_mask] + self.move_proj(move_emb) + target_ctx + meta_emb
+        # combine all contexts
+        ctx = torch.zeros(B, self.pass_emb.size(0), device=device)
+        ctx = torch.where(is_tp.unsqueeze(-1), tp_ctx, ctx)
+        ctx = torch.where(is_pass.unsqueeze(-1), pass_ctx, ctx)
+        ctx = torch.where(is_switch.unsqueeze(-1), switch_ctx, ctx)
+        ctx = torch.where(is_move.unsqueeze(-1), move_ctx, ctx)
 
         return self.ctx_norm(ctx)
 

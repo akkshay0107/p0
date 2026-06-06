@@ -68,6 +68,12 @@ def dummy_obs():
 
     # Numerical features
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
+    
+    # Populate valid orig_idxs to prevent random switch actions from crashing
+    ally_indices = [1, 3, 5, 7, 9, 11]
+    for i, idx in enumerate(ally_indices):
+        numerical[:, idx + 1, 26] = (i + 1) / 6.0
+        
     # Set the is_tp flag (numerical[:, 25, 6]) randomly
     numerical[:, 25, 6] = 1.0
 
