@@ -11,7 +11,12 @@ from torch.distributions import Categorical
 from src.lookups import ACT_SIZE
 from src.model.cls_reducer import CLSReducer
 from src.model.fused_token_encoder import FusedTokenEncoder
-from src.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH, StructuredObservation
+from src.model.structured_observation import (
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
+    SideId,
+    StructuredObservation,
+)
 
 
 class PolicyHead(nn.Module):
@@ -83,10 +88,12 @@ class ActorPolicy(nn.Module):
         nhead: int,
         nlayer: int,
         act_size: int,
+        side_emb: nn.Embedding,
         seq_len: int = SEQUENCE_LENGTH,
     ):
         super().__init__()
         self.act_size = act_size
+        self.side_emb = side_emb
 
         self.reducer = CLSReducer(
             seq_len=seq_len,
@@ -106,12 +113,6 @@ class ActorPolicy(nn.Module):
         self.mega_meta_emb = nn.Parameter(torch.empty(d_act_emb))
         self.target_self_multi_emb = nn.Parameter(torch.empty(d_act_emb))
 
-        # TODO: rework these to reuse the embeddings
-        # that the cls reducer uses to assign ALLY or FOE
-        # use a projection to bring them to d_act_emb
-        self.target_ally_emb = nn.Parameter(torch.empty(d_act_emb))
-        self.target_opp_emb = nn.Parameter(torch.empty(d_act_emb))
-
         def make_proj() -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(d_model, d_act_emb), nn.GELU(), nn.Linear(d_act_emb, d_act_emb)
@@ -120,6 +121,7 @@ class ActorPolicy(nn.Module):
         self.actor_proj = make_proj()
         self.target_proj = make_proj()
         self.move_proj = make_proj()
+        self.side_proj = nn.Linear(d_model, d_act_emb)
 
         for p in [
             self.pass_emb,
@@ -127,8 +129,6 @@ class ActorPolicy(nn.Module):
             self.switch_meta_emb,
             self.move_meta_emb,
             self.mega_meta_emb,
-            self.target_ally_emb,
-            self.target_opp_emb,
             self.target_self_multi_emb,
         ]:
             init.normal_(p, mean=0, std=0.02)
@@ -138,6 +138,9 @@ class ActorPolicy(nn.Module):
                 if isinstance(module, nn.Linear):
                     init.orthogonal_(module.weight, gain=1.0)
                     init.zeros_(module.bias)
+
+        init.orthogonal_(self.side_proj.weight, gain=1.0)
+        init.zeros_(self.side_proj.bias)
 
         self.ctx_norm = nn.LayerNorm(d_act_emb)
         self.head1 = PolicyHead(d_model, act_size)  # P(a1 | z)
@@ -216,10 +219,17 @@ class ActorPolicy(nn.Module):
 
         is_ally = target_idx < 2
         is_opp = target_idx > 2
+
+        # project side embeddings from the shared encoder
+        side_weights_proj = self.side_proj(self.side_emb.weight)
+        ally_meta = side_weights_proj[int(SideId.ALLY)].unsqueeze(0)
+        opp_meta = side_weights_proj[int(SideId.OPPONENT)].unsqueeze(0)
+        self_meta = self.target_self_multi_emb.unsqueeze(0)
+
         target_meta = torch.where(
             is_ally.unsqueeze(-1),
-            self.target_ally_emb,
-            torch.where(is_opp.unsqueeze(-1), self.target_opp_emb, self.target_self_multi_emb),
+            ally_meta,
+            torch.where(is_opp.unsqueeze(-1), opp_meta, self_meta),
         )
 
         move_meta = torch.where(is_mega.unsqueeze(-1), self.mega_meta_emb, self.move_meta_emb)
@@ -369,20 +379,20 @@ class PolicyNet(nn.Module):
         act_size=ACT_SIZE,
         d_model=768,
         nhead=8,
-        nlayer=3,
+        nlayer=4,
     ):
         super().__init__()
         self.seq_len, self.feat_dim = obs_dim
         self.act_size = act_size
         self.d_model = d_model
 
-        # Shared structured front-end
+        # shared backbone + policy head
         self.encoder = FusedTokenEncoder(d_model, nhead, d_model * 4)
+        self.actor = ActorPolicy(
+            d_model, nhead, nlayer, act_size, self.encoder.side_emb, self.seq_len
+        )
 
-        # Stateful Actor
-        self.actor = ActorPolicy(d_model, nhead, nlayer, act_size, self.seq_len)
-
-        # Stateless Critic
+        # value head
         self.critic = ValueHead(d_model)
 
     @property

@@ -58,7 +58,7 @@ class FusedTokenEncoder(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        d_raw = 64  # lower dim for reduced memory
+        d_raw = 128  # lower dim for reduced memory
 
         sizes = _load_vocab_sizes()
         self.species_emb = nn.Embedding(sizes.get("species", 1), d_raw)
