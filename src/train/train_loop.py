@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from src.env import SimEnv
 from src.lookups import ACT_SIZE, OBS_DIM
 from src.model.policy import PolicyNet
-from src.model.structured_observation import StructuredObservation
+from src.model.structured_observation import StructuredObservation, NUM_IDX_TEAM_PREVIEW, TOKEN_IDX_GLOBAL_FIELD
 from src.train.config import PPOConfig, load_config
 from src.train.opponent_pool import OpponentPool
 from src.train.rollout import RolloutBuffer, collect_rollouts
@@ -127,7 +127,7 @@ def _run_batched_ppo(
         advantages_t = advantages_p[:active_n, t]
         returns_t = returns_p[:active_n, t]
         action_masks_t = action_masks_p[:active_n, t]
-        is_tp_t = numerical_t[:, 25, 2] > 0.5
+        is_tp_t = numerical_t[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] > 0.5
 
         curr_state = state[:active_n]
         curr_log_prob, curr_entropy, curr_normalized_entropy, curr_val, next_state = (
@@ -151,7 +151,7 @@ def _run_batched_ppo(
                     f"  action_masks_t (p1): {action_masks_t[idx, 0].nonzero().squeeze(-1).tolist()}\n"
                     f"  action_masks_t (p2): {action_masks_t[idx, 1].nonzero().squeeze(-1).tolist()}\n"
                     f"  is_tp_t: {is_tp_t[idx].item()}\n"
-                    f"  numerical_t[:, 25, :4]: {numerical_t[idx, 25, :4].tolist()}\n"
+                    f"  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD, :4]: {numerical_t[idx, TOKEN_IDX_GLOBAL_FIELD, :4].tolist()}\n"
                     f"  old_log_prob: {old_log_probs_t[idx].item()}\n"
                     f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
                 )

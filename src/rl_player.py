@@ -18,6 +18,7 @@ from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
 from src.team_picker import RandomTeamFromPool
+from src.model.structured_observation import NUM_IDX_TEAM_PREVIEW, TOKEN_IDX_GLOBAL_FIELD
 from src.train.utils import initial_state, load_checkpoint
 
 
@@ -83,7 +84,7 @@ class RLPlayer(Player):
             # Combine and apply sequential masks
             logits = torch.stack([logits1, logits2], dim=1)
             if action_mask is not None:
-                is_tp_t = (numerical[:, 25, 2] > 0.5).bool()
+                is_tp_t = (numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
                 logits = self.policy.actor._apply_sequential_masks(
                     logits, action1, action_mask, is_tp_t
                 )

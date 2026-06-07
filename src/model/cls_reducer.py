@@ -33,7 +33,7 @@ class CLSReducer(nn.Module):
         self.cls_base = nn.Parameter(torch.empty(1, 1, d_model))
         self.register_buffer("hg_init", torch.zeros(1, self.n_hg, d_model))
         if self.use_history:
-            self.hg_gate = nn.Parameter(torch.zeros(1, 1, d_model))
+            self.hg_gate = nn.Parameter(torch.zeros(1, self.n_hg, 1))
 
         self.encoder = SwiGLUTransformerEncoder(
             d_model=d_model,

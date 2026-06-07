@@ -12,8 +12,15 @@ from src.lookups import ACT_SIZE
 from src.model.cls_reducer import CLSReducer
 from src.model.fused_token_encoder import FusedTokenEncoder
 from src.model.structured_observation import (
+    ALL_NUM_TOKENS,
+    ALLY_POKE_TOKENS,
+    NUM_IDX_FAINTED,
+    NUM_IDX_ORIG_IDX_RATIO,
+    NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
+    TARGET_SEQ_INDICES,
+    TOKEN_IDX_GLOBAL_FIELD,
     SideId,
     StructuredObservation,
 )
@@ -158,7 +165,7 @@ class ActorPolicy(nn.Module):
         device = a1.device
         batch_idx = torch.arange(B, device=device)
 
-        is_tp = (numerical[:, 25, 2] > 0.5).bool()
+        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
         is_pass = (a1 == 0) & ~is_tp
         is_switch = (a1 >= 1) & (a1 <= 6) & ~is_tp
         is_move = (a1 >= 7) & ~is_tp
@@ -184,8 +191,8 @@ class ActorPolicy(nn.Module):
 
         # switch context embeds pokemon switching out + pokemon switching in
         slot_idx = a1.clamp(1, 6)
-        ally_indices = torch.tensor([1, 3, 5, 7, 9, 11], device=device)
-        orig_ids = torch.round(numerical[:, ally_indices + 1, 26] * 6).long()
+        ally_indices = torch.tensor(ALLY_POKE_TOKENS, device=device)
+        orig_ids = torch.round(numerical[:, ally_indices + 1, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
         matches = orig_ids == slot_idx.unsqueeze(-1)
         valid_match = matches.any(dim=-1)
         match_idx = matches.float().argmax(dim=-1)
@@ -207,7 +214,7 @@ class ActorPolicy(nn.Module):
         move_idx = (a1_m % 20) // 5
         target_idx = a1_m % 5
 
-        seq_indices = torch.tensor([3, 1, 0, 13, 15], device=device)
+        seq_indices = torch.tensor(TARGET_SEQ_INDICES, device=device)
         target_toks = tokens[batch_idx, seq_indices[target_idx], :]
         target_toks_proj = self.target_proj(target_toks)
 
@@ -259,12 +266,12 @@ class ActorPolicy(nn.Module):
         device = tokens.device
 
         # compute metadata internally to simplify signature
-        is_tp = (numerical[:, 25, 2] > 0.5).bool()
+        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
 
         # padding mask for the reducer
         padding_mask = torch.zeros(B, tokens.size(1), dtype=torch.bool, device=device)
-        idx_num = torch.arange(2, 25, 2, device=device)
-        is_fainted = numerical[:, idx_num, 27] > 0.5
+        idx_num = torch.tensor(ALL_NUM_TOKENS, device=device)
+        is_fainted = numerical[:, idx_num, NUM_IDX_FAINTED] > 0.5
         padding_mask[:, idx_num] = is_fainted
         padding_mask[:, idx_num - 1] = is_fainted
 
