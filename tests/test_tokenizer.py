@@ -128,3 +128,25 @@ def test_tokenizer_pokemon_attributes():
     m3 = Move("protect", 9)
     assert tokenizer.move_category_id(m3) == 3
     assert tokenizer.move_category_id(None) == 0
+
+
+def test_tokenizer_nature():
+    """Verify that nature_id correctly extracts and maps Pokemon natures."""
+    assert tokenizer.nature_id(None) == 0
+
+    p = Pokemon(gen=9, species="pikachu")
+    assert tokenizer.nature_id(p) == 0  # no nature set yet
+
+    p._nature = "Jolly"
+    jolly_id = tokenizer.nature_id(p)
+    assert jolly_id > 0
+    assert tokenizer.natures_list[jolly_id] == "jolly"
+
+    p._nature = "Adamant"
+    adamant_id = tokenizer.nature_id(p)
+    assert adamant_id > 0
+    assert tokenizer.natures_list[adamant_id] == "adamant"
+
+    # test fallback to 0/neutral
+    p._nature = "unknown_nature"
+    assert tokenizer.nature_id(p) == 0
