@@ -57,11 +57,8 @@ def _run_batched_bc(
         all_obs_tensors.append(StructuredObservation.cat([sample["obs"].unsqueeze(0) for sample in ep], dim=0))
     all_obs = StructuredObservation.cat(all_obs_tensors, dim=0).to(device)
     all_tokens, all_aux = policy.encoder(all_obs, aux=True)
-    all_padding_masks = policy._get_padding_mask(all_obs.numerical)
-
     tokens_list = torch.split(all_tokens, [len(ep) for ep in episodes])
     aux_list = torch.split(all_aux, [len(ep) for ep in episodes])
-    padding_mask_list = torch.split(all_padding_masks, [len(ep) for ep in episodes])
     numerical_list = torch.split(all_obs.numerical, [len(ep) for ep in episodes])
 
     def pack(fields):
@@ -91,21 +88,17 @@ def _run_batched_bc(
         tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
         aux_t = torch.stack([a[t] for a in aux_list[:active_n]], dim=0)
         numerical_t = torch.stack([num[t] for num in numerical_list[:active_n]], dim=0)
-        padding_mask_t = torch.stack([pm[t] for pm in padding_mask_list[:active_n]], dim=0)
         masks_t = masks_p[:active_n, t]
         targets_t = targets_p[:active_n, t]
-        is_tp_t = numerical_t[:, 25, 2] > 0.5
 
-        curr_state = (state[0][:active_n], state[1][:active_n])
+        curr_state = state[:active_n]
         log_prob, _, _, _, next_state = policy.evaluate_actions_tokens(
             tokens_t,
             aux_t,
             numerical_t,
-            is_tp_t,
             targets_t,
             action_mask=masks_t,
             state=curr_state,
-            padding_mask=padding_mask_t,
         )
 
         loss = -log_prob.sum()
@@ -117,12 +110,10 @@ def _run_batched_bc(
                 tokens_t,
                 aux_t,
                 numerical_t,
-                is_tp_t,
                 state=curr_state,
                 action_mask=masks_t,
                 sample_actions=False,
                 actions=targets_t,
-                padding_mask=padding_mask_t,
             )
             preds = torch.stack(
                 [logits[:, 0].argmax(dim=-1), logits[:, 1].argmax(dim=-1)],
@@ -131,11 +122,8 @@ def _run_batched_bc(
             correct += (preds == targets_t).sum().item()
             total += targets_t.numel()
 
-        state_cls, state_hg = next_state
         if active_n < batch_size:
-            padded_cls = torch.cat([state_cls, state[0][active_n:]], dim=0)
-            padded_hg = torch.cat([state_hg, state[1][active_n:]], dim=0)
-            state = (padded_cls, padded_hg)
+            state = torch.cat([next_state, state[active_n:]], dim=0)
         else:
             state = next_state
 

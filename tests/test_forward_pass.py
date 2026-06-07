@@ -48,9 +48,7 @@ def test_policy_net_forward_pass(policy_net):
     assert value.shape == (B,)
 
     # recurrent state check
-    cls, hg = next_state
-    # cls is enc[:, 0] which is (B, d_model)
-    assert cls.shape == (B, 128)
+    hg = next_state
     assert hg.shape == (B, 4, 128)  # n_hg is 4
 
 
@@ -65,11 +63,9 @@ def test_policy_net_forward_tokens(policy_net):
     for i, idx in enumerate(ally_indices):
         numerical[:, idx + 1, 26] = (i + 1) / 6.0
 
-    is_tp = torch.zeros(B, dtype=torch.bool)
-
     with torch.no_grad():
         logits, log_probs, sampled_actions, value, next_state = policy_net.forward_tokens(
-            tokens, aux, numerical, is_tp
+            tokens, aux, numerical
         )
 
     assert logits.shape == (B, 2, ACT_SIZE)
@@ -81,7 +77,7 @@ def test_sequential_mask_fallback(policy_net):
     action_mask = torch.zeros((1, 2, ACT_SIZE), dtype=torch.bool)
     action_mask[:, 0, 0] = True
     action1 = torch.tensor([0])
-    is_tp = torch.tensor([False])
+    is_tp = torch.zeros(1, dtype=torch.bool)
 
     masked_logits = policy_net.actor._apply_sequential_masks(logits, action1, action_mask, is_tp)
 
@@ -97,7 +93,6 @@ def test_policy_net_padding_mask_real(policy_net):
 
     sys.path.append(str(Path(__file__).parent))
     from test_observation import make_real_battle, make_real_pokemon
-
     from src.model.observation_builder import from_battle
     from src.model.tokenizer import tokenizer
 
@@ -118,28 +113,6 @@ def test_policy_net_padding_mask_real(policy_net):
     numerical = obs.numerical
     if numerical.dim() == 2:
         numerical = numerical.unsqueeze(0)
-
-    padding_mask = policy_net._get_padding_mask(numerical)
-
-    assert padding_mask.shape == (1, SEQUENCE_LENGTH)
-
-    # 0: CLS
-    # 1: P1 Super, 2: P1 Numeric
-    # 3: P2 Super, 4: P2 Numeric
-    # 5: Bench Super, 6: Bench Numeric
-    # Since P2 is fainted, indices 3 and 4 should be True (ignored)
-    assert padding_mask[0, 1].item() is False  # p1 super
-    assert padding_mask[0, 2].item() is False  # p1 numeric
-
-    assert padding_mask[0, 3].item() is True  # p2_fainted super
-    assert padding_mask[0, 4].item() is True  # p2_fainted numeric
-
-    assert padding_mask[0, 5].item() is False  # p_bench super
-    assert padding_mask[0, 6].item() is False  # p_bench numeric
-
-    assert padding_mask[0, 25].item() is False
-    assert padding_mask[0, 26].item() is False
-    assert padding_mask[0, 27].item() is False
 
     with torch.no_grad():
         batched_obs = obs.unsqueeze(0)

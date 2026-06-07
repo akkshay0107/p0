@@ -18,7 +18,7 @@ from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
 from src.team_picker import RandomTeamFromPool
-from src.train.utils import load_checkpoint
+from src.train.utils import initial_state, load_checkpoint
 
 
 class RLPlayer(Player):
@@ -53,26 +53,23 @@ class RLPlayer(Player):
 
         return sorted_logits.scatter(-1, sorted_indices, sorted_logits)
 
-    def _top_p(self, obs, action_mask, is_tp: bool):
+    def _top_p(self, obs, action_mask):
         if self.state is None:
-            reducer = self.policy.actor.reducer
             batch_size = 1
             device = self.policy.device
-            cls = reducer.cls_base.detach().expand(batch_size, -1, -1).squeeze(1).to(device)
-            hg = reducer.hg_init.detach().expand(batch_size, -1, -1).to(device)
-            self.state = (cls, hg)
+            self.state = initial_state(self.policy, batch_size, device)
 
         with torch.no_grad():
             tokens, aux = self.policy.encoder(obs, aux=True)
             numerical = obs.numerical
             if numerical.dim() == 2:
                 numerical = numerical.unsqueeze(0)
-            padding_mask = self.policy._get_padding_mask(numerical)
 
-            z, self.state = self.policy.actor.reducer(tokens, self.state, padding_mask)
+            logits, _, _, self.state, z = self.policy.actor(
+                tokens, aux, numerical, state=self.state, action_mask=action_mask, sample=False
+            )
 
-            # Pokemon 1: P(a1 | z)
-            logits1 = self.policy.actor.head1(z)
+            logits1 = logits[:, 0]
             if action_mask is not None:
                 logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
 
@@ -80,14 +77,13 @@ class RLPlayer(Player):
             cat1 = Categorical(logits=p1_logits_top_p)
             action1 = cat1.sample()  # (B,)
 
-            # Pokemon 2: P(a2 | z, a1)
-            is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
-            a1_emb = self.policy.actor._build_action_context(action1, is_tp_t, tokens, aux, numerical)
+            a1_emb = self.policy.actor._build_action_context(action1, tokens, aux, numerical)
             logits2 = self.policy.actor.head2(torch.cat([z, a1_emb], dim=-1))
 
             # Combine and apply sequential masks
             logits = torch.stack([logits1, logits2], dim=1)
             if action_mask is not None:
+                is_tp_t = (numerical[:, 25, 2] > 0.5).bool()
                 logits = self.policy.actor._apply_sequential_masks(
                     logits, action1, action_mask, is_tp_t
                 )
@@ -108,7 +104,6 @@ class RLPlayer(Player):
             actions = self._top_p(
                 obs,
                 action_mask.unsqueeze(0).to(self.policy.device),
-                is_tp,
             )
         return actions[0].cpu().numpy()
 

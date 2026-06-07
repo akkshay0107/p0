@@ -130,8 +130,8 @@ def collect_rollouts(
     active_pool_policies: dict[str, PolicyNet],
     trajectories1: dict,
     trajectories2: dict,
-    state1: tuple[torch.Tensor, torch.Tensor],
-    state2: tuple[torch.Tensor, torch.Tensor],
+    state1: torch.Tensor,
+    state2: torch.Tensor,
     env_opponents: list[str],
     target_mode: str,
 ):
@@ -176,8 +176,7 @@ def collect_rollouts(
         log_probs2 = torch.zeros_like(log_probs1)
         values2 = torch.zeros_like(values1)
 
-        new_s2_h = state2[0].clone()
-        new_s2_c = state2[1].clone()
+        next_state2 = state2.clone()
 
         # group by env_opponents string
         opp_groups = {}
@@ -190,7 +189,7 @@ def collect_rollouts(
             idx_tensor = torch.tensor(env_indices, device=device)
             group_obs2 = obs2_batched[idx_tensor]
             group_mask2 = mask2_t[idx_tensor]
-            group_state2 = (state2[0][idx_tensor], state2[1][idx_tensor])
+            group_state2 = state2[idx_tensor]
 
             if opp_id == "self":
                 active_policy = policy
@@ -204,10 +203,7 @@ def collect_rollouts(
             actions2[idx_tensor] = g_actions
             log_probs2[idx_tensor] = g_log_probs
             values2[idx_tensor] = g_values
-            new_s2_h[idx_tensor] = g_next_state[0]
-            new_s2_c[idx_tensor] = g_next_state[1]
-
-        next_state2 = (new_s2_h, new_s2_c)
+            next_state2[idx_tensor] = g_next_state
 
         env_actions = [
             {
@@ -308,10 +304,8 @@ def collect_rollouts(
                     pool_total += 1
                     pool.update_win_rate(env_opponents[i], won)
 
-                next_state1[0][i : i + 1] = 0
-                next_state1[1][i : i + 1] = 0
-                next_state2[0][i : i + 1] = 0
-                next_state2[1][i : i + 1] = 0
+                next_state1[i : i + 1] = 0
+                next_state2[i : i + 1] = 0
 
                 # lazy swap
                 if target_mode == "self_play" or len(pool) == 0:

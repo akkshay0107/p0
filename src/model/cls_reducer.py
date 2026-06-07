@@ -57,9 +57,9 @@ class CLSReducer(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+        state: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if tokens.dim() == 2:
             tokens = tokens.unsqueeze(0)
 
@@ -74,8 +74,7 @@ class CLSReducer(nn.Module):
         if state is None:
             hg_prev = self.hg_init.expand(B, -1, -1)
         else:
-            _, hg_prev = state
-            hg_prev = hg_prev.to(tokens.device)
+            hg_prev = state.to(tokens.device)
 
         # hg_prev empty if use history false
         seq = torch.cat([cls_tok, hg_prev, tokens[:, 1:]], dim=1)
@@ -98,4 +97,4 @@ class CLSReducer(nn.Module):
         else:
             hg = hg_candidate
 
-        return cls, (cls, hg)
+        return cls, hg

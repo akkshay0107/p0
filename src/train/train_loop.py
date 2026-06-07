@@ -89,8 +89,6 @@ def _run_batched_ppo(
     tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
     aux_list = torch.split(all_aux, [ep["length"] for ep in episodes])
 
-    all_padding_masks = policy._get_padding_mask(all_obs.numerical)
-    padding_mask_list = torch.split(all_padding_masks, [ep["length"] for ep in episodes])
     numerical_list = torch.split(all_obs.numerical, [ep["length"] for ep in episodes])
 
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
@@ -125,7 +123,6 @@ def _run_batched_ppo(
 
         tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
         aux_t = torch.stack([a[t] for a in aux_list[:active_n]], dim=0)
-        padding_mask_t = torch.stack([pm[t] for pm in padding_mask_list[:active_n]], dim=0)
         numerical_t = torch.stack([num[t] for num in numerical_list[:active_n]], dim=0)
         actions_t = actions_p[:active_n, t]
         old_log_probs_t = old_log_probs_p[:active_n, t]
@@ -134,17 +131,15 @@ def _run_batched_ppo(
         action_masks_t = action_masks_p[:active_n, t]
         is_tp_t = numerical_t[:, 25, 2] > 0.5
 
-        curr_state = (state[0][:active_n], state[1][:active_n])
+        curr_state = state[:active_n]
         curr_log_prob, curr_entropy, curr_normalized_entropy, curr_val, next_state = (
             policy.evaluate_actions_tokens(
                 tokens_t,
                 aux_t,
                 numerical_t,
-                is_tp_t,
                 actions_t,
-                action_masks_t,
+                action_mask=action_masks_t,
                 state=curr_state,
-                padding_mask=padding_mask_t,
                 is_warmup=is_warmup,
             )
         )
@@ -193,8 +188,12 @@ def _run_batched_ppo(
         total_steps += active_n
 
         if is_warmup:
-            next_state = (next_state[0].detach(), next_state[1].detach())
-        state = next_state
+            next_state = next_state.detach()
+
+        if active_n < batch_size:
+            state = torch.cat([next_state, state[active_n:]], dim=0)
+        else:
+            state = next_state
 
         with torch.no_grad():
             metrics["policy_loss"] += step_policy_loss.sum().item() if not is_warmup else 0.0
