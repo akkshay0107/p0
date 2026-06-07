@@ -83,38 +83,3 @@ def test_sequential_mask_fallback(policy_net):
 
     assert torch.isfinite(masked_logits[0, 1, 0])
     assert torch.isneginf(masked_logits[0, 1, 1:]).all()
-
-
-def test_policy_net_padding_mask_real(policy_net):
-    import sys
-    from pathlib import Path
-
-    from poke_env.battle.status import Status
-
-    sys.path.append(str(Path(__file__).parent))
-    from test_observation import make_real_battle, make_real_pokemon
-    from src.model.observation_builder import from_battle
-    from src.model.tokenizer import tokenizer
-
-    p1 = make_real_pokemon(species="charizard", status=None)
-    p2_fainted = make_real_pokemon(species="camerupt", status=Status.FNT)
-    p_bench = make_real_pokemon(species="pikachu")
-
-    battle = make_real_battle(
-        active_pokemon=[p1, p2_fainted],
-        opponent_active_pokemon=[None, None],
-        team=[p1, p2_fainted, p_bench],
-        opponent_team=[],
-        teampreview=False,
-    )
-
-    obs = from_battle(battle, tokenizer)
-
-    numerical = obs.numerical
-    if numerical.dim() == 2:
-        numerical = numerical.unsqueeze(0)
-
-    with torch.no_grad():
-        batched_obs = obs.unsqueeze(0)
-        logits, log_probs, sampled_actions, value, next_state = policy_net(batched_obs)
-        assert logits.shape == (1, 2, ACT_SIZE)

@@ -7,6 +7,8 @@ from poke_env.battle.field import Field
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
+from poke_env.data import GenData
+from poke_env.stats import compute_raw_stats
 
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -78,7 +80,35 @@ def _pokemon_categorical(
         *move_category_ids,
         tok.status_id(pokemon.status),
         *volatile_ids,
+        tok.nature_id(pokemon),
     ]
+
+
+def _get_pokemon_level_stats(
+    pokemon: Pokemon, battle: DoubleBattle, is_opponent: bool
+) -> tuple[list[float], float]:
+    if not is_opponent and pokemon.stats is not None and pokemon.stats.get("hp") is not None:
+        return [
+            float(pokemon.stats["hp"]),
+            float(pokemon.stats["atk"]),
+            float(pokemon.stats["def"]),
+            float(pokemon.stats["spa"]),
+            float(pokemon.stats["spd"]),
+            float(pokemon.stats["spe"]),
+        ], 1.0
+
+    level = pokemon.level or 50
+    gen_data = GenData.from_gen(battle.gen)
+    # default base stats
+    raw_stats = compute_raw_stats(
+        pokemon.species,
+        [0] * 6,
+        [31] * 6,
+        level,
+        "serious",
+        gen_data,
+    )
+    return [float(x) for x in raw_stats], 0.0
 
 
 def _pokemon_numeric(
@@ -88,6 +118,7 @@ def _pokemon_numeric(
     orig_idx: int,
     move_slots: list[Move | None],
     active_idx: int | None = None,
+    is_opponent: bool = False,
 ) -> list[float]:
     row = [0.0] * NUMERICAL_WIDTH
     row[cond + 1] = 1.0
@@ -158,6 +189,16 @@ def _pokemon_numeric(
         row[37 + i] = min(val, max_dur) / max_dur
 
     row[42] = pokemon.preparing
+
+    level_stats, stats_exact = _get_pokemon_level_stats(pokemon, battle, is_opponent)
+    row[43] = level_stats[0] / 300.0
+    row[44] = level_stats[1] / 300.0
+    row[45] = level_stats[2] / 300.0
+    row[46] = level_stats[3] / 300.0
+    row[47] = level_stats[4] / 300.0
+    row[48] = level_stats[5] / 300.0
+    row[49] = stats_exact
+
     return row
 
 
@@ -351,7 +392,9 @@ def from_battle(
             sides[idx] = side
             slots[idx] = slot_id
             # categorical is already 0 initialized
-            numerical[idx] = _pokemon_numeric(mon, battle, cond, orig_idx, move_slots, active_idx)
+            numerical[idx] = _pokemon_numeric(
+                mon, battle, cond, orig_idx, move_slots, active_idx, is_opponent=is_opponent
+            )
             idx += 1
 
     global_cat, global_num = _global_field_token(battle, tok)

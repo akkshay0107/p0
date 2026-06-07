@@ -69,7 +69,6 @@ def _run_batched_ppo(
             {
                 "policy_loss": 0.0,
                 "value_loss": 0.0,
-                "entropy_loss": 0.0,
                 "kl_div": 0.0,
                 "clip_frac": 0.0,
             },
@@ -106,7 +105,6 @@ def _run_batched_ppo(
     metrics = {
         "policy_loss": 0.0,
         "value_loss": 0.0,
-        "entropy_loss": 0.0,
         "normalized_entropy": 0.0,
         "kl_div": 0.0,
         "clip_frac": 0.0,
@@ -198,7 +196,6 @@ def _run_batched_ppo(
         with torch.no_grad():
             metrics["policy_loss"] += step_policy_loss.sum().item() if not is_warmup else 0.0
             metrics["value_loss"] += step_value_loss.sum().item()
-            metrics["entropy_loss"] += step_entropy_loss.sum().item() if not is_warmup else 0.0
 
             metrics["normalized_entropy"] += curr_normalized_entropy.sum().item()
 
@@ -236,7 +233,6 @@ def ppo_update(
 
     tot_policy_loss = 0.0
     tot_value_loss = 0.0
-    tot_entropy_loss = 0.0
     tot_normalized_entropy = 0.0
     tot_kl_div = 0.0
     tot_grad_norm = 0.0
@@ -269,7 +265,6 @@ def ppo_update(
 
             tot_policy_loss += batch_metrics["policy_loss"]
             tot_value_loss += batch_metrics["value_loss"]
-            tot_entropy_loss += batch_metrics["entropy_loss"]
             tot_normalized_entropy += batch_metrics["normalized_entropy"]
             epoch_kl += batch_metrics["kl_div"]
             tot_clip_frac += batch_metrics["clip_frac"]
@@ -325,7 +320,6 @@ def ppo_update(
         return {
             "policy_loss": 0.0,
             "value_loss": 0.0,
-            "entropy_loss": 0.0,
             "normalized_entropy": 0.0,
             "kl_divergence": 0.0,
             "grad_norm": 0.0,
@@ -338,7 +332,6 @@ def ppo_update(
     return {
         "policy_loss": tot_policy_loss / tot_steps,
         "value_loss": tot_value_loss / tot_steps,
-        "entropy_loss": tot_entropy_loss / tot_steps,
         "normalized_entropy": tot_normalized_entropy / tot_steps,
         "kl_divergence": tot_kl_div / tot_steps,
         "grad_norm": tot_grad_norm / num_updates if num_updates > 0 else 0.0,
@@ -517,7 +510,6 @@ def main():
             tb_writer.add_scalar(f"{tag}/WinRate/Pool", pool_wr, episode + 1)
             tb_writer.add_scalar(f"{tag}/Loss/Policy", stats["policy_loss"], episode + 1)
             tb_writer.add_scalar(f"{tag}/Loss/Value", stats["value_loss"], episode + 1)
-            tb_writer.add_scalar(f"{tag}/Loss/Entropy", stats["entropy_loss"], episode + 1)
             tb_writer.add_scalar(
                 f"{tag}/Loss/NormalizedEntropy", stats["normalized_entropy"], episode + 1
             )
@@ -546,7 +538,6 @@ def main():
                 f"Ep {episode + 1}/{config.num_episodes} ({tag[:1]}) | "
                 f"Pi: {stats['policy_loss']:.4f} | "
                 f"V: {stats['value_loss']:.4f} | "
-                f"Entropy: {-stats['entropy_loss']:.4f} | "
                 f"NormEnt: {stats['normalized_entropy']:.2%} | "
                 f"Clip: {stats['clip_fraction']:.2%} | "
                 f"KL: {stats['kl_divergence']:.4f} | "

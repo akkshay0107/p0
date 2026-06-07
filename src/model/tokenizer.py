@@ -29,6 +29,37 @@ class PokemonTokenizer:
         self.abilities = vocab.get("abilities", {})
         self.moves = vocab.get("moves", {})
 
+        # all neutral natures map to serious
+        # just present here in case showdown still has it
+        self.natures_list = [
+            "serious",  # default to serious
+            "adamant",
+            "bashful",
+            "bold",
+            "brave",
+            "calm",
+            "careful",
+            "docile",
+            "gentle",
+            "hardy",
+            "hasty",
+            "impish",
+            "jolly",
+            "lax",
+            "lonely",
+            "mild",
+            "modest",
+            "naive",
+            "naughty",
+            "quiet",
+            "quirky",
+            "rash",
+            "relaxed",
+            "sassy",
+            "timid",
+        ]
+        self.natures = {nature: idx for idx, nature in enumerate(self.natures_list)}
+
         # map enum directly to id
         self._volatiles_str = vocab.get("volatiles", {})
         self.volatiles = {
@@ -172,6 +203,11 @@ class PokemonTokenizer:
         if move is None:
             return 0
         return self.categories.get(move.category, 0)
+
+    def nature_id(self, pokemon: Pokemon | None) -> int:
+        if pokemon is None or pokemon.nature is None:
+            return 0
+        return self.natures.get(self.normalize_id(pokemon.nature), 0)
 
 
 tokenizer = PokemonTokenizer.from_file()

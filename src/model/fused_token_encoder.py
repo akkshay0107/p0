@@ -16,7 +16,7 @@ from src.model.structured_observation import (
 )
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 
-NUM_COMPONENTS = 10
+NUM_COMPONENTS = 11
 NUM_TOKEN_TYPES = 6
 NUM_SIDES = 3
 NUM_SLOTS = 7
@@ -73,6 +73,7 @@ class FusedTokenEncoder(nn.Module):
         self.weather_emb = nn.Embedding(sizes.get("weathers", 1), d_raw)
         self.trickroom_emb = nn.Embedding(sizes.get("trickroom", 1), d_raw)
         self.side_condition_emb = nn.Embedding(sizes.get("side_conditions", 1), d_raw)
+        self.nature_emb = nn.Embedding(25, d_raw)
 
         self.species_proj = nn.Linear(d_raw, d_model)
         self.ability_proj = nn.Linear(d_raw, d_model)
@@ -80,6 +81,7 @@ class FusedTokenEncoder(nn.Module):
         self.status_proj = nn.Linear(d_raw, d_model)
         self.weather_proj = nn.Linear(d_raw, d_model)
         self.trickroom_proj = nn.Linear(d_raw, d_model)
+        self.nature_proj = nn.Linear(d_raw, d_model)
 
         self.volatile_set = MultiAggDeepSet(d_raw, d_model)
         self.side_condition_set = MultiAggDeepSet(d_raw, d_model)
@@ -159,6 +161,8 @@ class FusedTokenEncoder(nn.Module):
         v_mask = v_cat != 0
         volatile = self.volatile_set(self.volatile_emb(v_cat), mask=v_mask)
 
+        nature = self.nature_proj(self.nature_emb(categorical[..., 24]))
+
         # combine all components into (N, NUM_COMPONENTS, d_model)
         # Note: move_embs is (..., 4, d_model), others are (..., d_model)
         components = torch.cat(
@@ -170,6 +174,7 @@ class FusedTokenEncoder(nn.Module):
                 move_embs,
                 status.unsqueeze(-2),
                 volatile.unsqueeze(-2),
+                nature.unsqueeze(-2),
             ],
             dim=-2,
         )
