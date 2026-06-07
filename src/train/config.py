@@ -16,7 +16,7 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     value_coef: float = 0.5
-    entropy_coef: float = 0.04
+    entropy_coef: float = 0.15
     max_grad_norm: float = 1.0
     target_kl: float = 0.05  # for early kl stopping
     ppo_epochs: int = 4  # number of ppo loops per episode

@@ -32,6 +32,8 @@ class CLSReducer(nn.Module):
 
         self.cls_base = nn.Parameter(torch.empty(1, 1, d_model))
         self.register_buffer("hg_init", torch.zeros(1, self.n_hg, d_model))
+        if self.use_history:
+            self.hg_gate = nn.Parameter(torch.zeros(1, 1, d_model))
 
         self.encoder = SwiGLUTransformerEncoder(
             d_model=d_model,
@@ -45,6 +47,8 @@ class CLSReducer(nn.Module):
     def _init_weights(self):
         emb_gain = self.d_model**-0.5
         init.normal_(self.cls_base, std=emb_gain)
+        if self.use_history:
+            init.zeros_(self.hg_gate)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 init.orthogonal_(module.weight, gain=1.0)
@@ -86,6 +90,12 @@ class CLSReducer(nn.Module):
 
         cls = enc[:, 0]
         # empty if use history is false (n_hg = 0)
-        hg = enc[:, 1 : 1 + self.n_hg]
+        hg_candidate = enc[:, 1 : 1 + self.n_hg]
+
+        if self.use_history:
+            gate = torch.sigmoid(self.hg_gate)
+            hg = gate * hg_prev.to(hg_candidate.device) + (1 - gate) * hg_candidate
+        else:
+            hg = hg_candidate
 
         return cls, (cls, hg)

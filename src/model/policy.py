@@ -211,7 +211,7 @@ class ActorPolicy(nn.Module):
         sample: bool = True,
         is_tp: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], State]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], State, torch.Tensor]:
         B = tokens.size(0)
         device = tokens.device
 
@@ -236,13 +236,13 @@ class ActorPolicy(nn.Module):
             dist2 = Categorical(logits=logits[:, 1])
             log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
 
-            return logits, log_probs, None, next_state
+            return logits, log_probs, None, next_state, z
 
         # inference mode
         if not sample:
             # Return logits with placeholder for second action if not sampling or evaluating
             logits = torch.stack([logits1, torch.zeros_like(logits1)], dim=1)
-            return logits, torch.zeros(B, device=device), None, next_state
+            return logits, torch.zeros(B, device=device), None, next_state, z
 
         # Sampling with sequential constraints
         m1 = action_mask[:, 0] if action_mask is not None else None
@@ -267,7 +267,7 @@ class ActorPolicy(nn.Module):
         log_probs = dist1.log_prob(a1) + dist2.log_prob(a2)
         sampled_actions = torch.stack([a1, a2], dim=-1)
 
-        return logits, log_probs, sampled_actions, next_state
+        return logits, log_probs, sampled_actions, next_state, z
 
     def _apply_sequential_masks(
         self,
@@ -325,26 +325,16 @@ class ActorPolicy(nn.Module):
 
 
 class ValueNet(nn.Module):
-    """Stateless critic value path with internal head and gradient scaling."""
+    """Stateful critic value path with internal head and gradient scaling."""
 
     def __init__(
         self,
         d_model: int,
-        nhead: int,
-        nlayer: int,
-        seq_len: int = SEQUENCE_LENGTH,
         hidden_dim: int = 1024,  # double that of policy heads
-        scale: float = 0.1,
+        scale: float = 0.05,
     ):
         super().__init__()
         self.scale = scale
-        self.reducer = CLSReducer(
-            seq_len=seq_len,
-            d_model=d_model,
-            nhead=nhead,
-            nlayer=nlayer,
-            use_history=False,
-        )
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.GELU(),
@@ -361,15 +351,11 @@ class ValueNet(nn.Module):
                 init.orthogonal_(module.weight, gain=1.0)
                 init.zeros_(module.bias)
 
-    def forward(
-        self, tokens: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         # scale the gradient flowing back to the trunk
-        # may not be needed anymore given the deeper split
-        if tokens.requires_grad and self.scale < 1.0:
-            tokens = tokens.detach() + self.scale * (tokens - tokens.detach())
+        if z.requires_grad and self.scale < 1.0:
+            z = z.detach() + self.scale * (z - z.detach())
 
-        z, _ = self.reducer(tokens, None, padding_mask)
         return self.net(z).squeeze(-1)
 
 
@@ -389,7 +375,6 @@ class PolicyNet(nn.Module):
         d_model=768,
         nhead=8,
         nlayer=3,
-        critic_nlayer: int | None = None,
     ):
         super().__init__()
         self.seq_len, self.feat_dim = obs_dim
@@ -403,8 +388,7 @@ class PolicyNet(nn.Module):
         self.actor = ActorPolicy(d_model, nhead, nlayer, act_size, self.seq_len)
 
         # Stateless Critic
-        critic_nlayer = critic_nlayer or nlayer
-        self.critic = ValueNet(d_model, nhead, critic_nlayer, self.seq_len)
+        self.critic = ValueNet(d_model)
 
     @property
     def device(self):
@@ -467,14 +451,17 @@ class PolicyNet(nn.Module):
         sample_actions: bool = True,
         actions: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        is_warmup: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, State]:
         """
         Forward pass using already encoded tokens.
         """
-        logits, log_probs, sampled_actions, next_state = self.actor(
+        logits, log_probs, sampled_actions, next_state, z = self.actor(
             tokens, aux, numerical, state, action_mask, actions, sample_actions, is_tp, padding_mask
         )
-        value = self.critic(tokens, padding_mask)
+        if is_warmup:
+            z = z.detach()
+        value = self.critic(z)
 
         return logits, log_probs, sampled_actions, value, next_state
 
@@ -510,6 +497,7 @@ class PolicyNet(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         state: Optional[State] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        is_warmup: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, State]:
         """
         Evaluate actions using already encoded tokens.
@@ -524,6 +512,7 @@ class PolicyNet(nn.Module):
             sample_actions=False,
             actions=actions,
             padding_mask=padding_mask,
+            is_warmup=is_warmup,
         )
 
         dist1 = Categorical(logits=logits[:, 0])

@@ -145,6 +145,7 @@ def _run_batched_ppo(
                 action_masks_t,
                 state=curr_state,
                 padding_mask=padding_mask_t,
+                is_warmup=is_warmup,
             )
         )
 
@@ -170,7 +171,7 @@ def _run_batched_ppo(
 
         step_policy_loss = -torch.min(surr1, surr2)
         step_value_loss = F.mse_loss(curr_val, returns_t, reduction="none")
-        step_entropy_loss = -curr_entropy
+        step_entropy_loss = -curr_normalized_entropy
 
         is_tp_mask = is_tp_t.reshape(-1)
         step_ent_coef = curr_ent_coef * torch.where(
