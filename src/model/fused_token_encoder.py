@@ -12,7 +12,6 @@ from src.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
-    TokenType,
 )
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 
@@ -20,6 +19,17 @@ NUM_COMPONENTS = 11
 NUM_TOKEN_TYPES = 6
 NUM_SIDES = 3
 NUM_SLOTS = 7
+
+# 0 CLS
+# 1,3,...,23 pokemon super tokens
+# 2,4,...,24 pokemon numeric tokens
+# 25 Global-field token
+# 26 Ally-side token
+# 27 Opponent-side token
+_SUPER_POS = tuple(range(1, 24, 2))  # (1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
+_ACTOR_POS = 1  # active ally Pokémon is always at slot 1
+_OTHER_SUPER_POS = _SUPER_POS[1:]  # the 11 super slots that are not the active actor
+_NUMERIC_POS = tuple(range(2, 25, 2))  # (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)
 
 
 def _load_vocab_sizes() -> dict[str, int]:
@@ -49,6 +59,11 @@ class MultiAggDeepSet(nn.Module):
         return self.f(torch.cat([sum_gx, max_gx], dim=-1))
 
 
+# TODO: improve the structure setup to support seperate numeric rows
+# for the fields instead of combining them with the embeddings
+# Also considering removing the unnecessary interleaving and just stacking
+# all embeddings together and all numerical rows together. Would make
+# downstream slicing much easier
 class FusedTokenEncoder(nn.Module):
     def __init__(
         self,
@@ -116,6 +131,11 @@ class FusedTokenEncoder(nn.Module):
 
         # cache component ids instead of creating them every forward pass
         self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
+        # cache fixed sequence-position indices so advanced indexing uses pre-allocated
+        # device tensors rather than constructing a new index tensor on every forward pass.
+        self.register_buffer("_super_pos", torch.tensor(_SUPER_POS, dtype=torch.long))
+        self.register_buffer("_other_super_pos", torch.tensor(_OTHER_SUPER_POS, dtype=torch.long))
+        self.register_buffer("_numeric_pos", torch.tensor(_NUMERIC_POS, dtype=torch.long))
         self._init_weights()
 
     @torch.no_grad()
@@ -237,51 +257,40 @@ class FusedTokenEncoder(nn.Module):
         slot_ids = slot_ids.to(device)
 
         x = torch.zeros(B, S, self.d_model, device=device, dtype=self.mon_fusion_token.dtype)
-        aux_tensor = None  # unbound warning
+        aux_tensor: torch.Tensor | None = None
 
-        # sparse execution: only compute embeddings for the slots that actually need them
-        super_mask = token_type_ids == TokenType.POKEMON_SUPER
+        # TODO: make the code below work for non aux paths if needed in the future
+        # and improve the way it is written.
         if aux:
-            aux_tensor = torch.zeros(B, 4, self.d_model, device=device, dtype=x.dtype)
-            active_mask = torch.zeros_like(super_mask)
-            active_mask[:, 1] = super_mask[:, 1]
-            other_super_mask = super_mask & ~active_mask
+            # active pokemon -> process separately to extract move embeddings needed by head2.
+            actor_out, aux_moves = self._embed_pokemon_super(
+                categorical[:, _ACTOR_POS, :], aux=True
+            )
+            x[:, _ACTOR_POS, :] = actor_out  # (B, D)
+            aux_tensor = aux_moves  # (B, 4, D)
 
-            if active_mask.any():
-                super_out, aux_moves = self._embed_pokemon_super(categorical[active_mask], aux=True)
-                x[active_mask] = super_out
-                aux_tensor[active_mask[:, 1]] = aux_moves
-
-            if other_super_mask.any():
-                x[other_super_mask] = self._embed_pokemon_super(categorical[other_super_mask])  # type: ignore
+            # remaining 11 super slots: flatten batch×slot, embed, unflatten.
+            n_other = len(_OTHER_SUPER_POS)
+            other_out = self._embed_pokemon_super(
+                categorical[:, self._other_super_pos, :].flatten(0, 1)  # (B*11, C)
+            ).unflatten(0, (B, n_other))  # (B, 11, D)
+            x[:, self._other_super_pos, :] = other_out
         else:
-            if super_mask.any():
-                x[super_mask] = self._embed_pokemon_super(categorical[super_mask])  # type: ignore
+            n_super = len(_SUPER_POS)
+            super_out = self._embed_pokemon_super(
+                categorical[:, self._super_pos, :].flatten(0, 1)  # (B*12, C)
+            ).unflatten(0, (B, n_super))  # (B, 12, D)
+            x[:, self._super_pos, :] = super_out
 
-        numeric_mask = token_type_ids == TokenType.POKEMON_NUMERIC
-        if numeric_mask.any():
-            x[numeric_mask] = self.numeric_proj(numerical[numeric_mask])
-
-        global_mask = token_type_ids == TokenType.GLOBAL_FIELD
-        side_mask = (token_type_ids == TokenType.ALLY_SIDE) | (
-            token_type_ids == TokenType.OPPONENT_SIDE
+        x[:, self._numeric_pos, :] = self.numeric_proj(
+            numerical[:, self._numeric_pos, :]  # (B, 12, NUMERICAL_WIDTH) → (B, 12, D)
         )
-        field_mask = global_mask | side_mask
-        if field_mask.any():
-            # one batched layer norm and linear pass for all 3 field tokens
-            field_num = self.field_numeric_proj(numerical[field_mask])
 
-            # categorical embeddings still differ by token type — fill per type
-            field_cat_emb = torch.zeros_like(field_num)
-            global_in_field = global_mask[field_mask]
-            if global_in_field.any():
-                field_cat_emb[global_in_field] = self._embed_global_field_cond(
-                    categorical[global_mask]
-                )
-            side_in_field = side_mask[field_mask]
-            if side_in_field.any():
-                field_cat_emb[side_in_field] = self._embed_side_field_cond(categorical[side_mask])
-            x[field_mask] = field_cat_emb + field_num
+        # global (25), ally_side (26), opponent_side (27)
+        field_num = self.field_numeric_proj(numerical[:, 25:28, :])
+        global_cat = self._embed_global_field_cond(categorical[:, 25, :])
+        side_cat = self._embed_side_field_cond(categorical[:, 26:28, :])
+        x[:, 25:28, :] = torch.cat([global_cat.unsqueeze(1), side_cat], dim=1) + field_num
 
         out_tokens = (
             x

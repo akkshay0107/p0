@@ -15,7 +15,11 @@ from torch.utils.tensorboard import SummaryWriter
 from src.env import SimEnv
 from src.lookups import ACT_SIZE, OBS_DIM
 from src.model.policy import PolicyNet
-from src.model.structured_observation import StructuredObservation, NUM_IDX_TEAM_PREVIEW, TOKEN_IDX_GLOBAL_FIELD
+from src.model.structured_observation import (
+    NUM_IDX_TEAM_PREVIEW,
+    TOKEN_IDX_GLOBAL_FIELD,
+    StructuredObservation,
+)
 from src.train.config import PPOConfig, load_config
 from src.train.opponent_pool import OpponentPool
 from src.train.rollout import RolloutBuffer, collect_rollouts
@@ -49,9 +53,6 @@ def handle_sigterm(signum, frame):
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
-policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE)
-optimizer = optim.AdamW(policy.parameters(), lr=config.lr, eps=1e-6, weight_decay=1e-4)
-
 
 def _run_batched_ppo(
     episodes: list[dict],
@@ -76,8 +77,8 @@ def _run_batched_ppo(
         )
 
     batch_size = len(episodes)
-    lengths = torch.tensor([ep["length"] for ep in episodes], device=device)
-    max_steps = int(lengths[0].item())
+    lengths = [ep["length"] for ep in episodes]
+    max_steps = lengths[0]
     is_warmup = episode < config.warmup_episodes
 
     all_obs = StructuredObservation.cat([ep["obs"] for ep in episodes], dim=0)
@@ -85,10 +86,15 @@ def _run_batched_ppo(
     if is_warmup:
         all_tokens = all_tokens.detach()
         all_aux = all_aux.detach()
-    tokens_list = torch.split(all_tokens, [ep["length"] for ep in episodes])
-    aux_list = torch.split(all_aux, [ep["length"] for ep in episodes])
+    split_sizes = [ep["length"] for ep in episodes]
+    tokens_list = torch.split(all_tokens, split_sizes)
+    aux_list = torch.split(all_aux, split_sizes)
+    numerical_list = torch.split(all_obs.numerical, split_sizes)
 
-    numerical_list = torch.split(all_obs.numerical, [ep["length"] for ep in episodes])
+    # pre pad all to max len
+    tokens_p = torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True)
+    aux_p = torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True)
+    numerical_p = torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True)
 
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
     def pack(fields):
@@ -115,13 +121,13 @@ def _run_batched_ppo(
     curr_ent_coef = config.entropy_coef
 
     for t in range(max_steps):
-        active_n = int((lengths > t).sum().item())
+        active_n = sum(1 for length in lengths if length > t)
         if active_n == 0:
             break
 
-        tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
-        aux_t = torch.stack([a[t] for a in aux_list[:active_n]], dim=0)
-        numerical_t = torch.stack([num[t] for num in numerical_list[:active_n]], dim=0)
+        tokens_t = tokens_p[:active_n, t]  # (active_n, S, D) — contiguous slice
+        aux_t = aux_p[:active_n, t]  # (active_n, 4, D)
+        numerical_t = numerical_p[:active_n, t]  # (active_n, S, N)
         actions_t = actions_p[:active_n, t]
         old_log_probs_t = old_log_probs_p[:active_n, t]
         advantages_t = advantages_p[:active_n, t]
@@ -346,6 +352,11 @@ def main():
     showdown_procs = []
     vec_env = None
     tb_writer = None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info("Using device: %s", device)
+    policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
+    optimizer = optim.AdamW(policy.parameters(), lr=config.lr, eps=1e-6, weight_decay=1e-4)
 
     # to guarantee executor shutdown
     try:

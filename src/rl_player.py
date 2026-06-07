@@ -17,8 +17,8 @@ from src.env import MegaEnv
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
-from src.team_picker import RandomTeamFromPool
 from src.model.structured_observation import NUM_IDX_TEAM_PREVIEW, TOKEN_IDX_GLOBAL_FIELD
+from src.team_picker import RandomTeamFromPool
 from src.train.utils import initial_state, load_checkpoint
 
 
@@ -235,8 +235,9 @@ def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
 
 
 def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> PolicyNet:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Use recommended dimensions if unspecified
-    policy = PolicyNet()
+    policy = PolicyNet().to(device)
 
     if checkpoint_path is None:
         if not allow_random_init:
@@ -254,6 +255,7 @@ def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> Polic
         checkpoint_path,
         f" (episode {episode})" if episode is not None else "",
     )
+    LOGGER.info("Running inference on device: %s", device)
     policy.eval()
     return policy
 

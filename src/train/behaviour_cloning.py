@@ -49,17 +49,24 @@ def _run_batched_bc(
 
     episodes = sorted(episodes, key=len, reverse=True)
     batch_size = len(episodes)
-    lengths = torch.tensor([len(ep) for ep in episodes], device=device)
-    max_steps = int(lengths[0].item())
+    lengths = [len(ep) for ep in episodes]
+    max_steps = lengths[0]
 
     all_obs_tensors = []
     for ep in episodes:
-        all_obs_tensors.append(StructuredObservation.cat([sample["obs"].unsqueeze(0) for sample in ep], dim=0))
+        all_obs_tensors.append(
+            StructuredObservation.cat([sample["obs"].unsqueeze(0) for sample in ep], dim=0)
+        )
     all_obs = StructuredObservation.cat(all_obs_tensors, dim=0).to(device)
     all_tokens, all_aux = policy.encoder(all_obs, aux=True)
     tokens_list = torch.split(all_tokens, [len(ep) for ep in episodes])
     aux_list = torch.split(all_aux, [len(ep) for ep in episodes])
     numerical_list = torch.split(all_obs.numerical, [len(ep) for ep in episodes])
+
+    # pre pad the tensors to max len
+    tokens_p = torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True)
+    aux_p = torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True)
+    numerical_p = torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True)
 
     def pack(fields):
         return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
@@ -81,13 +88,13 @@ def _run_batched_bc(
     total_steps = 0
 
     for t in range(max_steps):
-        active_n = int((lengths > t).sum().item())
+        active_n = sum(1 for length in lengths if length > t)
         if active_n == 0:
             break
 
-        tokens_t = torch.stack([tk[t] for tk in tokens_list[:active_n]], dim=0)
-        aux_t = torch.stack([a[t] for a in aux_list[:active_n]], dim=0)
-        numerical_t = torch.stack([num[t] for num in numerical_list[:active_n]], dim=0)
+        tokens_t = tokens_p[:active_n, t]  # (active_n, S, D)
+        aux_t = aux_p[:active_n, t]  # (active_n, 4, D)
+        numerical_t = numerical_p[:active_n, t]  # (active_n, S, N)
         masks_t = masks_p[:active_n, t]
         targets_t = targets_p[:active_n, t]
 

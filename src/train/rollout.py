@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 
 from src.lookups import ACT_SIZE
@@ -45,14 +44,24 @@ def create_trajectory_buffers(n_envs, max_steps=100, device="cpu"):
     }
 
 
-def compute_gae(rewards, values, dones, gamma, gae_lambda):
-    T = len(rewards)
-    adv = np.zeros_like(rewards)
+def compute_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    dones: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+) -> torch.Tensor:
+    """
+    Compute Generalized Advantage Estimation.
+    Accepts 1-D tensors on any device. Returns an advantage tensor on the same device.
+    """
+    T = rewards.size(0)
+    adv = torch.zeros_like(rewards)
     gae = 0.0
     for t in reversed(range(T)):
-        next_value = values[t + 1] if t + 1 < T else 0.0
-        nonterminal = 1.0 - dones[t]
-        delta = rewards[t] + gamma * next_value * nonterminal - values[t]
+        next_value = values[t + 1].item() if t + 1 < T else 0.0
+        nonterminal = 1.0 - dones[t].item()
+        delta = rewards[t].item() + gamma * next_value * nonterminal - values[t].item()
         gae = delta + gamma * gae_lambda * nonterminal * gae
         adv[t] = gae
     return adv
@@ -90,12 +99,9 @@ class RolloutBuffer:
             dones = ep["dones"]
             T = ep["length"]
 
-            adv_np = compute_gae(
-                rewards.numpy(), values.numpy(), dones.numpy(), config.gamma, config.gae_lambda
-            )
-            adv = torch.from_numpy(adv_np).to(device)
+            adv = compute_gae(rewards, values, dones, config.gamma, config.gae_lambda)
             values_dev = values.to(device)
-            ret = adv + values_dev
+            ret = adv.to(device) + values_dev
 
             episode_data = {
                 "obs": ep["obs"].to(device),
