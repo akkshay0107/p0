@@ -59,9 +59,9 @@ def compute_gae(
     adv = torch.zeros_like(rewards)
     gae = 0.0
     for t in reversed(range(T)):
-        next_value = values[t + 1].item() if t + 1 < T else 0.0
-        nonterminal = 1.0 - dones[t].item()
-        delta = rewards[t].item() + gamma * next_value * nonterminal - values[t].item()
+        next_value = values[t + 1] if t + 1 < T else 0.0
+        nonterminal = 1.0 - dones[t]
+        delta = rewards[t] + gamma * next_value * nonterminal - values[t]
         gae = delta + gamma * gae_lambda * nonterminal * gae
         adv[t] = gae
     return adv
@@ -94,23 +94,23 @@ class RolloutBuffer:
         all_advantages = []
 
         for ep in self.trajectories:
+            # Ep data is on CPU
             rewards = ep["rewards"]
             values = ep["values"]
             dones = ep["dones"]
             T = ep["length"]
 
             adv = compute_gae(rewards, values, dones, config.gamma, config.gae_lambda)
-            values_dev = values.to(device)
-            ret = adv.to(device) + values_dev
+            ret = adv + values
 
             episode_data = {
                 "obs": ep["obs"].to(device),
                 "actions": ep["actions"].to(device),
                 "log_probs": ep["log_probs"].to(device),
                 "action_masks": ep["action_masks"].to(device),
-                "values": values_dev,
+                "values": values.to(device),
                 "advantages": adv,
-                "returns": ret,
+                "returns": ret.to(device),
                 "length": T,
             }
             all_episodes.append(episode_data)
@@ -121,7 +121,7 @@ class RolloutBuffer:
             adv_mean = flat_adv.mean()
             adv_std = flat_adv.std().clamp_min(1e-8)
             for ep in all_episodes:
-                ep["advantages"] = (ep["advantages"] - adv_mean) / adv_std
+                ep["advantages"] = ((ep["advantages"] - adv_mean) / adv_std).to(device)
 
         return all_episodes
 
@@ -166,6 +166,7 @@ def collect_rollouts(
     idx_all = torch.arange(n_envs)
 
     for step in range(steps):
+        # move to gpu
         obs1 = vec_env.get_batched_obs1(device)
         mask1_t = torch.from_numpy(masks1).to(device, non_blocking=True)
         obs2_batched = vec_env.get_batched_obs2(device)
@@ -211,16 +212,27 @@ def collect_rollouts(
             values2[idx_tensor] = g_values
             next_state2[idx_tensor] = g_next_state
 
+        # results back to cpu to interact with env
+        actions1_cpu = actions1.cpu().clone()
+        actions2_cpu = actions2.cpu().clone()
+        log_probs1_cpu = log_probs1.cpu().clone()
+        log_probs2_cpu = log_probs2.cpu().clone()
+        values1_cpu = values1.cpu().clone()
+        values2_cpu = values2.cpu().clone()
+
         env_actions = [
             {
-                vec_env.envs[i].agent1.username: actions1[i].cpu().numpy(),
-                vec_env.envs[i].agent2.username: actions2[i].cpu().numpy(),
+                vec_env.envs[i].agent1.username: actions1_cpu[i].numpy(),
+                vec_env.envs[i].agent2.username: actions2_cpu[i].numpy(),
             }
             for i in range(n_envs)
         ]
 
-        obs1_cpu = obs1.clone().cpu()
-        obs2_cpu = obs2_batched.clone().cpu()
+        obs1_cpu = obs1.cpu().clone()
+        obs2_cpu = obs2_batched.cpu().clone()
+        mask1_cpu = mask1_t.detach().cpu().bool().clone()
+        mask2_cpu = mask2_t.detach().cpu().bool().clone()
+
         next_masks1, next_masks2, rewards1, rewards2, dones, infos = vec_env.step(env_actions)
 
         # batch insert for first trajectory
@@ -230,33 +242,30 @@ def collect_rollouts(
         trajectories1["token_type_ids"][idx_all, s1] = obs1_cpu.token_type_ids
         trajectories1["side_ids"][idx_all, s1] = obs1_cpu.side_ids
         trajectories1["slot_ids"][idx_all, s1] = obs1_cpu.slot_ids
-        trajectories1["actions"][idx_all, s1] = actions1.cpu()
-        trajectories1["log_probs"][idx_all, s1] = log_probs1.cpu()
-        trajectories1["values"][idx_all, s1] = values1.cpu()
+        trajectories1["actions"][idx_all, s1] = actions1_cpu
+        trajectories1["log_probs"][idx_all, s1] = log_probs1_cpu
+        trajectories1["values"][idx_all, s1] = values1_cpu
         trajectories1["rewards"][idx_all, s1] = torch.tensor(rewards1, dtype=torch.float32)
         trajectories1["dones"][idx_all, s1] = torch.tensor(dones, dtype=torch.float32)
-        trajectories1["action_masks"][idx_all, s1] = mask1_t.cpu().bool()
+        trajectories1["action_masks"][idx_all, s1] = mask1_cpu
         step_counts1 += 1
 
-        # batch insert for traj 2 (only in self play)
-        self_play_mask = torch.tensor([env_opponents[i] == "self" for i in range(n_envs)])
-        if self_play_mask.any():
-            sp_idx = idx_all[self_play_mask]
-            s2 = step_counts2[sp_idx]
-            trajectories2["categorical"][sp_idx, s2] = obs2_cpu.categorical[sp_idx]
-            trajectories2["numerical"][sp_idx, s2] = obs2_cpu.numerical[sp_idx]
-            trajectories2["token_type_ids"][sp_idx, s2] = obs2_cpu.token_type_ids[sp_idx]
-            trajectories2["side_ids"][sp_idx, s2] = obs2_cpu.side_ids[sp_idx]
-            trajectories2["slot_ids"][sp_idx, s2] = obs2_cpu.slot_ids[sp_idx]
-            trajectories2["actions"][sp_idx, s2] = actions2[sp_idx].cpu()
-            trajectories2["log_probs"][sp_idx, s2] = log_probs2[sp_idx].cpu()
-            trajectories2["values"][sp_idx, s2] = values2[sp_idx].cpu()
-            trajectories2["rewards"][sp_idx, s2] = torch.tensor(rewards2, dtype=torch.float32)[
-                sp_idx
-            ]
-            trajectories2["dones"][sp_idx, s2] = torch.tensor(dones, dtype=torch.float32)[sp_idx]
-            trajectories2["action_masks"][sp_idx, s2] = mask2_t[sp_idx].cpu().bool()
-            step_counts2[sp_idx] += 1
+        self_play_mask = [env_opponents[i] == "self" for i in range(n_envs)]
+        for i, is_sp in enumerate(self_play_mask):
+            if is_sp:
+                s2 = step_counts2[i]
+                trajectories2["categorical"][i, s2] = obs2_cpu.categorical[i]
+                trajectories2["numerical"][i, s2] = obs2_cpu.numerical[i]
+                trajectories2["token_type_ids"][i, s2] = obs2_cpu.token_type_ids[i]
+                trajectories2["side_ids"][i, s2] = obs2_cpu.side_ids[i]
+                trajectories2["slot_ids"][i, s2] = obs2_cpu.slot_ids[i]
+                trajectories2["actions"][i, s2] = actions2_cpu[i]
+                trajectories2["log_probs"][i, s2] = log_probs2_cpu[i]
+                trajectories2["values"][i, s2] = values2_cpu[i]
+                trajectories2["rewards"][i, s2] = torch.tensor(rewards2[i], dtype=torch.float32)
+                trajectories2["dones"][i, s2] = torch.tensor(dones[i], dtype=torch.float32)
+                trajectories2["action_masks"][i, s2] = mask2_cpu[i]
+                step_counts2[i] += 1
 
         for i in range(n_envs):
             if dones[i]:

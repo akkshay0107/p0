@@ -31,15 +31,7 @@ from src.train.utils import (
 )
 from src.train.vec_env import ThreadVecEnv
 
-config = load_config()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("training.log", mode="w"), logging.StreamHandler(sys.stdout)],
-)
-
-shutdown_requested = False
+CHUNK_SIZE = 32
 
 
 def handle_sigterm(signum, frame):
@@ -51,8 +43,15 @@ def handle_sigterm(signum, frame):
     shutdown_requested = True
 
 
+shutdown_requested = False
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler("training.log", mode="w"), logging.StreamHandler(sys.stdout)],
+)
 
 
 def _run_batched_ppo(
@@ -251,6 +250,10 @@ def ppo_update(
     num_updates = 0
     epochs_done = 0
 
+    effective_batch_size = (
+        config.batch_size + CHUNK_SIZE
+    ) & ~CHUNK_SIZE  # rounding up (only works for pow of 2)
+
     early_stop = False
     last_entropy_coef = config.entropy_coef
     for epoch_idx in range(config.ppo_epochs):
@@ -261,55 +264,51 @@ def ppo_update(
         epoch_steps = 0
         epoch_kl = 0.0
 
-        for batch_start in range(0, len(episodes), config.batch_size):
+        for batch_start in range(0, len(episodes), effective_batch_size):
             if shutdown_requested:
                 break
-            batch = episodes[batch_start : batch_start + config.batch_size]
-            batch.sort(key=lambda ep: ep["length"], reverse=True)
+
+            minibatch = episodes[batch_start : batch_start + effective_batch_size]
+            if not minibatch:
+                continue
 
             optimizer.zero_grad(set_to_none=True)
 
-            batch_loss, batch_metrics, batch_steps = _run_batched_ppo(
-                batch, policy, config, policy.device, episode
-            )
+            minibatch_steps = 0
+            for chunk_idx in range(0, len(minibatch), CHUNK_SIZE):
+                chunk = minibatch[chunk_idx : chunk_idx + CHUNK_SIZE]
+                chunk.sort(key=lambda ep: ep["length"], reverse=True)
 
-            tot_policy_loss += batch_metrics["policy_loss"]
-            tot_value_loss += batch_metrics["value_loss"]
-            tot_normalized_entropy += batch_metrics["normalized_entropy"]
-            epoch_kl += batch_metrics["kl_div"]
-            tot_clip_frac += batch_metrics["clip_frac"]
-            last_entropy_coef = batch_metrics["entropy_coef"]
+                batch_loss, batch_metrics, batch_steps = _run_batched_ppo(
+                    chunk, policy, config, policy.device, episode
+                )
 
-            if batch_steps > 0:
-                scaled_loss = batch_loss / batch_steps
-                if not torch.isfinite(scaled_loss):
-                    logging.warning(
-                        "Skipping PPO batch with non-finite loss at episode %s, epoch %s, batch %s",
-                        episode,
-                        epoch_idx + 1,
-                        batch_start // config.batch_size + 1,
-                    )
-                    continue
+                tot_policy_loss += batch_metrics["policy_loss"]
+                tot_value_loss += batch_metrics["value_loss"]
+                tot_normalized_entropy += batch_metrics["normalized_entropy"]
+                epoch_kl += batch_metrics["kl_div"]
+                tot_clip_frac += batch_metrics["clip_frac"]
+                last_entropy_coef = batch_metrics["entropy_coef"]
+                minibatch_steps += batch_steps
 
-                scaled_loss.backward()
+                if batch_steps > 0:
+                    scaled_loss = batch_loss / batch_steps
+                    if torch.isfinite(scaled_loss):
+                        scaled_loss.backward()
+
+            if minibatch_steps > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), config.max_grad_norm
                 )
-                if not torch.isfinite(grad_norm):
-                    logging.warning(
-                        "Skipping PPO batch with non-finite grad norm at episode %s, epoch %s, batch %s",
-                        episode,
-                        epoch_idx + 1,
-                        batch_start // config.batch_size + 1,
-                    )
+                if torch.isfinite(grad_norm):
+                    tot_grad_norm += grad_norm.item()
+                    optimizer.step()
+                    num_updates += 1
+                else:
+                    logging.warning("Non-finite grad norm, skipping update")
                     optimizer.zero_grad(set_to_none=True)
-                    continue
 
-                tot_grad_norm += grad_norm.item()
-                optimizer.step()
-                num_updates += 1
-
-            epoch_steps += batch_steps
+            epoch_steps += minibatch_steps
 
             if epoch_steps > 0:
                 avg_kl = epoch_kl / epoch_steps
@@ -357,6 +356,7 @@ def main():
     vec_env = None
     tb_writer = None
 
+    config = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
@@ -562,6 +562,7 @@ def main():
                 f"NormEnt: {stats['normalized_entropy']:.2%} | "
                 f"Clip: {stats['clip_fraction']:.2%} | "
                 f"KL: {stats['kl_divergence']:.4f} | "
+                f"ATL: {avg_traj_length:.1f} | "
                 f"ATT: {avg_traj_time:.2f}"
             )
 
