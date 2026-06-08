@@ -89,6 +89,11 @@ class ValueHead(nn.Module):
 class ActorPolicy(nn.Module):
     """Stateful actor policy path."""
 
+    target_seq_indices: Tensor
+    ally_poke_tokens: Tensor
+    batch_indices: Tensor
+    all_a: Tensor
+
     def __init__(
         self,
         d_model: int,
@@ -149,6 +154,12 @@ class ActorPolicy(nn.Module):
         init.orthogonal_(self.side_proj.weight, gain=1.0)
         init.zeros_(self.side_proj.bias)
 
+        self.register_buffer(
+            "target_seq_indices", torch.tensor(TARGET_SEQ_INDICES, dtype=torch.long)
+        )
+        self.register_buffer("ally_poke_tokens", torch.tensor(ALLY_POKE_TOKENS, dtype=torch.long))
+        self.register_buffer("all_a", torch.arange(36, dtype=torch.long))
+
         self.ctx_norm = nn.LayerNorm(d_act_emb)
         self.head1 = PolicyHead(d_model, act_size)  # P(a1 | z)
         self.head2 = PolicyHead(d_model + d_act_emb, act_size)  # P(a2 | z, a1)
@@ -171,41 +182,43 @@ class ActorPolicy(nn.Module):
         is_move = (a1 >= 7) & ~is_tp
         is_mega = (a1 >= 27) & (a1 <= 46) & ~is_tp
 
-        # actor embedding always comes at slot 1
+        # actor embedding always comes at slot 1 and 2
         # since we order it in the obs builder
-        actor_emb = self.actor_proj(tokens[:, 1, :])
+        actor_emb = self.actor_proj(tokens[:, 1:3, :]).sum(dim=1)
 
         # context embeddings for team preview
         idx_p1 = (a1 // 6) * 2 + 1
         idx_p2 = (a1 % 6) * 2 + 1
-        tok_p1 = tokens[batch_idx, idx_p1, :]
-        tok_p2 = tokens[batch_idx, idx_p2, :]
+        tok_p1_super = tokens[batch_idx, idx_p1, :]
+        tok_p1_num = tokens[batch_idx, idx_p1 + 1, :]
+        tok_p2_super = tokens[batch_idx, idx_p2, :]
+        tok_p2_num = tokens[batch_idx, idx_p2 + 1, :]
+        tok_leads = torch.stack([tok_p1_super, tok_p1_num, tok_p2_super, tok_p2_num], dim=1)
 
         # set embedding for the lead pokemon
         # manual deepset impl
-        tp_ctx = (
-            nn.functional.gelu(self.actor_proj(tok_p1) + self.actor_proj(tok_p2)) + self.tp_meta_emb
-        )
+        tp_ctx = nn.functional.gelu(self.actor_proj(tok_leads).sum(dim=1)) + self.tp_meta_emb
 
         pass_ctx = actor_emb + self.pass_emb
 
         # switch context embeds pokemon switching out + pokemon switching in
         slot_idx = a1.clamp(1, 6)
-        ally_indices = torch.tensor(ALLY_POKE_TOKENS, device=device)
+        ally_indices = self.ally_poke_tokens
         orig_ids = torch.round(numerical[:, ally_indices + 1, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
         matches = orig_ids == slot_idx.unsqueeze(-1)
+        valid_match = matches.any(dim=-1)
         match_idx = matches.float().argmax(dim=-1)
 
         # force a index error if switch invalid
-        # comment out if code works, unnecessary cpu gpu sync
-        #
-        # valid_match = matches.any(dim=-1)
-        # if (is_switch & ~valid_match).any():
-        #     raise IndexError("Invalid switch action: no matching ally pokemon found.")
+        if (is_switch & ~valid_match).any():
+            raise IndexError("Invalid switch action: no matching ally pokemon found.")
 
         actual_seq_idx = ally_indices[match_idx]
-        incoming_tok = tokens[batch_idx, actual_seq_idx, :]
-        switch_ctx = actor_emb + self.switch_meta_emb + self.target_proj(incoming_tok)
+        incoming_tok_super = tokens[batch_idx, actual_seq_idx, :]
+        incoming_tok_num = tokens[batch_idx, actual_seq_idx + 1, :]
+        incoming_toks = torch.stack([incoming_tok_super, incoming_tok_num], dim=1)
+        incoming_proj = self.target_proj(incoming_toks).sum(dim=1)
+        switch_ctx = actor_emb + incoming_proj + self.switch_meta_emb
 
         # move context embedding
         # if move is single target => actor emb + target emb
@@ -215,9 +228,11 @@ class ActorPolicy(nn.Module):
         move_idx = (a1_m % 20) // 5
         target_idx = a1_m % 5
 
-        seq_indices = torch.tensor(TARGET_SEQ_INDICES, device=device)
-        target_toks = tokens[batch_idx, seq_indices[target_idx], :]
-        target_toks_proj = self.target_proj(target_toks)
+        mapped_target = self.target_seq_indices[target_idx]
+        target_toks_super = tokens[batch_idx, mapped_target, :]
+        target_toks_num = tokens[batch_idx, mapped_target + 1, :]
+        target_toks = torch.stack([target_toks_super, target_toks_num], dim=1)
+        target_toks_proj = self.target_proj(target_toks).sum(dim=1)
 
         target_toks_proj = torch.where(
             (target_idx == 2).unsqueeze(-1),
@@ -330,8 +345,6 @@ class ActorPolicy(nn.Module):
         action_mask: Tensor,
         is_tp: Tensor,
     ) -> Tensor:
-        device = logits.device
-
         mask2 = action_mask[:, 1].clone().bool()
 
         # If Pokemon 1 switches to slot idx, Pokemon 2 cannot switch to the same slot
@@ -350,11 +363,10 @@ class ActorPolicy(nn.Module):
         # Ensure all 4 selected Pokemon are unique (no overlap between Lead and Back).
         # compute overlap for all B rows simultaneously, gate with is_tp.
         # eliminates the is_tp.any() GPU->CPU sync
-        all_a = torch.arange(36, device=device)
         p1_1 = action1 // 6 + 1  # (B,) — meaningful only for tp rows
         p2_1 = action1 % 6 + 1  # (B,)
-        p1_2 = all_a // 6 + 1  # (36,)
-        p2_2 = all_a % 6 + 1  # (36,)
+        p1_2 = self.all_a // 6 + 1  # (36,)
+        p2_2 = self.all_a % 6 + 1  # (36,)
         tp_overlap = (
             (p1_2[None] == p1_1[:, None])
             | (p1_2[None] == p2_1[:, None])

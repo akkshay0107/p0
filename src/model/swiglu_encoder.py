@@ -128,6 +128,7 @@ class SwiGLUTransformerEncoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        self.norm = nn.LayerNorm(d_model, eps=layer_norm_eps)
 
     def forward(
         self,
@@ -137,4 +138,4 @@ class SwiGLUTransformerEncoder(nn.Module):
         x = src
         for layer in self.layers:
             x = layer(x, src_key_padding_mask=src_key_padding_mask)
-        return x
+        return self.norm(x)

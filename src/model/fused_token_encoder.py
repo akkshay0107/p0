@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal, overload
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,9 @@ from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
+    TOKEN_IDX_ALLY_SIDE_SUPER,
+    TOKEN_IDX_GLOBAL_FIELD_SUPER,
+    TOKEN_IDX_OPPONENT_SIDE_SUPER,
     StructuredObservation,
 )
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
@@ -68,6 +72,14 @@ class MultiAggDeepSet(nn.Module):
 # all embeddings together and all numerical rows together. Would make
 # downstream slicing much easier. More effort to rewrite / test the code tho
 class FusedTokenEncoder(nn.Module):
+    # type annotations for pyright
+    _super_pos: torch.Tensor
+    _other_super_pos: torch.Tensor
+    _numeric_pos: torch.Tensor
+    _field_super_pos: torch.Tensor
+    _field_numeric_pos: torch.Tensor
+    _component_ids: torch.Tensor
+
     def __init__(
         self,
         d_model: int,
@@ -232,6 +244,19 @@ class FusedTokenEncoder(nn.Module):
         s_mask = s_cat != 0
         return self.side_condition_set(self.side_condition_emb(s_cat), mask=s_mask)
 
+    @overload
+    def forward(
+        self, obs: StructuredObservation, aux: Literal[True]
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    @overload
+    def forward(self, obs: StructuredObservation, aux: Literal[False] = False) -> torch.Tensor: ...
+
+    @overload
+    def forward(
+        self, obs: StructuredObservation, aux: bool
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+
     def forward(
         self, obs: StructuredObservation, aux: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -264,10 +289,7 @@ class FusedTokenEncoder(nn.Module):
         slot_ids = slot_ids.to(device)
 
         x = torch.zeros(B, S, self.d_model, device=device, dtype=self.mon_fusion_token.dtype)
-        aux_tensor: torch.Tensor | None = None
 
-        # TODO: make the code below work for non aux paths if needed in the future
-        # and improve the way it is written.
         if aux:
             # active pokemon -> process separately to extract move embeddings needed by head2.
             actor_out, aux_moves = self._embed_pokemon_super(
@@ -278,23 +300,27 @@ class FusedTokenEncoder(nn.Module):
 
             # remaining 11 super slots: flatten batch×slot, embed, unflatten.
             n_other = len(_OTHER_SUPER_POS)
-            other_out = self._embed_pokemon_super(
-                categorical[:, self._other_super_pos, :].flatten(0, 1)
-            ).unflatten(0, (B, n_other))
+            other_cats = categorical[:, self._other_super_pos, :].flatten(0, 1)
+            other_out = self._embed_pokemon_super(other_cats).unflatten(0, (B, n_other))  # type: ignore
             x[:, self._other_super_pos, :] = other_out
         else:
             n_super = len(_SUPER_POS)
-            super_out = self._embed_pokemon_super(
-                categorical[:, self._super_pos, :].flatten(0, 1)
-            ).unflatten(0, (B, n_super))
+            super_cats = categorical[:, self._super_pos, :].flatten(0, 1)
+            super_out = self._embed_pokemon_super(super_cats).unflatten(0, (B, n_super))  # type: ignore
             x[:, self._super_pos, :] = super_out
+            aux_tensor = None
 
         x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :])
 
-        # global field super at 25
-        x[:, 25, :] = self._embed_global_field_cond(categorical[:, 25, :])
-        # ally side super at 27, opp side super at 29
-        x[:, (27, 29), :] = self._embed_side_field_cond(categorical[:, (27, 29), :])
+        x[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :] = self._embed_global_field_cond(
+            categorical[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :]
+        )
+
+        x[:, (TOKEN_IDX_ALLY_SIDE_SUPER, TOKEN_IDX_OPPONENT_SIDE_SUPER), :] = (
+            self._embed_side_field_cond(
+                categorical[:, (TOKEN_IDX_ALLY_SIDE_SUPER, TOKEN_IDX_OPPONENT_SIDE_SUPER), :]
+            )
+        )
 
         x[:, self._field_numeric_pos, :] = self.field_numeric_proj(
             numerical[:, self._field_numeric_pos, :]
@@ -306,6 +332,8 @@ class FusedTokenEncoder(nn.Module):
             + self.side_emb(side_ids)
             + self.slot_emb(slot_ids)
         )
+
         if aux:
-            return out_tokens, aux_tensor  # type: ignore
+            assert aux_tensor is not None
+            return out_tokens, aux_tensor
         return out_tokens
