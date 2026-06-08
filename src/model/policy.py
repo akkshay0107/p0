@@ -20,7 +20,7 @@ from src.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TARGET_SEQ_INDICES,
-    TOKEN_IDX_GLOBAL_FIELD,
+    TOKEN_IDX_GLOBAL_FIELD_NUMERIC,
     SideId,
     StructuredObservation,
 )
@@ -165,11 +165,11 @@ class ActorPolicy(nn.Module):
         device = a1.device
         batch_idx = torch.arange(B, device=device)
 
-        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
+        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
         is_pass = (a1 == 0) & ~is_tp
         is_switch = (a1 >= 1) & (a1 <= 6) & ~is_tp
         is_move = (a1 >= 7) & ~is_tp
-        is_mega = (a1 >= 27) & ~is_tp
+        is_mega = (a1 >= 27) & (a1 <= 46) & ~is_tp
 
         # actor embedding always comes at slot 1
         # since we order it in the obs builder
@@ -194,13 +194,14 @@ class ActorPolicy(nn.Module):
         ally_indices = torch.tensor(ALLY_POKE_TOKENS, device=device)
         orig_ids = torch.round(numerical[:, ally_indices + 1, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
         matches = orig_ids == slot_idx.unsqueeze(-1)
-        valid_match = matches.any(dim=-1)
         match_idx = matches.float().argmax(dim=-1)
 
         # force a index error if switch invalid
-        match_idx = torch.where(
-            is_switch & ~valid_match, torch.tensor(1000, device=device), match_idx
-        )
+        # comment out if code works, unnecessary cpu gpu sync
+        #
+        # valid_match = matches.any(dim=-1)
+        # if (is_switch & ~valid_match).any():
+        #     raise IndexError("Invalid switch action: no matching ally pokemon found.")
 
         actual_seq_idx = ally_indices[match_idx]
         incoming_tok = tokens[batch_idx, actual_seq_idx, :]
@@ -266,7 +267,7 @@ class ActorPolicy(nn.Module):
         device = tokens.device
 
         # compute metadata internally to simplify signature
-        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
+        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
 
         # padding mask for the reducer
         padding_mask = torch.zeros(B, tokens.size(1), dtype=torch.bool, device=device)

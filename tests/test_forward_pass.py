@@ -125,11 +125,16 @@ def test_fainted_pokemon_masking(policy_net):
         obs.side_ids[0, i] = 2  # OPPONENT
         obs.slot_ids[0, i] = (i - 13) // 2 + 1
 
-    obs.token_type_ids[0, 25] = 3  # GLOBAL_FIELD
-    obs.token_type_ids[0, 26] = 4  # ALLY_SIDE
-    obs.side_ids[0, 26] = 1
-    obs.token_type_ids[0, 27] = 5  # OPPONENT_SIDE
-    obs.side_ids[0, 27] = 2
+    obs.token_type_ids[0, 25] = 3  # FIELD_SUPER
+    obs.token_type_ids[0, 26] = 4  # FIELD_NUMERIC
+    obs.token_type_ids[0, 27] = 3  # FIELD_SUPER
+    obs.token_type_ids[0, 28] = 4  # FIELD_NUMERIC
+    obs.side_ids[0, 27] = 1
+    obs.side_ids[0, 28] = 1
+    obs.token_type_ids[0, 29] = 3  # FIELD_SUPER
+    obs.token_type_ids[0, 30] = 4  # FIELD_NUMERIC
+    obs.side_ids[0, 29] = 2
+    obs.side_ids[0, 30] = 2
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
     ally_indices = [1, 3, 5, 7, 9, 11]

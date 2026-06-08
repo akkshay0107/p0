@@ -452,16 +452,22 @@ def test_from_battle_real_end_to_end():
     assert obs.token_type_ids[0] == TokenType.CLS
     assert obs.token_type_ids[1] == TokenType.POKEMON_SUPER
     assert obs.token_type_ids[2] == TokenType.POKEMON_NUMERIC
-    assert obs.token_type_ids[25] == TokenType.GLOBAL_FIELD
-    assert obs.token_type_ids[26] == TokenType.ALLY_SIDE
-    assert obs.token_type_ids[27] == TokenType.OPPONENT_SIDE
+    assert obs.token_type_ids[25] == TokenType.FIELD_SUPER
+    assert obs.token_type_ids[26] == TokenType.FIELD_NUMERIC
+    assert obs.token_type_ids[27] == TokenType.FIELD_SUPER
+    assert obs.token_type_ids[28] == TokenType.FIELD_NUMERIC
+    assert obs.token_type_ids[29] == TokenType.FIELD_SUPER
+    assert obs.token_type_ids[30] == TokenType.FIELD_NUMERIC
 
     assert obs.side_ids[0] == SideId.NONE
     assert obs.side_ids[1] == SideId.ALLY
     assert obs.side_ids[13] == SideId.OPPONENT
     assert obs.side_ids[25] == SideId.NONE
-    assert obs.side_ids[26] == SideId.ALLY
-    assert obs.side_ids[27] == SideId.OPPONENT
+    assert obs.side_ids[26] == SideId.NONE
+    assert obs.side_ids[27] == SideId.ALLY
+    assert obs.side_ids[28] == SideId.ALLY
+    assert obs.side_ids[29] == SideId.OPPONENT
+    assert obs.side_ids[30] == SideId.OPPONENT
 
 
 @pytest.mark.asyncio
@@ -528,7 +534,7 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
         assert cat.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
         assert num.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
 
-        global_field_num = num[25]
+        global_field_num = num[26]
         if is_teampreview:
             seen_teampreview = True
             # teampreview flag is at index 2 in Global Field numerical array

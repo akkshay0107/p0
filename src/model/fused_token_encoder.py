@@ -16,20 +16,25 @@ from src.model.structured_observation import (
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 NUM_COMPONENTS = 11
-NUM_TOKEN_TYPES = 6
+NUM_TOKEN_TYPES = 5
 NUM_SIDES = 3
 NUM_SLOTS = 7
 
 # 0 CLS
 # 1,3,...,23 pokemon super tokens
 # 2,4,...,24 pokemon numeric tokens
-# 25 Global-field token
-# 26 Ally-side token
-# 27 Opponent-side token
+# 25 Global-field super
+# 26 Global-field numeric
+# 27 Ally-side super
+# 28 Ally-side numeric
+# 29 Opponent-side super
+# 30 Opponent-side numeric
 _SUPER_POS = tuple(range(1, 24, 2))  # (1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
 _ACTOR_POS = 1  # active ally Pokémon is always at slot 1
 _OTHER_SUPER_POS = _SUPER_POS[1:]  # the 11 super slots that are not the active actor
 _NUMERIC_POS = tuple(range(2, 25, 2))  # (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)
+_FIELD_SUPER_POS = (25, 27, 29)
+_FIELD_NUMERIC_POS = (26, 28, 30)
 
 
 def _load_vocab_sizes() -> dict[str, int]:
@@ -59,11 +64,9 @@ class MultiAggDeepSet(nn.Module):
         return self.f(torch.cat([sum_gx, max_gx], dim=-1))
 
 
-# TODO: improve the structure setup to support seperate numeric rows
-# for the fields instead of combining them with the embeddings
 # Also considering removing the unnecessary interleaving and just stacking
 # all embeddings together and all numerical rows together. Would make
-# downstream slicing much easier
+# downstream slicing much easier. More effort to rewrite / test the code tho
 class FusedTokenEncoder(nn.Module):
     def __init__(
         self,
@@ -136,6 +139,10 @@ class FusedTokenEncoder(nn.Module):
         self.register_buffer("_super_pos", torch.tensor(_SUPER_POS, dtype=torch.long))
         self.register_buffer("_other_super_pos", torch.tensor(_OTHER_SUPER_POS, dtype=torch.long))
         self.register_buffer("_numeric_pos", torch.tensor(_NUMERIC_POS, dtype=torch.long))
+        self.register_buffer("_field_super_pos", torch.tensor(_FIELD_SUPER_POS, dtype=torch.long))
+        self.register_buffer(
+            "_field_numeric_pos", torch.tensor(_FIELD_NUMERIC_POS, dtype=torch.long)
+        )
         self._init_weights()
 
     @torch.no_grad()
@@ -266,31 +273,32 @@ class FusedTokenEncoder(nn.Module):
             actor_out, aux_moves = self._embed_pokemon_super(
                 categorical[:, _ACTOR_POS, :], aux=True
             )
-            x[:, _ACTOR_POS, :] = actor_out  # (B, D)
-            aux_tensor = aux_moves  # (B, 4, D)
+            x[:, _ACTOR_POS, :] = actor_out
+            aux_tensor = aux_moves
 
             # remaining 11 super slots: flatten batch×slot, embed, unflatten.
             n_other = len(_OTHER_SUPER_POS)
             other_out = self._embed_pokemon_super(
-                categorical[:, self._other_super_pos, :].flatten(0, 1)  # (B*11, C)
-            ).unflatten(0, (B, n_other))  # (B, 11, D)
+                categorical[:, self._other_super_pos, :].flatten(0, 1)
+            ).unflatten(0, (B, n_other))
             x[:, self._other_super_pos, :] = other_out
         else:
             n_super = len(_SUPER_POS)
             super_out = self._embed_pokemon_super(
-                categorical[:, self._super_pos, :].flatten(0, 1)  # (B*12, C)
-            ).unflatten(0, (B, n_super))  # (B, 12, D)
+                categorical[:, self._super_pos, :].flatten(0, 1)
+            ).unflatten(0, (B, n_super))
             x[:, self._super_pos, :] = super_out
 
-        x[:, self._numeric_pos, :] = self.numeric_proj(
-            numerical[:, self._numeric_pos, :]  # (B, 12, NUMERICAL_WIDTH) → (B, 12, D)
-        )
+        x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :])
 
-        # global (25), ally_side (26), opponent_side (27)
-        field_num = self.field_numeric_proj(numerical[:, 25:28, :])
-        global_cat = self._embed_global_field_cond(categorical[:, 25, :])
-        side_cat = self._embed_side_field_cond(categorical[:, 26:28, :])
-        x[:, 25:28, :] = torch.cat([global_cat.unsqueeze(1), side_cat], dim=1) + field_num
+        # global field super at 25
+        x[:, 25, :] = self._embed_global_field_cond(categorical[:, 25, :])
+        # ally side super at 27, opp side super at 29
+        x[:, (27, 29), :] = self._embed_side_field_cond(categorical[:, (27, 29), :])
+
+        x[:, self._field_numeric_pos, :] = self.field_numeric_proj(
+            numerical[:, self._field_numeric_pos, :]
+        )
 
         out_tokens = (
             x

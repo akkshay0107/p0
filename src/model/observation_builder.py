@@ -398,28 +398,34 @@ def from_battle(
             idx += 1
 
     global_cat, global_num = _global_field_token(battle, tok)
-    token_types[idx] = TokenType.GLOBAL_FIELD
+    token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.NONE
-    slots[idx] = 0
     categorical[idx] = global_cat
+    idx += 1
+    token_types[idx] = TokenType.FIELD_NUMERIC
+    sides[idx] = SideId.NONE
     numerical[idx] = global_num + [0.0] * (NUMERICAL_WIDTH - len(global_num))
     idx += 1
 
     ally_fainted = sum([1 for mon in battle.team.values() if mon.fainted])
     ally_cat, ally_num = _side_token(battle, battle.side_conditions, tok, ally_fainted)
-    token_types[idx] = TokenType.ALLY_SIDE
+    token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.ALLY
-    slots[idx] = 0
     categorical[idx] = ally_cat
+    idx += 1
+    token_types[idx] = TokenType.FIELD_NUMERIC
+    sides[idx] = SideId.ALLY
     numerical[idx] = ally_num + [0.0] * (NUMERICAL_WIDTH - len(ally_num))
     idx += 1
 
     opp_fainted = sum([1 for mon in battle.opponent_team.values() if mon.fainted])
     opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions, tok, opp_fainted)
-    token_types[idx] = TokenType.OPPONENT_SIDE
+    token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.OPPONENT
-    slots[idx] = 0
     categorical[idx] = opp_cat
+    idx += 1
+    token_types[idx] = TokenType.FIELD_NUMERIC
+    sides[idx] = SideId.OPPONENT
     numerical[idx] = opp_num + [0.0] * (NUMERICAL_WIDTH - len(opp_num))
     idx += 1
 

@@ -23,18 +23,25 @@ def dummy_obs():
     token_type_ids[:, 0] = TokenType.CLS
     token_type_ids[:, 1:13] = TokenType.POKEMON_SUPER
     token_type_ids[:, 13:25] = TokenType.POKEMON_NUMERIC
-    token_type_ids[:, 25] = TokenType.GLOBAL_FIELD
-    token_type_ids[:, 26] = TokenType.ALLY_SIDE
-    token_type_ids[:, 27] = TokenType.OPPONENT_SIDE
+    token_type_ids[:, 25] = TokenType.FIELD_SUPER
+    token_type_ids[:, 26] = TokenType.FIELD_NUMERIC
+    token_type_ids[:, 27] = TokenType.FIELD_SUPER
+    token_type_ids[:, 28] = TokenType.FIELD_NUMERIC
+    token_type_ids[:, 29] = TokenType.FIELD_SUPER
+    token_type_ids[:, 30] = TokenType.FIELD_NUMERIC
 
     side_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
-    side_ids[:, 1:7] = SideId.ALLY
-    side_ids[:, 7:13] = SideId.OPPONENT
+    side_ids[:, 1:13] = SideId.ALLY
+    side_ids[:, 13:25] = SideId.OPPONENT
+    side_ids[:, 25:27] = SideId.NONE
+    side_ids[:, 27:29] = SideId.ALLY
+    side_ids[:, 29:31] = SideId.OPPONENT
 
     slot_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
     for i in range(6):
-        slot_ids[:, 1 + i] = i + 1
-        slot_ids[:, 7 + i] = i + 1
+        # 1, 2 for first pokemon, 3, 4 for second pokemon, etc.
+        slot_ids[:, 1 + 2 * i : 1 + 2 * i + 2] = i + 1
+        slot_ids[:, 13 + 2 * i : 13 + 2 * i + 2] = i + 1
 
     # Populate categorical with random IDs respecting vocab limits
     categorical = torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long)
@@ -64,7 +71,7 @@ def dummy_obs():
     categorical[:, 25, 1] = torch.randint(1, 2, (B,))
 
     # side_condition_emb has size 5 (0-4)
-    categorical[:, 26:28, :4] = torch.randint(1, 5, (B, 2, 4))
+    categorical[:, (27, 29), :4] = torch.randint(1, 5, (B, 2, 4))
 
     # Numerical features
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
@@ -74,8 +81,7 @@ def dummy_obs():
     for i, idx in enumerate(ally_indices):
         numerical[:, idx + 1, 26] = (i + 1) / 6.0
 
-    # Set the is_tp flag (numerical[:, 25, 6]) randomly
-    numerical[:, 25, 6] = 1.0
+    numerical[:, 26, 2] = 1.0
 
     return StructuredObservation(
         token_type_ids=token_type_ids,
