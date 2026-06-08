@@ -2,36 +2,42 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 
-@dataclass
+# unfortunately the config is not static
+# and is reused as a vessel to carry the changing
+# hyperparams (lr, entropy_coef, clip_high) for
+# simplicity in the train loop
+@dataclass(slots=True)
 class PPOConfig:
     num_episodes: int = 12500
     n_envs: int = 16
-    self_play_steps: int = 640
-    pool_play_steps: int = 640
+    self_play_steps: int = 320
+    pool_play_steps: int = 320
     n_pool_opponents: int = 4
+    batch_size: int = 64
 
-    lr: float = 3e-5
-    batch_size: int = 32
     gamma: float = 0.97
     gae_lambda: float = 0.95
-    clip_range: float = 0.2
+    clip_low: float = 0.2
+    clip_high: float = 0.28  # DAPO style, entropy regularizer
+
+    lr: float = 3e-5
     value_coef: float = 0.5
-    entropy_coef: float = 0.15
+    entropy_coef: float = 0.04
     max_grad_norm: float = 1.0
     target_kl: float = 0.05  # for early kl stopping
     ppo_epochs: int = 4  # number of ppo loops per episode
-    # value head warmup episodes. policy receives no gradients for the first
-    # warmup_episodes episodes. was having trouble with huge kl swings on the
-    # shared features without this at the start.
-    warmup_episodes: int = 100
-    checkpoint_path: Path = (
-        Path(__file__).resolve().parent.parent.parent / "checkpoints" / "ppo_checkpoint.pt"
-    )
     # skew importance of team preview step
     teampreview_loss_mult: float = 1.5
     teampreview_entropy_mult: float = 2.0
 
+    warmup_episodes: int = 100  # policy gradients frozen, allow value head to catchup to bc seeds
+    ramp_up_phase: float = 0.1  # frac of epochs spent in linear lr increase
+    ramp_down_phase: float = 0.2  # frac of epochs spent in decaying entropy coef
+
     pool_dir: Path = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "pool"
+    checkpoint_path: Path = (
+        Path(__file__).resolve().parent.parent.parent / "checkpoints" / "ppo_checkpoint.pt"
+    )
     pool_size: int = 40
     snapshot_interval: int = 50
     pool_win_rate_smoothing: float = 0.1

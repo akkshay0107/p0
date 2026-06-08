@@ -24,6 +24,7 @@ from src.train.config import PPOConfig, load_config
 from src.train.opponent_pool import OpponentPool
 from src.train.rollout import RolloutBuffer, collect_rollouts
 from src.train.utils import (
+    PPOScheduler,
     initial_state,
     load_checkpoint,
     save_checkpoint,
@@ -166,7 +167,7 @@ def _run_batched_ppo(
         ratio = torch.exp(log_ratio)
 
         surr1 = ratio * advantages_t
-        surr2 = torch.clamp(ratio, 1.0 - config.clip_range, 1.0 + config.clip_range) * advantages_t
+        surr2 = torch.clamp(ratio, 1.0 - config.clip_low, 1.0 + config.clip_high) * advantages_t
 
         step_policy_loss = -torch.min(surr1, surr2)
         step_value_loss = F.mse_loss(curr_val, returns_t, reduction="none")
@@ -207,7 +208,10 @@ def _run_batched_ppo(
 
             metrics["kl_div"] += ((ratio - 1) - log_ratio).sum().item() if not is_warmup else 0.0
             metrics["clip_frac"] += (
-                ((ratio - 1.0).abs() > config.clip_range).float().sum().item()
+                ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high))
+                .float()
+                .sum()
+                .item()
                 if not is_warmup
                 else 0.0
             )
@@ -422,6 +426,7 @@ def main():
 
         vec_env = ThreadVecEnv(envs)
         buffer = RolloutBuffer()
+        scheduler = PPOScheduler(config)
 
         config.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         config.pool_dir.mkdir(parents=True, exist_ok=True)
@@ -465,6 +470,11 @@ def main():
                 logging.warning("Shutdown requested, saving checkpoint and exiting")
                 save_checkpoint(config.checkpoint_path, episode, policy, optimizer)
                 break
+
+            lr = scheduler.lr(episode)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+            config.entropy_coef = scheduler.entropy_coef(episode)
 
             buffer.reset()
             rollout_time = 0.0
