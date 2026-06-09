@@ -14,6 +14,12 @@ from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
 
 
+def assign_pool_opponents(n_envs: int, roster: list[str]) -> list[str]:
+    if not roster:
+        raise ValueError("Pool opponent roster must not be empty.")
+    return [roster[env_id % len(roster)] for env_id in range(n_envs)]
+
+
 def create_trajectory_buffers(n_envs, max_steps=100, device="cpu"):
     return {
         "step_counts": torch.zeros(n_envs, dtype=torch.long, device=device),
@@ -144,11 +150,11 @@ def collect_rollouts(
 ):
     """
     Collects rollouts using the vectorized environment defined in the train module.
-    Environments (one per thread) are split into two groups - self play / pop. based training.
+    Self-play and pool-play are collected in separate phases across all environments.
 
-    Pool policy is swapped lazily as soon as its game is done to prevent episodes being
-    split across different policies in the pool. The current policy receives updates as
-    usual through boundaries that split games.
+    Each pool-play phase samples a bounded policy roster and assigns every environment
+    a fixed roster member. Policies are swapped lazily when games end to prevent episodes
+    or recurrent states from being split across different policies.
     """
     n_envs = vec_env.n_envs
     device = policy.device
@@ -165,6 +171,15 @@ def collect_rollouts(
     step_counts2 = trajectories2["step_counts"]
 
     idx_all = torch.arange(n_envs)
+    pool_roster: list[str] = []
+    thread_pool_opponents: list[str] = []
+
+    if target_mode != "self_play" and len(pool) > 0:
+        pool_roster = pool.sample_many(config.n_pool_opponents)
+        thread_pool_opponents = assign_pool_opponents(n_envs, pool_roster)
+        for opponent_id in pool_roster:
+            if opponent_id not in active_pool_policies:
+                active_pool_policies[opponent_id] = pool.load_policy(opponent_id, str(device))
 
     for step in range(steps):
         obs1_gpu = vec_env.get_batched_obs1(device)
@@ -243,7 +258,9 @@ def collect_rollouts(
             trajectories2["actions"][sp_idx, s2] = actions2_cpu[sp_idx]
             trajectories2["log_probs"][sp_idx, s2] = log_probs2_cpu[sp_idx]
             trajectories2["values"][sp_idx, s2] = values2_cpu[sp_idx]
-            trajectories2["action_masks"][sp_idx, s2] = torch.from_numpy(masks2)[sp_idx].to(torch.bool)
+            trajectories2["action_masks"][sp_idx, s2] = torch.from_numpy(masks2)[sp_idx].to(
+                torch.bool
+            )
             step_counts2[sp_idx] += 1
 
         env_actions = [
@@ -327,10 +344,8 @@ def collect_rollouts(
                 if target_mode == "self_play" or len(pool) == 0:
                     env_opponents[i] = "self"
                 else:
-                    new_opp_id = pool.sample_id()
+                    new_opp_id = thread_pool_opponents[i]
                     env_opponents[i] = new_opp_id
-                    if new_opp_id not in active_pool_policies:
-                        active_pool_policies[new_opp_id] = pool.load_policy(new_opp_id, str(device))
 
         masks1 = next_masks1
         masks2 = next_masks2

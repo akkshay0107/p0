@@ -130,3 +130,20 @@ class OpponentPool:
         (opponent_id,) = random.choices(self.opponent_ids, weights=weights, k=1)
         return opponent_id
 
+    def sample_many(self, count: int) -> list[str]:
+        """Sample opponent IDs without replacement using win rates as weights."""
+        if count <= 0:
+            raise ValueError("Opponent count must be greater than zero.")
+        if not self.opponent_ids:
+            raise RuntimeError("OpponentPool is empty. Call pool.add() before pool.sample_many().")
+
+        count = min(count, len(self.opponent_ids))
+        weights = torch.tensor(
+            [
+                max(self.config.pool_wr_floor, self.win_rates[opponent_id])
+                for opponent_id in self.opponent_ids
+            ],
+            dtype=torch.float32,
+        )
+        indices = torch.multinomial(weights, count, replacement=False)
+        return [self.opponent_ids[index] for index in indices.tolist()]

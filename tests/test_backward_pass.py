@@ -218,24 +218,19 @@ def test_value_head_scaling(dummy_obs):
 
     # backprop using value loss only
     p1.zero_grad()
-    _, _, _, value1, _ = p1(obs)
+    _, _, _, value1, _ = p1(obs, sample_actions=False)
     value1.mean().backward()
     grads1 = {n: p.grad.clone() for n, p in p1.encoder.named_parameters() if p.grad is not None}
 
     p2.zero_grad()
-    _, _, _, value2, _ = p2(obs)
+    _, _, _, value2, _ = p2(obs, sample_actions=False)
     value2.mean().backward()
     grads2 = {n: p.grad.clone() for n, p in p2.encoder.named_parameters() if p.grad is not None}
 
     for name in grads1:
         g1 = grads1[name]
         g2 = grads2[name]
-
-        mask = torch.abs(g1) > 1e-7
-        if mask.any():
-            # ratio should match scale above
-            ratio = g2[mask] / g1[mask]
-            torch.testing.assert_close(ratio, torch.full_like(ratio, 0.1), rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(g2, 0.1 * g1, rtol=1e-4, atol=1e-8)
 
 
 def test_ppo_warmup(dummy_obs):
