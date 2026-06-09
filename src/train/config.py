@@ -4,16 +4,20 @@ from pathlib import Path
 
 # unfortunately the config is not static
 # and is reused as a vessel to carry the changing
-# hyperparams (lr, entropy_coef, clip_high) for
+# hyperparams (lr, entropy_coef) for
 # simplicity in the train loop
 @dataclass(slots=True)
 class PPOConfig:
+    # default values provided are meant for the colab
+    # T4 runtime with 15 GB VRAM and some unknown CPU
+    # with 16 GB RAM
     num_episodes: int = 12500
-    n_envs: int = 16
-    self_play_steps: int = 320
-    pool_play_steps: int = 320
-    n_pool_opponents: int = 4
-    batch_size: int = 64
+    n_envs: int = 8
+    n_pool_opponents: int = 2
+    self_play_steps: int = 160
+    pool_play_steps: int = 160
+    batch_size: int = 128
+    chunk_size: int = 32  # with BPTT, backward pass takes 14 GB RAM
 
     gamma: float = 0.97
     gae_lambda: float = 0.95
@@ -25,7 +29,7 @@ class PPOConfig:
     entropy_coef: float = 0.04
     max_grad_norm: float = 1.0
     target_kl: float = 0.05  # for early kl stopping
-    ppo_epochs: int = 4  # number of ppo loops per episode
+    ppo_epochs: int = 2  # number of ppo loops per episode
     # skew importance of team preview step
     teampreview_loss_mult: float = 1.5
     teampreview_entropy_mult: float = 2.0

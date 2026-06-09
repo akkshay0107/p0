@@ -31,8 +31,6 @@ from src.train.utils import (
 )
 from src.train.vec_env import ThreadVecEnv
 
-CHUNK_SIZE = 32
-
 
 def handle_sigterm(signum, frame):
     global shutdown_requested
@@ -250,9 +248,9 @@ def ppo_update(
     num_updates = 0
     epochs_done = 0
 
-    effective_batch_size = (
-        config.batch_size + CHUNK_SIZE
-    ) & ~CHUNK_SIZE  # rounding up (only works for pow of 2)
+    effective_batch_size = config.chunk_size * (
+        (config.chunk_size + config.batch_size + 1) // config.batch_size
+    )  # round up to nearest chunk
 
     early_stop = False
     last_entropy_coef = config.entropy_coef
@@ -275,8 +273,8 @@ def ppo_update(
             optimizer.zero_grad(set_to_none=True)
 
             minibatch_steps = 0
-            for chunk_idx in range(0, len(minibatch), CHUNK_SIZE):
-                chunk = minibatch[chunk_idx : chunk_idx + CHUNK_SIZE]
+            for chunk_idx in range(0, len(minibatch), config.chunk_size):
+                chunk = minibatch[chunk_idx : chunk_idx + config.chunk_size]
                 chunk.sort(key=lambda ep: ep["length"], reverse=True)
 
                 batch_loss, batch_metrics, batch_steps = _run_batched_ppo(
