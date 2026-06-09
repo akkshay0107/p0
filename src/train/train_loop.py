@@ -249,7 +249,7 @@ def ppo_update(
     epochs_done = 0
 
     effective_batch_size = config.chunk_size * (
-        (config.chunk_size + config.batch_size + 1) // config.batch_size
+        (config.batch_size - config.chunk_size + 1) // config.chunk_size
     )  # round up to nearest chunk
 
     early_stop = False
@@ -273,6 +273,7 @@ def ppo_update(
             optimizer.zero_grad(set_to_none=True)
 
             minibatch_steps = 0
+            expected_minibatch_steps = sum(ep["length"] for ep in minibatch)
             for chunk_idx in range(0, len(minibatch), config.chunk_size):
                 chunk = minibatch[chunk_idx : chunk_idx + config.chunk_size]
                 chunk.sort(key=lambda ep: ep["length"], reverse=True)
@@ -290,7 +291,7 @@ def ppo_update(
                 minibatch_steps += batch_steps
 
                 if batch_steps > 0:
-                    scaled_loss = batch_loss / batch_steps
+                    scaled_loss = batch_loss / expected_minibatch_steps
                     if torch.isfinite(scaled_loss):
                         scaled_loss.backward()
 
