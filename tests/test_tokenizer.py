@@ -139,6 +139,12 @@ def test_tokenizer_nature():
     p = Pokemon(gen=9, species="pikachu")
     assert tokenizer.nature_id(p) == 0  # no nature set yet
 
+    p._nature = "Serious"
+    serious_id = tokenizer.nature_id(p)
+    assert serious_id > 0
+    p._nature = "Bashful"
+    assert serious_id == tokenizer.nature_id(p)
+
     p._nature = "Jolly"
     jolly_id = tokenizer.nature_id(p)
     assert jolly_id > 0

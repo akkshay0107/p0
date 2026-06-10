@@ -59,6 +59,8 @@ class PokemonTokenizer:
             "timid",
         ]
         self.natures = {nature: idx for idx, nature in enumerate(self.natures_list)}
+        for nature in ("serious", "bashful", "docile", "hardy", "quirky"):
+            self.natures[nature] = 0
 
         # map enum directly to id
         self._volatiles_str = vocab.get("volatiles", {})

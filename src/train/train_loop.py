@@ -256,16 +256,16 @@ def ppo_update(
     tot_clip_frac = 0.0
     tot_steps = 0
     num_updates = 0
+    num_skipped = 0
     epochs_done = 0
 
     effective_batch_size = config.chunk_size * (
         (config.batch_size + config.chunk_size - 1) // config.chunk_size
     )  # round up to nearest chunk
 
-    early_stop = False
     last_entropy_coef = config.entropy_coef
     for epoch_idx in range(config.ppo_epochs):
-        if shutdown_requested or early_stop:
+        if shutdown_requested:
             break
         random.shuffle(episodes)
 
@@ -313,30 +313,32 @@ def ppo_update(
                         )
 
             if minibatch_steps > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    policy.parameters(), config.max_grad_norm
+                # skip just this minibatch when its KL exceeds
+                # target instead of aborting the rest of the update
+                should_skip, minibatch_mean_kl = _kl_exceeds_target(
+                    minibatch_kl, minibatch_steps, config.target_kl
                 )
-                if torch.isfinite(grad_norm):
-                    tot_grad_norm += grad_norm.item()
-                    optimizer.step()
-                    num_updates += 1
-                else:
-                    logging.warning("Non-finite grad norm, skipping update")
+                if should_skip:
+                    logging.info(
+                        f"Skipping minibatch at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
+                        f"batch {batch_start // effective_batch_size + 1} "
+                        f"(minibatch KL={minibatch_mean_kl:.4f} > {config.target_kl:.4f})"
+                    )
                     optimizer.zero_grad(set_to_none=True)
+                    num_skipped += 1
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        policy.parameters(), config.max_grad_norm
+                    )
+                    if torch.isfinite(grad_norm):
+                        tot_grad_norm += grad_norm.item()
+                        optimizer.step()
+                        num_updates += 1
+                    else:
+                        logging.warning("Non-finite grad norm, skipping update")
+                        optimizer.zero_grad(set_to_none=True)
 
             epoch_steps += minibatch_steps
-
-            should_stop, minibatch_mean_kl = _kl_exceeds_target(
-                minibatch_kl, minibatch_steps, config.target_kl
-            )
-            if should_stop:
-                logging.info(
-                    f"Early stop at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
-                    f"batch {batch_start // effective_batch_size + 1} "
-                    f"(minibatch KL={minibatch_mean_kl:.4f} > {config.target_kl:.4f})"
-                )
-                early_stop = True
-                break
 
         tot_steps += epoch_steps
         tot_kl_div += epoch_kl
@@ -352,6 +354,7 @@ def ppo_update(
             "clip_fraction": 0.0,
             "entropy_coefficient": config.entropy_coef,
             "explained_variance": 0.0,
+            "skipped_minibatches": num_skipped,
             "time": time.time() - t0,
         }
 
@@ -364,6 +367,7 @@ def ppo_update(
         "clip_fraction": tot_clip_frac / tot_steps,
         "entropy_coefficient": last_entropy_coef,
         "explained_variance": explained_var,
+        "skipped_minibatches": num_skipped,
         "time": time.time() - t0,
     }
 
@@ -540,7 +544,8 @@ def main():
 
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
-                added = pool.add(policy, snap_id, pool_wr_ema)
+                force_admit = (episode + 1) % config.pool_force_admit_every == 0
+                added = pool.add(policy, snap_id, pool_wr_ema, force=force_admit)
                 if added:
                     pool.save_state()
                     logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
@@ -566,6 +571,9 @@ def main():
             tb_writer.add_scalar(f"{tag}/Training/GradNorm", stats["grad_norm"], episode + 1)
             tb_writer.add_scalar(
                 f"{tag}/Training/ClipFraction", stats["clip_fraction"], episode + 1
+            )
+            tb_writer.add_scalar(
+                f"{tag}/Training/SkippedMinibatches", stats["skipped_minibatches"], episode + 1
             )
             tb_writer.add_scalar(
                 f"{tag}/Training/ExplainedVariance", stats["explained_variance"], episode + 1

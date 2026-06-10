@@ -155,7 +155,6 @@ class FusedTokenEncoder(nn.Module):
             nn.GELU(),
         )
         self.field_numeric_proj = nn.Sequential(
-            nn.LayerNorm(NUMERICAL_WIDTH),
             nn.Linear(NUMERICAL_WIDTH, d_model),
             nn.GELU(),
         )

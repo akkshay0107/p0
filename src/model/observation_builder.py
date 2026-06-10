@@ -328,10 +328,31 @@ def _pad_team(
     return res
 
 
+def _selected_ally_pokemon(battle: DoubleBattle) -> set[Pokemon]:
+    """Return the persistent set of allies selected at team preview."""
+    if battle.teampreview:
+        return set(battle.team.values())
+
+    selected = {
+        mon
+        for mon in battle.team.values()
+        if mon.selected_in_teampreview or bool(getattr(mon, "_last_request", None))
+    }
+    if selected:
+        return selected
+
+    # Synthetic/legacy battle states may not carry request history. Keep a
+    # conservative fallback without making live classification depend on it.
+    selected.update(mon for mon in battle.active_pokemon if mon is not None)
+    selected.update(mon for switches in battle.available_switches for mon in switches)
+    selected.update(mon for mon in battle.team.values() if mon.fainted or mon.revealed)
+    return selected
+
+
 def _get_ordered_pokemon(
     battle: DoubleBattle,
     is_opponent: bool,
-    possible_switches: set[Pokemon] | None = None,
+    selected_allies: set[Pokemon] | None = None,
     orig_idx_map: Mapping[Pokemon, int] | None = None,
 ) -> list[tuple[Pokemon | None, int, int | None]]:
     # returns list of (pokemon, orig_id, active_id)
@@ -366,8 +387,8 @@ def _get_ordered_pokemon(
         res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
         return _pad_team(res)
 
-    if possible_switches is None:
-        possible_switches = {mon for switches in battle.available_switches for mon in switches}
+    if selected_allies is None:
+        selected_allies = _selected_ally_pokemon(battle)
 
     res = []
     assigned = set()
@@ -383,7 +404,7 @@ def _get_ordered_pokemon(
         if mon in assigned:
             continue
         idx = orig_idx_map.get(mon, -1)
-        if mon.fainted or mon in possible_switches:
+        if mon in selected_allies:
             bench.append((mon, idx, None))
         else:
             dropped.append((mon, idx, None))
@@ -397,7 +418,7 @@ def _slot_condition(
     mon: Pokemon | None,
     seq_idx: int,
     is_opponent: bool,
-    possible_switches: set[Pokemon] | None = None,
+    selected_allies: set[Pokemon] | None = None,
 ) -> int:
     if mon is None:
         return 0
@@ -409,9 +430,9 @@ def _slot_condition(
         return 1
     if is_opponent:
         return 2
-    if possible_switches is None:
-        possible_switches = {s for switches in battle.available_switches for s in switches}
-    return 2 if mon in possible_switches else -1
+    if selected_allies is None:
+        selected_allies = _selected_ally_pokemon(battle)
+    return 2 if mon in selected_allies else -1
 
 
 def _global_field_token_into(
@@ -478,6 +499,27 @@ def _side_token_into(
     num[4] = float(mega_available)
 
 
+def _side_mega_available(
+    battle: DoubleBattle,
+    *,
+    is_opponent: bool,
+    selected_allies: set[Pokemon] | None = None,
+) -> bool:
+    if is_opponent:
+        if battle.opponent_used_mega_evolve:
+            return False
+        candidates = battle.opponent_team.values()
+    else:
+        if battle.used_mega_evolve:
+            return False
+        candidates = _selected_ally_pokemon(battle) if selected_allies is None else selected_allies
+
+    return any(
+        PokemonTokenizer.normalize_id(mon.item) in _MEGA_ITEMS and not _is_mega_form(mon)
+        for mon in candidates
+    )
+
+
 def _validate_output(out: StructuredObservation) -> None:
     expected = (
         ("token_type_ids", out.token_type_ids, (SEQUENCE_LENGTH,), torch.long),
@@ -531,7 +573,7 @@ def from_battle_into(
     token_types[0] = TokenType.CLS
     sides[0] = SideId.NONE
 
-    possible_switches = {mon for switches in battle.available_switches for mon in switches}
+    selected_allies = _selected_ally_pokemon(battle)
     ally_orig_idx = {mon: i for i, mon in enumerate(battle.team.values())}
     opponent_orig_idx = {mon: i for i, mon in enumerate(battle.opponent_team.values())}
 
@@ -543,12 +585,12 @@ def from_battle_into(
         ordered = _get_ordered_pokemon(
             battle,
             is_opponent,
-            possible_switches if not is_opponent else None,
+            selected_allies if not is_opponent else None,
             orig_idx_map,
         )
         for slot_idx, (mon, orig_idx, active_idx) in enumerate(ordered):
             cond = _slot_condition(
-                battle, mon, slot_idx, is_opponent, possible_switches if not is_opponent else None
+                battle, mon, slot_idx, is_opponent, selected_allies if not is_opponent else None
             )
             slot_id = slot_idx + 1
             move_slots = _iter_move_slots(mon)
@@ -583,7 +625,11 @@ def from_battle_into(
     idx += 1
 
     ally_fainted = sum(mon.fainted for mon in battle.team.values())
-    ally_mega_available = not any(_is_mega_form(mon) for mon in battle.team.values())
+    ally_mega_available = _side_mega_available(
+        battle,
+        is_opponent=False,
+        selected_allies=selected_allies,
+    )
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.ALLY
     _side_token_into(
@@ -601,7 +647,7 @@ def from_battle_into(
     idx += 1
 
     opp_fainted = sum(mon.fainted for mon in battle.opponent_team.values())
-    opp_mega_available = not any(_is_mega_form(mon) for mon in battle.opponent_team.values())
+    opp_mega_available = _side_mega_available(battle, is_opponent=True)
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.OPPONENT
     _side_token_into(

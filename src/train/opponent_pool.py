@@ -65,16 +65,17 @@ class OpponentPool:
         pool._load_state()
         return pool
 
-    def add(self, policy: PolicyNet, id: str, pool_wr: float) -> bool:
-        if id in self.opponent_ids or pool_wr < 0.5:
+    def add(self, policy: PolicyNet, id: str, pool_wr: float, force: bool = False) -> bool:
+        if id in self.opponent_ids or (pool_wr < 0.5 and not force):
             return False
 
         # evict lowest wr policy
         # win_rates are opponent-vs-agent; a new snapshot joins at parity (0.5),
         # so only evict an opponent that is weaker than parity
+        # (forced admissions always evict the weakest to keep diversity growing)
         if len(self.opponent_ids) >= self.config.pool_size:
             evict_id = min(self.opponent_ids, key=lambda opp_id: self.win_rates[opp_id])
-            if self.win_rates[evict_id] >= 0.5:
+            if self.win_rates[evict_id] >= 0.5 and not force:
                 return False
 
             evict_path = self.pool_dir / f"{evict_id}.pt"
@@ -117,23 +118,22 @@ class OpponentPool:
         alpha = self.config.pool_win_rate_smoothing
         self.win_rates[opponent_id] = (1 - alpha) * curr_wr + alpha * observed_wr
 
-    def sample(self, device: str) -> tuple[PolicyNet, str]:
-        """Returns a frozen policy (loaded to device) from the pool sampled using win rates as weights."""
-        opponent_id = self.sample_id()
-        return self.load_policy(opponent_id, device), opponent_id
+    def _pfsp_weight(self, opponent_id: str) -> float:
+        # competitive weighting: starves both too good and too bad agents
+        wr = self.win_rates[opponent_id]
+        return max(self.config.pool_wr_floor, wr * (1.0 - wr))
 
-    def sample_id(self) -> str:
-        """Returns an opponent ID sampled using win rates as weights."""
+    def sample(self, device: str) -> tuple[PolicyNet, str]:
+        """Returns a frozen policy (loaded to device) from the pool sampled with PFSP weights."""
         if not self.opponent_ids:
             raise RuntimeError("OpponentPool is empty. Call pool.add() before pool.sample().")
 
-        floor = self.config.pool_wr_floor
-        weights = [max(floor, self.win_rates[oid]) for oid in self.opponent_ids]
+        weights = [self._pfsp_weight(oid) for oid in self.opponent_ids]
         (opponent_id,) = random.choices(self.opponent_ids, weights=weights, k=1)
-        return opponent_id
+        return self.load_policy(opponent_id, device), opponent_id
 
     def sample_many(self, count: int) -> list[str]:
-        """Sample opponent IDs without replacement using win rates as weights."""
+        """Sample opponent IDs without replacement using PFSP weights."""
         if count <= 0:
             raise ValueError("Opponent count must be greater than zero.")
         if not self.opponent_ids:
@@ -141,10 +141,7 @@ class OpponentPool:
 
         count = min(count, len(self.opponent_ids))
         weights = torch.tensor(
-            [
-                max(self.config.pool_wr_floor, self.win_rates[opponent_id])
-                for opponent_id in self.opponent_ids
-            ],
+            [self._pfsp_weight(opponent_id) for opponent_id in self.opponent_ids],
             dtype=torch.float32,
         )
         indices = torch.multinomial(weights, count, replacement=False)

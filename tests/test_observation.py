@@ -18,6 +18,7 @@ from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
+from src.env import SimEnv
 from src.model.observation_builder import (
     _cached_raw_stats,
     _estimate_stat_by_nature,
@@ -26,6 +27,7 @@ from src.model.observation_builder import (
     _iter_move_slots,
     _pokemon_categorical_into,
     _pokemon_numeric_into,
+    _side_mega_available,
     _side_token_into,
     _slot_condition,
     from_battle,
@@ -40,7 +42,6 @@ from src.model.structured_observation import (
     TokenType,
 )
 from src.model.tokenizer import tokenizer
-from src.env import SimEnv
 from src.team_picker import RandomTeamFromPool
 
 
@@ -394,6 +395,30 @@ def test_get_ordered_pokemon_real():
 
     assert ordered_reg[5][0] == p6  # dropped
 
+    # Request-backed selection is persistent even when trapping makes all
+    # available-switch lists temporarily empty.
+    for mon in (p1, p2, p3, p4):
+        mon._selected_in_teampreview = True
+    trapped_battle = make_real_battle(
+        active_pokemon=[p1, p2],
+        team=team,
+        teampreview=False,
+        available_switches=[[], []],
+    )
+    trapped_battle._trapped = [True, True]
+    ordered_trapped = _get_ordered_pokemon(trapped_battle, is_opponent=False)
+    assert [entry[0] for entry in ordered_trapped[:4]] == [p1, p2, p3, p4]
+    assert (
+        _slot_condition(
+            trapped_battle,
+            p3,
+            2,
+            is_opponent=False,
+            selected_allies={p1, p2, p3, p4},
+        )
+        == 2
+    )
+
     # Empty left active slot: right active must stay at index 1 with a None
     # placeholder at index 0, so seq positions match env action positions.
     battle_left_empty = make_real_battle(
@@ -523,6 +548,35 @@ def test_side_token_real():
         num=num_used,
     )
     assert num_used[4] == 0.0
+
+
+def test_side_mega_available_uses_selection_and_usage():
+    mega = make_real_pokemon(species="charizard", item="charizarditey")
+    regular = make_real_pokemon(species="dragonite", item="choicescarf")
+    unused_mega = make_real_pokemon(species="aerodactyl", item="aerodactylite")
+    team = [mega, regular, unused_mega]
+    battle = make_real_battle(active_pokemon=[mega, regular], team=team)
+
+    mega._selected_in_teampreview = True
+    regular._selected_in_teampreview = True
+    assert _side_mega_available(
+        battle,
+        is_opponent=False,
+        selected_allies={mega, regular},
+    )
+
+    assert not _side_mega_available(
+        battle,
+        is_opponent=False,
+        selected_allies={regular},
+    )
+
+    battle._used_mega_evolve = True
+    assert not _side_mega_available(
+        battle,
+        is_opponent=False,
+        selected_allies={mega, regular},
+    )
 
 
 def test_from_battle_real_end_to_end():

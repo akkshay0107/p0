@@ -15,6 +15,8 @@ from src.train.config import PPOConfig
 from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
 
+MAX_TRAJECTORY_STEPS = 100
+
 
 def assign_pool_opponents(n_envs: int, roster: list[str]) -> list[str]:
     if not roster:
@@ -68,7 +70,11 @@ def build_partition(
     )
 
 
-def create_trajectory_buffers(n_envs, max_steps=100, device="cpu"):
+def create_trajectory_buffers(
+    n_envs,
+    max_steps=MAX_TRAJECTORY_STEPS,
+    device="cpu",
+):
     return {
         "step_counts": torch.zeros(n_envs, dtype=torch.long, device=device),
         "categorical": torch.zeros(

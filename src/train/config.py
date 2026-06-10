@@ -14,7 +14,7 @@ class PPOConfig:
     num_episodes: int = 12500
     n_envs: int = 8
     n_self_envs: int = 4
-    n_pool_opponents: int = 2
+    n_pool_opponents: int = 4
     rollout_steps: int = 320
     batch_size: int = 128
     chunk_size: int = 32  # with BPTT, backward pass takes 14 GB RAM
@@ -24,7 +24,7 @@ class PPOConfig:
     clip_low: float = 0.2
     clip_high: float = 0.28  # DAPO style, entropy regularizer
 
-    lr: float = 3e-5
+    lr: float = 6e-5
     value_coef: float = 0.5
     entropy_coef: float = 0.04
     max_grad_norm: float = 1.0
@@ -44,6 +44,9 @@ class PPOConfig:
     )
     pool_size: int = 40
     snapshot_interval: int = 50
+    # admit a snapshot unconditionally every N episodes so pool diversity
+    # keeps growing even when the win-rate gate would reject it
+    pool_force_admit_every: int = 250
     pool_win_rate_smoothing: float = 0.1
     pool_wr_floor: float = 0.1
 

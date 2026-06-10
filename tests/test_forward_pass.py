@@ -48,7 +48,7 @@ def test_policy_net_forward_pass(policy_net):
     assert out.actions.shape == (B, 2)
     assert out.value.shape == (B,)
 
-    assert out.state.shape == (B, 4, 128)  # n_hg is 4
+    assert out.state.shape == (B, 8, 128)  # n_hg is 8
 
 
 def test_encoder_batches_all_pokemon_in_one_fusion_call(policy_net):
@@ -77,9 +77,7 @@ def test_encoder_batches_all_pokemon_in_one_fusion_call(policy_net):
     assert calls == [(B * 12, 12, 128)]
 
     with torch.no_grad():
-        separate = [
-            policy_net.encode(obs[i : i + 1], action_mask[i : i + 1]) for i in range(B)
-        ]
+        separate = [policy_net.encode(obs[i : i + 1], action_mask[i : i + 1]) for i in range(B)]
 
     torch.testing.assert_close(
         batched.tokens,
@@ -132,7 +130,7 @@ def test_policy_net_encoded_evaluate(policy_net):
     assert out.entropy.shape == (B,)
     assert out.norm_entropy.shape == (B,)
     assert out.value.shape == (B,)
-    assert out.state.shape == (B, 4, 128)
+    assert out.state.shape == (B, 8, 128)
 
 
 def test_encode_requires_batched_observation_and_mask(policy_net):
