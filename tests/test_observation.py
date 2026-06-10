@@ -1,9 +1,12 @@
 import asyncio
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
+import torch
 from poke_env import LocalhostServerConfiguration
 from poke_env.battle import DoubleBattle, Pokemon
 from poke_env.battle.effect import Effect
@@ -16,14 +19,17 @@ from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
 from src.model.observation_builder import (
+    _cached_raw_stats,
+    _estimate_stat_by_nature,
     _get_ordered_pokemon,
-    _global_field_token,
+    _global_field_token_into,
     _iter_move_slots,
-    _pokemon_categorical,
-    _pokemon_numeric,
-    _side_token,
+    _pokemon_categorical_into,
+    _pokemon_numeric_into,
+    _side_token_into,
     _slot_condition,
     from_battle,
+    from_battle_into,
 )
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -34,6 +40,7 @@ from src.model.structured_observation import (
     TokenType,
 )
 from src.model.tokenizer import tokenizer
+from src.env import SimEnv
 from src.team_picker import RandomTeamFromPool
 
 
@@ -172,9 +179,11 @@ def sample_team():
 
 
 def test_pokemon_categorical_real():
-    """Verify that _pokemon_categorical maps all features correctly to vocabulary IDs using real Pokemon."""
+    """Verify that categorical rows are written correctly."""
     # None Pokemon returns 24 zeros
-    assert _pokemon_categorical(None, tokenizer, _iter_move_slots(None)) == [0] * CATEGORICAL_WIDTH
+    empty_cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    _pokemon_categorical_into(None, tokenizer, _iter_move_slots(None), empty_cat)
+    assert not empty_cat.any()
 
     # Active Pokemon with custom moves and effects
     moves = {"closecombat": 10, "airslash": 15}
@@ -190,7 +199,8 @@ def test_pokemon_categorical_real():
         status=Status.BRN,
     )
 
-    cat = _pokemon_categorical(mon, tokenizer, _iter_move_slots(mon))
+    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    _pokemon_categorical_into(mon, tokenizer, _iter_move_slots(mon), cat)
     assert len(cat) == CATEGORICAL_WIDTH
 
     # Species, Ability, Item, Type 1, Type 2
@@ -227,12 +237,13 @@ def test_pokemon_categorical_real():
 
 
 def test_pokemon_numeric_real():
-    """Verify that _pokemon_numeric computes properly scaled attributes using real Pokemon."""
+    """Verify that numerical rows are written correctly."""
     battle = make_real_battle()
 
     # None Pokemon returns mostly zeros except for condition flag (e.g. cond=1 -> row[2] = 1.0)
-    none_row = _pokemon_numeric(
-        None, battle, cond=1, orig_idx=-1, move_slots=_iter_move_slots(None)
+    none_row = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+    _pokemon_numeric_into(
+        None, battle, cond=1, orig_idx=-1, move_slots=_iter_move_slots(None), row=none_row
     )
     assert len(none_row) == NUMERICAL_WIDTH
     assert none_row[2] == 1.0
@@ -266,12 +277,18 @@ def test_pokemon_numeric_real():
     ]
     for w, val in weights_and_expected:
         mon._weightkg = w
-        row = _pokemon_numeric(mon, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon))
+        row = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+        _pokemon_numeric_into(
+            mon, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon), row=row
+        )
         assert abs(row[25] - val) < 1e-5
 
     mon._weightkg = 75
-    row = _pokemon_numeric(mon, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon))
-    assert row[5] == 0.8  # HP fraction
+    row = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+    _pokemon_numeric_into(
+        mon, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon), row=row
+    )
+    assert row[5] == pytest.approx(0.8)  # HP fraction
     assert abs(row[6] - 78.0 / 160.0) < 1e-5  # Charizard base HP is 78
     assert abs(row[7] - 84.0 / 160.0) < 1e-5  # Charizard base Atk is 84
     assert row[12] == 3.0 / 6.0  # Atk Boost
@@ -291,14 +308,27 @@ def test_pokemon_numeric_real():
     assert row[42] == 1.0  # Preparing (preparing_move is not None)
 
     battle._can_mega_evolve = [True, False]
-    row_mega_active = _pokemon_numeric(
-        mon, battle, cond=1, orig_idx=2, active_idx=0, move_slots=_iter_move_slots(mon)
+    row_mega_active = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+    _pokemon_numeric_into(
+        mon,
+        battle,
+        cond=1,
+        orig_idx=2,
+        active_idx=0,
+        move_slots=_iter_move_slots(mon),
+        row=row_mega_active,
     )
     assert row_mega_active[30] == 1.0
 
     mon_mega = make_real_pokemon(species="charizardmegay")
-    row_mega_form = _pokemon_numeric(
-        mon_mega, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_mega)
+    row_mega_form = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+    _pokemon_numeric_into(
+        mon_mega,
+        battle,
+        cond=1,
+        orig_idx=2,
+        move_slots=_iter_move_slots(mon_mega),
+        row=row_mega_form,
     )
     assert row_mega_form[31] == 1.0
 
@@ -308,8 +338,14 @@ def test_pokemon_numeric_real():
         moves={"airslash": 10},
         last_move_id="airslash",
     )
-    row_last_move = _pokemon_numeric(
-        mon_last, battle, cond=1, orig_idx=2, move_slots=_iter_move_slots(mon_last)
+    row_last_move = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+    _pokemon_numeric_into(
+        mon_last,
+        battle,
+        cond=1,
+        orig_idx=2,
+        move_slots=_iter_move_slots(mon_last),
+        row=row_last_move,
     )
     assert row_last_move[32] == 1.0  # First move slot matched last_move
 
@@ -425,7 +461,9 @@ def test_global_field_token_real():
     }  # started at turn 2. Duration = 5. Left: (5 - (3 - 2)) / 5 = 0.8
     battle._teampreview = False
 
-    cat, num = _global_field_token(battle, tokenizer)
+    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    num = np.zeros(4, dtype=np.float32)
+    _global_field_token_into(battle, tokenizer, cat, num)
     assert len(cat) == CATEGORICAL_WIDTH
     assert len(num) == 4
 
@@ -447,7 +485,17 @@ def test_side_token_real():
         SideCondition.TOXIC_SPIKES: 2,  # layers = 2. Value: 2 / 2 = 1.0
     }
 
-    cat, num = _side_token(battle, conditions, tokenizer, fainted_count=3, mega_available=True)
+    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    num = np.zeros(5, dtype=np.float32)
+    _side_token_into(
+        battle,
+        conditions,
+        tokenizer,
+        fainted_count=3,
+        mega_available=True,
+        cat=cat,
+        num=num,
+    )
     assert len(cat) == CATEGORICAL_WIDTH
     assert len(num) == 5
 
@@ -463,7 +511,17 @@ def test_side_token_real():
     assert abs(num[3] - 0.5) < 1e-5  # 3 fainted out of 6
     assert num[4] == 1.0  # mega still available
 
-    _, num_used = _side_token(battle, conditions, tokenizer, fainted_count=3, mega_available=False)
+    cat_used = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    num_used = np.zeros(5, dtype=np.float32)
+    _side_token_into(
+        battle,
+        conditions,
+        tokenizer,
+        fainted_count=3,
+        mega_available=False,
+        cat=cat_used,
+        num=num_used,
+    )
     assert num_used[4] == 0.0
 
 
@@ -505,6 +563,87 @@ def test_from_battle_real_end_to_end():
     assert obs.side_ids[28] == SideId.ALLY
     assert obs.side_ids[29] == SideId.OPPONENT
     assert obs.side_ids[30] == SideId.OPPONENT
+
+
+def test_from_battle_into_overwrites_dirty_output():
+    ally = make_real_pokemon(
+        species="charizard",
+        moves={"airslash": 10, "protect": 8},
+        effects={Effect.CONFUSION: 2},
+        current_hp=73,
+        max_hp=100,
+    )
+    opponent = make_real_pokemon(
+        species="venusaur",
+        moves={"gigadrain": 6},
+        status=Status.BRN,
+    )
+    battle = make_real_battle(
+        active_pokemon=[ally, None],
+        opponent_active_pokemon=[opponent, None],
+        team=[ally],
+        opponent_team=[opponent],
+        weather={Weather.SUNNYDAY: 1},
+        fields={Field.TRICK_ROOM: 2},
+        turn=3,
+    )
+
+    expected = from_battle(battle, tokenizer)
+    out = StructuredObservation.empty_batch(1)[0]
+    out.token_type_ids.fill_(99)
+    out.side_ids.fill_(99)
+    out.slot_ids.fill_(99)
+    out.categorical.fill_(99)
+    out.numerical.fill_(99.0)
+
+    from_battle_into(battle, out, tokenizer)
+
+    assert torch.equal(out.token_type_ids, expected.token_type_ids)
+    assert torch.equal(out.side_ids, expected.side_ids)
+    assert torch.equal(out.slot_ids, expected.slot_ids)
+    assert torch.equal(out.categorical, expected.categorical)
+    assert torch.equal(out.numerical, expected.numerical)
+    assert torch.count_nonzero(out.categorical[0]) == 0
+    assert torch.count_nonzero(out.numerical[0]) == 0
+
+
+def test_from_battle_into_validates_output_shape_and_dtype():
+    battle = make_real_battle()
+    invalid = StructuredObservation.empty_batch(1)[0]
+    invalid.numerical = invalid.numerical.to(torch.float64)
+
+    with pytest.raises(ValueError, match="Invalid numerical"):
+        from_battle_into(battle, invalid)
+
+
+def test_raw_stat_estimation_cache_matches_repeated_result():
+    battle = make_real_battle()
+    opponent = make_real_pokemon(species="charizard")
+    _cached_raw_stats.cache_clear()
+
+    first = _estimate_stat_by_nature(opponent, battle)
+    after_first = _cached_raw_stats.cache_info()
+    second = _estimate_stat_by_nature(opponent, battle)
+    after_second = _cached_raw_stats.cache_info()
+
+    assert first == second
+    assert after_first.misses == 1
+    assert after_second.hits == 1
+
+
+def test_sim_env_embed_battle_writes_configured_target():
+    battle = make_real_battle()
+    env = SimEnv.__new__(SimEnv)
+    cast(Any, env).agent1 = SimpleNamespace(username=battle.player_username)
+    cast(Any, env).agent2 = SimpleNamespace(username="other-player")
+    out1 = StructuredObservation.empty_batch(1)[0]
+    out2 = StructuredObservation.empty_batch(1)[0]
+    env.set_observation_targets(out1, out2)
+
+    result = env.embed_battle(battle)
+
+    assert result is out1
+    assert result.token_type_ids[0] == TokenType.CLS
 
 
 @pytest.mark.asyncio
@@ -588,7 +727,8 @@ def test_pokemon_nature_in_categorical():
     mon = make_real_pokemon(species="charizard")
     mon._nature = "Jolly"
 
-    cat = _pokemon_categorical(mon, tokenizer, _iter_move_slots(mon))
+    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    _pokemon_categorical_into(mon, tokenizer, _iter_move_slots(mon), cat)
     assert len(cat) == CATEGORICAL_WIDTH
     jolly_id = tokenizer.nature_id(mon)
     assert jolly_id > 0

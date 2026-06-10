@@ -12,8 +12,10 @@ from src.train.rollout import (
     RolloutBuffer,
     build_partition,
     collect_rollouts,
+    compute_gae_batch,
     create_trajectory_buffers,
 )
+from src.train.vec_env import ThreadVecEnv
 
 
 class FakePolicy:
@@ -110,6 +112,90 @@ class FakeVecEnv:
             dones,
             [{} for _ in range(self.n_envs)],
         )
+
+
+class BufferBindingEnv:
+    def __init__(self):
+        self.targets: tuple[StructuredObservation, StructuredObservation] | None = None
+
+    def set_observation_targets(
+        self,
+        obs1: StructuredObservation,
+        obs2: StructuredObservation,
+    ) -> None:
+        self.targets = (obs1, obs2)
+
+
+def test_thread_vec_env_binds_each_env_to_its_preallocated_rows():
+    envs = [BufferBindingEnv(), BufferBindingEnv()]
+    vec_env = ThreadVecEnv(cast(Any, envs))
+    try:
+        for env_id, env in enumerate(envs):
+            assert env.targets is not None
+            obs1, obs2 = env.targets
+            assert obs1.numerical.data_ptr() == vec_env.obs1_buffers[env_id].numerical.data_ptr()
+            assert obs2.numerical.data_ptr() == vec_env.obs2_buffers[env_id].numerical.data_ptr()
+    finally:
+        vec_env.shutdown()
+
+
+def test_compute_gae_batch_matches_single_episode_reference():
+    def compute_gae_reference(
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        dones: torch.Tensor,
+        gamma: float,
+        gae_lambda: float,
+    ) -> torch.Tensor:
+        advantages = torch.zeros_like(rewards)
+        gae = 0.0
+        for t in reversed(range(rewards.size(0))):
+            next_value = values[t + 1] if t + 1 < rewards.size(0) else 0.0
+            nonterminal = 1.0 - dones[t]
+            delta = rewards[t] + gamma * next_value * nonterminal - values[t]
+            gae = delta + gamma * gae_lambda * nonterminal * gae
+            advantages[t] = gae
+        return advantages
+
+    rewards = [
+        torch.tensor([1.0, 0.5, -0.25, 2.0]),
+        torch.tensor([0.25, 0.75]),
+        torch.tensor([-1.0, 0.0, 1.0]),
+    ]
+    values = [
+        torch.tensor([0.2, 0.3, 0.4, 0.5]),
+        torch.tensor([0.1, 0.2]),
+        torch.tensor([0.5, 0.25, -0.1]),
+    ]
+    dones = [
+        torch.tensor([0.0, 0.0, 0.0, 1.0]),
+        torch.tensor([0.0, 0.0]),
+        torch.tensor([0.0, 1.0, 0.0]),
+    ]
+    lengths = torch.tensor([len(row) for row in rewards])
+    rewards_padded = torch.nn.utils.rnn.pad_sequence(rewards, batch_first=True)
+    values_padded = torch.nn.utils.rnn.pad_sequence(values, batch_first=True)
+    dones_padded = torch.nn.utils.rnn.pad_sequence(dones, batch_first=True)
+
+    actual = compute_gae_batch(
+        rewards_padded,
+        values_padded,
+        dones_padded,
+        lengths,
+        gamma=0.99,
+        gae_lambda=0.95,
+    )
+
+    for episode_idx, length in enumerate(lengths.tolist()):
+        expected = compute_gae_reference(
+            rewards[episode_idx],
+            values[episode_idx],
+            dones[episode_idx],
+            gamma=0.99,
+            gae_lambda=0.95,
+        )
+        assert torch.equal(actual[episode_idx, :length], expected)
+        assert torch.count_nonzero(actual[episode_idx, length:]) == 0
 
 
 def test_build_partition_assigns_static_pool_groups():

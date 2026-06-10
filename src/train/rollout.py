@@ -99,27 +99,41 @@ def create_trajectory_buffers(n_envs, max_steps=100, device="cpu"):
     }
 
 
-def compute_gae(
+def compute_gae_batch(
     rewards: torch.Tensor,
     values: torch.Tensor,
     dones: torch.Tensor,
+    lengths: torch.Tensor,
     gamma: float,
     gae_lambda: float,
 ) -> torch.Tensor:
-    """
-    Compute Generalized Advantage Estimation.
-    Accepts 1-D tensors on any device. Returns an advantage tensor on the same device.
-    """
-    T = rewards.size(0)
-    adv = torch.zeros_like(rewards)
-    gae = 0.0
-    for t in reversed(range(T)):
-        next_value = values[t + 1] if t + 1 < T else 0.0
-        nonterminal = 1.0 - dones[t]
-        delta = rewards[t] + gamma * next_value * nonterminal - values[t]
-        gae = delta + gamma * gae_lambda * nonterminal * gae
-        adv[t] = gae
-    return adv
+    """Compute GAE for a padded batch with one reverse scan over time."""
+    if rewards.shape != values.shape or rewards.shape != dones.shape:
+        raise ValueError("rewards, values, and dones must have matching padded shapes.")
+    if rewards.dim() != 2 or lengths.shape != (rewards.size(0),):
+        raise ValueError("Expected padded tensors shaped (batch, time) and lengths shaped (batch,).")
+
+    batch_size, max_steps = rewards.shape
+    lengths = lengths.to(rewards.device)
+    advantages = torch.zeros_like(rewards)
+    gae = torch.zeros(batch_size, dtype=rewards.dtype, device=rewards.device)
+
+    for t in reversed(range(max_steps)):
+        active = t < lengths
+        if t + 1 < max_steps:
+            next_value = torch.where(t + 1 < lengths, values[:, t + 1], 0.0)
+        else:
+            next_value = torch.zeros_like(gae)
+        nonterminal = 1.0 - dones[:, t]
+        delta = rewards[:, t] + gamma * next_value * nonterminal - values[:, t]
+        gae = torch.where(
+            active,
+            delta + gamma * gae_lambda * nonterminal * gae,
+            0.0,
+        )
+        advantages[:, t] = gae
+
+    return advantages
 
 
 class RolloutBuffer:
@@ -129,16 +143,6 @@ class RolloutBuffer:
     def reset(self):
         self.trajectories: list[dict] = []
 
-    _FIELDS = (
-        "obs",
-        "actions",
-        "log_probs",
-        "values",
-        "rewards",
-        "dones",
-        "action_masks",
-    )
-
     def add_episode(self, episode: dict):
         if not episode or "length" not in episode or episode["length"] == 0:
             return
@@ -147,15 +151,37 @@ class RolloutBuffer:
     def get_batches(self, device: torch.device, config: PPOConfig):
         all_episodes = []
         all_advantages = []
+        if not self.trajectories:
+            return all_episodes
 
-        for ep in self.trajectories:
+        rewards_padded = torch.nn.utils.rnn.pad_sequence(
+            [ep["rewards"] for ep in self.trajectories],
+            batch_first=True,
+        )
+        values_padded = torch.nn.utils.rnn.pad_sequence(
+            [ep["values"] for ep in self.trajectories],
+            batch_first=True,
+        )
+        dones_padded = torch.nn.utils.rnn.pad_sequence(
+            [ep["dones"] for ep in self.trajectories],
+            batch_first=True,
+        )
+        lengths = torch.tensor([ep["length"] for ep in self.trajectories])
+        advantages_padded = compute_gae_batch(
+            rewards_padded,
+            values_padded,
+            dones_padded,
+            lengths,
+            config.gamma,
+            config.gae_lambda,
+        )
+
+        for episode_idx, ep in enumerate(self.trajectories):
             # Ep data is on CPU
-            rewards = ep["rewards"]
             values = ep["values"]
-            dones = ep["dones"]
             T = ep["length"]
 
-            adv = compute_gae(rewards, values, dones, config.gamma, config.gae_lambda)
+            adv = advantages_padded[episode_idx, :T]
             ret = adv + values
 
             episode_data = {
@@ -316,6 +342,8 @@ def collect_rollouts(
             for i in range(n_envs)
         ]
 
+        # The D2H action copies above synchronize the H2D observation reads. The env
+        # workers may only overwrite their shared observation rows after that point.
         next_masks1, next_masks2, rewards1, rewards2, dones, infos = vec_env.step(env_actions)
 
         # store step results

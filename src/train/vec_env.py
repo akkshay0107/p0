@@ -22,6 +22,11 @@ class ThreadVecEnv:
         # Pre-allocate shared observation buffers for agent1 and agent2
         self.obs1_buffers = self._create_buffers()
         self.obs2_buffers = self._create_buffers()
+        for env_id, env in enumerate(self.envs):
+            env.set_observation_targets(
+                self.obs1_buffers[env_id],
+                self.obs2_buffers[env_id],
+            )
 
         self.last_masks1 = None
         self.last_masks2 = None
@@ -29,36 +34,15 @@ class ThreadVecEnv:
     def _create_buffers(self):
         return StructuredObservation.empty_batch(self.n_envs, pin_memory=self.use_pinned)
 
-    def _write_obs(
-        self, env_id: int, obs1: StructuredObservation, obs2: StructuredObservation | None
-    ):
-        if obs1 is not None:
-            self.obs1_buffers.token_type_ids[env_id].copy_(obs1.token_type_ids)
-            self.obs1_buffers.side_ids[env_id].copy_(obs1.side_ids)
-            self.obs1_buffers.slot_ids[env_id].copy_(obs1.slot_ids)
-            self.obs1_buffers.categorical[env_id].copy_(obs1.categorical)
-            self.obs1_buffers.numerical[env_id].copy_(obs1.numerical)
-
-        if obs2 is not None:
-            self.obs2_buffers.token_type_ids[env_id].copy_(obs2.token_type_ids)
-            self.obs2_buffers.side_ids[env_id].copy_(obs2.side_ids)
-            self.obs2_buffers.slot_ids[env_id].copy_(obs2.slot_ids)
-            self.obs2_buffers.categorical[env_id].copy_(obs2.categorical)
-            self.obs2_buffers.numerical[env_id].copy_(obs2.numerical)
-
     def _reset_env(self, env_id: int, env: SimEnv):
         obs, info = env.reset()
 
         agent1 = env.agent1.username
         agent2 = env.agent2.username
 
-        obs1 = obs[agent1]["observation"]
-        obs2 = obs[agent2]["observation"]
-
         mask1 = np.reshape(obs[agent1]["action_mask"], (2, ACT_SIZE))
         mask2 = np.reshape(obs[agent2]["action_mask"], (2, ACT_SIZE)) if agent2 in obs else None
 
-        self._write_obs(env_id, obs1, obs2)
         return env_id, mask1, mask2, info
 
     def reset(self):
@@ -81,9 +65,6 @@ class ThreadVecEnv:
         agent1 = env.agent1.username
         agent2 = env.agent2.username
 
-        obs1 = next_obs[agent1]["observation"]
-        obs2 = next_obs[agent2]["observation"]
-
         mask1 = np.reshape(next_obs[agent1]["action_mask"], (2, ACT_SIZE))
         mask2 = np.reshape(next_obs[agent2]["action_mask"], (2, ACT_SIZE))
 
@@ -97,7 +78,6 @@ class ThreadVecEnv:
             _, mask1, mask2, _ = self._reset_env(env_id, env)
             return env_id, mask1, mask2, reward1, reward2, done, info
 
-        self._write_obs(env_id, obs1, obs2)
         return env_id, mask1, mask2, reward1, reward2, done, info
 
     def step(self, actions: list[dict]):

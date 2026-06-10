@@ -25,6 +25,7 @@ from poke_env.teambuilder import Teambuilder
 
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
+from src.model.structured_observation import StructuredObservation
 from src.team_picker import RandomTeamFromPool
 
 
@@ -331,12 +332,14 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
                 move_target=(action.item() - 7) % 5 - 2,
                 mega=(action - 7) // 20 == 1,
             )
-        if not fake and str(order) not in [str(o) for o in battle.valid_orders[pos]]:
-            raise ValueError(
-                f"Invalid action {action} from player {battle.player_username} "
-                f"in battle {battle.battle_tag} at position {pos} - order {order} "
-                f"not in action space {[str(o) for o in battle.valid_orders[pos]]}!"
-            )
+        if not fake:
+            valid_orders = [str(valid_order) for valid_order in battle.valid_orders[pos]]
+            if str(order) not in valid_orders:
+                raise ValueError(
+                    f"Invalid action {action} from player {battle.player_username} "
+                    f"in battle {battle.battle_tag} at position {pos} - order {order} "
+                    f"not in action space {valid_orders}!"
+                )
         return order
 
     @staticmethod
@@ -444,12 +447,14 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             else:
                 assert isinstance(order, PassBattleOrder)
                 return np.int64(0)
-        if not fake and str(order) not in [str(o) for o in battle.valid_orders[pos]]:
-            raise ValueError(
-                f"Invalid order from player {battle.player_username} in battle "
-                f"{battle.battle_tag} at position {pos} - order {order} not in "
-                f"action space {[str(o) for o in battle.valid_orders[pos]]}!"
-            )
+        if not fake:
+            valid_orders = [str(valid_order) for valid_order in battle.valid_orders[pos]]
+            if str(order) not in valid_orders:
+                raise ValueError(
+                    f"Invalid order from player {battle.player_username} in battle "
+                    f"{battle.battle_tag} at position {pos} - order {order} not in "
+                    f"action space {valid_orders}!"
+                )
         if isinstance(order.order, Pokemon):
             action = [p.base_species for p in battle.team.values()].index(
                 order.order.base_species
@@ -476,6 +481,17 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
 class SimEnv(MegaEnv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._observation_targets: dict[str, StructuredObservation] = {}
+
+    def set_observation_targets(
+        self,
+        agent1_out: StructuredObservation,
+        agent2_out: StructuredObservation,
+    ) -> None:
+        self._observation_targets = {
+            self.agent1.username: agent1_out,
+            self.agent2.username: agent2_out,
+        }
 
     @classmethod
     def build_env(cls, env_id: int = 0, server_port: int = 8000):
@@ -507,4 +523,8 @@ class SimEnv(MegaEnv):
 
     def embed_battle(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
-        return observation_builder.from_battle(battle)
+        out = self._observation_targets.get(battle.player_username)
+        if out is None:
+            return observation_builder.from_battle(battle)
+        observation_builder.from_battle_into(battle, out)
+        return out

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from functools import lru_cache
+from typing import Mapping
+
+import numpy as np
 import torch
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.battle.effect import Effect
@@ -31,9 +35,6 @@ _VOLATILE_MAX_DURATIONS: dict[Effect, float] = {
     Effect.THROAT_CHOP: 2.0,
 }
 _VOLATILE_ORDER = list(_VOLATILE_MAX_DURATIONS.keys())
-
-_ZERO_CATEGORICAL = [0] * CATEGORICAL_WIDTH
-_ZERO_NUMERICAL = [0.0] * NUMERICAL_WIDTH
 
 # mega stones end in -ite(x/y) (z soon)
 # replacing the substring check for mega items
@@ -88,33 +89,48 @@ def _iter_move_slots(pokemon: Pokemon | None) -> list[Move | None]:
     return moves + [None] * (MOVE_SLOTS - len(moves))
 
 
-def _pokemon_categorical(
+def _pokemon_categorical_into(
     pokemon: Pokemon | None,
     tok: PokemonTokenizer,
     move_slots: list[Move | None],
-) -> list[int]:
+    row: np.ndarray,
+) -> None:
     if pokemon is None:
-        return [0] * CATEGORICAL_WIDTH
+        return
 
-    move_ids = [tok.move_id(m) if m else 0 for m in move_slots]
-    move_type_ids = [tok.move_type_id(m) if m else 0 for m in move_slots]
-    move_category_ids = [tok.move_category_id(m) if m else 0 for m in move_slots]
+    row[0] = tok.species_id(pokemon)
+    row[1] = tok.ability_id(pokemon)
+    row[2] = tok.item_id(pokemon)
+    row[3] = tok.type_id(pokemon.type_1)
+    row[4] = tok.type_id(pokemon.type_2)
+    for i, move in enumerate(move_slots):
+        if move is not None:
+            row[5 + i] = tok.move_id(move)
+            row[9 + i] = tok.move_type_id(move)
+            row[13 + i] = tok.move_category_id(move)
+    row[17] = tok.status_id(pokemon.status)
+    row[18:24] = tok.volatile_ids(pokemon.effects)
+    row[24] = tok.nature_id(pokemon)
 
-    volatile_ids = tok.volatile_ids(pokemon.effects)
 
-    return [
-        tok.species_id(pokemon),
-        tok.ability_id(pokemon),
-        tok.item_id(pokemon),
-        tok.type_id(pokemon.type_1),
-        tok.type_id(pokemon.type_2),
-        *move_ids,
-        *move_type_ids,
-        *move_category_ids,
-        tok.status_id(pokemon.status),
-        *volatile_ids,
-        tok.nature_id(pokemon),
-    ]
+@lru_cache(maxsize=4096)
+def _cached_raw_stats(
+    species: str,
+    evs: tuple[int, ...],
+    ivs: tuple[int, ...],
+    level: int,
+    nature: str,
+    gen: int,
+) -> tuple[float, ...]:
+    raw_stats = compute_raw_stats(
+        species,
+        list(evs),
+        list(ivs),
+        level,
+        nature,
+        GenData.from_gen(gen),
+    )
+    return tuple(float(value) for value in raw_stats)
 
 
 def _estimate_stat_by_nature(pokemon: Pokemon, battle: DoubleBattle):
@@ -142,14 +158,13 @@ def _estimate_stat_by_nature(pokemon: Pokemon, battle: DoubleBattle):
         # assume 252 hp and nothing else
         evs[0] = 252
 
-    gen_data = GenData.from_gen(battle.gen)
-    return compute_raw_stats(
+    return _cached_raw_stats(
         pokemon.species,
-        evs,
-        ivs,
-        pokemon.level or 50,
+        tuple(evs),
+        tuple(ivs),
+        int(pokemon.level or 50),
         nature,
-        gen_data,
+        battle.gen,
     )
 
 
@@ -166,20 +181,20 @@ def _get_pokemon_level_stats(
     return [float(x) for x in raw_stats], 0.0
 
 
-def _pokemon_numeric(
+def _pokemon_numeric_into(
     pokemon: Pokemon | None,
     battle: DoubleBattle,
     cond: int,
     orig_idx: int,
     move_slots: list[Move | None],
+    row: np.ndarray,
     active_idx: int | None = None,
     is_opponent: bool = False,
-) -> list[float]:
-    row = [0.0] * NUMERICAL_WIDTH
+) -> None:
     row[cond + 1] = 1.0
 
     if pokemon is None:
-        return row
+        return
 
     row[5] = float(pokemon.current_hp_fraction)
 
@@ -266,8 +281,6 @@ def _pokemon_numeric(
 
     row[55] = pokemon.revealed
 
-    return row
-
 
 def _ally_legality(
     battle: DoubleBattle, active_idx: int, move_slots: list[Move | None]
@@ -316,7 +329,10 @@ def _pad_team(
 
 
 def _get_ordered_pokemon(
-    battle: DoubleBattle, is_opponent: bool, possible_switches: set[Pokemon] | None = None
+    battle: DoubleBattle,
+    is_opponent: bool,
+    possible_switches: set[Pokemon] | None = None,
+    orig_idx_map: Mapping[Pokemon, int] | None = None,
 ) -> list[tuple[Pokemon | None, int, int | None]]:
     # returns list of (pokemon, orig_id, active_id)
     active = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
@@ -324,7 +340,8 @@ def _get_ordered_pokemon(
 
     # both sides: dict insertion order is stable across the battle, so this gives
     # every mon a persistent identity even as the active-first ordering reshuffles
-    orig_idx_map = {mon: i for i, mon in enumerate(team.values())}
+    if orig_idx_map is None:
+        orig_idx_map = {mon: i for i, mon in enumerate(team.values())}
 
     if is_opponent:
         if battle.teampreview:
@@ -397,9 +414,12 @@ def _slot_condition(
     return 2 if mon in possible_switches else -1
 
 
-def _global_field_token(
-    battle: DoubleBattle, tok: PokemonTokenizer
-) -> tuple[list[int], list[float]]:
+def _global_field_token_into(
+    battle: DoubleBattle,
+    tok: PokemonTokenizer,
+    categorical: np.ndarray,
+    numerical: np.ndarray,
+) -> None:
     # categorical slots:
     # slot 0: weather ID
     # slot 1: Trick Room ID
@@ -420,25 +440,23 @@ def _global_field_token(
         trickroom_id = tok.trickroom_id
         trickroom_duration = _get_turns_left(battle, start_turn)
 
-    categorical = [weather_id, trickroom_id] + [0] * (CATEGORICAL_WIDTH - 2)
-    numerical = [
-        weather_duration,
-        trickroom_duration,
-        float(battle.teampreview),
-        battle.turn / 24.0,
-    ]
-    return categorical, numerical
+    categorical[0] = weather_id
+    categorical[1] = trickroom_id
+    numerical[0] = weather_duration
+    numerical[1] = trickroom_duration
+    numerical[2] = float(battle.teampreview)
+    numerical[3] = battle.turn / 24.0
 
 
-def _side_token(
+def _side_token_into(
     battle: DoubleBattle,
     conditions: dict[SideCondition, int],
     tok: PokemonTokenizer,
     fainted_count: int,
     mega_available: bool,
-) -> tuple[list[int], list[float]]:
-    cat = [0] * CATEGORICAL_WIDTH
-    num = [0.0] * 5
+    cat: np.ndarray,
+    num: np.ndarray,
+) -> None:
 
     auroraveil_turn = conditions.get(SideCondition.AURORA_VEIL)
     if auroraveil_turn is not None:
@@ -459,33 +477,76 @@ def _side_token(
     num[3] = float(fainted_count) / float(TEAM_SIZE)
     num[4] = float(mega_available)
 
-    return cat, num
+
+def _validate_output(out: StructuredObservation) -> None:
+    expected = (
+        ("token_type_ids", out.token_type_ids, (SEQUENCE_LENGTH,), torch.long),
+        ("side_ids", out.side_ids, (SEQUENCE_LENGTH,), torch.long),
+        ("slot_ids", out.slot_ids, (SEQUENCE_LENGTH,), torch.long),
+        (
+            "categorical",
+            out.categorical,
+            (SEQUENCE_LENGTH, CATEGORICAL_WIDTH),
+            torch.long,
+        ),
+        (
+            "numerical",
+            out.numerical,
+            (SEQUENCE_LENGTH, NUMERICAL_WIDTH),
+            torch.float32,
+        ),
+    )
+    for name, tensor, shape, dtype in expected:
+        if tensor.device.type != "cpu":
+            raise ValueError(
+                f"from_battle_into requires CPU output tensors; {name} is on {tensor.device}."
+            )
+        if tensor.shape != shape or tensor.dtype != dtype:
+            raise ValueError(
+                f"Invalid {name}: expected shape {shape} and dtype {dtype}, "
+                f"got shape {tuple(tensor.shape)} and dtype {tensor.dtype}."
+            )
 
 
-def from_battle(
+def from_battle_into(
     battle: AbstractBattle,
+    out: StructuredObservation,
     tok: PokemonTokenizer | None = None,
-) -> StructuredObservation:
+) -> None:
     assert isinstance(battle, DoubleBattle)
+    _validate_output(out)
     tok = tok or tokenizer
 
-    token_types = [TokenType.CLS] + [0] * (SEQUENCE_LENGTH - 1)
-    sides = [SideId.NONE] + [0] * (SEQUENCE_LENGTH - 1)
-    slots = [0] * SEQUENCE_LENGTH
-    categorical = [_ZERO_CATEGORICAL] * SEQUENCE_LENGTH
-    numerical = [_ZERO_NUMERICAL] * SEQUENCE_LENGTH
+    token_types = out.token_type_ids.numpy()
+    sides = out.side_ids.numpy()
+    slots = out.slot_ids.numpy()
+    categorical = out.categorical.numpy()
+    numerical = out.numerical.numpy()
 
-    possible_switches: set[Pokemon] = {
-        mon for switches in battle.available_switches for mon in switches
-    }
+    token_types.fill(0)
+    sides.fill(0)
+    slots.fill(0)
+    categorical.fill(0)
+    numerical.fill(0)
+    token_types[0] = TokenType.CLS
+    sides[0] = SideId.NONE
+
+    possible_switches = {mon for switches in battle.available_switches for mon in switches}
+    ally_orig_idx = {mon: i for i, mon in enumerate(battle.team.values())}
+    opponent_orig_idx = {mon: i for i, mon in enumerate(battle.opponent_team.values())}
 
     idx = 1
-    for side, is_opponent in ((SideId.ALLY, False), (SideId.OPPONENT, True)):
-        for slot_idx, (mon, orig_idx, active_idx) in enumerate(
-            _get_ordered_pokemon(
-                battle, is_opponent, possible_switches if not is_opponent else None
-            )
-        ):
+    for side, is_opponent, orig_idx_map in (
+        (SideId.ALLY, False, ally_orig_idx),
+        (SideId.OPPONENT, True, opponent_orig_idx),
+    ):
+        ordered = _get_ordered_pokemon(
+            battle,
+            is_opponent,
+            possible_switches if not is_opponent else None,
+            orig_idx_map,
+        )
+        for slot_idx, (mon, orig_idx, active_idx) in enumerate(ordered):
             cond = _slot_condition(
                 battle, mon, slot_idx, is_opponent, possible_switches if not is_opponent else None
             )
@@ -495,69 +556,78 @@ def from_battle(
             token_types[idx] = TokenType.POKEMON_SUPER
             sides[idx] = side
             slots[idx] = slot_id
-            categorical[idx] = _pokemon_categorical(mon, tok, move_slots)
-            # numerical is already 0.0 initialized
+            _pokemon_categorical_into(mon, tok, move_slots, categorical[idx])
             idx += 1
 
             token_types[idx] = TokenType.POKEMON_NUMERIC
             sides[idx] = side
             slots[idx] = slot_id
-            # categorical is already 0 initialized
-            numerical[idx] = _pokemon_numeric(
-                mon, battle, cond, orig_idx, move_slots, active_idx, is_opponent=is_opponent
+            _pokemon_numeric_into(
+                mon,
+                battle,
+                cond,
+                orig_idx,
+                move_slots,
+                numerical[idx],
+                active_idx,
+                is_opponent=is_opponent,
             )
             idx += 1
 
-    global_cat, global_num = _global_field_token(battle, tok)
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.NONE
-    categorical[idx] = global_cat
+    _global_field_token_into(battle, tok, categorical[idx], numerical[idx + 1])
     idx += 1
     token_types[idx] = TokenType.FIELD_NUMERIC
     sides[idx] = SideId.NONE
-    numerical[idx] = global_num + [0.0] * (NUMERICAL_WIDTH - len(global_num))
     idx += 1
 
-    ally_fainted = sum([1 for mon in battle.team.values() if mon.fainted])
-    # mega forms persist after fainting, so "any mega form on the team" == "mega used"
+    ally_fainted = sum(mon.fainted for mon in battle.team.values())
     ally_mega_available = not any(_is_mega_form(mon) for mon in battle.team.values())
-    ally_cat, ally_num = _side_token(
-        battle, battle.side_conditions, tok, ally_fainted, ally_mega_available
-    )
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.ALLY
-    categorical[idx] = ally_cat
+    _side_token_into(
+        battle,
+        battle.side_conditions,
+        tok,
+        ally_fainted,
+        ally_mega_available,
+        categorical[idx],
+        numerical[idx + 1],
+    )
     idx += 1
     token_types[idx] = TokenType.FIELD_NUMERIC
     sides[idx] = SideId.ALLY
-    numerical[idx] = ally_num + [0.0] * (NUMERICAL_WIDTH - len(ally_num))
     idx += 1
 
-    opp_fainted = sum([1 for mon in battle.opponent_team.values() if mon.fainted])
+    opp_fainted = sum(mon.fainted for mon in battle.opponent_team.values())
     opp_mega_available = not any(_is_mega_form(mon) for mon in battle.opponent_team.values())
-    opp_cat, opp_num = _side_token(
-        battle, battle.opponent_side_conditions, tok, opp_fainted, opp_mega_available
-    )
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.OPPONENT
-    categorical[idx] = opp_cat
+    _side_token_into(
+        battle,
+        battle.opponent_side_conditions,
+        tok,
+        opp_fainted,
+        opp_mega_available,
+        categorical[idx],
+        numerical[idx + 1],
+    )
     idx += 1
     token_types[idx] = TokenType.FIELD_NUMERIC
     sides[idx] = SideId.OPPONENT
-    numerical[idx] = opp_num + [0.0] * (NUMERICAL_WIDTH - len(opp_num))
     idx += 1
 
-    obs = StructuredObservation(
-        token_type_ids=torch.tensor(token_types, dtype=torch.long),
-        side_ids=torch.tensor(sides, dtype=torch.long),
-        slot_ids=torch.tensor(slots, dtype=torch.long),
-        categorical=torch.tensor(categorical, dtype=torch.long),
-        numerical=torch.tensor(numerical, dtype=torch.float32),
-    )
+    if idx != SEQUENCE_LENGTH:
+        raise RuntimeError(f"Structured observation length drifted to {idx}")
 
-    if obs.token_type_ids.numel() != SEQUENCE_LENGTH:
-        raise RuntimeError(f"Structured observation length drifted to {obs.token_type_ids.numel()}")
 
+def from_battle(
+    battle: AbstractBattle,
+    tok: PokemonTokenizer | None = None,
+) -> StructuredObservation:
+    obs = StructuredObservation.empty_batch(1)[0]
+    from_battle_into(battle, obs, tok)
     return obs
 
 
