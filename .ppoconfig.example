@@ -1,0 +1,11 @@
+# local cpu test values
+# missing parameters are taken from
+# their default in src/train/config.py
+num_episodes=10
+warmup_episodes=1
+n_envs=4
+n_pool_opponents=2
+chunk_size=16
+batch_size=32
+self_play_steps=80
+pool_play_steps=80
