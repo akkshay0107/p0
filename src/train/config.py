@@ -20,16 +20,16 @@ class PPOConfig:
     chunk_size: int = 32  # with BPTT, backward pass takes 14 GB RAM
 
     gamma: float = 0.99
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.98
     clip_low: float = 0.2
     clip_high: float = 0.28  # DAPO style, entropy regularizer
 
     lr: float = 6e-5
-    value_coef: float = 0.5
+    value_coef: float = 0.05
     entropy_coef: float = 0.04
     max_grad_norm: float = 1.0
-    target_kl: float = 0.05  # for early kl stopping
-    ppo_epochs: int = 2  # number of ppo loops per episode
+    target_kl: float = 0.015  # for early kl stopping
+    ppo_epochs: int = 4  # number of ppo loops per episode
     # skew importance of team preview step
     teampreview_loss_mult: float = 1.5
     teampreview_entropy_mult: float = 2.0

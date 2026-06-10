@@ -78,16 +78,14 @@ class PolicyHead(nn.Module):
 
 
 class ValueHead(nn.Module):
-    """Stateful critic value path with gradient scaling."""
+    """Stateful critic value path."""
 
     def __init__(
         self,
         d_model: int,
         hidden_dim: int = 1024,  # double that of policy heads
-        scale: float = 0.05,
     ):
         super().__init__()
-        self.scale = scale
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.GELU(),
@@ -105,10 +103,6 @@ class ValueHead(nn.Module):
                 init.zeros_(module.bias)
 
     def forward(self, z: Tensor) -> Tensor:
-        # scale the gradient flowing back to the trunk
-        if z.requires_grad and self.scale < 1.0:
-            z = z.detach() + self.scale * (z - z.detach())
-
         return self.net(z).squeeze(-1)
 
 

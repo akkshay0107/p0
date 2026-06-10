@@ -49,23 +49,70 @@ class PPOScheduler:
         return self.lr_min + 0.5 * delta * (1 + math.cos(math.pi * prog))
 
 
-def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
-    """Apply weight decay only to Linear weights."""
+def adamw_param_groups(
+    model: PolicyNet, weight_decay: float, base_lr: float, value_lr_mult: float = 10.0
+) -> list[dict]:
+    """Apply weight decay only to Linear weights and scale value head lr."""
     linear_weights = {
         id(module.weight) for module in model.modules() if isinstance(module, nn.Linear)
     }
+    critic_param_ids = {id(p) for p in model.critic.parameters()}
+
     decay_params = []
     no_decay_params = []
-    for param in model.parameters():
-        if id(param) in linear_weights:
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
+    critic_decay_params = []
+    critic_no_decay_params = []
 
-    return [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
+    for param in model.parameters():
+        is_linear_weight = id(param) in linear_weights
+        if id(param) in critic_param_ids:
+            if is_linear_weight:
+                critic_decay_params.append(param)
+            else:
+                critic_no_decay_params.append(param)
+        else:
+            if is_linear_weight:
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+
+    groups = []
+    if decay_params:
+        groups.append(
+            {
+                "params": decay_params,
+                "weight_decay": weight_decay,
+                "lr": base_lr,
+                "is_critic": False,
+            }
+        )
+
+    if no_decay_params:
+        groups.append(
+            {"params": no_decay_params, "weight_decay": 0.0, "lr": base_lr, "is_critic": False}
+        )
+
+    if critic_decay_params:
+        groups.append(
+            {
+                "params": critic_decay_params,
+                "weight_decay": weight_decay,
+                "lr": base_lr * value_lr_mult,
+                "is_critic": True,
+            }
+        )
+
+    if critic_no_decay_params:
+        groups.append(
+            {
+                "params": critic_no_decay_params,
+                "weight_decay": 0.0,
+                "lr": base_lr * value_lr_mult,
+                "is_critic": True,
+            }
+        )
+
+    return groups
 
 
 def save_checkpoint(path: Path, episode: int, policy: PolicyNet, optimizer=None, scheduler=None):

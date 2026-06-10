@@ -383,7 +383,7 @@ def main():
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 
     optimizer = optim.AdamW(
-        adamw_param_groups(policy, weight_decay=1e-4),
+        adamw_param_groups(policy, weight_decay=1e-4, base_lr=config.lr, value_lr_mult=10.0),
         lr=config.lr,
         eps=1e-6,
     )
@@ -502,7 +502,8 @@ def main():
 
             lr = scheduler.lr(episode)
             for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+                mult = 10.0 if param_group.get("is_critic", False) else 1.0
+                param_group["lr"] = lr * mult
             config.entropy_coef = scheduler.entropy_coef(episode)
 
             buffer.reset()
