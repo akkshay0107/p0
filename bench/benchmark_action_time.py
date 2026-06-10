@@ -246,4 +246,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from src.showdown_server import spawned_showdown
+    with spawned_showdown(port=8000):
+        asyncio.run(main())

@@ -100,4 +100,7 @@ if __name__ == "__main__":
         help="Number of battles between any two sets of bots (default: 100)",
     )
     args = parser.parse_args()
-    asyncio.run(main(args.b))
+
+    from src.showdown_server import spawned_showdown
+    with spawned_showdown(port=8000):
+        asyncio.run(main(args.b))

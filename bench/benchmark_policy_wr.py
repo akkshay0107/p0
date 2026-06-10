@@ -127,4 +127,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    asyncio.run(main(args.n_battles, args.checkpoint))
+    from src.showdown_server import spawned_showdown
+    with spawned_showdown(port=8000):
+        asyncio.run(main(args.n_battles, args.checkpoint))
