@@ -2,6 +2,7 @@ import math
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from src.model.policy import PolicyNet
 from src.train.config import PPOConfig
@@ -34,15 +35,37 @@ class PPOScheduler:
         """
         Learning rate scheduling. Linear increase into cosine decay.
         """
-        if t <= self.ramp_up_end:
+        if self.ramp_up_end > 0 and t <= self.ramp_up_end:
             prog = t / self.ramp_up_end
             prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]
             return (1 - prog) * self.lr_min + prog * self.lr_max
+
+        if self.decay_len <= 0:
+            return self.lr_max
+
+        prog = (t - self.ramp_up_end) / self.decay_len
+        prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]
+        delta = self.lr_max - self.lr_min
+        return self.lr_min + 0.5 * delta * (1 + math.cos(math.pi * prog))
+
+
+def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+    """Apply weight decay only to Linear weights."""
+    linear_weights = {
+        id(module.weight) for module in model.modules() if isinstance(module, nn.Linear)
+    }
+    decay_params = []
+    no_decay_params = []
+    for param in model.parameters():
+        if id(param) in linear_weights:
+            decay_params.append(param)
         else:
-            prog = (t - self.ramp_up_end) / self.decay_len
-            prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]
-            delta = self.lr_max - self.lr_min
-            return self.lr_min + 0.5 * delta * (1 + math.cos(math.pi * prog))
+            no_decay_params.append(param)
+
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
 
 
 def initial_state(model: PolicyNet, batch_size: int, device: torch.device):

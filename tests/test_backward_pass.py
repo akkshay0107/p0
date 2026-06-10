@@ -203,6 +203,32 @@ def test_gradient_flow(dummy_obs):
     )
 
 
+def test_action_mask_projection_learns_from_zero_residual():
+    policy = PolicyNet(d_model=64, nhead=2, nlayer=1)
+    projection = policy.actor.mask_proj
+    optimizer = torch.optim.SGD(projection.parameters(), lr=0.1)
+    masks = torch.stack(
+        [
+            torch.zeros(2 * ACT_SIZE),
+            torch.ones(2 * ACT_SIZE),
+        ]
+    )
+
+    initial_output = projection(masks)
+    assert torch.count_nonzero(initial_output) == 0
+
+    optimizer.zero_grad()
+    projection(masks).sum().backward()
+    assert projection[2].weight.grad is not None
+    assert torch.count_nonzero(projection[2].weight.grad) > 0  # type: ignore
+    optimizer.step()
+
+    optimizer.zero_grad()
+    projection(masks).sum().backward()
+    assert projection[0].weight.grad is not None
+    assert torch.count_nonzero(projection[0].weight.grad) > 0  # type: ignore
+
+
 def test_value_head_scaling(dummy_obs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     obs = dummy_obs.to(device)

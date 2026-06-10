@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 # removed as_obs_dict
 from src.model.policy import PolicyNet
 from src.model.structured_observation import StructuredObservation
-from src.train.utils import initial_state
+from src.train.utils import adamw_param_groups, initial_state
 
 BATCH_SIZE = 32  # number of episodes per gradient update
 
@@ -190,7 +190,9 @@ def train_behavior_cloning(
 
     device = policy.device
     optimizer = torch.optim.AdamW(
-        policy.parameters(), lr=learning_rate, eps=1e-5, weight_decay=1e-4
+        adamw_param_groups(policy, weight_decay=1e-4),
+        lr=learning_rate,
+        eps=1e-5,
     )
 
     for epoch in range(num_epochs):

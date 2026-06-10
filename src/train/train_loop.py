@@ -25,6 +25,7 @@ from src.train.opponent_pool import OpponentPool
 from src.train.rollout import RolloutBuffer, collect_rollouts
 from src.train.utils import (
     PPOScheduler,
+    adamw_param_groups,
     initial_state,
     load_checkpoint,
     save_checkpoint,
@@ -50,6 +51,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler("training.log", mode="w"), logging.StreamHandler(sys.stdout)],
 )
+
+
+def _kl_exceeds_target(kl_sum: float, steps: int, target_kl: float) -> tuple[bool, float]:
+    mean_kl = kl_sum / steps if steps > 0 else 0.0
+    return mean_kl > target_kl, mean_kl
 
 
 def _run_batched_ppo(
@@ -273,6 +279,7 @@ def ppo_update(
             optimizer.zero_grad(set_to_none=True)
 
             minibatch_steps = 0
+            minibatch_kl = 0.0
             expected_minibatch_steps = sum(ep["length"] for ep in minibatch)
             for chunk_idx in range(0, len(minibatch), config.chunk_size):
                 chunk = minibatch[chunk_idx : chunk_idx + config.chunk_size]
@@ -286,6 +293,7 @@ def ppo_update(
                 tot_value_loss += batch_metrics["value_loss"]
                 tot_normalized_entropy += batch_metrics["normalized_entropy"]
                 epoch_kl += batch_metrics["kl_div"]
+                minibatch_kl += batch_metrics["kl_div"]
                 tot_clip_frac += batch_metrics["clip_frac"]
                 last_entropy_coef = batch_metrics["entropy_coef"]
                 minibatch_steps += batch_steps
@@ -314,16 +322,17 @@ def ppo_update(
 
             epoch_steps += minibatch_steps
 
-            if epoch_steps > 0:
-                avg_kl = epoch_kl / epoch_steps
-                if avg_kl > config.target_kl:
-                    logging.info(
-                        f"Early stop at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
-                        f"batch {batch_start // config.batch_size + 1} "
-                        f"(KL={avg_kl:.4f} > {config.target_kl:.4f})"
-                    )
-                    early_stop = True
-                    break
+            should_stop, minibatch_mean_kl = _kl_exceeds_target(
+                minibatch_kl, minibatch_steps, config.target_kl
+            )
+            if should_stop:
+                logging.info(
+                    f"Early stop at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
+                    f"batch {batch_start // effective_batch_size + 1} "
+                    f"(minibatch KL={minibatch_mean_kl:.4f} > {config.target_kl:.4f})"
+                )
+                early_stop = True
+                break
 
         tot_steps += epoch_steps
         tot_kl_div += epoch_kl
@@ -365,19 +374,8 @@ def main():
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 
-    # decay only linear weights
-    decay_params, no_decay_params = [], []
-    for module in policy.modules():
-        for name, param in module.named_parameters(recurse=False):
-            if isinstance(module, torch.nn.Linear) and name == "weight":
-                decay_params.append(param)
-            else:
-                no_decay_params.append(param)
     optimizer = optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": 1e-4},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
+        adamw_param_groups(policy, weight_decay=1e-4),
         lr=config.lr,
         eps=1e-6,
     )

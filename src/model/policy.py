@@ -153,10 +153,12 @@ class ActorPolicy(nn.Module):
         # raw env action-mask embedding, added into z so the heads and critic
         # see legality with targetting (mon level doesnt give target info)
         self.mask_proj = make_proj(2 * act_size, d_model)
-        for module in self.mask_proj.modules():
-            if isinstance(module, nn.Linear):
-                init.zeros_(module.weight)
-                init.zeros_(module.bias)
+        mask_input = self.mask_proj[0]
+        mask_output = self.mask_proj[2]
+        init.orthogonal_(mask_input.weight, gain=1.0)  # type: ignore
+        init.zeros_(mask_input.bias)  # type: ignore
+        init.zeros_(mask_output.weight)  # type: ignore
+        init.zeros_(mask_output.bias)  # type: ignore
 
         self.register_buffer(
             "target_seq_indices", torch.tensor(TARGET_SEQ_INDICES, dtype=torch.long)
