@@ -35,6 +35,39 @@ _VOLATILE_ORDER = list(_VOLATILE_MAX_DURATIONS.keys())
 _ZERO_CATEGORICAL = [0] * CATEGORICAL_WIDTH
 _ZERO_NUMERICAL = [0.0] * NUMERICAL_WIDTH
 
+# mega stones end in -ite(x/y) (z soon)
+# replacing the substring check for mega items
+_MEGA_ITEMS = frozenset(
+    item
+    for item in tokenizer.items
+    if item.endswith("ite") or item.endswith("itex") or item.endswith("itey")
+)
+
+# Nature stat impacts: (boosted_stat, hindered_stat)
+# 1: Atk, 2: Def, 3: SpA, 4: SpD, 5: Spe
+nature_impacts = {
+    "adamant": (1, 3),
+    "brave": (1, 5),
+    "lonely": (1, 2),
+    "naughty": (1, 4),
+    "bold": (2, 1),
+    "relaxed": (2, 5),
+    "impish": (2, 3),
+    "lax": (2, 4),
+    "modest": (3, 1),
+    "quiet": (3, 5),
+    "mild": (3, 2),
+    "rash": (3, 4),
+    "calm": (4, 1),
+    "gentle": (4, 2),
+    "sassy": (4, 5),
+    "careful": (4, 3),
+    "timid": (5, 1),
+    "hasty": (5, 2),
+    "jolly": (5, 3),
+    "naive": (5, 4),
+}
+
 
 def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) -> float:
     if start_turn < 0:
@@ -84,6 +117,42 @@ def _pokemon_categorical(
     ]
 
 
+def _estimate_stat_by_nature(pokemon: Pokemon, battle: DoubleBattle):
+    evs = [0] * 6
+    ivs = [31] * 6
+    nature = pokemon.nature or "serious"
+
+    if nature in nature_impacts:
+        boosted, _ = nature_impacts[nature]
+        if boosted in (1, 3, 5):  # Attacking or Speed
+            evs[boosted] = 252
+            if boosted == 5:  # Speed boost; pick best attack stat
+                if pokemon.base_stats["atk"] >= pokemon.base_stats["spa"]:
+                    evs[1] = 252
+                else:
+                    evs[3] = 252
+            else:
+                evs[5] = 252
+            evs[0] = 4
+        elif boosted in (2, 4):  # Defensive
+            evs[boosted] = 252
+            evs[0] = 252
+            evs[5] = 4
+    else:
+        # assume 252 hp and nothing else
+        evs[0] = 252
+
+    gen_data = GenData.from_gen(battle.gen)
+    return compute_raw_stats(
+        pokemon.species,
+        evs,
+        ivs,
+        pokemon.level or 50,
+        nature,
+        gen_data,
+    )
+
+
 def _get_pokemon_level_stats(
     pokemon: Pokemon, battle: DoubleBattle, is_opponent: bool
 ) -> tuple[list[float], float]:
@@ -97,17 +166,7 @@ def _get_pokemon_level_stats(
             float(pokemon.stats["spe"]),
         ], 1.0
 
-    level = pokemon.level or 50
-    gen_data = GenData.from_gen(battle.gen)
-    # default base stats
-    raw_stats = compute_raw_stats(
-        pokemon.species,
-        [0] * 6,
-        [31] * 6,
-        level,
-        "serious",
-        gen_data,
-    )
+    raw_stats = _estimate_stat_by_nature(pokemon, battle)
     return [float(x) for x in raw_stats], 0.0
 
 
@@ -199,7 +258,40 @@ def _pokemon_numeric(
     row[48] = level_stats[5] / 300.0
     row[49] = stats_exact
 
+    # action legality (allies only, the action mask is otherwise invisible to the
+    # network, hiding choice lock / disable / trapping / force switches)
+    if active_idx is not None and not is_opponent and not battle.teampreview:
+        move_legal, can_switch_out = _ally_legality(battle, active_idx, move_slots)
+        row[50] = move_legal[0]
+        row[51] = move_legal[1]
+        row[52] = move_legal[2]
+        row[53] = move_legal[3]
+        row[54] = can_switch_out
+
+    row[55] = pokemon.revealed
+
     return row
+
+
+def _ally_legality(
+    battle: DoubleBattle, active_idx: int, move_slots: list[Move | None]
+) -> tuple[list[float], float]:
+    # mirrors MegaEnv.single_action_mask (env.py) without the action encoding
+    move_legal = [0.0] * MOVE_SLOTS
+    if battle._wait or (any(battle.force_switch) and not battle.force_switch[active_idx]):
+        return move_legal, 0.0
+
+    can_switch_out = float(
+        bool(battle.available_switches[active_idx])
+        and not (battle.trapped[active_idx] or battle.maybe_trapped[active_idx])
+    )
+
+    available_move_ids = {move.id for move in battle.available_moves[active_idx]}
+    for i, move in enumerate(move_slots):
+        if move is not None and move.id in available_move_ids:
+            move_legal[i] = 1.0
+
+    return move_legal, can_switch_out
 
 
 def _pad_team(
@@ -220,23 +312,25 @@ def _get_ordered_pokemon(
     active = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
     team = battle.opponent_team if is_opponent else battle.team
 
+    # both sides: dict insertion order is stable across the battle, so this gives
+    # every mon a persistent identity even as the active-first ordering reshuffles
+    orig_idx_map = {mon: i for i, mon in enumerate(team.values())}
+
     if is_opponent:
-        # opponent: orig_idx is always -1, no switch set needed.
         if battle.teampreview:
-            res = [(mon, -1, None) for mon in team.values()]
+            res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
             return _pad_team(res)
 
         res: list[tuple[Pokemon | None, int, int | None]] = []
         assigned: set[Pokemon] = set()
         for mon in active:
             if mon is not None:
-                res.append((mon, -1, None))
+                res.append((mon, orig_idx_map.get(mon, -1), None))
                 assigned.add(mon)
-        res += [(mon, -1, None) for mon in team.values() if mon not in assigned]
+        res += [
+            (mon, orig_idx_map.get(mon, -1), None) for mon in team.values() if mon not in assigned
+        ]
         return _pad_team(res)
-
-    # ally side: build the orig_idx map once instead of scanning per pokemon.
-    orig_idx_map = {mon: i for i, mon in enumerate(battle.team.values())}
 
     if battle.teampreview:
         res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
@@ -326,9 +420,10 @@ def _side_token(
     conditions: dict[SideCondition, int],
     tok: PokemonTokenizer,
     fainted_count: int,
+    mega_available: bool,
 ) -> tuple[list[int], list[float]]:
     cat = [0] * CATEGORICAL_WIDTH
-    num = [0.0] * 4
+    num = [0.0] * 5
 
     auroraveil_turn = conditions.get(SideCondition.AURORA_VEIL)
     if auroraveil_turn is not None:
@@ -347,6 +442,7 @@ def _side_token(
         num[2] = float(toxic_spikes_layers) / 2.0
 
     num[3] = float(fainted_count) / float(TEAM_SIZE)
+    num[4] = float(mega_available)
 
     return cat, num
 
@@ -408,7 +504,11 @@ def from_battle(
     idx += 1
 
     ally_fainted = sum([1 for mon in battle.team.values() if mon.fainted])
-    ally_cat, ally_num = _side_token(battle, battle.side_conditions, tok, ally_fainted)
+    # mega forms persist after fainting, so "any mega form on the team" == "mega used"
+    ally_mega_available = not any(_is_mega_form(mon) for mon in battle.team.values())
+    ally_cat, ally_num = _side_token(
+        battle, battle.side_conditions, tok, ally_fainted, ally_mega_available
+    )
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.ALLY
     categorical[idx] = ally_cat
@@ -419,7 +519,10 @@ def from_battle(
     idx += 1
 
     opp_fainted = sum([1 for mon in battle.opponent_team.values() if mon.fainted])
-    opp_cat, opp_num = _side_token(battle, battle.opponent_side_conditions, tok, opp_fainted)
+    opp_mega_available = not any(_is_mega_form(mon) for mon in battle.opponent_team.values())
+    opp_cat, opp_num = _side_token(
+        battle, battle.opponent_side_conditions, tok, opp_fainted, opp_mega_available
+    )
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.OPPONENT
     categorical[idx] = opp_cat
@@ -462,7 +565,4 @@ def _can_mega(pokemon: Pokemon | None, battle: DoubleBattle, active_idx: int | N
     item = pokemon.item
     if not item:
         return False
-    item_lower = item.lower()
-    return (item_lower in {"redorb", "blueorb"} or "ite" in item_lower) and not _is_mega_form(
-        pokemon
-    )
+    return PokemonTokenizer.normalize_id(item) in _MEGA_ITEMS and not _is_mega_form(pokemon)

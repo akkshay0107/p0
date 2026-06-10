@@ -105,7 +105,7 @@ def test_nature_embedding_correctness(policy_net):
     )
 
 
-def test_fainted_pokemon_masking(policy_net):
+def test_fainted_pokemon_visible(policy_net):
     B = 1
     obs = StructuredObservation(
         categorical=torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
@@ -169,5 +169,5 @@ def test_fainted_pokemon_masking(policy_net):
             obs, action_mask=action_mask, actions=actions
         )
 
-    assert torch.allclose(logits_fainted, logits_modified, atol=1e-5)
-    assert torch.allclose(value_fainted, value_modified, atol=1e-5)
+    assert not torch.allclose(logits_fainted, logits_modified, atol=1e-5)
+    assert not torch.allclose(value_fainted, value_modified, atol=1e-5)

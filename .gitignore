@@ -39,3 +39,6 @@ backups/
 
 # Scratch dir for small experiments
 scratch/
+
+# Training export
+*.tar.gz

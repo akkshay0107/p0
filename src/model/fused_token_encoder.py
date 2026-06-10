@@ -48,6 +48,30 @@ def _load_vocab_sizes() -> dict[str, int]:
     return {name: len(values) + 1 for name, values in vocab.items()}
 
 
+MOVE_STATIC_WIDTH = 3  # base power, max pp, priority
+
+
+def _load_move_statics() -> torch.Tensor:
+    """Static per-move scalars indexed by vocab move id (row 0 = padding)."""
+    from poke_env.battle.move import Move
+
+    path = Path(__file__).resolve().parents[2] / "data" / "vocab.json"
+    with path.open("r", encoding="utf-8") as f:
+        moves_vocab = json.load(f)["moves"]
+
+    table = torch.zeros(len(moves_vocab) + 1, MOVE_STATIC_WIDTH)
+    for name, idx in moves_vocab.items():
+        try:
+            move = Move(name, gen=9)
+            table[idx, 0] = move.base_power / 150.0
+            table[idx, 1] = move.max_pp / 64.0
+            table[idx, 2] = move.priority / 5.0
+        except Exception:
+            # pseudo-moves without full data stay zero
+            pass
+    return table
+
+
 class MultiAggDeepSet(nn.Module):
     def __init__(self, in_features: int, d_model: int):
         super().__init__()
@@ -79,6 +103,7 @@ class FusedTokenEncoder(nn.Module):
     _field_super_pos: torch.Tensor
     _field_numeric_pos: torch.Tensor
     _component_ids: torch.Tensor
+    _move_statics: torch.Tensor
 
     def __init__(
         self,
@@ -122,8 +147,9 @@ class FusedTokenEncoder(nn.Module):
         self.side_emb = nn.Embedding(NUM_SIDES, d_model)
         self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
 
-        # each move gets a move embedding, a type embedding, and a category embedding
-        self.move_proj = nn.Sequential(nn.Linear(3 * d_raw, d_model), nn.GELU())
+        # each move gets a move embedding, a type embedding, a category embedding,
+        # and a static scalar vector (base power, max pp, priority)
+        self.move_proj = nn.Sequential(nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH, d_model), nn.GELU())
         self.type_set = MultiAggDeepSet(d_raw, d_model)
         self.numeric_proj = nn.Sequential(
             nn.LayerNorm(NUMERICAL_WIDTH),
@@ -146,6 +172,7 @@ class FusedTokenEncoder(nn.Module):
 
         # cache component ids instead of creating them every forward pass
         self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
+        self.register_buffer("_move_statics", _load_move_statics())
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
         self.register_buffer("_super_pos", torch.tensor(_SUPER_POS, dtype=torch.long))
@@ -179,11 +206,13 @@ class FusedTokenEncoder(nn.Module):
 
         type_summary = self.type_set(self.type_emb(categorical[..., 3:5]))
 
+        move_ids = categorical[..., 5:9]
         move_parts = torch.cat(
             [
-                self.move_emb(categorical[..., 5:9]),
+                self.move_emb(move_ids),
                 self.type_emb(categorical[..., 9:13]),
                 self.category_emb(categorical[..., 13:17]),
+                self._move_statics[move_ids],
             ],
             dim=-1,
         )

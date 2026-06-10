@@ -12,9 +12,7 @@ from src.lookups import ACT_SIZE
 from src.model.cls_reducer import CLSReducer
 from src.model.fused_token_encoder import FusedTokenEncoder
 from src.model.structured_observation import (
-    ALL_NUM_TOKENS,
     ALLY_POKE_TOKENS,
-    NUM_IDX_FAINTED,
     NUM_IDX_ORIG_IDX_RATIO,
     NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
@@ -125,14 +123,12 @@ class ActorPolicy(nn.Module):
         self.mega_meta_emb = nn.Parameter(torch.empty(d_act_emb))
         self.target_self_multi_emb = nn.Parameter(torch.empty(d_act_emb))
 
-        def make_proj() -> nn.Sequential:
-            return nn.Sequential(
-                nn.Linear(d_model, d_act_emb), nn.GELU(), nn.Linear(d_act_emb, d_act_emb)
-            )
+        def make_proj(d_in: int, d_out: int) -> nn.Sequential:
+            return nn.Sequential(nn.Linear(d_in, d_out), nn.GELU(), nn.Linear(d_out, d_out))
 
-        self.actor_proj = make_proj()
-        self.target_proj = make_proj()
-        self.move_proj = make_proj()
+        self.actor_proj = make_proj(d_model, d_act_emb)
+        self.target_proj = make_proj(d_model, d_act_emb)
+        self.move_proj = make_proj(d_model, d_act_emb)
         self.side_proj = nn.Linear(d_model, d_act_emb)
 
         for p in [
@@ -153,6 +149,14 @@ class ActorPolicy(nn.Module):
 
         init.orthogonal_(self.side_proj.weight, gain=1.0)
         init.zeros_(self.side_proj.bias)
+
+        # raw env action-mask embedding, added into z so the heads and critic
+        # see legality with targetting (mon level doesnt give target info)
+        self.mask_proj = make_proj(2 * act_size, d_model)
+        for module in self.mask_proj.modules():
+            if isinstance(module, nn.Linear):
+                init.zeros_(module.weight)
+                init.zeros_(module.bias)
 
         self.register_buffer(
             "target_seq_indices", torch.tensor(TARGET_SEQ_INDICES, dtype=torch.long)
@@ -284,14 +288,13 @@ class ActorPolicy(nn.Module):
         # compute metadata internally to simplify signature
         is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
 
-        # padding mask for the reducer
-        padding_mask = torch.zeros(B, tokens.size(1), dtype=torch.bool, device=device)
-        idx_num = torch.tensor(ALL_NUM_TOKENS, device=device)
-        is_fainted = numerical[:, idx_num, NUM_IDX_FAINTED] > 0.5
-        padding_mask[:, idx_num] = is_fainted
-        padding_mask[:, idx_num - 1] = is_fainted
+        # fainted mons stay visible to attention instead of masking
+        z, next_state = self.reducer(tokens, state, None)
 
-        z, next_state = self.reducer(tokens, state, padding_mask)
+        # embed the raw env mask
+        if action_mask is not None:
+            z = z + self.mask_proj(action_mask.reshape(B, -1).float())
+
         logits1 = self.head1(z)
 
         # action eval

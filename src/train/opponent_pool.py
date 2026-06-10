@@ -70,9 +70,11 @@ class OpponentPool:
             return False
 
         # evict lowest wr policy
+        # win_rates are opponent-vs-agent; a new snapshot joins at parity (0.5),
+        # so only evict an opponent that is weaker than parity
         if len(self.opponent_ids) >= self.config.pool_size:
             evict_id = min(self.opponent_ids, key=lambda opp_id: self.win_rates[opp_id])
-            if pool_wr <= self.win_rates[evict_id]:
+            if self.win_rates[evict_id] >= 0.5:
                 return False
 
             evict_path = self.pool_dir / f"{evict_id}.pt"
@@ -91,7 +93,7 @@ class OpponentPool:
         )
 
         self.opponent_ids.append(id)
-        self.win_rates[id] = pool_wr
+        self.win_rates[id] = 0.5
         return True
 
     def load_policy(self, opponent_id: str, device: str) -> PolicyNet:

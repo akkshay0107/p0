@@ -16,7 +16,6 @@ from poke_env.player import RandomPlayer
 
 from src.model.observation_builder import (
     _get_ordered_pokemon,
-    _get_pokemon_level_stats,
     _global_field_token,
     _iter_move_slots,
     _pokemon_categorical,
@@ -416,9 +415,9 @@ def test_side_token_real():
         SideCondition.TOXIC_SPIKES: 2,  # layers = 2. Value: 2 / 2 = 1.0
     }
 
-    cat, num = _side_token(battle, conditions, tokenizer, fainted_count=3)
+    cat, num = _side_token(battle, conditions, tokenizer, fainted_count=3, mega_available=True)
     assert len(cat) == CATEGORICAL_WIDTH
-    assert len(num) == 4
+    assert len(num) == 5
 
     assert cat[0] == tokenizer.side_conditions.get(SideCondition.AURORA_VEIL)
     assert cat[1] == tokenizer.side_conditions.get(SideCondition.TAILWIND)
@@ -428,6 +427,10 @@ def test_side_token_real():
     assert abs(num[1] - 0.5) < 1e-5
     assert abs(num[2] - 1.0) < 1e-5
     assert abs(num[3] - 0.5) < 1e-5  # 3 fainted out of 6
+    assert num[4] == 1.0  # mega still available
+
+    _, num_used = _side_token(battle, conditions, tokenizer, fainted_count=3, mega_available=False)
+    assert num_used[4] == 0.0
 
 
 def test_from_battle_real_end_to_end():
@@ -556,47 +559,3 @@ def test_pokemon_nature_in_categorical():
     jolly_id = tokenizer.nature_id(mon)
     assert jolly_id > 0
     assert cat[24] == jolly_id
-
-
-def test_get_pokemon_level_stats_logic():
-    battle = make_real_battle()
-    mon = make_real_pokemon(species="charizard")
-
-    # 1. Ally with populated stats
-    mon._stats = {"hp": 300, "atk": 200, "def": 180, "spa": 150, "spd": 160, "spe": 210}
-    stats, exact = _get_pokemon_level_stats(mon, battle, is_opponent=False)
-    assert exact == 1.0
-    assert stats == [300.0, 200.0, 180.0, 150.0, 160.0, 210.0]
-
-    # 2. Opponent (should fall back to uninvested base stats)
-    mon._level = 50
-    stats_opp, exact_opp = _get_pokemon_level_stats(mon, battle, is_opponent=True)
-    assert exact_opp == 0.0
-    # Charizard level 50 uninvested: HP base 78 -> (78*2 + 31)*50/100 + 10 + 50 = 153
-    # Atk base 84 -> (84*2 + 31)*50/100 + 5 = 104
-    assert stats_opp[0] == 153.0
-    assert stats_opp[1] == 104.0
-
-
-def test_exact_stats_in_numeric():
-    battle = make_real_battle()
-    mon = make_real_pokemon(species="charizard")
-    mon._stats = {"hp": 300, "atk": 200, "def": 180, "spa": 150, "spd": 160, "spe": 210}
-
-    # Ally (is_opponent=False)
-    row_ally = _pokemon_numeric(
-        mon, battle, cond=1, orig_idx=0, move_slots=_iter_move_slots(mon), is_opponent=False
-    )
-    assert len(row_ally) == NUMERICAL_WIDTH
-    assert abs(row_ally[43] - 300.0 / 300.0) < 1e-5
-    assert abs(row_ally[44] - 200.0 / 300.0) < 1e-5
-    assert abs(row_ally[49] - 1.0) < 1e-5
-
-    # Opponent (is_opponent=True)
-    mon._level = 50
-    row_opp = _pokemon_numeric(
-        mon, battle, cond=1, orig_idx=0, move_slots=_iter_move_slots(mon), is_opponent=True
-    )
-    # HP uninvested is 153
-    assert abs(row_opp[43] - 153.0 / 300.0) < 1e-5
-    assert abs(row_opp[49] - 0.0) < 1e-5

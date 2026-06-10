@@ -294,6 +294,11 @@ def ppo_update(
                     scaled_loss = batch_loss / expected_minibatch_steps
                     if torch.isfinite(scaled_loss):
                         scaled_loss.backward()
+                    else:
+                        logging.warning(
+                            f"Non-finite chunk loss at episode {episode}, skipping backward "
+                            f"for {batch_steps} steps (minibatch gradient will be undercounted)"
+                        )
 
             if minibatch_steps > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -359,7 +364,23 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
-    optimizer = optim.AdamW(policy.parameters(), lr=config.lr, eps=1e-6, weight_decay=1e-4)
+
+    # decay only linear weights
+    decay_params, no_decay_params = [], []
+    for module in policy.modules():
+        for name, param in module.named_parameters(recurse=False):
+            if isinstance(module, torch.nn.Linear) and name == "weight":
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+    optimizer = optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": 1e-4},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=config.lr,
+        eps=1e-6,
+    )
 
     # to guarantee executor shutdown
     try:
@@ -464,6 +485,10 @@ def main():
         env_opponents = ["self"] * config.n_envs
         active_pool_policies = {}
 
+        # smoothed agent-vs-pool win rate for snapshot admission; a single
+        # episode's pbt phase (~70 games) is too noisy to gate on
+        pool_wr_ema = 0.5
+
         for episode in range(start, config.num_episodes):
             if shutdown_requested:
                 logging.warning("Shutdown requested, saving checkpoint and exiting")
@@ -512,15 +537,19 @@ def main():
             rollout_data = buffer.get_batches(policy.device, config)
             stats = ppo_update(rollout_data, policy, optimizer, config, episode, shutdown_requested)
 
+            alpha = config.pool_win_rate_smoothing
+            pool_wr_ema = (1 - alpha) * pool_wr_ema + alpha * pool_wr
+
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
-                added = pool.add(policy, snap_id, pool_wr)
+                added = pool.add(policy, snap_id, pool_wr_ema)
                 if added:
                     pool.save_state()
                     logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
                 else:
                     logging.info(
-                        f"Snapshot '{snap_id}' not added to opponent pool (win rate: {pool_wr:.4f}). Pool: {pool}"
+                        f"Snapshot '{snap_id}' not added to opponent pool "
+                        f"(win rate EMA: {pool_wr_ema:.4f}). Pool: {pool}"
                     )
 
             current_lr = optimizer.param_groups[0]["lr"]

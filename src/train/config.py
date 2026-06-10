@@ -19,7 +19,7 @@ class PPOConfig:
     batch_size: int = 128
     chunk_size: int = 32  # with BPTT, backward pass takes 14 GB RAM
 
-    gamma: float = 0.97
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_low: float = 0.2
     clip_high: float = 0.28  # DAPO style, entropy regularizer
