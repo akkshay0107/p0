@@ -22,7 +22,7 @@ from src.model.structured_observation import (
 )
 from src.train.config import PPOConfig, load_config
 from src.train.opponent_pool import OpponentPool
-from src.train.rollout import RolloutBuffer, collect_rollouts
+from src.train.rollout import RolloutBuffer, build_partition, collect_rollouts
 from src.train.utils import (
     PPOScheduler,
     adamw_param_groups,
@@ -484,11 +484,10 @@ def main():
         state2 = policy.initial_state(config.n_envs)
         trajectories1 = create_trajectory_buffers(config.n_envs)
         trajectories2 = create_trajectory_buffers(config.n_envs)
-        env_opponents = ["self"] * config.n_envs
         active_pool_policies = {}
+        partition = build_partition(config, pool, policy.device)
 
-        # smoothed agent-vs-pool win rate for snapshot admission; a single
-        # episode's pbt phase (~70 games) is too noisy to gate on
+        # Smoothed agent-vs-pool win rate for snapshot admission.
         pool_wr_ema = 0.5
 
         for episode in range(start, config.num_episodes):
@@ -503,30 +502,26 @@ def main():
             config.entropy_coef = scheduler.entropy_coef(episode)
 
             buffer.reset()
-            rollout_time = 0.0
+            policy.eval()
+
+            t0_rollout = time.time()
+            (pool_wins, pool_games), state1, state2 = collect_rollouts(
+                vec_env,
+                policy,
+                buffer,
+                pool,
+                config,
+                active_pool_policies,
+                trajectories1,
+                trajectories2,
+                state1,
+                state2,
+                partition,
+            )
+            rollout_time = time.time() - t0_rollout
             pool_wr = 0.0
-
-            for target_mode in ["self_play", "pbt"]:
-                policy.eval()
-
-                t0_rollout = time.time()
-                mode_pool_wr, state1, state2 = collect_rollouts(
-                    vec_env,
-                    policy,
-                    buffer,
-                    pool,
-                    config,
-                    active_pool_policies,
-                    trajectories1,
-                    trajectories2,
-                    state1,
-                    state2,
-                    env_opponents,
-                    target_mode,
-                )
-                rollout_time += time.time() - t0_rollout
-                if target_mode == "pbt":
-                    pool_wr = mode_pool_wr
+            if pool_games > 0:
+                pool_wr = pool_wins / pool_games
 
             if not buffer.trajectories:
                 logging.warning("No trajectories collected, skipping update")
@@ -539,8 +534,9 @@ def main():
             rollout_data = buffer.get_batches(policy.device, config)
             stats = ppo_update(rollout_data, policy, optimizer, config, episode, shutdown_requested)
 
-            alpha = config.pool_win_rate_smoothing
-            pool_wr_ema = (1 - alpha) * pool_wr_ema + alpha * pool_wr
+            if pool_games > 0:
+                alpha = config.pool_win_rate_smoothing
+                pool_wr_ema = (1 - alpha) * pool_wr_ema + alpha * pool_wr
 
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"

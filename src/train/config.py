@@ -13,9 +13,9 @@ class PPOConfig:
     # with 16 GB RAM
     num_episodes: int = 12500
     n_envs: int = 8
+    n_self_envs: int = 4
     n_pool_opponents: int = 2
-    self_play_steps: int = 160
-    pool_play_steps: int = 160
+    rollout_steps: int = 320
     batch_size: int = 128
     chunk_size: int = 32  # with BPTT, backward pass takes 14 GB RAM
 
@@ -46,6 +46,14 @@ class PPOConfig:
     snapshot_interval: int = 50
     pool_win_rate_smoothing: float = 0.1
     pool_wr_floor: float = 0.1
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.n_self_envs <= self.n_envs:
+            raise ValueError("n_self_envs must be between 0 and n_envs.")
+        if self.rollout_steps <= 0:
+            raise ValueError("rollout_steps must be greater than zero.")
+        if self.n_pool_opponents <= 0:
+            raise ValueError("n_pool_opponents must be greater than zero.")
 
 
 def load_config(config_path: str = ".ppoconfig") -> PPOConfig:

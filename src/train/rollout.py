@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 
@@ -18,6 +20,52 @@ def assign_pool_opponents(n_envs: int, roster: list[str]) -> list[str]:
     if not roster:
         raise ValueError("Pool opponent roster must not be empty.")
     return [roster[env_id % len(roster)] for env_id in range(n_envs)]
+
+
+@dataclass(slots=True)
+class EnvPartition:
+    self_idx: torch.Tensor
+    pool_idx: torch.Tensor
+    opponent_ids: list[str]
+    self_mask_cpu: torch.Tensor
+
+    def pool_groups(self) -> tuple[tuple[str, torch.Tensor], ...]:
+        grouped_indices: dict[str, list[int]] = {}
+        for env_id in self.pool_idx.tolist():
+            opponent_id = self.opponent_ids[env_id]
+            grouped_indices.setdefault(opponent_id, []).append(env_id)
+        return tuple(
+            (
+                opponent_id,
+                torch.tensor(indices, device=self.pool_idx.device),
+            )
+            for opponent_id, indices in grouped_indices.items()
+        )
+
+
+def build_partition(
+    config: PPOConfig,
+    pool: OpponentPool,
+    device: torch.device,
+) -> EnvPartition:
+    n_self = config.n_envs if len(pool) == 0 else config.n_self_envs
+    self_idx = torch.arange(n_self, device=device)
+    pool_idx = torch.arange(n_self, config.n_envs, device=device)
+    self_mask_cpu = torch.arange(config.n_envs) < n_self
+
+    opponent_ids = ["self"] * config.n_envs
+    if pool_idx.numel() > 0:
+        roster = pool.sample_many(config.n_pool_opponents)
+        assignments = assign_pool_opponents(pool_idx.numel(), roster)
+        for env_id, opponent_id in zip(pool_idx.tolist(), assignments, strict=True):
+            opponent_ids[env_id] = opponent_id
+
+    return EnvPartition(
+        self_idx=self_idx,
+        pool_idx=pool_idx,
+        opponent_ids=opponent_ids,
+        self_mask_cpu=self_mask_cpu,
+    )
 
 
 def create_trajectory_buffers(n_envs, max_steps=100, device="cpu"):
@@ -145,16 +193,11 @@ def collect_rollouts(
     trajectories2: dict,
     state1: torch.Tensor,
     state2: torch.Tensor,
-    env_opponents: list[str],
-    target_mode: str,
-):
+    partition: EnvPartition,
+) -> tuple[tuple[int, int], torch.Tensor, torch.Tensor]:
     """
-    Collects rollouts using the vectorized environment defined in the train module.
-    Self-play and pool-play are collected in separate phases across all environments.
-
-    Each pool-play phase samples a bounded policy roster and assigns every environment
-    a fixed roster member. Policies are swapped lazily when games end to prevent episodes
-    or recurrent states from being split across different policies.
+    Collect one rollout with statically assigned self-play and pool-play environments.
+    Pool snapshots change only after that environment completes a battle.
     """
     n_envs = vec_env.n_envs
     device = policy.device
@@ -165,23 +208,25 @@ def collect_rollouts(
     pool_wins = 0
     pool_total = 0
 
-    steps = config.self_play_steps if target_mode == "self_play" else config.pool_play_steps
-
     step_counts1 = trajectories1["step_counts"]
     step_counts2 = trajectories2["step_counts"]
 
     idx_all = torch.arange(n_envs)
-    pool_roster: list[str] = []
-    thread_pool_opponents: list[str] = []
+    self_idx_cpu = partition.self_mask_cpu.nonzero().squeeze(-1)
+    next_pool_opponents: dict[int, str] = {}
+    if partition.pool_idx.numel() > 0:
+        roster = pool.sample_many(config.n_pool_opponents)
+        assignments = assign_pool_opponents(partition.pool_idx.numel(), roster)
+        next_pool_opponents = dict(zip(partition.pool_idx.tolist(), assignments, strict=True))
 
-    if target_mode != "self_play" and len(pool) > 0:
-        pool_roster = pool.sample_many(config.n_pool_opponents)
-        thread_pool_opponents = assign_pool_opponents(n_envs, pool_roster)
-        for opponent_id in pool_roster:
-            if opponent_id not in active_pool_policies:
-                active_pool_policies[opponent_id] = pool.load_policy(opponent_id, str(device))
+    for opponent_id, _ in partition.pool_groups():
+        if opponent_id not in active_pool_policies:
+            active_pool_policies[opponent_id] = pool.load_policy(opponent_id, str(device))
+    for opponent_id in set(next_pool_opponents.values()):
+        if opponent_id not in active_pool_policies:
+            active_pool_policies[opponent_id] = pool.load_policy(opponent_id, str(device))
 
-    for step in range(steps):
+    for _ in range(config.rollout_steps):
         obs1_gpu = vec_env.get_batched_obs1(device)
         mask1_gpu = torch.from_numpy(masks1).to(device, non_blocking=True)
         obs2_gpu = vec_env.get_batched_obs2(device)
@@ -193,9 +238,7 @@ def collect_rollouts(
         values1 = out1.value
         next_state1 = out1.state
 
-        is_all_self_play = all(opp == "self" for opp in env_opponents)
-        # self play fast path
-        if is_all_self_play:
+        if partition.pool_idx.numel() == 0:
             out2 = policy.act_obs(obs2_gpu, mask2_gpu, state2)
             log_probs2 = out2.log_probs
             actions2 = out2.actions
@@ -207,23 +250,27 @@ def collect_rollouts(
             values2 = torch.zeros_like(values1)
             next_state2 = state2.clone()
 
-            opp_groups = {}
-            for i, opp_id in enumerate(env_opponents):
-                opp_groups.setdefault(opp_id, []).append(i)
+            if partition.self_idx.numel() > 0:
+                self_out = policy.act_obs(
+                    obs2_gpu[partition.self_idx],
+                    mask2_gpu[partition.self_idx],
+                    state2[partition.self_idx],
+                )
+                actions2[partition.self_idx] = self_out.actions
+                log_probs2[partition.self_idx] = self_out.log_probs
+                values2[partition.self_idx] = self_out.value
+                next_state2[partition.self_idx] = self_out.state
 
-            for opp_id, env_indices in opp_groups.items():
-                idx_tensor = torch.tensor(env_indices, device=device)
-                group_obs2 = obs2_gpu[idx_tensor]
-                group_mask2 = mask2_gpu[idx_tensor]
-                group_state2 = state2[idx_tensor]
-
-                active_policy = policy if opp_id == "self" else active_pool_policies[opp_id]
-                group_out = active_policy.act_obs(group_obs2, group_mask2, group_state2)
-
-                actions2[idx_tensor] = group_out.actions
-                log_probs2[idx_tensor] = group_out.log_probs
-                values2[idx_tensor] = group_out.value
-                next_state2[idx_tensor] = group_out.state
+            for opponent_id, group_idx in partition.pool_groups():
+                group_out = active_pool_policies[opponent_id].act_obs(
+                    obs2_gpu[group_idx],
+                    mask2_gpu[group_idx],
+                    state2[group_idx],
+                )
+                actions2[group_idx] = group_out.actions
+                log_probs2[group_idx] = group_out.log_probs
+                values2[group_idx] = group_out.value
+                next_state2[group_idx] = group_out.state
 
         # store actions in traj before step to avoid overwrite
         # and needing to clone, instead of with step results
@@ -248,23 +295,23 @@ def collect_rollouts(
         trajectories1["action_masks"][idx_all, s1] = torch.from_numpy(masks1).to(torch.bool)
         step_counts1 += 1
 
-        self_play_mask = torch.tensor([opp == "self" for opp in env_opponents], dtype=torch.bool)
-        has_self_play = bool(self_play_mask.any())
-        sp_idx = self_play_mask.nonzero().squeeze(-1)
-        s2 = step_counts2[sp_idx]
+        has_self_play = self_idx_cpu.numel() > 0
+        s2 = step_counts2[self_idx_cpu]
         if has_self_play:
-            trajectories2["categorical"][sp_idx, s2] = obs2_cpu.categorical[sp_idx]
-            trajectories2["numerical"][sp_idx, s2] = obs2_cpu.numerical[sp_idx]
-            trajectories2["token_type_ids"][sp_idx, s2] = obs2_cpu.token_type_ids[sp_idx]
-            trajectories2["side_ids"][sp_idx, s2] = obs2_cpu.side_ids[sp_idx]
-            trajectories2["slot_ids"][sp_idx, s2] = obs2_cpu.slot_ids[sp_idx]
-            trajectories2["actions"][sp_idx, s2] = actions2_cpu[sp_idx]
-            trajectories2["log_probs"][sp_idx, s2] = log_probs2_cpu[sp_idx]
-            trajectories2["values"][sp_idx, s2] = values2_cpu[sp_idx]
-            trajectories2["action_masks"][sp_idx, s2] = torch.from_numpy(masks2)[sp_idx].to(
-                torch.bool
-            )
-            step_counts2[sp_idx] += 1
+            trajectories2["categorical"][self_idx_cpu, s2] = obs2_cpu.categorical[self_idx_cpu]
+            trajectories2["numerical"][self_idx_cpu, s2] = obs2_cpu.numerical[self_idx_cpu]
+            trajectories2["token_type_ids"][self_idx_cpu, s2] = obs2_cpu.token_type_ids[
+                self_idx_cpu
+            ]
+            trajectories2["side_ids"][self_idx_cpu, s2] = obs2_cpu.side_ids[self_idx_cpu]
+            trajectories2["slot_ids"][self_idx_cpu, s2] = obs2_cpu.slot_ids[self_idx_cpu]
+            trajectories2["actions"][self_idx_cpu, s2] = actions2_cpu[self_idx_cpu]
+            trajectories2["log_probs"][self_idx_cpu, s2] = log_probs2_cpu[self_idx_cpu]
+            trajectories2["values"][self_idx_cpu, s2] = values2_cpu[self_idx_cpu]
+            trajectories2["action_masks"][self_idx_cpu, s2] = torch.from_numpy(masks2)[
+                self_idx_cpu
+            ].to(torch.bool)
+            step_counts2[self_idx_cpu] += 1
 
         env_actions = [
             {
@@ -281,11 +328,11 @@ def collect_rollouts(
         trajectories1["dones"][idx_all, s1] = torch.from_numpy(dones.astype(np.float32))
 
         if has_self_play:
-            trajectories2["rewards"][sp_idx, s2] = torch.from_numpy(
-                rewards2[self_play_mask.numpy()]
+            trajectories2["rewards"][self_idx_cpu, s2] = torch.from_numpy(
+                rewards2[partition.self_mask_cpu.numpy()]
             )
-            trajectories2["dones"][sp_idx, s2] = torch.from_numpy(
-                dones[self_play_mask.numpy()].astype(np.float32)
+            trajectories2["dones"][self_idx_cpu, s2] = torch.from_numpy(
+                dones[partition.self_mask_cpu.numpy()].astype(np.float32)
             )
 
         for i in range(n_envs):
@@ -312,7 +359,7 @@ def collect_rollouts(
                     buffer.add_episode(ep1)
                 step_counts1[i] = 0
 
-                if env_opponents[i] == "self":
+                if partition.self_mask_cpu[i]:
                     length2 = step_counts2[i].item()
                     if length2 > 0:
                         ep2 = {
@@ -335,21 +382,17 @@ def collect_rollouts(
                 step_counts2[i] = 0
 
                 # ties only happen on truncation; exclude them from win-rate stats
-                if env_opponents[i] != "self" and rewards1[i] != rewards2[i]:
+                opponent_id = partition.opponent_ids[i]
+                if opponent_id != "self" and rewards1[i] != rewards2[i]:
                     won = bool(rewards1[i] > rewards2[i])
                     pool_wins += int(won)
                     pool_total += 1
-                    pool.update_win_rate(env_opponents[i], won)
+                    pool.update_win_rate(opponent_id, int(won))
 
                 next_state1[i : i + 1] = 0
                 next_state2[i : i + 1] = 0
-
-                # lazy swap
-                if target_mode == "self_play" or len(pool) == 0:
-                    env_opponents[i] = "self"
-                else:
-                    new_opp_id = thread_pool_opponents[i]
-                    env_opponents[i] = new_opp_id
+                if opponent_id != "self":
+                    partition.opponent_ids[i] = next_pool_opponents[i]
 
         masks1 = next_masks1
         masks2 = next_masks2
@@ -357,9 +400,9 @@ def collect_rollouts(
         state2 = next_state2
 
     # cleanup inactive policies
-    active_ids = set(env_opponents)
+    active_ids = {opponent_id for opponent_id, _ in partition.pool_groups()}
     keys_to_remove = [k for k in active_pool_policies.keys() if k not in active_ids]
     for k in keys_to_remove:
         del active_pool_policies[k]
 
-    return pool_wins / pool_total if pool_total > 0 else 0.0, state1, state2
+    return (pool_wins, pool_total), state1, state2
