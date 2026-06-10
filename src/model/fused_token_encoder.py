@@ -150,7 +150,6 @@ class FusedTokenEncoder(nn.Module):
         self.move_proj = nn.Sequential(nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH, d_model), nn.GELU())
         self.type_set = MultiAggDeepSet(d_raw, d_model)
         self.numeric_proj = nn.Sequential(
-            nn.LayerNorm(NUMERICAL_WIDTH),
             nn.Linear(NUMERICAL_WIDTH, d_model),
             nn.GELU(),
         )

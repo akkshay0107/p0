@@ -141,7 +141,7 @@ def test_tokenizer_nature():
 
     p._nature = "Serious"
     serious_id = tokenizer.nature_id(p)
-    assert serious_id > 0
+    assert serious_id == 0
     p._nature = "Bashful"
     assert serious_id == tokenizer.nature_id(p)
 

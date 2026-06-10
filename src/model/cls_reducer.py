@@ -31,7 +31,8 @@ class CLSReducer(nn.Module):
         dim_feedforward = dim_feedforward or 4 * d_model
 
         self.cls_base = nn.Parameter(torch.empty(1, 1, d_model))
-        self.register_buffer("hg_init", torch.zeros(1, self.n_hg, d_model))
+        # learned initial state with random per-slot init
+        self.hg_init = nn.Parameter(torch.empty(1, self.n_hg, d_model))
         if self.use_history:
             # per-channel gate so each history dimension can keep or refresh independently
             self.hg_gate = nn.Parameter(torch.zeros(1, self.n_hg, d_model))
@@ -48,6 +49,7 @@ class CLSReducer(nn.Module):
     def _init_weights(self):
         emb_gain = self.d_model**-0.5
         init.normal_(self.cls_base, std=emb_gain)
+        init.normal_(self.hg_init, std=emb_gain)
         if self.use_history:
             init.zeros_(self.hg_gate)
         for module in self.modules():

@@ -418,10 +418,17 @@ def collect_rollouts(
                     pool_total += 1
                     pool.update_win_rate(opponent_id, int(won))
 
-                next_state1[i : i + 1] = 0
-                next_state2[i : i + 1] = 0
+                # reset to each policy's learned initial state (hg_init is no
+                # longer zeros); the BPTT recompute starts episodes from
+                # initial_state, so the rollout reset must match it
+                next_state1[i : i + 1] = policy.initial_state(1)
                 if opponent_id != "self":
                     partition.opponent_ids[i] = next_pool_opponents[i]
+                    next_state2[i : i + 1] = active_pool_policies[
+                        next_pool_opponents[i]
+                    ].initial_state(1)
+                else:
+                    next_state2[i : i + 1] = policy.initial_state(1)
 
         masks1 = next_masks1
         masks2 = next_masks2

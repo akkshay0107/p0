@@ -24,6 +24,9 @@ class FakePolicy:
         self.device = torch.device("cpu")
         self.batch_sizes: list[int] = []
 
+    def initial_state(self, batch_size: int) -> torch.Tensor:
+        return torch.zeros((batch_size, 1, 1))
+
     def act_obs(
         self,
         obs: StructuredObservation,

@@ -439,7 +439,7 @@ class PolicyNet(nn.Module):
         return next(self.parameters()).device
 
     def initial_state(self, batch_size: int) -> Tensor:
-        return self.actor.reducer.hg_init.detach().expand(batch_size, -1, -1).to(self.device)
+        return self.actor.reducer.hg_init.expand(batch_size, -1, -1).to(self.device)
 
     def encode(
         self,
@@ -459,6 +459,12 @@ class PolicyNet(nn.Module):
         *,
         top_p: float = 1.0,
     ) -> ActOutput:
+        # NOTE: with top_p < 1.0 the returned log_probs are taken w.r.t. the
+        # truncated sampling distribution, not the full policy, while `evaluate`
+        # always scores against the full distribution. Rollouts collected for
+        # PPO training must therefore use top_p=1.0 (the default) or the
+        # importance ratios will be wrong top_p < 1.0 is for
+        # evaluation/play only.
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
         actions, log_probs, next_state, z = self.actor.sample(enc, action_mask, state, top_p=top_p)
