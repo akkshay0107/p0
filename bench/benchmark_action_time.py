@@ -129,7 +129,7 @@ class ProfiledRLPlayer(RLPlayer):
 
         start_inference = get_time()
         with torch.no_grad():
-            tokens, aux = self.policy.encoder(obs, aux=True)
+            tokens, aux = self.policy.encoder(obs, action_mask=action_mask, aux=True)
             numerical = obs.numerical
             if numerical.dim() == 2:
                 numerical = numerical.unsqueeze(0)

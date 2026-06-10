@@ -86,7 +86,8 @@ def _run_batched_ppo(
     is_warmup = episode < config.warmup_episodes
 
     all_obs = StructuredObservation.cat([ep["obs"] for ep in episodes], dim=0)
-    all_tokens, all_aux = policy.encoder(all_obs, aux=True)
+    all_action_masks = torch.cat([ep["action_masks"] for ep in episodes], dim=0).to(device)
+    all_tokens, all_aux = policy.encoder(all_obs, action_mask=all_action_masks, aux=True)
     if is_warmup:
         all_tokens = all_tokens.detach()
         all_aux = all_aux.detach()

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
+from src.lookups import ACT_SIZE
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
     NUMERICAL_WIDTH,
@@ -161,6 +162,12 @@ class FusedTokenEncoder(nn.Module):
             nn.Linear(NUMERICAL_WIDTH, d_model),
             nn.GELU(),
         )
+        self.action_mask_proj = nn.Sequential(
+            nn.Linear(2 * ACT_SIZE, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
 
         self.mon_fusion = SwiGLUTransformerEncoder(
             d_model=d_model,
@@ -194,6 +201,37 @@ class FusedTokenEncoder(nn.Module):
             elif isinstance(module, nn.Embedding):
                 init.normal_(module.weight, std=emb_gain)
         init.normal_(self.mon_fusion_token, std=emb_gain)
+        init.normal_(self.action_mask_token, std=emb_gain)
+
+    def append_action_mask_token(
+        self,
+        tokens: torch.Tensor,
+        action_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if tokens.dim() == 2:
+            tokens = tokens.unsqueeze(0)
+
+        B = tokens.size(0)
+        if action_mask is None:
+            flat_mask = torch.zeros(
+                B,
+                2 * ACT_SIZE,
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+        else:
+            action_mask = action_mask.to(tokens.device)
+            if action_mask.dim() == 2:
+                action_mask = action_mask.unsqueeze(0)
+            if action_mask.shape != (B, 2, ACT_SIZE):
+                raise ValueError(
+                    f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
+                )
+            flat_mask = action_mask.reshape(B, -1).to(tokens.dtype)
+
+        mask_token = self.action_mask_token.expand(B, -1, -1)
+        mask_token = mask_token + self.action_mask_proj(flat_mask).unsqueeze(1)
+        return torch.cat([tokens, mask_token], dim=1)
 
     def _embed_pokemon_super(
         self, categorical: torch.Tensor, aux: bool = False
@@ -275,19 +313,20 @@ class FusedTokenEncoder(nn.Module):
 
     @overload
     def forward(
-        self, obs: StructuredObservation, aux: Literal[True]
+        self,
+        obs: StructuredObservation,
+        aux: Literal[True],
+        action_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
     @overload
     def forward(self, obs: StructuredObservation, aux: Literal[False] = False) -> torch.Tensor: ...
 
-    @overload
     def forward(
-        self, obs: StructuredObservation, aux: bool
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
-
-    def forward(
-        self, obs: StructuredObservation, aux: bool = False
+        self,
+        obs: StructuredObservation,
+        aux: bool = False,
+        action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         categorical = obs.categorical.long()
         numerical = obs.numerical.float()
@@ -361,6 +400,7 @@ class FusedTokenEncoder(nn.Module):
             + self.side_emb(side_ids)
             + self.slot_emb(slot_ids)
         )
+        out_tokens = self.append_action_mask_token(out_tokens, action_mask)
 
         if aux:
             assert aux_tensor is not None

@@ -57,8 +57,12 @@ def _run_batched_bc(
         all_obs_tensors.append(
             StructuredObservation.cat([sample["obs"].unsqueeze(0) for sample in ep], dim=0)
         )
+    all_masks_list = [
+        torch.cat([sample["mask"].unsqueeze(0) for sample in ep], dim=0) for ep in episodes
+    ]
     all_obs = StructuredObservation.cat(all_obs_tensors, dim=0).to(device)
-    all_tokens, all_aux = policy.encoder(all_obs, aux=True)
+    all_masks = torch.cat(all_masks_list, dim=0).to(device)
+    all_tokens, all_aux = policy.encoder(all_obs, action_mask=all_masks, aux=True)
     tokens_list = torch.split(all_tokens, [len(ep) for ep in episodes])
     aux_list = torch.split(all_aux, [len(ep) for ep in episodes])
     numerical_list = torch.split(all_obs.numerical, [len(ep) for ep in episodes])
@@ -71,9 +75,6 @@ def _run_batched_bc(
     def pack(fields):
         return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
 
-    all_masks_list = [
-        torch.cat([sample["mask"].unsqueeze(0) for sample in ep], dim=0) for ep in episodes
-    ]
     all_targets_list = [
         torch.cat([sample["action"].unsqueeze(0) for sample in ep], dim=0) for ep in episodes
     ]

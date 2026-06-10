@@ -150,16 +150,6 @@ class ActorPolicy(nn.Module):
         init.orthogonal_(self.side_proj.weight, gain=1.0)
         init.zeros_(self.side_proj.bias)
 
-        # raw env action-mask embedding, added into z so the heads and critic
-        # see legality with targetting (mon level doesnt give target info)
-        self.mask_proj = make_proj(2 * act_size, d_model)
-        mask_input = self.mask_proj[0]
-        mask_output = self.mask_proj[2]
-        init.orthogonal_(mask_input.weight, gain=1.0)  # type: ignore
-        init.zeros_(mask_input.bias)  # type: ignore
-        init.zeros_(mask_output.weight)  # type: ignore
-        init.zeros_(mask_output.bias)  # type: ignore
-
         self.register_buffer(
             "target_seq_indices", torch.tensor(TARGET_SEQ_INDICES, dtype=torch.long)
         )
@@ -293,10 +283,6 @@ class ActorPolicy(nn.Module):
         # fainted mons stay visible to attention instead of masking
         z, next_state = self.reducer(tokens, state, None)
 
-        # embed the raw env mask
-        if action_mask is not None:
-            z = z + self.mask_proj(action_mask.reshape(B, -1).float())
-
         logits1 = self.head1(z)
 
         # action eval
@@ -414,7 +400,7 @@ class PolicyNet(nn.Module):
         # shared backbone + policy head
         self.encoder = FusedTokenEncoder(d_model, nhead, d_model * 4)
         self.actor = ActorPolicy(
-            d_model, nhead, nlayer, act_size, self.encoder.side_emb, self.seq_len
+            d_model, nhead, nlayer, act_size, self.encoder.side_emb, self.seq_len + 1
         )
 
         # value head
@@ -435,16 +421,16 @@ class PolicyNet(nn.Module):
         """
         Main forward pass. Matches original PolicyNet signature for compatibility.
         """
-        tokens, aux = self.encoder(obs, aux=True)
-
-        numerical = obs.numerical
-        if numerical.dim() == 2:
-            numerical = numerical.unsqueeze(0)
-
         if action_mask is not None:
             action_mask = action_mask.to(self.device)
             if action_mask.dim() == 2:
                 action_mask = action_mask.unsqueeze(0)
+
+        tokens, aux = self.encoder(obs, action_mask=action_mask, aux=True)
+
+        numerical = obs.numerical
+        if numerical.dim() == 2:
+            numerical = numerical.unsqueeze(0)
 
         if actions is not None:
             actions = actions.to(self.device)
@@ -469,6 +455,9 @@ class PolicyNet(nn.Module):
         """
         Forward pass using already encoded tokens.
         """
+        if tokens.size(-2) == self.seq_len:
+            tokens = self.encoder.append_action_mask_token(tokens, action_mask)
+
         logits, log_probs, sampled_actions, next_state, z = self.actor(
             tokens, aux, numerical, state, action_mask, actions, sample_actions
         )
@@ -489,7 +478,12 @@ class PolicyNet(nn.Module):
         Evaluate actions for PPO updates.
         Returns (log_prob, entropy, normalized_entropy, value, next_state).
         """
-        tokens, aux = self.encoder(obs, aux=True)
+        if action_mask is not None:
+            action_mask = action_mask.to(self.device)
+            if action_mask.dim() == 2:
+                action_mask = action_mask.unsqueeze(0)
+
+        tokens, aux = self.encoder(obs, action_mask=action_mask, aux=True)
         numerical = obs.numerical
         if numerical.dim() == 2:
             numerical = numerical.unsqueeze(0)
