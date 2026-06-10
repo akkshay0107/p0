@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from src.lookups import ACT_SIZE
-from src.model.policy import PolicyNet
+from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
     NUMERICAL_WIDTH,
@@ -38,23 +38,22 @@ def test_policy_net_forward_pass(policy_net):
     for i, idx in enumerate(ally_indices):
         obs.numerical[:, idx + 1, 26] = (i + 1) / 6.0
 
+    action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
+    state = policy_net.initial_state(B)
+
     with torch.no_grad():
-        logits, log_probs, sampled_actions, value, next_state = policy_net(obs)
+        out = policy_net.act_obs(obs, action_mask, state)
 
-    # output shapes
-    assert logits.shape == (B, 2, ACT_SIZE)
-    assert log_probs.shape == (B,)
-    assert sampled_actions.shape == (B, 2)
-    assert value.shape == (B,)
+    assert out.log_probs.shape == (B,)
+    assert out.actions.shape == (B, 2)
+    assert out.value.shape == (B,)
 
-    # recurrent state check
-    hg = next_state
-    assert hg.shape == (B, 4, 128)  # n_hg is 4
+    assert out.state.shape == (B, 4, 128)  # n_hg is 4
 
 
-def test_policy_net_forward_tokens(policy_net):
+def test_policy_net_encoded_evaluate(policy_net):
     B = 16
-    tokens = torch.randn((B, SEQUENCE_LENGTH, 128))
+    tokens = torch.randn((B, SEQUENCE_LENGTH + 1, 128))
     aux = torch.randn((B, 4, 128))
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
 
@@ -63,13 +62,52 @@ def test_policy_net_forward_tokens(policy_net):
     for i, idx in enumerate(ally_indices):
         numerical[:, idx + 1, 26] = (i + 1) / 6.0
 
-    with torch.no_grad():
-        logits, log_probs, sampled_actions, value, next_state = policy_net.forward_tokens(
-            tokens, aux, numerical
-        )
+    enc = EncodedObs(tokens, aux, numerical)
+    action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
+    actions = torch.full((B, 2), 7, dtype=torch.long)
+    state = policy_net.initial_state(B)
 
-    assert logits.shape == (B, 2, ACT_SIZE)
-    assert value.shape == (B,)
+    with torch.no_grad():
+        out = policy_net.evaluate(enc, action_mask, actions, state)
+
+    assert out.logits.shape == (B, 2, ACT_SIZE)
+    assert out.log_probs.shape == (B,)
+    assert out.entropy.shape == (B,)
+    assert out.norm_entropy.shape == (B,)
+    assert out.value.shape == (B,)
+    assert out.state.shape == (B, 4, 128)
+
+
+def test_encode_requires_batched_observation_and_mask(policy_net):
+    obs = StructuredObservation(
+        categorical=torch.zeros((SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
+        numerical=torch.zeros((SEQUENCE_LENGTH, NUMERICAL_WIDTH), dtype=torch.float32),
+        token_type_ids=torch.zeros(SEQUENCE_LENGTH, dtype=torch.long),
+        side_ids=torch.zeros(SEQUENCE_LENGTH, dtype=torch.long),
+        slot_ids=torch.zeros(SEQUENCE_LENGTH, dtype=torch.long),
+    )
+    action_mask = torch.ones((2, ACT_SIZE), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="batched"):
+        policy_net.encode(obs, action_mask)
+
+    with pytest.raises(TypeError):
+        policy_net.encode(obs.unsqueeze(0))  # type: ignore[call-arg]
+
+
+def test_top_p_validation(policy_net):
+    B = 1
+    obs = StructuredObservation(
+        categorical=torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
+        numerical=torch.zeros((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH), dtype=torch.float32),
+        token_type_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
+        side_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
+        slot_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
+    )
+    action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="top_p"):
+        policy_net.act_obs(obs, action_mask, policy_net.initial_state(B), top_p=0.0)
 
 
 def test_sequential_mask_fallback(policy_net):
@@ -142,22 +180,19 @@ def test_fainted_pokemon_visible(policy_net):
         obs.numerical[:, idx + 1, 26] = (i + 1) / 6.0
 
     action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
-    actions = torch.zeros((B, 2), dtype=torch.long)
+    actions = torch.full((B, 2), 7, dtype=torch.long)
+    state = policy_net.initial_state(B)
 
     with torch.no_grad():
-        logits_active, _, _, value_active, _ = policy_net(
-            obs, action_mask=action_mask, actions=actions
-        )
+        out_active = policy_net.evaluate_obs(obs, action_mask, actions, state)
 
     # Mark Ally Pokemon 2 (numeric at index 4) as fainted (fainted flag at 27)
     obs.numerical[:, 4, 27] = 1.0
 
     with torch.no_grad():
-        logits_fainted, _, _, value_fainted, _ = policy_net(
-            obs, action_mask=action_mask, actions=actions
-        )
+        out_fainted = policy_net.evaluate_obs(obs, action_mask, actions, state)
 
-    assert not torch.allclose(logits_active, logits_fainted, atol=1e-5)
+    assert not torch.allclose(out_active.logits, out_fainted.logits, atol=1e-5)
 
     # Modify the features of the fainted pokemon:
     obs.categorical[:, 3, 0] = 41  # species
@@ -165,9 +200,7 @@ def test_fainted_pokemon_visible(policy_net):
     obs.numerical[:, 4, 0] = 0.99  # numeric stat
 
     with torch.no_grad():
-        logits_modified, _, _, value_modified, _ = policy_net(
-            obs, action_mask=action_mask, actions=actions
-        )
+        out_modified = policy_net.evaluate_obs(obs, action_mask, actions, state)
 
-    assert not torch.allclose(logits_fainted, logits_modified, atol=1e-5)
-    assert not torch.allclose(value_fainted, value_modified, atol=1e-5)
+    assert not torch.allclose(out_fainted.logits, out_modified.logits, atol=1e-5)
+    assert not torch.allclose(out_fainted.value, out_modified.value, atol=1e-5)

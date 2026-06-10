@@ -4,10 +4,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
-# removed as_obs_dict
-from src.model.policy import PolicyNet
+from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import StructuredObservation
-from src.train.utils import adamw_param_groups, initial_state
+from src.train.utils import adamw_param_groups
 
 BATCH_SIZE = 32  # number of episodes per gradient update
 
@@ -62,15 +61,18 @@ def _run_batched_bc(
     ]
     all_obs = StructuredObservation.cat(all_obs_tensors, dim=0).to(device)
     all_masks = torch.cat(all_masks_list, dim=0).to(device)
-    all_tokens, all_aux = policy.encoder(all_obs, action_mask=all_masks, aux=True)
-    tokens_list = torch.split(all_tokens, [len(ep) for ep in episodes])
-    aux_list = torch.split(all_aux, [len(ep) for ep in episodes])
-    numerical_list = torch.split(all_obs.numerical, [len(ep) for ep in episodes])
+    all_enc = policy.encode(all_obs, all_masks)
+    split_sizes = [len(ep) for ep in episodes]
+    tokens_list = torch.split(all_enc.tokens, split_sizes)
+    aux_list = torch.split(all_enc.aux, split_sizes)
+    numerical_list = torch.split(all_enc.numerical, split_sizes)
 
     # pre pad the tensors to max len
-    tokens_p = torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True)
-    aux_p = torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True)
-    numerical_p = torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True)
+    enc_p = EncodedObs(
+        tokens=torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True),
+        aux=torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True),
+        numerical=torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True),
+    )
 
     def pack(fields):
         return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
@@ -82,7 +84,7 @@ def _run_batched_bc(
     masks_p = pack(all_masks_list)
     targets_p = pack(all_targets_list)
 
-    state = initial_state(policy, batch_size, device)
+    state = policy.initial_state(batch_size)
     total_loss = torch.tensor(0.0, device=device)
     correct = 0
     total = 0
@@ -93,43 +95,23 @@ def _run_batched_bc(
         if active_n == 0:
             break
 
-        tokens_t = tokens_p[:active_n, t]  # (active_n, S, D)
-        aux_t = aux_p[:active_n, t]  # (active_n, 4, D)
-        numerical_t = numerical_p[:active_n, t]  # (active_n, S, N)
+        enc_t = enc_p.step(active_n, t)
         masks_t = masks_p[:active_n, t]
         targets_t = targets_p[:active_n, t]
 
         curr_state = state[:active_n]
-        log_prob, _, _, _, next_state = policy.evaluate_actions_tokens(
-            tokens_t,
-            aux_t,
-            numerical_t,
-            targets_t,
-            action_mask=masks_t,
-            state=curr_state,
-        )
+        out = policy.evaluate(enc_t, masks_t, targets_t, curr_state)
 
-        loss = -log_prob.sum()
+        loss = -out.log_probs.sum()
         total_loss = total_loss + loss
         total_steps += active_n
 
         with torch.no_grad():
-            logits, _, _, _, _ = policy.forward_tokens(
-                tokens_t,
-                aux_t,
-                numerical_t,
-                state=curr_state,
-                action_mask=masks_t,
-                sample_actions=False,
-                actions=targets_t,
-            )
-            preds = torch.stack(
-                [logits[:, 0].argmax(dim=-1), logits[:, 1].argmax(dim=-1)],
-                dim=-1,
-            )
+            preds = out.logits.argmax(dim=-1)
             correct += (preds == targets_t).sum().item()
             total += targets_t.numel()
 
+        next_state = out.state
         if active_n < batch_size:
             state = torch.cat([next_state, state[active_n:]], dim=0)
         else:

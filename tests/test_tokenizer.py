@@ -1,3 +1,5 @@
+from typing import cast
+
 from poke_env.battle import Pokemon
 from poke_env.battle.effect import Effect
 from poke_env.battle.move import Move
@@ -36,7 +38,7 @@ def test_tokenizer_status_id():
     assert tokenizer.status_id(Status.SLP) == 5
     assert tokenizer.status_id(None) == 0
     # Test unrecognized/invalid status (not in vocab mapping)
-    assert tokenizer.status_id("UNKNOWN_STATUS") == 0
+    assert tokenizer.status_id(cast(Status, "UNKNOWN_STATUS")) == 0
 
 
 def test_tokenizer_volatile_ids():
@@ -88,8 +90,8 @@ def test_tokenizer_pokemon_attributes():
 
     class FallbackPokemon(Pokemon):
         @property
-        def species(self) -> str | None:
-            return None
+        def species(self) -> str:
+            return ""
 
         @property
         def base_species(self) -> str:

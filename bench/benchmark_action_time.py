@@ -10,7 +10,6 @@ from pathlib import Path
 import torch
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.player import SimpleHeuristicsPlayer
-from torch.distributions import Categorical
 
 from src.env import MegaEnv
 from src.lookups import ACT_SIZE
@@ -18,7 +17,6 @@ from src.model.policy import PolicyNet
 from src.model.tokenizer import tokenizer
 from src.rl_player import RLPlayer
 from src.team_picker import RandomTeamFromPool
-from src.train.utils import initial_state
 
 
 @dataclass(slots=True)
@@ -27,8 +25,8 @@ class TimeTracker:
     observation_builder_time = 0.0
     action_mask_time = 0.0
     tensor_prep_time = 0.0
-    policy_inference_time = 0.0
-    top_p_time = 0.0
+    encoder_time = 0.0
+    policy_action_time = 0.0
     post_process_time = 0.0
 
 
@@ -78,7 +76,7 @@ class ProfiledRLPlayer(RLPlayer):
         self.profiler = cProfile.Profile()
         self.call_count = 0
 
-    def _get_action(self, battle, is_tp):
+    def _get_action(self, battle):
         self.call_count += 1
         self.profiler.enable()
         try:
@@ -107,72 +105,31 @@ class ProfiledRLPlayer(RLPlayer):
 
             # forward pass + sampling (overrepresented if device is cpu)
             with torch.no_grad():
-                actions = self._top_p(
-                    obs_t,
+                if self.state is None:
+                    self.state = self.policy.initial_state(1)
+
+                start_inference = get_time()
+                enc = self.policy.encode(obs_t, action_mask_t)
+                TimeTracker.encoder_time += get_time() - start_inference
+
+                start_inference = get_time()
+                out = self.policy.act(
+                    enc,
                     action_mask_t,
+                    self.state,
+                    top_p=self.top_p,
                 )
+                TimeTracker.policy_action_time += get_time() - start_inference
+                self.state = out.state
 
             # gpu to cpu (underrepresented if device is cpu)
             start_post = get_time()
-            result = actions[0].cpu().numpy()
+            result = out.actions[0].cpu().numpy()
             TimeTracker.post_process_time += get_time() - start_post
 
             return result
         finally:
             self.profiler.disable()
-
-    def _top_p(self, obs, action_mask):
-        if self.state is None:
-            batch_size = 1
-            device = self.policy.device
-            self.state = initial_state(self.policy, batch_size, device)
-
-        start_inference = get_time()
-        with torch.no_grad():
-            tokens, aux = self.policy.encoder(obs, action_mask=action_mask, aux=True)
-            numerical = obs.numerical
-            if numerical.dim() == 2:
-                numerical = numerical.unsqueeze(0)
-
-            logits, _, sampled_actions, self.state, z = self.policy.actor(
-                tokens, aux, numerical, state=self.state, action_mask=action_mask, sample=False
-            )
-            # Pokemon 1: P(a1 | z)
-            logits1 = logits[:, 0]
-            if action_mask is not None:
-                logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
-
-            end_inference = get_time()
-            TimeTracker.policy_inference_time += end_inference - start_inference
-
-            start_topp = get_time()
-            p1_logits_top_p = self._apply_top_p(logits1)
-            cat1 = Categorical(logits=p1_logits_top_p)
-            action1 = cat1.sample()  # (B,)
-            TimeTracker.top_p_time += get_time() - start_topp
-
-            start_inference = get_time()
-            # Pokemon 2: P(a2 | z, a1)
-            a1_emb = self.policy.actor._build_action_context(action1, tokens, aux, numerical)
-            logits2 = self.policy.actor.head2(torch.cat([z, a1_emb], dim=-1))
-
-            # Combine and apply sequential masks
-            logits = torch.stack([logits1, logits2], dim=1)
-            if action_mask is not None:
-                is_tp_t = (numerical[:, 25, 2] > 0.5).bool()
-                logits = self.policy.actor._apply_sequential_masks(
-                    logits, action1, action_mask, is_tp_t
-                )
-            end_inference = get_time()
-            TimeTracker.policy_inference_time += end_inference - start_inference
-
-            start_topp = get_time()
-            p2_logits_top_p = self._apply_top_p(logits[:, 1])
-            cat2 = Categorical(logits=p2_logits_top_p)
-            action2 = cat2.sample()  # (B,)
-            TimeTracker.top_p_time += get_time() - start_topp
-
-            return torch.stack([action1, action2], dim=-1)
 
     def print_profiling_results(self, sort_by="tottime", limit=50):
         # cProfile results
@@ -191,8 +148,8 @@ class ProfiledRLPlayer(RLPlayer):
             + TimeTracker.observation_builder_time
             + TimeTracker.action_mask_time
             + TimeTracker.tensor_prep_time
-            + TimeTracker.policy_inference_time
-            + TimeTracker.top_p_time
+            + TimeTracker.encoder_time
+            + TimeTracker.policy_action_time
             + TimeTracker.post_process_time
         )
         tot = max(tot, 1e-9)
@@ -211,8 +168,8 @@ class ProfiledRLPlayer(RLPlayer):
             ("Observation Builder (non-tok)", TimeTracker.observation_builder_time),
             ("Action Masking", TimeTracker.action_mask_time),
             ("Tensor Prep / Device Transfer", TimeTracker.tensor_prep_time),
-            ("Policy Inference", TimeTracker.policy_inference_time),
-            ("Top-P Sampling", TimeTracker.top_p_time),
+            ("Policy Encoding", TimeTracker.encoder_time),
+            ("Policy Act / Top-P", TimeTracker.policy_action_time),
             ("Post-processing", TimeTracker.post_process_time),
         ]
         for name, val in stages:

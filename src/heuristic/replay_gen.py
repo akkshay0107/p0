@@ -105,6 +105,7 @@ class ReplayRecordingPlayer(Player, ABC):
         self, battle: AbstractBattle, maybe_default_order: bool = False
     ):
         if battle.teampreview:
+            assert isinstance(battle, DoubleBattle)
             obs = self.get_observation(battle)
             action_mask_list = MegaEnv.get_action_mask(battle)
             action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])

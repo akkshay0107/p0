@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -14,14 +14,42 @@ from src.model.fused_token_encoder import FusedTokenEncoder
 from src.model.structured_observation import (
     ALLY_POKE_TOKENS,
     NUM_IDX_ORIG_IDX_RATIO,
-    NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TARGET_SEQ_INDICES,
-    TOKEN_IDX_GLOBAL_FIELD_NUMERIC,
     SideId,
     StructuredObservation,
+    is_teampreview,
 )
+
+
+class EncodedObs(NamedTuple):
+    tokens: Tensor
+    aux: Tensor
+    numerical: Tensor
+
+    def step(self, n: int, t: int) -> EncodedObs:
+        return EncodedObs(
+            tokens=self.tokens[:n, t],
+            aux=self.aux[:n, t],
+            numerical=self.numerical[:n, t],
+        )
+
+
+class ActOutput(NamedTuple):
+    actions: Tensor
+    log_probs: Tensor
+    value: Tensor
+    state: Tensor
+
+
+class EvalOutput(NamedTuple):
+    log_probs: Tensor
+    entropy: Tensor
+    norm_entropy: Tensor
+    value: Tensor
+    state: Tensor
+    logits: Tensor
 
 
 class PolicyHead(nn.Module):
@@ -172,7 +200,7 @@ class ActorPolicy(nn.Module):
         device = a1.device
         batch_idx = torch.arange(B, device=device)
 
-        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
+        is_tp = is_teampreview(numerical)
         is_pass = (a1 == 0) & ~is_tp
         is_switch = (a1 >= 1) & (a1 <= 6) & ~is_tp
         is_move = (a1 >= 7) & ~is_tp
@@ -264,70 +292,70 @@ class ActorPolicy(nn.Module):
 
         return self.ctx_norm(ctx)
 
-    def forward(
+    @staticmethod
+    def _apply_top_p(logits: Tensor, top_p: float) -> Tensor:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        remove = cumulative_probs > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+
+        return torch.empty_like(logits).scatter(-1, sorted_indices, sorted_logits)
+
+    def sample(
         self,
-        tokens: Tensor,
-        aux: Tensor,
-        numerical: Tensor,
-        state: Optional[Tensor] = None,
-        action_mask: Optional[Tensor] = None,
-        actions: Optional[Tensor] = None,
-        sample: bool = True,
-    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
-        B = tokens.size(0)
-        device = tokens.device
-
-        # compute metadata internally to simplify signature
-        is_tp = (numerical[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5).bool()
-
-        # fainted mons stay visible to attention instead of masking
-        z, next_state = self.reducer(tokens, state, None)
-
+        enc: EncodedObs,
+        action_mask: Tensor,
+        state: Tensor,
+        *,
+        top_p: float = 1.0,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        z, next_state = self.reducer(enc.tokens, state, None)
         logits1 = self.head1(z)
+        logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
+        sample_logits1 = self._apply_top_p(logits1, top_p) if top_p < 1.0 else logits1
 
-        # action eval
-        if actions is not None:
-            a1 = actions[:, 0]
-            a1_emb = self._build_action_context(a1, tokens, aux, numerical)
-            logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
-            logits = torch.stack([logits1, logits2], dim=1)
-
-            if action_mask is not None:
-                logits = self._apply_sequential_masks(logits, a1, action_mask, is_tp)
-
-            dist1 = Categorical(logits=logits[:, 0])
-            dist2 = Categorical(logits=logits[:, 1])
-            log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
-
-            return logits, log_probs, None, next_state, z
-
-        # inference mode
-        if not sample:
-            # Return logits with placeholder for second action if not sampling or evaluating
-            logits = torch.stack([logits1, torch.zeros_like(logits1)], dim=1)
-            return logits, torch.zeros(B, device=device), None, next_state, z
-
-        # Sampling with sequential constraints
-        m1 = action_mask[:, 0] if action_mask is not None else None
-        l1 = logits1 if m1 is None else logits1.masked_fill(m1 == 0, float("-inf"))
-
-        dist1 = Categorical(logits=l1)
+        dist1 = Categorical(logits=sample_logits1)
         a1 = dist1.sample()
 
-        a1_emb = self._build_action_context(a1, tokens, aux, numerical)
+        a1_emb = self._build_action_context(a1, enc.tokens, enc.aux, enc.numerical)
         logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
-
         logits = torch.stack([logits1, logits2], dim=1)
-        if action_mask is not None:
-            logits = self._apply_sequential_masks(logits, a1, action_mask, is_tp)
+        logits = self._apply_sequential_masks(
+            logits, a1, action_mask, is_teampreview(enc.numerical)
+        )
+        sample_logits2 = self._apply_top_p(logits[:, 1], top_p) if top_p < 1.0 else logits[:, 1]
 
-        dist2 = Categorical(logits=logits[:, 1])
+        dist2 = Categorical(logits=sample_logits2)
         a2 = dist2.sample()
-
         log_probs = dist1.log_prob(a1) + dist2.log_prob(a2)
-        sampled_actions = torch.stack([a1, a2], dim=-1)
+        actions = torch.stack([a1, a2], dim=-1)
+        return actions, log_probs, next_state, z
 
-        return logits, log_probs, sampled_actions, next_state, z
+    def score(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        actions: Tensor,
+        state: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        z, next_state = self.reducer(enc.tokens, state, None)
+        logits1 = self.head1(z)
+        a1 = actions[:, 0]
+        a1_emb = self._build_action_context(a1, enc.tokens, enc.aux, enc.numerical)
+        logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
+        logits = torch.stack([logits1, logits2], dim=1)
+        logits = self._apply_sequential_masks(
+            logits, a1, action_mask, is_teampreview(enc.numerical)
+        )
+
+        dist1 = Categorical(logits=logits[:, 0])
+        dist2 = Categorical(logits=logits[:, 1])
+        log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
+        return logits, log_probs, next_state, z
 
     def _apply_sequential_masks(
         self,
@@ -407,124 +435,56 @@ class PolicyNet(nn.Module):
         self.critic = ValueHead(d_model)
 
     @property
-    def device(self):
+    def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def forward(
+    def initial_state(self, batch_size: int) -> Tensor:
+        return self.actor.reducer.hg_init.detach().expand(batch_size, -1, -1).to(self.device)
+
+    def encode(
         self,
         obs: StructuredObservation,
-        state: Optional[Tensor] = None,
-        action_mask: Optional[Tensor] = None,
-        sample_actions: bool = True,
-        actions: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
-        """
-        Main forward pass. Matches original PolicyNet signature for compatibility.
-        """
-        if action_mask is not None:
-            action_mask = action_mask.to(self.device)
-            if action_mask.dim() == 2:
-                action_mask = action_mask.unsqueeze(0)
+        action_mask: Tensor,
+    ) -> EncodedObs:
+        if obs.categorical.dim() != 3:
+            raise ValueError("PolicyNet.encode expects a batched StructuredObservation.")
+        tokens, aux = self.encoder(obs, action_mask)
+        return EncodedObs(tokens=tokens, aux=aux, numerical=obs.numerical)
 
-        tokens, aux = self.encoder(obs, action_mask=action_mask, aux=True)
-
-        numerical = obs.numerical
-        if numerical.dim() == 2:
-            numerical = numerical.unsqueeze(0)
-
-        if actions is not None:
-            actions = actions.to(self.device)
-            if actions.dim() == 1:
-                actions = actions.unsqueeze(0)
-
-        return self.forward_tokens(
-            tokens, aux, numerical, state, action_mask, sample_actions, actions
-        )
-
-    def forward_tokens(
+    def act(
         self,
-        tokens: Tensor,
-        aux: Tensor,
-        numerical: Tensor,
-        state: Optional[Tensor] = None,
-        action_mask: Optional[Tensor] = None,
-        sample_actions: bool = True,
-        actions: Optional[Tensor] = None,
-        is_warmup: bool = False,
-    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
-        """
-        Forward pass using already encoded tokens.
-        """
-        if tokens.size(-2) == self.seq_len:
-            tokens = self.encoder.append_action_mask_token(tokens, action_mask)
+        enc: EncodedObs,
+        action_mask: Tensor,
+        state: Tensor,
+        *,
+        top_p: float = 1.0,
+    ) -> ActOutput:
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+        actions, log_probs, next_state, z = self.actor.sample(enc, action_mask, state, top_p=top_p)
+        return ActOutput(actions, log_probs, self.critic(z), next_state)
 
-        logits, log_probs, sampled_actions, next_state, z = self.actor(
-            tokens, aux, numerical, state, action_mask, actions, sample_actions
-        )
-        if is_warmup:
+    def evaluate(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        actions: Tensor,
+        state: Tensor,
+        *,
+        critic_only: bool = False,
+    ) -> EvalOutput:
+        logits, log_probs, next_state, z = self.actor.score(enc, action_mask, actions, state)
+        if critic_only:
             z = z.detach()
         value = self.critic(z)
-
-        return logits, log_probs, sampled_actions, value, next_state
-
-    def evaluate_actions(
-        self,
-        obs: StructuredObservation,
-        actions: Tensor,
-        action_mask: Optional[Tensor] = None,
-        state: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Evaluate actions for PPO updates.
-        Returns (log_prob, entropy, normalized_entropy, value, next_state).
-        """
-        if action_mask is not None:
-            action_mask = action_mask.to(self.device)
-            if action_mask.dim() == 2:
-                action_mask = action_mask.unsqueeze(0)
-
-        tokens, aux = self.encoder(obs, action_mask=action_mask, aux=True)
-        numerical = obs.numerical
-        if numerical.dim() == 2:
-            numerical = numerical.unsqueeze(0)
-
-        return self.evaluate_actions_tokens(tokens, aux, numerical, actions, action_mask, state)
-
-    def evaluate_actions_tokens(
-        self,
-        tokens: Tensor,
-        aux: Tensor,
-        numerical: Tensor,
-        actions: Tensor,
-        action_mask: Optional[Tensor] = None,
-        state: Optional[Tensor] = None,
-        is_warmup: bool = False,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Evaluate actions using already encoded tokens.
-        """
-        logits, log_prob, _, value, next_state = self.forward_tokens(
-            tokens,
-            aux,
-            numerical,
-            state,
-            action_mask,
-            sample_actions=False,
-            actions=actions,
-            is_warmup=is_warmup,
-        )
 
         dist1 = Categorical(logits=logits[:, 0])
         dist2 = Categorical(logits=logits[:, 1])
         entropy = dist1.entropy() + dist2.entropy()
 
-        # normalized entropy (relative to valid action support)
-        if action_mask is not None:
-            v1 = (logits[:, 0] > float("-inf")).sum(-1).float().clamp_min(1.0)
-            v2 = (logits[:, 1] > float("-inf")).sum(-1).float().clamp_min(1.0)
-            max_entropy = torch.log(v1) + torch.log(v2)
-        else:
-            max_entropy = torch.log(torch.tensor(self.act_size, device=self.device).float()) * 2
+        v1 = torch.isfinite(logits[:, 0]).sum(-1).float().clamp_min(1.0)
+        v2 = torch.isfinite(logits[:, 1]).sum(-1).float().clamp_min(1.0)
+        max_entropy = torch.log(v1) + torch.log(v2)
 
         norm_entropy = torch.where(
             max_entropy > 0,
@@ -532,16 +492,31 @@ class PolicyNet(nn.Module):
             torch.zeros_like(entropy),
         )
 
-        return log_prob, entropy, norm_entropy, value, next_state
+        return EvalOutput(log_probs, entropy, norm_entropy, value, next_state, logits)
 
-    def get_policy_masked_logits(
+    def act_obs(
         self,
         obs: StructuredObservation,
-        action_taken: Tensor,
-        action_mask: Optional[Tensor],
-        state: Optional[Tensor] = None,
-    ):
-        logits, _, _, _, _ = self(
-            obs, state, action_mask, sample_actions=False, actions=action_taken
+        action_mask: Tensor,
+        state: Tensor,
+        *,
+        top_p: float = 1.0,
+    ) -> ActOutput:
+        return self.act(self.encode(obs, action_mask), action_mask, state, top_p=top_p)
+
+    def evaluate_obs(
+        self,
+        obs: StructuredObservation,
+        action_mask: Tensor,
+        actions: Tensor,
+        state: Tensor,
+        *,
+        critic_only: bool = False,
+    ) -> EvalOutput:
+        return self.evaluate(
+            self.encode(obs, action_mask),
+            action_mask,
+            actions,
+            state,
+            critic_only=critic_only,
         )
-        return logits

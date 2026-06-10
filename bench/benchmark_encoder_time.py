@@ -1,4 +1,5 @@
 import time
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -35,12 +36,15 @@ def benchmark():
     )
 
     # Compiled SwiGLU transformer
-    compiled_swiglu_encoder = torch.compile(
-        SwiGLUTransformerEncoder(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            num_layers=num_layers,
+    compiled_swiglu_encoder = cast(
+        SwiGLUTransformerEncoder,
+        torch.compile(
+            SwiGLUTransformerEncoder(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                num_layers=num_layers,
+            ),
         ),
     )
 

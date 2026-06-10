@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from poke_env import LocalhostServerConfiguration
@@ -50,7 +51,7 @@ def make_real_pokemon(
     boosts: dict[str, int] | None = None,
     protect_counter: int = 0,
     active_turns: int = 0,
-    weightkg: int | None = None,
+    weightkg: float | None = None,
     status_counter: int = 0,
     preparing_move: str | None = None,
     last_move_id: str | None = None,
@@ -81,7 +82,7 @@ def make_real_pokemon(
     p._protect_counter = protect_counter
     p._active_turns = active_turns
     if weightkg is not None:
-        p._weightkg = weightkg
+        cast(Any, p)._weightkg = weightkg
     p._status_counter = status_counter
     if preparing_move:
         p._preparing_move = Move(preparing_move, 9)
@@ -452,7 +453,9 @@ def test_side_token_real():
 
     assert cat[0] == tokenizer.side_conditions.get(SideCondition.AURORA_VEIL)
     assert cat[1] == tokenizer.side_conditions.get(SideCondition.TAILWIND)
-    assert cat[2] == tokenizer.side_conditions.get(SideCondition.TOXIC_SPIKES).get(2)
+    toxic_spikes = tokenizer.side_conditions.get(SideCondition.TOXIC_SPIKES)
+    assert toxic_spikes is not None
+    assert cat[2] == toxic_spikes.get(2)
 
     assert abs(num[0] - 0.4) < 1e-5
     assert abs(num[1] - 0.5) < 1e-5

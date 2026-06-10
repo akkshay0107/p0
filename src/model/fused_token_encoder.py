@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Literal, overload
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -203,31 +203,17 @@ class FusedTokenEncoder(nn.Module):
         init.normal_(self.mon_fusion_token, std=emb_gain)
         init.normal_(self.action_mask_token, std=emb_gain)
 
-    def append_action_mask_token(
+    def _append_action_mask_token(
         self,
         tokens: torch.Tensor,
-        action_mask: torch.Tensor | None,
+        action_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if tokens.dim() == 2:
-            tokens = tokens.unsqueeze(0)
-
         B = tokens.size(0)
-        if action_mask is None:
-            flat_mask = torch.zeros(
-                B,
-                2 * ACT_SIZE,
-                device=tokens.device,
-                dtype=tokens.dtype,
+        if action_mask.shape != (B, 2, ACT_SIZE):
+            raise ValueError(
+                f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
             )
-        else:
-            action_mask = action_mask.to(tokens.device)
-            if action_mask.dim() == 2:
-                action_mask = action_mask.unsqueeze(0)
-            if action_mask.shape != (B, 2, ACT_SIZE):
-                raise ValueError(
-                    f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
-                )
-            flat_mask = action_mask.reshape(B, -1).to(tokens.dtype)
+        flat_mask = action_mask.reshape(B, -1).to(tokens.dtype)
 
         mask_token = self.action_mask_token.expand(B, -1, -1)
         mask_token = mask_token + self.action_mask_proj(flat_mask).unsqueeze(1)
@@ -311,35 +297,22 @@ class FusedTokenEncoder(nn.Module):
         s_mask = s_cat != 0
         return self.side_condition_set(self.side_condition_emb(s_cat), mask=s_mask)
 
-    @overload
     def forward(
         self,
         obs: StructuredObservation,
-        aux: Literal[True],
-        action_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-    @overload
-    def forward(self, obs: StructuredObservation, aux: Literal[False] = False) -> torch.Tensor: ...
-
-    def forward(
-        self,
-        obs: StructuredObservation,
-        aux: bool = False,
-        action_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        action_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         categorical = obs.categorical.long()
         numerical = obs.numerical.float()
         token_type_ids = obs.token_type_ids.long()
         side_ids = obs.side_ids.long()
         slot_ids = obs.slot_ids.long()
 
-        if categorical.dim() == 2:
-            categorical = categorical.unsqueeze(0)
-            numerical = numerical.unsqueeze(0)
-            token_type_ids = token_type_ids.unsqueeze(0)
-            side_ids = side_ids.unsqueeze(0)
-            slot_ids = slot_ids.unsqueeze(0)
+        if categorical.dim() != 3:
+            raise ValueError(
+                f"Expected a batched categorical tensor with 3 dimensions; "
+                f"got {tuple(categorical.shape)}."
+            )
 
         B, S, C = categorical.shape
         if S != SEQUENCE_LENGTH or C != CATEGORICAL_WIDTH or numerical.shape[-1] != NUMERICAL_WIDTH:
@@ -355,28 +328,19 @@ class FusedTokenEncoder(nn.Module):
         token_type_ids = token_type_ids.to(device)
         side_ids = side_ids.to(device)
         slot_ids = slot_ids.to(device)
+        action_mask = action_mask.to(device)
 
         x = torch.zeros(B, S, self.d_model, device=device, dtype=self.mon_fusion_token.dtype)
 
-        if aux:
-            # active pokemon -> process separately to extract move embeddings needed by head2.
-            actor_out, aux_moves = self._embed_pokemon_super(
-                categorical[:, _ACTOR_POS, :], aux=True
-            )
-            x[:, _ACTOR_POS, :] = actor_out
-            aux_tensor = aux_moves
+        # active Pokemon is processed separately to expose its move embeddings.
+        actor_out, aux_moves = self._embed_pokemon_super(categorical[:, _ACTOR_POS, :], aux=True)
+        x[:, _ACTOR_POS, :] = actor_out
 
-            # remaining 11 super slots: flatten batch×slot, embed, unflatten.
-            n_other = len(_OTHER_SUPER_POS)
-            other_cats = categorical[:, self._other_super_pos, :].flatten(0, 1)
-            other_out = self._embed_pokemon_super(other_cats).unflatten(0, (B, n_other))  # type: ignore
-            x[:, self._other_super_pos, :] = other_out
-        else:
-            n_super = len(_SUPER_POS)
-            super_cats = categorical[:, self._super_pos, :].flatten(0, 1)
-            super_out = self._embed_pokemon_super(super_cats).unflatten(0, (B, n_super))  # type: ignore
-            x[:, self._super_pos, :] = super_out
-            aux_tensor = None
+        n_other = len(_OTHER_SUPER_POS)
+        other_cats = categorical[:, self._other_super_pos, :].flatten(0, 1)
+        other_super = cast(torch.Tensor, self._embed_pokemon_super(other_cats))
+        other_out = other_super.unflatten(0, (B, n_other))
+        x[:, self._other_super_pos, :] = other_out
 
         x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :])
 
@@ -400,9 +364,5 @@ class FusedTokenEncoder(nn.Module):
             + self.side_emb(side_ids)
             + self.slot_emb(slot_ids)
         )
-        out_tokens = self.append_action_mask_token(out_tokens, action_mask)
-
-        if aux:
-            assert aux_tensor is not None
-            return out_tokens, aux_tensor
-        return out_tokens
+        out_tokens = self._append_action_mask_token(out_tokens, action_mask)
+        return out_tokens, aux_moves

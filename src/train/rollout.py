@@ -187,16 +187,20 @@ def collect_rollouts(
         obs2_gpu = vec_env.get_batched_obs2(device)
         mask2_gpu = torch.from_numpy(masks2).to(device, non_blocking=True)
 
-        _, log_probs1, actions1, values1, next_state1 = policy(
-            obs1_gpu, state1, mask1_gpu, sample_actions=True
-        )
+        out1 = policy.act_obs(obs1_gpu, mask1_gpu, state1)
+        log_probs1 = out1.log_probs
+        actions1 = out1.actions
+        values1 = out1.value
+        next_state1 = out1.state
 
         is_all_self_play = all(opp == "self" for opp in env_opponents)
         # self play fast path
         if is_all_self_play:
-            _, log_probs2, actions2, values2, next_state2 = policy(
-                obs2_gpu, state2, mask2_gpu, sample_actions=True
-            )
+            out2 = policy.act_obs(obs2_gpu, mask2_gpu, state2)
+            log_probs2 = out2.log_probs
+            actions2 = out2.actions
+            values2 = out2.value
+            next_state2 = out2.state
         else:
             actions2 = torch.zeros_like(actions1)
             log_probs2 = torch.zeros_like(log_probs1)
@@ -214,14 +218,12 @@ def collect_rollouts(
                 group_state2 = state2[idx_tensor]
 
                 active_policy = policy if opp_id == "self" else active_pool_policies[opp_id]
-                _, g_log_probs, g_actions, g_values, g_next_state = active_policy(
-                    group_obs2, group_state2, group_mask2, sample_actions=True
-                )
+                group_out = active_policy.act_obs(group_obs2, group_mask2, group_state2)
 
-                actions2[idx_tensor] = g_actions
-                log_probs2[idx_tensor] = g_log_probs
-                values2[idx_tensor] = g_values
-                next_state2[idx_tensor] = g_next_state
+                actions2[idx_tensor] = group_out.actions
+                log_probs2[idx_tensor] = group_out.log_probs
+                values2[idx_tensor] = group_out.value
+                next_state2[idx_tensor] = group_out.state
 
         # store actions in traj before step to avoid overwrite
         # and needing to clone, instead of with step results
@@ -247,9 +249,10 @@ def collect_rollouts(
         step_counts1 += 1
 
         self_play_mask = torch.tensor([opp == "self" for opp in env_opponents], dtype=torch.bool)
-        if self_play_mask.any():
-            sp_idx = self_play_mask.nonzero().squeeze(-1)
-            s2 = step_counts2[sp_idx]
+        has_self_play = bool(self_play_mask.any())
+        sp_idx = self_play_mask.nonzero().squeeze(-1)
+        s2 = step_counts2[sp_idx]
+        if has_self_play:
             trajectories2["categorical"][sp_idx, s2] = obs2_cpu.categorical[sp_idx]
             trajectories2["numerical"][sp_idx, s2] = obs2_cpu.numerical[sp_idx]
             trajectories2["token_type_ids"][sp_idx, s2] = obs2_cpu.token_type_ids[sp_idx]
@@ -277,7 +280,7 @@ def collect_rollouts(
         trajectories1["rewards"][idx_all, s1] = torch.from_numpy(rewards1)
         trajectories1["dones"][idx_all, s1] = torch.from_numpy(dones.astype(np.float32))
 
-        if self_play_mask.any():
+        if has_self_play:
             trajectories2["rewards"][sp_idx, s2] = torch.from_numpy(
                 rewards2[self_play_mask.numpy()]
             )

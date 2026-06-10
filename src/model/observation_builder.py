@@ -156,15 +156,11 @@ def _estimate_stat_by_nature(pokemon: Pokemon, battle: DoubleBattle):
 def _get_pokemon_level_stats(
     pokemon: Pokemon, battle: DoubleBattle, is_opponent: bool
 ) -> tuple[list[float], float]:
-    if not is_opponent and pokemon.stats is not None and pokemon.stats.get("hp") is not None:
-        return [
-            float(pokemon.stats["hp"]),
-            float(pokemon.stats["atk"]),
-            float(pokemon.stats["def"]),
-            float(pokemon.stats["spa"]),
-            float(pokemon.stats["spd"]),
-            float(pokemon.stats["spe"]),
-        ], 1.0
+    stats = pokemon.stats
+    if not is_opponent and stats is not None:
+        values = [stats.get(key) for key in ("hp", "atk", "def", "spa", "spd", "spe")]
+        if all(value is not None for value in values):
+            return [float(value) for value in values], 1.0  # type: ignore
 
     raw_stats = _estimate_stat_by_nature(pokemon, battle)
     return [float(x) for x in raw_stats], 0.0

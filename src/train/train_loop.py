@@ -14,11 +14,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
 from src.lookups import ACT_SIZE, OBS_DIM
-from src.model.policy import PolicyNet
+from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
-    NUM_IDX_TEAM_PREVIEW,
     TOKEN_IDX_GLOBAL_FIELD_NUMERIC,
     StructuredObservation,
+    is_teampreview,
 )
 from src.train.config import PPOConfig, load_config
 from src.train.opponent_pool import OpponentPool
@@ -26,7 +26,6 @@ from src.train.rollout import RolloutBuffer, collect_rollouts
 from src.train.utils import (
     PPOScheduler,
     adamw_param_groups,
-    initial_state,
     load_checkpoint,
     save_checkpoint,
 )
@@ -87,19 +86,24 @@ def _run_batched_ppo(
 
     all_obs = StructuredObservation.cat([ep["obs"] for ep in episodes], dim=0)
     all_action_masks = torch.cat([ep["action_masks"] for ep in episodes], dim=0).to(device)
-    all_tokens, all_aux = policy.encoder(all_obs, action_mask=all_action_masks, aux=True)
+    all_enc = policy.encode(all_obs, all_action_masks)
     if is_warmup:
-        all_tokens = all_tokens.detach()
-        all_aux = all_aux.detach()
+        all_enc = EncodedObs(
+            all_enc.tokens.detach(),
+            all_enc.aux.detach(),
+            all_enc.numerical,
+        )
     split_sizes = [ep["length"] for ep in episodes]
-    tokens_list = torch.split(all_tokens, split_sizes)
-    aux_list = torch.split(all_aux, split_sizes)
-    numerical_list = torch.split(all_obs.numerical, split_sizes)
+    tokens_list = torch.split(all_enc.tokens, split_sizes)
+    aux_list = torch.split(all_enc.aux, split_sizes)
+    numerical_list = torch.split(all_enc.numerical, split_sizes)
 
     # pre pad all to max len
-    tokens_p = torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True)
-    aux_p = torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True)
-    numerical_p = torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True)
+    enc_p = EncodedObs(
+        tokens=torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True),
+        aux=torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True),
+        numerical=torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True),
+    )
 
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
     def pack(fields):
@@ -111,7 +115,7 @@ def _run_batched_ppo(
     returns_p = pack([ep["returns"] for ep in episodes])
     action_masks_p = pack([ep["action_masks"] for ep in episodes])
 
-    state = initial_state(policy, batch_size, device)
+    state = policy.initial_state(batch_size)
     total_loss = torch.tensor(0.0, device=device)
     metrics = {
         "policy_loss": 0.0,
@@ -130,28 +134,26 @@ def _run_batched_ppo(
         if active_n == 0:
             break
 
-        tokens_t = tokens_p[:active_n, t]  # (active_n, S, D) — contiguous slice
-        aux_t = aux_p[:active_n, t]  # (active_n, 4, D)
-        numerical_t = numerical_p[:active_n, t]  # (active_n, S, N)
+        enc_t = enc_p.step(active_n, t)
         actions_t = actions_p[:active_n, t]
         old_log_probs_t = old_log_probs_p[:active_n, t]
         advantages_t = advantages_p[:active_n, t]
         returns_t = returns_p[:active_n, t]
         action_masks_t = action_masks_p[:active_n, t]
-        is_tp_t = numerical_t[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5
+        is_tp_t = is_teampreview(enc_t.numerical)
 
         curr_state = state[:active_n]
-        curr_log_prob, curr_entropy, curr_normalized_entropy, curr_val, next_state = (
-            policy.evaluate_actions_tokens(
-                tokens_t,
-                aux_t,
-                numerical_t,
-                actions_t,
-                action_mask=action_masks_t,
-                state=curr_state,
-                is_warmup=is_warmup,
-            )
+        out = policy.evaluate(
+            enc_t,
+            action_masks_t,
+            actions_t,
+            curr_state,
+            critic_only=is_warmup,
         )
+        curr_log_prob = out.log_probs
+        curr_normalized_entropy = out.norm_entropy
+        curr_val = out.value
+        next_state = out.state
 
         if not torch.isfinite(curr_log_prob).all():
             non_finite_idx = (~torch.isfinite(curr_log_prob)).nonzero(as_tuple=True)[0]
@@ -162,7 +164,8 @@ def _run_batched_ppo(
                     f"  action_masks_t (p1): {action_masks_t[idx, 0].nonzero().squeeze(-1).tolist()}\n"
                     f"  action_masks_t (p2): {action_masks_t[idx, 1].nonzero().squeeze(-1).tolist()}\n"
                     f"  is_tp_t: {is_tp_t[idx].item()}\n"
-                    f"  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4]: {numerical_t[idx, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4].tolist()}\n"
+                    "  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4]: "
+                    f"{enc_t.numerical[idx, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4].tolist()}\n"
                     f"  old_log_prob: {old_log_probs_t[idx].item()}\n"
                     f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
                 )
@@ -477,8 +480,8 @@ def main():
         from src.train.rollout import create_trajectory_buffers
 
         vec_env.reset()
-        state1 = initial_state(policy, config.n_envs, policy.device)
-        state2 = initial_state(policy, config.n_envs, policy.device)
+        state1 = policy.initial_state(config.n_envs)
+        state2 = policy.initial_state(config.n_envs)
         trajectories1 = create_trajectory_buffers(config.n_envs)
         trajectories2 = create_trajectory_buffers(config.n_envs)
         env_opponents = ["self"] * config.n_envs

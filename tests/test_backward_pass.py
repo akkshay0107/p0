@@ -103,12 +103,9 @@ def test_gradient_flow(dummy_obs):
     # allow all actions for now
     action_mask = torch.ones((2, 2, 47), dtype=torch.uint8).to(device)
 
-    logits, log_probs, sampled_actions, value, next_state = policy(
-        obs, action_mask=action_mask, sample_actions=True
-    )
-
+    out = policy.act_obs(obs, action_mask, policy.initial_state(2))
     # random loss fn involving both value and policy paths
-    loss = value.mean() - log_probs.mean()
+    loss = out.value.mean() - out.log_probs.mean()
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
     optimizer.zero_grad()
@@ -218,13 +215,15 @@ def test_value_head_scaling(dummy_obs):
 
     # backprop using value loss only
     p1.zero_grad()
-    _, _, _, value1, _ = p1(obs, sample_actions=False)
-    value1.mean().backward()
+    action_mask = torch.ones((obs.numerical.size(0), 2, ACT_SIZE), dtype=torch.bool, device=device)
+    actions = torch.full((obs.numerical.size(0), 2), 7, dtype=torch.long, device=device)
+    out1 = p1.evaluate_obs(obs, action_mask, actions, p1.initial_state(obs.numerical.size(0)))
+    out1.value.mean().backward()
     grads1 = {n: p.grad.clone() for n, p in p1.encoder.named_parameters() if p.grad is not None}
 
     p2.zero_grad()
-    _, _, _, value2, _ = p2(obs, sample_actions=False)
-    value2.mean().backward()
+    out2 = p2.evaluate_obs(obs, action_mask, actions, p2.initial_state(obs.numerical.size(0)))
+    out2.value.mean().backward()
     grads2 = {n: p.grad.clone() for n, p in p2.encoder.named_parameters() if p.grad is not None}
 
     for name in grads1:

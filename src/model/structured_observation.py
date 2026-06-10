@@ -58,6 +58,9 @@ class StructuredObservation:
     categorical: torch.Tensor
     numerical: torch.Tensor
 
+    def is_teampreview(self) -> torch.Tensor:
+        return is_teampreview(self.numerical)
+
     def clone(self) -> StructuredObservation:
         return StructuredObservation(
             token_type_ids=self.token_type_ids.clone(),
@@ -140,3 +143,7 @@ class StructuredObservation:
                 pin_memory=pin_memory,
             ),
         )
+
+
+def is_teampreview(numerical: torch.Tensor) -> torch.Tensor:
+    return numerical[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5

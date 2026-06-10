@@ -68,12 +68,6 @@ def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
     ]
 
 
-def initial_state(model: PolicyNet, batch_size: int, device: torch.device):
-    reducer = model.actor.reducer
-    hg = reducer.hg_init.detach().expand(batch_size, -1, -1).to(device)
-    return hg
-
-
 def save_checkpoint(path: Path, episode: int, policy: PolicyNet, optimizer=None, scheduler=None):
     state = {
         "episode": episode,
