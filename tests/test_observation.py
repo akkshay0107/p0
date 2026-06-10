@@ -357,6 +357,35 @@ def test_get_ordered_pokemon_real():
 
     assert ordered_reg[5][0] == p6  # dropped
 
+    # Empty left active slot: right active must stay at index 1 with a None
+    # placeholder at index 0, so seq positions match env action positions.
+    battle_left_empty = make_real_battle(
+        active_pokemon=[None, p2],
+        team=team,
+        teampreview=False,
+        available_switches=[[p3, p4], [p3, p4]],
+    )
+    ordered_le = _get_ordered_pokemon(battle_left_empty, is_opponent=False)
+    assert len(ordered_le) == 6
+    assert ordered_le[0] == (None, -1, None)
+    assert ordered_le[1][0] == p2
+    assert ordered_le[1][2] == 1  # active_idx preserved
+    # placeholder overflows the 6-row budget; the trimmed mon must be an
+    # unrevealed, unfainted one (likely unbrought) — fainted p5 must survive
+    le_mons = [entry[0] for entry in ordered_le]
+    assert p5 in le_mons
+    assert p6 not in le_mons
+
+    # Same invariant for the opponent side
+    battle_opp_left_empty = make_real_battle(
+        opponent_active_pokemon=[None, p2],
+        opponent_team=team,
+        teampreview=False,
+    )
+    ordered_opp_le = _get_ordered_pokemon(battle_opp_left_empty, is_opponent=True)
+    assert ordered_opp_le[0] == (None, -1, None)
+    assert ordered_opp_le[1][0] == p2
+
 
 def test_slot_condition_real():
     """Verify condition values assigned based on slot index, fainted, switches, or opponent using real Pokemon."""
@@ -373,6 +402,8 @@ def test_slot_condition_real():
     assert _slot_condition(battle_reg, p1, 1, is_opponent=False) == 1
 
     assert _slot_condition(battle_reg, p_fainted, 2, is_opponent=False) == 3
+    # fainted takes precedence over the active-slot index
+    assert _slot_condition(battle_reg, p_fainted, 0, is_opponent=False) == 3
 
     assert _slot_condition(battle_reg, p1, 2, is_opponent=True) == 2
 
@@ -403,7 +434,7 @@ def test_global_field_token_real():
     assert abs(num[0] - 0.6) < 1e-5
     assert abs(num[1] - 0.8) < 1e-5
     assert num[2] == 0.0  # teampreview
-    assert num[3] == 3.0 / 16.0  # turn scaling
+    assert num[3] == 3.0 / 24.0  # turn scaling
 
 
 def test_side_token_real():

@@ -256,7 +256,7 @@ def ppo_update(
     epochs_done = 0
 
     effective_batch_size = config.chunk_size * (
-        (config.batch_size - config.chunk_size + 1) // config.chunk_size
+        (config.batch_size + config.chunk_size - 1) // config.chunk_size
     )  # round up to nearest chunk
 
     early_stop = False

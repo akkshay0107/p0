@@ -331,7 +331,8 @@ def collect_rollouts(
                         buffer.add_episode(ep2)
                 step_counts2[i] = 0
 
-                if env_opponents[i] != "self":
+                # ties only happen on truncation; exclude them from win-rate stats
+                if env_opponents[i] != "self" and rewards1[i] != rewards2[i]:
                     won = bool(rewards1[i] > rewards2[i])
                     pool_wins += int(won)
                     pool_total += 1

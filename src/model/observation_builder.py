@@ -297,11 +297,25 @@ def _ally_legality(
 def _pad_team(
     res: list[tuple[Pokemon | None, int, int | None]],
 ) -> list[tuple[Pokemon | None, int, int | None]]:
+    overflow = len(res) - TEAM_SIZE
+    if overflow > 0:
+        # only happens when an active slot placeholder pushes a 6-mon team list
+        # (opponent with open team sheet) over the row budget.prefer dropping
+        # mons that are confirmed to have not been brought
+        actives, rest = res[:2], res[2:]
+        for i in range(len(rest) - 1, -1, -1):
+            if overflow == 0:
+                break
+            mon = rest[i][0]
+            if mon is not None and not mon.revealed and not mon.fainted:
+                rest.pop(i)
+                overflow -= 1
+        del rest[len(rest) - overflow :]
+        res = actives + rest
+
     pad_len = TEAM_SIZE - len(res)
     if pad_len > 0:
         res.extend([(None, -1, None)] * pad_len)
-    elif pad_len < 0:
-        res = res[:TEAM_SIZE]
     return res
 
 
@@ -321,10 +335,13 @@ def _get_ordered_pokemon(
             res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
             return _pad_team(res)
 
+        # active slots are positional: left always at index 0, right at index 1
         res: list[tuple[Pokemon | None, int, int | None]] = []
         assigned: set[Pokemon] = set()
         for mon in active:
-            if mon is not None:
+            if mon is None:
+                res.append((None, -1, None))
+            else:
                 res.append((mon, orig_idx_map.get(mon, -1), None))
                 assigned.add(mon)
         res += [
@@ -342,7 +359,9 @@ def _get_ordered_pokemon(
     res = []
     assigned = set()
     for active_idx, mon in enumerate(active):
-        if mon is not None:
+        if mon is None:
+            res.append((None, -1, None))
+        else:
             res.append((mon, orig_idx_map.get(mon, -1), active_idx))
             assigned.add(mon)
 
@@ -371,10 +390,10 @@ def _slot_condition(
         return 0
     if battle.teampreview:
         return 2
-    if seq_idx < 2:
-        return 1
     if mon.fainted:
         return 3
+    if seq_idx < 2:
+        return 1
     if is_opponent:
         return 2
     if possible_switches is None:
@@ -410,7 +429,7 @@ def _global_field_token(
         weather_duration,
         trickroom_duration,
         float(battle.teampreview),
-        battle.turn / 16.0,
+        battle.turn / 24.0,
     ]
     return categorical, numerical
 
