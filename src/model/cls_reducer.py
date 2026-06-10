@@ -20,7 +20,7 @@ class CLSReducer(nn.Module):
         nhead: int = 8,
         nlayer: int = 3,
         dim_feedforward: int | None = None,
-        n_hg: int = 4,
+        n_hg: int = 8,
         use_history: bool = True,
     ):
         super().__init__()
@@ -33,7 +33,8 @@ class CLSReducer(nn.Module):
         self.cls_base = nn.Parameter(torch.empty(1, 1, d_model))
         self.register_buffer("hg_init", torch.zeros(1, self.n_hg, d_model))
         if self.use_history:
-            self.hg_gate = nn.Parameter(torch.zeros(1, self.n_hg, 1))
+            # per-channel gate so each history dimension can keep or refresh independently
+            self.hg_gate = nn.Parameter(torch.zeros(1, self.n_hg, d_model))
 
         self.encoder = SwiGLUTransformerEncoder(
             d_model=d_model,
