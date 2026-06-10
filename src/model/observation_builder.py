@@ -333,19 +333,12 @@ def _selected_ally_pokemon(battle: DoubleBattle) -> set[Pokemon]:
     if battle.teampreview:
         return set(battle.team.values())
 
-    selected = {
-        mon
-        for mon in battle.team.values()
-        if mon.selected_in_teampreview or bool(getattr(mon, "_last_request", None))
-    }
-    if selected:
-        return selected
+    selected = {mon for mon in battle.team.values() if mon.selected_in_teampreview}
 
-    # Synthetic/legacy battle states may not carry request history. Keep a
-    # conservative fallback without making live classification depend on it.
+    # battle state authoritative, previous is fallback for trapped situations
     selected.update(mon for mon in battle.active_pokemon if mon is not None)
     selected.update(mon for switches in battle.available_switches for mon in switches)
-    selected.update(mon for mon in battle.team.values() if mon.fainted or mon.revealed)
+    selected.update(mon for mon in battle.team.values() if mon.fainted)
     return selected
 
 

@@ -419,6 +419,23 @@ def test_get_ordered_pokemon_real():
         == 2
     )
 
+    # Request metadata can be partial. A currently available switch must still
+    # be treated as selected so an empty active slot cannot trim its token.
+    for mon in team:
+        mon._selected_in_teampreview = False
+        mon._last_request = None
+    p2._selected_in_teampreview = True
+    partial_request_battle = make_real_battle(
+        active_pokemon=[None, p2],
+        team=team,
+        teampreview=False,
+        available_switches=[[p3, p6], [p3, p6]],
+    )
+    ordered_partial = _get_ordered_pokemon(partial_request_battle, is_opponent=False)
+    partial_mons = [entry[0] for entry in ordered_partial]
+    assert p6 in partial_mons
+    assert partial_mons.index(p6) < 5
+
     # Empty left active slot: right active must stay at index 1 with a None
     # placeholder at index 0, so seq positions match env action positions.
     battle_left_empty = make_real_battle(
