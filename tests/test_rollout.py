@@ -20,6 +20,7 @@ class FakePolicy:
     def __init__(self, action: int):
         self.action = action
         self.device = torch.device("cpu")
+        self.batch_sizes: list[int] = []
 
     def act_obs(
         self,
@@ -28,6 +29,7 @@ class FakePolicy:
         state: torch.Tensor,
     ) -> ActOutput:
         batch_size = action_mask.size(0)
+        self.batch_sizes.append(batch_size)
         actions = torch.full((batch_size, 2), self.action, dtype=torch.long)
         return ActOutput(
             actions=actions,
@@ -190,6 +192,8 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
     assert side_two_actions[0].tolist() == [7, 7]
     assert side_two_actions[1].tolist() == [8, 8]
     assert side_two_actions[2].tolist() == [8, 8]
+    assert policy.batch_sizes == [4]
+    assert pool.loaded["opp"].batch_sizes == [2]
 
 
 def test_pool_opponent_rotates_only_after_completed_battle():

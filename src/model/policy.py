@@ -30,9 +30,9 @@ class EncodedObs(NamedTuple):
 
     def step(self, n: int, t: int) -> EncodedObs:
         return EncodedObs(
-            tokens=self.tokens[:n, t],
-            aux=self.aux[:n, t],
-            numerical=self.numerical[:n, t],
+            tokens=self.tokens[t, :n],
+            aux=self.aux[t, :n],
+            numerical=self.numerical[t, :n],
         )
 
 

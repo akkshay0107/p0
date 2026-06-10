@@ -232,45 +232,40 @@ def collect_rollouts(
         obs2_gpu = vec_env.get_batched_obs2(device)
         mask2_gpu = torch.from_numpy(masks2).to(device, non_blocking=True)
 
-        out1 = policy.act_obs(obs1_gpu, mask1_gpu, state1)
-        log_probs1 = out1.log_probs
-        actions1 = out1.actions
-        values1 = out1.value
-        next_state1 = out1.state
+        current_obs = StructuredObservation.cat(
+            [obs1_gpu, obs2_gpu[partition.self_idx]],
+        )
+        current_mask = torch.cat([mask1_gpu, mask2_gpu[partition.self_idx]])
+        current_state = torch.cat([state1, state2[partition.self_idx]])
+        current_out = policy.act_obs(current_obs, current_mask, current_state)
 
-        if partition.pool_idx.numel() == 0:
-            out2 = policy.act_obs(obs2_gpu, mask2_gpu, state2)
-            log_probs2 = out2.log_probs
-            actions2 = out2.actions
-            values2 = out2.value
-            next_state2 = out2.state
-        else:
-            actions2 = torch.zeros_like(actions1)
-            log_probs2 = torch.zeros_like(log_probs1)
-            values2 = torch.zeros_like(values1)
-            next_state2 = state2.clone()
+        actions1 = current_out.actions[:n_envs]
+        log_probs1 = current_out.log_probs[:n_envs]
+        values1 = current_out.value[:n_envs]
+        next_state1 = current_out.state[:n_envs]
 
-            if partition.self_idx.numel() > 0:
-                self_out = policy.act_obs(
-                    obs2_gpu[partition.self_idx],
-                    mask2_gpu[partition.self_idx],
-                    state2[partition.self_idx],
-                )
-                actions2[partition.self_idx] = self_out.actions
-                log_probs2[partition.self_idx] = self_out.log_probs
-                values2[partition.self_idx] = self_out.value
-                next_state2[partition.self_idx] = self_out.state
+        actions2 = torch.zeros_like(actions1)
+        log_probs2 = torch.zeros_like(log_probs1)
+        values2 = torch.zeros_like(values1)
+        next_state2 = state2.clone()
 
-            for opponent_id, group_idx in partition.pool_groups():
-                group_out = active_pool_policies[opponent_id].act_obs(
-                    obs2_gpu[group_idx],
-                    mask2_gpu[group_idx],
-                    state2[group_idx],
-                )
-                actions2[group_idx] = group_out.actions
-                log_probs2[group_idx] = group_out.log_probs
-                values2[group_idx] = group_out.value
-                next_state2[group_idx] = group_out.state
+        if partition.self_idx.numel() > 0:
+            self_slice = slice(n_envs, None)
+            actions2[partition.self_idx] = current_out.actions[self_slice]
+            log_probs2[partition.self_idx] = current_out.log_probs[self_slice]
+            values2[partition.self_idx] = current_out.value[self_slice]
+            next_state2[partition.self_idx] = current_out.state[self_slice]
+
+        for opponent_id, group_idx in partition.pool_groups():
+            group_out = active_pool_policies[opponent_id].act_obs(
+                obs2_gpu[group_idx],
+                mask2_gpu[group_idx],
+                state2[group_idx],
+            )
+            actions2[group_idx] = group_out.actions
+            log_probs2[group_idx] = group_out.log_probs
+            values2[group_idx] = group_out.value
+            next_state2[group_idx] = group_out.state
 
         # store actions in traj before step to avoid overwrite
         # and needing to clone, instead of with step results

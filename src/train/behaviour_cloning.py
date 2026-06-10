@@ -67,15 +67,15 @@ def _run_batched_bc(
     aux_list = torch.split(all_enc.aux, split_sizes)
     numerical_list = torch.split(all_enc.numerical, split_sizes)
 
-    # pre pad the tensors to max len
+    # time major padding
     enc_p = EncodedObs(
-        tokens=torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True),
-        aux=torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True),
-        numerical=torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True),
+        tokens=torch.nn.utils.rnn.pad_sequence(list(tokens_list)),
+        aux=torch.nn.utils.rnn.pad_sequence(list(aux_list)),
+        numerical=torch.nn.utils.rnn.pad_sequence(list(numerical_list)),
     )
 
     def pack(fields):
-        return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
+        return torch.nn.utils.rnn.pad_sequence(fields).to(device)
 
     all_targets_list = [
         torch.cat([sample["action"].unsqueeze(0) for sample in ep], dim=0) for ep in episodes
@@ -96,8 +96,8 @@ def _run_batched_bc(
             break
 
         enc_t = enc_p.step(active_n, t)
-        masks_t = masks_p[:active_n, t]
-        targets_t = targets_p[:active_n, t]
+        masks_t = masks_p[t, :active_n]
+        targets_t = targets_p[t, :active_n]
 
         curr_state = state[:active_n]
         out = policy.evaluate(enc_t, masks_t, targets_t, curr_state)

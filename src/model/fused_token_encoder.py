@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import cast
 
 import torch
 import torch.nn as nn
@@ -35,8 +34,6 @@ NUM_SLOTS = 7
 # 29 Opponent-side super
 # 30 Opponent-side numeric
 _SUPER_POS = tuple(range(1, 24, 2))  # (1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
-_ACTOR_POS = 1  # active ally Pokémon is always at slot 1
-_OTHER_SUPER_POS = _SUPER_POS[1:]  # the 11 super slots that are not the active actor
 _NUMERIC_POS = tuple(range(2, 25, 2))  # (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)
 _FIELD_SUPER_POS = (25, 27, 29)
 _FIELD_NUMERIC_POS = (26, 28, 30)
@@ -183,7 +180,6 @@ class FusedTokenEncoder(nn.Module):
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
         self.register_buffer("_super_pos", torch.tensor(_SUPER_POS, dtype=torch.long))
-        self.register_buffer("_other_super_pos", torch.tensor(_OTHER_SUPER_POS, dtype=torch.long))
         self.register_buffer("_numeric_pos", torch.tensor(_NUMERIC_POS, dtype=torch.long))
         self.register_buffer("_field_super_pos", torch.tensor(_FIELD_SUPER_POS, dtype=torch.long))
         self.register_buffer(
@@ -332,15 +328,11 @@ class FusedTokenEncoder(nn.Module):
 
         x = torch.zeros(B, S, self.d_model, device=device, dtype=self.mon_fusion_token.dtype)
 
-        # active Pokemon is processed separately to expose its move embeddings.
-        actor_out, aux_moves = self._embed_pokemon_super(categorical[:, _ACTOR_POS, :], aux=True)
-        x[:, _ACTOR_POS, :] = actor_out
-
-        n_other = len(_OTHER_SUPER_POS)
-        other_cats = categorical[:, self._other_super_pos, :].flatten(0, 1)
-        other_super = cast(torch.Tensor, self._embed_pokemon_super(other_cats))
-        other_out = other_super.unflatten(0, (B, n_other))
-        x[:, self._other_super_pos, :] = other_out
+        n_super = len(_SUPER_POS)
+        super_cats = categorical[:, self._super_pos, :].flatten(0, 1)
+        super_out, all_move_embs = self._embed_pokemon_super(super_cats, aux=True)
+        x[:, self._super_pos, :] = super_out.unflatten(0, (B, n_super))
+        aux_moves = all_move_embs.unflatten(0, (B, n_super))[:, 0]
 
         x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :])
 

@@ -98,16 +98,16 @@ def _run_batched_ppo(
     aux_list = torch.split(all_enc.aux, split_sizes)
     numerical_list = torch.split(all_enc.numerical, split_sizes)
 
-    # pre pad all to max len
+    # time major padding
     enc_p = EncodedObs(
-        tokens=torch.nn.utils.rnn.pad_sequence(list(tokens_list), batch_first=True),
-        aux=torch.nn.utils.rnn.pad_sequence(list(aux_list), batch_first=True),
-        numerical=torch.nn.utils.rnn.pad_sequence(list(numerical_list), batch_first=True),
+        tokens=torch.nn.utils.rnn.pad_sequence(list(tokens_list)),
+        aux=torch.nn.utils.rnn.pad_sequence(list(aux_list)),
+        numerical=torch.nn.utils.rnn.pad_sequence(list(numerical_list)),
     )
 
     # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
     def pack(fields):
-        return torch.nn.utils.rnn.pad_sequence(fields, batch_first=True).to(device)
+        return torch.nn.utils.rnn.pad_sequence(fields).to(device)
 
     actions_p = pack([ep["actions"] for ep in episodes])
     old_log_probs_p = pack([ep["log_probs"] for ep in episodes])
@@ -135,11 +135,11 @@ def _run_batched_ppo(
             break
 
         enc_t = enc_p.step(active_n, t)
-        actions_t = actions_p[:active_n, t]
-        old_log_probs_t = old_log_probs_p[:active_n, t]
-        advantages_t = advantages_p[:active_n, t]
-        returns_t = returns_p[:active_n, t]
-        action_masks_t = action_masks_p[:active_n, t]
+        actions_t = actions_p[t, :active_n]
+        old_log_probs_t = old_log_probs_p[t, :active_n]
+        advantages_t = advantages_p[t, :active_n]
+        returns_t = returns_p[t, :active_n]
+        action_masks_t = action_masks_p[t, :active_n]
         is_tp_t = is_teampreview(enc_t.numerical)
 
         curr_state = state[:active_n]

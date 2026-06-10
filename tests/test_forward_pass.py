@@ -51,6 +51,63 @@ def test_policy_net_forward_pass(policy_net):
     assert out.state.shape == (B, 4, 128)  # n_hg is 4
 
 
+def test_encoder_batches_all_pokemon_in_one_fusion_call(policy_net):
+    B = 2
+    obs = StructuredObservation(
+        categorical=torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
+        numerical=torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH)),
+        token_type_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
+        side_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
+        slot_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
+    )
+    action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
+    calls: list[tuple[int, ...]] = []
+
+    def record_shape(module, args, output):
+        del module, output
+        calls.append(tuple(args[0].shape))
+
+    handle = policy_net.encoder.mon_fusion.register_forward_hook(record_shape)
+    try:
+        with torch.no_grad():
+            batched = policy_net.encode(obs, action_mask)
+    finally:
+        handle.remove()
+
+    assert calls == [(B * 12, 12, 128)]
+
+    with torch.no_grad():
+        separate = [
+            policy_net.encode(obs[i : i + 1], action_mask[i : i + 1]) for i in range(B)
+        ]
+
+    torch.testing.assert_close(
+        batched.tokens,
+        torch.cat([enc.tokens for enc in separate]),
+    )
+    torch.testing.assert_close(
+        batched.aux,
+        torch.cat([enc.aux for enc in separate]),
+    )
+
+
+def test_encoded_obs_step_is_contiguous_time_major():
+    enc = EncodedObs(
+        tokens=torch.randn((3, 4, 5, 6)),
+        aux=torch.randn((3, 4, 2, 6)),
+        numerical=torch.randn((3, 4, 5, 7)),
+    )
+
+    step = enc.step(3, 1)
+
+    assert step.tokens.shape == (3, 5, 6)
+    assert step.aux.shape == (3, 2, 6)
+    assert step.numerical.shape == (3, 5, 7)
+    assert step.tokens.is_contiguous()
+    assert step.aux.is_contiguous()
+    assert step.numerical.is_contiguous()
+
+
 def test_policy_net_encoded_evaluate(policy_net):
     B = 16
     tokens = torch.randn((B, SEQUENCE_LENGTH + 1, 128))
