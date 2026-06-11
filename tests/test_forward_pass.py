@@ -109,7 +109,7 @@ def test_encoded_obs_step_is_contiguous_time_major():
 def test_policy_net_encoded_evaluate(policy_net):
     B = 16
     tokens = torch.randn((B, SEQUENCE_LENGTH + 1, 128))
-    aux = torch.randn((B, 4, 128))
+    aux = torch.randn((B, 2, 4, 128))
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
@@ -259,3 +259,23 @@ def test_fainted_pokemon_visible(policy_net):
 
     assert not torch.allclose(out_fainted.logits, out_modified.logits, atol=1e-5)
     assert not torch.allclose(out_fainted.value, out_modified.value, atol=1e-5)
+
+
+def test_cls_reducer_pokemon_tokens_alignment():
+    """pokemon_tokens must be exactly the 24 pokemon tokens (original indices 1-24)."""
+    import torch.nn as nn
+
+    from src.model.cls_reducer import CLSReducer
+
+    reducer = CLSReducer(seq_len=SEQUENCE_LENGTH + 1, d_model=32, nhead=4, nlayer=1)
+
+    class _Passthrough(nn.Module):
+        def forward(self, seq, src_key_padding_mask=None):
+            return seq
+
+    reducer.encoder = _Passthrough()
+    tokens = torch.randn(2, SEQUENCE_LENGTH + 1, 32)
+
+    _, _, pokemon_tokens = reducer(tokens, None, None)
+
+    torch.testing.assert_close(pokemon_tokens, tokens[:, 1:25])

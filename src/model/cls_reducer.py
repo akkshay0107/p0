@@ -62,7 +62,8 @@ class CLSReducer(nn.Module):
         tokens: torch.Tensor,
         state: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns cls, history, all other tokens"""
         if tokens.dim() == 2:
             tokens = tokens.unsqueeze(0)
 
@@ -100,4 +101,6 @@ class CLSReducer(nn.Module):
         else:
             hg = hg_candidate
 
-        return cls, hg
+        # extract only the 24 pokemon tokens (skipping CLS at idx 0, and field tokens at idx 25+).
+        pokemon_tokens = enc[:, 1 + self.n_hg : 1 + self.n_hg + 24]
+        return cls, hg, pokemon_tokens

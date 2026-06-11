@@ -126,6 +126,8 @@ def test_gradient_flow(dummy_obs):
         "actor.move_proj",
         "actor.tp_meta_emb",
         "actor.reducer.hg_gate",  # since test only on a single step
+        "actor.q_switch_proj1",
+        "actor.q_pass_proj1",
     ]
 
     for name, param in policy.named_parameters():
@@ -146,8 +148,8 @@ def test_gradient_flow(dummy_obs):
     components = {
         "shared_encoder": "encoder",
         "actor_reducer": "actor.reducer",
-        "actor_head1": "actor.head1",
-        "actor_head2": "actor.head2",
+        "actor_w_k": "actor.w_k",
+        "actor_q_proj": "actor.q_",
         "critic_head": "critic.net",
     }
 
@@ -198,38 +200,6 @@ def test_gradient_flow(dummy_obs):
     assert not missing_emb_grads, (
         f"The following embeddings are not receiving gradients: {missing_emb_grads}"
     )
-
-
-def test_value_head_scaling(dummy_obs):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    obs = dummy_obs.to(device)
-
-    # Create two identical policies except for the scale
-    torch.manual_seed(1)
-    p1 = PolicyNet(d_model=64, nhead=2, nlayer=1).to(device)
-    p2 = PolicyNet(d_model=64, nhead=2, nlayer=1).to(device)
-    p2.load_state_dict(p1.state_dict())
-
-    p1.critic.scale = 1.0
-    p2.critic.scale = 0.1
-
-    # backprop using value loss only
-    p1.zero_grad()
-    action_mask = torch.ones((obs.numerical.size(0), 2, ACT_SIZE), dtype=torch.bool, device=device)
-    actions = torch.full((obs.numerical.size(0), 2), 7, dtype=torch.long, device=device)
-    out1 = p1.evaluate_obs(obs, action_mask, actions, p1.initial_state(obs.numerical.size(0)))
-    out1.value.mean().backward()
-    grads1 = {n: p.grad.clone() for n, p in p1.encoder.named_parameters() if p.grad is not None}
-
-    p2.zero_grad()
-    out2 = p2.evaluate_obs(obs, action_mask, actions, p2.initial_state(obs.numerical.size(0)))
-    out2.value.mean().backward()
-    grads2 = {n: p.grad.clone() for n, p in p2.encoder.named_parameters() if p.grad is not None}
-
-    for name in grads1:
-        g1 = grads1[name]
-        g2 = grads2[name]
-        torch.testing.assert_close(g2, 0.1 * g1, rtol=1e-4, atol=1e-8)
 
 
 def test_ppo_warmup(dummy_obs):

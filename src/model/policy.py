@@ -1,26 +1,45 @@
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from torch import Tensor  # just to shorten type defs
+from torch import Tensor
 from torch.distributions import Categorical
 
 from src.lookups import ACT_SIZE
 from src.model.cls_reducer import CLSReducer
 from src.model.fused_token_encoder import FusedTokenEncoder
 from src.model.structured_observation import (
+    ALLY_NUM_TOKENS,
     ALLY_POKE_TOKENS,
     NUM_IDX_ORIG_IDX_RATIO,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TARGET_SEQ_INDICES,
-    SideId,
+    TEAM_SIZE,
+    TOKEN_IDX_CLS,
     StructuredObservation,
     is_teampreview,
 )
+
+# Only these entities are ever pointed at: the 6 allies (switch/TP/ally targets)
+# and the 2 opponent actives (move targets). Opponent bench rows get no keys.
+N_KEY_ENTITIES = TEAM_SIZE + 2
+
+# Action Space Layout Constants
+PASS_START = 0
+PASS_END = 1
+SWITCH_START = 1
+SWITCH_END = 7
+MOVE_START = 7
+MOVE_END = 27
+MEGA_START = 27
+MEGA_END = 47
+TP_START = 0
+TP_END = 36
 
 
 class EncodedObs(NamedTuple):
@@ -52,38 +71,13 @@ class EvalOutput(NamedTuple):
     logits: Tensor
 
 
-class PolicyHead(nn.Module):
-    def __init__(self, in_features: int, out_features: int, hidden_dim: int = 512):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, out_features),
-        )
-        self._init_weights()
-
-    @torch.no_grad()
-    def _init_weights(self):
-        for i, module in enumerate(self.net):
-            if isinstance(module, nn.Linear):
-                # init output layer with minimal variance at the start
-                gain = 0.01 if i == len(self.net) - 1 else 1.0
-                init.orthogonal_(module.weight, gain=gain)
-                init.zeros_(module.bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
-
-
 class ValueHead(nn.Module):
     """Stateful critic value path."""
 
     def __init__(
         self,
         d_model: int,
-        hidden_dim: int = 1024,  # double that of policy heads
+        hidden_dim: int = 1024,
     ):
         super().__init__()
         self.net = nn.Sequential(
@@ -107,10 +101,11 @@ class ValueHead(nn.Module):
 
 
 class ActorPolicy(nn.Module):
-    """Stateful actor policy path."""
+    """Stateful actor policy path using Pointer Head."""
 
-    target_seq_indices: Tensor
-    ally_poke_tokens: Tensor
+    target_entity_indices: Tensor
+    ally_poke_entities: Tensor
+    ally_num_tokens: Tensor
     batch_indices: Tensor
     all_a: Tensor
 
@@ -126,6 +121,8 @@ class ActorPolicy(nn.Module):
         super().__init__()
         self.act_size = act_size
         self.side_emb = side_emb
+        self.d_model = d_model
+        self.d_k = d_model // 4
 
         self.reducer = CLSReducer(
             seq_len=seq_len,
@@ -135,156 +132,154 @@ class ActorPolicy(nn.Module):
             use_history=True,
         )
 
-        # embedding components for P(a2 | z, a1)
-        d_act_emb = d_model // 4
+        # pure linear key projections (attention-style): a GELU here would confine
+        # keys to the near-nonnegative cone and bias every dot-product score
+        self.w_k_super = nn.Linear(d_model, self.d_k)
+        self.w_k_num = nn.Linear(d_model, self.d_k)
+        self.w_k_move = nn.Linear(d_model, self.d_k)
 
-        self.pass_emb = nn.Parameter(torch.empty(d_act_emb))
-        self.tp_meta_emb = nn.Parameter(torch.empty(d_act_emb))
-        self.switch_meta_emb = nn.Parameter(torch.empty(d_act_emb))
-        self.move_meta_emb = nn.Parameter(torch.empty(d_act_emb))
-        self.mega_meta_emb = nn.Parameter(torch.empty(d_act_emb))
-        self.target_self_multi_emb = nn.Parameter(torch.empty(d_act_emb))
+        self.q_switch_proj1 = nn.Linear(d_model, self.d_k)
+        self.q_move_proj1 = nn.Linear(d_model, self.d_k)
+        self.q_pass_proj1 = nn.Linear(d_model, self.d_k)
+        self.q_tp_proj1 = nn.Linear(d_model, self.d_k)
 
-        def make_proj(d_in: int, d_out: int) -> nn.Sequential:
-            return nn.Sequential(nn.Linear(d_in, d_out), nn.GELU(), nn.Linear(d_out, d_out))
+        self.q_switch_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
+        self.q_move_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
+        self.q_pass_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
+        self.q_tp_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
 
-        self.actor_proj = make_proj(d_model, d_act_emb)
-        self.target_proj = make_proj(d_model, d_act_emb)
-        self.move_proj = make_proj(d_model, d_act_emb)
-        self.side_proj = nn.Linear(d_model, d_act_emb)
+        self.joint_move_mlp = nn.Sequential(
+            nn.Linear(3 * self.d_k, self.d_k), nn.GELU(), nn.Linear(self.d_k, 1)
+        )
+        self.joint_tp_mlp = nn.Sequential(
+            nn.Linear(3 * self.d_k, self.d_k), nn.GELU(), nn.Linear(self.d_k, 1)
+        )
 
-        for p in [
-            self.pass_emb,
-            self.tp_meta_emb,
-            self.switch_meta_emb,
-            self.move_meta_emb,
-            self.mega_meta_emb,
-            self.target_self_multi_emb,
-        ]:
-            init.normal_(p, mean=0, std=0.02)
+        self.mega_emb = nn.Parameter(torch.empty(self.d_k))
+        self.pass_key = nn.Parameter(torch.empty(self.d_k))
+        self.target_self_key = nn.Parameter(torch.empty(self.d_k))
+        self.pointer_temp = nn.Parameter(torch.tensor(0.01))
 
-        for seq_module in [self.actor_proj, self.target_proj, self.move_proj]:
-            for module in seq_module.modules():
-                if isinstance(module, nn.Linear):
-                    init.orthogonal_(module.weight, gain=1.0)
-                    init.zeros_(module.bias)
-
-        init.orthogonal_(self.side_proj.weight, gain=1.0)
-        init.zeros_(self.side_proj.bias)
-
+        # entity i is built from the pokemon token pair (1 + 2i, 2 + 2i); the
+        # learned self key is appended after the N_KEY_ENTITIES real entities
+        target_entities = [
+            N_KEY_ENTITIES if t == TOKEN_IDX_CLS else (t - 1) // 2 for t in TARGET_SEQ_INDICES
+        ]
         self.register_buffer(
-            "target_seq_indices", torch.tensor(TARGET_SEQ_INDICES, dtype=torch.long)
+            "target_entity_indices", torch.tensor(target_entities, dtype=torch.long)
         )
-        self.register_buffer("ally_poke_tokens", torch.tensor(ALLY_POKE_TOKENS, dtype=torch.long))
-        self.register_buffer("all_a", torch.arange(36, dtype=torch.long))
+        self.register_buffer(
+            "ally_poke_entities",
+            torch.tensor([(t - 1) // 2 for t in ALLY_POKE_TOKENS], dtype=torch.long),
+        )
+        self.register_buffer("ally_num_tokens", torch.tensor(ALLY_NUM_TOKENS, dtype=torch.long))
+        self.register_buffer("all_a", torch.arange(TP_END, dtype=torch.long))
 
-        self.ctx_norm = nn.LayerNorm(d_act_emb)
-        self.head1 = PolicyHead(d_model, act_size)  # P(a1 | z)
-        self.head2 = PolicyHead(d_model + d_act_emb, act_size)  # P(a2 | z, a1)
+        self._init_weights()
 
-    def _build_action_context(
+    @torch.no_grad()
+    def _init_weights(self):
+        init.normal_(self.mega_emb, std=0.02)
+        init.normal_(self.pass_key, std=0.02)
+        init.normal_(self.target_self_key, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                init.orthogonal_(module.weight, gain=1.0)
+                init.zeros_(module.bias)
+
+    def _compute_pointer_logits(
         self,
-        a1: Tensor,
-        tokens: Tensor,
-        aux: Tensor,
+        z: Tensor,
+        tokens_ctx: Tensor,
+        aux_moves: Tensor,
         numerical: Tensor,
-    ) -> Tensor:
-        # slightly wasteful but avoids CPU checks for assigning to mask
-        B = a1.size(0)
-        device = a1.device
-        batch_idx = torch.arange(B, device=device)
+        head_idx: int,
+        ctx_a1: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        B = z.size(0)
+        device = z.device
 
-        is_tp = is_teampreview(numerical)
-        is_pass = (a1 == 0) & ~is_tp
-        is_switch = (a1 >= 1) & (a1 <= 6) & ~is_tp
-        is_move = (a1 >= 7) & ~is_tp
-        is_mega = (a1 >= 27) & (a1 <= 46) & ~is_tp
+        k_tokens = tokens_ctx[:, : 2 * N_KEY_ENTITIES]
+        k_super = self.w_k_super(k_tokens[:, 0::2])
+        k_num = self.w_k_num(k_tokens[:, 1::2])
+        k_entity = k_super + k_num
 
-        # actor embedding always comes at slot 1 and 2
-        # since we order it in the obs builder
-        actor_emb = self.actor_proj(tokens[:, 1:3, :]).sum(dim=1)
+        k_self = self.target_self_key.unsqueeze(0).unsqueeze(1).expand(B, 1, -1)
+        k_entity_extended = torch.cat([k_entity, k_self], dim=1)
 
-        # context embeddings for team preview
-        idx_p1 = (a1 // 6) * 2 + 1
-        idx_p2 = (a1 % 6) * 2 + 1
-        tok_p1_super = tokens[batch_idx, idx_p1, :]
-        tok_p1_num = tokens[batch_idx, idx_p1 + 1, :]
-        tok_p2_super = tokens[batch_idx, idx_p2, :]
-        tok_p2_num = tokens[batch_idx, idx_p2 + 1, :]
-        tok_leads = torch.stack([tok_p1_super, tok_p1_num, tok_p2_super, tok_p2_num], dim=1)
+        k_moves = self.w_k_move(aux_moves)
 
-        # set embedding for the lead pokemon
-        # manual deepset impl
-        tp_ctx = nn.functional.gelu(self.actor_proj(tok_leads).sum(dim=1)) + self.tp_meta_emb
+        if head_idx == 0:
+            q_switch = self.q_switch_proj1(z)
+            q_move = self.q_move_proj1(z)
+            q_pass = self.q_pass_proj1(z)
+            q_tp = self.q_tp_proj1(z)
+        else:
+            assert ctx_a1 is not None, "ctx_a1 must be provided for head 2"
+            z_ctx = torch.cat([z, ctx_a1], dim=-1)
+            q_switch = self.q_switch_proj2(z_ctx)
+            q_move = self.q_move_proj2(z_ctx)
+            q_pass = self.q_pass_proj2(z_ctx)
+            q_tp = self.q_tp_proj2(z_ctx)
 
-        pass_ctx = actor_emb + self.pass_emb
+        # one scratch column past act_size absorbs the switch scatter of empty
+        # ally rows (orig ratio 0), which would otherwise land on the pass slot
+        logits = torch.full((B, self.act_size + 1), float("-inf"), device=device)
+        action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
-        # switch context embeds pokemon switching out + pokemon switching in
-        slot_idx = a1.clamp(1, 6)
-        ally_indices = self.ally_poke_tokens
-        orig_ids = torch.round(numerical[:, ally_indices + 1, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
-        matches = orig_ids == slot_idx.unsqueeze(-1)
-        valid_match = matches.any(dim=-1)
-        match_idx = matches.float().argmax(dim=-1)
+        logits[:, PASS_START] = (q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)
+        action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1)
 
-        # force a index error if switch invalid
-        if (is_switch & ~valid_match).any():
-            raise IndexError("Invalid switch action: no matching ally pokemon found.")
+        k_ally = k_entity[:, self.ally_poke_entities, :]
+        switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / math.sqrt(self.d_k)
+        orig_ids = torch.round(
+            numerical[:, self.ally_num_tokens, NUM_IDX_ORIG_IDX_RATIO] * 6
+        ).long()
+        orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
+        logits.scatter_(1, orig_ids, switch_scores)
+        action_keys.scatter_(1, orig_ids.unsqueeze(-1).expand(-1, -1, self.d_k), k_ally)
 
-        actual_seq_idx = ally_indices[match_idx]
-        incoming_tok_super = tokens[batch_idx, actual_seq_idx, :]
-        incoming_tok_num = tokens[batch_idx, actual_seq_idx + 1, :]
-        incoming_toks = torch.stack([incoming_tok_super, incoming_tok_num], dim=1)
-        incoming_proj = self.target_proj(incoming_toks).sum(dim=1)
-        switch_ctx = actor_emb + incoming_proj + self.switch_meta_emb
+        k_targets = k_entity_extended[:, self.target_entity_indices, :]
+        k_moves_grid = k_moves.unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
+        k_targets_grid = k_targets.unsqueeze(1).expand(-1, 4, -1, -1).reshape(B, 20, self.d_k)
+        q_move_grid = q_move.unsqueeze(1).expand(-1, 20, -1)
 
-        # move context embedding
-        # if move is single target => actor emb + target emb
-        # else => actor emb + learned token for self / multi target
-        # mega token added if mega too
-        a1_m = a1.clamp_min(7) - 7
-        move_idx = (a1_m % 20) // 5
-        target_idx = a1_m % 5
+        joint_move_input = torch.cat([k_moves_grid, k_targets_grid, q_move_grid], dim=-1)
+        move_scores = self.joint_move_mlp(joint_move_input).squeeze(-1)
+        move_ctxs = k_moves_grid + k_targets_grid
 
-        mapped_target = self.target_seq_indices[target_idx]
-        target_toks_super = tokens[batch_idx, mapped_target, :]
-        target_toks_num = tokens[batch_idx, mapped_target + 1, :]
-        target_toks = torch.stack([target_toks_super, target_toks_num], dim=1)
-        target_toks_proj = self.target_proj(target_toks).sum(dim=1)
+        logits[:, MOVE_START:MOVE_END] = move_scores
+        action_keys[:, MOVE_START:MOVE_END, :] = move_ctxs
 
-        target_toks_proj = torch.where(
-            (target_idx == 2).unsqueeze(-1),
-            torch.zeros_like(target_toks_proj),
-            target_toks_proj,
+        k_mega_moves_grid = (
+            (k_moves + self.mega_emb).unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
+        )
+        joint_mega_input = torch.cat([k_mega_moves_grid, k_targets_grid, q_move_grid], dim=-1)
+        mega_scores = self.joint_move_mlp(joint_mega_input).squeeze(-1)
+        mega_ctxs = k_mega_moves_grid + k_targets_grid
+
+        logits[:, MEGA_START:MEGA_END] = mega_scores
+        action_keys[:, MEGA_START:MEGA_END, :] = mega_ctxs
+
+        is_tp = is_teampreview(numerical).unsqueeze(-1)
+
+        k_lead_grid = k_ally.unsqueeze(2).expand(-1, -1, 6, -1).reshape(B, TP_END, self.d_k)
+        k_back_grid = k_ally.unsqueeze(1).expand(-1, 6, -1, -1).reshape(B, TP_END, self.d_k)
+        q_tp_grid = q_tp.unsqueeze(1).expand(-1, TP_END, -1)
+
+        joint_tp_input = torch.cat([k_lead_grid, k_back_grid, q_tp_grid], dim=-1)
+        tp_scores = self.joint_tp_mlp(joint_tp_input).squeeze(-1)
+
+        tp_ctxs = k_lead_grid + k_back_grid
+
+        logits[:, TP_START:TP_END] = torch.where(is_tp, tp_scores, logits[:, TP_START:TP_END])
+        action_keys[:, TP_START:TP_END, :] = torch.where(
+            is_tp.unsqueeze(-1), tp_ctxs, action_keys[:, TP_START:TP_END, :]
         )
 
-        is_ally = target_idx < 2
-        is_opp = target_idx > 2
-
-        # project side embeddings from the shared encoder
-        side_weights_proj = self.side_proj(self.side_emb.weight)
-        ally_meta = side_weights_proj[int(SideId.ALLY)].unsqueeze(0)
-        opp_meta = side_weights_proj[int(SideId.OPPONENT)].unsqueeze(0)
-        self_meta = self.target_self_multi_emb.unsqueeze(0)
-
-        target_meta = torch.where(
-            is_ally.unsqueeze(-1),
-            ally_meta,
-            torch.where(is_opp.unsqueeze(-1), opp_meta, self_meta),
-        )
-
-        move_meta = torch.where(is_mega.unsqueeze(-1), self.mega_meta_emb, self.move_meta_emb)
-        move_emb = aux[batch_idx, move_idx, :]
-        move_ctx = actor_emb + self.move_proj(move_emb) + target_toks_proj + target_meta + move_meta
-
-        # combine all contexts
-        ctx = torch.zeros(B, self.pass_emb.size(0), device=device)
-        ctx = torch.where(is_tp.unsqueeze(-1), tp_ctx, ctx)
-        ctx = torch.where(is_pass.unsqueeze(-1), pass_ctx, ctx)
-        ctx = torch.where(is_switch.unsqueeze(-1), switch_ctx, ctx)
-        ctx = torch.where(is_move.unsqueeze(-1), move_ctx, ctx)
-
-        return self.ctx_norm(ctx)
+        # prevent pointer temp from becoming negative / 0
+        logits = logits[:, : self.act_size] * self.pointer_temp.clamp_min(1e-4)
+        return logits, action_keys[:, : self.act_size]
 
     @staticmethod
     def _apply_top_p(logits: Tensor, top_p: float) -> Tensor:
@@ -307,16 +302,24 @@ class ActorPolicy(nn.Module):
         *,
         top_p: float = 1.0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        z, next_state = self.reducer(enc.tokens, state, None)
-        logits1 = self.head1(z)
+        z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
+
+        logits1, keys1 = self._compute_pointer_logits(
+            z, tokens_ctx, enc.aux[:, 0], enc.numerical, head_idx=0
+        )
         logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
         sample_logits1 = self._apply_top_p(logits1, top_p) if top_p < 1.0 else logits1
 
         dist1 = Categorical(logits=sample_logits1)
         a1 = dist1.sample()
 
-        a1_emb = self._build_action_context(a1, enc.tokens, enc.aux, enc.numerical)
-        logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
+        batch_idx = torch.arange(a1.size(0), device=a1.device)
+        ctx_a1 = keys1[batch_idx, a1]
+
+        logits2, _ = self._compute_pointer_logits(
+            z, tokens_ctx, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
+        )
+
         logits = torch.stack([logits1, logits2], dim=1)
         logits = self._apply_sequential_masks(
             logits, a1, action_mask, is_teampreview(enc.numerical)
@@ -336,11 +339,20 @@ class ActorPolicy(nn.Module):
         actions: Tensor,
         state: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        z, next_state = self.reducer(enc.tokens, state, None)
-        logits1 = self.head1(z)
+        z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
+
+        logits1, keys1 = self._compute_pointer_logits(
+            z, tokens_ctx, enc.aux[:, 0], enc.numerical, head_idx=0
+        )
         a1 = actions[:, 0]
-        a1_emb = self._build_action_context(a1, enc.tokens, enc.aux, enc.numerical)
-        logits2 = self.head2(torch.cat([z, a1_emb], dim=-1))
+
+        batch_idx = torch.arange(a1.size(0), device=a1.device)
+        ctx_a1 = keys1[batch_idx, a1]
+
+        logits2, _ = self._compute_pointer_logits(
+            z, tokens_ctx, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
+        )
+
         logits = torch.stack([logits1, logits2], dim=1)
         logits = self._apply_sequential_masks(
             logits, a1, action_mask, is_teampreview(enc.numerical)

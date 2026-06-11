@@ -143,6 +143,10 @@ def main():
                     moves_set.add(move)
                     current_moves.append(move)
 
+    # in-battle forme changes that never appear in team sheets
+    if "mimikyu" in species_set:
+        species_set.add("mimikyubusted")
+
     vocab = {
         "species": {name: idx + 1 for idx, name in enumerate(sorted(species_set))},
         "items": {name: idx + 1 for idx, name in enumerate(sorted(items_set))},

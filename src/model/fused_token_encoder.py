@@ -330,7 +330,7 @@ class FusedTokenEncoder(nn.Module):
         super_cats = categorical[:, self._super_pos, :].flatten(0, 1)
         super_out, all_move_embs = self._embed_pokemon_super(super_cats, aux=True)
         x[:, self._super_pos, :] = super_out.unflatten(0, (B, n_super))
-        aux_moves = all_move_embs.unflatten(0, (B, n_super))[:, 0]
+        aux_moves = all_move_embs.unflatten(0, (B, n_super))[:, :2]
 
         x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :])
 
