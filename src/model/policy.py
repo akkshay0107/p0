@@ -228,7 +228,7 @@ class ActorPolicy(nn.Module):
 
         # one scratch column past act_size absorbs the switch scatter of empty
         # ally rows (orig ratio 0), which would otherwise land on the pass slot
-        logits = torch.full((B, self.act_size + 1), float("-inf"), device=device)
+        logits = torch.zeros((B, self.act_size + 1), device=device)
         action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
         logits[:, PASS_START] = (q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)
