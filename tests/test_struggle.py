@@ -118,8 +118,9 @@ def test_struggle_policy_logits():
     enc = policy.encode(obs, action_mask)
 
     z, next_state, tokens_ctx = policy.actor.reducer(enc.tokens, state, None)
+    k_entity_extended = policy.actor._compute_keys(tokens_ctx)
     logits, keys = policy.actor._compute_pointer_logits(
-        z, tokens_ctx, enc.aux[:, 0], enc.numerical, head_idx=0
+        z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
     )
 
     torch.testing.assert_close(keys[:, 48], policy.actor.struggle_key.unsqueeze(0).expand(B, -1))

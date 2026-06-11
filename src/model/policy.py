@@ -134,21 +134,14 @@ class ActorPolicy(nn.Module):
             use_history=True,
         )
 
-        # pure linear key projections (attention-style): a GELU here would confine
-        # keys to the near-nonnegative cone and bias every dot-product score
         self.w_k_super = nn.Linear(d_model, self.d_k)
         self.w_k_num = nn.Linear(d_model, self.d_k)
         self.w_k_move = nn.Linear(d_model, self.d_k)
 
-        self.q_switch_proj1 = nn.Linear(d_model, self.d_k)
-        self.q_move_proj1 = nn.Linear(d_model, self.d_k)
-        self.q_pass_proj1 = nn.Linear(d_model, self.d_k)
-        self.q_tp_proj1 = nn.Linear(d_model, self.d_k)
-
-        self.q_switch_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
-        self.q_move_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
-        self.q_pass_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
-        self.q_tp_proj2 = nn.Linear(d_model + self.d_k, self.d_k)
+        # fused query projector for the 4 query types
+        # pass, switch, move, mega
+        self.q_proj1 = nn.Linear(d_model, 4 * self.d_k)
+        self.q_proj2 = nn.Linear(d_model + self.d_k, 4 * self.d_k)
 
         self.joint_move_mlp = nn.Sequential(
             nn.Linear(3 * self.d_k, self.d_k), nn.GELU(), nn.Linear(self.d_k, 1)
@@ -191,18 +184,8 @@ class ActorPolicy(nn.Module):
                 init.orthogonal_(module.weight, gain=1.0)
                 init.zeros_(module.bias)
 
-    def _compute_pointer_logits(
-        self,
-        z: Tensor,
-        tokens_ctx: Tensor,
-        aux_moves: Tensor,
-        numerical: Tensor,
-        head_idx: int,
-        ctx_a1: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        B = z.size(0)
-        device = z.device
-
+    def _compute_keys(self, tokens_ctx: Tensor) -> Tensor:
+        B = tokens_ctx.size(0)
         k_tokens = tokens_ctx[:, : 2 * N_KEY_ENTITIES]
         k_super = self.w_k_super(k_tokens[:, 0::2])
         k_num = self.w_k_num(k_tokens[:, 1::2])
@@ -211,20 +194,30 @@ class ActorPolicy(nn.Module):
         k_self = self.target_self_key.unsqueeze(0).unsqueeze(1).expand(B, 1, -1)
         k_entity_extended = torch.cat([k_entity, k_self], dim=1)
 
+        return k_entity_extended
+
+    def _compute_pointer_logits(
+        self,
+        z: Tensor,
+        k_entity_extended: Tensor,
+        aux_moves: Tensor,
+        numerical: Tensor,
+        head_idx: int,
+        ctx_a1: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        B = z.size(0)
+        device = z.device
+
         k_moves = self.w_k_move(aux_moves)
 
         if head_idx == 0:
-            q_switch = self.q_switch_proj1(z)
-            q_move = self.q_move_proj1(z)
-            q_pass = self.q_pass_proj1(z)
-            q_tp = self.q_tp_proj1(z)
+            q_all = self.q_proj1(z)
         else:
             assert ctx_a1 is not None, "ctx_a1 must be provided for head 2"
             z_ctx = torch.cat([z, ctx_a1], dim=-1)
-            q_switch = self.q_switch_proj2(z_ctx)
-            q_move = self.q_move_proj2(z_ctx)
-            q_pass = self.q_pass_proj2(z_ctx)
-            q_tp = self.q_tp_proj2(z_ctx)
+            q_all = self.q_proj2(z_ctx)
+
+        q_switch, q_move, q_pass, q_tp = torch.split(q_all, self.d_k, dim=-1)
 
         # one scratch column past act_size absorbs the switch scatter of empty
         # ally rows (orig ratio 0), which would otherwise land on the pass slot
@@ -234,7 +227,7 @@ class ActorPolicy(nn.Module):
         logits[:, PASS_START] = (q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)
         action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1)
 
-        k_ally = k_entity[:, self.ally_poke_entities, :]
+        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
         switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / math.sqrt(self.d_k)
         orig_ids = torch.round(
             numerical[:, self.ally_num_tokens, NUM_IDX_ORIG_IDX_RATIO] * 6
@@ -266,7 +259,9 @@ class ActorPolicy(nn.Module):
         action_keys[:, MEGA_START:MEGA_END, :] = mega_ctxs
 
         mega_struggle_key = self.struggle_key + self.mega_emb
-        logits[:, MEGA_STRUGGLE_START] = (q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
+        logits[:, MEGA_STRUGGLE_START] = (q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(
+            self.d_k
+        )
         action_keys[:, MEGA_STRUGGLE_START] = mega_struggle_key.unsqueeze(0).expand(B, -1)
 
         logits[:, STRUGGLE_START] = (q_move * self.struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
@@ -314,9 +309,10 @@ class ActorPolicy(nn.Module):
         top_p: float = 1.0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
+        k_entity_extended = self._compute_keys(tokens_ctx)
 
         logits1, keys1 = self._compute_pointer_logits(
-            z, tokens_ctx, enc.aux[:, 0], enc.numerical, head_idx=0
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
         )
         logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
         sample_logits1 = self._apply_top_p(logits1, top_p) if top_p < 1.0 else logits1
@@ -328,7 +324,7 @@ class ActorPolicy(nn.Module):
         ctx_a1 = keys1[batch_idx, a1]
 
         logits2, _ = self._compute_pointer_logits(
-            z, tokens_ctx, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
+            z, k_entity_extended, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
         )
 
         logits = torch.stack([logits1, logits2], dim=1)
@@ -351,9 +347,10 @@ class ActorPolicy(nn.Module):
         state: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
+        k_entity_extended = self._compute_keys(tokens_ctx)
 
         logits1, keys1 = self._compute_pointer_logits(
-            z, tokens_ctx, enc.aux[:, 0], enc.numerical, head_idx=0
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
         )
         a1 = actions[:, 0]
 
@@ -361,7 +358,7 @@ class ActorPolicy(nn.Module):
         ctx_a1 = keys1[batch_idx, a1]
 
         logits2, _ = self._compute_pointer_logits(
-            z, tokens_ctx, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
+            z, k_entity_extended, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
         )
 
         logits = torch.stack([logits1, logits2], dim=1)

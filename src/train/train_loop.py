@@ -117,16 +117,16 @@ def _run_batched_ppo(
 
     state = policy.initial_state(batch_size)
     total_loss = torch.tensor(0.0, device=device)
+    # convert them to python floats once at the end
     metrics = {
-        "policy_loss": 0.0,
-        "value_loss": 0.0,
-        "normalized_entropy": 0.0,
-        "kl_div": 0.0,
-        "clip_frac": 0.0,
+        "policy_loss": torch.tensor(0.0, device=device),
+        "value_loss": torch.tensor(0.0, device=device),
+        "normalized_entropy": torch.tensor(0.0, device=device),
+        "kl_div": torch.tensor(0.0, device=device),
+        "clip_frac": torch.tensor(0.0, device=device),
         "entropy_coef": 0.0,
     }
     total_steps = 0
-
     curr_ent_coef = config.entropy_coef
 
     for t in range(max_steps):
@@ -208,21 +208,27 @@ def _run_batched_ppo(
             state = next_state
 
         with torch.no_grad():
-            metrics["policy_loss"] += step_policy_loss.sum().item() if not is_warmup else 0.0
-            metrics["value_loss"] += step_value_loss.sum().item()
+            metrics["policy_loss"] += (
+                step_policy_loss.sum() if not is_warmup else torch.tensor(0.0, device=device)
+            )
+            metrics["value_loss"] += step_value_loss.sum()
 
-            metrics["normalized_entropy"] += curr_normalized_entropy.sum().item()
+            metrics["normalized_entropy"] += curr_normalized_entropy.sum()
 
-            metrics["kl_div"] += ((ratio - 1) - log_ratio).sum().item() if not is_warmup else 0.0
-            metrics["clip_frac"] += (
-                ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high))
-                .float()
-                .sum()
-                .item()
+            metrics["kl_div"] += (
+                ((ratio - 1) - log_ratio).sum()
                 if not is_warmup
-                else 0.0
+                else torch.tensor(0.0, device=device)
+            )
+            metrics["clip_frac"] += (
+                ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high)).float().sum()
+                if not is_warmup
+                else torch.tensor(0.0, device=device)
             )
             metrics["entropy_coef"] = curr_ent_coef
+
+    for k in ["policy_loss", "value_loss", "normalized_entropy", "kl_div", "clip_frac"]:
+        metrics[k] = metrics[k].item()
 
     return total_loss, metrics, total_steps
 
@@ -383,7 +389,7 @@ def main():
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 
     optimizer = optim.AdamW(
-        adamw_param_groups(policy, weight_decay=1e-4, base_lr=config.lr, value_lr_mult=10.0),
+        adamw_param_groups(policy, weight_decay=1e-4),
         lr=config.lr,
         eps=1e-6,
     )
@@ -502,8 +508,7 @@ def main():
 
             lr = scheduler.lr(episode)
             for param_group in optimizer.param_groups:
-                mult = 10.0 if param_group.get("is_critic", False) else 1.0
-                param_group["lr"] = lr * mult
+                param_group["lr"] = lr
             config.entropy_coef = scheduler.entropy_coef(episode)
 
             buffer.reset()
