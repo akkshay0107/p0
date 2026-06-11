@@ -5,4 +5,5 @@ OBS_DIM = (31, 56)
 
 # Action space:
 # 0 pass, 1-6 switches, 7-26 regular move-target actions, 27-46 Mega move-target actions.
-ACT_SIZE = 47
+# 47 mega struggle/recharge, 48 struggle/recharge
+ACT_SIZE = 49

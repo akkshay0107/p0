@@ -38,6 +38,8 @@ MOVE_START = 7
 MOVE_END = 27
 MEGA_START = 27
 MEGA_END = 47
+MEGA_STRUGGLE_START = 47
+STRUGGLE_START = 48
 TP_START = 0
 TP_END = 36
 
@@ -157,6 +159,7 @@ class ActorPolicy(nn.Module):
 
         self.mega_emb = nn.Parameter(torch.empty(self.d_k))
         self.pass_key = nn.Parameter(torch.empty(self.d_k))
+        self.struggle_key = nn.Parameter(torch.empty(self.d_k))
         self.target_self_key = nn.Parameter(torch.empty(self.d_k))
         self.pointer_temp = nn.Parameter(torch.tensor(0.01))
 
@@ -181,6 +184,7 @@ class ActorPolicy(nn.Module):
     def _init_weights(self):
         init.normal_(self.mega_emb, std=0.02)
         init.normal_(self.pass_key, std=0.02)
+        init.normal_(self.struggle_key, std=0.02)
         init.normal_(self.target_self_key, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -260,6 +264,13 @@ class ActorPolicy(nn.Module):
 
         logits[:, MEGA_START:MEGA_END] = mega_scores
         action_keys[:, MEGA_START:MEGA_END, :] = mega_ctxs
+
+        mega_struggle_key = self.struggle_key + self.mega_emb
+        logits[:, MEGA_STRUGGLE_START] = (q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
+        action_keys[:, MEGA_STRUGGLE_START] = mega_struggle_key.unsqueeze(0).expand(B, -1)
+
+        logits[:, STRUGGLE_START] = (q_move * self.struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
+        action_keys[:, STRUGGLE_START] = self.struggle_key.unsqueeze(0).expand(B, -1)
 
         is_tp = is_teampreview(numerical).unsqueeze(-1)
 
@@ -377,9 +388,9 @@ class ActorPolicy(nn.Module):
         mask2[switch_mask, action1[switch_mask]] = 0
 
         # Only one Mega per turn.
-        # Mega moves are 27-46.
-        mega_mask = (action1 >= 27) & (action1 <= 46) & (~is_tp)
-        mask2[mega_mask, 27:47] = False
+        # Mega moves are 27-46, plus 47 for Mega Struggle.
+        mega_mask = (action1 >= 27) & (action1 <= 47) & (~is_tp)
+        mask2[mega_mask, 27:48] = False
 
         # If Pokemon 1 passes, Pokemon 2 cannot pass as well unless no valid moves left
         pass_mask = (action1 == 0) & (~is_tp)

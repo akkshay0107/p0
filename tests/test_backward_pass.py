@@ -101,7 +101,7 @@ def test_gradient_flow(dummy_obs):
     obs = dummy_obs.to(device)
 
     # allow all actions for now
-    action_mask = torch.ones((2, 2, 47), dtype=torch.uint8).to(device)
+    action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.uint8).to(device)
 
     out = policy.act_obs(obs, action_mask, policy.initial_state(2))
     # random loss fn involving both value and policy paths

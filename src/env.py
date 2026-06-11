@@ -160,15 +160,17 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
                 if move.id in available_move_ids
                 for target in battle.get_possible_showdown_targets(move, active_mon)
             ]
-            mega_space = (
-                [action + 20 for action in move_space] if battle.can_mega_evolve[pos] else []
-            )
             if (
                 not move_space
                 and len(battle.available_moves[pos]) == 1
                 and battle.available_moves[pos][0].id in {"struggle", "recharge"}
             ):
-                move_space = [9]
+                move_space = [48]
+                mega_space = [47] if battle.can_mega_evolve[pos] else []
+            else:
+                mega_space = (
+                    [action + 20 for action in move_space] if battle.can_mega_evolve[pos] else []
+                )
             actions = switch_space + move_space + mega_space
 
         return actions or [0]
@@ -222,6 +224,8 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         32 <= element <= 36: move 2 and mega evolution
         37 <= element <= 41: move 3 and mega evolution
         42 <= element <= 46: move 4 and mega evolution
+        element = 47: mega struggle/recharge
+        element = 48: struggle/recharge
 
         :param action: The action to take.
         :type action: ndarray[int64]
@@ -314,24 +318,24 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
                     f"in battle {battle.battle_tag} at position {pos} - action "
                     f"specifies a move, but battle.active_pokemon is None!"
                 )
-            mvs = (
-                battle.available_moves[pos]
-                if len(battle.available_moves[pos]) == 1
-                and battle.available_moves[pos][0].id in ["struggle", "recharge"]
-                else list(active_mon.moves.values())
-            )
-            if (action - 7) % 20 // 5 not in range(len(mvs)):
-                raise ValueError(
-                    f"Invalid action {action} from player {battle.player_username} "
-                    f"in battle {battle.battle_tag} at position {pos} - action "
-                    f"specifies a move but the move index {(action - 7) % 20 // 5} "
-                    f"is out of bounds for available moves {mvs}!"
+            if action in (47, 48):
+                order = Player.create_order(
+                    battle.available_moves[pos][0], mega=(action == 47)
                 )
-            order = Player.create_order(
-                mvs[(action - 7) % 20 // 5],
-                move_target=(action.item() - 7) % 5 - 2,
-                mega=(action - 7) // 20 == 1,
-            )
+            else:
+                mvs = list(active_mon.moves.values())
+                if (action - 7) % 20 // 5 not in range(len(mvs)):
+                    raise ValueError(
+                        f"Invalid action {action} from player {battle.player_username} "
+                        f"in battle {battle.battle_tag} at position {pos} - action "
+                        f"specifies a move but the move index {(action - 7) % 20 // 5} "
+                        f"is out of bounds for available moves {mvs}!"
+                    )
+                order = Player.create_order(
+                    mvs[(action - 7) % 20 // 5],
+                    move_target=(action.item() - 7) % 5 - 2,
+                    mega=(action - 7) // 20 == 1,
+                )
         if not fake:
             valid_orders = [str(valid_order) for valid_order in battle.valid_orders[pos]]
             if str(order) not in valid_orders:
@@ -462,12 +466,10 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         else:
             active_mon = battle.active_pokemon[pos]
             assert active_mon is not None
-            mvs = (
-                battle.available_moves[pos]
-                if len(battle.available_moves[pos]) == 1
-                and battle.available_moves[pos][0].id in ["struggle", "recharge"]
-                else list(active_mon.moves.values())
-            )
+            if len(battle.available_moves[pos]) == 1 and battle.available_moves[pos][0].id in ["struggle", "recharge"]:
+                return np.int64(47 if order.mega else 48)
+
+            mvs = list(active_mon.moves.values())
             action = [m.id for m in mvs].index(order.order.id)
             target = order.move_target + 2
             if order.mega:
