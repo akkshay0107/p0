@@ -68,7 +68,7 @@ def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
     ]
 
 
-def save_checkpoint(path: Path, episode: int, policy: PolicyNet, optimizer=None, scheduler=None):
+def save_checkpoint(path: Path, episode: int, policy: PolicyNet, optimizer=None, scheduler=None, scaler=None):
     state = {
         "episode": episode,
         "model_state_dict": policy.state_dict(),
@@ -77,10 +77,12 @@ def save_checkpoint(path: Path, episode: int, policy: PolicyNet, optimizer=None,
         state["optimizer_state_dict"] = optimizer.state_dict()
     if scheduler is not None:
         state["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        state["scaler_state_dict"] = scaler.state_dict()
     torch.save(state, path)
 
 
-def load_checkpoint(path: Path, policy: PolicyNet, optimizer=None, scheduler=None):
+def load_checkpoint(path: Path, policy: PolicyNet, optimizer=None, scheduler=None, scaler=None):
     if not path.exists():
         return None
     checkpoint = torch.load(path, map_location=policy.device)
@@ -89,4 +91,6 @@ def load_checkpoint(path: Path, policy: PolicyNet, optimizer=None, scheduler=Non
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if scheduler is not None and "scheduler_state_dict" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    if scaler is not None and "scaler_state_dict" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
     return checkpoint.get("episode", None)

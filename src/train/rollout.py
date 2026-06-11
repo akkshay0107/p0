@@ -269,7 +269,8 @@ def collect_rollouts(
         )
         current_mask = torch.cat([mask1_gpu, mask2_gpu[partition.self_idx]])
         current_state = torch.cat([state1, state2[partition.self_idx]])
-        current_out = policy.act_obs(current_obs, current_mask, current_state)
+        with torch.amp.autocast(device_type=device.type, enabled=config.enable_optim):
+            current_out = policy.act_obs(current_obs, current_mask, current_state)
 
         actions1 = current_out.actions[:n_envs]
         log_probs1 = current_out.log_probs[:n_envs]
@@ -289,11 +290,12 @@ def collect_rollouts(
             next_state2[partition.self_idx] = current_out.state[self_slice]
 
         for opponent_id, group_idx in partition.pool_groups():
-            group_out = active_pool_policies[opponent_id].act_obs(
-                obs2_gpu[group_idx],
-                mask2_gpu[group_idx],
-                state2[group_idx],
-            )
+            with torch.amp.autocast(device_type=device.type, enabled=config.enable_optim):
+                group_out = active_pool_policies[opponent_id].act_obs(
+                    obs2_gpu[group_idx],
+                    mask2_gpu[group_idx],
+                    state2[group_idx],
+                )
             actions2[group_idx] = group_out.actions
             log_probs2[group_idx] = group_out.log_probs
             values2[group_idx] = group_out.value

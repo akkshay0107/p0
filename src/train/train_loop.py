@@ -6,10 +6,12 @@ import socket
 import subprocess
 import sys
 import time
+from typing import Callable, cast
 
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
@@ -143,58 +145,59 @@ def _run_batched_ppo(
         is_tp_t = is_teampreview(enc_t.numerical)
 
         curr_state = state[:active_n]
-        out = policy.evaluate(
-            enc_t,
-            action_masks_t,
-            actions_t,
-            curr_state,
-            critic_only=is_warmup,
-        )
-        curr_log_prob = out.log_probs
-        curr_normalized_entropy = out.norm_entropy
-        curr_val = out.value
-        next_state = out.state
+        with autocast(device_type=device.type, enabled=config.enable_optim):
+            out = policy.evaluate(
+                enc_t,
+                action_masks_t,
+                actions_t,
+                curr_state,
+                critic_only=is_warmup,
+            )
+            curr_log_prob = out.log_probs
+            curr_normalized_entropy = out.norm_entropy
+            curr_val = out.value
+            next_state = out.state
 
-        if not torch.isfinite(curr_log_prob).all():
-            non_finite_idx = (~torch.isfinite(curr_log_prob)).nonzero(as_tuple=True)[0]
-            for idx in non_finite_idx:
-                logging.error(
-                    f"DEBUG: Non-finite log_prob at step {t}, episode element {idx}.\n"
-                    f"  actions_t: {actions_t[idx].tolist()}\n"
-                    f"  action_masks_t (p1): {action_masks_t[idx, 0].nonzero().squeeze(-1).tolist()}\n"
-                    f"  action_masks_t (p2): {action_masks_t[idx, 1].nonzero().squeeze(-1).tolist()}\n"
-                    f"  is_tp_t: {is_tp_t[idx].item()}\n"
-                    "  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4]: "
-                    f"{enc_t.numerical[idx, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4].tolist()}\n"
-                    f"  old_log_prob: {old_log_probs_t[idx].item()}\n"
-                    f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
-                )
+            if not torch.isfinite(curr_log_prob).all():
+                non_finite_idx = (~torch.isfinite(curr_log_prob)).nonzero(as_tuple=True)[0]
+                for idx in non_finite_idx:
+                    logging.error(
+                        f"DEBUG: Non-finite log_prob at step {t}, episode element {idx}.\n"
+                        f"  actions_t: {actions_t[idx].tolist()}\n"
+                        f"  action_masks_t (p1): {action_masks_t[idx, 0].nonzero().squeeze(-1).tolist()}\n"
+                        f"  action_masks_t (p2): {action_masks_t[idx, 1].nonzero().squeeze(-1).tolist()}\n"
+                        f"  is_tp_t: {is_tp_t[idx].item()}\n"
+                        "  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4]: "
+                        f"{enc_t.numerical[idx, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4].tolist()}\n"
+                        f"  old_log_prob: {old_log_probs_t[idx].item()}\n"
+                        f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
+                    )
 
-        log_ratio = curr_log_prob - old_log_probs_t
-        ratio = torch.exp(log_ratio)
+            log_ratio = curr_log_prob - old_log_probs_t
+            ratio = torch.exp(log_ratio)
 
-        surr1 = ratio * advantages_t
-        surr2 = torch.clamp(ratio, 1.0 - config.clip_low, 1.0 + config.clip_high) * advantages_t
+            surr1 = ratio * advantages_t
+            surr2 = torch.clamp(ratio, 1.0 - config.clip_low, 1.0 + config.clip_high) * advantages_t
 
-        step_policy_loss = -torch.min(surr1, surr2)
-        step_value_loss = F.mse_loss(curr_val, returns_t, reduction="none")
-        step_entropy_loss = -curr_normalized_entropy
+            step_policy_loss = -torch.min(surr1, surr2)
+            step_value_loss = F.mse_loss(curr_val, returns_t, reduction="none")
+            step_entropy_loss = -curr_normalized_entropy
 
-        is_tp_mask = is_tp_t.reshape(-1)
-        step_ent_coef = curr_ent_coef * torch.where(
-            is_tp_mask, config.teampreview_entropy_mult, 1.0
-        )
+            is_tp_mask = is_tp_t.reshape(-1)
+            step_ent_coef = curr_ent_coef * torch.where(
+                is_tp_mask, config.teampreview_entropy_mult, 1.0
+            )
 
-        step_loss = config.value_coef * step_value_loss
+            step_loss = config.value_coef * step_value_loss
 
-        if not is_warmup:
-            step_loss = step_loss + step_policy_loss + step_ent_coef * step_entropy_loss
+            if not is_warmup:
+                step_loss = step_loss + step_policy_loss + step_ent_coef * step_entropy_loss
 
-        step_loss = torch.where(
-            is_tp_mask,
-            step_loss * config.teampreview_loss_mult,
-            step_loss,
-        )
+            step_loss = torch.where(
+                is_tp_mask,
+                step_loss * config.teampreview_loss_mult,
+                step_loss,
+            )
 
         total_loss = total_loss + step_loss.sum()
         total_steps += active_n
@@ -237,6 +240,7 @@ def ppo_update(
     episodes: list,
     policy: PolicyNet,
     optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
     config: PPOConfig,
     episode: int,
     shutdown_requested: bool = False,
@@ -311,7 +315,7 @@ def ppo_update(
                 if batch_steps > 0:
                     scaled_loss = batch_loss / expected_minibatch_steps
                     if torch.isfinite(scaled_loss):
-                        scaled_loss.backward()
+                        scaler.scale(scaled_loss).backward()
                     else:
                         logging.warning(
                             f"Non-finite chunk loss at episode {episode}, skipping backward "
@@ -333,16 +337,17 @@ def ppo_update(
                     optimizer.zero_grad(set_to_none=True)
                     num_skipped += 1
                 else:
+                    scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         policy.parameters(), config.max_grad_norm
                     )
-                    if torch.isfinite(grad_norm):
-                        tot_grad_norm += grad_norm.item()
-                        optimizer.step()
-                        num_updates += 1
-                    else:
-                        logging.warning("Non-finite grad norm, skipping update")
-                        optimizer.zero_grad(set_to_none=True)
+                    if not torch.isfinite(grad_norm):
+                        logging.warning("Non-finite grad norm detected, skipping update internals")
+
+                    tot_grad_norm += grad_norm.item()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    num_updates += 1
 
             epoch_steps += minibatch_steps
 
@@ -387,6 +392,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
+
+    if config.enable_optim and device.type == "cuda":
+        logging.info("Compiling model for reduce-overhead...")
+        import torch._dynamo as dynamo
+
+        dynamo.config.suppress_errors = True
+        policy.evaluate = cast(Callable, torch.compile(policy.evaluate, mode="reduce-overhead"))
+        policy.encode = cast(Callable, torch.compile(policy.encode, mode="reduce-overhead"))
+
+    scaler = GradScaler("cuda", enabled=(config.enable_optim and device.type == "cuda"))
 
     optimizer = optim.AdamW(
         adamw_param_groups(policy, weight_decay=1e-4),
@@ -465,7 +480,7 @@ def main():
 
         tb_writer = SummaryWriter(log_dir="runs/ppo_training")
 
-        start = load_checkpoint(config.checkpoint_path, policy, optimizer)
+        start = load_checkpoint(config.checkpoint_path, policy, optimizer, scaler=scaler)
         if start is not None:
             logging.info(f"Resuming training from episode {start + 1}")
         else:
@@ -503,7 +518,7 @@ def main():
         for episode in range(start, config.num_episodes):
             if shutdown_requested:
                 logging.warning("Shutdown requested, saving checkpoint and exiting")
-                save_checkpoint(config.checkpoint_path, episode, policy, optimizer)
+                save_checkpoint(config.checkpoint_path, episode, policy, optimizer, scaler=scaler)
                 break
 
             lr = scheduler.lr(episode)
@@ -542,7 +557,15 @@ def main():
             avg_traj_time = rollout_time / num_trajectories
 
             rollout_data = buffer.get_batches(policy.device, config)
-            stats = ppo_update(rollout_data, policy, optimizer, config, episode, shutdown_requested)
+            stats = ppo_update(
+                rollout_data,
+                policy,
+                optimizer,
+                scaler,
+                config,
+                episode,
+                shutdown_requested,
+            )
 
             if pool_games > 0:
                 alpha = config.pool_win_rate_smoothing
@@ -607,7 +630,7 @@ def main():
             )
 
             if (episode + 1) % 10 == 0:
-                save_checkpoint(config.checkpoint_path, episode + 1, policy, optimizer)
+                save_checkpoint(config.checkpoint_path, episode + 1, policy, optimizer, scaler=scaler)
                 logging.info("Checkpoint saved.")
 
     finally:

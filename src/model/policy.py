@@ -224,8 +224,8 @@ class ActorPolicy(nn.Module):
         logits = torch.zeros((B, self.act_size + 1), device=device)
         action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
-        logits[:, PASS_START] = (q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)
-        action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1)
+        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)).to(logits.dtype)
+        action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
 
         k_ally = k_entity_extended[:, self.ally_poke_entities, :]
         switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / math.sqrt(self.d_k)
@@ -233,8 +233,8 @@ class ActorPolicy(nn.Module):
             numerical[:, self.ally_num_tokens, NUM_IDX_ORIG_IDX_RATIO] * 6
         ).long()
         orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
-        logits.scatter_(1, orig_ids, switch_scores)
-        action_keys.scatter_(1, orig_ids.unsqueeze(-1).expand(-1, -1, self.d_k), k_ally)
+        logits.scatter_(1, orig_ids, switch_scores.to(logits.dtype))
+        action_keys.scatter_(1, orig_ids.unsqueeze(-1).expand(-1, -1, self.d_k), k_ally.to(action_keys.dtype))
 
         k_targets = k_entity_extended[:, self.target_entity_indices, :]
         k_moves_grid = k_moves.unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
@@ -245,8 +245,8 @@ class ActorPolicy(nn.Module):
         move_scores = self.joint_move_mlp(joint_move_input).squeeze(-1)
         move_ctxs = k_moves_grid + k_targets_grid
 
-        logits[:, MOVE_START:MOVE_END] = move_scores
-        action_keys[:, MOVE_START:MOVE_END, :] = move_ctxs
+        logits[:, MOVE_START:MOVE_END] = move_scores.to(logits.dtype)
+        action_keys[:, MOVE_START:MOVE_END, :] = move_ctxs.to(action_keys.dtype)
 
         k_mega_moves_grid = (
             (k_moves + self.mega_emb).unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
@@ -255,17 +255,17 @@ class ActorPolicy(nn.Module):
         mega_scores = self.joint_move_mlp(joint_mega_input).squeeze(-1)
         mega_ctxs = k_mega_moves_grid + k_targets_grid
 
-        logits[:, MEGA_START:MEGA_END] = mega_scores
-        action_keys[:, MEGA_START:MEGA_END, :] = mega_ctxs
+        logits[:, MEGA_START:MEGA_END] = mega_scores.to(logits.dtype)
+        action_keys[:, MEGA_START:MEGA_END, :] = mega_ctxs.to(action_keys.dtype)
 
         mega_struggle_key = self.struggle_key + self.mega_emb
-        logits[:, MEGA_STRUGGLE_START] = (q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(
+        logits[:, MEGA_STRUGGLE_START] = ((q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(
             self.d_k
-        )
-        action_keys[:, MEGA_STRUGGLE_START] = mega_struggle_key.unsqueeze(0).expand(B, -1)
+        )).to(logits.dtype)
+        action_keys[:, MEGA_STRUGGLE_START] = mega_struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
 
-        logits[:, STRUGGLE_START] = (q_move * self.struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
-        action_keys[:, STRUGGLE_START] = self.struggle_key.unsqueeze(0).expand(B, -1)
+        logits[:, STRUGGLE_START] = ((q_move * self.struggle_key).sum(dim=-1) / math.sqrt(self.d_k)).to(logits.dtype)
+        action_keys[:, STRUGGLE_START] = self.struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
 
         is_tp = is_teampreview(numerical).unsqueeze(-1)
 
@@ -278,10 +278,10 @@ class ActorPolicy(nn.Module):
 
         tp_ctxs = k_lead_grid + k_back_grid
 
-        logits[:, TP_START:TP_END] = torch.where(is_tp, tp_scores, logits[:, TP_START:TP_END])
+        logits[:, TP_START:TP_END] = torch.where(is_tp, tp_scores, logits[:, TP_START:TP_END]).to(logits.dtype)
         action_keys[:, TP_START:TP_END, :] = torch.where(
             is_tp.unsqueeze(-1), tp_ctxs, action_keys[:, TP_START:TP_END, :]
-        )
+        ).to(action_keys.dtype)
 
         # prevent pointer temp from becoming negative / 0
         logits = logits[:, : self.act_size] * self.pointer_temp.clamp_min(1e-4)

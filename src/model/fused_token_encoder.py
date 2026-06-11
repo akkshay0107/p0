@@ -329,24 +329,25 @@ class FusedTokenEncoder(nn.Module):
         n_super = len(_SUPER_POS)
         super_cats = categorical[:, self._super_pos, :].flatten(0, 1)
         super_out, all_move_embs = self._embed_pokemon_super(super_cats, aux=True)
-        x[:, self._super_pos, :] = super_out.unflatten(0, (B, n_super))
+
+        x[:, self._super_pos, :] = super_out.unflatten(0, (B, n_super)).to(x.dtype)
         aux_moves = all_move_embs.unflatten(0, (B, n_super))[:, :2]
 
-        x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :])
+        x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :]).to(x.dtype)
 
         x[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :] = self._embed_global_field_cond(
             categorical[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :]
-        )
+        ).to(x.dtype)
 
         x[:, (TOKEN_IDX_ALLY_SIDE_SUPER, TOKEN_IDX_OPPONENT_SIDE_SUPER), :] = (
             self._embed_side_field_cond(
                 categorical[:, (TOKEN_IDX_ALLY_SIDE_SUPER, TOKEN_IDX_OPPONENT_SIDE_SUPER), :]
-            )
+            ).to(x.dtype)
         )
 
         x[:, self._field_numeric_pos, :] = self.field_numeric_proj(
             numerical[:, self._field_numeric_pos, :]
-        )
+        ).to(x.dtype)
 
         out_tokens = (
             x

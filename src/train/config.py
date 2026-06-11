@@ -34,6 +34,8 @@ class PPOConfig:
     teampreview_loss_mult: float = 1.5
     teampreview_entropy_mult: float = 2.0
 
+    enable_optim: bool = False  # enable FP16 and torch.compile
+
     warmup_episodes: int = 100  # policy gradients frozen, allow value head to catchup to bc seeds
     ramp_up_phase: float = 0.1  # frac of epochs spent in linear lr increase
     ramp_down_phase: float = 0.2  # frac of epochs spent in decaying entropy coef
