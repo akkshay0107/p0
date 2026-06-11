@@ -31,8 +31,6 @@ class TimeTracker:
 
 
 def get_time():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
     return time.perf_counter()
 
 
