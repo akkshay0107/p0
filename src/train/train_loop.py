@@ -342,13 +342,18 @@ def ppo_update(
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         policy.parameters(), config.max_grad_norm
                     )
+                    scale_before_update = scaler.get_scale()
                     if not torch.isfinite(grad_norm):
-                        logging.warning("Non-finite grad norm detected, scaler will skip this step")
+                        logging.warning(
+                            "Non-finite grad norm detected; scaler will skip this step "
+                            f"(loss scale={scale_before_update:.0f})"
+                        )
                     else:
                         tot_grad_norm += grad_norm.item()
                     scaler.step(optimizer)
                     scaler.update()
-                    num_updates += 1
+                    if torch.isfinite(grad_norm):
+                        num_updates += 1
 
             epoch_steps += minibatch_steps
 
@@ -404,7 +409,11 @@ def main():
         # rest stay fp16 but eager
         policy.act_obs = cast(Callable, torch.compile(policy.act_obs, mode="reduce-overhead"))
 
-    scaler = GradScaler("cuda", enabled=(config.enable_optim and device.type == "cuda"))
+    scaler = GradScaler(
+        "cuda",
+        enabled=(config.enable_optim and device.type == "cuda"),
+        init_scale=4096.0,
+    )
 
     optimizer = optim.AdamW(
         adamw_param_groups(policy, weight_decay=1e-4),
