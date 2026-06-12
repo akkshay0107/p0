@@ -51,7 +51,8 @@ class CLSReducer(nn.Module):
         init.normal_(self.cls_base, std=emb_gain)
         init.normal_(self.hg_init, std=emb_gain)
         if self.use_history:
-            init.zeros_(self.hg_gate)
+            # bias towards preserving history
+            init.normal_(self.hg_gate, mean=1.0, std=0.3)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 init.orthogonal_(module.weight, gain=1.0)
