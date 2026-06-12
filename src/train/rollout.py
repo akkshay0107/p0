@@ -277,7 +277,7 @@ def collect_rollouts(
         actions1 = current_out.actions[:n_envs]
         log_probs1 = current_out.log_probs[:n_envs]
         values1 = current_out.value[:n_envs]
-        next_state1 = current_out.state[:n_envs]
+        next_state1 = current_out.state[:n_envs].to(torch.float32)
 
         actions2 = torch.zeros_like(actions1)
         log_probs2 = torch.zeros_like(log_probs1)
@@ -289,7 +289,7 @@ def collect_rollouts(
             actions2[partition.self_idx] = current_out.actions[self_slice]
             log_probs2[partition.self_idx] = current_out.log_probs[self_slice]
             values2[partition.self_idx] = current_out.value[self_slice]
-            next_state2[partition.self_idx] = current_out.state[self_slice]
+            next_state2[partition.self_idx] = current_out.state[self_slice].to(torch.float32)
 
         for opponent_id, group_idx in partition.pool_groups():
             with torch.amp.autocast(device_type=device.type, enabled=config.enable_optim):
@@ -301,16 +301,16 @@ def collect_rollouts(
             actions2[group_idx] = group_out.actions
             log_probs2[group_idx] = group_out.log_probs
             values2[group_idx] = group_out.value
-            next_state2[group_idx] = group_out.state
+            next_state2[group_idx] = group_out.state.to(torch.float32)
 
         # store actions in traj before step to avoid overwrite
         # and needing to clone, instead of with step results
-        actions1_cpu = actions1.to("cpu")
-        actions2_cpu = actions2.to("cpu")
-        log_probs1_cpu = log_probs1.to("cpu")
-        log_probs2_cpu = log_probs2.to("cpu")
-        values1_cpu = values1.to("cpu")
-        values2_cpu = values2.to("cpu")
+        actions1_cpu = actions1.to(device="cpu", dtype=torch.long)
+        actions2_cpu = actions2.to(device="cpu", dtype=torch.long)
+        log_probs1_cpu = log_probs1.to(device="cpu", dtype=torch.float32)
+        log_probs2_cpu = log_probs2.to(device="cpu", dtype=torch.float32)
+        values1_cpu = values1.to(device="cpu", dtype=torch.float32)
+        values2_cpu = values2.to(device="cpu", dtype=torch.float32)
         obs1_cpu = vec_env.obs1_buffers
         obs2_cpu = vec_env.obs2_buffers
 

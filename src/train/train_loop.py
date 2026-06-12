@@ -157,7 +157,7 @@ def _run_batched_ppo(
             curr_log_prob = out.log_probs
             curr_normalized_entropy = out.norm_entropy
             curr_val = out.value
-            next_state = out.state
+            next_state = out.state.to(torch.float32)
 
             if not torch.isfinite(curr_log_prob).all():
                 non_finite_idx = (~torch.isfinite(curr_log_prob)).nonzero(as_tuple=True)[0]
@@ -472,7 +472,10 @@ def main():
             raise RuntimeError(f"Showdown servers failed to start on ports: {pending_ports}")
         logging.info("All showdown servers are ready.")
 
-        envs = [SimEnv.build_env(env_id=i, server_port=8000 + i) for i in range(config.n_envs)]
+        envs = []
+        for i in range(config.n_envs):
+            envs.append(SimEnv.build_env(env_id=i, server_port=8000 + i))
+            time.sleep(0.1)
 
         vec_env = ThreadVecEnv(envs)
         buffer = RolloutBuffer()

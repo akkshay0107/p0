@@ -1,5 +1,7 @@
+import asyncio
 import logging
 from pathlib import Path
+from time import perf_counter
 from typing import Optional, Union
 
 import numpy as np
@@ -21,12 +23,26 @@ from poke_env.ps_client import (
     LocalhostServerConfiguration,
     ServerConfiguration,
 )
+from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import Teambuilder
 
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.structured_observation import StructuredObservation
 from src.team_picker import RandomTeamFromPool
+
+
+# patch poke_env's PSClient to avoid login timeouts
+async def patched_wait_for_login(self, checking_interval: float = 0.1, wait_for: int = 30):
+    start = perf_counter()
+    while perf_counter() - start < wait_for:
+        await asyncio.sleep(checking_interval)
+        if self.logged_in.is_set():
+            return
+    assert self.logged_in.is_set(), f"Expected {self.username} to be logged in."
+
+
+PSClient.wait_for_login = patched_wait_for_login
 
 
 def _build_tp_mask(team_size: int) -> list[int]:
@@ -319,9 +335,7 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
                     f"specifies a move, but battle.active_pokemon is None!"
                 )
             if action in (47, 48):
-                order = Player.create_order(
-                    battle.available_moves[pos][0], mega=(action == 47)
-                )
+                order = Player.create_order(battle.available_moves[pos][0], mega=(action == 47))
             else:
                 mvs = list(active_mon.moves.values())
                 if (action - 7) % 20 // 5 not in range(len(mvs)):
@@ -466,7 +480,10 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         else:
             active_mon = battle.active_pokemon[pos]
             assert active_mon is not None
-            if len(battle.available_moves[pos]) == 1 and battle.available_moves[pos][0].id in ["struggle", "recharge"]:
+            if len(battle.available_moves[pos]) == 1 and battle.available_moves[pos][0].id in [
+                "struggle",
+                "recharge",
+            ]:
                 return np.int64(47 if order.mega else 48)
 
             mvs = list(active_mon.moves.values())
