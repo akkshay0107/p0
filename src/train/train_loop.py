@@ -413,7 +413,7 @@ def main():
     scaler = GradScaler(
         "cuda",
         enabled=(config.enable_optim and device.type == "cuda"),
-        init_scale=4096.0,
+        init_scale=512.0,
     )
 
     optimizer = optim.AdamW(

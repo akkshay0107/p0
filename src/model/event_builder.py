@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import IntEnum
 from typing import NamedTuple
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, finalize
 
 from poke_env.battle import DoubleBattle
 from poke_env.battle.pokemon import Pokemon
@@ -87,7 +87,17 @@ PROTECT_EFFECTS = (
 )
 
 _raw_event_buffers: WeakKeyDictionary[object, list[RawBattleEvent]] = WeakKeyDictionary()
-_CUSTOM_LAST_MOVE = "_custom_last_move"
+_pokemon_last_moves: dict[int, str] = {}
+_battle_pokemon_ids: dict[int, set[int]] = {}
+_registered_battles: set[int] = set()
+
+
+def _cleanup_battle(battle_id: int) -> None:
+    _registered_battles.discard(battle_id)
+    pokemon_ids = _battle_pokemon_ids.pop(battle_id, None)
+    if pokemon_ids:
+        for pid in pokemon_ids:
+            _pokemon_last_moves.pop(pid, None)
 
 
 def _get_pokemon_safely(battle: DoubleBattle, identifier: str) -> Pokemon | None:
@@ -98,17 +108,16 @@ def _get_pokemon_safely(battle: DoubleBattle, identifier: str) -> Pokemon | None
 
 
 def _clear_last_move(pokemon: Pokemon) -> None:
-    if hasattr(pokemon, _CUSTOM_LAST_MOVE):
-        delattr(pokemon, _CUSTOM_LAST_MOVE)
+    _pokemon_last_moves.pop(id(pokemon), None)
 
 
 def _get_last_move(pokemon: Pokemon) -> str | None:
-    value = getattr(pokemon, _CUSTOM_LAST_MOVE, None)
-    return value if isinstance(value, str) else None
+    return _pokemon_last_moves.get(id(pokemon), None)
 
 
-def _set_last_move(pokemon: Pokemon, move: str) -> None:
-    setattr(pokemon, _CUSTOM_LAST_MOVE, move)
+def _set_last_move(battle_id: int, pokemon_id: int, move: str) -> None:
+    _pokemon_last_moves[pokemon_id] = move
+    _battle_pokemon_ids.setdefault(battle_id, set()).add(pokemon_id)
 
 
 _original_switch_out = Pokemon.switch_out
@@ -125,6 +134,10 @@ _original_parse_message = DoubleBattle.parse_message
 
 
 def _patched_parse_message(self: DoubleBattle, split_message: list[str]):
+    if id(self) not in _registered_battles:
+        _registered_battles.add(id(self))
+        finalize(self, _cleanup_battle, id(self))
+
     raw_events = _raw_event_buffers.setdefault(self, [])
 
     pre_hp = None
@@ -136,7 +149,7 @@ def _patched_parse_message(self: DoubleBattle, split_message: list[str]):
     if len(split_message) > 3 and split_message[1] == "move":
         pokemon = _get_pokemon_safely(self, split_message[2])
         if pokemon is not None:
-            _set_last_move(pokemon, split_message[3])
+            _set_last_move(id(self), id(pokemon), split_message[3])
 
     raw_events.append(RawBattleEvent(tuple(split_message), pre_hp))
     _original_parse_message(self, split_message)

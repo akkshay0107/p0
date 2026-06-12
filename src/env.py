@@ -64,14 +64,16 @@ _TEAM_PREVIEW_MASK = _build_tp_mask(6)  # never using a team that doesnt have 6 
 
 
 # filter out logging about internal mismatch
-class MismatchWarningFilter(logging.Filter):
-    def filter(self, record):
-        if record.msg and "is active, but it's not" in str(record.msg):
-            return False
-        return True
+_original_handler_handle = logging.Handler.handle
 
 
-logging.getLogger("poke_env").addFilter(MismatchWarningFilter())
+def _patched_handler_handle(self, record):
+    if record.msg and "is active, but it's not" in str(record.msg):
+        return False
+    return _original_handler_handle(self, record)
+
+
+logging.Handler.handle = _patched_handler_handle
 
 
 class VGCEnvPlayer(_EnvPlayer):

@@ -11,7 +11,7 @@ class PPOConfig:
     # default values provided are meant for the colab
     # T4 runtime with 15 GB VRAM and some unknown CPU
     # with 16 GB RAM
-    num_episodes: int = 12500
+    num_episodes: int = 2000  # ~7.5M steps total
     n_envs: int = 8
     n_self_envs: int = 4
     n_pool_opponents: int = 4
@@ -20,23 +20,23 @@ class PPOConfig:
     chunk_size: int = 32  # with BPTT, backward pass takes 14 GB RAM
 
     gamma: float = 0.99
-    gae_lambda: float = 0.98
+    gae_lambda: float = 0.97
     clip_low: float = 0.2
     clip_high: float = 0.28  # DAPO style, entropy regularizer
 
     lr: float = 6e-5
     value_coef: float = 0.05
-    entropy_coef: float = 0.04
+    entropy_coef: float = 0.03
     max_grad_norm: float = 1.0
-    target_kl: float = 0.015  # for early kl stopping
-    ppo_epochs: int = 4  # number of ppo loops per episode
+    target_kl: float = 0.015  # for kl skipping
+    ppo_epochs: int = 6  # number of ppo loops per episode
     # skew importance of team preview step
     teampreview_loss_mult: float = 1.5
     teampreview_entropy_mult: float = 2.0
 
-    enable_optim: bool = False  # enable FP16 autocast + CUDA-graph compile of the rollout actor
+    enable_optim: bool = True  # enable FP16 autocast + CUDA-graph compile of the rollout actor
 
-    warmup_episodes: int = 100  # policy gradients frozen, allow value head to catchup to bc seeds
+    warmup_episodes: int = 20  # policy gradients frozen, allow value head to catchup to bc seeds
     ramp_up_phase: float = 0.1  # frac of epochs spent in linear lr increase
     ramp_down_phase: float = 0.2  # frac of epochs spent in decaying entropy coef
 
@@ -44,7 +44,7 @@ class PPOConfig:
     checkpoint_path: Path = (
         Path(__file__).resolve().parent.parent.parent / "checkpoints" / "ppo_checkpoint.pt"
     )
-    pool_size: int = 40
+    pool_size: int = 50
     snapshot_interval: int = 50
     # admit a snapshot unconditionally every N episodes so pool diversity
     # keeps growing even when the win-rate gate would reject it

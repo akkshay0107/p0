@@ -80,7 +80,7 @@ class ValueHead(nn.Module):
     def __init__(
         self,
         d_model: int,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 768,
     ):
         super().__init__()
         self.net = nn.Sequential(
@@ -444,9 +444,9 @@ class PolicyNet(nn.Module):
         self,
         obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH),
         act_size=ACT_SIZE,
-        d_model=768,
+        d_model=512,
         nhead=8,
-        nlayer=4,
+        nlayer=5,
     ):
         super().__init__()
         self.seq_len, self.feat_dim = obs_dim
