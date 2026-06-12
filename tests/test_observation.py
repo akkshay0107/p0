@@ -19,6 +19,7 @@ from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
 from src.env import SimEnv
+from src.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
 from src.model.observation_builder import (
     _cached_raw_stats,
     _estimate_stat_by_nature,
@@ -35,6 +36,9 @@ from src.model.observation_builder import (
 )
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_COUNT,
+    EVENT_NUMERICAL_WIDTH,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     SideId,
@@ -615,6 +619,11 @@ def test_from_battle_real_end_to_end():
     assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
     assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
 
+    assert obs.events_cat.shape == (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH)
+    assert obs.events_num.shape == (EVENT_COUNT, EVENT_NUMERICAL_WIDTH)
+    assert obs.events_side_ids.shape == (EVENT_COUNT,)
+    assert obs.events_slot_ids.shape == (EVENT_COUNT,)
+
     assert obs.token_type_ids[0] == TokenType.CLS
     assert obs.token_type_ids[1] == TokenType.POKEMON_SUPER
     assert obs.token_type_ids[2] == TokenType.POKEMON_NUMERIC
@@ -634,6 +643,44 @@ def test_from_battle_real_end_to_end():
     assert obs.side_ids[28] == SideId.ALLY
     assert obs.side_ids[29] == SideId.OPPONENT
     assert obs.side_ids[30] == SideId.OPPONENT
+
+
+def test_events_join_to_current_slots_after_switch_and_are_consumed():
+    switched_out = make_real_pokemon(species="charizard")
+    switched_in = make_real_pokemon(species="venusaur")
+    opponent = make_real_pokemon(species="tyranitar")
+    battle = make_real_battle(
+        active_pokemon=[switched_in, None],
+        opponent_active_pokemon=[opponent, None],
+        team=[switched_out, switched_in],
+        opponent_team=[opponent],
+    )
+    battle._team = {
+        "p1: Charizard": switched_out,
+        "p1: Venusaur": switched_in,
+    }
+    battle._opponent_team = {"p2: Tyranitar": opponent}
+    EventCollector.set_raw_events(
+        battle,
+        [
+            RawBattleEvent(("", "switch", "p1a: Venusaur", "Venusaur, L50", "100/100")),
+            RawBattleEvent(("", "move", "p2a: Tyranitar", "Rock Slide", "p1a: Venusaur")),
+        ],
+    )
+
+    obs = from_battle(battle, tokenizer)
+
+    assert obs.events_cat[:2, 0].tolist() == [
+        EventTypeId.SWITCH_IN,
+        EventTypeId.MOVE,
+    ]
+    assert obs.events_cat[:2, 4].tolist() == [1, 2]
+    assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
+    assert obs.events_slot_ids[:2].tolist() == [1, 1]
+
+    next_obs = from_battle(battle, tokenizer)
+    assert torch.count_nonzero(next_obs.events_cat) == 0
+    assert torch.count_nonzero(next_obs.events_num) == 0
 
 
 def test_from_battle_into_overwrites_dirty_output():
@@ -667,6 +714,18 @@ def test_from_battle_into_overwrites_dirty_output():
     out.categorical.fill_(99)
     out.numerical.fill_(99.0)
 
+    assert out.events_cat is not None
+    out.events_cat.fill_(99)
+
+    assert out.events_num is not None
+    out.events_num.fill_(99.0)
+
+    assert out.events_side_ids is not None
+    out.events_side_ids.fill_(99)
+
+    assert out.events_slot_ids is not None
+    out.events_slot_ids.fill_(99)
+
     from_battle_into(battle, out, tokenizer)
 
     assert torch.equal(out.token_type_ids, expected.token_type_ids)
@@ -674,6 +733,14 @@ def test_from_battle_into_overwrites_dirty_output():
     assert torch.equal(out.slot_ids, expected.slot_ids)
     assert torch.equal(out.categorical, expected.categorical)
     assert torch.equal(out.numerical, expected.numerical)
+    assert expected.events_cat is not None and torch.equal(out.events_cat, expected.events_cat)
+    assert expected.events_num is not None and torch.equal(out.events_num, expected.events_num)
+    assert expected.events_side_ids is not None and torch.equal(
+        out.events_side_ids, expected.events_side_ids
+    )
+    assert expected.events_slot_ids is not None and torch.equal(
+        out.events_slot_ids, expected.events_slot_ids
+    )
     assert torch.count_nonzero(out.categorical[0]) == 0
     assert torch.count_nonzero(out.numerical[0]) == 0
 

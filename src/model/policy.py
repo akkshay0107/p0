@@ -15,6 +15,7 @@ from src.model.fused_token_encoder import FusedTokenEncoder
 from src.model.structured_observation import (
     ALLY_NUM_TOKENS,
     ALLY_POKE_TOKENS,
+    EVENT_COUNT,
     NUM_IDX_ORIG_IDX_RATIO,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
@@ -224,7 +225,9 @@ class ActorPolicy(nn.Module):
         logits = torch.zeros((B, self.act_size + 1), device=device)
         action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
-        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)).to(logits.dtype)
+        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)).to(
+            logits.dtype
+        )
         action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
 
         k_ally = k_entity_extended[:, self.ally_poke_entities, :]
@@ -234,7 +237,9 @@ class ActorPolicy(nn.Module):
         ).long()
         orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
         logits.scatter_(1, orig_ids, switch_scores.to(logits.dtype))
-        action_keys.scatter_(1, orig_ids.unsqueeze(-1).expand(-1, -1, self.d_k), k_ally.to(action_keys.dtype))
+        action_keys.scatter_(
+            1, orig_ids.unsqueeze(-1).expand(-1, -1, self.d_k), k_ally.to(action_keys.dtype)
+        )
 
         k_targets = k_entity_extended[:, self.target_entity_indices, :]
         k_moves_grid = k_moves.unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
@@ -259,13 +264,19 @@ class ActorPolicy(nn.Module):
         action_keys[:, MEGA_START:MEGA_END, :] = mega_ctxs.to(action_keys.dtype)
 
         mega_struggle_key = self.struggle_key + self.mega_emb
-        logits[:, MEGA_STRUGGLE_START] = ((q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(
-            self.d_k
-        )).to(logits.dtype)
-        action_keys[:, MEGA_STRUGGLE_START] = mega_struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
+        logits[:, MEGA_STRUGGLE_START] = (
+            (q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
+        ).to(logits.dtype)
+        action_keys[:, MEGA_STRUGGLE_START] = (
+            mega_struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
+        )
 
-        logits[:, STRUGGLE_START] = ((q_move * self.struggle_key).sum(dim=-1) / math.sqrt(self.d_k)).to(logits.dtype)
-        action_keys[:, STRUGGLE_START] = self.struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
+        logits[:, STRUGGLE_START] = (
+            (q_move * self.struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
+        ).to(logits.dtype)
+        action_keys[:, STRUGGLE_START] = (
+            self.struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
+        )
 
         is_tp = is_teampreview(numerical).unsqueeze(-1)
 
@@ -278,7 +289,9 @@ class ActorPolicy(nn.Module):
 
         tp_ctxs = k_lead_grid + k_back_grid
 
-        logits[:, TP_START:TP_END] = torch.where(is_tp, tp_scores, logits[:, TP_START:TP_END]).to(logits.dtype)
+        logits[:, TP_START:TP_END] = torch.where(is_tp, tp_scores, logits[:, TP_START:TP_END]).to(
+            logits.dtype
+        )
         action_keys[:, TP_START:TP_END, :] = torch.where(
             is_tp.unsqueeze(-1), tp_ctxs, action_keys[:, TP_START:TP_END, :]
         ).to(action_keys.dtype)
@@ -443,7 +456,12 @@ class PolicyNet(nn.Module):
         # shared backbone + policy head
         self.encoder = FusedTokenEncoder(d_model, nhead, d_model * 4)
         self.actor = ActorPolicy(
-            d_model, nhead, nlayer, act_size, self.encoder.side_emb, self.seq_len + 1
+            d_model,
+            nhead,
+            nlayer,
+            act_size,
+            self.encoder.side_emb,
+            self.seq_len + 1 + EVENT_COUNT,  # +1 for action mask embedding, rest for event tokens
         )
 
         # value head
@@ -475,10 +493,10 @@ class PolicyNet(nn.Module):
         top_p: float = 1.0,
     ) -> ActOutput:
         # NOTE: with top_p < 1.0 the returned log_probs are taken w.r.t. the
-        # truncated sampling distribution, not the full policy, while `evaluate`
+        # truncated sampling distribution, not the full policy, while evaluate
         # always scores against the full distribution. Rollouts collected for
         # PPO training must therefore use top_p=1.0 (the default) or the
-        # importance ratios will be wrong top_p < 1.0 is for
+        # importance ratios will be wrong, top_p < 1.0 is for
         # evaluation/play only.
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")

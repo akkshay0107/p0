@@ -28,6 +28,7 @@ from src.train.rollout import RolloutBuffer, build_partition, collect_rollouts
 from src.train.utils import (
     PPOScheduler,
     adamw_param_groups,
+    default_device,
     load_checkpoint,
     save_checkpoint,
 )
@@ -395,7 +396,7 @@ def main():
     tb_writer = None
 
     config = load_config()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 

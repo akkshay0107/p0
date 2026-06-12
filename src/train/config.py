@@ -61,7 +61,7 @@ class PPOConfig:
             raise ValueError("n_pool_opponents must be greater than zero.")
 
 
-def load_config(config_path: str = ".ppoconfig") -> PPOConfig:
+def load_config(config_path: str | Path = ".ppoconfig") -> PPOConfig:
     """
     Loads a PPOConfig from a flat key=value file.
     Merges specified values for hyperparameters with the default values

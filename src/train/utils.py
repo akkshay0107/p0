@@ -8,6 +8,10 @@ from src.model.policy import PolicyNet
 from src.train.config import PPOConfig
 
 
+def default_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class PPOScheduler:
     def __init__(self, config: PPOConfig):
         self.ent_max = config.entropy_coef
@@ -68,7 +72,9 @@ def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
     ]
 
 
-def save_checkpoint(path: Path, episode: int, policy: PolicyNet, optimizer=None, scheduler=None, scaler=None):
+def save_checkpoint(
+    path: Path, episode: int, policy: PolicyNet, optimizer=None, scheduler=None, scaler=None
+):
     state = {
         "episode": episode,
         "model_state_dict": policy.state_dict(),

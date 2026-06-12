@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 from pathlib import Path
 
@@ -8,8 +7,10 @@ from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPl
 from src.heuristic.heuristic import FuzzyHeuristic
 from src.team_picker import RandomTeamFromPool
 
+N_BATTLES = 100
 
-async def main(n_battles: int):
+
+async def main():
     root_dir = Path(__file__).resolve().parent.parent
     teams_dir = root_dir / "teams"
     if not teams_dir.exists():
@@ -50,15 +51,15 @@ async def main(n_battles: int):
     n = len(players)
     winrate_matrix = [[0.0 for _ in range(n)] for _ in range(n)]
 
-    print(f"Starting {n * (n - 1) // 2 * n_battles} matches total...")
+    print(f"Starting {n * (n - 1) // 2 * N_BATTLES} matches total...")
 
     for i in range(n):
         for j in range(i + 1, n):
             p1 = players[i]
             p2 = players[j]
 
-            print(f"Battling {bot_names[i]} vs {bot_names[j]} ({n_battles} games)...")
-            await p1.battle_against(p2, n_battles=n_battles)
+            print(f"Battling {bot_names[i]} vs {bot_names[j]} ({N_BATTLES} games)...")
+            await p1.battle_against(p2, n_battles=N_BATTLES)
 
             winrate = p1.win_rate
             winrate_matrix[i][j] = winrate
@@ -92,15 +93,7 @@ async def main(n_battles: int):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Battle bots and calculate winrates.")
-    parser.add_argument(
-        "-b",
-        type=int,
-        default=100,
-        help="Number of battles between any two sets of bots (default: 100)",
-    )
-    args = parser.parse_args()
-
     from src.showdown_server import spawned_showdown
+
     with spawned_showdown(port=8000):
-        asyncio.run(main(args.b))
+        asyncio.run(main())

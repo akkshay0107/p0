@@ -11,6 +11,10 @@ MAX_VOLATILES = 6
 SEQUENCE_LENGTH = 1 + TEAM_SIZE * 2 * 2 + 3 * 2
 CATEGORICAL_WIDTH = 25
 NUMERICAL_WIDTH = 56
+EVENT_COUNT = 24
+EVENT_CATEGORICAL_WIDTH = 5
+EVENT_NUMERICAL_WIDTH = 2
+EVENT_ORDER_VOCAB_SIZE = 32
 
 TOKEN_IDX_CLS = 0
 TOKEN_IDX_GLOBAL_FIELD_SUPER = 25
@@ -42,6 +46,7 @@ class TokenType(IntEnum):
     POKEMON_NUMERIC = 2
     FIELD_SUPER = 3
     FIELD_NUMERIC = 4
+    EVENT = 5
 
 
 class SideId(IntEnum):
@@ -59,6 +64,10 @@ class StructuredObservation:
     slot_ids: torch.Tensor
     categorical: torch.Tensor
     numerical: torch.Tensor
+    events_cat: torch.Tensor
+    events_num: torch.Tensor
+    events_side_ids: torch.Tensor
+    events_slot_ids: torch.Tensor
 
     def is_teampreview(self) -> torch.Tensor:
         return is_teampreview(self.numerical)
@@ -70,6 +79,10 @@ class StructuredObservation:
             slot_ids=self.slot_ids.clone(),
             categorical=self.categorical.clone(),
             numerical=self.numerical.clone(),
+            events_cat=self.events_cat.clone(),
+            events_num=self.events_num.clone(),
+            events_side_ids=self.events_side_ids.clone(),
+            events_slot_ids=self.events_slot_ids.clone(),
         )
 
     def to(self, *args, **kwargs) -> StructuredObservation:
@@ -79,6 +92,10 @@ class StructuredObservation:
             slot_ids=self.slot_ids.to(*args, **kwargs),
             categorical=self.categorical.to(*args, **kwargs),
             numerical=self.numerical.to(*args, **kwargs),
+            events_cat=self.events_cat.to(*args, **kwargs),
+            events_num=self.events_num.to(*args, **kwargs),
+            events_side_ids=self.events_side_ids.to(*args, **kwargs),
+            events_slot_ids=self.events_slot_ids.to(*args, **kwargs),
         )
 
     def unsqueeze(self, dim: int) -> StructuredObservation:
@@ -88,6 +105,10 @@ class StructuredObservation:
             slot_ids=self.slot_ids.unsqueeze(dim),
             categorical=self.categorical.unsqueeze(dim),
             numerical=self.numerical.unsqueeze(dim),
+            events_cat=self.events_cat.unsqueeze(dim),
+            events_num=self.events_num.unsqueeze(dim),
+            events_side_ids=self.events_side_ids.unsqueeze(dim),
+            events_slot_ids=self.events_slot_ids.unsqueeze(dim),
         )
 
     def cpu(self) -> StructuredObservation:
@@ -100,6 +121,10 @@ class StructuredObservation:
             slot_ids=self.slot_ids[index],
             categorical=self.categorical[index],
             numerical=self.numerical[index],
+            events_cat=self.events_cat[index],
+            events_num=self.events_num[index],
+            events_side_ids=self.events_side_ids[index],
+            events_slot_ids=self.events_slot_ids[index],
         )
 
     @staticmethod
@@ -110,6 +135,10 @@ class StructuredObservation:
             slot_ids=torch.cat([obs.slot_ids for obs in observations], dim=dim),
             categorical=torch.cat([obs.categorical for obs in observations], dim=dim),
             numerical=torch.cat([obs.numerical for obs in observations], dim=dim),
+            events_cat=torch.cat([obs.events_cat for obs in observations], dim=dim),
+            events_num=torch.cat([obs.events_num for obs in observations], dim=dim),
+            events_side_ids=torch.cat([obs.events_side_ids for obs in observations], dim=dim),
+            events_slot_ids=torch.cat([obs.events_slot_ids for obs in observations], dim=dim),
         )
 
     @staticmethod
@@ -120,6 +149,10 @@ class StructuredObservation:
             slot_ids=torch.stack([obs.slot_ids for obs in observations], dim=dim),
             categorical=torch.stack([obs.categorical for obs in observations], dim=dim),
             numerical=torch.stack([obs.numerical for obs in observations], dim=dim),
+            events_cat=torch.stack([obs.events_cat for obs in observations], dim=dim),
+            events_num=torch.stack([obs.events_num for obs in observations], dim=dim),
+            events_side_ids=torch.stack([obs.events_side_ids for obs in observations], dim=dim),
+            events_slot_ids=torch.stack([obs.events_slot_ids for obs in observations], dim=dim),
         )
 
     @staticmethod
@@ -142,6 +175,26 @@ class StructuredObservation:
             numerical=torch.zeros(
                 (batch_size, SEQUENCE_LENGTH, NUMERICAL_WIDTH),
                 dtype=torch.float32,
+                pin_memory=pin_memory,
+            ),
+            events_cat=torch.zeros(
+                (batch_size, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH),
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            ),
+            events_num=torch.zeros(
+                (batch_size, EVENT_COUNT, EVENT_NUMERICAL_WIDTH),
+                dtype=torch.float32,
+                pin_memory=pin_memory,
+            ),
+            events_side_ids=torch.zeros(
+                (batch_size, EVENT_COUNT),
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            ),
+            events_slot_ids=torch.zeros(
+                (batch_size, EVENT_COUNT),
+                dtype=torch.long,
                 pin_memory=pin_memory,
             ),
         )

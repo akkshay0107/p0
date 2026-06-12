@@ -5,6 +5,7 @@ from src.lookups import ACT_SIZE
 from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
+    EVENT_COUNT,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
@@ -24,14 +25,7 @@ def policy_net():
 
 def test_policy_net_forward_pass(policy_net):
     B = 16
-    # dummy observation
-    obs = StructuredObservation(
-        categorical=torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
-        numerical=torch.zeros((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH), dtype=torch.float32),
-        token_type_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        side_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        slot_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-    )
+    obs = StructuredObservation.empty_batch(B)
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
     ally_indices = [1, 3, 5, 7, 9, 11]
@@ -53,13 +47,8 @@ def test_policy_net_forward_pass(policy_net):
 
 def test_encoder_batches_all_pokemon_in_one_fusion_call(policy_net):
     B = 2
-    obs = StructuredObservation(
-        categorical=torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
-        numerical=torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH)),
-        token_type_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        side_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        slot_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-    )
+    obs = StructuredObservation.empty_batch(B)
+    obs.numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
     action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
     calls: list[tuple[int, ...]] = []
 
@@ -108,7 +97,7 @@ def test_encoded_obs_step_is_contiguous_time_major():
 
 def test_policy_net_encoded_evaluate(policy_net):
     B = 16
-    tokens = torch.randn((B, SEQUENCE_LENGTH + 1, 128))
+    tokens = torch.randn((B, SEQUENCE_LENGTH + 1 + EVENT_COUNT, 128))
     aux = torch.randn((B, 2, 4, 128))
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
 
@@ -134,13 +123,7 @@ def test_policy_net_encoded_evaluate(policy_net):
 
 
 def test_encode_requires_batched_observation_and_mask(policy_net):
-    obs = StructuredObservation(
-        categorical=torch.zeros((SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
-        numerical=torch.zeros((SEQUENCE_LENGTH, NUMERICAL_WIDTH), dtype=torch.float32),
-        token_type_ids=torch.zeros(SEQUENCE_LENGTH, dtype=torch.long),
-        side_ids=torch.zeros(SEQUENCE_LENGTH, dtype=torch.long),
-        slot_ids=torch.zeros(SEQUENCE_LENGTH, dtype=torch.long),
-    )
+    obs = StructuredObservation.empty_batch(1)[0]
     action_mask = torch.ones((2, ACT_SIZE), dtype=torch.bool)
 
     with pytest.raises(ValueError, match="batched"):
@@ -152,13 +135,7 @@ def test_encode_requires_batched_observation_and_mask(policy_net):
 
 def test_top_p_validation(policy_net):
     B = 1
-    obs = StructuredObservation(
-        categorical=torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
-        numerical=torch.zeros((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH), dtype=torch.float32),
-        token_type_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        side_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        slot_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-    )
+    obs = StructuredObservation.empty_batch(B)
     action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
 
     with pytest.raises(ValueError, match="top_p"):
@@ -200,13 +177,7 @@ def test_nature_embedding_correctness(policy_net):
 
 def test_fainted_pokemon_visible(policy_net):
     B = 1
-    obs = StructuredObservation(
-        categorical=torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
-        numerical=torch.zeros((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH), dtype=torch.float32),
-        token_type_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        side_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-        slot_ids=torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long),
-    )
+    obs = StructuredObservation.empty_batch(B)
 
     obs.token_type_ids[0, 0] = 0  # CLS
     for i in range(1, 13):
@@ -273,7 +244,7 @@ def test_cls_reducer_pokemon_tokens_alignment():
         def forward(self, seq, src_key_padding_mask=None):
             return seq
 
-    reducer.encoder = _Passthrough()
+    reducer.encoder = _Passthrough()  # type: ignore
     tokens = torch.randn(2, SEQUENCE_LENGTH + 1, 32)
 
     _, _, pokemon_tokens = reducer(tokens, None, None)

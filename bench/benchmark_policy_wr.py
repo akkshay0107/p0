@@ -1,8 +1,6 @@
-import argparse
 import asyncio
 from pathlib import Path
 
-import torch
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 
@@ -10,13 +8,16 @@ from src.heuristic.heuristic import FuzzyHeuristic
 from src.model.policy import PolicyNet
 from src.rl_player import RLPlayer
 from src.team_picker import RandomTeamFromPool
-from src.train.utils import load_checkpoint
+from src.train.config import load_config
+from src.train.utils import default_device, load_checkpoint
+
+N_BATTLES = 100
 
 
-async def main(n_battles: int, checkpoint_path: str):
+async def main():
     root_dir = Path(__file__).resolve().parent.parent
     teams_dir = root_dir / "teams"
-    checkpoint_file = Path(checkpoint_path)
+    config = load_config(root_dir / ".ppoconfig")
 
     if not teams_dir.exists():
         print(f"Teams directory not found: {teams_dir}")
@@ -35,16 +36,12 @@ async def main(n_battles: int, checkpoint_path: str):
     fmt = "gen9championsvgc2026regma"
 
     # Load policy
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
+    if not config.checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {config.checkpoint_path}")
     policy = PolicyNet().to(device)
-
-    if checkpoint_file.exists():
-        print(f"Loading checkpoint from: {checkpoint_file}")
-        load_checkpoint(checkpoint_file, policy)
-    else:
-        print(
-            f"Warning: Checkpoint not found at {checkpoint_file}. Using randomly initialized policy."
-        )
+    print(f"Loading checkpoint from: {config.checkpoint_path}")
+    load_checkpoint(config.checkpoint_path, policy)
 
     policy.eval()
 
@@ -77,7 +74,7 @@ async def main(n_battles: int, checkpoint_path: str):
     ]
 
     print(
-        f"Starting evaluation of policy against {len(opponents)} bots ({n_battles} games each)..."
+        f"Starting evaluation of policy against {len(opponents)} bots ({N_BATTLES} games each)..."
     )
     print("=" * 60)
 
@@ -85,7 +82,7 @@ async def main(n_battles: int, checkpoint_path: str):
 
     for name, opponent in opponents:
         print(f"Battling RL_Policy vs {name}...")
-        await rl_player.battle_against(opponent, n_battles=n_battles)
+        await rl_player.battle_against(opponent, n_battles=N_BATTLES)
 
         winrate = rl_player.win_rate
         results[name] = winrate
@@ -110,23 +107,7 @@ async def main(n_battles: int, checkpoint_path: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate RL policy against various bots.")
-    parser.add_argument(
-        "-n",
-        "--n-battles",
-        type=int,
-        default=100,
-        help="Number of battles against each opponent (default: 100)",
-    )
-    parser.add_argument(
-        "-c",
-        "--checkpoint",
-        type=str,
-        default="checkpoints/ppo_checkpoint.pt",
-        help="Path to the policy checkpoint (default: checkpoints/ppo_checkpoint.pt)",
-    )
-    args = parser.parse_args()
-
     from src.showdown_server import spawned_showdown
+
     with spawned_showdown(port=8000):
-        asyncio.run(main(args.n_battles, args.checkpoint))
+        asyncio.run(main())

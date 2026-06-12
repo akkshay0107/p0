@@ -7,6 +7,9 @@ from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_COUNT,
+    EVENT_NUMERICAL_WIDTH,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
@@ -93,6 +96,26 @@ def create_trajectory_buffers(
         ),
         "slot_ids": torch.zeros(
             (n_envs, max_steps, SEQUENCE_LENGTH), dtype=torch.long, device=device
+        ),
+        "events_cat": torch.zeros(
+            (n_envs, max_steps, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH),
+            dtype=torch.long,
+            device=device,
+        ),
+        "events_num": torch.zeros(
+            (n_envs, max_steps, EVENT_COUNT, EVENT_NUMERICAL_WIDTH),
+            dtype=torch.float32,
+            device=device,
+        ),
+        "events_side_ids": torch.zeros(
+            (n_envs, max_steps, EVENT_COUNT),
+            dtype=torch.long,
+            device=device,
+        ),
+        "events_slot_ids": torch.zeros(
+            (n_envs, max_steps, EVENT_COUNT),
+            dtype=torch.long,
+            device=device,
         ),
         "actions": torch.zeros((n_envs, max_steps, 2), dtype=torch.long, device=device),
         "log_probs": torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
@@ -320,6 +343,10 @@ def collect_rollouts(
         trajectories1["token_type_ids"][idx_all, s1] = obs1_cpu.token_type_ids
         trajectories1["side_ids"][idx_all, s1] = obs1_cpu.side_ids
         trajectories1["slot_ids"][idx_all, s1] = obs1_cpu.slot_ids
+        trajectories1["events_cat"][idx_all, s1] = obs1_cpu.events_cat
+        trajectories1["events_num"][idx_all, s1] = obs1_cpu.events_num
+        trajectories1["events_side_ids"][idx_all, s1] = obs1_cpu.events_side_ids
+        trajectories1["events_slot_ids"][idx_all, s1] = obs1_cpu.events_slot_ids
         trajectories1["actions"][idx_all, s1] = actions1_cpu
         trajectories1["log_probs"][idx_all, s1] = log_probs1_cpu
         trajectories1["values"][idx_all, s1] = values1_cpu
@@ -336,6 +363,14 @@ def collect_rollouts(
             ]
             trajectories2["side_ids"][self_idx_cpu, s2] = obs2_cpu.side_ids[self_idx_cpu]
             trajectories2["slot_ids"][self_idx_cpu, s2] = obs2_cpu.slot_ids[self_idx_cpu]
+            trajectories2["events_cat"][self_idx_cpu, s2] = obs2_cpu.events_cat[self_idx_cpu]
+            trajectories2["events_num"][self_idx_cpu, s2] = obs2_cpu.events_num[self_idx_cpu]
+            trajectories2["events_side_ids"][self_idx_cpu, s2] = obs2_cpu.events_side_ids[
+                self_idx_cpu
+            ]
+            trajectories2["events_slot_ids"][self_idx_cpu, s2] = obs2_cpu.events_slot_ids[
+                self_idx_cpu
+            ]
             trajectories2["actions"][self_idx_cpu, s2] = actions2_cpu[self_idx_cpu]
             trajectories2["log_probs"][self_idx_cpu, s2] = log_probs2_cpu[self_idx_cpu]
             trajectories2["values"][self_idx_cpu, s2] = values2_cpu[self_idx_cpu]
@@ -380,6 +415,10 @@ def collect_rollouts(
                             slot_ids=trajectories1["slot_ids"][i, :length1].clone(),
                             categorical=trajectories1["categorical"][i, :length1].clone(),
                             numerical=trajectories1["numerical"][i, :length1].clone(),
+                            events_cat=trajectories1["events_cat"][i, :length1].clone(),
+                            events_num=trajectories1["events_num"][i, :length1].clone(),
+                            events_side_ids=trajectories1["events_side_ids"][i, :length1].clone(),
+                            events_slot_ids=trajectories1["events_slot_ids"][i, :length1].clone(),
                         ),
                         "actions": trajectories1["actions"][i, :length1].clone(),
                         "log_probs": trajectories1["log_probs"][i, :length1].clone(),
@@ -402,6 +441,14 @@ def collect_rollouts(
                                 slot_ids=trajectories2["slot_ids"][i, :length2].clone(),
                                 categorical=trajectories2["categorical"][i, :length2].clone(),
                                 numerical=trajectories2["numerical"][i, :length2].clone(),
+                                events_cat=trajectories2["events_cat"][i, :length2].clone(),
+                                events_num=trajectories2["events_num"][i, :length2].clone(),
+                                events_side_ids=trajectories2["events_side_ids"][
+                                    i, :length2
+                                ].clone(),
+                                events_slot_ids=trajectories2["events_slot_ids"][
+                                    i, :length2
+                                ].clone(),
                             ),
                             "actions": trajectories2["actions"][i, :length2].clone(),
                             "log_probs": trajectories2["log_probs"][i, :length2].clone(),

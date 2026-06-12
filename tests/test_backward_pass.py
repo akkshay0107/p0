@@ -5,6 +5,9 @@ from src.lookups import ACT_SIZE
 from src.model.policy import PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_COUNT,
+    EVENT_NUMERICAL_WIDTH,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     SideId,
@@ -83,12 +86,27 @@ def dummy_obs():
 
     numerical[:, 26, 2] = 1.0
 
+    events_cat = torch.zeros((B, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), dtype=torch.long)
+    events_cat[..., 0] = torch.randint(1, 19, (B, EVENT_COUNT))
+    events_cat[..., 1] = torch.randint(1, 70, (B, EVENT_COUNT))
+    events_cat[..., 2] = torch.randint(1, 19, (B, EVENT_COUNT))
+    events_cat[..., 3] = torch.randint(1, 7, (B, EVENT_COUNT))
+    events_cat[..., 4] = torch.randint(1, 25, (B, EVENT_COUNT))
+
+    events_num = torch.randn((B, EVENT_COUNT, EVENT_NUMERICAL_WIDTH))
+    events_side_ids = torch.randint(0, 3, (B, EVENT_COUNT), dtype=torch.long)
+    events_slot_ids = torch.randint(0, 7, (B, EVENT_COUNT), dtype=torch.long)
+
     return StructuredObservation(
         token_type_ids=token_type_ids,
         side_ids=side_ids,
         slot_ids=slot_ids,
         categorical=categorical,
         numerical=numerical,
+        events_cat=events_cat,
+        events_num=events_num,
+        events_side_ids=events_side_ids,
+        events_slot_ids=events_slot_ids,
     )
 
 
@@ -184,6 +202,8 @@ def test_gradient_flow(dummy_obs):
         "token_type_emb",
         "side_emb",
         "slot_emb",
+        "event_type_emb",
+        "order_pos_emb",
     ]
 
     missing_emb_grads = []

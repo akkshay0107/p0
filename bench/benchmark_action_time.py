@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import cProfile
 import io
@@ -17,21 +16,35 @@ from src.model.policy import PolicyNet
 from src.model.tokenizer import tokenizer
 from src.rl_player import RLPlayer
 from src.team_picker import RandomTeamFromPool
+from src.train.config import load_config
+from src.train.utils import default_device, load_checkpoint
+
+N_BATTLES = 5
+PROFILE_SORT = "tottime"
+PROFILE_LIMIT = 50
 
 
 @dataclass(slots=True)
 class TimeTracker:
-    tokenizer_time = 0.0
-    observation_builder_time = 0.0
-    action_mask_time = 0.0
-    tensor_prep_time = 0.0
-    encoder_time = 0.0
-    policy_action_time = 0.0
-    post_process_time = 0.0
+    tokenizer_time: float = 0.0
+    observation_builder_time: float = 0.0
+    action_mask_time: float = 0.0
+    tensor_prep_time: float = 0.0
+    encoder_time: float = 0.0
+    policy_action_time: float = 0.0
+    post_process_time: float = 0.0
+
+
+TIMINGS = TimeTracker()
 
 
 def get_time():
     return time.perf_counter()
+
+
+def synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 # Instrument tokenizer methods to measure tokenizer stage
@@ -56,7 +69,7 @@ for name in tokenizer_methods:
             try:
                 return orig(*args, **kwargs)
             finally:
-                TimeTracker.tokenizer_time += get_time() - start
+                TIMINGS.tokenizer_time += get_time() - start
 
         return wrapped
 
@@ -80,35 +93,39 @@ class ProfiledRLPlayer(RLPlayer):
         try:
             # tokenizer stage
             start_obs = get_time()
-            tok_start = TimeTracker.tokenizer_time
+            tok_start = TIMINGS.tokenizer_time
             obs = self.get_observation(battle)
-            tok_end = TimeTracker.tokenizer_time
+            tok_end = TIMINGS.tokenizer_time
             obs_duration = get_time() - start_obs
 
             # non tokenizing observation building stage
             tok_duration_call = tok_end - tok_start
-            TimeTracker.observation_builder_time += obs_duration - tok_duration_call
+            TIMINGS.observation_builder_time += obs_duration - tok_duration_call
 
             # action mask fetch
             start_mask = get_time()
             action_mask_list = MegaEnv.get_action_mask(battle)
             action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
-            TimeTracker.action_mask_time += get_time() - start_mask
+            TIMINGS.action_mask_time += get_time() - start_mask
 
             # cpu to gpu moving stage (underrepresented if device is cpu)
+            device = self.policy.device
+            synchronize(device)
             start_prep = get_time()
-            obs_t = obs.unsqueeze(0).to(self.policy.device)
-            action_mask_t = action_mask.unsqueeze(0).to(self.policy.device)
-            TimeTracker.tensor_prep_time += get_time() - start_prep
+            obs_t = obs.unsqueeze(0).to(device)
+            action_mask_t = action_mask.unsqueeze(0).to(device)
+            synchronize(device)
+            TIMINGS.tensor_prep_time += get_time() - start_prep
 
-            # forward pass + sampling (overrepresented if device is cpu)
             with torch.no_grad():
                 if self.state is None:
                     self.state = self.policy.initial_state(1)
 
+                synchronize(device)
                 start_inference = get_time()
                 enc = self.policy.encode(obs_t, action_mask_t)
-                TimeTracker.encoder_time += get_time() - start_inference
+                synchronize(device)
+                TIMINGS.encoder_time += get_time() - start_inference
 
                 start_inference = get_time()
                 out = self.policy.act(
@@ -117,13 +134,14 @@ class ProfiledRLPlayer(RLPlayer):
                     self.state,
                     top_p=self.top_p,
                 )
-                TimeTracker.policy_action_time += get_time() - start_inference
+                synchronize(device)
+                TIMINGS.policy_action_time += get_time() - start_inference
                 self.state = out.state
 
-            # gpu to cpu (underrepresented if device is cpu)
             start_post = get_time()
             result = out.actions[0].cpu().numpy()
-            TimeTracker.post_process_time += get_time() - start_post
+            synchronize(device)
+            TIMINGS.post_process_time += get_time() - start_post
 
             return result
         finally:
@@ -142,13 +160,13 @@ class ProfiledRLPlayer(RLPlayer):
 
         # stagewise profiling
         tot = (
-            TimeTracker.tokenizer_time
-            + TimeTracker.observation_builder_time
-            + TimeTracker.action_mask_time
-            + TimeTracker.tensor_prep_time
-            + TimeTracker.encoder_time
-            + TimeTracker.policy_action_time
-            + TimeTracker.post_process_time
+            TIMINGS.tokenizer_time
+            + TIMINGS.observation_builder_time
+            + TIMINGS.action_mask_time
+            + TIMINGS.tensor_prep_time
+            + TIMINGS.encoder_time
+            + TIMINGS.policy_action_time
+            + TIMINGS.post_process_time
         )
         tot = max(tot, 1e-9)
 
@@ -162,13 +180,13 @@ class ProfiledRLPlayer(RLPlayer):
         print("-" * 83)
 
         stages = [
-            ("Tokenizer", TimeTracker.tokenizer_time),
-            ("Observation Builder (non-tok)", TimeTracker.observation_builder_time),
-            ("Action Masking", TimeTracker.action_mask_time),
-            ("Tensor Prep / Device Transfer", TimeTracker.tensor_prep_time),
-            ("Policy Encoding", TimeTracker.encoder_time),
-            ("Policy Act / Top-P", TimeTracker.policy_action_time),
-            ("Post-processing", TimeTracker.post_process_time),
+            ("Tokenizer", TIMINGS.tokenizer_time),
+            ("Observation Builder (non-tok)", TIMINGS.observation_builder_time),
+            ("Action Masking", TIMINGS.action_mask_time),
+            ("Tensor Prep / Device Transfer", TIMINGS.tensor_prep_time),
+            ("Policy Encoding", TIMINGS.encoder_time),
+            ("Policy Act / Top-P", TIMINGS.policy_action_time),
+            ("Post-processing", TIMINGS.post_process_time),
         ]
         for name, val in stages:
             avg_ms = (val / max(1, self.call_count)) * 1000
@@ -178,20 +196,9 @@ class ProfiledRLPlayer(RLPlayer):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Profile the RL forward pass during battles.")
-    parser.add_argument(
-        "-n", "--n-battles", type=int, default=5, help="Number of battles to run for profiling."
-    )
-    parser.add_argument(
-        "--sort", type=str, default="tottime", help="Sort criteria for pstats (tottime, cumtime)."
-    )
-    parser.add_argument(
-        "--limit", type=int, default=50, help="Number of lines to show in the profile output."
-    )
-    args = parser.parse_args()
-
     root_dir = Path(__file__).resolve().parent.parent
     teams_dir = root_dir / "teams"
+    config = load_config(root_dir / ".ppoconfig")
 
     if not teams_dir.exists():
         print(f"Teams directory not found: {teams_dir}")
@@ -209,10 +216,12 @@ async def main():
     team = RandomTeamFromPool(team_files)
     fmt = "gen9championsvgc2026regma"
 
-    # random policy weights for benchmarking
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
     print(f"Using device: {device}")
+    if not config.checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {config.checkpoint_path}")
     policy = PolicyNet().to(device)
+    load_checkpoint(config.checkpoint_path, policy)
     policy.eval()
 
     rl_player = ProfiledRLPlayer(
@@ -232,18 +241,19 @@ async def main():
         accept_open_team_sheet=True,
     )
 
-    print(f"Starting {args.n_battles} battles to profile the forward pass...")
+    print(f"Starting {N_BATTLES} battles to profile the forward pass...")
     try:
-        await rl_player.battle_against(opponent, n_battles=args.n_battles)
+        await rl_player.battle_against(opponent, n_battles=N_BATTLES)
     except Exception as e:
         print(f"Error during battles: {e}")
         print("Make sure a local Pokémon Showdown server is running.")
         return
 
-    rl_player.print_profiling_results(sort_by=args.sort, limit=args.limit)
+    rl_player.print_profiling_results(sort_by=PROFILE_SORT, limit=PROFILE_LIMIT)
 
 
 if __name__ == "__main__":
     from src.showdown_server import spawned_showdown
+
     with spawned_showdown(port=8000):
         asyncio.run(main())

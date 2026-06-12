@@ -8,9 +8,13 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from src.lookups import ACT_SIZE
+from src.model.event_builder import EVENT_TYPE_COUNT
 from src.model.structured_observation import (
     ALLY_NUM_TOKENS,
     CATEGORICAL_WIDTH,
+    EVENT_COUNT,
+    EVENT_NUMERICAL_WIDTH,
+    EVENT_ORDER_VOCAB_SIZE,
     MOVE_SLOTS,
     NUM_IDX_MOVE_LAST,
     NUM_IDX_MOVE_LEGAL,
@@ -21,11 +25,12 @@ from src.model.structured_observation import (
     TOKEN_IDX_GLOBAL_FIELD_SUPER,
     TOKEN_IDX_OPPONENT_SIDE_SUPER,
     StructuredObservation,
+    TokenType,
 )
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 NUM_COMPONENTS = 11
-NUM_TOKEN_TYPES = 5
+NUM_TOKEN_TYPES = 6
 NUM_SIDES = 3
 NUM_SLOTS = 7
 
@@ -153,6 +158,10 @@ class FusedTokenEncoder(nn.Module):
         self.side_emb = nn.Embedding(NUM_SIDES, d_model)
         self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
 
+        self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_model)
+        self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_model)
+        self.event_proj = nn.Linear(3 * d_raw + EVENT_NUMERICAL_WIDTH, d_model)
+
         # each move gets a move embedding, a type embedding, a category embedding,
         # and a static scalar vector (base power, max pp, priority, accuracy)
         self.move_proj = nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH, d_model)
@@ -194,9 +203,7 @@ class FusedTokenEncoder(nn.Module):
         self.register_buffer(
             "_field_numeric_pos", torch.tensor(_FIELD_NUMERIC_POS, dtype=torch.long)
         )
-        self.register_buffer(
-            "_active_num_pos", torch.tensor(ALLY_NUM_TOKENS[:2], dtype=torch.long)
-        )
+        self.register_buffer("_active_num_pos", torch.tensor(ALLY_NUM_TOKENS[:2], dtype=torch.long))
         self._init_weights()
 
     @torch.no_grad()
@@ -360,7 +367,9 @@ class FusedTokenEncoder(nn.Module):
         )
         aux_moves = aux_moves + self.move_dyn_proj(move_dyn)
 
-        x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :]).to(x.dtype)
+        x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :]).to(
+            x.dtype
+        )
 
         x[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :] = self._embed_global_field_cond(
             categorical[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :]
@@ -383,4 +392,43 @@ class FusedTokenEncoder(nn.Module):
             + self.slot_emb(slot_ids)
         )
         out_tokens = self._append_action_mask_token(out_tokens, action_mask)
+
+        events_cat = obs.events_cat.long().to(device)
+        events_num = obs.events_num.float().to(device)
+        events_side_ids = obs.events_side_ids.long().to(device)
+        events_slot_ids = obs.events_slot_ids.long().to(device)
+
+        event_feats = torch.cat(
+            [
+                self.move_emb(events_cat[..., 1]),
+                self.item_emb(events_cat[..., 2]),
+                self.status_emb(events_cat[..., 3]),
+                events_num,
+            ],
+            dim=-1,
+        )
+
+        event_tokens = self.event_proj(event_feats)
+        event_tokens = (
+            event_tokens
+            + self.event_type_emb(events_cat[..., 0])
+            + self.side_emb(events_side_ids)
+            + self.slot_emb(events_slot_ids)
+            + self.order_pos_emb(events_cat[..., 4])
+            + self.token_type_emb(
+                torch.full(
+                    (B, EVENT_COUNT),
+                    TokenType.EVENT,
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+        )
+
+        # zero out embeddings for padded event slots to prevent slot/pos/side embedding bleeding
+        event_mask = (events_cat[..., 0] != 0).to(event_tokens.dtype).unsqueeze(-1)
+        event_tokens = event_tokens * event_mask
+
+        out_tokens = torch.cat([out_tokens, event_tokens.to(out_tokens.dtype)], dim=1)
+
         return out_tokens, aux_moves

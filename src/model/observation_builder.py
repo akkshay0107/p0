@@ -14,8 +14,12 @@ from poke_env.battle.side_condition import SideCondition
 from poke_env.data import GenData
 from poke_env.stats import compute_raw_stats
 
+from src.model.event_builder import BattleEvent, EventCollector
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_COUNT,
+    EVENT_NUMERICAL_WIDTH,
     MOVE_SLOTS,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
@@ -244,8 +248,14 @@ def _pokemon_numeric_into(
     row[30] = _can_mega(pokemon, battle, active_idx)
     row[31] = _is_mega_form(pokemon)
 
-    if cond == 1 and pokemon.last_move:
+    last_move_id = None
+    custom_last_move = EventCollector.last_move(pokemon)
+    if custom_last_move:
+        last_move_id = tokenizer.normalize_id(custom_last_move)
+    elif pokemon.last_move:
         last_move_id = pokemon.last_move.id
+
+    if cond == 1 and last_move_id:
         for move_idx, move in enumerate(move_slots):
             if move is not None and move.id == last_move_id:
                 row[32 + move_idx] = 1.0
@@ -530,6 +540,20 @@ def _validate_output(out: StructuredObservation) -> None:
             (SEQUENCE_LENGTH, NUMERICAL_WIDTH),
             torch.float32,
         ),
+        (
+            "events_cat",
+            out.events_cat,
+            (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH),
+            torch.long,
+        ),
+        (
+            "events_num",
+            out.events_num,
+            (EVENT_COUNT, EVENT_NUMERICAL_WIDTH),
+            torch.float32,
+        ),
+        ("events_side_ids", out.events_side_ids, (EVENT_COUNT,), torch.long),
+        ("events_slot_ids", out.events_slot_ids, (EVENT_COUNT,), torch.long),
     )
     for name, tensor, shape, dtype in expected:
         if tensor.device.type != "cpu":
@@ -541,6 +565,26 @@ def _validate_output(out: StructuredObservation) -> None:
                 f"Invalid {name}: expected shape {shape} and dtype {dtype}, "
                 f"got shape {tuple(tensor.shape)} and dtype {tensor.dtype}."
             )
+
+
+def _event_location(
+    battle: DoubleBattle,
+    event: BattleEvent,
+    pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
+) -> tuple[SideId, int]:
+    entity_id = event.entity_id
+    if entity_id is None:
+        return SideId.NONE, 0
+
+    if entity_id in ("p1", "p2"):
+        side = SideId.ALLY if entity_id == battle.player_role else SideId.OPPONENT
+        return side, 0
+
+    try:
+        pokemon = battle.get_pokemon(entity_id)
+    except (AssertionError, IndexError, KeyError, ValueError):
+        return SideId.NONE, 0
+    return pokemon_to_slot.get(pokemon, (SideId.NONE, 0))
 
 
 def from_battle_into(
@@ -570,6 +614,8 @@ def from_battle_into(
     ally_orig_idx = {mon: i for i, mon in enumerate(battle.team.values())}
     opponent_orig_idx = {mon: i for i, mon in enumerate(battle.opponent_team.values())}
 
+    pokemon_to_slot = {}
+
     idx = 1
     for side, is_opponent, orig_idx_map in (
         (SideId.ALLY, False, ally_orig_idx),
@@ -586,6 +632,8 @@ def from_battle_into(
                 battle, mon, slot_idx, is_opponent, selected_allies if not is_opponent else None
             )
             slot_id = slot_idx + 1
+            if mon is not None:
+                pokemon_to_slot[mon] = (side, slot_id)
             move_slots = _iter_move_slots(mon)
 
             token_types[idx] = TokenType.POKEMON_SUPER
@@ -659,6 +707,33 @@ def from_battle_into(
 
     if idx != SEQUENCE_LENGTH:
         raise RuntimeError(f"Structured observation length drifted to {idx}")
+
+    events = EventCollector.truncate_events(EventCollector.consume_events(battle))
+
+    events_cat = out.events_cat.numpy()
+    events_num = out.events_num.numpy()
+    events_side_ids = out.events_side_ids.numpy()
+    events_slot_ids = out.events_slot_ids.numpy()
+
+    events_cat.fill(0)
+    events_num.fill(0)
+    events_side_ids.fill(0)
+    events_slot_ids.fill(0)
+
+    for event_idx, event in enumerate(events):
+        side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
+
+        events_cat[event_idx, 0] = event.event_type
+        events_cat[event_idx, 1] = event.move_id
+        events_cat[event_idx, 2] = event.item_id
+        events_cat[event_idx, 3] = event.status_id
+        events_cat[event_idx, 4] = min(event.order + 1, 31)
+
+        events_num[event_idx, 0] = event.value
+        events_num[event_idx, 1] = event.order / float(EVENT_COUNT)
+
+        events_side_ids[event_idx] = side_id
+        events_slot_ids[event_idx] = slot_id
 
 
 def from_battle(
