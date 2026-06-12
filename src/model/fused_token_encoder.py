@@ -9,7 +9,12 @@ import torch.nn.init as init
 
 from src.lookups import ACT_SIZE
 from src.model.structured_observation import (
+    ALLY_NUM_TOKENS,
     CATEGORICAL_WIDTH,
+    MOVE_SLOTS,
+    NUM_IDX_MOVE_LAST,
+    NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_MOVE_PP,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TOKEN_IDX_ALLY_SIDE_SUPER,
@@ -46,7 +51,8 @@ def _load_vocab_sizes() -> dict[str, int]:
     return {name: len(values) + 1 for name, values in vocab.items()}
 
 
-MOVE_STATIC_WIDTH = 3  # base power, max pp, priority
+MOVE_STATIC_WIDTH = 4  # base power, max pp, priority, accuracy
+MOVE_DYNAMIC_WIDTH = 3  # pp fraction, last-move flag, legal-this-step
 
 
 def _load_move_statics() -> torch.Tensor:
@@ -64,6 +70,7 @@ def _load_move_statics() -> torch.Tensor:
             table[idx, 0] = move.base_power / 150.0
             table[idx, 1] = move.max_pp / 64.0
             table[idx, 2] = move.priority / 5.0
+            table[idx, 3] = move.accuracy  # poke-env already returns 0-1 scale
         except Exception:
             # pseudo-moves without full data stay zero
             pass
@@ -100,6 +107,7 @@ class FusedTokenEncoder(nn.Module):
     _numeric_pos: torch.Tensor
     _field_super_pos: torch.Tensor
     _field_numeric_pos: torch.Tensor
+    _active_num_pos: torch.Tensor
     _component_ids: torch.Tensor
     _move_statics: torch.Tensor
 
@@ -146,8 +154,11 @@ class FusedTokenEncoder(nn.Module):
         self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
 
         # each move gets a move embedding, a type embedding, a category embedding,
-        # and a static scalar vector (base power, max pp, priority)
-        self.move_proj = nn.Sequential(nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH, d_model), nn.GELU())
+        # and a static scalar vector (base power, max pp, priority, accuracy)
+        self.move_proj = nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH, d_model)
+        # mixes the per-slot dynamic move state into the aux channel so the
+        # pointer move keys see more than the static move identity
+        self.move_dyn_proj = nn.Linear(MOVE_DYNAMIC_WIDTH, d_model)
         self.type_set = MultiAggDeepSet(d_raw, d_model)
         self.numeric_proj = nn.Sequential(
             nn.Linear(NUMERICAL_WIDTH, d_model),
@@ -182,6 +193,9 @@ class FusedTokenEncoder(nn.Module):
         self.register_buffer("_field_super_pos", torch.tensor(_FIELD_SUPER_POS, dtype=torch.long))
         self.register_buffer(
             "_field_numeric_pos", torch.tensor(_FIELD_NUMERIC_POS, dtype=torch.long)
+        )
+        self.register_buffer(
+            "_active_num_pos", torch.tensor(ALLY_NUM_TOKENS[:2], dtype=torch.long)
         )
         self._init_weights()
 
@@ -332,6 +346,19 @@ class FusedTokenEncoder(nn.Module):
 
         x[:, self._super_pos, :] = super_out.unflatten(0, (B, n_super)).to(x.dtype)
         aux_moves = all_move_embs.unflatten(0, (B, n_super))[:, :2]
+
+        # the move embeddings above are state-blind; without this the pointer
+        # head only learns pp / encore / choice-lock nuance indirectly through z
+        active_num = numerical[:, self._active_num_pos, :]
+        move_dyn = torch.stack(
+            [
+                active_num[..., NUM_IDX_MOVE_PP : NUM_IDX_MOVE_PP + MOVE_SLOTS],
+                active_num[..., NUM_IDX_MOVE_LAST : NUM_IDX_MOVE_LAST + MOVE_SLOTS],
+                active_num[..., NUM_IDX_MOVE_LEGAL : NUM_IDX_MOVE_LEGAL + MOVE_SLOTS],
+            ],
+            dim=-1,
+        )
+        aux_moves = aux_moves + self.move_dyn_proj(move_dyn)
 
         x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :]).to(x.dtype)
 

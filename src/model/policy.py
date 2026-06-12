@@ -74,7 +74,7 @@ class EvalOutput(NamedTuple):
 
 
 class ValueHead(nn.Module):
-    """Stateful critic value path."""
+    """Feedforward critic head over the recurrent CLS summary."""
 
     def __init__(
         self,
@@ -139,7 +139,7 @@ class ActorPolicy(nn.Module):
         self.w_k_move = nn.Linear(d_model, self.d_k)
 
         # fused query projector for the 4 query types
-        # pass, switch, move, mega
+        # switch, move, pass, teampreview (mega reuses q_move with mega_emb keys)
         self.q_proj1 = nn.Linear(d_model, 4 * self.d_k)
         self.q_proj2 = nn.Linear(d_model + self.d_k, 4 * self.d_k)
 
@@ -422,7 +422,8 @@ class PolicyNet(nn.Module):
     Refactored Pokemon Policy Network with explicit Actor/Critic split.
     Name kept the same to be consistent with training loop. Might be fixed later.
 
-    The Policy path is stateful (recurrent), while the Value path is stateless.
+    Both heads read the stateful (recurrent) reducer output: the actor builds
+    pointer logits from it, the critic is a feedforward head on its CLS.
     Both share a common FusedTokenEncoder for efficiency.
     """
 

@@ -88,7 +88,8 @@ def _run_batched_ppo(
 
     all_obs = StructuredObservation.cat([ep["obs"] for ep in episodes], dim=0)
     all_action_masks = torch.cat([ep["action_masks"] for ep in episodes], dim=0).to(device)
-    all_enc = policy.encode(all_obs, all_action_masks)
+    with autocast(device_type=device.type, enabled=config.enable_optim):
+        all_enc = policy.encode(all_obs, all_action_masks)
     if is_warmup:
         all_enc = EncodedObs(
             all_enc.tokens.detach(),
@@ -342,9 +343,9 @@ def ppo_update(
                         policy.parameters(), config.max_grad_norm
                     )
                     if not torch.isfinite(grad_norm):
-                        logging.warning("Non-finite grad norm detected, skipping update internals")
-
-                    tot_grad_norm += grad_norm.item()
+                        logging.warning("Non-finite grad norm detected, scaler will skip this step")
+                    else:
+                        tot_grad_norm += grad_norm.item()
                     scaler.step(optimizer)
                     scaler.update()
                     num_updates += 1
@@ -394,12 +395,14 @@ def main():
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 
     if config.enable_optim and device.type == "cuda":
-        logging.info("Compiling model for reduce-overhead...")
+        logging.info("Compiling rollout actor for reduce-overhead...")
         import torch._dynamo as dynamo
 
         dynamo.config.suppress_errors = True
-        policy.evaluate = cast(Callable, torch.compile(policy.evaluate, mode="reduce-overhead"))
-        policy.encode = cast(Callable, torch.compile(policy.encode, mode="reduce-overhead"))
+        # only the rollout actor sees a static batch (n_envs + n_self_envs on
+        # every step), so it is the only path to compile
+        # rest stay fp16 but eager
+        policy.act_obs = cast(Callable, torch.compile(policy.act_obs, mode="reduce-overhead"))
 
     scaler = GradScaler("cuda", enabled=(config.enable_optim and device.type == "cuda"))
 
@@ -511,6 +514,15 @@ def main():
         trajectories2 = create_trajectory_buffers(config.n_envs)
         active_pool_policies = {}
         partition = build_partition(config, pool, policy.device)
+
+        with torch.no_grad():
+            state2 = state2.clone()
+            for opponent_id, group_idx in partition.pool_groups():
+                if opponent_id not in active_pool_policies:
+                    active_pool_policies[opponent_id] = pool.load_policy(opponent_id, str(device))
+                state2[group_idx] = active_pool_policies[opponent_id].initial_state(
+                    group_idx.numel()
+                )
 
         # Smoothed agent-vs-pool win rate for snapshot admission.
         pool_wr_ema = 0.5
@@ -630,7 +642,9 @@ def main():
             )
 
             if (episode + 1) % 10 == 0:
-                save_checkpoint(config.checkpoint_path, episode + 1, policy, optimizer, scaler=scaler)
+                save_checkpoint(
+                    config.checkpoint_path, episode + 1, policy, optimizer, scaler=scaler
+                )
                 logging.info("Checkpoint saved.")
 
     finally:

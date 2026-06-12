@@ -15,7 +15,7 @@ from src.train.config import PPOConfig
 from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
 
-MAX_TRAJECTORY_STEPS = 100
+MAX_TRAJECTORY_STEPS = 200
 
 
 def assign_pool_opponents(n_envs: int, roster: list[str]) -> list[str]:
@@ -117,7 +117,9 @@ def compute_gae_batch(
     if rewards.shape != values.shape or rewards.shape != dones.shape:
         raise ValueError("rewards, values, and dones must have matching padded shapes.")
     if rewards.dim() != 2 or lengths.shape != (rewards.size(0),):
-        raise ValueError("Expected padded tensors shaped (batch, time) and lengths shaped (batch,).")
+        raise ValueError(
+            "Expected padded tensors shaped (batch, time) and lengths shaped (batch,)."
+        )
 
     batch_size, max_steps = rewards.shape
     lengths = lengths.to(rewards.device)

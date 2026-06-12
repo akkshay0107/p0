@@ -21,8 +21,10 @@ TOKEN_IDX_OPPONENT_SIDE_SUPER = 29
 TOKEN_IDX_OPPONENT_SIDE_NUMERIC = 30
 
 NUM_IDX_TEAM_PREVIEW = 2
+NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction
 NUM_IDX_ORIG_IDX_RATIO = 26
 NUM_IDX_FAINTED = 27
+NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot "was the last move used" (actives only)
 NUM_IDX_MOVE_LEGAL = 50  # 50-53: per-move-slot "legal this step" (allies only)
 NUM_IDX_CAN_SWITCH_OUT = 54  # active allies only
 NUM_IDX_REVEALED = 55  # has appeared on the field this battle
