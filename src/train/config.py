@@ -51,12 +51,15 @@ class PPOConfig:
     runs_dir: Path = ARTIFACTS_DIR / "runs"
     replays_dir: Path = ARTIFACTS_DIR / "replays"
     backups_dir: Path = ARTIFACTS_DIR / "backups"
+    eval_dir: Path = ARTIFACTS_DIR / "eval"  # per-promotion validation win-rate logs
     log_path: Path = ARTIFACTS_DIR / "training.log"
     pool_size: int = 50
-    snapshot_interval: int = 50
+    snapshot_interval: int = 20
     # promote the strongest snapshot to the permanent anchor pool once every
     # this many rotating snapshots are admitted
-    pool_anchor_every: int = 5
+    pool_anchor_every: int = 10
+    # battles per heuristic when validating a snapshot (vs the 4 fixed heuristics)
+    eval_battles: int = 100
     pool_win_rate_smoothing: float = 0.1
     pool_wr_floor: float = 0.1
 

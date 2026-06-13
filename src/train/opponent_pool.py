@@ -137,29 +137,29 @@ class OpponentPool:
             self.anchor_ids.append(id)
         else:
             self.promotion_window.append(id)
-            self._maybe_promote()
         return True
 
-    def _maybe_promote(self) -> None:
+    def maybe_promote(self) -> str | None:
         """Promote the strongest of every `pool_anchor_every` rotating snapshots
-        into the permanent anchor set."""
+        into the permanent anchor set. Returns the promoted id, or None."""
         k = self.config.pool_anchor_every
         if k <= 0 or len(self.promotion_window) < k:
-            return
+            return None
 
         candidates = [oid for oid in self.promotion_window if oid in self.win_rates]
         self.promotion_window = []
         if not candidates:
-            return
+            return None
 
-        # highest opponent-vs-agent win rate == the snapshot that best withstands
-        # the current agent == most useful to keep around forever
+        # promote the snapshot the agent struggles most against (highest
+        # opponent-vs-agent win rate) == the strongest of the window
         best = max(candidates, key=lambda oid: self.win_rates[oid])
         self.anchor_ids.append(best)
         logging.info(
-            f"Promoted '{best}' to anchor pool (win rate {self.win_rates[best]:.3f}). "
-            f"Anchors: {self.anchor_ids}"
+            f"Promoted '{best}' to anchor pool "
+            f"(win rate {self.win_rates[best]:.3f}). Anchors: {self.anchor_ids}"
         )
+        return best
 
     def load_policy(self, opponent_id: str, device: str) -> PolicyNet:
         path = self.pool_dir / f"{opponent_id}.pt"

@@ -1,3 +1,5 @@
+import asyncio
+import json
 import logging
 import os
 import random
@@ -15,6 +17,7 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
+from src.eval import evaluate_against_heuristics, load_team
 from src.lookups import ACT_SIZE, OBS_DIM
 from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
@@ -394,6 +397,50 @@ def ppo_update(
     }
 
 
+def run_validation(
+    policy: PolicyNet,
+    eager_act_obs: Callable,
+    eval_team,
+    config: PPOConfig,
+    eval_port: int,
+    episode: int,
+    tb_writer: SummaryWriter,
+) -> dict[str, float]:
+    """Benchmark the latest policy against the fixed heuristics and persist the
+    result as JSON to artifacts/eval/ep_<episode>_wr.log (loadable for metrics).
+
+    Runs eager (swaps out the compiled reduce-overhead actor) to avoid a batch
+    size 1 recompile of the rollout graph.
+    """
+    compiled_act_obs = policy.act_obs
+    policy.act_obs = eager_act_obs
+    policy.eval()
+    try:
+        results = asyncio.run(
+            evaluate_against_heuristics(
+                policy,
+                team=eval_team,
+                port=eval_port,
+                n_battles=config.eval_battles,
+            )
+        )
+    finally:
+        policy.act_obs = compiled_act_obs
+
+    config.eval_dir.mkdir(parents=True, exist_ok=True)
+    log_path = config.eval_dir / f"ep_{episode}_wr.log"
+    payload = {"episode": episode, "n_battles": config.eval_battles, "win_rates": results}
+    with open(log_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    for name, wr in results.items():
+        tb_writer.add_scalar(f"Eval/WinRate/{name}", wr, episode)
+
+    table = " | ".join(f"{name}: {wr:.2%}" for name, wr in results.items())
+    logging.info(f"Validation @ ep{episode} (vs heuristics): {table} -> {log_path}")
+    return results
+
+
 def main():
     showdown_procs = []
     vec_env = None
@@ -404,6 +451,9 @@ def main():
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 
+    # keep the uncompiled actor around so validation eval (batch size 1) can run
+    # eager instead of forcing a recompile of the reduce-overhead rollout graph
+    eager_act_obs = policy.act_obs
     if config.enable_optim and device.type == "cuda":
         logging.info("Compiling rollout actor for reduce-overhead...")
         import torch._dynamo as dynamo
@@ -444,8 +494,13 @@ def main():
             logging.error(f"Failed to build pokemon-showdown: {e}")
             raise e
 
+        # one showdown server per env thread, plus one dedicated server for
+        # validation eval (kept off the training ports to avoid collisions)
+        eval_port = 8000 + config.n_envs
+        n_servers = config.n_envs + 1
+
         # clean up other processes occupying the port
-        for i in range(config.n_envs):
+        for i in range(n_servers):
             port = 8000 + i
             try:
                 subprocess.run(
@@ -456,8 +511,7 @@ def main():
             except Exception:
                 pass
 
-        # one showdown server per thread
-        for i in range(config.n_envs):
+        for i in range(n_servers):
             port = 8000 + i
             proc = subprocess.Popen(
                 ["node", "pokemon-showdown", "start", "--no-security", "--skip-build", str(port)],
@@ -471,7 +525,7 @@ def main():
         # rather than a flat timeout
         start_time = time.time()
         timeout = 30.0  # auto fail if not listening in these many secs
-        pending_ports = [8000 + i for i in range(config.n_envs)]
+        pending_ports = [8000 + i for i in range(n_servers)]
         while pending_ports and (time.time() - start_time) < timeout:
             for port in list(pending_ports):
                 try:
@@ -522,6 +576,7 @@ def main():
 
         logging.info(f"Opponent pool: {pool}")
 
+        eval_team = load_team()
         from src.train.rollout import create_trajectory_buffers
 
         vec_env.reset()
@@ -597,13 +652,21 @@ def main():
                 snap_id = f"ep{episode + 1}"
                 added = pool.add(policy, snap_id)
                 if added:
-                    pool.save_state()
                     logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
                 else:
                     logging.info(
                         f"Snapshot '{snap_id}' not added to opponent pool "
                         f"(weakest member still above parity). Pool: {pool}"
                     )
+
+                # whenever a snapshot is promoted to the anchor pool, benchmark the
+                # latest policy against the fixed heuristics and log it to disk
+                if pool.maybe_promote() is not None:
+                    run_validation(
+                        policy, eager_act_obs, eval_team, config, eval_port, episode + 1, tb_writer
+                    )
+
+                pool.save_state()
 
             current_lr = optimizer.param_groups[0]["lr"]
             is_warmup = episode < config.warmup_episodes

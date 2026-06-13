@@ -56,6 +56,7 @@ def gather_files(project_root: Path, exclude_logs: bool) -> list[tuple[Path, str
             targets.append((training_log, "artifacts/training.log", training_log.stat().st_size))
 
         gather_directory_files(artifacts / "runs", project_root, targets)
+        gather_directory_files(artifacts / "eval", project_root, targets)
 
     return targets
 
