@@ -100,7 +100,7 @@ Launch the main reinforcement learning loop. The script automatically manages th
 uv run python p0/src/train/train_loop.py
 ```
 
-_Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Loss, etc.) are exported to TensorBoard. You can view them by running `tensorboard --logdir p0/runs/ppo_training/`._
+_Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Loss, etc.) are exported to TensorBoard. You can view them by running `tensorboard --logdir p0/artifacts/runs/ppo_training/`._
 
 ---
 
@@ -108,4 +108,4 @@ _Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Lo
 
 - **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
 - **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and `.ppoconfig` into a `tar.gz` archive. I use it for moving stuff between remote servers.
-- **`reset_pool.sh`**: Clears out the current `OpponentPool` (snapshots inside `checkpoints/pool/`) while retaining the foundational heuristic seed models. If you want to reset the training phase without redoing replay gen / behaviour cloning.
+- **`reset_pool.sh`**: Clears out the current `OpponentPool` (snapshots inside `artifacts/checkpoints/pool/`) while retaining the foundational heuristic seed models. If you want to reset the training phase without redoing replay gen / behaviour cloning.

@@ -86,7 +86,7 @@ class RLPlayer(Player):
 LOGGER = logging.getLogger(__name__)
 DEFAULT_BATTLE_FORMAT = "gen9championsvgc2026regma"
 DEFAULT_CHALLENGE_LIMIT = 1_000_000
-DEFAULT_CHECKPOINT_CANDIDATES = (Path("checkpoints/ppo_checkpoint.pt"),)
+DEFAULT_CHECKPOINT_CANDIDATES = (Path("artifacts/checkpoints/ppo_checkpoint.pt"),)
 
 
 def _env_flag(name: str, default: bool) -> bool:

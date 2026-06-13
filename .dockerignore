@@ -5,10 +5,7 @@ __pycache__
 *.pyo
 *.pyd
 .DS_Store
-runs/
-replays/
-models/
-training.log
+artifacts/
 .python-version
 .ppoconfig
 .ruff_cache/

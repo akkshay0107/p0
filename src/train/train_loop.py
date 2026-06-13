@@ -22,7 +22,7 @@ from src.model.structured_observation import (
     StructuredObservation,
     is_teampreview,
 )
-from src.train.config import PPOConfig, load_config
+from src.train.config import ARTIFACTS_DIR, PPOConfig, load_config
 from src.train.opponent_pool import OpponentPool
 from src.train.rollout import RolloutBuffer, build_partition, collect_rollouts
 from src.train.utils import (
@@ -48,10 +48,14 @@ shutdown_requested = False
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("training.log", mode="w"), logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.FileHandler(ARTIFACTS_DIR / "training.log", mode="w"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
 
@@ -494,7 +498,7 @@ def main():
         config.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         config.pool_dir.mkdir(parents=True, exist_ok=True)
 
-        tb_writer = SummaryWriter(log_dir="runs/ppo_training")
+        tb_writer = SummaryWriter(log_dir=str(config.runs_dir / "ppo_training"))
 
         start = load_checkpoint(config.checkpoint_path, policy, optimizer, scaler=scaler)
         if start is not None:
@@ -513,7 +517,7 @@ def main():
         pool = OpponentPool.load_or_create(config.pool_dir, config)
         if len(pool) == 0:
             logging.info("Opponent pool empty, seeding with current policy as ep0")
-            pool.add(policy, "ep0", 0.5)
+            pool.add(policy, "ep0")
             pool.save_state()
 
         logging.info(f"Opponent pool: {pool}")
@@ -536,9 +540,6 @@ def main():
                 state2[group_idx] = active_pool_policies[opponent_id].initial_state(
                     group_idx.numel()
                 )
-
-        # Smoothed agent-vs-pool win rate for snapshot admission.
-        pool_wr_ema = 0.5
 
         for episode in range(start, config.num_episodes):
             if shutdown_requested:
@@ -592,21 +593,16 @@ def main():
                 shutdown_requested,
             )
 
-            if pool_games > 0:
-                alpha = config.pool_win_rate_smoothing
-                pool_wr_ema = (1 - alpha) * pool_wr_ema + alpha * pool_wr
-
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
-                force_admit = (episode + 1) % config.pool_force_admit_every == 0
-                added = pool.add(policy, snap_id, pool_wr_ema, force=force_admit)
+                added = pool.add(policy, snap_id)
                 if added:
                     pool.save_state()
                     logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
                 else:
                     logging.info(
                         f"Snapshot '{snap_id}' not added to opponent pool "
-                        f"(win rate EMA: {pool_wr_ema:.4f}). Pool: {pool}"
+                        f"(weakest member still above parity). Pool: {pool}"
                     )
 
             current_lr = optimizer.param_groups[0]["lr"]

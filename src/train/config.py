@@ -1,6 +1,11 @@
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+# all runtime artifacts (checkpoints, pool, tensorboard runs, replays,
+# backups, logs) live under a single directory to keep the project root tidy.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+
 
 # unfortunately the config is not static
 # and is reused as a vessel to carry the changing
@@ -40,15 +45,18 @@ class PPOConfig:
     ramp_up_phase: float = 0.1  # frac of epochs spent in linear lr increase
     ramp_down_phase: float = 0.2  # frac of epochs spent in decaying entropy coef
 
-    pool_dir: Path = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "pool"
-    checkpoint_path: Path = (
-        Path(__file__).resolve().parent.parent.parent / "checkpoints" / "ppo_checkpoint.pt"
-    )
+    artifacts_dir: Path = ARTIFACTS_DIR
+    pool_dir: Path = ARTIFACTS_DIR / "checkpoints" / "pool"
+    checkpoint_path: Path = ARTIFACTS_DIR / "checkpoints" / "ppo_checkpoint.pt"
+    runs_dir: Path = ARTIFACTS_DIR / "runs"
+    replays_dir: Path = ARTIFACTS_DIR / "replays"
+    backups_dir: Path = ARTIFACTS_DIR / "backups"
+    log_path: Path = ARTIFACTS_DIR / "training.log"
     pool_size: int = 50
     snapshot_interval: int = 50
-    # admit a snapshot unconditionally every N episodes so pool diversity
-    # keeps growing even when the win-rate gate would reject it
-    pool_force_admit_every: int = 250
+    # promote the strongest snapshot to the permanent anchor pool once every
+    # this many rotating snapshots are admitted
+    pool_anchor_every: int = 5
     pool_win_rate_smoothing: float = 0.1
     pool_wr_floor: float = 0.1
 

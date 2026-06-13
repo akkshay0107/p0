@@ -24,6 +24,7 @@ from src.heuristic.heuristic import FuzzyHeuristic
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.team_picker import RandomTeamFromPool
+from src.train.config import PPOConfig
 
 
 def _modify_mask(action_mask: torch.Tensor, action1):
@@ -203,22 +204,23 @@ async def main():
     n = args.n
     shard_size = max(1, n // 8)
 
+    replays_dir = PPOConfig().replays_dir
     rec_players = {
         "fuzzy": StrategyRecordingPlayer(
             strategy_player=fuzzy_strat,
-            save_dir="./replays/fuzzy_heuristic",
+            save_dir=str(replays_dir / "fuzzy_heuristic"),
             shard_size=shard_size,
             **get_kwargs("RecFuzzy"),
         ),
         "sh": StrategyRecordingPlayer(
             strategy_player=sh_strat,
-            save_dir="./replays/simple_heuristic",
+            save_dir=str(replays_dir / "simple_heuristic"),
             shard_size=shard_size,
             **get_kwargs("RecSH"),
         ),
         "mbp": StrategyRecordingPlayer(
             strategy_player=mbp_strat,
-            save_dir="./replays/max_base_power",
+            save_dir=str(replays_dir / "max_base_power"),
             shard_size=shard_size,
             **get_kwargs("RecMBP"),
         ),

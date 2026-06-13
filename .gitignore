@@ -22,20 +22,13 @@ teams/.pastes
 !.python-version
 !.gitignore
 
-# Checkpoints
-models/
-checkpoints/
-ppo_best_checkpoint.pt
-
-# Replays
-replays/
-test_replays/
+# All runtime artifacts (checkpoints, pool, tensorboard runs, replays,
+# backups, training.log) live under a single dir
+artifacts/
 
 # Training related
-runs/
 *.log
 .ppoconfig
-backups/
 
 # Scratch dir for small experiments
 scratch/

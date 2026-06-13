@@ -9,5 +9,5 @@ batch_size=32
 chunk_size=16
 ppo_epochs=2
 snapshot_interval=20
-pool_force_admit_every=60
+pool_anchor_every=3
 warmup_episodes=1

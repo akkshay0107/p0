@@ -40,19 +40,22 @@ def gather_files(project_root: Path, exclude_logs: bool) -> list[tuple[Path, str
     if ppoconfig.exists():
         targets.append((ppoconfig, ".ppoconfig", ppoconfig.stat().st_size))
 
-    checkpoint = project_root / "checkpoints" / "ppo_checkpoint.pt"
+    artifacts = project_root / "artifacts"
+    checkpoint = artifacts / "checkpoints" / "ppo_checkpoint.pt"
     if checkpoint.exists():
-        targets.append((checkpoint, "checkpoints/ppo_checkpoint.pt", checkpoint.stat().st_size))
+        targets.append(
+            (checkpoint, "artifacts/checkpoints/ppo_checkpoint.pt", checkpoint.stat().st_size)
+        )
 
-    gather_directory_files(project_root / "checkpoints" / "pool", project_root, targets)
-    gather_directory_files(project_root / "backups", project_root, targets)
+    gather_directory_files(artifacts / "checkpoints" / "pool", project_root, targets)
+    gather_directory_files(artifacts / "backups", project_root, targets)
 
     if not exclude_logs:
-        training_log = project_root / "training.log"
+        training_log = artifacts / "training.log"
         if training_log.exists():
-            targets.append((training_log, "training.log", training_log.stat().st_size))
+            targets.append((training_log, "artifacts/training.log", training_log.stat().st_size))
 
-        gather_directory_files(project_root / "runs", project_root, targets)
+        gather_directory_files(artifacts / "runs", project_root, targets)
 
     return targets
 

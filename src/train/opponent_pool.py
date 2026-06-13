@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 from pathlib import Path
 from typing import Self
@@ -8,10 +9,17 @@ import torch
 from src.model.policy import PolicyNet
 from src.train.config import PPOConfig
 
+# new snapshots and seeds join the pool at parity (opponent-vs-agent win rate)
+INITIAL_WIN_RATE = 0.5
+
 
 # manager for past checkpoints of the model
 # past checkpoints used as opponents in a league manner
 # similar to alphastar (no specific exploiter agents though)
+#
+# the pool is split in two:
+#   - anchors: never evicted (the bc seeds plus periodically promoted snapshots)
+#   - rotating: ordinary snapshots that get evicted once the agent outgrows them
 class OpponentPool:
     def __init__(self, pool_dir: Path, config: PPOConfig):
         self.pool_dir = pool_dir
@@ -19,17 +27,26 @@ class OpponentPool:
         self.config = config
         self.opponent_ids: list[str] = []  # ordered list of opponents (first = oldest)
         self.win_rates: dict[str, float] = {}  # ema win rate for each of the policies in the pool
+        self.anchor_ids: list[str] = []  # never-evicted subset of opponent_ids
+        # rotating snapshots admitted since the last promotion; the best of every
+        # `pool_anchor_every` of them gets promoted into the anchor set
+        self.promotion_window: list[str] = []
 
     def __len__(self) -> int:
         return len(self.opponent_ids)
 
     def __repr__(self) -> str:
-        return f"OpponentPool(size={len(self)}/{self.config.pool_size}, ids={self.opponent_ids})"
+        return (
+            f"OpponentPool(size={len(self)}/{self.config.pool_size}, "
+            f"anchors={self.anchor_ids}, ids={self.opponent_ids})"
+        )
 
     def save_state(self) -> None:
         state = {
             "opponent_ids": self.opponent_ids,
             "win_rates": self.win_rates,
+            "anchor_ids": self.anchor_ids,
+            "promotion_window": self.promotion_window,
         }
         with open(self.pool_dir / "pool_state.json", "w") as f:
             json.dump(state, f, indent=2)
@@ -41,6 +58,8 @@ class OpponentPool:
                 state = json.load(f)
             self.opponent_ids = state.get("opponent_ids", [])
             self.win_rates = state.get("win_rates", {})
+            self.anchor_ids = state.get("anchor_ids", [])
+            self.promotion_window = state.get("promotion_window", [])
 
         # sync with pool directory (in case json got deleted)
         # sort by creation time to maintain order
@@ -52,11 +71,22 @@ class OpponentPool:
             if opponent_id not in self.opponent_ids:
                 self.opponent_ids.append(opponent_id)
                 if opponent_id not in self.win_rates:
-                    self.win_rates[opponent_id] = 0.5
+                    self.win_rates[opponent_id] = INITIAL_WIN_RATE
 
-        # remove entries that do not exist in pool dir anymore
+        # bc seeds are always anchors (migrates pools saved before anchoring existed)
+        for opponent_id in self.opponent_ids:
+            if opponent_id.startswith("seed") and opponent_id not in self.anchor_ids:
+                self.anchor_ids.append(opponent_id)
+
+        # drop entries that no longer exist on disk
         self.opponent_ids = [oid for oid in self.opponent_ids if oid in existing_ids]
         self.win_rates = {oid: wr for oid, wr in self.win_rates.items() if oid in existing_ids}
+        self.anchor_ids = [oid for oid in self.anchor_ids if oid in existing_ids]
+        self.promotion_window = [
+            oid
+            for oid in self.promotion_window
+            if oid in existing_ids and oid not in self.anchor_ids
+        ]
 
     @classmethod
     def load_or_create(cls, pool_dir: Path, config: PPOConfig) -> Self:
@@ -65,25 +95,33 @@ class OpponentPool:
         pool._load_state()
         return pool
 
-    def add(self, policy: PolicyNet, id: str, pool_wr: float, force: bool = False) -> bool:
-        if id in self.opponent_ids or (pool_wr < 0.5 and not force):
+    def _remove(self, opponent_id: str) -> None:
+        evict_path = self.pool_dir / f"{opponent_id}.pt"
+        if evict_path.exists():
+            evict_path.unlink()
+        self.opponent_ids.remove(opponent_id)
+        self.win_rates.pop(opponent_id, None)
+        if opponent_id in self.anchor_ids:
+            self.anchor_ids.remove(opponent_id)
+        if opponent_id in self.promotion_window:
+            self.promotion_window.remove(opponent_id)
+
+    def add(self, policy: PolicyNet, id: str, anchor: bool = False) -> bool:
+        if id in self.opponent_ids:
             return False
 
-        # evict lowest wr policy
-        # win_rates are opponent-vs-agent; a new snapshot joins at parity (0.5),
-        # so only evict an opponent that is weaker than parity
-        # (forced admissions always evict the weakest to keep diversity growing)
+        # when full, make room by evicting the weakest rotating (non-anchor) opponent.
+        # win_rates are opponent-vs-agent, so the lowest one is the snapshot the agent
+        # beats the most. a new snapshot joins at parity, so it only displaces an
+        # opponent the agent already outgrew (anchors bypass this gate).
         if len(self.opponent_ids) >= self.config.pool_size:
-            evict_id = min(self.opponent_ids, key=lambda opp_id: self.win_rates[opp_id])
-            if self.win_rates[evict_id] >= 0.5 and not force:
+            rotating = [oid for oid in self.opponent_ids if oid not in self.anchor_ids]
+            if not rotating:
                 return False
-
-            evict_path = self.pool_dir / f"{evict_id}.pt"
-            if evict_path.exists():
-                evict_path.unlink()
-
-            self.opponent_ids.remove(evict_id)
-            del self.win_rates[evict_id]
+            weakest = min(rotating, key=lambda oid: self.win_rates[oid])
+            if not anchor and self.win_rates[weakest] >= INITIAL_WIN_RATE:
+                return False
+            self._remove(weakest)
 
         save_path = self.pool_dir / f"{id}.pt"
         torch.save(
@@ -94,8 +132,34 @@ class OpponentPool:
         )
 
         self.opponent_ids.append(id)
-        self.win_rates[id] = 0.5
+        self.win_rates[id] = INITIAL_WIN_RATE
+        if anchor:
+            self.anchor_ids.append(id)
+        else:
+            self.promotion_window.append(id)
+            self._maybe_promote()
         return True
+
+    def _maybe_promote(self) -> None:
+        """Promote the strongest of every `pool_anchor_every` rotating snapshots
+        into the permanent anchor set."""
+        k = self.config.pool_anchor_every
+        if k <= 0 or len(self.promotion_window) < k:
+            return
+
+        candidates = [oid for oid in self.promotion_window if oid in self.win_rates]
+        self.promotion_window = []
+        if not candidates:
+            return
+
+        # highest opponent-vs-agent win rate == the snapshot that best withstands
+        # the current agent == most useful to keep around forever
+        best = max(candidates, key=lambda oid: self.win_rates[oid])
+        self.anchor_ids.append(best)
+        logging.info(
+            f"Promoted '{best}' to anchor pool (win rate {self.win_rates[best]:.3f}). "
+            f"Anchors: {self.anchor_ids}"
+        )
 
     def load_policy(self, opponent_id: str, device: str) -> PolicyNet:
         path = self.pool_dir / f"{opponent_id}.pt"
