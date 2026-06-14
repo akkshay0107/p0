@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import multiprocessing
 import os
 import random
 import signal
@@ -8,6 +9,8 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import Future, ProcessPoolExecutor
+from pathlib import Path
 from typing import Callable, cast
 
 import torch
@@ -17,7 +20,7 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
-from src.eval import evaluate_against_heuristics, load_team
+from src.eval import evaluate_checkpoint
 from src.lookups import ACT_SIZE, OBS_DIM
 from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
@@ -397,63 +400,82 @@ def ppo_update(
     }
 
 
-def run_validation(
-    policy: PolicyNet,
-    eager_act_obs: Callable,
-    eval_team,
-    config: PPOConfig,
-    eval_port: int,
-    episode: int,
-    tb_writer: SummaryWriter,
-) -> dict[str, float]:
-    """Benchmark the latest policy against the fixed heuristics and persist the
-    result as JSON to artifacts/eval/ep_<episode>_wr.log (loadable for metrics).
+class BackgroundEval:
+    """Runs heuristic validation in a separate CPU process so the GPU keeps
+    training while the (CPU-bound) Showdown battles play out.
 
-    Runs eager (swaps out the compiled reduce-overhead actor) to avoid a batch
-    size 1 recompile of the rollout graph.
+    Each promotion serializes the current policy to a throwaway checkpoint and
+    hands it to a single-worker process pool. Completed runs are drained back on
+    the main process, which owns the SummaryWriter, and persisted as JSON to
+    artifacts/eval/ep_<episode>_wr.log.
     """
-    compiled_act_obs = policy.act_obs
-    policy.act_obs = eager_act_obs
-    policy.eval()
-    try:
-        results = asyncio.run(
-            evaluate_against_heuristics(
-                policy,
-                team=eval_team,
-                port=eval_port,
-                n_battles=config.eval_battles,
-            )
+
+    def __init__(self, config: PPOConfig, eval_port: int, tb_writer: SummaryWriter):
+        self.config = config
+        self.eval_port = eval_port
+        self.tb_writer = tb_writer
+        # spawn (not fork) so the child never inherits the parent's CUDA context
+        ctx = multiprocessing.get_context("spawn")
+        self.executor = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+        self.pending: dict[Future, tuple[int, Path]] = {}
+
+    def submit(self, policy: PolicyNet, episode: int) -> None:
+        self.config.eval_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = self.config.eval_dir / f"validation_ep{episode}.pt"
+        torch.save({"model_state_dict": policy.state_dict()}, ckpt_path)
+        future = self.executor.submit(
+            evaluate_checkpoint,
+            str(ckpt_path),
+            port=self.eval_port,
+            n_battles=self.config.eval_battles,
         )
-    finally:
-        policy.act_obs = compiled_act_obs
+        self.pending[future] = (episode, ckpt_path)
 
-    config.eval_dir.mkdir(parents=True, exist_ok=True)
-    log_path = config.eval_dir / f"ep_{episode}_wr.log"
-    payload = {"episode": episode, "n_battles": config.eval_battles, "win_rates": results}
-    with open(log_path, "w") as f:
-        json.dump(payload, f, indent=2)
+    def drain(self) -> None:
+        """Record any finished evals. Non-blocking: skips runs still in flight."""
+        for future in [f for f in self.pending if f.done()]:
+            self._collect(future)
 
-    for name, wr in results.items():
-        tb_writer.add_scalar(f"Eval/WinRate/{name}", wr, episode)
+    def shutdown(self) -> None:
+        """Drain finished runs and stop the pool without waiting on in-flight evals."""
+        self.drain()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        for episode, ckpt_path in self.pending.values():
+            ckpt_path.unlink(missing_ok=True)
+        self.pending.clear()
 
-    table = " | ".join(f"{name}: {wr:.2%}" for name, wr in results.items())
-    logging.info(f"Validation @ ep{episode} (vs heuristics): {table} -> {log_path}")
-    return results
+    def _collect(self, future: Future) -> None:
+        episode, ckpt_path = self.pending.pop(future)
+        ckpt_path.unlink(missing_ok=True)
+        try:
+            results = future.result()
+        except Exception as e:
+            logging.error(f"Background validation @ ep{episode} failed: {e}")
+            return
+
+        log_path = self.config.eval_dir / f"ep_{episode}_wr.log"
+        payload = {"episode": episode, "n_battles": self.config.eval_battles, "win_rates": results}
+        with open(log_path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+        for name, wr in results.items():
+            self.tb_writer.add_scalar(f"Eval/WinRate/{name}", wr, episode)
+
+        table = " | ".join(f"{name}: {wr:.2%}" for name, wr in results.items())
+        logging.info(f"Validation @ ep{episode}: {table} -> {log_path}")
 
 
 def main():
     showdown_procs = []
     vec_env = None
     tb_writer = None
+    bg_eval = None
 
     config = load_config()
     device = default_device()
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 
-    # keep the uncompiled actor around so validation eval (batch size 1) can run
-    # eager instead of forcing a recompile of the reduce-overhead rollout graph
-    eager_act_obs = policy.act_obs
     if config.enable_optim and device.type == "cuda":
         logging.info("Compiling rollout actor for reduce-overhead...")
         import torch._dynamo as dynamo
@@ -553,6 +575,7 @@ def main():
         config.pool_dir.mkdir(parents=True, exist_ok=True)
 
         tb_writer = SummaryWriter(log_dir=str(config.runs_dir / "ppo_training"))
+        bg_eval = BackgroundEval(config, eval_port, tb_writer)
 
         start = load_checkpoint(config.checkpoint_path, policy, optimizer, scaler=scaler)
         if start is not None:
@@ -569,19 +592,20 @@ def main():
             start = 0
 
         pool = OpponentPool.load_or_create(config.pool_dir, config)
-        if len(pool) == 0:
+        if len(pool) == 0 or pool.shadow_id is None:
             logging.info("Opponent pool empty, seeding with current policy as ep0")
+            pool.set_shadow(policy)
             pool.add(policy, "ep0")
             pool.save_state()
 
         logging.info(f"Opponent pool: {pool}")
 
-        eval_team = load_team()
         from src.train.rollout import create_trajectory_buffers
 
         vec_env.reset()
         state1 = policy.initial_state(config.n_envs)
         state2 = policy.initial_state(config.n_envs)
+
         trajectories1 = create_trajectory_buffers(config.n_envs)
         trajectories2 = create_trajectory_buffers(config.n_envs)
         active_pool_policies = {}
@@ -633,6 +657,34 @@ def main():
                 logging.warning("No trajectories collected, skipping update")
                 continue
 
+            if pool.reference_batch is None:
+                all_obs_list = [ep["obs"] for ep in buffer.trajectories]
+                all_masks_list = [ep["action_masks"] for ep in buffer.trajectories]
+
+                flat_obs = StructuredObservation.cat(all_obs_list, dim=0)
+                flat_masks = torch.cat(all_masks_list, dim=0)
+
+                total_steps = flat_masks.size(0)
+                ref_size = min(64, total_steps)
+                indices = torch.randperm(total_steps)[:ref_size]
+
+                ref_dict = {
+                    "token_type_ids": flat_obs.token_type_ids[indices].clone(),
+                    "side_ids": flat_obs.side_ids[indices].clone(),
+                    "slot_ids": flat_obs.slot_ids[indices].clone(),
+                    "categorical": flat_obs.categorical[indices].clone(),
+                    "numerical": flat_obs.numerical[indices].clone(),
+                    "events_cat": flat_obs.events_cat[indices].clone(),
+                    "events_num": flat_obs.events_num[indices].clone(),
+                    "events_side_ids": flat_obs.events_side_ids[indices].clone(),
+                    "events_slot_ids": flat_obs.events_slot_ids[indices].clone(),
+                    "action_masks": flat_masks[indices].clone(),
+                }
+                pool.set_reference_batch(ref_dict)
+                logging.info(
+                    f"Captured new reference batch of {ref_size} random steps from trajectories"
+                )
+
             num_trajectories = len(buffer.trajectories)
             avg_traj_length = sum(ep["length"] for ep in buffer.trajectories) / num_trajectories
             avg_traj_time = rollout_time / num_trajectories
@@ -650,23 +702,25 @@ def main():
 
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
+                pool.update_shadow(policy)
                 added = pool.add(policy, snap_id)
                 if added:
                     logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
                 else:
                     logging.info(
                         f"Snapshot '{snap_id}' not added to opponent pool "
-                        f"(weakest member still above parity). Pool: {pool}"
+                        f"(id already exists). Pool: {pool}"
                     )
 
                 # whenever a snapshot is promoted to the anchor pool, benchmark the
-                # latest policy against the fixed heuristics and log it to disk
+                # latest policy against the fixed heuristics off the training loop
                 if pool.maybe_promote() is not None:
-                    run_validation(
-                        policy, eager_act_obs, eval_team, config, eval_port, episode + 1, tb_writer
-                    )
+                    bg_eval.submit(policy, episode + 1)
 
                 pool.save_state()
+
+            # log any background validations that finished since last episode
+            bg_eval.drain()
 
             current_lr = optimizer.param_groups[0]["lr"]
             is_warmup = episode < config.warmup_episodes
@@ -720,6 +774,8 @@ def main():
                 logging.info("Checkpoint saved.")
 
     finally:
+        if bg_eval is not None:
+            bg_eval.shutdown()
         if vec_env is not None:
             vec_env.shutdown()
         if tb_writer is not None:
@@ -729,6 +785,12 @@ def main():
             for env in vec_env.envs:
                 try:
                     env.close()
+                    asyncio.run_coroutine_threadsafe(
+                        env.agent1.ps_client.stop_listening(), env.agent1.ps_client.loop
+                    ).result(timeout=2.0)
+                    asyncio.run_coroutine_threadsafe(
+                        env.agent2.ps_client.stop_listening(), env.agent2.ps_client.loop
+                    ).result(timeout=2.0)
                 except Exception:
                     pass
 

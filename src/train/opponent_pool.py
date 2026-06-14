@@ -1,175 +1,84 @@
 import json
 import logging
-import random
 from pathlib import Path
 from typing import Self
 
 import torch
 
 from src.model.policy import PolicyNet
+from src.model.structured_observation import StructuredObservation
 from src.train.config import PPOConfig
 
-# new snapshots and seeds join the pool at parity (opponent-vs-agent win rate)
-INITIAL_WIN_RATE = 0.5
+INIT_WR = 0.5
+SHADOW_ID = "shadow"
+alpha_shadow = 0.99  # ema decay rate of the shadow model
 
 
-# manager for past checkpoints of the model
-# past checkpoints used as opponents in a league manner
-# similar to alphastar (no specific exploiter agents though)
-#
-# the pool is split in two:
-#   - anchors: never evicted (the bc seeds plus periodically promoted snapshots)
-#   - rotating: ordinary snapshots that get evicted once the agent outgrows them
+def _js_divergence(p: torch.Tensor, q: torch.Tensor) -> float:
+    """Computes the Jensen-Shannon divergence between two batched probability distributions.
+    Expects p and q to be valid distributions that sum to 1 over their last dimension."""
+    m = 0.5 * (p + q)
+    safe_m = m.clamp_min(1e-12)
+
+    kl_p = torch.sum(torch.where(p > 0, p * torch.log2(p / safe_m), 0.0), dim=-1)
+    kl_q = torch.sum(torch.where(q > 0, q * torch.log2(q / safe_m), 0.0), dim=-1)
+
+    return (0.5 * kl_p + 0.5 * kl_q).mean().item()
+
+
 class OpponentPool:
     def __init__(self, pool_dir: Path, config: PPOConfig):
         self.pool_dir = pool_dir
         self.pool_dir.mkdir(parents=True, exist_ok=True)
         self.config = config
-        self.opponent_ids: list[str] = []  # ordered list of opponents (first = oldest)
-        self.win_rates: dict[str, float] = {}  # ema win rate for each of the policies in the pool
-        self.anchor_ids: list[str] = []  # never-evicted subset of opponent_ids
-        # rotating snapshots admitted since the last promotion; the best of every
-        # `pool_anchor_every` of them gets promoted into the anchor set
-        self.promotion_window: list[str] = []
+        self.shadow_id: str | None = None
+        self.anchor_ids: list[str] = []
+        self.regular_ids: list[str] = []
+        self.win_rates: dict[str, float] = {}
+        self.snapshots_since_anchor = 0
+        self.signatures: dict[str, torch.Tensor] = {}
+        self.reference_batch: dict[str, torch.Tensor] | None = None
 
     def __len__(self) -> int:
-        return len(self.opponent_ids)
+        return len(self.active_ids())
 
     def __repr__(self) -> str:
         return (
             f"OpponentPool(size={len(self)}/{self.config.pool_size}, "
-            f"anchors={self.anchor_ids}, ids={self.opponent_ids})"
+            f"shadow={self.shadow_id}, anchors={self.anchor_ids}, regular={self.regular_ids})"
         )
 
-    def save_state(self) -> None:
-        state = {
-            "opponent_ids": self.opponent_ids,
-            "win_rates": self.win_rates,
-            "anchor_ids": self.anchor_ids,
-            "promotion_window": self.promotion_window,
-        }
-        with open(self.pool_dir / "pool_state.json", "w") as f:
-            json.dump(state, f, indent=2)
+    @property
+    def opponent_ids(self) -> list[str]:
+        return self.active_ids()
 
-    def _load_state(self) -> None:
-        path = self.pool_dir / "pool_state.json"
-        if path.exists():
-            with open(path) as f:
-                state = json.load(f)
-            self.opponent_ids = state.get("opponent_ids", [])
-            self.win_rates = state.get("win_rates", {})
-            self.anchor_ids = state.get("anchor_ids", [])
-            self.promotion_window = state.get("promotion_window", [])
+    def active_ids(self) -> list[str]:
+        ids: list[str] = []
+        if self.shadow_id is not None:
+            ids.append(self.shadow_id)
+        ids.extend(self.anchor_ids)
+        ids.extend(self.regular_ids)
+        return ids
 
-        # sync with pool directory (in case json got deleted)
-        # sort by creation time to maintain order
-        existing_files = sorted(self.pool_dir.glob("*.pt"), key=lambda p: p.stat().st_ctime)
-        existing_ids = {pt.stem for pt in existing_files}
+    def contains(self, opponent_id: str) -> bool:
+        return opponent_id in self.active_ids()
 
-        for pt_file in existing_files:
-            opponent_id = pt_file.stem
-            if opponent_id not in self.opponent_ids:
-                self.opponent_ids.append(opponent_id)
-                if opponent_id not in self.win_rates:
-                    self.win_rates[opponent_id] = INITIAL_WIN_RATE
+    def sample_many(self, count: int) -> list[str]:
+        """Sample opponent IDs across shadow, anchors, and regulars without replacement."""
+        if count <= 0:
+            raise ValueError("Opponent count must be greater than zero.")
 
-        # bc seeds are always anchors (migrates pools saved before anchoring existed)
-        for opponent_id in self.opponent_ids:
-            if opponent_id.startswith("seed") and opponent_id not in self.anchor_ids:
-                self.anchor_ids.append(opponent_id)
+        roster = self.active_ids()
+        if not roster:
+            raise RuntimeError("OpponentPool is empty. Add an opponent before sampling.")
 
-        # drop entries that no longer exist on disk
-        self.opponent_ids = [oid for oid in self.opponent_ids if oid in existing_ids]
-        self.win_rates = {oid: wr for oid, wr in self.win_rates.items() if oid in existing_ids}
-        self.anchor_ids = [oid for oid in self.anchor_ids if oid in existing_ids]
-        self.promotion_window = [
-            oid
-            for oid in self.promotion_window
-            if oid in existing_ids and oid not in self.anchor_ids
-        ]
-
-    @classmethod
-    def load_or_create(cls, pool_dir: Path, config: PPOConfig) -> Self:
-        """Load an existing pool from disk, or create an empty one."""
-        pool = cls(pool_dir, config)
-        pool._load_state()
-        return pool
-
-    def _remove(self, opponent_id: str) -> None:
-        evict_path = self.pool_dir / f"{opponent_id}.pt"
-        if evict_path.exists():
-            evict_path.unlink()
-        self.opponent_ids.remove(opponent_id)
-        self.win_rates.pop(opponent_id, None)
-        if opponent_id in self.anchor_ids:
-            self.anchor_ids.remove(opponent_id)
-        if opponent_id in self.promotion_window:
-            self.promotion_window.remove(opponent_id)
-
-    def add(self, policy: PolicyNet, id: str, anchor: bool = False) -> bool:
-        if id in self.opponent_ids:
-            return False
-
-        # when full, make room by evicting the weakest rotating (non-anchor) opponent.
-        # win_rates are opponent-vs-agent, so the lowest one is the snapshot the agent
-        # beats the most. a new snapshot joins at parity, so it only displaces an
-        # opponent the agent already outgrew (anchors bypass this gate).
-        if len(self.opponent_ids) >= self.config.pool_size:
-            rotating = [oid for oid in self.opponent_ids if oid not in self.anchor_ids]
-            if not rotating:
-                return False
-            weakest = min(rotating, key=lambda oid: self.win_rates[oid])
-            if not anchor and self.win_rates[weakest] >= INITIAL_WIN_RATE:
-                return False
-            self._remove(weakest)
-
-        save_path = self.pool_dir / f"{id}.pt"
-        torch.save(
-            {
-                "model_state_dict": policy.state_dict(),
-            },
-            save_path,
+        count = min(count, len(roster))
+        weights = torch.tensor(
+            [self._pfsp_weight(opponent_id) for opponent_id in roster],
+            dtype=torch.float32,
         )
-
-        self.opponent_ids.append(id)
-        self.win_rates[id] = INITIAL_WIN_RATE
-        if anchor:
-            self.anchor_ids.append(id)
-        else:
-            self.promotion_window.append(id)
-        return True
-
-    def maybe_promote(self) -> str | None:
-        """Promote the strongest of every `pool_anchor_every` rotating snapshots
-        into the permanent anchor set. Returns the promoted id, or None."""
-        k = self.config.pool_anchor_every
-        if k <= 0 or len(self.promotion_window) < k:
-            return None
-
-        candidates = [oid for oid in self.promotion_window if oid in self.win_rates]
-        self.promotion_window = []
-        if not candidates:
-            return None
-
-        # promote the snapshot the agent struggles most against (highest
-        # opponent-vs-agent win rate) == the strongest of the window
-        best = max(candidates, key=lambda oid: self.win_rates[oid])
-        self.anchor_ids.append(best)
-        logging.info(
-            f"Promoted '{best}' to anchor pool "
-            f"(win rate {self.win_rates[best]:.3f}). Anchors: {self.anchor_ids}"
-        )
-        return best
-
-    def load_policy(self, opponent_id: str, device: str) -> PolicyNet:
-        path = self.pool_dir / f"{opponent_id}.pt"
-        if not path.exists():
-            raise FileNotFoundError(f"Checkpoint for opponent '{opponent_id}' not found at {path}")
-
-        checkpoint = torch.load(path, weights_only=True, map_location=device)
-        net = PolicyNet()
-        net.load_state_dict(checkpoint["model_state_dict"])
-        return net.to(device).eval()
+        indices = torch.multinomial(weights, count, replacement=False)
+        return [roster[index] for index in indices.tolist()]
 
     def update_win_rate(self, opponent_id: str, agent_wins: int, num_games: int = 1) -> None:
         if opponent_id not in self.win_rates:
@@ -182,31 +91,263 @@ class OpponentPool:
         alpha = self.config.pool_win_rate_smoothing
         self.win_rates[opponent_id] = (1 - alpha) * curr_wr + alpha * observed_wr
 
-    def _pfsp_weight(self, opponent_id: str) -> float:
-        # competitive weighting: starves both too good and too bad agents
-        wr = self.win_rates[opponent_id]
-        return max(self.config.pool_wr_floor, wr * (1.0 - wr))
+    def load_policy(self, opponent_id: str, device: str) -> PolicyNet:
+        path = self._checkpoint_path(opponent_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint for opponent '{opponent_id}' not found at {path}")
 
-    def sample(self, device: str) -> tuple[PolicyNet, str]:
-        """Returns a frozen policy (loaded to device) from the pool sampled with PFSP weights."""
-        if not self.opponent_ids:
-            raise RuntimeError("OpponentPool is empty. Call pool.add() before pool.sample().")
+        checkpoint = torch.load(path, weights_only=True, map_location=device)
+        net = PolicyNet()
+        net.load_state_dict(checkpoint["model_state_dict"])
+        return net.to(device).eval()
 
-        weights = [self._pfsp_weight(oid) for oid in self.opponent_ids]
-        (opponent_id,) = random.choices(self.opponent_ids, weights=weights, k=1)
-        return self.load_policy(opponent_id, device), opponent_id
+    def add_anchor(self, policy: PolicyNet, id: str) -> bool:
+        if self.contains(id):
+            return False
+        self._register_opponent(id, policy, "anchor")
+        return True
 
-    def sample_many(self, count: int) -> list[str]:
-        """Sample opponent IDs without replacement using PFSP weights."""
-        if count <= 0:
-            raise ValueError("Opponent count must be greater than zero.")
-        if not self.opponent_ids:
-            raise RuntimeError("OpponentPool is empty. Call pool.add() before pool.sample_many().")
+    def add(self, policy: PolicyNet, id: str) -> bool:
+        """Add the latest snapshot to the regular pool, evicting the weakest regular."""
+        if self.contains(id):
+            return False
 
-        count = min(count, len(self.opponent_ids))
-        weights = torch.tensor(
-            [self._pfsp_weight(opponent_id) for opponent_id in self.opponent_ids],
-            dtype=torch.float32,
+        while len(self.regular_ids) >= self._regular_capacity():
+            weakest = min(self.regular_ids, key=lambda oid: self.win_rates.get(oid, INIT_WR))
+            self._deregister_opponent(weakest)
+
+        self._register_opponent(id, policy, "regular")
+        self.snapshots_since_anchor += 1
+        return True
+
+    def maybe_promote(self) -> str | None:
+        self._drop_outgrown_anchors()
+
+        k = self.config.pool_anchor_every
+        if k <= 0 or self.snapshots_since_anchor < k or not self.regular_ids:
+            return None
+
+        self.snapshots_since_anchor = 0
+        best_wr = max(self.win_rates.get(oid, INIT_WR) for oid in self.regular_ids)
+        candidates = [
+            oid for oid in self.regular_ids if self.win_rates.get(oid, INIT_WR) >= best_wr - 0.1
+        ]
+
+        best = max(
+            candidates,
+            key=lambda oid: (self._min_anchor_distance(oid), self.win_rates.get(oid, INIT_WR)),
         )
-        indices = torch.multinomial(weights, count, replacement=False)
-        return [self.opponent_ids[index] for index in indices.tolist()]
+        self.regular_ids.remove(best)
+        self.anchor_ids.append(best)
+
+        logging.info(
+            f"Promoted '{best}' to anchor pool "
+            f"(win rate {self.win_rates.get(best, INIT_WR):.3f}, "
+            f"diversity dist {self._min_anchor_distance(best):.4f}). Anchors: {self.anchor_ids}"
+        )
+        return best
+
+    def set_shadow(self, policy: PolicyNet) -> None:
+        self._register_opponent(SHADOW_ID, policy, "shadow")
+
+    def update_shadow(self, policy: PolicyNet) -> None:
+        if self.shadow_id is None:
+            self.set_shadow(policy)
+            return
+
+        path = self._checkpoint_path(self.shadow_id)
+        checkpoint = torch.load(path, weights_only=True, map_location="cpu")
+        shadow_state = checkpoint["model_state_dict"]
+        policy_state = policy.state_dict()
+        for key, shadow_value in shadow_state.items():
+            policy_value = policy_state[key].detach().cpu()
+            if torch.is_floating_point(shadow_value):
+                shadow_value *= alpha_shadow
+                shadow_value += (1 - alpha_shadow) * policy_value
+            else:
+                shadow_state[key] = policy_value
+        torch.save({"model_state_dict": shadow_state}, path)
+        self.signatures.pop(self.shadow_id, None)
+
+    def _regular_capacity(self) -> int:
+        reserved = len(self.anchor_ids) + int(self.shadow_id is not None)
+        return max(1, self.config.pool_size - reserved)
+
+    def _drop_outgrown_anchors(self) -> None:
+        threshold = self.config.pool_anchor_drop_wr
+        outgrown = [oid for oid in self.anchor_ids if self.win_rates.get(oid, INIT_WR) < threshold]
+        for oid in outgrown:
+            wr = self.win_rates.get(oid, INIT_WR)
+            self._deregister_opponent(oid)
+            logging.info(
+                f"Dropped outgrown anchor '{oid}' (win rate {wr:.3f} < {threshold}). "
+                f"Anchors: {self.anchor_ids}"
+            )
+
+    def _pfsp_weight(self, opponent_id: str) -> float:
+        # mix of competitive weighting + preferential hard weighting
+        wr = max(self.config.pool_wr_floor, self.win_rates[opponent_id])
+        return wr * (1 - wr) + 0.3 * wr
+
+    def set_reference_batch(self, batch: dict[str, torch.Tensor]) -> None:
+        self.reference_batch = {k: v.cpu() for k, v in batch.items()}
+        torch.save(self.reference_batch, self.pool_dir / "reference_batch.pt")
+
+        for oid in self.active_ids():
+            if oid == self.shadow_id:
+                continue
+            if oid not in self.signatures:
+                try:
+                    policy = self.load_policy(oid, "cpu")
+                    sig = self._compute_signature(policy)
+                    if sig is not None:
+                        self.signatures[oid] = sig
+                except Exception as e:
+                    logging.warning(f"Failed to backfill signature for {oid}: {e}")
+
+        self.save_state()
+
+    def load_reference_batch(self) -> None:
+        path = self.pool_dir / "reference_batch.pt"
+        if path.exists():
+            self.reference_batch = torch.load(path, weights_only=True, map_location="cpu")
+
+    def _compute_signature(self, policy: PolicyNet) -> torch.Tensor | None:
+        if self.reference_batch is None:
+            return None
+        device = policy.device
+        obs_tensors = {
+            k: v.to(device)
+            for k, v in self.reference_batch.items()
+            if k not in ("action_masks", "states")
+        }
+
+        # the hidden state does matter when it comes to decision
+        # making, and there is the slight chance that when you do
+        # end up replacing the actual hidden state, it might have
+        # wildly different responses, but calculating the actual history
+        # for each of these policies would be time consuming, so this is
+        # a cheap approximation
+        obs = StructuredObservation(**obs_tensors)
+        mask = self.reference_batch["action_masks"].to(device)
+        B = mask.size(0)
+        state = policy.initial_state(B)
+        dummy_actions = torch.zeros((B, 2), dtype=torch.long, device=device)
+
+        with torch.inference_mode():
+            out = policy.evaluate_obs(obs, mask, dummy_actions, state)
+
+        sig = out.logits.softmax(dim=-1).cpu()
+        return sig  # (B, 2, ACT_SIZE)
+
+    def _min_anchor_distance(self, oid: str) -> float:
+        if not self.anchor_ids or oid not in self.signatures:
+            return 0.0
+
+        sig_c = self.signatures[oid]
+        min_d = float("inf")
+        for a in self.anchor_ids:
+            if a in self.signatures:
+                min_d = min(min_d, _js_divergence(sig_c, self.signatures[a]))
+
+        return min_d if min_d != float("inf") else 0.0
+
+    def _checkpoint_path(self, opponent_id: str) -> Path:
+        return self.pool_dir / f"{opponent_id}.pt"
+
+    def _register_opponent(self, opponent_id: str, policy: PolicyNet, role: str) -> None:
+        """Saves the policy to disk, computes its signature, and tracks its state."""
+        torch.save({"model_state_dict": policy.state_dict()}, self._checkpoint_path(opponent_id))
+
+        if role != "shadow":
+            sig = self._compute_signature(policy)
+            if sig is not None:
+                self.signatures[opponent_id] = sig
+
+        if role == "anchor":
+            self.anchor_ids.append(opponent_id)
+        elif role == "regular":
+            self.regular_ids.append(opponent_id)
+        elif role == "shadow":
+            self.shadow_id = opponent_id
+        else:
+            raise ValueError(f"Unknown role: {role}")
+
+        self.win_rates.setdefault(opponent_id, INIT_WR)
+
+    def _deregister_opponent(self, opponent_id: str) -> None:
+        """Removes an opponent from disk and all tracking structures."""
+        self._checkpoint_path(opponent_id).unlink(missing_ok=True)
+        self.win_rates.pop(opponent_id, None)
+        self.signatures.pop(opponent_id, None)
+
+        if opponent_id in self.regular_ids:
+            self.regular_ids.remove(opponent_id)
+        elif opponent_id in self.anchor_ids:
+            self.anchor_ids.remove(opponent_id)
+        elif self.shadow_id == opponent_id:
+            self.shadow_id = None
+
+    def save_state(self) -> None:
+        state = {
+            "shadow_id": self.shadow_id,
+            "anchor_ids": self.anchor_ids,
+            "regular_ids": self.regular_ids,
+            "win_rates": self.win_rates,
+            "snapshots_since_anchor": self.snapshots_since_anchor,
+        }
+        with open(self.pool_dir / "pool_state.json", "w") as f:
+            json.dump(state, f, indent=2)
+        torch.save(self.signatures, self.pool_dir / "pool_signatures.pt")
+
+    def _load_state(self) -> None:
+        path = self.pool_dir / "pool_state.json"
+        if path.exists():
+            with open(path) as f:
+                state = json.load(f)
+            self.shadow_id = state.get("shadow_id")
+            self.anchor_ids = state.get("anchor_ids", [])
+            self.regular_ids = state.get("regular_ids", [])
+            self.win_rates = state.get("win_rates", {})
+            self.snapshots_since_anchor = state.get("snapshots_since_anchor", 0)
+        else:
+            self._load_from_checkpoints()
+
+        self.load_reference_batch()
+        path_sig = self.pool_dir / "pool_signatures.pt"
+        if path_sig.exists():
+            self.signatures = torch.load(path_sig, weights_only=True, map_location="cpu")
+
+        self._prune_missing_files()
+
+    def _load_from_checkpoints(self) -> None:
+        existing_files = sorted(self.pool_dir.glob("*.pt"), key=lambda p: p.stat().st_ctime)
+        for pt_file in existing_files:
+            opponent_id = pt_file.stem
+            if opponent_id == SHADOW_ID:
+                self.shadow_id = SHADOW_ID
+            elif opponent_id.startswith("seed"):
+                self.anchor_ids.append(opponent_id)
+            else:
+                self.regular_ids.append(opponent_id)
+            self.win_rates.setdefault(opponent_id, INIT_WR)
+
+    def _prune_missing_files(self) -> None:
+        existing_ids = {pt.stem for pt in self.pool_dir.glob("*.pt")}
+        if self.shadow_id not in existing_ids:
+            self.shadow_id = None
+        self.anchor_ids = [oid for oid in self.anchor_ids if oid in existing_ids]
+        self.regular_ids = [oid for oid in self.regular_ids if oid in existing_ids]
+        self.win_rates = {oid: wr for oid, wr in self.win_rates.items() if oid in self.active_ids()}
+        self.signatures = {
+            oid: sig for oid, sig in self.signatures.items() if oid in self.active_ids()
+        }
+        for opponent_id in self.active_ids():
+            self.win_rates.setdefault(opponent_id, INIT_WR)
+
+    @classmethod
+    def load_or_create(cls, pool_dir: Path, config: PPOConfig) -> Self:
+        """Load an existing pool from disk, or create an empty one."""
+        pool = cls(pool_dir, config)
+        pool._load_state()
+        return pool

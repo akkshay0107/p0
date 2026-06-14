@@ -40,13 +40,13 @@ def main():
     print("=" * 60)
 
     # 1. Max Base Power
-    if "seed_max_base_power" not in pool.opponent_ids:
+    if not pool.contains("seed_max_base_power"):
         print("--- Training seed_max_base_power ---")
         ds_mbp = _get_dataset(replays_base, "max_base_power")
         if ds_mbp:
             policy = train_behavior_cloning(ds_mbp, **bc_kwargs)
             if policy:
-                pool.add(policy, "seed_max_base_power", anchor=True)
+                pool.add_anchor(policy, "seed_max_base_power")
                 added_seeds.append("seed_max_base_power")
                 shutil.copy(
                     config.pool_dir / "seed_max_base_power.pt",
@@ -56,13 +56,13 @@ def main():
         print("seed_max_base_power already exists.")
 
     # 2. Simple Heuristic
-    if "seed_simple_heuristic" not in pool.opponent_ids:
+    if not pool.contains("seed_simple_heuristic"):
         print("--- Training seed_simple_heuristic ---")
         ds_sh = _get_dataset(replays_base, "simple_heuristic")
         if ds_sh:
             policy = train_behavior_cloning(ds_sh, **bc_kwargs)
             if policy:
-                pool.add(policy, "seed_simple_heuristic", anchor=True)
+                pool.add_anchor(policy, "seed_simple_heuristic")
                 added_seeds.append("seed_simple_heuristic")
                 shutil.copy(
                     config.pool_dir / "seed_simple_heuristic.pt",
@@ -72,13 +72,14 @@ def main():
         print("seed_simple_heuristic already exists.")
 
     # 3. Fuzzy Heuristic
-    if "seed_fuzzy_heuristic" not in pool.opponent_ids:
+    if not pool.contains("seed_fuzzy_heuristic"):
         print("--- Training seed_fuzzy_heuristic ---")
         ds_fuzzy = _get_dataset(replays_base, "fuzzy_heuristic")
         if ds_fuzzy:
             policy = train_behavior_cloning(ds_fuzzy, **bc_kwargs)
             if policy:
-                pool.add(policy, "seed_fuzzy_heuristic", anchor=True)
+                pool.add_anchor(policy, "seed_fuzzy_heuristic")
+                pool.set_shadow(policy)
                 added_seeds.append("seed_fuzzy_heuristic")
                 shutil.copy(
                     config.pool_dir / "seed_fuzzy_heuristic.pt",

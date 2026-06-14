@@ -54,7 +54,7 @@ async def evaluate_against_heuristics(
     """Play `policy` against each of the fixed heuristics for `n_battles` games
     on the showdown server at `port`.
 
-    Returns per-opponent win rates plus a "mean" aggregate, all in [0, 1].
+    Returns per-opponent win rates, all in [0, 1].
 
     `log_level` is forwarded to the players to silence poke_env's per-message
     websocket logging (which otherwise floods the root logger at INFO).
@@ -88,7 +88,6 @@ async def evaluate_against_heuristics(
     finally:
         await rl_player.ps_client.stop_listening()
 
-    results["mean"] = sum(results[name] for name in HEURISTIC_OPPONENTS) / len(HEURISTIC_OPPONENTS)
     return results
 
 
@@ -116,4 +115,34 @@ def run_evaluation(
             max_concurrent_battles=max_concurrent_battles,
             log_level=log_level,
         )
+    )
+
+
+def evaluate_checkpoint(
+    checkpoint_path: str,
+    *,
+    port: int,
+    n_battles: int,
+    teams_dir: Path | str | None = None,
+    battle_format: str = DEFAULT_BATTLE_FORMAT,
+) -> dict[str, float]:
+    """Load a policy checkpoint onto CPU and benchmark it against the heuristics.
+
+    Built to run in a separate process so this CPU-bound eval overlaps GPU
+    training. Returns per-opponent win rates in [0, 1].
+    """
+    import torch
+
+    from src.lookups import ACT_SIZE, OBS_DIM
+
+    policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE)
+    checkpoint = torch.load(checkpoint_path, weights_only=True, map_location="cpu")
+    policy.load_state_dict(checkpoint["model_state_dict"])
+    policy.eval()
+    return run_evaluation(
+        policy,
+        port=port,
+        n_battles=n_battles,
+        teams_dir=teams_dir,
+        battle_format=battle_format,
     )

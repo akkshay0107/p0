@@ -53,15 +53,16 @@ class PPOConfig:
     backups_dir: Path = ARTIFACTS_DIR / "backups"
     eval_dir: Path = ARTIFACTS_DIR / "eval"  # per-promotion validation win-rate logs
     log_path: Path = ARTIFACTS_DIR / "training.log"
+
     pool_size: int = 50
     snapshot_interval: int = 20
     # promote the strongest snapshot to the permanent anchor pool once every
-    # this many rotating snapshots are admitted
+    # k snapshots get added
     pool_anchor_every: int = 10
-    # battles per heuristic when validating a snapshot (vs the 4 fixed heuristics)
-    eval_battles: int = 100
+    eval_battles: int = 100  # battles per heuristic when validating a snapshot
     pool_win_rate_smoothing: float = 0.1
     pool_wr_floor: float = 0.1
+    pool_anchor_drop_wr: float = 0.05  # drop an anchor once the agent beats it this thoroughly
 
     def __post_init__(self) -> None:
         if not 0 <= self.n_self_envs <= self.n_envs:

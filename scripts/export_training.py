@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import argparse
 import sys
 import tarfile
 import time
+import shutil
 from pathlib import Path
 
 
@@ -33,59 +33,26 @@ def gather_directory_files(
             targets.append((p, str(p.relative_to(project_root)), p.stat().st_size))
 
 
-def gather_files(project_root: Path, exclude_logs: bool) -> list[tuple[Path, str, int]]:
-    targets = []
+def main():
+    project_root = find_project_root()
+    output_path = project_root / "ppo_training_export.tar.gz"
+
+    artifacts = project_root / "artifacts"
+    if not artifacts.exists():
+        print("No artifacts directory found.", file=sys.stderr)
+        sys.exit(1)
 
     ppoconfig = project_root / ".ppoconfig"
     if ppoconfig.exists():
-        targets.append((ppoconfig, ".ppoconfig", ppoconfig.stat().st_size))
+        shutil.copy(ppoconfig, artifacts / ".ppoconfig.bk")
 
-    artifacts = project_root / "artifacts"
-    checkpoint = artifacts / "checkpoints" / "ppo_checkpoint.pt"
-    if checkpoint.exists():
-        targets.append(
-            (checkpoint, "artifacts/checkpoints/ppo_checkpoint.pt", checkpoint.stat().st_size)
-        )
+    targets = []
+    gather_directory_files(artifacts, project_root, targets)
 
-    gather_directory_files(artifacts / "checkpoints" / "pool", project_root, targets)
-    gather_directory_files(artifacts / "backups", project_root, targets)
-
-    if not exclude_logs:
-        training_log = artifacts / "training.log"
-        if training_log.exists():
-            targets.append((training_log, "artifacts/training.log", training_log.stat().st_size))
-
-        gather_directory_files(artifacts / "runs", project_root, targets)
-        gather_directory_files(artifacts / "eval", project_root, targets)
-
-    return targets
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Export training checkpoints and state.")
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=str,
-        default="ppo_training_export.tar.gz",
-        help="Path to save the export archive.",
-    )
-    parser.add_argument(
-        "--exclude-logs", action="store_true", help="Exclude TensorBoard runs and training.log."
-    )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print verbose file lists.")
-    args = parser.parse_args()
-
-    project_root = find_project_root()
-    output_path = Path(args.output).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # avoid archiving the output file into itself
-    # if output path is within the project root.
     files_to_archive = [
         (p, arc, size)
-        for p, arc, size in gather_files(project_root, args.exclude_logs)
-        if p.resolve() != output_path
+        for p, arc, size in targets
+        if p.resolve() != output_path.resolve()
     ]
 
     if not files_to_archive:
@@ -102,7 +69,7 @@ def main():
     try:
         with tarfile.open(output_path, "w:gz") as tar:
             for filepath, arcname, size in files_to_archive:
-                if args.verbose or size > 10 * 1024 * 1024:
+                if size > 10 * 1024 * 1024:
                     print(f"Adding: {arcname} ({format_size(size)})")
                 tar.add(filepath, arcname=arcname)
     except Exception as e:
