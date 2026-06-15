@@ -85,8 +85,16 @@ async def evaluate_against_heuristics(
             rl_player.reset_battles()
             opponent.reset_battles()
             await opponent.ps_client.stop_listening()
+            # prevent a bunch of warnings from poke-env
+            # for cancelling pending tasks
+            opponent.ps_client.logger.setLevel(100)
+            for task in list(opponent.ps_client._active_tasks):
+                task.cancel()
     finally:
         await rl_player.ps_client.stop_listening()
+        rl_player.ps_client.logger.setLevel(100)
+        for task in list(rl_player.ps_client._active_tasks):
+            task.cancel()
 
     return results
 

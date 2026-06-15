@@ -21,7 +21,8 @@ class PPOScheduler:
 
         self.lr_max = config.lr
         self.lr_min = 0.1 * config.lr
-        self.ramp_up_end = int(config.ramp_up_phase * config.num_episodes)  # also the length
+        self.warmup_episodes = config.warmup_episodes
+        self.ramp_up_end = int(config.ramp_up_phase * config.num_episodes)
         self.decay_len = config.num_episodes - self.ramp_up_end
 
     def entropy_coef(self, t: int):
@@ -37,8 +38,12 @@ class PPOScheduler:
 
     def lr(self, t: int):
         """
-        Learning rate scheduling. Linear increase into cosine decay.
+        Learning rate scheduling. Constant high LR for value warmup,
+        then linear increase for policy, into cosine decay.
         """
+        if t < self.warmup_episodes:
+            return self.lr_max
+
         if self.ramp_up_end > 0 and t <= self.ramp_up_end:
             prog = t / self.ramp_up_end
             prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]

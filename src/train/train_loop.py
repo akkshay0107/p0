@@ -307,6 +307,9 @@ def ppo_update(
             minibatch_steps = 0
             minibatch_kl = 0.0
             expected_minibatch_steps = sum(ep["length"] for ep in minibatch)
+            should_skip = False
+            minibatch_mean_kl = 0.0
+
             for chunk_idx in range(0, len(minibatch), config.chunk_size):
                 chunk = minibatch[chunk_idx : chunk_idx + config.chunk_size]
                 chunk.sort(key=lambda ep: ep["length"], reverse=True)
@@ -334,12 +337,14 @@ def ppo_update(
                             f"for {batch_steps} steps (minibatch gradient will be undercounted)"
                         )
 
-            if minibatch_steps > 0:
-                # skip just this minibatch when its KL exceeds
-                # target instead of aborting the rest of the update
+                # Check KL early at the chunk level to save processing remaining chunks
                 should_skip, minibatch_mean_kl = _kl_exceeds_target(
                     minibatch_kl, minibatch_steps, config.target_kl
                 )
+                if should_skip:
+                    break
+
+            if minibatch_steps > 0:
                 if should_skip:
                     logging.info(
                         f"Skipping minibatch at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
@@ -400,6 +405,29 @@ def ppo_update(
     }
 
 
+def build_reference_batch(buffer, size: int = 64) -> dict[str, torch.Tensor]:
+    # builds the reference batch to be used in the opponent pool
+    # for a cheap diversity check
+    flat_obs = StructuredObservation.cat([ep["obs"] for ep in buffer.trajectories], dim=0)
+    flat_masks = torch.cat([ep["action_masks"] for ep in buffer.trajectories], dim=0)
+
+    total_steps = flat_masks.size(0)
+    indices = torch.randperm(total_steps)[: min(size, total_steps)]
+
+    return {
+        "token_type_ids": flat_obs.token_type_ids[indices].clone(),
+        "side_ids": flat_obs.side_ids[indices].clone(),
+        "slot_ids": flat_obs.slot_ids[indices].clone(),
+        "categorical": flat_obs.categorical[indices].clone(),
+        "numerical": flat_obs.numerical[indices].clone(),
+        "events_cat": flat_obs.events_cat[indices].clone(),
+        "events_num": flat_obs.events_num[indices].clone(),
+        "events_side_ids": flat_obs.events_side_ids[indices].clone(),
+        "events_slot_ids": flat_obs.events_slot_ids[indices].clone(),
+        "action_masks": flat_masks[indices].clone(),
+    }
+
+
 class BackgroundEval:
     """Runs heuristic validation in a separate CPU process so the GPU keeps
     training while the (CPU-bound) Showdown battles play out.
@@ -436,10 +464,12 @@ class BackgroundEval:
         for future in [f for f in self.pending if f.done()]:
             self._collect(future)
 
-    def shutdown(self) -> None:
+    def shutdown(self, wait: bool = False) -> None:
         """Drain finished runs and stop the pool without waiting on in-flight evals."""
+        if wait and self.pending:
+            logging.info("Waiting for final background evaluation to complete...")
         self.drain()
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.executor.shutdown(wait=wait, cancel_futures=True)
         for episode, ckpt_path in self.pending.values():
             ckpt_path.unlink(missing_ok=True)
         self.pending.clear()
@@ -657,34 +687,6 @@ def main():
                 logging.warning("No trajectories collected, skipping update")
                 continue
 
-            if pool.reference_batch is None:
-                all_obs_list = [ep["obs"] for ep in buffer.trajectories]
-                all_masks_list = [ep["action_masks"] for ep in buffer.trajectories]
-
-                flat_obs = StructuredObservation.cat(all_obs_list, dim=0)
-                flat_masks = torch.cat(all_masks_list, dim=0)
-
-                total_steps = flat_masks.size(0)
-                ref_size = min(64, total_steps)
-                indices = torch.randperm(total_steps)[:ref_size]
-
-                ref_dict = {
-                    "token_type_ids": flat_obs.token_type_ids[indices].clone(),
-                    "side_ids": flat_obs.side_ids[indices].clone(),
-                    "slot_ids": flat_obs.slot_ids[indices].clone(),
-                    "categorical": flat_obs.categorical[indices].clone(),
-                    "numerical": flat_obs.numerical[indices].clone(),
-                    "events_cat": flat_obs.events_cat[indices].clone(),
-                    "events_num": flat_obs.events_num[indices].clone(),
-                    "events_side_ids": flat_obs.events_side_ids[indices].clone(),
-                    "events_slot_ids": flat_obs.events_slot_ids[indices].clone(),
-                    "action_masks": flat_masks[indices].clone(),
-                }
-                pool.set_reference_batch(ref_dict)
-                logging.info(
-                    f"Captured new reference batch of {ref_size} random steps from trajectories"
-                )
-
             num_trajectories = len(buffer.trajectories)
             avg_traj_length = sum(ep["length"] for ep in buffer.trajectories) / num_trajectories
             avg_traj_time = rollout_time / num_trajectories
@@ -700,9 +702,11 @@ def main():
                 shutdown_requested,
             )
 
+            # Keep shadow model trailing the active policy every step
+            pool.update_shadow(policy)
+
             if (episode + 1) % config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
-                pool.update_shadow(policy)
                 added = pool.add(policy, snap_id)
                 if added:
                     logging.info(f"Snapshot '{snap_id}' added to opponent pool. Pool: {pool}")
@@ -713,8 +717,11 @@ def main():
                     )
 
                 # whenever a snapshot is promoted to the anchor pool, benchmark the
-                # latest policy against the fixed heuristics off the training loop
-                if pool.maybe_promote() is not None:
+                # latest policy against the fixed heuristics off the training loop.
+                # maybe_promote refreshes signatures against this fresh batch only
+                # when it commits to a promotion.
+                ref_dict = build_reference_batch(buffer)
+                if pool.maybe_promote(reference_batch=ref_dict) is not None:
                     bg_eval.submit(policy, episode + 1)
 
                 pool.save_state()
@@ -775,7 +782,7 @@ def main():
 
     finally:
         if bg_eval is not None:
-            bg_eval.shutdown()
+            bg_eval.shutdown(wait=not shutdown_requested)
         if vec_env is not None:
             vec_env.shutdown()
         if tb_writer is not None:

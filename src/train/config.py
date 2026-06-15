@@ -63,6 +63,9 @@ class PPOConfig:
     pool_win_rate_smoothing: float = 0.1
     pool_wr_floor: float = 0.1
     pool_anchor_drop_wr: float = 0.05  # drop an anchor once the agent beats it this thoroughly
+    pool_anchor_min_wr: float = 0.4  # threat floor: don't anchor a snapshot the agent already beats
+    pool_anchor_min_games: int = 20  # min games before a snapshot is trusted enough to anchor
+    pool_explore_coef: float = 0.3  # PFSP up-weight for under-sampled opponents (decays with games)
 
     def __post_init__(self) -> None:
         if not 0 <= self.n_self_envs <= self.n_envs:

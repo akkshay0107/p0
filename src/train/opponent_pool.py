@@ -13,6 +13,21 @@ INIT_WR = 0.5
 SHADOW_ID = "shadow"
 alpha_shadow = 0.99  # ema decay rate of the shadow model
 
+SCORE_EPS = 0.05  # floor for not zeroing the product
+DIV_MIN_SPREAD = 0.01  # JSD spread below this is treated as uninformative
+
+
+def _normalize(
+    values: dict[str, float], min_spread: float = DIV_MIN_SPREAD, eps: float = SCORE_EPS
+) -> dict[str, float]:
+    """Min-max candidate values into [eps, 1]. When the spread is too small to
+    be meaningful, return a neutral 1.0 for every candidate so the factor drops
+    out of a multiplicative score instead of annihilating it."""
+    lo, hi = min(values.values()), max(values.values())
+    if hi - lo < min_spread:
+        return {k: 1.0 for k in values}
+    return {k: eps + (1 - eps) * (v - lo) / (hi - lo) for k, v in values.items()}
+
 
 def _js_divergence(p: torch.Tensor, q: torch.Tensor) -> float:
     """Computes the Jensen-Shannon divergence between two batched probability distributions.
@@ -35,6 +50,7 @@ class OpponentPool:
         self.anchor_ids: list[str] = []
         self.regular_ids: list[str] = []
         self.win_rates: dict[str, float] = {}
+        self.games: dict[str, int] = {}
         self.snapshots_since_anchor = 0
         self.signatures: dict[str, torch.Tensor] = {}
         self.reference_batch: dict[str, torch.Tensor] | None = None
@@ -90,6 +106,7 @@ class OpponentPool:
 
         alpha = self.config.pool_win_rate_smoothing
         self.win_rates[opponent_id] = (1 - alpha) * curr_wr + alpha * observed_wr
+        self.games[opponent_id] = self.games.get(opponent_id, 0) + num_games
 
     def load_policy(self, opponent_id: str, device: str) -> PolicyNet:
         path = self._checkpoint_path(opponent_id)
@@ -120,30 +137,49 @@ class OpponentPool:
         self.snapshots_since_anchor += 1
         return True
 
-    def maybe_promote(self) -> str | None:
+    def maybe_promote(self, reference_batch: dict[str, torch.Tensor] | None = None) -> str | None:
+        """Promote the regular that best balances competitiveness and diversity.
+
+        A candidate must still be a genuine threat (win rate >= floor) and have
+        been played enough to trust that win rate (games >= min). Among those, the
+        score is the *product* of normalized competitiveness and diversity, so a
+        promotion has to be good at both. When committing to a promotion, refresh
+        all signatures against the freshly captured `reference_batch` first.
+        """
         self._drop_outgrown_anchors()
 
         k = self.config.pool_anchor_every
         if k <= 0 or self.snapshots_since_anchor < k or not self.regular_ids:
             return None
 
-        self.snapshots_since_anchor = 0
-        best_wr = max(self.win_rates.get(oid, INIT_WR) for oid in self.regular_ids)
+        floor = self.config.pool_anchor_min_wr
+        min_games = self.config.pool_anchor_min_games
         candidates = [
-            oid for oid in self.regular_ids if self.win_rates.get(oid, INIT_WR) >= best_wr - 0.1
+            oid
+            for oid in self.regular_ids
+            if self.win_rates.get(oid, INIT_WR) >= floor and self.games.get(oid, 0) >= min_games
         ]
+        if not candidates:
+            # nothing worth protecting yet; leave the counter so we retry next snapshot
+            return None
 
-        best = max(
-            candidates,
-            key=lambda oid: (self._min_anchor_distance(oid), self.win_rates.get(oid, INIT_WR)),
-        )
+        # committed to a promotion -> refresh signatures against the fresh batch first
+        if reference_batch is not None:
+            self.set_reference_batch(reference_batch)
+        self.snapshots_since_anchor = 0
+
+        comp = _normalize({oid: self.win_rates[oid] for oid in candidates})
+        div = _normalize({oid: self._min_anchor_distance(oid) for oid in candidates})
+        best = max(candidates, key=lambda oid: comp[oid] * div[oid])
+
         self.regular_ids.remove(best)
         self.anchor_ids.append(best)
 
         logging.info(
             f"Promoted '{best}' to anchor pool "
             f"(win rate {self.win_rates.get(best, INIT_WR):.3f}, "
-            f"diversity dist {self._min_anchor_distance(best):.4f}). Anchors: {self.anchor_ids}"
+            f"diversity dist {self._min_anchor_distance(best):.4f}, "
+            f"games {self.games.get(best, 0)}). Anchors: {self.anchor_ids}"
         )
         return best
 
@@ -187,23 +223,28 @@ class OpponentPool:
     def _pfsp_weight(self, opponent_id: str) -> float:
         # mix of competitive weighting + preferential hard weighting
         wr = max(self.config.pool_wr_floor, self.win_rates[opponent_id])
-        return wr * (1 - wr) + 0.3 * wr
+        base = wr * (1 - wr) + 0.3 * wr
+        # up-weight under-sampled opponents so their win rate (and thus anchor
+        # eligibility) converges faster; decays to ~0 as games accumulate
+        explore = self.config.pool_explore_coef / (1 + 0.2 * self.games.get(opponent_id, 0))
+        return base + explore
 
     def set_reference_batch(self, batch: dict[str, torch.Tensor]) -> None:
+        """Install a fresh reference batch and recompute every signature against
+        it. A new batch makes old signatures incomparable so all are rebuilt."""
         self.reference_batch = {k: v.cpu() for k, v in batch.items()}
         torch.save(self.reference_batch, self.pool_dir / "reference_batch.pt")
 
+        self.signatures.clear()
         for oid in self.active_ids():
             if oid == self.shadow_id:
                 continue
-            if oid not in self.signatures:
-                try:
-                    policy = self.load_policy(oid, "cpu")
-                    sig = self._compute_signature(policy)
-                    if sig is not None:
-                        self.signatures[oid] = sig
-                except Exception as e:
-                    logging.warning(f"Failed to backfill signature for {oid}: {e}")
+            try:
+                sig = self._compute_signature(self.load_policy(oid, "cpu"))
+                if sig is not None:
+                    self.signatures[oid] = sig
+            except Exception as e:
+                logging.warning(f"Failed to compute signature for {oid}: {e}")
 
         self.save_state()
 
@@ -274,11 +315,13 @@ class OpponentPool:
             raise ValueError(f"Unknown role: {role}")
 
         self.win_rates.setdefault(opponent_id, INIT_WR)
+        self.games.setdefault(opponent_id, 0)
 
     def _deregister_opponent(self, opponent_id: str) -> None:
         """Removes an opponent from disk and all tracking structures."""
         self._checkpoint_path(opponent_id).unlink(missing_ok=True)
         self.win_rates.pop(opponent_id, None)
+        self.games.pop(opponent_id, None)
         self.signatures.pop(opponent_id, None)
 
         if opponent_id in self.regular_ids:
@@ -294,6 +337,7 @@ class OpponentPool:
             "anchor_ids": self.anchor_ids,
             "regular_ids": self.regular_ids,
             "win_rates": self.win_rates,
+            "games": self.games,
             "snapshots_since_anchor": self.snapshots_since_anchor,
         }
         with open(self.pool_dir / "pool_state.json", "w") as f:
@@ -309,6 +353,7 @@ class OpponentPool:
             self.anchor_ids = state.get("anchor_ids", [])
             self.regular_ids = state.get("regular_ids", [])
             self.win_rates = state.get("win_rates", {})
+            self.games = state.get("games", {})
             self.snapshots_since_anchor = state.get("snapshots_since_anchor", 0)
         else:
             self._load_from_checkpoints()
@@ -331,6 +376,7 @@ class OpponentPool:
             else:
                 self.regular_ids.append(opponent_id)
             self.win_rates.setdefault(opponent_id, INIT_WR)
+            self.games.setdefault(opponent_id, 0)
 
     def _prune_missing_files(self) -> None:
         existing_ids = {pt.stem for pt in self.pool_dir.glob("*.pt")}
@@ -339,11 +385,13 @@ class OpponentPool:
         self.anchor_ids = [oid for oid in self.anchor_ids if oid in existing_ids]
         self.regular_ids = [oid for oid in self.regular_ids if oid in existing_ids]
         self.win_rates = {oid: wr for oid, wr in self.win_rates.items() if oid in self.active_ids()}
+        self.games = {oid: g for oid, g in self.games.items() if oid in self.active_ids()}
         self.signatures = {
             oid: sig for oid, sig in self.signatures.items() if oid in self.active_ids()
         }
         for opponent_id in self.active_ids():
             self.win_rates.setdefault(opponent_id, INIT_WR)
+            self.games.setdefault(opponent_id, 0)
 
     @classmethod
     def load_or_create(cls, pool_dir: Path, config: PPOConfig) -> Self:
