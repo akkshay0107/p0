@@ -6,6 +6,7 @@ echo ""
 echo "Clearing *.log"
 rm -f *.log
 rm -f src/*.log
+rm -f artifacts/*.log
 
 clear_dir() {
     if [ -d "$1" ]; then
@@ -16,8 +17,9 @@ clear_dir() {
     fi
 }
 
-clear_dir "runs"
-clear_dir "replays"
-clear_dir "checkpoints"
+clear_dir "artifacts/runs"
+clear_dir "artifacts/replays"
+clear_dir "artifacts/checkpoints"
+clear_dir "artifacts/eval"
 
 echo "Done."

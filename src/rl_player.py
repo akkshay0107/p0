@@ -11,13 +11,13 @@ import torch
 from poke_env import AccountConfiguration, LocalhostServerConfiguration, ServerConfiguration
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
-from torch.distributions import Categorical
 
-import observation_builder
-from env import Gen9VGCEnv
-from policy import PolicyNet
-from ppo_utils import initial_state, load_checkpoint
-from teams import RandomTeamFromPool
+from src.env import MegaEnv
+from src.lookups import ACT_SIZE
+from src.model import observation_builder
+from src.model.policy import PolicyNet
+from src.team_picker import RandomTeamFromPool
+from src.train.utils import load_checkpoint
 
 
 class RLPlayer(Player):
@@ -28,79 +28,43 @@ class RLPlayer(Player):
     def __init__(
         self,
         policy: PolicyNet,
-        p: float = 0.9,
+        top_p: float = 0.9,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.policy = policy
 
-        assert 0.0 <= p <= 1.0
-        self.p = p
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+        self.top_p = top_p
         self.state = None
 
-    def _apply_top_p(self, logits: torch.Tensor) -> torch.Tensor:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-        sorted_indices_to_remove = cumulative_probs > self.p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = False
-
-        sorted_logits[sorted_indices_to_remove] = float("-inf")
-
-        return sorted_logits.scatter(-1, sorted_indices, sorted_logits)
-
-    def _top_p(self, obs, action_mask, is_tp: bool):
+    def _get_action(self, battle: AbstractBattle):
         if self.state is None:
-            self.state = initial_state(self.policy, 1, self.policy.device)
+            self.state = self.policy.initial_state(1)
 
-        # Get backbone embedding
-        z, self.state = self.policy.reducer(obs, self.state)
-
-        # Pokemon 1: P(a1 | z)
-        logits1 = self.policy.policy_head1(z)
-        if action_mask is not None:
-            logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
-
-        p1_logits_top_p = self._apply_top_p(logits1)
-        cat1 = Categorical(logits=p1_logits_top_p)
-        action1 = cat1.sample()  # (B,)
-
-        # Pokemon 2: P(a2 | z, a1)
-        a1_emb = self.policy.action_embedding(action1)
-        logits2 = self.policy.policy_head2(torch.cat([z, a1_emb], dim=-1))
-
-        # Combine and apply sequential masks
-        logits = torch.stack([logits1, logits2], dim=1)
-        if action_mask is not None:
-            is_tp_t = torch.tensor([is_tp], device=self.policy.device, dtype=torch.bool)
-            logits = self.policy._apply_masks(logits, action_mask)
-            logits = self.policy._apply_sequential_masks(logits, action1, action_mask, is_tp_t)
-
-        p2_logits_top_p = self._apply_top_p(logits[:, 1])
-        cat2 = Categorical(logits=p2_logits_top_p)
-        action2 = cat2.sample()  # (B,)
-
-        return torch.stack([action1, action2], dim=-1)
-
-    def _get_action(self, battle: AbstractBattle, is_tp: bool):
         obs = self.get_observation(battle)
-        action_mask = observation_builder.get_action_mask(battle)
+        action_mask_list = MegaEnv.get_action_mask(battle)
+        action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
+
+        obs = obs.unsqueeze(0).to(self.policy.device)
+        action_mask = action_mask.unsqueeze(0).to(self.policy.device)
         with torch.no_grad():
-            actions = self._top_p(
-                obs.unsqueeze(0).to(self.policy.device),
-                action_mask.unsqueeze(0).to(self.policy.device),
-                is_tp,
+            out = self.policy.act_obs(
+                obs,
+                action_mask,
+                self.state,
+                top_p=self.top_p,
             )
-        return actions[0].cpu().numpy()
+        self.state = out.state
+        return out.actions[0].cpu().numpy()
 
     def choose_move(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
         if battle._wait:
             return DefaultBattleOrder()
-        return Gen9VGCEnv.action_to_order(self._get_action(battle, False), battle)
+        return MegaEnv.action_to_order(self._get_action(battle), battle)
 
     def get_observation(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
@@ -108,21 +72,21 @@ class RLPlayer(Player):
 
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
-        # Team preview is the start of the battle, so we reset the state here
+        # Reset state at the beginning of each battle's Team Preview
         self.state = None
-        action = self._get_action(battle, True)
-        order = Gen9VGCEnv.action_to_order(action, battle)
+        action = self._get_action(battle)
+        order = MegaEnv.action_to_order(action, battle)
         return order.message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
-        # Reset state at the end of the battle to prevent memory leaks or state carry-over
+        # Reset state to prevent leaks or state carry-over across battles
         self.state = None
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_BATTLE_FORMAT = "gen9vgc2025regh"
+DEFAULT_BATTLE_FORMAT = "gen9championsvgc2026regma"
 DEFAULT_CHALLENGE_LIMIT = 1_000_000
-DEFAULT_CHECKPOINT_CANDIDATES = (Path("checkpoints/ppo_checkpoint.pt"),)
+DEFAULT_CHECKPOINT_CANDIDATES = (Path("artifacts/checkpoints/ppo_checkpoint.pt"),)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -223,7 +187,9 @@ def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
 
 
 def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> PolicyNet:
-    policy = PolicyNet()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Use recommended dimensions if unspecified
+    policy = PolicyNet().to(device)
 
     if checkpoint_path is None:
         if not allow_random_init:
@@ -241,6 +207,7 @@ def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> Polic
         checkpoint_path,
         f" (episode {episode})" if episode is not None else "",
     )
+    LOGGER.info("Running inference on device: %s", device)
     policy.eval()
     return policy
 
@@ -413,7 +380,7 @@ async def run_bot(config: RLBotConfig) -> None:
     account_configuration = AccountConfiguration(config.username, config.password)
     bot_player = RLPlayer(
         policy=policy,
-        p=config.top_p,
+        top_p=config.top_p,
         account_configuration=account_configuration,
         battle_format=config.battle_format,
         server_configuration=server_configuration,

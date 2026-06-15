@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-POOL_DIR="./checkpoints/pool"
-PPO_CHECKPOINT="./checkpoints/ppo_checkpoint.pt"
-BACKUP_DIR="./backups"
+POOL_DIR="./artifacts/checkpoints/pool"
+PPO_CHECKPOINT="./artifacts/checkpoints/ppo_checkpoint.pt"
+BACKUP_DIR="./artifacts/backups"
 SEEDS=(
   "seed_max_base_power"
   "seed_simple_heuristic"
