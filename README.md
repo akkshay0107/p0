@@ -109,3 +109,9 @@ _Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Lo
 - **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
 - **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and `.ppoconfig` into a `tar.gz` archive. I use it for moving stuff between remote servers.
 - **`reset_pool.sh`**: Clears out the current `OpponentPool` (snapshots inside `artifacts/checkpoints/pool/`) while retaining the foundational heuristic seed models. If you want to reset the training phase without redoing replay gen / behaviour cloning.
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
