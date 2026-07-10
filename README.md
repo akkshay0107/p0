@@ -1,6 +1,6 @@
 # p0: Reinforcement Learning for Pokémon VGC
 
-`p0` is a self-play reinforcement learning engine for Pokemon VGC. It uses a model free, recurrent approach and is trained without using any human data. Due to compute constraints, it plays within a very restricted metagame of 7 teams (for now) and does not support playing on ladder. I hope to expand this to support the entire game in the near future (if I can get access to GPUs for training).
+`p0` is a self-play reinforcement learning engine for Pokemon VGC. The current codebase is being refactored toward roster-independent Champions play and public Bo3 replay pretraining.
 
 ---
 
@@ -11,10 +11,8 @@
 - [Modules](#modules)
 - [Workflow Guide](#workflow-guide)
   - [1. Setup & Installation](#1-setup--installation)
-  - [2. Replay Generation](#2-replay-generation)
-  - [3. Behavioural Cloning Bootstrapping](#3-behavioural-cloning-bootstrapping)
-  - [4. PPO Training Loop](#4-ppo-training-loop)
-  - [5. Local Play](#5-local-play)
+  - [2. PPO Training Loop](#2-ppo-training-loop)
+  - [3. Local Play](#3-local-play)
 - [Utility Scripts](#utility-scripts)
 - [References](#references)
 - [Contributing](#contributing)
@@ -53,11 +51,10 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 
 - **`model/`**: Defines the neural network architecture. Contains the custom tokenizer, structured observation builders, the fused SwiGLU token encoder, and the dual actor-critic policy networks.
 - **`train/`**: Contains the PPO training loop, rollout buffers, vectorized environment management (spinning up local Node.js Showdown servers), behavioural cloning scripts, and the opponent pool (league) system.
-- **`heuristic/`**: Contains rule-based baseline agents and scripts used for generating initial replays for Behavioural Cloning.
 
 ### 2. `bench/` (Benchmarks)
 
-Scripts to benchmark system and model performance. This includes measuring inference times (action prediction and encoder throughput) as well as evaluating win rates for heuristic bots and policy models.
+Scripts to benchmark system and model performance, including inference and encoder throughput.
 
 ### 3. `tests/` (Tests)
 
@@ -90,23 +87,9 @@ Next, install the Node.js dependencies required by the local Pokémon Showdown s
 cd pokemon-showdown && npm install && cd ..
 ```
 
-### 2. Replay Generation
+### 2. PPO Training Loop
 
-Generate offline replays by pitting heuristic rule-based bots against each other. This creates the dataset for the model to learn the basics. This runs entirely on the CPU and takes a while (~20 mins with n = 5000 battles) to generate replays. It ends up generating more than the number asked due to recording both sides in mirror bot matches.
-
-```bash
-uv run python ./src/heuristic/replay_gen.py -n 2500
-```
-
-### 3. Behavioural Cloning Bootstrapping
-
-Train the initial neural network policy using supervised learning to predict the actions taken by the heuristics in the generated replays. This bootstraps the initial `OpponentPool` and gives the model a competent starting point before RL begins. I mainly see this as a way to save compute at the start of a run, the randomly initialized model does catch up in quality to the best seed policy in around 200k steps.
-
-```bash
-uv run python ./src/train/seed_pool.py
-```
-
-### 4. PPO Training Loop
+The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Add validated Showdown team files to those directories and set `team_pool=all` or `team_pool=reduced` in the PPO config. Opponents use `opponent_team_pool=all` by default.
 
 Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins league-based self-play.
 
@@ -126,7 +109,6 @@ You would have to move the trained model to a specific location and have the inf
 
 - **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
 - **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and `.ppoconfig` into a `tar.gz` archive. I use it for moving stuff between remote servers while training.
-- **`reset_pool.sh`**: Clears out the current `OpponentPool` (snapshots inside `artifacts/checkpoints/pool/`) while retaining the heuristic seed models. If you want to reset the training phase without redoing replay gen / behaviour cloning.
 
 ---
 

@@ -51,7 +51,8 @@ class PPOConfig:
     runs_dir: Path = ARTIFACTS_DIR / "runs"
     replays_dir: Path = ARTIFACTS_DIR / "replays"
     backups_dir: Path = ARTIFACTS_DIR / "backups"
-    eval_dir: Path = ARTIFACTS_DIR / "eval"  # per-promotion validation win-rate logs
+    team_pool: str = "all"  # switch to "reduced" for focused curriculum training
+    opponent_team_pool: str = "all"
     log_path: Path = ARTIFACTS_DIR / "training.log"
 
     pool_size: int = 50
@@ -59,7 +60,6 @@ class PPOConfig:
     # promote the strongest snapshot to the permanent anchor pool once every
     # k snapshots get added
     pool_anchor_every: int = 10
-    eval_battles: int = 100  # battles per heuristic when validating a snapshot
     pool_win_rate_smoothing: float = 0.1
     pool_wr_floor: float = 0.1
     pool_anchor_drop_wr: float = 0.05  # drop an anchor once the agent beats it this thoroughly

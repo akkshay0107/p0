@@ -1,4 +1,5 @@
 import random
+from pathlib import Path
 
 from poke_env.teambuilder import Teambuilder
 
@@ -14,6 +15,21 @@ class RandomTeamFromPool(Teambuilder):
 
     def yield_team(self):
         return random.choice(self.packed_teams)
+
+
+def load_team_pool(teams_dir: str | Path) -> RandomTeamFromPool:
+    """Load all explicit Showdown team files from a pool directory."""
+    path = Path(teams_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"Teams directory not found: {path}")
+    team_files = [
+        file.read_text(encoding="utf-8")
+        for file in sorted(path.iterdir())
+        if file.is_file() and not file.name.startswith(".")
+    ]
+    if not team_files:
+        raise FileNotFoundError(f"No team files found in {path}")
+    return RandomTeamFromPool(team_files)
 
 
 if __name__ == "__main__":

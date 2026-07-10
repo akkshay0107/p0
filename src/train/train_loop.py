@@ -1,7 +1,5 @@
 import asyncio
-import json
 import logging
-import multiprocessing
 import os
 import random
 import signal
@@ -9,7 +7,6 @@ import socket
 import subprocess
 import sys
 import time
-from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable, cast
 
@@ -20,7 +17,6 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
-from src.eval import evaluate_checkpoint
 from src.lookups import ACT_SIZE, OBS_DIM
 from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
@@ -428,78 +424,10 @@ def build_reference_batch(buffer, size: int = 64) -> dict[str, torch.Tensor]:
     }
 
 
-class BackgroundEval:
-    """Runs heuristic validation in a separate CPU process so the GPU keeps
-    training while the (CPU-bound) Showdown battles play out.
-
-    Each promotion serializes the current policy to a throwaway checkpoint and
-    hands it to a single-worker process pool. Completed runs are drained back on
-    the main process, which owns the SummaryWriter, and persisted as JSON to
-    artifacts/eval/ep_<episode>_wr.log.
-    """
-
-    def __init__(self, config: PPOConfig, eval_port: int, tb_writer: SummaryWriter):
-        self.config = config
-        self.eval_port = eval_port
-        self.tb_writer = tb_writer
-        # spawn (not fork) so the child never inherits the parent's CUDA context
-        ctx = multiprocessing.get_context("spawn")
-        self.executor = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
-        self.pending: dict[Future, tuple[int, Path]] = {}
-
-    def submit(self, policy: PolicyNet, episode: int) -> None:
-        self.config.eval_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = self.config.eval_dir / f"validation_ep{episode}.pt"
-        torch.save({"model_state_dict": policy.state_dict()}, ckpt_path)
-        future = self.executor.submit(
-            evaluate_checkpoint,
-            str(ckpt_path),
-            port=self.eval_port,
-            n_battles=self.config.eval_battles,
-        )
-        self.pending[future] = (episode, ckpt_path)
-
-    def drain(self) -> None:
-        """Record any finished evals. Non-blocking: skips runs still in flight."""
-        for future in [f for f in self.pending if f.done()]:
-            self._collect(future)
-
-    def shutdown(self, wait: bool = False) -> None:
-        """Drain finished runs and stop the pool without waiting on in-flight evals."""
-        if wait and self.pending:
-            logging.info("Waiting for final background evaluation to complete...")
-        self.drain()
-        self.executor.shutdown(wait=wait, cancel_futures=True)
-        for episode, ckpt_path in self.pending.values():
-            ckpt_path.unlink(missing_ok=True)
-        self.pending.clear()
-
-    def _collect(self, future: Future) -> None:
-        episode, ckpt_path = self.pending.pop(future)
-        ckpt_path.unlink(missing_ok=True)
-        try:
-            results = future.result()
-        except Exception as e:
-            logging.error(f"Background validation @ ep{episode} failed: {e}")
-            return
-
-        log_path = self.config.eval_dir / f"ep_{episode}_wr.log"
-        payload = {"episode": episode, "n_battles": self.config.eval_battles, "win_rates": results}
-        with open(log_path, "w") as f:
-            json.dump(payload, f, indent=2)
-
-        for name, wr in results.items():
-            self.tb_writer.add_scalar(f"Eval/WinRate/{name}", wr, episode)
-
-        table = " | ".join(f"{name}: {wr:.2%}" for name, wr in results.items())
-        logging.info(f"Validation @ ep{episode}: {table} -> {log_path}")
-
-
 def main():
     showdown_procs = []
     vec_env = None
     tb_writer = None
-    bg_eval = None
 
     config = load_config()
     device = default_device()
@@ -546,10 +474,8 @@ def main():
             logging.error(f"Failed to build pokemon-showdown: {e}")
             raise e
 
-        # one showdown server per env thread, plus one dedicated server for
-        # validation eval (kept off the training ports to avoid collisions)
-        eval_port = 8000 + config.n_envs
-        n_servers = config.n_envs + 1
+        # one Showdown server per environment thread
+        n_servers = config.n_envs
 
         # clean up other processes occupying the port
         for i in range(n_servers):
@@ -594,7 +520,14 @@ def main():
 
         envs = []
         for i in range(config.n_envs):
-            envs.append(SimEnv.build_env(env_id=i, server_port=8000 + i))
+            envs.append(
+                SimEnv.build_env(
+                    env_id=i,
+                    server_port=8000 + i,
+                    team_pool=config.team_pool,
+                    opponent_team_pool=config.opponent_team_pool,
+                )
+            )
             time.sleep(0.1)
 
         vec_env = ThreadVecEnv(envs)
@@ -605,20 +538,12 @@ def main():
         config.pool_dir.mkdir(parents=True, exist_ok=True)
 
         tb_writer = SummaryWriter(log_dir=str(config.runs_dir / "ppo_training"))
-        bg_eval = BackgroundEval(config, eval_port, tb_writer)
 
         start = load_checkpoint(config.checkpoint_path, policy, optimizer, scaler=scaler)
         if start is not None:
             logging.info(f"Resuming training from episode {start + 1}")
         else:
-            seed_path = config.pool_dir / "seed_fuzzy_heuristic.pt"
-            if seed_path.exists():
-                logging.info(f"No checkpoint found. Seeding policy from {seed_path}")
-                load_checkpoint(seed_path, policy)
-            else:
-                logging.info(
-                    "No checkpoint or seed policy found. Starting from random initialization."
-                )
+            logging.info("No checkpoint found. Starting from random initialization.")
             start = 0
 
         pool = OpponentPool.load_or_create(config.pool_dir, config)
@@ -716,18 +641,10 @@ def main():
                         f"(id already exists). Pool: {pool}"
                     )
 
-                # whenever a snapshot is promoted to the anchor pool, benchmark the
-                # latest policy against the fixed heuristics off the training loop.
-                # maybe_promote refreshes signatures against this fresh batch only
-                # when it commits to a promotion.
                 ref_dict = build_reference_batch(buffer)
-                if pool.maybe_promote(reference_batch=ref_dict) is not None:
-                    bg_eval.submit(policy, episode + 1)
+                pool.maybe_promote(reference_batch=ref_dict)
 
                 pool.save_state()
-
-            # log any background validations that finished since last episode
-            bg_eval.drain()
 
             current_lr = optimizer.param_groups[0]["lr"]
             is_warmup = episode < config.warmup_episodes
@@ -781,8 +698,6 @@ def main():
                 logging.info("Checkpoint saved.")
 
     finally:
-        if bg_eval is not None:
-            bg_eval.shutdown(wait=not shutdown_requested)
         if vec_env is not None:
             vec_env.shutdown()
         if tb_writer is not None:

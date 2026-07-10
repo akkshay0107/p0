@@ -29,7 +29,7 @@ from poke_env.teambuilder import Teambuilder
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.structured_observation import StructuredObservation
-from src.team_picker import RandomTeamFromPool
+from src.team_picker import load_team_pool
 
 
 # patch poke_env's PSClient to avoid login timeouts
@@ -515,15 +515,23 @@ class SimEnv(MegaEnv):
         }
 
     @classmethod
-    def build_env(cls, env_id: int = 0, server_port: int = 8000):
-        teams_dir = "./teams"
-        team_files = [
-            path.read_text(encoding="utf-8")
-            for path in Path(teams_dir).iterdir()
-            if path.is_file() and not path.name.startswith(".")
-        ]
-        team = RandomTeamFromPool(team_files)
-        return cls(
+    def build_env(
+        cls,
+        env_id: int = 0,
+        server_port: int = 8000,
+        *,
+        team=None,
+        team_pool: str = "all",
+        opponent_team_pool: str = "all",
+        teams_root: str | Path = "teams",
+    ):
+        if team is None:
+            agent_team = load_team_pool(Path(teams_root) / team_pool)
+            opponent_team = load_team_pool(Path(teams_root) / opponent_team_pool)
+        else:
+            agent_team = team
+            opponent_team = team
+        env = cls(
             account_configuration1=AccountConfiguration(f"TrainAgent_{env_id}", None),
             account_configuration2=AccountConfiguration(f"BestAgent_{env_id}", None),
             server_configuration=ServerConfiguration(
@@ -534,8 +542,14 @@ class SimEnv(MegaEnv):
             accept_open_team_sheet=True,
             start_timer_on_battle_start=False,
             log_level=25,
-            team=team,
+            # Poke-env accepts one team in its environment constructor. The
+            # players own their builders, so replace them after construction
+            # to support asymmetric agent/opponent team distributions.
+            team=agent_team,
         )
+        env.agent1.update_team(agent_team)
+        env.agent2.update_team(opponent_team)
+        return env
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         if not battle.finished:

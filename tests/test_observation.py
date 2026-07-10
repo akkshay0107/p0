@@ -171,16 +171,62 @@ def battle_format():
 
 @pytest.fixture(scope="module")
 def sample_team():
-    root_dir = Path(__file__).resolve().parent.parent
-    teams_dir = root_dir / "teams"
-    if not teams_dir.exists():
-        pytest.skip("No teams directory found.")
-    team_files = [
-        path.read_text(encoding="utf-8")
-        for path in teams_dir.iterdir()
-        if path.is_file() and not path.name.startswith(".")
-    ]
-    return RandomTeamFromPool(team_files)
+    team = """
+Pikachu @ Light Ball
+Ability: Static
+Level: 50
+Jolly Nature
+- Fake Out
+- Protect
+- Thunderbolt
+- Electroweb
+
+Charizard @ Charizardite Y
+Ability: Blaze
+Level: 50
+Modest Nature
+- Heat Wave
+- Solar Beam
+- Protect
+- Weather Ball
+
+Whimsicott @ Focus Sash
+Ability: Prankster
+Level: 50
+Timid Nature
+- Moonblast
+- Tailwind
+- Encore
+- Protect
+
+Garchomp @ Sitrus Berry
+Ability: Rough Skin
+Level: 50
+Jolly Nature
+- Earthquake
+- Dragon Claw
+- Rock Slide
+- Protect
+
+Kingambit @ Black Glasses
+Ability: Defiant
+Level: 50
+Adamant Nature
+- Kowtow Cleave
+- Sucker Punch
+- Protect
+- Low Kick
+
+Glimmora @ Focus Sash
+Ability: Toxic Debris
+Level: 50
+Modest Nature
+- Power Gem
+- Sludge Bomb
+- Earth Power
+- Protect
+"""
+    return RandomTeamFromPool([team])
 
 
 def test_pokemon_categorical_real():

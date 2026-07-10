@@ -16,7 +16,7 @@ from src.env import MegaEnv
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
-from src.team_picker import RandomTeamFromPool
+from src.team_picker import RandomTeamFromPool, load_team_pool
 from src.train.utils import load_checkpoint
 
 
@@ -157,19 +157,6 @@ def _load_team_pool(team_paths: Iterable[Path]) -> RandomTeamFromPool:
     return RandomTeamFromPool(teams)
 
 
-def _resolve_team_paths(
-    root_dir: Path, teams_dir: Path | None, team_files: list[Path]
-) -> list[Path]:
-    if team_files:
-        return team_files
-
-    resolved_dir = teams_dir or (root_dir / "teams")
-    if not resolved_dir.exists():
-        raise FileNotFoundError(f"Teams directory not found: {resolved_dir}")
-
-    return sorted(path for path in resolved_dir.iterdir() if path.is_file())
-
-
 def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
     if checkpoint is not None:
         if checkpoint.exists():
@@ -220,8 +207,8 @@ class RLBotConfig:
     websocket_url: str
     authentication_url: str
     checkpoint_path: Path | None
-    teams_dir: Path | None
     team_files: list[Path]
+    team_pool: str
     top_p: float
     max_concurrent_battles: int
     challenge_limit: int
@@ -272,15 +259,16 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         help="Path to the model checkpoint.",
     )
     parser.add_argument(
-        "--teams-dir",
-        default=os.getenv("SHOWDOWN_TEAMS_DIR"),
-        help="Directory containing Showdown export team files.",
-    )
-    parser.add_argument(
         "--team-file",
         action="append",
         default=env_team_files.split(os.pathsep) if env_team_files else [],
         help="Specific team file to include. Can be repeated.",
+    )
+    parser.add_argument(
+        "--team-pool",
+        choices=("all", "reduced"),
+        default=os.getenv("SHOWDOWN_TEAM_POOL", "all"),
+        help="Named team pool under the teams directory.",
     )
     parser.add_argument(
         "--top-p",
@@ -329,7 +317,6 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         authentication_url=args.authentication_url,
         server=args.server,
     )
-    teams_dir = _resolve_path(root_dir, args.teams_dir)
     team_files = _resolve_path_list(root_dir, args.team_file)
     checkpoint_path = _resolve_path(root_dir, args.checkpoint)
     if checkpoint_path is None and not args.allow_random_init:
@@ -348,8 +335,8 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         websocket_url=server_configuration.websocket_url,
         authentication_url=server_configuration.authentication_url,
         checkpoint_path=checkpoint_path,
-        teams_dir=teams_dir,
         team_files=team_files,
+        team_pool=args.team_pool,
         top_p=args.top_p,
         max_concurrent_battles=args.max_concurrent_battles,
         challenge_limit=args.challenge_limit,
@@ -369,8 +356,11 @@ def _configure_logging(level: str) -> None:
 
 async def run_bot(config: RLBotConfig) -> None:
     root_dir = Path(__file__).resolve().parent.parent
-    team_paths = _resolve_team_paths(root_dir, config.teams_dir, config.team_files)
-    team = _load_team_pool(team_paths)
+    team = (
+        _load_team_pool(config.team_files)
+        if config.team_files
+        else load_team_pool(root_dir / "teams" / config.team_pool)
+    )
     checkpoint_path = config.checkpoint_path
     policy = _load_policy(checkpoint_path, allow_random_init=config.allow_random_init)
     server_configuration = ServerConfiguration(
