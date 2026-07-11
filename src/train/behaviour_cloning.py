@@ -1,4 +1,5 @@
 import random
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -7,6 +8,7 @@ from torch.utils.data import Dataset
 from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import StructuredObservation
 from src.train.utils import adamw_param_groups
+from src.format_config import RuntimeManifest, runtime_manifest_for_data
 
 BATCH_SIZE = 32  # number of episodes per gradient update
 
@@ -18,12 +20,21 @@ class ReplayDataset(Dataset):
 
         for replay_file in sorted(path.rglob("*.replay")):
             try:
-                # each replay file is a shard (list of episodes)
                 shard_data = torch.load(replay_file, weights_only=False)
-                if isinstance(shard_data, list):
-                    self.episodes.extend(shard_data)
+                if not isinstance(shard_data, Mapping):
+                    raise ValueError("shard must be a manifest-wrapped mapping")
+                manifest = shard_data.get("runtime_manifest")
+                if manifest is None:
+                    raise ValueError("shard has no runtime manifest")
+                RuntimeManifest.from_dict(manifest).validate_compatible(runtime_manifest_for_data())
+                episodes = shard_data.get("episodes")
+                if not isinstance(episodes, list):
+                    raise ValueError("shard episodes must be a list")
+                self.episodes.extend(episodes)
             except Exception as e:
-                print(f"could not load shard {replay_file}: {e}")
+                raise ValueError(
+                    f"could not load compatible replay shard {replay_file}: {e}"
+                ) from e
 
         print(f"loaded {len(self.episodes)} episodes from {path}")
 
@@ -32,6 +43,17 @@ class ReplayDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.episodes[idx]
+
+
+def save_replay_shard(path: str | Path, episodes: list) -> None:
+    """Write a replay shard with the same contract used by ReplayDataset."""
+    torch.save(
+        {
+            "runtime_manifest": runtime_manifest_for_data().to_dict(),
+            "episodes": episodes,
+        },
+        Path(path),
+    )
 
 
 def _run_batched_bc(

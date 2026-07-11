@@ -32,6 +32,7 @@ from src.train.utils import (
     adamw_param_groups,
     default_device,
     load_checkpoint,
+    policy_from_checkpoint,
     save_checkpoint,
 )
 from src.train.vec_env import ThreadVecEnv
@@ -440,7 +441,11 @@ def main():
     pool_config = config.pool
     device = default_device()
     logging.info("Using device: %s", device)
-    policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
+    policy = (
+        policy_from_checkpoint(paths.checkpoint_path, device)
+        if paths.checkpoint_path.exists()
+        else PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
+    )
 
     if training.enable_optim and device.type == "cuda":
         logging.info("Compiling rollout actor for reduce-overhead...")

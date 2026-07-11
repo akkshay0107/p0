@@ -1,0 +1,20 @@
+{
+  "action_schema_version": "champions-mega-v1",
+  "champions_dex_sha256": "",
+  "event_schema_version": 1,
+  "format": {
+    "action_schema": "champions-mega-v1",
+    "battle_format": "gen9championsvgc2026regma",
+    "bo3_format": "gen9championsvgc2026regmabo3",
+    "generation": 9,
+    "mod": "champions",
+    "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
+  },
+  "format_spec_version": 1,
+  "model_config": {},
+  "observation_schema_version": 1,
+  "replay_compiler_version": 0,
+  "stat_point_imputer_version": 0,
+  "vocab_sha256": "e0e6e5001f28d42bf7d8e8c0b0956003986ebef6d045d9fa1c4a56b47a4a7361",
+  "vocab_version": 1
+}

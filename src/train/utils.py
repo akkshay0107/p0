@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from src.model.policy import PolicyNet
 from src.train.config import TrainingConfig
+from src.format_config import RuntimeManifest, runtime_manifest_for_policy
 
 
 def default_device() -> torch.device:
@@ -83,6 +84,7 @@ def save_checkpoint(
     state = {
         "episode": episode,
         "model_state_dict": policy.state_dict(),
+        "runtime_manifest": runtime_manifest_for_policy(policy).to_dict(),
     }
     if optimizer is not None:
         state["optimizer_state_dict"] = optimizer.state_dict()
@@ -93,10 +95,37 @@ def save_checkpoint(
     torch.save(state, path)
 
 
+def policy_from_checkpoint(path: Path, device: torch.device | str) -> PolicyNet:
+    """Construct a policy from its serialized architecture before loading weights."""
+    checkpoint = torch.load(path, weights_only=True, map_location="cpu")
+    manifest = checkpoint.get("runtime_manifest")
+    if manifest is None:
+        raise ValueError(f"Checkpoint {path} has no runtime manifest")
+    artifact_manifest = RuntimeManifest.from_dict(manifest)
+    config = dict(artifact_manifest.model_config)
+    if not config:
+        raise ValueError(f"Checkpoint {path} has no serialized model configuration")
+    try:
+        config["obs_dim"] = tuple(config["obs_dim"])
+        policy = PolicyNet(**config).to(device)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid model configuration in checkpoint {path}") from exc
+    artifact_manifest.validate_compatible(runtime_manifest_for_policy(policy))
+    return policy
+
+
 def load_checkpoint(path: Path, policy: PolicyNet, optimizer=None, scheduler=None, scaler=None):
     if not path.exists():
         return None
     checkpoint = torch.load(path, map_location=policy.device)
+    manifest = checkpoint.get("runtime_manifest")
+    if manifest is None:
+        raise ValueError(
+            f"Checkpoint {path} has no runtime manifest; refusing to load an unversioned artifact"
+        )
+    RuntimeManifest.from_dict(manifest).validate_compatible(
+        runtime_manifest_for_policy(policy)
+    )
     policy.load_state_dict(checkpoint["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

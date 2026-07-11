@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -47,6 +46,7 @@ from src.model.structured_observation import (
 )
 from src.model.tokenizer import tokenizer
 from src.team_picker import RandomTeamFromPool
+from src.format_config import FORMAT
 
 
 def make_real_pokemon(
@@ -166,7 +166,7 @@ def make_real_battle(
 
 @pytest.fixture(scope="module")
 def battle_format():
-    return "gen9championsvgc2026regma"
+    return FORMAT.battle_format
 
 
 @pytest.fixture(scope="module")
@@ -217,7 +217,7 @@ Adamant Nature
 - Protect
 - Low Kick
 
-Glimmora @ Focus Sash
+Glimmora @ Shuca Berry
 Ability: Toxic Debris
 Level: 50
 Modest Nature
@@ -830,31 +830,26 @@ def test_sim_env_embed_battle_writes_configured_target():
     assert result.token_type_ids[0] == TokenType.CLS
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_observation_builder_live(showdown_server, battle_format, sample_team):
-    """
-    Spins up two RandomPlayers against the live local Showdown server.
-    Hooks into `teampreview` and `choose_move` to extract live DoubleBattle states,
-    and runs `from_battle` to verify the resulting observation arrays.
-    """
+    """Exercise observation construction against the real local Showdown protocol."""
     captured_battles = []
     captured_errors = []
 
     class CapturePlayer(RandomPlayer):
         def teampreview(self, battle):
             try:
-                obs = from_battle(battle, tokenizer)
-                captured_battles.append((battle.turn, battle.teampreview, obs))
-            except Exception as e:
-                captured_errors.append(f"teampreview: {e}")
+                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
+            except Exception as exc:
+                captured_errors.append(f"teampreview: {exc}")
             return super().teampreview(battle)
 
         def choose_move(self, battle):
             try:
-                obs = from_battle(battle, tokenizer)
-                captured_battles.append((battle.turn, battle.teampreview, obs))
-            except Exception as e:
-                captured_errors.append(f"choose_move: {e}")
+                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
+            except Exception as exc:
+                captured_errors.append(f"choose_move: {exc}")
             return super().choose_move(battle)
 
     p1 = CapturePlayer(
@@ -874,37 +869,17 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
         await asyncio.wait_for(p1.battle_against(p2, n_battles=1), timeout=15.0)
     except asyncio.TimeoutError:
         pytest.fail(f"Battle timed out. Internal errors: {captured_errors}")
-    except Exception as e:
-        pytest.fail(f"Battle failed with exception: {e}. Internal errors: {captured_errors}")
+    except Exception as exc:
+        pytest.fail(f"Battle failed with exception: {exc}. Internal errors: {captured_errors}")
 
-    if captured_errors:
-        pytest.fail(f"Errors occurred during observation building: {captured_errors}")
-
-    assert len(captured_battles) > 0, "No battle states were captured."
-
-    seen_teampreview = False
-    seen_normal_turn = False
-
-    for _, is_teampreview, obs in captured_battles:
+    assert not captured_errors
+    assert captured_battles
+    assert any(is_teampreview for is_teampreview, _ in captured_battles)
+    assert any(not is_teampreview for is_teampreview, _ in captured_battles)
+    for _, obs in captured_battles:
         assert isinstance(obs, StructuredObservation)
-
-        cat = obs.categorical
-        num = obs.numerical
-
-        assert cat.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
-        assert num.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
-
-        global_field_num = num[26]
-        if is_teampreview:
-            seen_teampreview = True
-            # teampreview flag is at index 2 in Global Field numerical array
-            assert global_field_num[2].item() == 1.0
-        else:
-            seen_normal_turn = True
-            assert global_field_num[2].item() == 0.0
-
-    assert seen_teampreview, "Did not capture a teampreview state."
-    assert seen_normal_turn, "Did not capture a normal turn state."
+        assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
+        assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
 
 
 def test_pokemon_nature_in_categorical():

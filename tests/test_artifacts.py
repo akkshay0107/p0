@@ -1,0 +1,73 @@
+import importlib.util
+from pathlib import Path
+
+import pytest
+import torch
+
+from src.model.policy import PolicyNet
+from src.train.behaviour_cloning import ReplayDataset, save_replay_shard
+from src.train.utils import (
+    load_checkpoint,
+    policy_from_checkpoint,
+    save_checkpoint,
+)
+
+
+_EXPORT_SPEC = importlib.util.spec_from_file_location(
+    "export_training", Path(__file__).parents[1] / "scripts" / "export_training.py"
+)
+assert _EXPORT_SPEC is not None and _EXPORT_SPEC.loader is not None
+_EXPORT_MODULE = importlib.util.module_from_spec(_EXPORT_SPEC)
+_EXPORT_SPEC.loader.exec_module(_EXPORT_MODULE)
+collect_export_files = _EXPORT_MODULE.collect_export_files
+
+
+def _small_policy() -> PolicyNet:
+    return PolicyNet(obs_dim=(31, 56), act_size=49, d_model=32, nhead=4, nlayer=1)
+
+
+def test_checkpoint_reconstructs_serialized_policy(tmp_path):
+    path = tmp_path / "policy.pt"
+    original = _small_policy()
+    save_checkpoint(path, 7, original)
+
+    restored = policy_from_checkpoint(path, "cpu")
+    assert restored.d_model == original.d_model
+    assert len(restored.actor.reducer.encoder.layers) == 1
+    assert load_checkpoint(path, restored) == 7
+
+
+def test_checkpoint_rejects_incompatible_manifest(tmp_path):
+    path = tmp_path / "policy.pt"
+    save_checkpoint(path, 1, _small_policy())
+    artifact = torch.load(path, weights_only=False)
+    artifact["runtime_manifest"]["action_schema_version"] = "incompatible"
+    torch.save(artifact, path)
+
+    with pytest.raises(ValueError, match="action_schema_version"):
+        policy_from_checkpoint(path, "cpu")
+
+
+def test_replay_shards_require_and_validate_manifest(tmp_path):
+    path = tmp_path / "sample.replay"
+    save_replay_shard(path, [[{"step": 1}]])
+    assert len(ReplayDataset(str(tmp_path))) == 1
+
+    legacy = tmp_path / "legacy.replay"
+    torch.save([], legacy)
+    with pytest.raises(ValueError, match="manifest-wrapped"):
+        ReplayDataset(str(tmp_path))
+
+
+def test_export_includes_interpretation_contracts(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "checkpoint.pt").write_bytes(b"checkpoint")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/runtime_manifest.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "data/vocab.json").write_text("{}", encoding="utf-8")
+
+    exported = {arcname for _, arcname, _ in collect_export_files(tmp_path, artifacts)}
+    assert "artifacts/checkpoint.pt" in exported
+    assert "data/runtime_manifest.json" in exported
+    assert "data/vocab.json" in exported

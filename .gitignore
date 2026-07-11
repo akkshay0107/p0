@@ -17,6 +17,12 @@ wheels/
 teams/.pastes
 .ruff_cache
 .pytest_cache
+.coverage
+htmlcov/
+.mypy_cache/
+.pyright/
+.hypothesis/
+*.prof
 
 # Inverts
 !.python-version
@@ -25,6 +31,14 @@ teams/.pastes
 # All runtime artifacts (checkpoints, pool, tensorboard runs, replays,
 # backups, training.log) live under a single dir
 artifacts/
+
+# Generated raw data and local caches. Canonical contracts remain tracked.
+data/raw/
+data/cache/
+data/*.tmp
+!data/vocab.json
+!data/champions_dex.json
+!data/runtime_manifest.json
 
 # Training related
 *.log

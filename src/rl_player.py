@@ -13,12 +13,13 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 
 from src.env import MegaEnv
+from src.format_config import FORMAT
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
 from src.team_picker import RandomTeamFromPool, load_team_pool
-from src.train.utils import load_checkpoint
 from src.train.config import load_config
+from src.train.utils import load_checkpoint, policy_from_checkpoint
 
 
 class RLPlayer(Player):
@@ -85,7 +86,7 @@ class RLPlayer(Player):
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_BATTLE_FORMAT = "gen9championsvgc2026regma"
+DEFAULT_BATTLE_FORMAT = FORMAT.battle_format
 DEFAULT_CHALLENGE_LIMIT = 1_000_000
 DEFAULT_CHECKPOINT_CANDIDATES = (Path("artifacts/checkpoints/ppo_checkpoint.pt"),)
 
@@ -176,19 +177,19 @@ def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
 
 def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> PolicyNet:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Use recommended dimensions if unspecified
-    policy = PolicyNet().to(device)
 
     if checkpoint_path is None:
         if not allow_random_init:
             raise ValueError("A checkpoint is required unless random init is explicitly allowed.")
         LOGGER.warning("Starting bot with randomly initialized policy weights.")
+        policy = PolicyNet().to(device)
         policy.eval()
         return policy
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
+    policy = policy_from_checkpoint(checkpoint_path, device)
     episode = load_checkpoint(checkpoint_path, policy)
     LOGGER.info(
         "Loaded checkpoint from %s%s",
@@ -261,7 +262,10 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     )
     parser.add_argument(
         "--checkpoint",
-        default=os.getenv("SHOWDOWN_CHECKPOINT", str(bot_defaults.checkpoint_path) if bot_defaults.checkpoint_path else None),
+        default=os.getenv(
+            "SHOWDOWN_CHECKPOINT",
+            str(bot_defaults.checkpoint_path) if bot_defaults.checkpoint_path else None,
+        ),
         help="Path to the model checkpoint.",
     )
     parser.add_argument(
@@ -285,7 +289,9 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     parser.add_argument(
         "--max-concurrent-battles",
         type=int,
-        default=int(os.getenv("SHOWDOWN_MAX_CONCURRENT_BATTLES", str(bot_defaults.max_concurrent_battles))),
+        default=int(
+            os.getenv("SHOWDOWN_MAX_CONCURRENT_BATTLES", str(bot_defaults.max_concurrent_battles))
+        ),
         help="Maximum simultaneous battles.",
     )
     parser.add_argument(

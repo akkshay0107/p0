@@ -44,6 +44,12 @@ reportPrivateImportUsage = false
 [tool.ruff]
 line-length = 100
 
+[tool.pytest.ini_options]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: requires a built local Showdown server",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",

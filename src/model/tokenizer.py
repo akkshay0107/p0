@@ -19,6 +19,16 @@ from src.model.structured_observation import MAX_VOLATILES
 CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
 
 
+class Resolution:
+    """Knownness for categorical values; ID zero remains structural padding."""
+
+    PAD = "pad"
+    UNKNOWN = "unknown"
+    KNOWN_NONE = "known_none"
+    OOV = "oov"
+    KNOWN = "known"
+
+
 class PokemonTokenizer:
     """Vocabulary backed tokenizer for structured Pokemon observations."""
 
@@ -141,8 +151,26 @@ class PokemonTokenizer:
         return PokemonTokenizer._cached_normalize(name)
 
     def id_for(self, table: str, name: str | None) -> int:
-        vocab_table = self.vocab.get(table, {})
+        # Keep the legacy hot path allocation-free. Call resolve only when
+        # the caller needs knownness/provenance alongside the categorical ID.
+        if name is None:
+            return 0
+        vocab_table = self.vocab.get(table)
+        if vocab_table is None:
+            return 0
         return vocab_table.get(self.normalize_id(name), 0)
+
+    def resolve(self, table: str, name: str | None) -> tuple[int, str]:
+        """Resolve a value while exposing why ID zero was returned."""
+        if name is None or self.normalize_id(name) == "":
+            return 0, Resolution.KNOWN_NONE
+        vocab_table = self.vocab.get(table)
+        if vocab_table is None:
+            return 0, Resolution.UNKNOWN
+        key = self.normalize_id(name)
+        if key not in vocab_table:
+            return 0, Resolution.OOV
+        return vocab_table[key], Resolution.KNOWN
 
     def status_id(self, status: Status | None) -> int:
         if status is None:

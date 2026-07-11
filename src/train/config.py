@@ -8,6 +8,8 @@ from typing import Any
 from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
+from src.format_config import FORMAT
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
@@ -134,7 +136,7 @@ class EnvironmentConfig:
 class BotConfig:
     username: str = "Bot"
     password: str | None = None
-    battle_format: str = "gen9championsvgc2026regma"
+    battle_format: str = FORMAT.battle_format
     websocket_url: str | None = None
     authentication_url: str | None = None
     checkpoint_path: Path | None = None

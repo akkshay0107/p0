@@ -29,6 +29,7 @@ from poke_env.teambuilder import Teambuilder
 from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.structured_observation import StructuredObservation
+from src.format_config import FORMAT
 from src.team_picker import load_team_pool
 
 
@@ -96,7 +97,7 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         account_configuration1: Optional[AccountConfiguration] = None,
         account_configuration2: Optional[AccountConfiguration] = None,
         avatar: Optional[int] = None,
-        battle_format: str = "gen9championsvgc2026regma",
+        battle_format: str = FORMAT.battle_format,
         log_level: Optional[int] = None,
         save_replays: Union[bool, str] = False,
         server_configuration: Optional[ServerConfiguration] = LocalhostServerConfiguration,
@@ -538,7 +539,7 @@ class SimEnv(MegaEnv):
                 f"ws://localhost:{server_port}/showdown/websocket",
                 "https://play.pokemonshowdown.com/action.php?",
             ),
-            battle_format="gen9championsvgc2026regma",
+            battle_format=FORMAT.battle_format,
             accept_open_team_sheet=True,
             start_timer_on_battle_start=False,
             log_level=25,

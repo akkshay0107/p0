@@ -33,6 +33,21 @@ def gather_directory_files(
             targets.append((p, str(p.relative_to(project_root)), p.stat().st_size))
 
 
+def collect_export_files(project_root: Path, artifacts: Path) -> list[tuple[Path, str, int]]:
+    """Collect runtime artifacts plus the contracts needed to interpret them."""
+    targets: list[tuple[Path, str, int]] = []
+    gather_directory_files(artifacts, project_root, targets)
+    for relative in (
+        Path("data/runtime_manifest.json"),
+        Path("data/vocab.json"),
+        Path("data/champions_dex.json"),
+    ):
+        source = project_root / relative
+        if source.exists():
+            targets.append((source, str(relative), source.stat().st_size))
+    return targets
+
+
 def main():
     project_root = find_project_root()
     output_path = project_root / "ppo_training_export.tar.gz"
@@ -46,8 +61,7 @@ def main():
     if config.exists():
         shutil.copy(config, artifacts / "config.yaml")
 
-    targets = []
-    gather_directory_files(artifacts, project_root, targets)
+    targets = collect_export_files(project_root, artifacts)
 
     files_to_archive = [
         (p, arc, size)

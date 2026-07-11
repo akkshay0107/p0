@@ -5,6 +5,11 @@ from typing import Self
 
 import torch
 
+from src.format_config import (
+    RuntimeManifest,
+    runtime_manifest_for_data,
+    runtime_manifest_for_policy,
+)
 from src.model.policy import PolicyNet
 from src.model.structured_observation import StructuredObservation
 from src.train.config import PoolConfig
@@ -114,7 +119,19 @@ class OpponentPool:
             raise FileNotFoundError(f"Checkpoint for opponent '{opponent_id}' not found at {path}")
 
         checkpoint = torch.load(path, weights_only=True, map_location=device)
-        net = PolicyNet()
+        manifest = checkpoint.get("runtime_manifest")
+        if manifest is None:
+            raise ValueError(f"Opponent checkpoint {path} has no runtime manifest")
+        artifact_manifest = RuntimeManifest.from_dict(manifest)
+        config = dict(artifact_manifest.model_config)
+        if not config:
+            raise ValueError(f"Opponent checkpoint {path} has no serialized model configuration")
+        try:
+            config["obs_dim"] = tuple(config["obs_dim"])
+            net = PolicyNet(**config)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid model configuration in opponent checkpoint {path}") from exc
+        artifact_manifest.validate_compatible(runtime_manifest_for_policy(net))
         net.load_state_dict(checkpoint["model_state_dict"])
         return net.to(device).eval()
 
@@ -202,7 +219,13 @@ class OpponentPool:
                 shadow_value += (1 - alpha_shadow) * policy_value
             else:
                 shadow_state[key] = policy_value
-        torch.save({"model_state_dict": shadow_state}, path)
+        torch.save(
+            {
+                "model_state_dict": shadow_state,
+                "runtime_manifest": runtime_manifest_for_policy(policy).to_dict(),
+            },
+            path,
+        )
         self.signatures.pop(self.shadow_id, None)
 
     def _regular_capacity(self) -> int:
@@ -233,7 +256,13 @@ class OpponentPool:
         """Install a fresh reference batch and recompute every signature against
         it. A new batch makes old signatures incomparable so all are rebuilt."""
         self.reference_batch = {k: v.cpu() for k, v in batch.items()}
-        torch.save(self.reference_batch, self.pool_dir / "reference_batch.pt")
+        torch.save(
+            {
+                "runtime_manifest": runtime_manifest_for_data().to_dict(),
+                "batch": self.reference_batch,
+            },
+            self.pool_dir / "reference_batch.pt",
+        )
 
         self.signatures.clear()
         for oid in self.active_ids():
@@ -251,7 +280,12 @@ class OpponentPool:
     def load_reference_batch(self) -> None:
         path = self.pool_dir / "reference_batch.pt"
         if path.exists():
-            self.reference_batch = torch.load(path, weights_only=True, map_location="cpu")
+            artifact = torch.load(path, weights_only=True, map_location="cpu")
+            manifest = artifact.get("runtime_manifest")
+            if manifest is None:
+                raise ValueError(f"Reference batch {path} has no runtime manifest")
+            RuntimeManifest.from_dict(manifest).validate_compatible(runtime_manifest_for_data())
+            self.reference_batch = artifact["batch"]
 
     def _compute_signature(self, policy: PolicyNet) -> torch.Tensor | None:
         if self.reference_batch is None:
@@ -298,7 +332,13 @@ class OpponentPool:
 
     def _register_opponent(self, opponent_id: str, policy: PolicyNet, role: str) -> None:
         """Saves the policy to disk, computes its signature, and tracks its state."""
-        torch.save({"model_state_dict": policy.state_dict()}, self._checkpoint_path(opponent_id))
+        torch.save(
+            {
+                "model_state_dict": policy.state_dict(),
+                "runtime_manifest": runtime_manifest_for_policy(policy).to_dict(),
+            },
+            self._checkpoint_path(opponent_id),
+        )
 
         if role != "shadow":
             sig = self._compute_signature(policy)
@@ -333,6 +373,7 @@ class OpponentPool:
 
     def save_state(self) -> None:
         state = {
+            "runtime_manifest": runtime_manifest_for_data().to_dict(),
             "shadow_id": self.shadow_id,
             "anchor_ids": self.anchor_ids,
             "regular_ids": self.regular_ids,
@@ -342,13 +383,23 @@ class OpponentPool:
         }
         with open(self.pool_dir / "pool_state.json", "w") as f:
             json.dump(state, f, indent=2)
-        torch.save(self.signatures, self.pool_dir / "pool_signatures.pt")
+        torch.save(
+            {
+                "runtime_manifest": runtime_manifest_for_data().to_dict(),
+                "signatures": self.signatures,
+            },
+            self.pool_dir / "pool_signatures.pt",
+        )
 
     def _load_state(self) -> None:
         path = self.pool_dir / "pool_state.json"
         if path.exists():
             with open(path) as f:
                 state = json.load(f)
+            manifest = state.get("runtime_manifest")
+            if manifest is None:
+                raise ValueError(f"Opponent pool state {path} has no runtime manifest")
+            RuntimeManifest.from_dict(manifest).validate_compatible(runtime_manifest_for_data())
             self.shadow_id = state.get("shadow_id")
             self.anchor_ids = state.get("anchor_ids", [])
             self.regular_ids = state.get("regular_ids", [])
@@ -361,12 +412,24 @@ class OpponentPool:
         self.load_reference_batch()
         path_sig = self.pool_dir / "pool_signatures.pt"
         if path_sig.exists():
-            self.signatures = torch.load(path_sig, weights_only=True, map_location="cpu")
+            artifact = torch.load(path_sig, weights_only=True, map_location="cpu")
+            manifest = artifact.get("runtime_manifest")
+            if manifest is None:
+                raise ValueError(f"Opponent pool signatures {path_sig} have no runtime manifest")
+            RuntimeManifest.from_dict(manifest).validate_compatible(runtime_manifest_for_data())
+            self.signatures = artifact["signatures"]
 
         self._prune_missing_files()
 
     def _load_from_checkpoints(self) -> None:
-        existing_files = sorted(self.pool_dir.glob("*.pt"), key=lambda p: p.stat().st_ctime)
+        existing_files = sorted(
+            (
+                path
+                for path in self.pool_dir.glob("*.pt")
+                if path.name not in {"reference_batch.pt", "pool_signatures.pt"}
+            ),
+            key=lambda p: p.stat().st_ctime,
+        )
         for pt_file in existing_files:
             opponent_id = pt_file.stem
             if opponent_id == SHADOW_ID:
