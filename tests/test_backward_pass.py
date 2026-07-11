@@ -14,7 +14,7 @@ from src.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from src.train.config import PPOConfig
+from src.train.config import TrainingConfig
 from src.train.train_loop import _run_batched_ppo
 
 
@@ -237,7 +237,7 @@ def test_ppo_warmup(dummy_obs):
         "action_masks": torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
         "length": 1,
     }
-    config = PPOConfig(warmup_episodes=10)
+    config = TrainingConfig(warmup_episodes=10)
 
     loss, _, steps = _run_batched_ppo([episode], policy, config, device, episode=0)
     assert steps == 1

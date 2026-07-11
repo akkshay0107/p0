@@ -7,7 +7,7 @@ import torch
 from src.lookups import ACT_SIZE
 from src.model.policy import ActOutput
 from src.model.structured_observation import StructuredObservation
-from src.train.config import PPOConfig
+from src.train.config import TrainingConfig
 from src.train.rollout import (
     RolloutBuffer,
     build_partition,
@@ -202,7 +202,7 @@ def test_compute_gae_batch_matches_single_episode_reference():
 
 
 def test_build_partition_assigns_static_pool_groups():
-    config = PPOConfig(n_envs=6, n_self_envs=2, n_pool_opponents=2)
+    config = TrainingConfig(n_envs=6, n_self_envs=2, n_pool_opponents=2)
     pool = FakePool(["opp-a", "opp-b"])
 
     partition = build_partition(
@@ -222,7 +222,7 @@ def test_build_partition_assigns_static_pool_groups():
 
 
 def test_build_partition_falls_back_to_all_self_play_for_empty_pool():
-    config = PPOConfig(n_envs=4, n_self_envs=1)
+    config = TrainingConfig(n_envs=4, n_self_envs=1)
     partition = build_partition(
         config,
         cast(Any, FakePool([])),
@@ -236,7 +236,7 @@ def test_build_partition_falls_back_to_all_self_play_for_empty_pool():
 
 
 def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
-    config = PPOConfig(
+    config = TrainingConfig(
         n_envs=3,
         n_self_envs=1,
         n_pool_opponents=1,
@@ -286,7 +286,7 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
 
 
 def test_pool_opponent_rotates_only_after_completed_battle():
-    config = PPOConfig(
+    config = TrainingConfig(
         n_envs=3,
         n_self_envs=1,
         n_pool_opponents=1,

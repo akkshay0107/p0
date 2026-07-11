@@ -3,7 +3,7 @@ from typing import Any, cast
 
 import torch
 
-from src.train.config import PPOConfig
+from src.train.config import PoolConfig
 from src.train.opponent_pool import INIT_WR, SCORE_EPS, OpponentPool, _normalize
 
 
@@ -17,7 +17,7 @@ def _fake_policy(value: float = 0.0) -> Any:
 
 
 def test_sample_many_builds_roster_from_shadow_anchors_and_regulars(tmp_path):
-    pool = OpponentPool(tmp_path, PPOConfig(n_pool_opponents=4))
+    pool = OpponentPool(tmp_path, PoolConfig())
     pool.shadow_id = "shadow"
     pool.anchor_ids = ["seed-a", "seed-b"]
     pool.regular_ids = ["ep20", "ep40"]
@@ -30,7 +30,7 @@ def test_sample_many_builds_roster_from_shadow_anchors_and_regulars(tmp_path):
 
 
 def test_add_regular_evicts_lowest_win_rate_regular_and_keeps_anchors(tmp_path):
-    config = PPOConfig(pool_size=4)
+    config = PoolConfig(pool_size=4)
     pool = OpponentPool(tmp_path, config)
     pool.shadow_id = "shadow"
     pool.anchor_ids = ["seed"]
@@ -67,7 +67,7 @@ def test_normalize_neutral_when_spread_too_small():
 
 
 def test_update_win_rate_tracks_games_and_persists(tmp_path):
-    config = PPOConfig()
+    config = PoolConfig()
     pool = OpponentPool(tmp_path, config)
     pool.add(cast(Any, _fake_policy()), "ep20")
 
@@ -81,7 +81,7 @@ def test_update_win_rate_tracks_games_and_persists(tmp_path):
 
 
 def test_maybe_promote_skips_when_no_candidate_meets_floor_or_games(tmp_path):
-    config = PPOConfig(pool_anchor_every=1, pool_anchor_min_wr=0.4, pool_anchor_min_games=10)
+    config = PoolConfig(pool_anchor_every=1, pool_anchor_min_wr=0.4, pool_anchor_min_games=10)
     pool = OpponentPool(tmp_path, config)
     pool.regular_ids = ["lowwr", "fewgames"]
     pool.win_rates = {"lowwr": 0.3, "fewgames": 0.9}
@@ -95,7 +95,7 @@ def test_maybe_promote_skips_when_no_candidate_meets_floor_or_games(tmp_path):
 
 
 def test_maybe_promote_prefers_candidate_strong_on_both_axes(tmp_path):
-    config = PPOConfig(pool_anchor_every=1, pool_anchor_min_wr=0.4, pool_anchor_min_games=0)
+    config = PoolConfig(pool_anchor_every=1, pool_anchor_min_wr=0.4, pool_anchor_min_games=0)
     pool = OpponentPool(tmp_path, config)
     pool.anchor_ids = ["anchor"]
     pool.regular_ids = ["comp_only", "both", "div_only"]
@@ -122,7 +122,7 @@ def test_maybe_promote_prefers_candidate_strong_on_both_axes(tmp_path):
 
 
 def test_set_reference_batch_invalidates_stale_signatures(tmp_path):
-    config = PPOConfig()
+    config = PoolConfig()
     pool = OpponentPool(tmp_path, config)
     pool.anchor_ids = ["ghost"]  # active but has no checkpoint on disk
     pool.win_rates = {"ghost": 0.5}

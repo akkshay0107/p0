@@ -1,0 +1,55 @@
+# Copy this file to config.yaml for a machine-local configuration.
+training:
+  num_episodes: 2000
+  n_envs: 8
+  n_self_envs: 4
+  n_pool_opponents: 4
+  rollout_steps: 320
+  batch_size: 128
+  chunk_size: 32
+  gamma: 0.99
+  gae_lambda: 0.97
+  clip_low: 0.2
+  clip_high: 0.28
+  lr: 0.00006
+  value_coef: 0.05
+  entropy_coef: 0.03
+  max_grad_norm: 1.0
+  target_kl: 0.015
+  ppo_epochs: 6
+  teampreview_loss_mult: 1.5
+  teampreview_entropy_mult: 2.0
+  enable_optim: true
+  warmup_episodes: 20
+  ramp_up_phase: 0.1
+  ramp_down_phase: 0.2
+pool:
+  pool_size: 50
+  snapshot_interval: 20
+  pool_anchor_every: 10
+  pool_win_rate_smoothing: 0.1
+  pool_wr_floor: 0.1
+  pool_anchor_drop_wr: 0.05
+  pool_anchor_min_wr: 0.4
+  pool_anchor_min_games: 20
+  pool_explore_coef: 0.3
+paths:
+  artifacts_dir: artifacts
+  pool_dir: artifacts/checkpoints/pool
+  checkpoint_path: artifacts/checkpoints/ppo_checkpoint.pt
+  runs_dir: artifacts/runs
+  replays_dir: artifacts/replays
+  backups_dir: artifacts/backups
+  log_path: artifacts/training.log
+environment:
+  team_pool: all
+  opponent_team_pool: all
+bot:
+  username: Bot
+  battle_format: gen9championsvgc2026regma
+  top_p: 0.9
+  max_concurrent_battles: 10
+  challenge_limit: 1000000
+  accept_open_team_sheet: true
+  allow_random_init: false
+  log_level: INFO

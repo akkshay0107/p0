@@ -42,9 +42,9 @@ def main():
         print("No artifacts directory found.", file=sys.stderr)
         sys.exit(1)
 
-    ppoconfig = project_root / ".ppoconfig"
-    if ppoconfig.exists():
-        shutil.copy(ppoconfig, artifacts / ".ppoconfig.bk")
+    config = project_root / "config.yaml"
+    if config.exists():
+        shutil.copy(config, artifacts / "config.yaml")
 
     targets = []
     gather_directory_files(artifacts, project_root, targets)

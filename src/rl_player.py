@@ -18,6 +18,7 @@ from src.model import observation_builder
 from src.model.policy import PolicyNet
 from src.team_picker import RandomTeamFromPool, load_team_pool
 from src.train.utils import load_checkpoint
+from src.train.config import load_config
 
 
 class RLPlayer(Player):
@@ -199,7 +200,7 @@ def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> Polic
     return policy
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class RLBotConfig:
     username: str
     password: str | None
@@ -220,7 +221,10 @@ class RLBotConfig:
 
 def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     root_dir = Path(__file__).resolve().parent.parent
+    app_defaults = load_config()
+    bot_defaults = app_defaults.bot
     env_team_files = os.getenv("SHOWDOWN_TEAM_FILES", "")
+    configured_team_files = [str(path) for path in bot_defaults.team_files]
     parser = argparse.ArgumentParser(description="Run the VGC RL Showdown bot.")
     parser.add_argument(
         "--server",
@@ -229,85 +233,87 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     )
     parser.add_argument(
         "--websocket-url",
-        default=os.getenv("SHOWDOWN_WS_URL"),
+        default=os.getenv("SHOWDOWN_WS_URL", bot_defaults.websocket_url),
         help="Showdown websocket URL.",
     )
     parser.add_argument(
         "--authentication-url",
-        default=os.getenv("SHOWDOWN_AUTH_URL"),
+        default=os.getenv("SHOWDOWN_AUTH_URL", bot_defaults.authentication_url),
         help="Showdown authentication URL.",
     )
     parser.add_argument(
         "--username",
-        default=os.getenv("SHOWDOWN_USERNAME", "Bot"),
+        default=os.getenv("SHOWDOWN_USERNAME", bot_defaults.username),
         help="Account username used for Showdown login.",
     )
     parser.add_argument(
         "--password",
-        default=os.getenv("SHOWDOWN_PASSWORD") or os.getenv("SHOWDOWN_BOT_PASSWORD"),
+        default=os.getenv("SHOWDOWN_PASSWORD")
+        or os.getenv("SHOWDOWN_BOT_PASSWORD")
+        or bot_defaults.password,
         help="Account password used for Showdown login.",
     )
     parser.add_argument(
         "--format",
         dest="battle_format",
-        default=os.getenv("SHOWDOWN_BATTLE_FORMAT", DEFAULT_BATTLE_FORMAT),
+        default=os.getenv("SHOWDOWN_BATTLE_FORMAT", bot_defaults.battle_format),
         help="Battle format to queue for and accept challenges in.",
     )
     parser.add_argument(
         "--checkpoint",
-        default=os.getenv("SHOWDOWN_CHECKPOINT"),
+        default=os.getenv("SHOWDOWN_CHECKPOINT", str(bot_defaults.checkpoint_path) if bot_defaults.checkpoint_path else None),
         help="Path to the model checkpoint.",
     )
     parser.add_argument(
         "--team-file",
         action="append",
-        default=env_team_files.split(os.pathsep) if env_team_files else [],
+        default=env_team_files.split(os.pathsep) if env_team_files else configured_team_files,
         help="Specific team file to include. Can be repeated.",
     )
     parser.add_argument(
         "--team-pool",
         choices=("all", "reduced"),
-        default=os.getenv("SHOWDOWN_TEAM_POOL", "all"),
+        default=os.getenv("SHOWDOWN_TEAM_POOL", app_defaults.environment.team_pool),
         help="Named team pool under the teams directory.",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=float(os.getenv("SHOWDOWN_TOP_P", "0.9")),
+        default=float(os.getenv("SHOWDOWN_TOP_P", str(bot_defaults.top_p))),
         help="Top-p sampling threshold used by the policy.",
     )
     parser.add_argument(
         "--max-concurrent-battles",
         type=int,
-        default=int(os.getenv("SHOWDOWN_MAX_CONCURRENT_BATTLES", "10")),
+        default=int(os.getenv("SHOWDOWN_MAX_CONCURRENT_BATTLES", str(bot_defaults.max_concurrent_battles))),
         help="Maximum simultaneous battles.",
     )
     parser.add_argument(
         "--challenge-limit",
         type=int,
-        default=int(os.getenv("SHOWDOWN_CHALLENGE_LIMIT", str(DEFAULT_CHALLENGE_LIMIT))),
+        default=int(os.getenv("SHOWDOWN_CHALLENGE_LIMIT", str(bot_defaults.challenge_limit))),
         help="How many incoming challenges to accept before exiting.",
     )
     parser.add_argument(
         "--opponent",
-        default=os.getenv("SHOWDOWN_ACCEPT_OPPONENT"),
+        default=os.getenv("SHOWDOWN_ACCEPT_OPPONENT", bot_defaults.opponent),
         help="Only accept challenges from this opponent username.",
     )
     parser.add_argument(
         "--accept-open-team-sheet",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("SHOWDOWN_ACCEPT_OPEN_TEAM_SHEET", True),
+        default=_env_flag("SHOWDOWN_ACCEPT_OPEN_TEAM_SHEET", bot_defaults.accept_open_team_sheet),
         help="Whether the bot accepts open team sheet battles.",
     )
     parser.add_argument(
         "--allow-random-init",
         action=argparse.BooleanOptionalAction,
-        default=_env_flag("SHOWDOWN_ALLOW_RANDOM_INIT", False),
+        default=_env_flag("SHOWDOWN_ALLOW_RANDOM_INIT", bot_defaults.allow_random_init),
         help="Allow booting without a checkpoint.",
     )
     parser.add_argument(
         "--log-level",
-        default=os.getenv("SHOWDOWN_LOG_LEVEL", "INFO"),
+        default=os.getenv("SHOWDOWN_LOG_LEVEL", bot_defaults.log_level),
         help="Python logging level.",
     )
     args = parser.parse_args(argv)

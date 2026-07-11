@@ -28,7 +28,7 @@ artifacts/
 
 # Training related
 *.log
-.ppoconfig
+config.yaml
 
 # Scratch dir for small experiments
 scratch/

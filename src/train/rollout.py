@@ -14,7 +14,7 @@ from src.model.structured_observation import (
     SEQUENCE_LENGTH,
     StructuredObservation,
 )
-from src.train.config import PPOConfig
+from src.train.config import TrainingConfig
 from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
 
@@ -49,7 +49,7 @@ class EnvPartition:
 
 
 def build_partition(
-    config: PPOConfig,
+    config: TrainingConfig,
     pool: OpponentPool,
     device: torch.device,
 ) -> EnvPartition:
@@ -179,7 +179,7 @@ class RolloutBuffer:
             return
         self.trajectories.append(episode)
 
-    def get_batches(self, device: torch.device, config: PPOConfig):
+    def get_batches(self, device: torch.device, config: TrainingConfig):
         all_episodes = []
         all_advantages = []
         if not self.trajectories:
@@ -244,7 +244,7 @@ def collect_rollouts(
     policy: PolicyNet,
     buffer: RolloutBuffer,
     pool: OpponentPool,
-    config: PPOConfig,
+    config: TrainingConfig,
     active_pool_policies: dict[str, PolicyNet],
     trajectories1: dict,
     trajectories2: dict,

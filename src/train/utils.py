@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from src.model.policy import PolicyNet
-from src.train.config import PPOConfig
+from src.train.config import TrainingConfig
 
 
 def default_device() -> torch.device:
@@ -13,7 +13,7 @@ def default_device() -> torch.device:
 
 
 class PPOScheduler:
-    def __init__(self, config: PPOConfig):
+    def __init__(self, config: TrainingConfig):
         self.ent_max = config.entropy_coef
         self.ent_min = 0.1 * config.entropy_coef
         self.ramp_down_start = int((1 - config.ramp_down_phase) * config.num_episodes)

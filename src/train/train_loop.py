@@ -24,7 +24,7 @@ from src.model.structured_observation import (
     StructuredObservation,
     is_teampreview,
 )
-from src.train.config import ARTIFACTS_DIR, PPOConfig, load_config
+from src.train.config import ARTIFACTS_DIR, GlobalConfig, TrainingConfig, load_config
 from src.train.opponent_pool import OpponentPool
 from src.train.rollout import RolloutBuffer, build_partition, collect_rollouts
 from src.train.utils import (
@@ -69,9 +69,10 @@ def _kl_exceeds_target(kl_sum: float, steps: int, target_kl: float) -> tuple[boo
 def _run_batched_ppo(
     episodes: list[dict],
     policy: PolicyNet,
-    config: PPOConfig,
+    config: TrainingConfig,
     device: torch.device,
     episode: int,
+    entropy_coef: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
     """
     Run PPO BPTT over a minibatch of variable-length episodes.
@@ -137,7 +138,7 @@ def _run_batched_ppo(
         "entropy_coef": 0.0,
     }
     total_steps = 0
-    curr_ent_coef = config.entropy_coef
+    curr_ent_coef = config.entropy_coef if entropy_coef is None else entropy_coef
 
     for t in range(max_steps):
         active_n = sum(1 for length in lengths if length > t)
@@ -249,8 +250,9 @@ def ppo_update(
     policy: PolicyNet,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
-    config: PPOConfig,
+    config: TrainingConfig,
     episode: int,
+    entropy_coef: float | None = None,
     shutdown_requested: bool = False,
 ) -> dict:
     policy.train()
@@ -281,7 +283,9 @@ def ppo_update(
         (config.batch_size + config.chunk_size - 1) // config.chunk_size
     )  # round up to nearest chunk
 
-    last_entropy_coef = config.entropy_coef
+    if entropy_coef is None:
+        entropy_coef = config.entropy_coef
+    last_entropy_coef = entropy_coef
     for epoch_idx in range(config.ppo_epochs):
         if shutdown_requested:
             break
@@ -311,7 +315,7 @@ def ppo_update(
                 chunk.sort(key=lambda ep: ep["length"], reverse=True)
 
                 batch_loss, batch_metrics, batch_steps = _run_batched_ppo(
-                    chunk, policy, config, policy.device, episode
+                    chunk, policy, config, policy.device, episode, entropy_coef
                 )
 
                 tot_policy_loss += batch_metrics["policy_loss"]
@@ -381,7 +385,7 @@ def ppo_update(
             "kl_divergence": 0.0,
             "grad_norm": 0.0,
             "clip_fraction": 0.0,
-            "entropy_coefficient": config.entropy_coef,
+            "entropy_coefficient": entropy_coef,
             "explained_variance": 0.0,
             "skipped_minibatches": num_skipped,
             "time": time.time() - t0,
@@ -429,12 +433,16 @@ def main():
     vec_env = None
     tb_writer = None
 
-    config = load_config()
+    config: GlobalConfig = load_config()
+    training = config.training
+    paths = config.paths
+    environment = config.environment
+    pool_config = config.pool
     device = default_device()
     logging.info("Using device: %s", device)
     policy = PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
 
-    if config.enable_optim and device.type == "cuda":
+    if training.enable_optim and device.type == "cuda":
         logging.info("Compiling rollout actor for reduce-overhead...")
         import torch._dynamo as dynamo
 
@@ -446,13 +454,13 @@ def main():
 
     scaler = GradScaler(
         "cuda",
-        enabled=(config.enable_optim and device.type == "cuda"),
+        enabled=(training.enable_optim and device.type == "cuda"),
         init_scale=512.0,
     )
 
     optimizer = optim.AdamW(
         adamw_param_groups(policy, weight_decay=1e-4),
-        lr=config.lr,
+        lr=training.lr,
         eps=1e-6,
     )
 
@@ -475,7 +483,7 @@ def main():
             raise e
 
         # one Showdown server per environment thread
-        n_servers = config.n_envs
+        n_servers = training.n_envs
 
         # clean up other processes occupying the port
         for i in range(n_servers):
@@ -519,34 +527,34 @@ def main():
         logging.info("All showdown servers are ready.")
 
         envs = []
-        for i in range(config.n_envs):
+        for i in range(training.n_envs):
             envs.append(
                 SimEnv.build_env(
                     env_id=i,
                     server_port=8000 + i,
-                    team_pool=config.team_pool,
-                    opponent_team_pool=config.opponent_team_pool,
+                    team_pool=environment.team_pool,
+                    opponent_team_pool=environment.opponent_team_pool,
                 )
             )
             time.sleep(0.1)
 
         vec_env = ThreadVecEnv(envs)
         buffer = RolloutBuffer()
-        scheduler = PPOScheduler(config)
+        scheduler = PPOScheduler(training)
 
-        config.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        config.pool_dir.mkdir(parents=True, exist_ok=True)
+        paths.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        paths.pool_dir.mkdir(parents=True, exist_ok=True)
 
-        tb_writer = SummaryWriter(log_dir=str(config.runs_dir / "ppo_training"))
+        tb_writer = SummaryWriter(log_dir=str(paths.runs_dir / "ppo_training"))
 
-        start = load_checkpoint(config.checkpoint_path, policy, optimizer, scaler=scaler)
+        start = load_checkpoint(paths.checkpoint_path, policy, optimizer, scaler=scaler)
         if start is not None:
             logging.info(f"Resuming training from episode {start + 1}")
         else:
             logging.info("No checkpoint found. Starting from random initialization.")
             start = 0
 
-        pool = OpponentPool.load_or_create(config.pool_dir, config)
+        pool = OpponentPool.load_or_create(paths.pool_dir, pool_config)
         if len(pool) == 0 or pool.shadow_id is None:
             logging.info("Opponent pool empty, seeding with current policy as ep0")
             pool.set_shadow(policy)
@@ -558,13 +566,13 @@ def main():
         from src.train.rollout import create_trajectory_buffers
 
         vec_env.reset()
-        state1 = policy.initial_state(config.n_envs)
-        state2 = policy.initial_state(config.n_envs)
+        state1 = policy.initial_state(training.n_envs)
+        state2 = policy.initial_state(training.n_envs)
 
-        trajectories1 = create_trajectory_buffers(config.n_envs)
-        trajectories2 = create_trajectory_buffers(config.n_envs)
+        trajectories1 = create_trajectory_buffers(training.n_envs)
+        trajectories2 = create_trajectory_buffers(training.n_envs)
         active_pool_policies = {}
-        partition = build_partition(config, pool, policy.device)
+        partition = build_partition(training, pool, policy.device)
 
         with torch.no_grad():
             state2 = state2.clone()
@@ -575,16 +583,16 @@ def main():
                     group_idx.numel()
                 )
 
-        for episode in range(start, config.num_episodes):
+        for episode in range(start, training.num_episodes):
             if shutdown_requested:
                 logging.warning("Shutdown requested, saving checkpoint and exiting")
-                save_checkpoint(config.checkpoint_path, episode, policy, optimizer, scaler=scaler)
+                save_checkpoint(paths.checkpoint_path, episode, policy, optimizer, scaler=scaler)
                 break
 
             lr = scheduler.lr(episode)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
-            config.entropy_coef = scheduler.entropy_coef(episode)
+            entropy_coef = scheduler.entropy_coef(episode)
 
             buffer.reset()
             policy.eval()
@@ -595,7 +603,7 @@ def main():
                 policy,
                 buffer,
                 pool,
-                config,
+                training,
                 active_pool_policies,
                 trajectories1,
                 trajectories2,
@@ -616,21 +624,22 @@ def main():
             avg_traj_length = sum(ep["length"] for ep in buffer.trajectories) / num_trajectories
             avg_traj_time = rollout_time / num_trajectories
 
-            rollout_data = buffer.get_batches(policy.device, config)
+            rollout_data = buffer.get_batches(policy.device, training)
             stats = ppo_update(
                 rollout_data,
                 policy,
                 optimizer,
                 scaler,
-                config,
+                training,
                 episode,
+                entropy_coef,
                 shutdown_requested,
             )
 
             # Keep shadow model trailing the active policy every step
             pool.update_shadow(policy)
 
-            if (episode + 1) % config.snapshot_interval == 0:
+            if (episode + 1) % pool_config.snapshot_interval == 0:
                 snap_id = f"ep{episode + 1}"
                 added = pool.add(policy, snap_id)
                 if added:
@@ -647,7 +656,7 @@ def main():
                 pool.save_state()
 
             current_lr = optimizer.param_groups[0]["lr"]
-            is_warmup = episode < config.warmup_episodes
+            is_warmup = episode < training.warmup_episodes
             tag = "Warmup" if is_warmup else "Train"
 
             tb_writer.add_scalar(f"{tag}/WinRate/Pool", pool_wr, episode + 1)
@@ -681,7 +690,7 @@ def main():
 
             # slightly shorter list of things logged to the screen.
             logging.info(
-                f"Ep {episode + 1}/{config.num_episodes} ({tag[:1]}) | "
+                f"Ep {episode + 1}/{training.num_episodes} ({tag[:1]}) | "
                 f"Pi: {stats['policy_loss']:.4f} | "
                 f"V: {stats['value_loss']:.4f} | "
                 f"NormEnt: {stats['normalized_entropy']:.2%} | "
@@ -693,7 +702,7 @@ def main():
 
             if (episode + 1) % 10 == 0:
                 save_checkpoint(
-                    config.checkpoint_path, episode + 1, policy, optimizer, scaler=scaler
+                    paths.checkpoint_path, episode + 1, policy, optimizer, scaler=scaler
                 )
                 logging.info("Checkpoint saved.")
 

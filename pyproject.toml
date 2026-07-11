@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.21.6",
     "gymnasium>=0.26.3",
     "tensorboard>=2.20.0",
+    "omegaconf>=2.3.0",
 ]
 
 [project.optional-dependencies]

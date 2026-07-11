@@ -7,7 +7,7 @@ import torch
 
 from src.model.policy import PolicyNet
 from src.model.structured_observation import StructuredObservation
-from src.train.config import PPOConfig
+from src.train.config import PoolConfig
 
 INIT_WR = 0.5
 SHADOW_ID = "shadow"
@@ -42,7 +42,7 @@ def _js_divergence(p: torch.Tensor, q: torch.Tensor) -> float:
 
 
 class OpponentPool:
-    def __init__(self, pool_dir: Path, config: PPOConfig):
+    def __init__(self, pool_dir: Path, config: PoolConfig):
         self.pool_dir = pool_dir
         self.pool_dir.mkdir(parents=True, exist_ok=True)
         self.config = config
@@ -394,7 +394,7 @@ class OpponentPool:
             self.games.setdefault(opponent_id, 0)
 
     @classmethod
-    def load_or_create(cls, pool_dir: Path, config: PPOConfig) -> Self:
+    def load_or_create(cls, pool_dir: Path, config: PoolConfig) -> Self:
         """Load an existing pool from disk, or create an empty one."""
         pool = cls(pool_dir, config)
         pool._load_state()
