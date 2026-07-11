@@ -1,21 +1,21 @@
 {
   "action_schema_version": "champions-mega-v1",
-  "champions_dex_sha256": "",
+  "champions_dex_sha256": "72c56249fc2b8080331c575bb8fb1a56c8b75e8ee7377b6483bbe8efb7e546d0",
   "event_schema_version": 1,
   "format": {
     "action_schema": "champions-mega-v1",
-    "battle_format": "gen9championsvgc2026regma",
-    "bo3_format": "gen9championsvgc2026regmabo3",
+    "action_size": 49,
+    "battle_format": "gen9championsvgc2026regmb",
+    "bo3_format": "gen9championsvgc2026regmbbo3",
     "generation": 9,
     "mod": "champions",
-    "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac",
-    "action_size": 49
+    "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
   },
   "format_spec_version": 1,
   "model_config": {},
   "observation_schema_version": 1,
   "replay_compiler_version": 0,
   "stat_point_imputer_version": 0,
-  "vocab_sha256": "e0e6e5001f28d42bf7d8e8c0b0956003986ebef6d045d9fa1c4a56b47a4a7361",
-  "vocab_version": 1
+  "vocab_schema_version": 1,
+  "vocab_sha256": "b87940610c75e13611340d2114862ba02077a494beca246b5f013055be99519e"
 }

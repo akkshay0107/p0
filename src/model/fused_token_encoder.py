@@ -58,29 +58,72 @@ def _load_vocab_sizes() -> dict[str, int]:
     return {name: len(values) + 1 for name, values in vocab.items()}
 
 
-MOVE_STATIC_WIDTH = 4  # base power, max pp, priority, accuracy
+MOVE_STATIC_WIDTH = 8  # power, PP, priority, accuracy, target, spread, protect, self-switch
 MOVE_DYNAMIC_WIDTH = 3  # pp fraction, last-move flag, legal-this-step
+SPECIES_STATIC_WIDTH = 9  # six base stats, weight, mega flag, forme relationship
+
+_TARGET_CLASS_IDS = {
+    "self": 0.1,
+    "adjacentally": 0.2,
+    "adjacentfoe": 0.3,
+    "normal": 0.4,
+    "any": 0.5,
+    "all": 0.6,
+    "alladjacent": 0.7,
+    "alladjacentfoes": 0.8,
+    "foeaside": 0.9,
+    "scripted": 1.0,
+}
+
+
+def _load_species_statics() -> torch.Tensor:
+    root = Path(__file__).resolve().parents[2]
+    with (root / "data" / "vocab.json").open("r", encoding="utf-8") as f:
+        species_vocab = json.load(f)["species"]
+    with (root / "data" / "champions_dex.json").open("r", encoding="utf-8") as f:
+        dex_species = {entry["id"]: entry for entry in json.load(f)["species"]}
+
+    table = torch.zeros(len(species_vocab) + 1, SPECIES_STATIC_WIDTH)
+    for name, idx in species_vocab.items():
+        species = dex_species.get(name)
+        if species is None:
+            raise ValueError(f"Missing Champions mechanics for vocabulary species: {name}")
+        stats = species.get("baseStats", {})
+        for offset, stat in enumerate(("hp", "atk", "def", "spa", "spd", "spe")):
+            table[idx, offset] = float(stats.get(stat, 0)) / 255.0
+        table[idx, 6] = float(species.get("weightkg", 0.0) or 0.0) / 1000.0
+        table[idx, 7] = float(bool(species.get("isMega")))
+        table[idx, 8] = float(bool(species.get("baseSpecies") and species.get("baseSpecies") != species.get("name")))
+    return table
 
 
 def _load_move_statics() -> torch.Tensor:
     """Static per-move scalars indexed by vocab move id (row 0 = padding)."""
-    from poke_env.battle.move import Move
-
-    path = Path(__file__).resolve().parents[2] / "data" / "vocab.json"
-    with path.open("r", encoding="utf-8") as f:
+    root = Path(__file__).resolve().parents[2]
+    with (root / "data" / "vocab.json").open("r", encoding="utf-8") as f:
         moves_vocab = json.load(f)["moves"]
+    with (root / "data" / "champions_dex.json").open("r", encoding="utf-8") as f:
+        dex_moves = {entry["id"]: entry for entry in json.load(f)["moves"]}
 
     table = torch.zeros(len(moves_vocab) + 1, MOVE_STATIC_WIDTH)
     for name, idx in moves_vocab.items():
-        try:
-            move = Move(name, gen=9)
-            table[idx, 0] = move.base_power / 150.0
-            table[idx, 1] = move.max_pp / 64.0
-            table[idx, 2] = move.priority / 5.0
-            table[idx, 3] = move.accuracy  # poke-env already returns 0-1 scale
-        except Exception:
-            # pseudo-moves without full data stay zero
-            pass
+        move = dex_moves.get(name)
+        if move is None:
+            # Explicit runtime pseudo-actions are allowed to remain zero-valued;
+            # every ordinary vocabulary move must be present in the dex dump.
+            if name not in {"struggle", "recharge"}:
+                raise ValueError(f"Missing Champions mechanics for vocabulary move: {name}")
+            continue
+        table[idx, 0] = float(move.get("basePower", 0)) / 150.0
+        table[idx, 1] = float(move.get("pp", 0)) / 64.0
+        table[idx, 2] = float(move.get("priority", 0)) / 5.0
+        accuracy = move.get("accuracy", 100)
+        table[idx, 3] = float(accuracy) / 100.0 if isinstance(accuracy, (int, float)) else 0.0
+        table[idx, 4] = _TARGET_CLASS_IDS.get(str(move.get("target", "")).lower(), 0.0)
+        table[idx, 5] = float(bool(move.get("spreadHit")))
+        flags = move.get("flags", {})
+        table[idx, 6] = float(bool(flags.get("protect")))
+        table[idx, 7] = float(bool(move.get("selfSwitch")))
     return table
 
 
@@ -144,6 +187,7 @@ class FusedTokenEncoder(nn.Module):
         self.nature_emb = nn.Embedding(25, d_raw)
 
         self.species_proj = nn.Linear(d_raw, d_model)
+        self.species_static_proj = nn.Linear(SPECIES_STATIC_WIDTH, d_model)
         self.ability_proj = nn.Linear(d_raw, d_model)
         self.item_proj = nn.Linear(d_raw, d_model)
         self.status_proj = nn.Linear(d_raw, d_model)
@@ -196,6 +240,7 @@ class FusedTokenEncoder(nn.Module):
 
         # cache component ids instead of creating them every forward pass
         self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
+        self.register_buffer("_species_statics", _load_species_statics())
         self.register_buffer("_move_statics", _load_move_statics())
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
@@ -241,7 +286,9 @@ class FusedTokenEncoder(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # see _pokemon_categorical in observation_builder
         # for the order of the categorical features
-        species = self.species_proj(self.species_emb(categorical[..., 0]))
+        species_ids = categorical[..., 0]
+        species = self.species_proj(self.species_emb(species_ids))
+        species = species + self.species_static_proj(self._species_statics[species_ids])
         ability = self.ability_proj(self.ability_emb(categorical[..., 1]))
         item = self.item_proj(self.item_emb(categorical[..., 2]))
 

@@ -34,8 +34,8 @@ def test_tokenizer_id_for():
 
 def test_tokenizer_status_id():
     """Verify Status enum translation mapped to vocab values."""
-    assert tokenizer.status_id(Status.BRN) == 1
-    assert tokenizer.status_id(Status.SLP) == 5
+    assert tokenizer.status_id(Status.BRN) == tokenizer.status[Status.BRN]
+    assert tokenizer.status_id(Status.SLP) == tokenizer.status[Status.SLP]
     assert tokenizer.status_id(None) == 0
     # Test unrecognized/invalid status (not in vocab mapping)
     assert tokenizer.status_id(cast(Status, "UNKNOWN_STATUS")) == 0
@@ -46,13 +46,15 @@ def test_tokenizer_volatile_ids():
     assert tokenizer.volatile_ids(None) == [0] * 6
     assert tokenizer.volatile_ids({}) == [0] * 6
 
-    # CONFUSION -> 1, THROAT_CHOP -> 5, ENCORE -> 3
-    # Sorted unique active: [1, 3, 5], padded: [1, 3, 5, 0, 0, 0]
+    expected = sorted(
+        tokenizer.vocab["volatiles"][name]
+        for name in ("confusion", "throatchop", "encore")
+    )
     effects = {Effect.THROAT_CHOP: 1, Effect.CONFUSION: 1, Effect.ENCORE: 1}
-    assert tokenizer.volatile_ids(effects) == [1, 3, 5, 0, 0, 0]
+    assert tokenizer.volatile_ids(effects) == expected + [0, 0, 0]
 
     effects_dup = {Effect.CONFUSION: 1}
-    assert tokenizer.volatile_ids(effects_dup) == [1, 0, 0, 0, 0, 0]
+    assert tokenizer.volatile_ids(effects_dup) == [tokenizer.vocab["volatiles"]["confusion"], 0, 0, 0, 0, 0]
 
     custom_vocab = {
         "volatiles": {
@@ -86,7 +88,7 @@ def test_tokenizer_pokemon_attributes():
     """Verify species, ability, item, type, and move attributes parsing using real poke_env objects."""
 
     p1 = Pokemon(gen=9, species="archaludon")
-    assert tokenizer.species_id(p1) == 3
+    assert tokenizer.species_id(p1) == tokenizer.vocab["species"]["archaludon"]
 
     class FallbackPokemon(Pokemon):
         @property
@@ -98,30 +100,30 @@ def test_tokenizer_pokemon_attributes():
             return "charizard"
 
     p2 = FallbackPokemon(gen=9, species="charizard")
-    assert tokenizer.species_id(p2) == 8
+    assert tokenizer.species_id(p2) == tokenizer.vocab["species"]["charizard"]
     assert tokenizer.species_id(None) == 0
 
     p3 = Pokemon(gen=9, species="charizard")
     p3._ability = "intimidate"
-    assert tokenizer.ability_id(p3) == 14
+    assert tokenizer.ability_id(p3) == tokenizer.vocab["abilities"]["intimidate"]
     assert tokenizer.ability_id(None) == 0
 
     p4 = Pokemon(gen=9, species="charizard")
     p4._item = "choicescarf"
-    assert tokenizer.item_id(p4) == 5
+    assert tokenizer.item_id(p4) == tokenizer.vocab["items"]["choicescarf"]
     assert tokenizer.item_id(None) == 0
 
-    assert tokenizer.type_id(PokemonType.FIRE) == 2
-    assert tokenizer.type_id(PokemonType.WATER) == 3
+    assert tokenizer.type_id(PokemonType.FIRE) == tokenizer.vocab["types"]["fire"]
+    assert tokenizer.type_id(PokemonType.WATER) == tokenizer.vocab["types"]["water"]
     assert tokenizer.type_id(None) == 0
 
     m1 = Move("closecombat", 9)
-    assert tokenizer.move_id(m1) == 11
+    assert tokenizer.move_id(m1) == tokenizer.vocab["moves"]["closecombat"]
     m_aquajet = Move("aquajet", 9)
-    assert tokenizer.move_id(m_aquajet) == 2
+    assert tokenizer.move_id(m_aquajet) == tokenizer.vocab["moves"]["aquajet"]
     assert tokenizer.move_id(None) == 0
 
-    assert tokenizer.move_type_id(m1) == 7
+    assert tokenizer.move_type_id(m1) == tokenizer.vocab["types"]["fighting"]
     assert tokenizer.move_type_id(None) == 0
 
     m2 = Move("thunderbolt", 9)

@@ -72,51 +72,51 @@ class PokemonTokenizer:
         for nature in ("serious", "bashful", "docile", "hardy", "quirky"):
             self.natures[nature] = 0
 
-        # map enum directly to id
+        # Resolve enum members from their normalized names. Legacy aliases are
+        # retained because the first observation schema used shorter weather
+        # names and separate Toxic Spikes layer IDs.
         self._volatiles_str = vocab.get("volatiles", {})
         self.volatiles = {
-            effect_enum: self._volatiles_str.get(effect_str, 0)
-            for effect_enum, effect_str in {
-                Effect.CONFUSION: "confusion",
-                Effect.DISABLE: "disable",
-                Effect.ENCORE: "encore",
-                Effect.LEECH_SEED: "leechseed",
-                Effect.THROAT_CHOP: "throatchop",
-            }.items()
+            effect: self._enum_vocab_id(self._volatiles_str, effect, {effect.name: effect.name})
+            for effect in Effect
         }
 
         self._side_conditions_str = vocab.get("side_conditions", {})
         self.side_conditions = {
-            SideCondition.TAILWIND: self._side_conditions_str.get("tailwind", 0),
-            SideCondition.AURORA_VEIL: self._side_conditions_str.get("auroraveil", 0),
-            SideCondition.TOXIC_SPIKES: {
-                1: self._side_conditions_str.get("toxicspikes1", 0),
-                2: self._side_conditions_str.get("toxicspikes2", 0),
-            },
+            condition: self._enum_vocab_id(self._side_conditions_str, condition, {condition.name: condition.name})
+            for condition in SideCondition
+        }
+        self.side_conditions[SideCondition.TOXIC_SPIKES] = {
+            1: self._side_conditions_str.get("toxicspikes1", self.side_conditions.get(SideCondition.TOXIC_SPIKES, 0)),
+            2: self._side_conditions_str.get("toxicspikes2", self.side_conditions.get(SideCondition.TOXIC_SPIKES, 0)),
         }
 
         _weathers_str = vocab.get("weathers", {})
         self.weathers = {
-            weather_enum: _weathers_str.get(weather_str, 0)
-            for weather_enum, weather_str in {
-                Weather.RAINDANCE: "rain",
-                Weather.SUNNYDAY: "sun",
-                Weather.SANDSTORM: "sand",
-                Weather.SNOW: "snow",
-            }.items()
+            weather: self._enum_vocab_id(
+                _weathers_str,
+                weather,
+                {
+                    Weather.RAINDANCE.name: "rain",
+                    Weather.SUNNYDAY.name: "sun",
+                    Weather.SANDSTORM.name: "sand",
+                    Weather.SNOW.name: "snow",
+                },
+            )
+            for weather in Weather
         }
 
         _status_str = vocab.get("status", {})
         self.status = {
-            status_enum: _status_str.get(status_str, 0)
-            for status_enum, status_str in {
-                Status.BRN: "burn",
-                Status.FRZ: "freeze",
-                Status.PAR: "paralysis",
-                Status.PSN: "poison",
-                Status.SLP: "sleep",
-                Status.TOX: "toxic",
-            }.items()
+            status: self._enum_vocab_id(_status_str, status, {
+                Status.BRN.name: "burn",
+                Status.FRZ.name: "freeze",
+                Status.PAR.name: "paralysis",
+                Status.PSN.name: "poison",
+                Status.SLP.name: "sleep",
+                Status.TOX.name: "toxic",
+            })
+            for status in Status
         }
 
         _types_str = vocab.get("types", {})
@@ -149,6 +149,24 @@ class PokemonTokenizer:
         if name is None:
             return ""
         return PokemonTokenizer._cached_normalize(name)
+
+    @classmethod
+    def _enum_vocab_id(
+        cls,
+        table: dict[str, int],
+        member: object,
+        aliases: dict[str, str] | None = None,
+    ) -> int:
+        name = getattr(member, "name", str(member))
+        candidates = []
+        if aliases and name in aliases:
+            candidates.append(aliases[name])
+        candidates.append(name)
+        for candidate in candidates:
+            value = table.get(cls.normalize_id(candidate))
+            if value is not None:
+                return value
+        return 0
 
     def id_for(self, table: str, name: str | None) -> int:
         # Keep the legacy hot path allocation-free. Call resolve only when
@@ -183,11 +201,7 @@ class PokemonTokenizer:
 
         ids = []
         for effect in effects.keys():
-            idx = self.volatiles.get(effect)
-            if idx is None:
-                # fallback for unrecognized effects (for now since vocab not finalized)
-                name = self.normalize_id(effect.name)
-                idx = self._volatiles_str.get(name, 0)
+            idx = self.volatiles.get(effect, self._enum_vocab_id(self._volatiles_str, effect))
 
             if idx:
                 ids.append(idx)

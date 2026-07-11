@@ -12,7 +12,7 @@ FORMAT_SPEC_VERSION = 1
 OBSERVATION_SCHEMA_VERSION = 1
 ACTION_SCHEMA_VERSION = "champions-mega-v1"
 EVENT_SCHEMA_VERSION = 1
-VOCAB_VERSION = 1
+VOCAB_SCHEMA_VERSION = 1
 STAT_POINT_IMPUTER_VERSION = 0
 REPLAY_COMPILER_VERSION = 0
 
@@ -23,7 +23,7 @@ MANIFEST_FIELDS = frozenset(
         "observation_schema_version",
         "action_schema_version",
         "event_schema_version",
-        "vocab_version",
+        "vocab_schema_version",
         "vocab_sha256",
         "champions_dex_sha256",
         "stat_point_imputer_version",
@@ -46,8 +46,8 @@ FORMAT_FIELDS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class FormatSpec:
-    battle_format: str = "gen9championsvgc2026regma"
-    bo3_format: str = "gen9championsvgc2026regmabo3"
+    battle_format: str = "gen9championsvgc2026regmb"
+    bo3_format: str = "gen9championsvgc2026regmbbo3"
     showdown_commit: str = "8282e63102fa824fd2f7472778ec09793ceb7cac"
     generation: int = 9
     mod: str = "champions"
@@ -81,7 +81,7 @@ class RuntimeManifest:
     observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
     action_schema_version: str = ACTION_SCHEMA_VERSION
     event_schema_version: int = EVENT_SCHEMA_VERSION
-    vocab_version: int = VOCAB_VERSION
+    vocab_schema_version: int = VOCAB_SCHEMA_VERSION
     vocab_sha256: str = ""
     champions_dex_sha256: str = ""
     stat_point_imputer_version: int = STAT_POINT_IMPUTER_VERSION
