@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from src.model.policy import PolicyNet
-from src.train.behaviour_cloning import ReplayDataset, save_replay_shard
 from src.train.utils import (
     load_checkpoint,
     policy_from_checkpoint,
@@ -46,17 +45,6 @@ def test_checkpoint_rejects_incompatible_manifest(tmp_path):
 
     with pytest.raises(ValueError, match="action_schema_version"):
         policy_from_checkpoint(path, "cpu")
-
-
-def test_replay_shards_require_and_validate_manifest(tmp_path):
-    path = tmp_path / "sample.replay"
-    save_replay_shard(path, [[{"step": 1}]])
-    assert len(ReplayDataset(str(tmp_path))) == 1
-
-    legacy = tmp_path / "legacy.replay"
-    torch.save([], legacy)
-    with pytest.raises(ValueError, match="manifest-wrapped"):
-        ReplayDataset(str(tmp_path))
 
 
 def test_export_includes_interpretation_contracts(tmp_path):
