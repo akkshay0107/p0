@@ -32,7 +32,15 @@ MANIFEST_FIELDS = frozenset(
     }
 )
 FORMAT_FIELDS = frozenset(
-    {"battle_format", "bo3_format", "showdown_commit", "generation", "mod", "action_schema"}
+    {
+        "battle_format",
+        "bo3_format",
+        "showdown_commit",
+        "generation",
+        "mod",
+        "action_schema",
+        "action_size",
+    }
 )
 
 
@@ -44,6 +52,7 @@ class FormatSpec:
     generation: int = 9
     mod: str = "champions"
     action_schema: str = ACTION_SCHEMA_VERSION
+    action_size: int = 49
 
 
 FORMAT = FormatSpec()

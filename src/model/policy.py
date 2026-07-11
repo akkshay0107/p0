@@ -9,7 +9,7 @@ import torch.nn.init as init
 from torch import Tensor
 from torch.distributions import Categorical
 
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.cls_reducer import CLSReducer
 from src.model.fused_token_encoder import FusedTokenEncoder
 from src.model.structured_observation import (
@@ -25,6 +25,8 @@ from src.model.structured_observation import (
     StructuredObservation,
     is_teampreview,
 )
+
+ACT_SIZE = FORMAT.action_size
 
 # Only these entities are ever pointed at: the 6 allies (switch/TP/ally targets)
 # and the 2 opponent actives (move targets). Opponent bench rows get no keys.

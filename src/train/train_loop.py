@@ -7,7 +7,6 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Callable, cast
 
 import torch
@@ -17,9 +16,11 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from src.env import SimEnv
-from src.lookups import ACT_SIZE, OBS_DIM
+from src.format_config import FORMAT
 from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
     TOKEN_IDX_GLOBAL_FIELD_NUMERIC,
     StructuredObservation,
     is_teampreview,
@@ -36,6 +37,8 @@ from src.train.utils import (
     save_checkpoint,
 )
 from src.train.vec_env import ThreadVecEnv
+
+ACT_SIZE = FORMAT.action_size
 
 
 def handle_sigterm(signum, frame):
@@ -444,7 +447,7 @@ def main():
     policy = (
         policy_from_checkpoint(paths.checkpoint_path, device)
         if paths.checkpoint_path.exists()
-        else PolicyNet(obs_dim=OBS_DIM, act_size=ACT_SIZE).to(device)
+        else PolicyNet(obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH), act_size=ACT_SIZE).to(device)
     )
 
     if training.enable_optim and device.type == "cuda":

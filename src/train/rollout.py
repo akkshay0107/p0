@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.policy import PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -18,6 +18,7 @@ from src.train.config import TrainingConfig
 from src.train.opponent_pool import OpponentPool
 from src.train.vec_env import ThreadVecEnv
 
+ACT_SIZE = FORMAT.action_size
 MAX_TRAJECTORY_STEPS = 200
 
 

@@ -6,13 +6,15 @@ import torch
 from poke_env.battle import DoubleBattle
 
 from src.env import MegaEnv
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.policy import PolicyNet
 from src.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
 )
+
+ACT_SIZE = FORMAT.action_size
 
 
 def test_struggle_env_roundtrip():

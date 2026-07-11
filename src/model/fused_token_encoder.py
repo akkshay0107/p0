@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.event_builder import EVENT_TYPE_COUNT
 from src.model.structured_observation import (
     ALLY_NUM_TOKENS,
@@ -28,6 +28,8 @@ from src.model.structured_observation import (
     TokenType,
 )
 from src.model.swiglu_encoder import SwiGLUTransformerEncoder
+
+ACT_SIZE = FORMAT.action_size
 
 NUM_COMPONENTS = 11
 NUM_TOKEN_TYPES = 6

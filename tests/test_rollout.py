@@ -4,7 +4,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.policy import ActOutput
 from src.model.structured_observation import StructuredObservation
 from src.train.config import TrainingConfig
@@ -16,6 +16,8 @@ from src.train.rollout import (
     create_trajectory_buffers,
 )
 from src.train.vec_env import ThreadVecEnv
+
+ACT_SIZE = FORMAT.action_size
 
 
 class FakePolicy:

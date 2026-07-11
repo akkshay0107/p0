@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.policy import EncodedObs, PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -10,6 +10,8 @@ from src.model.structured_observation import (
     SEQUENCE_LENGTH,
     StructuredObservation,
 )
+
+ACT_SIZE = FORMAT.action_size
 
 
 @pytest.fixture

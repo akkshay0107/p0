@@ -14,12 +14,13 @@ from poke_env.player import DefaultBattleOrder, Player
 
 from src.env import MegaEnv
 from src.format_config import FORMAT
-from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.policy import PolicyNet
 from src.team_picker import RandomTeamFromPool, load_team_pool
 from src.train.config import load_config
 from src.train.utils import load_checkpoint, policy_from_checkpoint
+
+ACT_SIZE = FORMAT.action_size
 
 
 class RLPlayer(Player):

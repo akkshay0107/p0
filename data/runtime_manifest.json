@@ -8,7 +8,8 @@
     "bo3_format": "gen9championsvgc2026regmabo3",
     "generation": 9,
     "mod": "champions",
-    "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
+    "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac",
+    "action_size": 49
   },
   "format_spec_version": 1,
   "model_config": {},

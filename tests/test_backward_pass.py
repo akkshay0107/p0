@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.policy import PolicyNet
 from src.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -16,6 +16,8 @@ from src.model.structured_observation import (
 )
 from src.train.config import TrainingConfig
 from src.train.train_loop import _run_batched_ppo
+
+ACT_SIZE = FORMAT.action_size
 
 
 @pytest.fixture

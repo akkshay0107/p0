@@ -26,11 +26,12 @@ from poke_env.ps_client import (
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import Teambuilder
 
-from src.lookups import ACT_SIZE
 from src.model import observation_builder
 from src.model.structured_observation import StructuredObservation
 from src.format_config import FORMAT
 from src.team_picker import load_team_pool
+
+ACT_SIZE = FORMAT.action_size
 
 
 # patch poke_env's PSClient to avoid login timeouts

@@ -4,10 +4,12 @@ import numpy as np
 import torch
 
 from src.env import SimEnv
-from src.lookups import ACT_SIZE
+from src.format_config import FORMAT
 from src.model.structured_observation import (
     StructuredObservation,
 )
+
+ACT_SIZE = FORMAT.action_size
 
 
 class ThreadVecEnv:
