@@ -65,7 +65,7 @@ def test_encoder_batches_all_pokemon_in_one_fusion_call(policy_net):
     finally:
         handle.remove()
 
-    assert calls == [(B * 12, 12, 128)]
+    assert calls == [(B * 12, 11, 128)]
 
     with torch.no_grad():
         separate = [policy_net.encode(obs[i : i + 1], action_mask[i : i + 1]) for i in range(B)]

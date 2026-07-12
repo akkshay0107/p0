@@ -11,11 +11,17 @@ from src.format_config import FORMAT
 from src.model.event_builder import EVENT_TYPE_COUNT
 from src.model.structured_observation import (
     ALLY_NUM_TOKENS,
+    CAT_EFFECT_START,
+    CAT_KNOWNNESS_START,
+    CAT_KNOWNNESS_WIDTH,
     CATEGORICAL_WIDTH,
-    EVENT_COUNT,
+    EFFECT_CATEGORICAL_WIDTH,
+    EFFECT_NUMERICAL_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     EVENT_ORDER_VOCAB_SIZE,
+    MAX_EFFECTS,
     MOVE_SLOTS,
+    NUM_EFFECT_START,
     NUM_IDX_MOVE_LAST,
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_MOVE_PP,
@@ -32,7 +38,7 @@ from src.model.swiglu_encoder import SwiGLUTransformerEncoder
 ACT_SIZE = FORMAT.action_size
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 
-NUM_COMPONENTS = 11
+NUM_COMPONENTS = 10
 NUM_TOKEN_TYPES = 6
 NUM_SIDES = 3
 NUM_SLOTS = 7
@@ -203,6 +209,8 @@ class FusedTokenEncoder(nn.Module):
     _numeric_pos: torch.Tensor
     _field_numeric_pos: torch.Tensor
     _active_num_pos: torch.Tensor
+    _effect_super_pos: torch.Tensor
+    _effect_numeric_pos: torch.Tensor
     _component_ids: torch.Tensor
     _species_statics: torch.Tensor
     _move_statics: torch.Tensor
@@ -227,12 +235,14 @@ class FusedTokenEncoder(nn.Module):
         self.type_emb = nn.Embedding(sizes["types"], d_raw)
         self.category_emb = nn.Embedding(sizes["categories"], d_raw)
         self.status_emb = nn.Embedding(sizes["status"], d_raw)
-        self.volatile_emb = nn.Embedding(sizes["volatiles"], d_raw)
-
-        self.weather_emb = nn.Embedding(sizes["weathers"], d_raw)
-        self.trickroom_emb = nn.Embedding(sizes["trickroom"], d_raw)
-        self.side_condition_emb = nn.Embedding(sizes["side_conditions"], d_raw)
         self.nature_emb = nn.Embedding(25, d_raw)
+        effect_vocab_size = max(
+            sizes["volatiles"], sizes["side_conditions"], sizes["fields"], sizes["weathers"]
+        )
+        self.effect_emb = nn.Embedding(effect_vocab_size, d_raw)
+        self.counter_kind_emb = nn.Embedding(5, 16)
+        self.effect_namespace_emb = nn.Embedding(5, 16)
+        self.knownness_emb = nn.Embedding(5, 16)
 
         self.species_proj = nn.Linear(d_raw, d_model)
         self.species_static_proj = nn.Linear(SPECIES_STATIC_WIDTH, d_model)
@@ -246,12 +256,9 @@ class FusedTokenEncoder(nn.Module):
         self.register_buffer("_item_mechanic_tags", item_tags)
         self.register_buffer("_ability_mechanic_tags", ability_tags)
         self.status_proj = nn.Linear(d_raw, d_model)
-        self.weather_proj = nn.Linear(d_raw, d_model)
-        self.trickroom_proj = nn.Linear(d_raw, d_model)
         self.nature_proj = nn.Linear(d_raw, d_model)
-
-        self.volatile_set = MultiAggDeepSet(d_raw, d_model)
-        self.side_condition_set = MultiAggDeepSet(d_raw, d_model)
+        self.typed_effect_set = MultiAggDeepSet(d_raw + 16 + 16 + EFFECT_NUMERICAL_WIDTH, d_model)
+        self.knownness_proj = nn.Linear(CAT_KNOWNNESS_WIDTH * 16, d_model)
 
         self.component_emb = nn.Embedding(NUM_COMPONENTS, d_model)
         self.move_pos_emb = nn.Embedding(4, d_model)
@@ -261,7 +268,8 @@ class FusedTokenEncoder(nn.Module):
 
         self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_model)
         self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_model)
-        self.event_proj = nn.Linear(3 * d_raw + EVENT_NUMERICAL_WIDTH, d_model)
+        self.event_flag_emb = nn.Embedding(8, d_model)
+        self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_model)
 
         # each move gets a move embedding, a type embedding, a category embedding,
         # and a static scalar vector (base power, max pp, priority, accuracy)
@@ -305,6 +313,22 @@ class FusedTokenEncoder(nn.Module):
             "_field_numeric_pos", torch.tensor(_FIELD_NUMERIC_POS, dtype=torch.long)
         )
         self.register_buffer("_active_num_pos", torch.tensor(ALLY_NUM_TOKENS[:2], dtype=torch.long))
+        self.register_buffer(
+            "_effect_super_pos",
+            torch.tensor(
+                _SUPER_POS
+                + (
+                    TOKEN_IDX_GLOBAL_FIELD_SUPER,
+                    TOKEN_IDX_ALLY_SIDE_SUPER,
+                    TOKEN_IDX_OPPONENT_SIDE_SUPER,
+                ),
+                dtype=torch.long,
+            ),
+        )
+        self.register_buffer(
+            "_effect_numeric_pos",
+            torch.tensor(_NUMERIC_POS + _FIELD_NUMERIC_POS, dtype=torch.long),
+        )
         self._init_weights()
 
     @torch.no_grad()
@@ -371,11 +395,6 @@ class FusedTokenEncoder(nn.Module):
 
         status = self.status_proj(self.status_emb(categorical[..., 17]))
 
-        # masked multi-agg over volatile slots; zero-vector when no volatiles present
-        v_cat = categorical[..., 18:24]
-        v_mask = v_cat != 0
-        volatile = self.volatile_set(self.volatile_emb(v_cat), mask=v_mask)
-
         nature = self.nature_proj(self.nature_emb(categorical[..., 24]))
 
         # combine all components into (N, NUM_COMPONENTS, d_model)
@@ -388,7 +407,6 @@ class FusedTokenEncoder(nn.Module):
                 type_summary.unsqueeze(-2),
                 move_embs,
                 status.unsqueeze(-2),
-                volatile.unsqueeze(-2),
                 nature.unsqueeze(-2),
             ],
             dim=-2,
@@ -408,17 +426,25 @@ class FusedTokenEncoder(nn.Module):
         super_token, _ = self._embed_pokemon_components(categorical)
         return super_token
 
-    def _embed_global_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
-        """Returns the categorical-side embedding only (numeric added in forward)."""
-        weather_emb = self.weather_proj(self.weather_emb(categorical[..., 0]))
-        trickroom_emb = self.trickroom_proj(self.trickroom_emb(categorical[..., 1]))
-        return weather_emb + trickroom_emb
-
-    def _embed_side_field_cond(self, categorical: torch.Tensor) -> torch.Tensor:
-        """Returns the categorical-side embedding only (numeric added in forward)."""
-        s_cat = categorical[..., :4]
-        s_mask = s_cat != 0
-        return self.side_condition_set(self.side_condition_emb(s_cat), mask=s_mask)
+    def _embed_typed_effects(
+        self, categorical: torch.Tensor, numerical: torch.Tensor
+    ) -> torch.Tensor:
+        effect_cat = categorical[..., CAT_EFFECT_START:].unflatten(
+            -1, (MAX_EFFECTS, EFFECT_CATEGORICAL_WIDTH)
+        )
+        effect_num = numerical[
+            ..., NUM_EFFECT_START : NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
+        ].unflatten(-1, (MAX_EFFECTS, EFFECT_NUMERICAL_WIDTH))
+        features = torch.cat(
+            (
+                self.effect_emb(effect_cat[..., 0]),
+                self.counter_kind_emb(effect_cat[..., 1]),
+                self.effect_namespace_emb(effect_cat[..., 2]),
+                effect_num,
+            ),
+            dim=-1,
+        )
+        return self.typed_effect_set(features, mask=effect_num[..., 0] > 0.5)
 
     def forward(
         self,
@@ -490,18 +516,21 @@ class FusedTokenEncoder(nn.Module):
             x.dtype
         )
 
-        x[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :] = self._embed_global_field_cond(
-            categorical[:, TOKEN_IDX_GLOBAL_FIELD_SUPER, :]
-        ).to(x.dtype)
-
-        x[:, (TOKEN_IDX_ALLY_SIDE_SUPER, TOKEN_IDX_OPPONENT_SIDE_SUPER), :] = (
-            self._embed_side_field_cond(
-                categorical[:, (TOKEN_IDX_ALLY_SIDE_SUPER, TOKEN_IDX_OPPONENT_SIDE_SUPER), :]
-            ).to(x.dtype)
-        )
-
         x[:, self._field_numeric_pos, :] = self.field_numeric_proj(
             numerical[:, self._field_numeric_pos, :]
+        ).to(x.dtype)
+
+        x[:, self._effect_super_pos, :] += self._embed_typed_effects(
+            categorical[:, self._effect_super_pos, :],
+            numerical[:, self._effect_numeric_pos, :],
+        ).to(x.dtype)
+        pokemon_knownness = categorical[
+            :,
+            self._super_pos,
+            CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH,
+        ]
+        x[:, self._super_pos, :] += self.knownness_proj(
+            self.knownness_emb(pokemon_knownness).flatten(-2)
         ).to(x.dtype)
 
         out_tokens = (
@@ -522,6 +551,8 @@ class FusedTokenEncoder(nn.Module):
                 self.move_emb(events_cat[..., 1]),
                 self.item_emb(events_cat[..., 2]),
                 self.status_emb(events_cat[..., 3]),
+                self.effect_emb(events_cat[..., 5]),
+                self.ability_emb(events_cat[..., 6]),
                 events_num,
             ],
             dim=-1,
@@ -534,14 +565,10 @@ class FusedTokenEncoder(nn.Module):
             + self.side_emb(events_side_ids)
             + self.slot_emb(events_slot_ids)
             + self.order_pos_emb(events_cat[..., 4])
-            + self.token_type_emb(
-                torch.full(
-                    (batch_size, EVENT_COUNT),
-                    int(TokenType.EVENT),
-                    dtype=torch.long,
-                    device=device,
-                )
-            )
+            + self.event_flag_emb(events_cat[..., 7])
+            + self.side_emb(events_cat[..., 8])
+            + self.slot_emb(events_cat[..., 9])
+            + self.token_type_emb.weight[int(TokenType.EVENT)]
         )
 
         # zero out embeddings for padded event slots to prevent slot/pos/side embedding bleeding

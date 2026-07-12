@@ -1,7 +1,6 @@
 from typing import cast
 
 from poke_env.battle import Pokemon
-from poke_env.battle.effect import Effect
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.status import Status
@@ -39,49 +38,6 @@ def test_tokenizer_status_id():
     assert tokenizer.status_id(None) == 0
     # Test unrecognized/invalid status (not in vocab mapping)
     assert tokenizer.status_id(cast(Status, "UNKNOWN_STATUS")) == 0
-
-
-def test_tokenizer_volatile_ids():
-    """Verify mapping, sorting, deduplication, truncation, and padding of volatile IDs."""
-    assert tokenizer.volatile_ids(None) == [0] * 6
-    assert tokenizer.volatile_ids({}) == [0] * 6
-
-    expected = sorted(
-        tokenizer.vocab["volatiles"][name]
-        for name in ("confusion", "throatchop", "encore")
-    )
-    effects = {Effect.THROAT_CHOP: 1, Effect.CONFUSION: 1, Effect.ENCORE: 1}
-    assert tokenizer.volatile_ids(effects) == expected + [0, 0, 0]
-
-    effects_dup = {Effect.CONFUSION: 1}
-    assert tokenizer.volatile_ids(effects_dup) == [tokenizer.vocab["volatiles"]["confusion"], 0, 0, 0, 0, 0]
-
-    custom_vocab = {
-        "volatiles": {
-            "taunt": 1,
-            "yawn": 2,
-            "nightmare": 3,
-            "infestation": 4,
-            "flinch": 5,
-            "torment": 6,
-            "healblock": 7,
-            "embargo": 8,
-        }
-    }
-    custom_tok = PokemonTokenizer(custom_vocab)
-
-    # 8 real Effect enums that normalize to the vocab keys defined above
-    dummy_effects = {
-        Effect.EMBARGO: 1,
-        Effect.HEAL_BLOCK: 1,
-        Effect.TORMENT: 1,
-        Effect.FLINCH: 1,
-        Effect.INFESTATION: 1,
-        Effect.NIGHTMARE: 1,
-        Effect.YAWN: 1,
-        Effect.TAUNT: 1,
-    }
-    assert custom_tok.volatile_ids(dummy_effects) == [1, 2, 3, 4, 5, 6]
 
 
 def test_tokenizer_pokemon_attributes():

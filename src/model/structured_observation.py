@@ -7,14 +7,28 @@ import torch
 
 TEAM_SIZE = 6
 MOVE_SLOTS = 4
-MAX_VOLATILES = 6
+MAX_EFFECTS = 16
 SEQUENCE_LENGTH = 1 + TEAM_SIZE * 2 * 2 + 3 * 2
-CATEGORICAL_WIDTH = 25
-NUMERICAL_WIDTH = 56
-EVENT_COUNT = 24
-EVENT_CATEGORICAL_WIDTH = 5
-EVENT_NUMERICAL_WIDTH = 2
-EVENT_ORDER_VOCAB_SIZE = 32
+POKEMON_IDENTITY_WIDTH = 25
+CAT_KNOWNNESS_START = 25
+CAT_KNOWNNESS_WIDTH = POKEMON_IDENTITY_WIDTH
+CAT_EFFECT_START = 52
+EFFECT_CATEGORICAL_WIDTH = 3
+CATEGORICAL_WIDTH = CAT_EFFECT_START + MAX_EFFECTS * EFFECT_CATEGORICAL_WIDTH
+
+NUM_BASE_WIDTH = 56
+NUM_PROVENANCE_START = NUM_BASE_WIDTH
+NUM_PROVENANCE_WIDTH = 8
+NUM_EFFECT_START = NUM_PROVENANCE_START + NUM_PROVENANCE_WIDTH
+EFFECT_NUMERICAL_WIDTH = 5
+NUM_IDX_EFFECT_COUNT = NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
+NUM_IDX_EFFECT_OVERFLOW = NUM_IDX_EFFECT_COUNT + 1
+NUMERICAL_WIDTH = NUM_IDX_EFFECT_OVERFLOW + 1
+
+EVENT_COUNT = 64
+EVENT_CATEGORICAL_WIDTH = 10
+EVENT_NUMERICAL_WIDTH = 3
+EVENT_ORDER_VOCAB_SIZE = EVENT_COUNT + 1
 
 TOKEN_IDX_CLS = 0
 TOKEN_IDX_GLOBAL_FIELD_SUPER = 25
@@ -55,6 +69,53 @@ class SideId(IntEnum):
     OPPONENT = 2
 
 
+class Knownness(IntEnum):
+    PAD = 0
+    UNKNOWN = 1
+    KNOWN_NONE = 2
+    KNOWN = 3
+    OOV = 4
+
+
+class Provenance(IntEnum):
+    PAD = 0
+    UNKNOWN = 1
+    OBSERVED = 2
+    OPEN_TEAM_SHEET = 3
+    SELF_KNOWN = 4
+    IMPUTED = 5
+
+
+class EffectNamespace(IntEnum):
+    NONE = 0
+    POKEMON = 1
+    SIDE = 2
+    FIELD = 3
+    WEATHER = 4
+
+
+class CounterKind(IntEnum):
+    PRESENCE_ONLY = 0
+    TURN_AGE = 1
+    ACTION_COUNT = 2
+    STACK_COUNT = 3
+    KNOWN_REMAINING = 4
+
+
+def effect_cat_slice(index: int) -> slice:
+    if not 0 <= index < MAX_EFFECTS:
+        raise IndexError(index)
+    start = CAT_EFFECT_START + index * EFFECT_CATEGORICAL_WIDTH
+    return slice(start, start + EFFECT_CATEGORICAL_WIDTH)
+
+
+def effect_num_slice(index: int) -> slice:
+    if not 0 <= index < MAX_EFFECTS:
+        raise IndexError(index)
+    start = NUM_EFFECT_START + index * EFFECT_NUMERICAL_WIDTH
+    return slice(start, start + EFFECT_NUMERICAL_WIDTH)
+
+
 @dataclass(slots=True)
 class StructuredObservation:
     """Fixed battle token structure consumed by the learned encoder."""
@@ -71,6 +132,20 @@ class StructuredObservation:
 
     def is_teampreview(self) -> torch.Tensor:
         return is_teampreview(self.numerical)
+
+    def overflow_totals(self) -> tuple[int, int]:
+        """Return effect and event overflow counts for telemetry and corpus audits."""
+        effect_overflow = int(self.numerical[..., NUM_IDX_EFFECT_OVERFLOW].sum().item())
+        event_overflow = int(self.events_num[..., 2].amax().item())
+        return effect_overflow, event_overflow
+
+    def validate_overflow_contract(self) -> None:
+        """Reject counts that imply silent effect truncation."""
+        counts = self.numerical[..., NUM_IDX_EFFECT_COUNT]
+        overflow = self.numerical[..., NUM_IDX_EFFECT_OVERFLOW]
+        expected = torch.clamp(counts - MAX_EFFECTS, min=0)
+        if not torch.equal(overflow, expected):
+            raise ValueError("Effect overflow does not match the number of dropped effects")
 
     def clone(self) -> StructuredObservation:
         return StructuredObservation(

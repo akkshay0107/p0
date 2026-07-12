@@ -4,10 +4,16 @@ import torch
 from src.format_config import FORMAT
 from src.model.policy import PolicyNet
 from src.model.structured_observation import (
+    CAT_EFFECT_START,
+    CAT_KNOWNNESS_START,
+    CAT_KNOWNNESS_WIDTH,
     CATEGORICAL_WIDTH,
+    EFFECT_CATEGORICAL_WIDTH,
+    EFFECT_NUMERICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
     EVENT_NUMERICAL_WIDTH,
+    NUM_EFFECT_START,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     SideId,
@@ -68,18 +74,22 @@ def dummy_obs():
     categorical[:, 1:25, 13:17] = torch.randint(1, 4, (B, 24, 4))
     # status (17): 1-6
     categorical[:, 1:25, 17] = torch.randint(1, 7, (B, 24))
-    # volatiles (18-23): 1-5
-    categorical[:, 1:25, 18:24] = torch.randint(1, 6, (B, 24, 6))
-
-    # weather_emb has size 5 (0-4), trickroom_emb has size 2 (0-1)
-    categorical[:, 25, 0] = torch.randint(1, 5, (B,))
-    categorical[:, 25, 1] = torch.randint(1, 2, (B,))
-
-    # side_condition_emb has size 5 (0-4)
-    categorical[:, (27, 29), :4] = torch.randint(1, 5, (B, 2, 4))
+    categorical[:, 1:25, CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH] = (
+        torch.randint(1, 5, (B, 24, CAT_KNOWNNESS_WIDTH))
+    )
 
     # Numerical features
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
+
+    effect_super = (1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29)
+    effect_numeric = (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30)
+    for super_idx, numeric_idx in zip(effect_super, effect_numeric, strict=True):
+        categorical[
+            :, super_idx, CAT_EFFECT_START : CAT_EFFECT_START + EFFECT_CATEGORICAL_WIDTH
+        ] = torch.tensor((1, 1, 1))
+        numerical[:, numeric_idx, NUM_EFFECT_START : NUM_EFFECT_START + EFFECT_NUMERICAL_WIDTH] = (
+            1.0
+        )
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
     ally_indices = [1, 3, 5, 7, 9, 11]
@@ -94,6 +104,11 @@ def dummy_obs():
     events_cat[..., 2] = torch.randint(1, 19, (B, EVENT_COUNT))
     events_cat[..., 3] = torch.randint(1, 7, (B, EVENT_COUNT))
     events_cat[..., 4] = torch.randint(1, 25, (B, EVENT_COUNT))
+    events_cat[..., 5] = torch.randint(1, 6, (B, EVENT_COUNT))
+    events_cat[..., 6] = torch.randint(1, 19, (B, EVENT_COUNT))
+    events_cat[..., 7] = torch.randint(0, 8, (B, EVENT_COUNT))
+    events_cat[..., 8] = torch.randint(0, 3, (B, EVENT_COUNT))
+    events_cat[..., 9] = torch.randint(0, 7, (B, EVENT_COUNT))
 
     events_num = torch.randn((B, EVENT_COUNT, EVENT_NUMERICAL_WIDTH))
     events_side_ids = torch.randint(0, 3, (B, EVENT_COUNT), dtype=torch.long)
@@ -197,10 +212,10 @@ def test_gradient_flow(dummy_obs):
         "type_emb",
         "category_emb",
         "status_emb",
-        "volatile_emb",
-        "weather_emb",
-        "trickroom_emb",
-        "side_condition_emb",
+        "effect_emb",
+        "counter_kind_emb",
+        "effect_namespace_emb",
+        "knownness_emb",
         "token_type_emb",
         "side_emb",
         "slot_emb",

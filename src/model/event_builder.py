@@ -7,7 +7,6 @@ from weakref import WeakKeyDictionary, finalize
 from poke_env.battle import DoubleBattle
 from poke_env.battle.pokemon import Pokemon
 
-from src.model.structured_observation import EVENT_COUNT
 from src.model.tokenizer import tokenizer
 
 
@@ -31,6 +30,18 @@ class EventTypeId(IntEnum):
     CRIT = 16
     MEGA = 17
     FAILED = 18
+    WEATHER_END = 19
+    FIELD_END = 20
+    SIDE_END = 21
+    EFFECT_START = 22
+    EFFECT_END = 23
+    ABILITY = 24
+    ITEM_TRANSFER = 25
+    FORME_CHANGE = 26
+    DRAG = 27
+    SWAP = 28
+    MISS = 29
+    IMMUNE = 30
 
 
 EVENT_TYPE_COUNT = max(EventTypeId) + 1
@@ -44,9 +55,13 @@ class RawBattleEvent(NamedTuple):
 class BattleEvent(NamedTuple):
     event_type: EventTypeId
     entity_id: str | None
+    target_id: str | None = None
     move_id: int = 0
     item_id: int = 0
     status_id: int = 0
+    effect_id: int = 0
+    ability_id: int = 0
+    flags: int = 0
     value: float = 0.0
     order: int = 0
 
@@ -192,7 +207,7 @@ class EventCollector:
     def truncate_events(
         cls,
         events: list[BattleEvent],
-        limit: int = EVENT_COUNT,
+        limit: int = 24,
     ) -> list[BattleEvent]:
         if len(events) <= limit:
             return events
@@ -210,17 +225,25 @@ class EventCollector:
         entity_id: str | None,
         order: int,
         *,
+        target_id: str | None = None,
         move_id: int = 0,
         item_id: int = 0,
         status_id: int = 0,
+        effect_id: int = 0,
+        ability_id: int = 0,
+        flags: int = 0,
         value: float = 0.0,
     ) -> BattleEvent:
         return BattleEvent(
             event_type=event_type,
             entity_id=entity_id,
+            target_id=target_id,
             move_id=move_id,
             item_id=item_id,
             status_id=status_id,
+            effect_id=effect_id,
+            ability_id=ability_id,
+            flags=flags,
             value=value,
             order=order,
         )
@@ -245,16 +268,22 @@ class EventCollector:
 
             if tag == "move" and len(message) >= 4:
                 last_attacker = message[2]
+                generated = any(part.startswith("[from]") for part in message[5:])
                 events.append(
                     cls._event(
                         EventTypeId.MOVE,
                         last_attacker,
                         order,
+                        target_id=message[4] if len(message) >= 5 else None,
                         move_id=tokenizer.id_for("moves", message[3]),
+                        flags=4 if generated else 0,
                     )
                 )
             elif tag in ("switch", "drag") and len(message) >= 5:
-                events.append(cls._event(EventTypeId.SWITCH_IN, message[2], order))
+                event_type = EventTypeId.DRAG if tag == "drag" else EventTypeId.SWITCH_IN
+                events.append(cls._event(event_type, message[2], order))
+            elif tag == "swap" and len(message) >= 3:
+                events.append(cls._event(EventTypeId.SWAP, message[2], order))
             elif tag == "faint" and len(message) >= 3:
                 events.append(cls._event(EventTypeId.FAINT, message[2], order))
             elif tag in ("-damage", "-heal") and len(message) >= 4:
@@ -282,7 +311,17 @@ class EventCollector:
                     )
                 )
             elif tag in ("-enditem", "-item") and len(message) >= 4:
-                event_type = EventTypeId.ITEM_END if tag == "-enditem" else EventTypeId.ITEM_REVEAL
+                transferred = tag == "-item" and any(
+                    "move: trick" in part.lower() or "move: switcheroo" in part.lower()
+                    for part in message[4:]
+                )
+                event_type = (
+                    EventTypeId.ITEM_TRANSFER
+                    if transferred
+                    else EventTypeId.ITEM_END
+                    if tag == "-enditem"
+                    else EventTypeId.ITEM_REVEAL
+                )
                 events.append(
                     cls._event(
                         event_type,
@@ -291,18 +330,86 @@ class EventCollector:
                         item_id=tokenizer.id_for("items", message[3]),
                     )
                 )
+            elif tag == "-ability" and len(message) >= 4:
+                events.append(
+                    cls._event(
+                        EventTypeId.ABILITY,
+                        message[2],
+                        order,
+                        ability_id=tokenizer.id_for("abilities", message[3]),
+                    )
+                )
             elif tag == "-weather" and len(message) >= 3 and message[2] != "none":
-                events.append(cls._event(EventTypeId.WEATHER_START, None, order))
+                events.append(
+                    cls._event(
+                        EventTypeId.WEATHER_START,
+                        None,
+                        order,
+                        effect_id=tokenizer.effect_id_for("weathers", message[2]),
+                    )
+                )
+            elif tag == "-weather" and len(message) >= 3:
+                events.append(cls._event(EventTypeId.WEATHER_END, None, order))
             elif tag == "-fieldstart" and len(message) >= 3:
-                events.append(cls._event(EventTypeId.FIELD_START, None, order))
+                events.append(
+                    cls._event(
+                        EventTypeId.FIELD_START,
+                        None,
+                        order,
+                        effect_id=tokenizer.effect_id_for("fields", message[2]),
+                    )
+                )
+            elif tag == "-fieldend" and len(message) >= 3:
+                events.append(
+                    cls._event(
+                        EventTypeId.FIELD_END,
+                        None,
+                        order,
+                        effect_id=tokenizer.effect_id_for("fields", message[2]),
+                    )
+                )
             elif tag == "-sidestart" and len(message) >= 4:
-                events.append(cls._event(EventTypeId.SIDE_START, message[2], order))
+                events.append(
+                    cls._event(
+                        EventTypeId.SIDE_START,
+                        message[2],
+                        order,
+                        effect_id=tokenizer.effect_id_for("side_conditions", message[3]),
+                    )
+                )
+            elif tag == "-sideend" and len(message) >= 4:
+                events.append(
+                    cls._event(
+                        EventTypeId.SIDE_END,
+                        message[2],
+                        order,
+                        effect_id=tokenizer.effect_id_for("side_conditions", message[3]),
+                    )
+                )
+            elif tag in ("-start", "-end") and len(message) >= 4:
+                events.append(
+                    cls._event(
+                        EventTypeId.EFFECT_START if tag == "-start" else EventTypeId.EFFECT_END,
+                        message[2],
+                        order,
+                        effect_id=tokenizer.effect_id_for("volatiles", message[3]),
+                    )
+                )
+            elif tag in ("-formechange", "detailschange") and len(message) >= 4:
+                events.append(cls._event(EventTypeId.FORME_CHANGE, message[2], order))
             elif tag == "-fail":
                 entity_id = last_attacker or (message[2] if len(message) >= 3 else None)
                 events.append(cls._event(EventTypeId.FAILED, entity_id, order))
             elif tag in ("-immune", "-miss"):
                 entity_id = last_attacker or (message[2] if len(message) >= 3 else None)
-                events.append(cls._event(EventTypeId.BLOCKED, entity_id, order))
+                events.append(
+                    cls._event(
+                        EventTypeId.BLOCKED,
+                        entity_id,
+                        order,
+                        flags=1 if tag == "-immune" else 2,
+                    )
+                )
             elif tag == "-activate" and len(message) >= 4:
                 if message[3].startswith(PROTECT_EFFECTS):
                     events.append(

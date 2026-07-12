@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 import torch
 from poke_env.battle import AbstractBattle, DoubleBattle
-from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
@@ -16,37 +17,75 @@ from poke_env.stats import compute_raw_stats
 
 from src.model.event_builder import BattleEvent, EventCollector
 from src.model.structured_observation import (
+    CAT_KNOWNNESS_START,
     CATEGORICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
     EVENT_NUMERICAL_WIDTH,
+    MAX_EFFECTS,
     MOVE_SLOTS,
+    NUM_IDX_EFFECT_COUNT,
+    NUM_IDX_EFFECT_OVERFLOW,
+    NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TEAM_SIZE,
+    CounterKind,
+    EffectNamespace,
+    Knownness,
+    Provenance,
     SideId,
     StructuredObservation,
     TokenType,
+    effect_cat_slice,
+    effect_num_slice,
 )
 from src.model.tokenizer import PokemonTokenizer, tokenizer
 
-# avoid re-allocating this dict on every _pokemon_numeric call.
-_VOLATILE_MAX_DURATIONS: dict[Effect, float] = {
-    Effect.CONFUSION: 4.0,
-    Effect.DISABLE: 4.0,
-    Effect.ENCORE: 3.0,
-    Effect.LEECH_SEED: 1.0,
-    Effect.THROAT_CHOP: 2.0,
-}
-_VOLATILE_ORDER = list(_VOLATILE_MAX_DURATIONS.keys())
-
-# mega stones end in -ite(x/y) (z soon)
-# replacing the substring check for mega items
+_DEX_PATH = Path(__file__).resolve().parents[2] / "data" / "champions_dex.json"
+with _DEX_PATH.open("r", encoding="utf-8") as _stream:
+    _TRANSFORMATIONS = json.load(_stream)["transformations"]
 _MEGA_ITEMS = frozenset(
-    item
-    for item in tokenizer.items
-    if item.endswith("ite") or item.endswith("itex") or item.endswith("itey")
+    PokemonTokenizer.normalize_id(item)
+    for entry in _TRANSFORMATIONS
+    if entry.get("isMega")
+    for item in entry.get("requiredItems", [])
 )
+_MEGA_FORMS = frozenset(
+    PokemonTokenizer.normalize_id(entry["id"]) for entry in _TRANSFORMATIONS if entry.get("isMega")
+)
+
+_STACKABLE_SIDE_EFFECTS = frozenset({SideCondition.SPIKES, SideCondition.TOXIC_SPIKES})
+
+
+def _knownness(value: object | None, resolved_id: int) -> Knownness:
+    if value is None or value == "":
+        return Knownness.KNOWN_NONE
+    return Knownness.KNOWN if resolved_id else Knownness.OOV
+
+
+def _write_effects(
+    entries: list[tuple[EffectNamespace, int, CounterKind, float, float, bool, float]],
+    categorical: np.ndarray,
+    numerical: np.ndarray,
+) -> None:
+    entries.sort(key=lambda entry: (int(entry[0]), entry[1]))
+    if numerical.shape[0] <= NUM_IDX_EFFECT_OVERFLOW:
+        return
+    numerical[NUM_IDX_EFFECT_COUNT] = float(len(entries))
+    numerical[NUM_IDX_EFFECT_OVERFLOW] = float(max(0, len(entries) - MAX_EFFECTS))
+    for index, (namespace, effect_id, kind, value, stacks, remaining_known, remaining) in enumerate(
+        entries[:MAX_EFFECTS]
+    ):
+        categorical[effect_cat_slice(index)] = (effect_id, int(kind), int(namespace))
+        numerical[effect_num_slice(index)] = (
+            1.0,
+            float(value),
+            float(stacks),
+            float(remaining_known),
+            float(remaining),
+        )
+
 
 # Nature stat impacts: (boosted_stat, hindered_stat)
 # 1: Atk, 2: Def, 3: SpA, 4: SpD, 5: Spe
@@ -72,12 +111,6 @@ nature_impacts = {
     "jolly": (5, 3),
     "naive": (5, 4),
 }
-
-
-def _get_turns_left(battle: DoubleBattle, start_turn: int, duration: int = 5) -> float:
-    if start_turn < 0:
-        return 0.0
-    return max(0.0, duration - (battle.turn - start_turn)) / float(duration)
 
 
 def _safe_fraction(num: float | int | None, den: float | int | None) -> float:
@@ -113,8 +146,21 @@ def _pokemon_categorical_into(
             row[9 + i] = tok.move_type_id(move)
             row[13 + i] = tok.move_category_id(move)
     row[17] = tok.status_id(pokemon.status)
-    row[18:24] = tok.volatile_ids(pokemon.effects)
     row[24] = tok.nature_id(pokemon)
+    values = (
+        pokemon.species or pokemon.base_species,
+        pokemon.ability,
+        pokemon.item,
+        pokemon.type_1,
+        pokemon.type_2,
+        *move_slots,
+        *(move.type if move is not None else None for move in move_slots),
+        *(move.category if move is not None else None for move in move_slots),
+        pokemon.status,
+    )
+    for index, value in enumerate(values):
+        row[CAT_KNOWNNESS_START + index] = _knownness(value, int(row[index]))
+    row[CAT_KNOWNNESS_START + 24] = _knownness(pokemon.nature, int(row[24]))
 
 
 @lru_cache(maxsize=4096)
@@ -263,11 +309,6 @@ def _pokemon_numeric_into(
 
     row[36] = min(pokemon.status_counter, 5) / 5.0
 
-    for i, effect in enumerate(_VOLATILE_ORDER):
-        val = pokemon.effects.get(effect, 0)
-        max_dur = _VOLATILE_MAX_DURATIONS[effect]
-        row[37 + i] = min(val, max_dur) / max_dur
-
     row[42] = pokemon.preparing
 
     level_stats, stats_exact = _get_pokemon_level_stats(pokemon, battle, is_opponent)
@@ -278,6 +319,9 @@ def _pokemon_numeric_into(
     row[47] = level_stats[4] / 300.0
     row[48] = level_stats[5] / 300.0
     row[49] = stats_exact
+    row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = Provenance.IMPUTED
+    if stats_exact:
+        row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = Provenance.SELF_KNOWN
 
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
@@ -290,6 +334,39 @@ def _pokemon_numeric_into(
         row[54] = can_switch_out
 
     row[55] = pokemon.revealed
+
+
+def _pokemon_effects_into(
+    pokemon: Pokemon | None,
+    tok: PokemonTokenizer,
+    categorical: np.ndarray,
+    numerical: np.ndarray,
+) -> None:
+    if pokemon is None:
+        return
+    effects = []
+    for effect, counter in pokemon.effects.items():
+        effect_id = tok.volatiles.get(effect, 0)
+        remaining_known = effect.name.startswith(("YAWN", "PERISH"))
+        kind = (
+            CounterKind.KNOWN_REMAINING
+            if remaining_known
+            else CounterKind.ACTION_COUNT
+            if counter
+            else CounterKind.PRESENCE_ONLY
+        )
+        effects.append(
+            (
+                EffectNamespace.POKEMON,
+                effect_id,
+                kind,
+                float(counter),
+                0.0,
+                remaining_known,
+                float(counter) if remaining_known else 0.0,
+            )
+        )
+    _write_effects(effects, categorical, numerical)
 
 
 def _ally_legality(
@@ -444,30 +521,34 @@ def _global_field_token_into(
     categorical: np.ndarray,
     numerical: np.ndarray,
 ) -> None:
-    # categorical slots:
-    # slot 0: weather ID
-    # slot 1: Trick Room ID
-    # terrain and gravity to be added later
-    weather_id = 0
-    weather_duration = 0.0
+    effects = []
     for weather, start_turn in battle.weather.items():
-        idx = tok.weathers.get(weather, 0)
-        if idx:
-            weather_id = idx
-            weather_duration = _get_turns_left(battle, start_turn)
-            break  # Only one weather can be active at a time
-
-    trickroom_id = 0
-    trickroom_duration = 0.0
-    if Field.TRICK_ROOM in battle.fields:
-        start_turn = battle.fields[Field.TRICK_ROOM]
-        trickroom_id = tok.trickroom_id
-        trickroom_duration = _get_turns_left(battle, start_turn)
-
-    categorical[0] = weather_id
-    categorical[1] = trickroom_id
-    numerical[0] = weather_duration
-    numerical[1] = trickroom_duration
+        effects.append(
+            (
+                EffectNamespace.WEATHER,
+                tok.weathers.get(weather, 0),
+                CounterKind.TURN_AGE,
+                float(max(0, battle.turn - start_turn)),
+                0.0,
+                False,
+                0.0,
+            )
+        )
+    for field, start_turn in battle.fields.items():
+        remaining_known = field in {Field.TRICK_ROOM, Field.MAGIC_ROOM, Field.WONDER_ROOM}
+        age = float(max(0, battle.turn - start_turn))
+        effects.append(
+            (
+                EffectNamespace.FIELD,
+                tok.fields.get(field, 0),
+                CounterKind.TURN_AGE,
+                age,
+                0.0,
+                remaining_known,
+                max(0.0, 5.0 - age) if remaining_known else 0.0,
+            )
+        )
+    _write_effects(effects, categorical, numerical)
     numerical[2] = float(battle.teampreview)
     numerical[3] = battle.turn / 24.0
 
@@ -481,23 +562,25 @@ def _side_token_into(
     cat: np.ndarray,
     num: np.ndarray,
 ) -> None:
-
-    auroraveil_turn = conditions.get(SideCondition.AURORA_VEIL)
-    if auroraveil_turn is not None:
-        cat[0] = tok.side_conditions.get(SideCondition.AURORA_VEIL, 0)
-        num[0] = _get_turns_left(battle, auroraveil_turn, duration=5)
-
-    tailwind_turn = conditions.get(SideCondition.TAILWIND)
-    if tailwind_turn is not None:
-        cat[1] = tok.side_conditions.get(SideCondition.TAILWIND, 0)
-        num[1] = _get_turns_left(battle, tailwind_turn, duration=4)
-
-    toxic_spikes_layers = conditions.get(SideCondition.TOXIC_SPIKES)
-    if toxic_spikes_layers is not None:
-        toxic_spikes_dict = tok.side_conditions.get(SideCondition.TOXIC_SPIKES, {})
-        cat[2] = toxic_spikes_dict.get(toxic_spikes_layers, 0)
-        num[2] = float(toxic_spikes_layers) / 2.0
-
+    effects = []
+    for condition, stored_value in conditions.items():
+        stackable = condition in _STACKABLE_SIDE_EFFECTS
+        effect_value = tok.side_conditions.get(condition, 0)
+        effect_id = int(effect_value)
+        remaining_known = condition == SideCondition.TAILWIND
+        age = 0.0 if stackable else float(max(0, battle.turn - stored_value))
+        effects.append(
+            (
+                EffectNamespace.SIDE,
+                effect_id,
+                CounterKind.STACK_COUNT if stackable else CounterKind.TURN_AGE,
+                age,
+                float(stored_value) if stackable else 0.0,
+                remaining_known,
+                max(0.0, 4.0 - age) if remaining_known else 0.0,
+            )
+        )
+    _write_effects(effects, cat, num)
     num[3] = float(fainted_count) / float(TEAM_SIZE)
     num[4] = float(mega_available)
 
@@ -587,6 +670,20 @@ def _event_location(
     return pokemon_to_slot.get(pokemon, (SideId.NONE, 0))
 
 
+def _event_target_location(
+    battle: DoubleBattle,
+    event: BattleEvent,
+    pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
+) -> tuple[SideId, int]:
+    if event.target_id is None:
+        return SideId.NONE, 0
+    try:
+        pokemon = battle.get_pokemon(event.target_id)
+    except (AssertionError, IndexError, KeyError, ValueError):
+        return SideId.NONE, 0
+    return pokemon_to_slot.get(pokemon, (SideId.NONE, 0))
+
+
 def from_battle_into(
     battle: AbstractBattle,
     out: StructuredObservation,
@@ -655,6 +752,7 @@ def from_battle_into(
                 active_idx,
                 is_opponent=is_opponent,
             )
+            _pokemon_effects_into(mon, tok, categorical[idx - 1], numerical[idx])
             idx += 1
 
     token_types[idx] = TokenType.FIELD_SUPER
@@ -708,7 +806,9 @@ def from_battle_into(
     if idx != SEQUENCE_LENGTH:
         raise RuntimeError(f"Structured observation length drifted to {idx}")
 
-    events = EventCollector.truncate_events(EventCollector.consume_events(battle))
+    untruncated_events = EventCollector.consume_events(battle)
+    event_overflow = max(0, len(untruncated_events) - EVENT_COUNT)
+    events = EventCollector.truncate_events(untruncated_events, limit=EVENT_COUNT)
 
     events_cat = out.events_cat.numpy()
     events_num = out.events_num.numpy()
@@ -722,15 +822,22 @@ def from_battle_into(
 
     for event_idx, event in enumerate(events):
         side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
+        target_side_id, target_slot_id = _event_target_location(battle, event, pokemon_to_slot)
 
         events_cat[event_idx, 0] = event.event_type
         events_cat[event_idx, 1] = event.move_id
         events_cat[event_idx, 2] = event.item_id
         events_cat[event_idx, 3] = event.status_id
-        events_cat[event_idx, 4] = min(event.order + 1, 31)
+        events_cat[event_idx, 4] = min(event.order + 1, EVENT_COUNT)
+        events_cat[event_idx, 5] = event.effect_id
+        events_cat[event_idx, 6] = event.ability_id
+        events_cat[event_idx, 7] = event.flags
+        events_cat[event_idx, 8] = target_side_id
+        events_cat[event_idx, 9] = target_slot_id
 
         events_num[event_idx, 0] = event.value
         events_num[event_idx, 1] = event.order / float(EVENT_COUNT)
+        events_num[event_idx, 2] = float(event_overflow)
 
         events_side_ids[event_idx] = side_id
         events_slot_ids[event_idx] = slot_id
@@ -751,8 +858,7 @@ def _is_mega_form(pokemon: Pokemon | None) -> bool:
     species = pokemon.species
     if not species:
         return False
-    species_lower = species.lower()
-    return "mega" in species_lower or species_lower.endswith("primal")
+    return PokemonTokenizer.normalize_id(species) in _MEGA_FORMS
 
 
 def _can_mega(pokemon: Pokemon | None, battle: DoubleBattle, active_idx: int | None = None) -> bool:

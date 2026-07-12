@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from poke_env.battle.effect import Effect
+from poke_env.battle.field import Field
 from poke_env.battle.move import Move
 from poke_env.battle.move_category import MoveCategory
 from poke_env.battle.pokemon import Pokemon
@@ -13,8 +14,6 @@ from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
-
-from src.model.structured_observation import MAX_VOLATILES
 
 CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
 
@@ -72,9 +71,7 @@ class PokemonTokenizer:
         for nature in ("serious", "bashful", "docile", "hardy", "quirky"):
             self.natures[nature] = 0
 
-        # Resolve enum members from their normalized names. Legacy aliases are
-        # retained because the first observation schema used shorter weather
-        # names and separate Toxic Spikes layer IDs.
+        # Resolve enum members from their normalized names.
         self._volatiles_str = vocab.get("volatiles", {})
         self.volatiles = {
             effect: self._enum_vocab_id(self._volatiles_str, effect, {effect.name: effect.name})
@@ -86,11 +83,6 @@ class PokemonTokenizer:
             condition: self._enum_vocab_id(self._side_conditions_str, condition, {condition.name: condition.name})
             for condition in SideCondition
         }
-        self.side_conditions[SideCondition.TOXIC_SPIKES] = {
-            1: self._side_conditions_str.get("toxicspikes1", self.side_conditions.get(SideCondition.TOXIC_SPIKES, 0)),
-            2: self._side_conditions_str.get("toxicspikes2", self.side_conditions.get(SideCondition.TOXIC_SPIKES, 0)),
-        }
-
         _weathers_str = vocab.get("weathers", {})
         self.weathers = {
             weather: self._enum_vocab_id(
@@ -104,6 +96,10 @@ class PokemonTokenizer:
                 },
             )
             for weather in Weather
+        }
+        _fields_str = vocab.get("fields", {})
+        self.fields = {
+            field: self._enum_vocab_id(_fields_str, field) for field in Field
         }
 
         _status_str = vocab.get("status", {})
@@ -129,8 +125,6 @@ class PokemonTokenizer:
         _trickroom_vocab = vocab.get("trickroom", {})
         self.trickroom_id: int = _trickroom_vocab.get("trickroom", 0)
 
-        # fast path to avoid computing if no volatile status effect
-        self._EMPTY_VOLATILES = [0] * MAX_VOLATILES
 
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> PokemonTokenizer:
@@ -178,6 +172,13 @@ class PokemonTokenizer:
             return 0
         return vocab_table.get(self.normalize_id(name), 0)
 
+    def effect_id_for(self, table: str, name: str | None) -> int:
+        """Resolve protocol effect names without allocating intermediate tables."""
+        if name is None:
+            return 0
+        _, separator, remainder = name.partition(":")
+        return self.id_for(table, remainder if separator else name)
+
     def resolve(self, table: str, name: str | None) -> tuple[int, str]:
         """Resolve a value while exposing why ID zero was returned."""
         if name is None or self.normalize_id(name) == "":
@@ -194,23 +195,6 @@ class PokemonTokenizer:
         if status is None:
             return 0
         return self.status.get(status, 0)
-
-    def volatile_ids(self, effects: dict[Effect, int] | None) -> list[int]:
-        if not effects:
-            return self._EMPTY_VOLATILES
-
-        ids = []
-        for effect in effects.keys():
-            idx = self.volatiles.get(effect, self._enum_vocab_id(self._volatiles_str, effect))
-
-            if idx:
-                ids.append(idx)
-
-        if not ids:
-            return self._EMPTY_VOLATILES
-
-        ids = sorted(ids)[:MAX_VOLATILES]
-        return ids + [0] * (MAX_VOLATILES - len(ids))
 
     def species_id(self, pokemon: Pokemon | None) -> int:
         if pokemon is None:

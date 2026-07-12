@@ -5,12 +5,12 @@ import pytest
 import torch
 
 from src.model.policy import PolicyNet
+from src.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
 from src.train.utils import (
     load_checkpoint,
     policy_from_checkpoint,
     save_checkpoint,
 )
-
 
 _EXPORT_SPEC = importlib.util.spec_from_file_location(
     "export_training", Path(__file__).parents[1] / "scripts" / "export_training.py"
@@ -22,7 +22,13 @@ collect_export_files = _EXPORT_MODULE.collect_export_files
 
 
 def _small_policy() -> PolicyNet:
-    return PolicyNet(obs_dim=(31, 56), act_size=49, d_model=32, nhead=4, nlayer=1)
+    return PolicyNet(
+        obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH),
+        act_size=49,
+        d_model=32,
+        nhead=4,
+        nlayer=1,
+    )
 
 
 def test_checkpoint_reconstructs_serialized_policy(tmp_path):

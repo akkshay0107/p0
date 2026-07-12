@@ -1,7 +1,7 @@
 {
   "action_schema_version": "champions-mega-v1",
   "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
-  "event_schema_version": 1,
+  "event_schema_version": 2,
   "format": {
     "action_size": 49,
     "battle_format": "gen9championsvgc2026regmb",
@@ -11,7 +11,7 @@
     "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
   },
   "format_spec_version": 1,
-  "observation_schema_version": 1,
+  "observation_schema_version": 2,
   "replay_compiler_version": 0,
   "stat_point_imputer_version": 0,
   "vocab_schema_version": 1,

@@ -18,6 +18,7 @@ from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
 from src.env import SimEnv
+from src.format_config import FORMAT
 from src.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
 from src.model.observation_builder import (
     _cached_raw_stats,
@@ -34,19 +35,23 @@ from src.model.observation_builder import (
     from_battle_into,
 )
 from src.model.structured_observation import (
+    CAT_EFFECT_START,
     CATEGORICAL_WIDTH,
+    EFFECT_CATEGORICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
     EVENT_NUMERICAL_WIDTH,
+    NUM_IDX_EFFECT_COUNT,
+    NUM_IDX_EFFECT_OVERFLOW,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
+    EffectNamespace,
     SideId,
     StructuredObservation,
     TokenType,
 )
 from src.model.tokenizer import tokenizer
 from src.team_picker import RandomTeamFromPool
-from src.format_config import FORMAT
 
 
 def make_real_pokemon(
@@ -282,9 +287,7 @@ def test_pokemon_categorical_real():
     # Status
     assert cat[17] == tokenizer.status_id(Status.BRN)
 
-    # 6 Volatiles
-    vol_ids = cat[18:24]
-    assert sum(1 for v in vol_ids if v > 0) == 2
+    assert not cat[18:24].any()
 
 
 def test_pokemon_numeric_real():
@@ -354,8 +357,6 @@ def test_pokemon_numeric_real():
     assert row[28] == 1.0  # cond == 1
     assert row[29] == 0.0  # cond == 2
     assert row[36] == 3.0 / 5.0  # Status counter
-    assert row[37] == 2.0 / 4.0  # Confusion duration (max 4)
-    assert row[38] == 1.0 / 4.0  # Disable duration (max 4)
     assert row[42] == 1.0  # Preparing (preparing_move is not None)
 
     battle._can_mega_evolve = [True, False]
@@ -554,16 +555,11 @@ def test_global_field_token_real():
     battle._teampreview = False
 
     cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    num = np.zeros(4, dtype=np.float32)
+    num = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
     _global_field_token_into(battle, tokenizer, cat, num)
     assert len(cat) == CATEGORICAL_WIDTH
-    assert len(num) == 4
-
-    assert cat[0] == tokenizer.weathers.get(Weather.RAINDANCE)
-    assert cat[1] == tokenizer.id_for("trickroom", "trickroom")
-
-    assert abs(num[0] - 0.6) < 1e-5
-    assert abs(num[1] - 0.8) < 1e-5
+    assert len(num) == NUMERICAL_WIDTH
+    assert not cat[:2].any()
     assert num[2] == 0.0  # teampreview
     assert num[3] == 3.0 / 24.0  # turn scaling
 
@@ -578,7 +574,7 @@ def test_side_token_real():
     }
 
     cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    num = np.zeros(5, dtype=np.float32)
+    num = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
     _side_token_into(
         battle,
         conditions,
@@ -589,22 +585,13 @@ def test_side_token_real():
         num=num,
     )
     assert len(cat) == CATEGORICAL_WIDTH
-    assert len(num) == 5
-
-    assert cat[0] == tokenizer.side_conditions.get(SideCondition.AURORA_VEIL)
-    assert cat[1] == tokenizer.side_conditions.get(SideCondition.TAILWIND)
-    toxic_spikes = tokenizer.side_conditions.get(SideCondition.TOXIC_SPIKES)
-    assert toxic_spikes is not None
-    assert cat[2] == toxic_spikes.get(2)
-
-    assert abs(num[0] - 0.4) < 1e-5
-    assert abs(num[1] - 0.5) < 1e-5
-    assert abs(num[2] - 1.0) < 1e-5
+    assert len(num) == NUMERICAL_WIDTH
+    assert not cat[:3].any()
     assert abs(num[3] - 0.5) < 1e-5  # 3 fainted out of 6
     assert num[4] == 1.0  # mega still available
 
     cat_used = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    num_used = np.zeros(5, dtype=np.float32)
+    num_used = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
     _side_token_into(
         battle,
         conditions,
@@ -892,3 +879,49 @@ def test_pokemon_nature_in_categorical():
     jolly_id = tokenizer.nature_id(mon)
     assert jolly_id > 0
     assert cat[24] == jolly_id
+
+
+def test_concurrent_universal_effect_stress_state():
+    mon = make_real_pokemon(
+        effects={
+            Effect.TAUNT: 1,
+            Effect.LEECH_SEED: 1,
+            Effect.SUBSTITUTE: 1,
+            Effect.SALT_CURE: 1,
+            Effect.ENCORE: 1,
+            Effect.DISABLE: 1,
+            Effect.YAWN: 2,
+            Effect.PERISH3: 3,
+            Effect.TRAPPED: 1,
+        }
+    )
+    battle = make_real_battle(active_pokemon=[mon, None], team=[mon], turn=3)
+    battle._side_conditions = {
+        SideCondition.REFLECT: 1,
+        SideCondition.LIGHT_SCREEN: 1,
+        SideCondition.AURORA_VEIL: 1,
+        SideCondition.TAILWIND: 1,
+        SideCondition.SAFEGUARD: 1,
+        SideCondition.SPIKES: 3,
+        SideCondition.TOXIC_SPIKES: 2,
+    }
+    battle._weather = {Weather.RAINDANCE: 1}
+    battle._fields = {
+        Field.GRASSY_TERRAIN: 1,
+        Field.TRICK_ROOM: 1,
+        Field.WONDER_ROOM: 1,
+        Field.MAGIC_ROOM: 1,
+        Field.GRAVITY: 1,
+    }
+
+    obs = from_battle(battle, tokenizer)
+
+    assert obs.numerical[2, NUM_IDX_EFFECT_COUNT] == 9
+    assert obs.numerical[28, NUM_IDX_EFFECT_COUNT] == 7
+    assert obs.numerical[26, NUM_IDX_EFFECT_COUNT] == 6
+    assert obs.numerical[:, NUM_IDX_EFFECT_OVERFLOW].sum() == 0
+    pokemon_effects = obs.categorical[1, CAT_EFFECT_START::EFFECT_CATEGORICAL_WIDTH]
+    assert torch.count_nonzero(pokemon_effects) == 9
+    namespaces = obs.categorical[25, CAT_EFFECT_START + 2 :: EFFECT_CATEGORICAL_WIDTH]
+    assert EffectNamespace.FIELD in namespaces
+    assert EffectNamespace.WEATHER in namespaces
