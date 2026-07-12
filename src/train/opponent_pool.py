@@ -6,9 +6,9 @@ from typing import Self
 import torch
 
 from src.format_config import (
-    RuntimeManifest,
-    runtime_manifest_for_data,
-    runtime_manifest_for_policy,
+    policy_model_config,
+    runtime_manifest_sha256,
+    validate_artifact_manifest_reference,
 )
 from src.model.policy import PolicyNet
 from src.model.structured_observation import StructuredObservation
@@ -119,11 +119,11 @@ class OpponentPool:
             raise FileNotFoundError(f"Checkpoint for opponent '{opponent_id}' not found at {path}")
 
         checkpoint = torch.load(path, weights_only=True, map_location=device)
-        manifest = checkpoint.get("runtime_manifest")
-        if manifest is None:
-            raise ValueError(f"Opponent checkpoint {path} has no runtime manifest")
-        artifact_manifest = RuntimeManifest.from_dict(manifest)
-        config = dict(artifact_manifest.model_config)
+        validate_artifact_manifest_reference(checkpoint)
+        config_value = checkpoint.get("model_config")
+        if not isinstance(config_value, dict):
+            raise ValueError(f"Opponent checkpoint {path} has no valid model configuration")
+        config = dict(config_value)
         if not config:
             raise ValueError(f"Opponent checkpoint {path} has no serialized model configuration")
         try:
@@ -131,7 +131,6 @@ class OpponentPool:
             net = PolicyNet(**config)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Invalid model configuration in opponent checkpoint {path}") from exc
-        artifact_manifest.validate_compatible(runtime_manifest_for_policy(net))
         net.load_state_dict(checkpoint["model_state_dict"])
         return net.to(device).eval()
 
@@ -222,7 +221,8 @@ class OpponentPool:
         torch.save(
             {
                 "model_state_dict": shadow_state,
-                "runtime_manifest": runtime_manifest_for_policy(policy).to_dict(),
+                "runtime_manifest_sha256": runtime_manifest_sha256(),
+                "model_config": policy_model_config(policy),
             },
             path,
         )
@@ -258,7 +258,7 @@ class OpponentPool:
         self.reference_batch = {k: v.cpu() for k, v in batch.items()}
         torch.save(
             {
-                "runtime_manifest": runtime_manifest_for_data().to_dict(),
+                "runtime_manifest_sha256": runtime_manifest_sha256(),
                 "batch": self.reference_batch,
             },
             self.pool_dir / "reference_batch.pt",
@@ -281,10 +281,7 @@ class OpponentPool:
         path = self.pool_dir / "reference_batch.pt"
         if path.exists():
             artifact = torch.load(path, weights_only=True, map_location="cpu")
-            manifest = artifact.get("runtime_manifest")
-            if manifest is None:
-                raise ValueError(f"Reference batch {path} has no runtime manifest")
-            RuntimeManifest.from_dict(manifest).validate_compatible(runtime_manifest_for_data())
+            validate_artifact_manifest_reference(artifact)
             self.reference_batch = artifact["batch"]
 
     def _compute_signature(self, policy: PolicyNet) -> torch.Tensor | None:
@@ -335,7 +332,8 @@ class OpponentPool:
         torch.save(
             {
                 "model_state_dict": policy.state_dict(),
-                "runtime_manifest": runtime_manifest_for_policy(policy).to_dict(),
+                "runtime_manifest_sha256": runtime_manifest_sha256(),
+                "model_config": policy_model_config(policy),
             },
             self._checkpoint_path(opponent_id),
         )
@@ -373,7 +371,7 @@ class OpponentPool:
 
     def save_state(self) -> None:
         state = {
-            "runtime_manifest": runtime_manifest_for_data().to_dict(),
+            "runtime_manifest_sha256": runtime_manifest_sha256(),
             "shadow_id": self.shadow_id,
             "anchor_ids": self.anchor_ids,
             "regular_ids": self.regular_ids,
@@ -385,7 +383,7 @@ class OpponentPool:
             json.dump(state, f, indent=2)
         torch.save(
             {
-                "runtime_manifest": runtime_manifest_for_data().to_dict(),
+                "runtime_manifest_sha256": runtime_manifest_sha256(),
                 "signatures": self.signatures,
             },
             self.pool_dir / "pool_signatures.pt",
@@ -396,10 +394,7 @@ class OpponentPool:
         if path.exists():
             with open(path) as f:
                 state = json.load(f)
-            manifest = state.get("runtime_manifest")
-            if manifest is None:
-                raise ValueError(f"Opponent pool state {path} has no runtime manifest")
-            RuntimeManifest.from_dict(manifest).validate_compatible(runtime_manifest_for_data())
+            validate_artifact_manifest_reference(state)
             self.shadow_id = state.get("shadow_id")
             self.anchor_ids = state.get("anchor_ids", [])
             self.regular_ids = state.get("regular_ids", [])
@@ -413,10 +408,7 @@ class OpponentPool:
         path_sig = self.pool_dir / "pool_signatures.pt"
         if path_sig.exists():
             artifact = torch.load(path_sig, weights_only=True, map_location="cpu")
-            manifest = artifact.get("runtime_manifest")
-            if manifest is None:
-                raise ValueError(f"Opponent pool signatures {path_sig} have no runtime manifest")
-            RuntimeManifest.from_dict(manifest).validate_compatible(runtime_manifest_for_data())
+            validate_artifact_manifest_reference(artifact)
             self.signatures = artifact["signatures"]
 
         self._prune_missing_files()

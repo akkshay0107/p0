@@ -2,20 +2,20 @@ import json
 
 import pytest
 
-from src.format_config import RuntimeManifest, current_manifest
+from src.format_config import FORMAT, RuntimeManifest, current_manifest
 
 
 def test_runtime_manifest_round_trip_and_compatibility(tmp_path):
     vocab = tmp_path / "vocab.json"
     vocab.write_text('{"species": {"pikachu": 1}}', encoding="utf-8")
-    manifest = current_manifest(vocab_path=vocab, model_config={"d_model": 32})
+    manifest = current_manifest(vocab_path=vocab)
 
-    restored = RuntimeManifest.from_dict(json.loads(manifest.to_json()))
-    restored.validate_compatible(manifest)
-    with pytest.raises(ValueError, match="model_config"):
-        restored.validate_compatible(
-            RuntimeManifest(vocab_sha256=manifest.vocab_sha256, model_config={"d_model": 64})
-        )
+    restored = RuntimeManifest.from_dict(json.loads(json.dumps(manifest.to_dict())))
+    assert restored == manifest
+    assert "action_schema" not in restored.to_dict()["format"]
+    assert list(key for key in restored.to_dict() if key == "action_schema_version") == [
+        "action_schema_version"
+    ]
 
 
 def test_runtime_manifest_rejects_missing_fields(tmp_path):
@@ -25,6 +25,28 @@ def test_runtime_manifest_rejects_missing_fields(tmp_path):
     del manifest["event_schema_version"]
 
     with pytest.raises(ValueError, match="missing"):
+        RuntimeManifest.from_dict(manifest)
+
+
+@pytest.mark.parametrize("field", ["action_schema", "model_config"])
+def test_runtime_manifest_rejects_removed_fields(field):
+    manifest = RuntimeManifest().to_dict()
+    if field == "action_schema":
+        manifest["format"][field] = "old"
+    else:
+        manifest[field] = {}
+    with pytest.raises(ValueError, match="unknown"):
+        RuntimeManifest.from_dict(manifest)
+
+
+def test_format_spec_rejects_missing_and_unknown_fields():
+    manifest = RuntimeManifest().to_dict()
+    del manifest["format"]["action_size"]
+    with pytest.raises(ValueError, match="missing"):
+        RuntimeManifest.from_dict(manifest)
+    manifest = RuntimeManifest().to_dict()
+    manifest["format"]["extra"] = FORMAT.action_size
+    with pytest.raises(ValueError, match="unknown"):
         RuntimeManifest.from_dict(manifest)
 
 

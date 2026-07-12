@@ -6,7 +6,11 @@ import torch.nn as nn
 
 from src.model.policy import PolicyNet
 from src.train.config import TrainingConfig
-from src.format_config import RuntimeManifest, runtime_manifest_for_policy
+from src.format_config import (
+    policy_model_config,
+    runtime_manifest_sha256,
+    validate_artifact_manifest_reference,
+)
 
 
 def default_device() -> torch.device:
@@ -84,7 +88,8 @@ def save_checkpoint(
     state = {
         "episode": episode,
         "model_state_dict": policy.state_dict(),
-        "runtime_manifest": runtime_manifest_for_policy(policy).to_dict(),
+        "runtime_manifest_sha256": runtime_manifest_sha256(),
+        "model_config": policy_model_config(policy),
     }
     if optimizer is not None:
         state["optimizer_state_dict"] = optimizer.state_dict()
@@ -98,11 +103,11 @@ def save_checkpoint(
 def policy_from_checkpoint(path: Path, device: torch.device | str) -> PolicyNet:
     """Construct a policy from its serialized architecture before loading weights."""
     checkpoint = torch.load(path, weights_only=True, map_location="cpu")
-    manifest = checkpoint.get("runtime_manifest")
-    if manifest is None:
-        raise ValueError(f"Checkpoint {path} has no runtime manifest")
-    artifact_manifest = RuntimeManifest.from_dict(manifest)
-    config = dict(artifact_manifest.model_config)
+    validate_artifact_manifest_reference(checkpoint)
+    config_value = checkpoint.get("model_config")
+    if not isinstance(config_value, dict):
+        raise ValueError(f"Checkpoint {path} has no valid serialized model configuration")
+    config = dict(config_value)
     if not config:
         raise ValueError(f"Checkpoint {path} has no serialized model configuration")
     try:
@@ -110,7 +115,6 @@ def policy_from_checkpoint(path: Path, device: torch.device | str) -> PolicyNet:
         policy = PolicyNet(**config).to(device)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Invalid model configuration in checkpoint {path}") from exc
-    artifact_manifest.validate_compatible(runtime_manifest_for_policy(policy))
     return policy
 
 
@@ -118,14 +122,10 @@ def load_checkpoint(path: Path, policy: PolicyNet, optimizer=None, scheduler=Non
     if not path.exists():
         return None
     checkpoint = torch.load(path, map_location=policy.device)
-    manifest = checkpoint.get("runtime_manifest")
-    if manifest is None:
-        raise ValueError(
-            f"Checkpoint {path} has no runtime manifest; refusing to load an unversioned artifact"
-        )
-    RuntimeManifest.from_dict(manifest).validate_compatible(
-        runtime_manifest_for_policy(policy)
-    )
+    validate_artifact_manifest_reference(checkpoint)
+    config = checkpoint.get("model_config")
+    if not isinstance(config, dict) or config != policy_model_config(policy):
+        raise ValueError(f"Checkpoint {path} model configuration does not match the policy")
     policy.load_state_dict(checkpoint["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

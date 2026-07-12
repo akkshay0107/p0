@@ -1,9 +1,8 @@
 {
   "action_schema_version": "champions-mega-v1",
-  "champions_dex_sha256": "72c56249fc2b8080331c575bb8fb1a56c8b75e8ee7377b6483bbe8efb7e546d0",
+  "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
   "event_schema_version": 1,
   "format": {
-    "action_schema": "champions-mega-v1",
     "action_size": 49,
     "battle_format": "gen9championsvgc2026regmb",
     "bo3_format": "gen9championsvgc2026regmbbo3",
@@ -12,10 +11,9 @@
     "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
   },
   "format_spec_version": 1,
-  "model_config": {},
   "observation_schema_version": 1,
   "replay_compiler_version": 0,
   "stat_point_imputer_version": 0,
   "vocab_schema_version": 1,
-  "vocab_sha256": "b87940610c75e13611340d2114862ba02077a494beca246b5f013055be99519e"
+  "vocab_sha256": "00ea78cfb89fa15447cebaed1a080d3694af1aad2dd32ca85cf0dced83b05146"
 }

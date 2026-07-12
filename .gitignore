@@ -39,6 +39,7 @@ data/*.tmp
 !data/vocab.json
 !data/champions_dex.json
 !data/runtime_manifest.json
+data/champions_coverage.json
 
 # Training related
 *.log

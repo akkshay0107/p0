@@ -40,11 +40,20 @@ def test_checkpoint_rejects_incompatible_manifest(tmp_path):
     path = tmp_path / "policy.pt"
     save_checkpoint(path, 1, _small_policy())
     artifact = torch.load(path, weights_only=False)
-    artifact["runtime_manifest"]["action_schema_version"] = "incompatible"
+    artifact["runtime_manifest_sha256"] = "0" * 64
     torch.save(artifact, path)
 
-    with pytest.raises(ValueError, match="action_schema_version"):
+    with pytest.raises(ValueError, match="runtime_manifest_sha256"):
         policy_from_checkpoint(path, "cpu")
+
+
+def test_checkpoint_has_hash_reference_and_local_model_config(tmp_path):
+    path = tmp_path / "policy.pt"
+    save_checkpoint(path, 1, _small_policy())
+    artifact = torch.load(path, weights_only=True)
+    assert "runtime_manifest" not in artifact
+    assert len(artifact["runtime_manifest_sha256"]) == 64
+    assert artifact["model_config"]["d_model"] == 32
 
 
 def test_export_includes_interpretation_contracts(tmp_path):
