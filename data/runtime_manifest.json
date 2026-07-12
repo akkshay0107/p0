@@ -13,7 +13,7 @@
   "format_spec_version": 1,
   "observation_schema_version": 2,
   "replay_compiler_version": 0,
-  "stat_point_imputer_version": 0,
+  "stat_point_imputer_version": 1,
   "vocab_schema_version": 1,
   "vocab_sha256": "00ea78cfb89fa15447cebaed1a080d3694af1aad2dd32ca85cf0dced83b05146"
 }

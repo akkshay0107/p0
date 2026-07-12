@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
+from weakref import WeakKeyDictionary
 
 import numpy as np
 import torch
@@ -12,9 +12,8 @@ from poke_env.battle.field import Field
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
-from poke_env.data import GenData
-from poke_env.stats import compute_raw_stats
 
+from src.team_data.stat_points import BaseStats, ImputationInput, PrecomputedStats, imputed_stats
 from src.model.event_builder import BattleEvent, EventCollector
 from src.model.structured_observation import (
     CAT_KNOWNNESS_START,
@@ -56,6 +55,9 @@ _MEGA_FORMS = frozenset(
 )
 
 _STACKABLE_SIDE_EFFECTS = frozenset({SideCondition.SPIKES, SideCondition.TOXIC_SPIKES})
+_BATTLE_STAT_CACHE: WeakKeyDictionary[DoubleBattle, dict[Pokemon, PrecomputedStats]] = (
+    WeakKeyDictionary()
+)
 
 
 def _knownness(value: object | None, resolved_id: int) -> Knownness:
@@ -85,32 +87,6 @@ def _write_effects(
             float(remaining_known),
             float(remaining),
         )
-
-
-# Nature stat impacts: (boosted_stat, hindered_stat)
-# 1: Atk, 2: Def, 3: SpA, 4: SpD, 5: Spe
-nature_impacts = {
-    "adamant": (1, 3),
-    "brave": (1, 5),
-    "lonely": (1, 2),
-    "naughty": (1, 4),
-    "bold": (2, 1),
-    "relaxed": (2, 5),
-    "impish": (2, 3),
-    "lax": (2, 4),
-    "modest": (3, 1),
-    "quiet": (3, 5),
-    "mild": (3, 2),
-    "rash": (3, 4),
-    "calm": (4, 1),
-    "gentle": (4, 2),
-    "sassy": (4, 5),
-    "careful": (4, 3),
-    "timid": (5, 1),
-    "hasty": (5, 2),
-    "jolly": (5, 3),
-    "naive": (5, 4),
-}
 
 
 def _safe_fraction(num: float | int | None, den: float | int | None) -> float:
@@ -163,72 +139,57 @@ def _pokemon_categorical_into(
     row[CAT_KNOWNNESS_START + 24] = _knownness(pokemon.nature, int(row[24]))
 
 
-@lru_cache(maxsize=4096)
-def _cached_raw_stats(
-    species: str,
-    evs: tuple[int, ...],
-    ivs: tuple[int, ...],
-    level: int,
-    nature: str,
-    gen: int,
-) -> tuple[float, ...]:
-    raw_stats = compute_raw_stats(
-        species,
-        list(evs),
-        list(ivs),
-        level,
-        nature,
-        GenData.from_gen(gen),
+def _imputation_input(pokemon: Pokemon) -> ImputationInput | None:
+    if not pokemon.species or not pokemon.nature or len(pokemon.moves) != MOVE_SLOTS:
+        return None
+    moves = tuple(pokemon.moves.values())
+    return ImputationInput(
+        species=PokemonTokenizer.normalize_id(pokemon.species),
+        nature=str(pokemon.nature).lower(),
+        item=PokemonTokenizer.normalize_id(pokemon.item or ""),
+        ability=PokemonTokenizer.normalize_id(pokemon.ability or ""),
+        moves=tuple(move.id for move in moves),
+        move_categories=tuple(move.category.name.lower() for move in moves),
+        base_stats=BaseStats.from_mapping(pokemon.base_stats),
+        level=int(pokemon.level or 50),
     )
-    return tuple(float(value) for value in raw_stats)
 
 
-def _estimate_stat_by_nature(pokemon: Pokemon, battle: DoubleBattle):
-    evs = [0] * 6
-    ivs = [31] * 6
-    nature = pokemon.nature or "serious"
-
-    if nature in nature_impacts:
-        boosted, _ = nature_impacts[nature]
-        if boosted in (1, 3, 5):  # Attacking or Speed
-            evs[boosted] = 252
-            if boosted == 5:  # Speed boost; pick best attack stat
-                if pokemon.base_stats["atk"] >= pokemon.base_stats["spa"]:
-                    evs[1] = 252
-                else:
-                    evs[3] = 252
-            else:
-                evs[5] = 252
-            evs[0] = 4
-        elif boosted in (2, 4):  # Defensive
-            evs[boosted] = 252
-            evs[0] = 252
-            evs[5] = 4
-    else:
-        # assume 252 hp and nothing else
-        evs[0] = 252
-
-    return _cached_raw_stats(
-        pokemon.species,
-        tuple(evs),
-        tuple(ivs),
-        int(pokemon.level or 50),
-        nature,
-        battle.gen,
-    )
+def _cached_imputed_stats(
+    pokemon: Pokemon, cache: dict[Pokemon, PrecomputedStats]
+) -> PrecomputedStats | None:
+    result = cache.get(pokemon)
+    if result is not None:
+        return result
+    value = _imputation_input(pokemon)
+    if value is None:
+        return None
+    result = imputed_stats(value)
+    cache[pokemon] = result
+    return result
 
 
 def _get_pokemon_level_stats(
-    pokemon: Pokemon, battle: DoubleBattle, is_opponent: bool
-) -> tuple[list[float], float]:
+    pokemon: Pokemon,
+    is_opponent: bool,
+    precomputed: PrecomputedStats | None,
+) -> tuple[tuple[float, ...], Provenance]:
     stats = pokemon.stats
     if not is_opponent and stats is not None:
         values = [stats.get(key) for key in ("hp", "atk", "def", "spa", "spd", "spe")]
         if all(value is not None for value in values):
-            return [float(value) for value in values], 1.0  # type: ignore
+            return tuple(float(value) for value in values), Provenance.SELF_KNOWN  # type: ignore
 
-    raw_stats = _estimate_stat_by_nature(pokemon, battle)
-    return [float(x) for x in raw_stats], 0.0
+    if precomputed is not None:
+        return tuple(float(value) for value in precomputed.values), Provenance.IMPUTED
+    return (0.0,) * 6, Provenance.UNKNOWN
+
+
+def _has_exact_stats(pokemon: Pokemon) -> bool:
+    stats = pokemon.stats
+    return stats is not None and all(
+        stats.get(key) is not None for key in ("hp", "atk", "def", "spa", "spd", "spe")
+    )
 
 
 def _pokemon_numeric_into(
@@ -240,6 +201,7 @@ def _pokemon_numeric_into(
     row: np.ndarray,
     active_idx: int | None = None,
     is_opponent: bool = False,
+    precomputed_stats: PrecomputedStats | None = None,
 ) -> None:
     row[cond + 1] = 1.0
 
@@ -311,17 +273,15 @@ def _pokemon_numeric_into(
 
     row[42] = pokemon.preparing
 
-    level_stats, stats_exact = _get_pokemon_level_stats(pokemon, battle, is_opponent)
+    level_stats, stat_provenance = _get_pokemon_level_stats(pokemon, is_opponent, precomputed_stats)
     row[43] = level_stats[0] / 300.0
     row[44] = level_stats[1] / 300.0
     row[45] = level_stats[2] / 300.0
     row[46] = level_stats[3] / 300.0
     row[47] = level_stats[4] / 300.0
     row[48] = level_stats[5] / 300.0
-    row[49] = stats_exact
-    row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = Provenance.IMPUTED
-    if stats_exact:
-        row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = Provenance.SELF_KNOWN
+    row[49] = float(stat_provenance == Provenance.SELF_KNOWN)
+    row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = stat_provenance
 
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
@@ -688,6 +648,7 @@ def from_battle_into(
     battle: AbstractBattle,
     out: StructuredObservation,
     tok: PokemonTokenizer | None = None,
+    stat_overrides: Mapping[Pokemon, PrecomputedStats] | None = None,
 ) -> None:
     assert isinstance(battle, DoubleBattle)
     _validate_output(out)
@@ -710,6 +671,7 @@ def from_battle_into(
     selected_allies = _selected_ally_pokemon(battle)
     ally_orig_idx = {mon: i for i, mon in enumerate(battle.team.values())}
     opponent_orig_idx = {mon: i for i, mon in enumerate(battle.opponent_team.values())}
+    stat_cache = _BATTLE_STAT_CACHE.setdefault(battle, {})
 
     pokemon_to_slot = {}
 
@@ -742,6 +704,13 @@ def from_battle_into(
             token_types[idx] = TokenType.POKEMON_NUMERIC
             sides[idx] = side
             slots[idx] = slot_id
+            precomputed = stat_overrides.get(mon) if stat_overrides and mon else None
+            if (
+                precomputed is None
+                and mon is not None
+                and (is_opponent or not _has_exact_stats(mon))
+            ):
+                precomputed = _cached_imputed_stats(mon, stat_cache)
             _pokemon_numeric_into(
                 mon,
                 battle,
@@ -751,6 +720,7 @@ def from_battle_into(
                 numerical[idx],
                 active_idx,
                 is_opponent=is_opponent,
+                precomputed_stats=precomputed,
             )
             _pokemon_effects_into(mon, tok, categorical[idx - 1], numerical[idx])
             idx += 1
@@ -846,9 +816,10 @@ def from_battle_into(
 def from_battle(
     battle: AbstractBattle,
     tok: PokemonTokenizer | None = None,
+    stat_overrides: Mapping[Pokemon, PrecomputedStats] | None = None,
 ) -> StructuredObservation:
     obs = StructuredObservation.empty_batch(1)[0]
-    from_battle_into(battle, obs, tok)
+    from_battle_into(battle, obs, tok, stat_overrides)
     return obs
 
 

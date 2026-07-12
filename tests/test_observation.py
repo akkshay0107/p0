@@ -21,8 +21,8 @@ from src.env import SimEnv
 from src.format_config import FORMAT
 from src.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
 from src.model.observation_builder import (
-    _cached_raw_stats,
-    _estimate_stat_by_nature,
+    _cached_imputed_stats,
+    _get_pokemon_level_stats,
     _get_ordered_pokemon,
     _global_field_token_into,
     _iter_move_slots,
@@ -46,11 +46,13 @@ from src.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     EffectNamespace,
+    Provenance,
     SideId,
     StructuredObservation,
     TokenType,
 )
 from src.model.tokenizer import tokenizer
+from src.team_data.stat_points import PrecomputedStats
 from src.team_picker import RandomTeamFromPool
 
 
@@ -787,19 +789,30 @@ def test_from_battle_into_validates_output_shape_and_dtype():
         from_battle_into(battle, invalid)
 
 
-def test_raw_stat_estimation_cache_matches_repeated_result():
-    battle = make_real_battle()
-    opponent = make_real_pokemon(species="charizard")
-    _cached_raw_stats.cache_clear()
+def test_stat_resolution_distinguishes_imputed_and_unknown_without_fabrication():
+    pokemon = make_real_pokemon(species="charizard")
+    pokemon._nature = None
+    values, provenance = _get_pokemon_level_stats(pokemon, True, None)
+    assert values == (0.0,) * 6
+    assert provenance == Provenance.UNKNOWN
 
-    first = _estimate_stat_by_nature(opponent, battle)
-    after_first = _cached_raw_stats.cache_info()
-    second = _estimate_stat_by_nature(opponent, battle)
-    after_second = _cached_raw_stats.cache_info()
+    expected = PrecomputedStats((155, 93, 98, 177, 105, 152))
+    values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
+    assert values == tuple(float(value) for value in expected.values)
+    assert provenance == Provenance.IMPUTED
 
-    assert first == second
-    assert after_first.misses == 1
-    assert after_second.hits == 1
+
+def test_battle_stat_cache_avoids_rebuilding_static_imputation():
+    pokemon = make_real_pokemon(
+        species="charizard",
+        moves={"heatwave": 10, "solarbeam": 10, "protect": 10, "weatherball": 10},
+    )
+    pokemon._nature = "modest"
+    cache = {}
+    first = _cached_imputed_stats(pokemon, cache)
+    second = _cached_imputed_stats(pokemon, cache)
+    assert first is second
+    assert len(cache) == 1
 
 
 def test_sim_env_embed_battle_writes_configured_target():
