@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Mapping
 from weakref import WeakKeyDictionary
 
@@ -13,9 +12,8 @@ from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
 
-from src.team_data.stat_points import BaseStats, ImputationInput, PrecomputedStats, imputed_stats
-from src.model.event_builder import BattleEvent, EventCollector
-from src.model.structured_observation import (
+from p0.model.event_builder import BattleEvent, EventCollector
+from p0.model.structured_observation import (
     CAT_KNOWNNESS_START,
     CATEGORICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
@@ -39,9 +37,11 @@ from src.model.structured_observation import (
     effect_cat_slice,
     effect_num_slice,
 )
-from src.model.tokenizer import PokemonTokenizer, tokenizer
+from p0.model.tokenizer import PokemonTokenizer, tokenizer
+from p0.paths import DEFAULT_PATHS
+from p0.team_data.stat_points import BaseStats, ImputationInput, PrecomputedStats, imputed_stats
 
-_DEX_PATH = Path(__file__).resolve().parents[2] / "data" / "champions_dex.json"
+_DEX_PATH = DEFAULT_PATHS.data_root / "champions_dex.json"
 with _DEX_PATH.open("r", encoding="utf-8") as _stream:
     _TRANSFORMATIONS = json.load(_stream)["transformations"]
 _MEGA_ITEMS = frozenset(

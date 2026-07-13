@@ -5,10 +5,10 @@ import numpy as np
 import torch
 from poke_env.battle import DoubleBattle
 
-from src.env import MegaEnv
-from src.format_config import FORMAT
-from src.model.policy import PolicyNet
-from src.model.structured_observation import (
+from p0.env import MegaEnv
+from p0.format_config import FORMAT
+from p0.model.policy import PolicyNet
+from p0.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,

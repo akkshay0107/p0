@@ -47,10 +47,10 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 
 ## Modules
 
-### 1. `src/` (Source)
+### 1. `src/p0/` (Source)
 
-- **`model/`**: Defines the neural network architecture. Contains the custom tokenizer, structured observation builders, the fused SwiGLU token encoder, and the dual actor-critic policy networks.
-- **`train/`**: Contains the PPO training loop, rollout buffers, vectorized environment management (spinning up local Node.js Showdown servers), behavioural cloning scripts, and the opponent pool (league) system.
+- **`model/`**: Defines the tokenizer, structured observations, encoder, and actor-critic policy.
+- **`train/`**: Contains PPO rollout, optimization, vector-environment, and league code.
 
 ### 2. `bench/` (Benchmarks)
 
@@ -89,17 +89,17 @@ cd pokemon-showdown && npm install && cd ..
 
 ### 2. PPO Training Loop
 
-The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.yaml.example` to the ignored, machine-local `config.yaml`, then set `environment.team_pool=all` or `environment.team_pool=reduced`. Opponents use `environment.opponent_team_pool=all` by default.
+The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.yaml.example` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.pool` and `environment.opponent_team_source.pool` independently.
 
 Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins league-based self-play.
 
 ```bash
-uv run python ./src/train/train_loop.py
+uv run p0-train
 ```
 
 _Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Loss, etc.) are exported to TensorBoard. You can view them by running `tensorboard --logdir ./artifacts/runs/ppo_training/`._
 
-### 5. Local Play
+### 3. Local Play
 
 You would have to move the trained model to a specific location and have the infra and client (which are slightly outdated since they were meant for v1) setup in order to play against the model locally with the usual showdown interface. Unfortunately, this part is slightly flaky since I haven't worked on it recently. See [p0-infra](https://github.com/akkshay0107/p0-infra) for more details.
 
@@ -111,6 +111,19 @@ You would have to move the trained model to a specific location and have the inf
 - **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and the active `config.yaml` snapshot into a `tar.gz` archive. I use it for moving stuff between remote servers while training.
 
 The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.yaml.example`.
+
+## Development verification
+
+Run the standard checkpoint gates from the repository root:
+
+```bash
+uv run ruff check src tests
+uv run pyright
+uv run pytest -q
+uv build
+```
+
+The installed command-line interfaces are `p0-train`, `p0-play`, `p0-build-vocab`, and `p0-export-training`.
 
 ---
 

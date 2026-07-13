@@ -3,9 +3,9 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
-from src.env import SimEnv
-from src.format_config import FORMAT
-from src.model.structured_observation import (
+from p0.env import SimEnv
+from p0.format_config import FORMAT
+from p0.model.structured_observation import (
     StructuredObservation,
 )
 

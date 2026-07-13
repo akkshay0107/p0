@@ -5,14 +5,14 @@ from typing import Self
 
 import torch
 
-from src.format_config import (
+from p0.format_config import (
     policy_model_config,
     runtime_manifest_sha256,
     validate_artifact_manifest_reference,
 )
-from src.model.policy import PolicyNet
-from src.model.structured_observation import StructuredObservation
-from src.train.config import PoolConfig
+from p0.model.policy import PolicyNet
+from p0.model.structured_observation import StructuredObservation
+from p0.train.config import PoolConfig
 
 INIT_WR = 0.5
 SHADOW_ID = "shadow"

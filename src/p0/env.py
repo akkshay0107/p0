@@ -26,10 +26,10 @@ from poke_env.ps_client import (
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import Teambuilder
 
-from src.model import observation_builder
-from src.model.structured_observation import StructuredObservation
-from src.format_config import FORMAT
-from src.team_picker import load_team_pool
+from p0.format_config import FORMAT
+from p0.model import observation_builder
+from p0.model.structured_observation import StructuredObservation
+from p0.team_picker import load_team_pool
 
 ACT_SIZE = FORMAT.action_size
 

@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-from src.model.structured_observation import SEQUENCE_LENGTH
-from src.model.swiglu_encoder import SwiGLUTransformerEncoder
+from p0.model.structured_observation import SEQUENCE_LENGTH
+from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 
 class CLSReducer(nn.Module):

@@ -5,10 +5,10 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SHOWDOWN_DIR = PROJECT_ROOT / "pokemon-showdown"
+from p0.paths import DEFAULT_PATHS
+
+SHOWDOWN_DIR = DEFAULT_PATHS.showdown_root
 
 
 class ShowdownServer:

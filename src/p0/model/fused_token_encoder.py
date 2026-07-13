@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-from src.format_config import FORMAT
-from src.model.event_builder import EVENT_TYPE_COUNT
-from src.model.structured_observation import (
+from p0.format_config import FORMAT
+from p0.model.event_builder import EVENT_TYPE_COUNT
+from p0.model.structured_observation import (
     ALLY_NUM_TOKENS,
     CAT_EFFECT_START,
     CAT_KNOWNNESS_START,
@@ -33,10 +32,11 @@ from src.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from src.model.swiglu_encoder import SwiGLUTransformerEncoder
+from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
+from p0.paths import DEFAULT_PATHS
 
 ACT_SIZE = FORMAT.action_size
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DATA_DIR = DEFAULT_PATHS.data_root
 
 NUM_COMPONENTS = 10
 NUM_TOKEN_TYPES = 6

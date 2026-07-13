@@ -5,7 +5,7 @@ from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.status import Status
 
-from src.model.tokenizer import PokemonTokenizer, tokenizer
+from p0.model.tokenizer import PokemonTokenizer, tokenizer
 
 
 def test_tokenizer_normalization():

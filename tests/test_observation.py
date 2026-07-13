@@ -17,13 +17,13 @@ from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
-from src.env import SimEnv
-from src.format_config import FORMAT
-from src.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
-from src.model.observation_builder import (
+from p0.env import SimEnv
+from p0.format_config import FORMAT
+from p0.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
+from p0.model.observation_builder import (
     _cached_imputed_stats,
-    _get_pokemon_level_stats,
     _get_ordered_pokemon,
+    _get_pokemon_level_stats,
     _global_field_token_into,
     _iter_move_slots,
     _pokemon_categorical_into,
@@ -34,7 +34,7 @@ from src.model.observation_builder import (
     from_battle,
     from_battle_into,
 )
-from src.model.structured_observation import (
+from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
@@ -51,9 +51,9 @@ from src.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from src.model.tokenizer import tokenizer
-from src.team_data.stat_points import PrecomputedStats
-from src.team_picker import RandomTeamFromPool
+from p0.model.tokenizer import tokenizer
+from p0.team_data.stat_points import PrecomputedStats
+from p0.team_picker import RandomTeamFromPool
 
 
 def make_real_pokemon(

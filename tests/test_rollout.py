@@ -4,18 +4,18 @@ from typing import Any, cast
 import numpy as np
 import torch
 
-from src.format_config import FORMAT
-from src.model.policy import ActOutput
-from src.model.structured_observation import StructuredObservation
-from src.train.config import TrainingConfig
-from src.train.rollout import (
+from p0.format_config import FORMAT
+from p0.model.policy import ActOutput
+from p0.model.structured_observation import StructuredObservation
+from p0.train.config import TrainingConfig
+from p0.train.rollout import (
     RolloutBuffer,
     build_partition,
     collect_rollouts,
     compute_gae_batch,
     create_trajectory_buffers,
 )
-from src.train.vec_env import ThreadVecEnv
+from p0.train.vec_env import ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
 

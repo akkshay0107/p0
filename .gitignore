@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+pip-wheel-metadata/
 
 # Virtual environments
 .test
@@ -21,8 +22,6 @@ teams/.pastes
 htmlcov/
 .mypy_cache/
 .pyright/
-.hypothesis/
-*.prof
 
 # Inverts
 !.python-version
@@ -48,5 +47,13 @@ config.yaml
 # Scratch dir for small experiments
 scratch/
 
+# Temporary local work directories
+tmp/
+temp/
+
 # Training export
 *.tar.gz
+*.zip
+
+# Incomplete documentation
+docs/

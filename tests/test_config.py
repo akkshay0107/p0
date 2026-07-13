@@ -1,8 +1,10 @@
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
-from src.train.config import GlobalConfig, TrainingConfig, load_config
+from p0.model.config import ModelConfig
+from p0.train.config import GlobalConfig, TrainingConfig, load_config
 
 
 def write_config(tmp_path, contents: str):
@@ -44,6 +46,50 @@ def test_config_is_immutable(tmp_path):
     config = load_config(write_config(tmp_path, "{}\n"))
 
     with pytest.raises(FrozenInstanceError):
-        config.training = TrainingConfig()
+        setattr(config, "training", TrainingConfig())
     with pytest.raises(FrozenInstanceError):
-        config.training.n_envs = 1
+        setattr(config.training, "n_envs", 1)
+
+
+def test_paths_and_team_source_paths_resolve_once_from_project_root(tmp_path):
+    config = load_config(
+        write_config(
+            tmp_path,
+            """
+paths:
+  data_root: relative-data
+environment:
+  agent_team_source:
+    path: team-pool
+""",
+        )
+    )
+
+    assert config.paths.repository_root.is_absolute()
+    assert config.paths.data_root == (Path(__file__).parents[1] / "relative-data").resolve()
+    assert config.environment.agent_team_source.path == (
+        Path(__file__).parents[1] / "team-pool"
+    ).resolve()
+
+
+def test_team_source_config_rejects_unknown_kind(tmp_path):
+    path = write_config(
+        tmp_path,
+        "environment:\n  agent_team_source:\n    kind: directory_magic\n",
+    )
+    with pytest.raises(ValueError, match="file_pool"):
+        load_config(path)
+
+
+def test_bot_format_must_match_application_format(tmp_path):
+    path = write_config(tmp_path, "bot:\n  battle_format: gen9anythinggoes\n")
+    with pytest.raises(ValueError, match="battle_format"):
+        load_config(path)
+
+
+def test_model_config_is_checkpoint_local_and_validated():
+    config = ModelConfig.baseline()
+    assert config.d_model == 512
+    assert config.history_tokens == 8
+    with pytest.raises(ValueError, match="divisible"):
+        ModelConfig(63, 8, 1, 8, 256)

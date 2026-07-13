@@ -5,22 +5,23 @@ from pathlib import Path
 
 import pytest
 
-from src.format_config import FORMAT, RuntimeManifest
-from src.model.fused_token_encoder import (
+from p0.format_config import FORMAT, RuntimeManifest
+from p0.model.build_vocab import build
+from p0.model.fused_token_encoder import (
     FusedTokenEncoder,
     _load_mechanic_tag_tables,
     _load_move_statics,
     _load_species_statics,
 )
-from src.model.tokenizer import PokemonTokenizer
-from src.model.build_vocab import build
-
+from p0.model.tokenizer import PokemonTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_active_contract_is_reg_m_b_and_manifest_matches_sources():
-    manifest = RuntimeManifest.from_dict(json.loads((ROOT / "data/runtime_manifest.json").read_text()))
+    manifest = RuntimeManifest.from_dict(
+        json.loads((ROOT / "data/runtime_manifest.json").read_text())
+    )
     assert FORMAT.battle_format == "gen9championsvgc2026regmb"
     assert FORMAT.bo3_format == "gen9championsvgc2026regmbbo3"
     assert manifest.format == FORMAT
@@ -91,9 +92,14 @@ console.log(JSON.stringify({
 """
     oracle = json.loads(subprocess.check_output(["node", "-e", script], cwd=ROOT, text=True))
     dex = json.loads((ROOT / "data/champions_dex.json").read_text())
-    tables = {name: {entry["id"]: entry for entry in dex[name]} for name in ("moves", "species", "items", "abilities")}
+    tables = {
+        name: {entry["id"]: entry for entry in dex[name]}
+        for name in ("moves", "species", "items", "abilities")
+    }
     assert {key: tables["moves"]["protect"][key] for key in oracle["move"]} == oracle["move"]
-    assert {key: tables["species"]["charizardmegax"][key] for key in oracle["species"]} == oracle["species"]
+    assert {key: tables["species"]["charizardmegax"][key] for key in oracle["species"]} == oracle[
+        "species"
+    ]
     assert tables["items"]["lifeorb"]["mechanicTags"] == oracle["itemTags"]
     assert tables["abilities"]["intimidate"]["mechanicTags"] == oracle["abilityTags"]
 

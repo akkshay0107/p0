@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from src.format_config import FORMAT, RuntimeManifest, current_manifest
+from p0.format_config import FORMAT, RuntimeManifest, current_manifest
 
 
 def test_runtime_manifest_round_trip_and_compatibility(tmp_path):
@@ -51,7 +51,7 @@ def test_format_spec_rejects_missing_and_unknown_fields():
 
 
 def test_tokenizer_resolution_distinguishes_none_and_oov():
-    from src.model.tokenizer import PokemonTokenizer, Resolution
+    from p0.model.tokenizer import PokemonTokenizer, Resolution
 
     tokenizer = PokemonTokenizer({"species": {"pikachu": 1}})
     assert tokenizer.resolve("species", None) == (0, Resolution.KNOWN_NONE)

@@ -8,10 +8,8 @@ from typing import Any
 from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from src.format_config import FORMAT
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+from p0.format_config import FORMAT
+from p0.paths import DEFAULT_PATHS, ProjectPaths
 
 
 def _positive_ints(config: Any, *names: str) -> None:
@@ -116,20 +114,22 @@ class PoolConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class PathsConfig:
-    artifacts_dir: Path = ARTIFACTS_DIR
-    pool_dir: Path = ARTIFACTS_DIR / "checkpoints" / "pool"
-    checkpoint_path: Path = ARTIFACTS_DIR / "checkpoints" / "ppo_checkpoint.pt"
-    runs_dir: Path = ARTIFACTS_DIR / "runs"
-    replays_dir: Path = ARTIFACTS_DIR / "replays"
-    backups_dir: Path = ARTIFACTS_DIR / "backups"
-    log_path: Path = ARTIFACTS_DIR / "training.log"
+class TeamSourceConfig:
+    kind: str = "file_pool"
+    pool: str = "all"
+    path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind != "file_pool":
+            raise ValueError("TeamSourceConfig.kind must be 'file_pool'")
+        if not self.pool.strip():
+            raise ValueError("TeamSourceConfig.pool must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentConfig:
-    team_pool: str = "all"
-    opponent_team_pool: str = "all"
+    agent_team_source: TeamSourceConfig = TeamSourceConfig()
+    opponent_team_source: TeamSourceConfig = TeamSourceConfig()
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,12 +149,20 @@ class BotConfig:
     allow_random_init: bool = False
     log_level: str = "INFO"
 
+    def __post_init__(self) -> None:
+        if self.battle_format != FORMAT.battle_format:
+            raise ValueError(
+                f"bot.battle_format must match configured format {FORMAT.battle_format!r}"
+            )
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError("bot.top_p must be in (0, 1]")
+
 
 @dataclass(frozen=True, slots=True)
 class GlobalConfig:
     training: TrainingConfig = TrainingConfig()
     pool: PoolConfig = PoolConfig()
-    paths: PathsConfig = PathsConfig()
+    paths: ProjectPaths = DEFAULT_PATHS
     environment: EnvironmentConfig = EnvironmentConfig()
     bot: BotConfig = BotConfig()
 
@@ -163,32 +171,56 @@ class GlobalConfig:
             raise ValueError("training.n_pool_opponents must not exceed pool.pool_size")
 
 
-def _resolve_path(value: str | Path) -> Path:
+def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root) -> Path:
     path = Path(value).expanduser()
-    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
 def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
+    repository_root = _resolve_path(config.paths.repository_root)
     paths = replace(
         config.paths,
-        artifacts_dir=_resolve_path(config.paths.artifacts_dir),
-        pool_dir=_resolve_path(config.paths.pool_dir),
-        checkpoint_path=_resolve_path(config.paths.checkpoint_path),
-        runs_dir=_resolve_path(config.paths.runs_dir),
-        replays_dir=_resolve_path(config.paths.replays_dir),
-        backups_dir=_resolve_path(config.paths.backups_dir),
-        log_path=_resolve_path(config.paths.log_path),
+        repository_root=repository_root,
+        data_root=_resolve_path(config.paths.data_root, repository_root),
+        teams_root=_resolve_path(config.paths.teams_root, repository_root),
+        artifacts_root=_resolve_path(config.paths.artifacts_root, repository_root),
+        showdown_root=_resolve_path(config.paths.showdown_root, repository_root),
+        pool_dir=_resolve_path(config.paths.pool_dir, repository_root),
+        checkpoint_path=_resolve_path(config.paths.checkpoint_path, repository_root),
+        runs_dir=_resolve_path(config.paths.runs_dir, repository_root),
+        replays_dir=_resolve_path(config.paths.replays_dir, repository_root),
+        backups_dir=_resolve_path(config.paths.backups_dir, repository_root),
+        log_path=_resolve_path(config.paths.log_path, repository_root),
     )
     bot = replace(
         config.bot,
         checkpoint_path=(
             None
             if config.bot.checkpoint_path is None
-            else _resolve_path(config.bot.checkpoint_path)
+            else _resolve_path(config.bot.checkpoint_path, repository_root)
         ),
-        team_files=tuple(_resolve_path(path) for path in config.bot.team_files),
+        team_files=tuple(_resolve_path(path, repository_root) for path in config.bot.team_files),
     )
-    return replace(config, paths=paths, bot=bot)
+    environment = replace(
+        config.environment,
+        agent_team_source=replace(
+            config.environment.agent_team_source,
+            path=(
+                None
+                if config.environment.agent_team_source.path is None
+                else _resolve_path(config.environment.agent_team_source.path, repository_root)
+            ),
+        ),
+        opponent_team_source=replace(
+            config.environment.opponent_team_source,
+            path=(
+                None
+                if config.environment.opponent_team_source.path is None
+                else _resolve_path(config.environment.opponent_team_source.path, repository_root)
+            ),
+        ),
+    )
+    return replace(config, paths=paths, bot=bot, environment=environment)
 
 
 def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
@@ -205,11 +237,26 @@ def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
     return cls(**values)
 
 
+def _build_environment(values: Any) -> EnvironmentConfig:
+    if not isinstance(values, Mapping):
+        raise ValueError("EnvironmentConfig must be a mapping")
+    names = {field.name for field in fields(EnvironmentConfig)}
+    unknown = set(values) - names
+    if unknown:
+        raise ValueError(f"unknown EnvironmentConfig field(s): {', '.join(sorted(unknown))}")
+    return EnvironmentConfig(
+        agent_team_source=_build_section(TeamSourceConfig, values["agent_team_source"]),
+        opponent_team_source=_build_section(TeamSourceConfig, values["opponent_team_source"]),
+    )
+
+
 def load_config(config_path: str | Path | None = None) -> GlobalConfig:
     """Load required ``config.yaml`` and apply its values to source defaults."""
-    path = PROJECT_ROOT / "config.yaml" if config_path is None else Path(config_path)
+    path = (
+        DEFAULT_PATHS.repository_root / "config.yaml" if config_path is None else Path(config_path)
+    )
     if not path.is_absolute():
-        path = PROJECT_ROOT / path
+        path = DEFAULT_PATHS.repository_root / path
     if path.name in {".ppoconfig", ".ppoconfig.example"}:
         raise ValueError(".ppoconfig is no longer supported; migrate settings to config.yaml")
     if not path.exists():
@@ -224,13 +271,13 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
         sections = {field.name for field in fields(GlobalConfig)}
         unknown = set(values) - sections
         if unknown:
-            names = ", ".join(sorted(unknown))
+            names = ", ".join(sorted(str(name) for name in unknown))
             raise ValueError(f"unknown root configuration section(s): {names}")
         config = GlobalConfig(
             training=_build_section(TrainingConfig, values["training"]),
             pool=_build_section(PoolConfig, values["pool"]),
-            paths=_build_section(PathsConfig, values["paths"]),
-            environment=_build_section(EnvironmentConfig, values["environment"]),
+            paths=_build_section(ProjectPaths, values["paths"]),
+            environment=_build_environment(values["environment"]),
             bot=_build_section(BotConfig, values["bot"], bot=True),
         )
         return _resolve_paths(config)

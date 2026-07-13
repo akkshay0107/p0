@@ -34,7 +34,11 @@ pool:
   pool_anchor_min_games: 20
   pool_explore_coef: 0.3
 paths:
-  artifacts_dir: artifacts
+  repository_root: .
+  data_root: data
+  teams_root: teams
+  artifacts_root: artifacts
+  showdown_root: pokemon-showdown
   pool_dir: artifacts/checkpoints/pool
   checkpoint_path: artifacts/checkpoints/ppo_checkpoint.pt
   runs_dir: artifacts/runs
@@ -42,11 +46,15 @@ paths:
   backups_dir: artifacts/backups
   log_path: artifacts/training.log
 environment:
-  team_pool: all
-  opponent_team_pool: all
+  agent_team_source:
+    kind: file_pool
+    pool: all
+  opponent_team_source:
+    kind: file_pool
+    pool: all
 bot:
   username: Bot
-  battle_format: gen9championsvgc2026regma
+  battle_format: gen9championsvgc2026regmb
   top_p: 0.9
   max_concurrent_battles: 10
   challenge_limit: 1000000

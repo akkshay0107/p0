@@ -3,9 +3,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from src.format_config import FORMAT
-from src.model.policy import PolicyNet
-from src.model.structured_observation import (
+from p0.format_config import FORMAT
+from p0.model.policy import PolicyNet
+from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
@@ -14,9 +14,9 @@ from src.model.structured_observation import (
     SEQUENCE_LENGTH,
     StructuredObservation,
 )
-from src.train.config import TrainingConfig
-from src.train.opponent_pool import OpponentPool
-from src.train.vec_env import ThreadVecEnv
+from p0.train.config import TrainingConfig
+from p0.train.opponent_pool import OpponentPool
+from p0.train.vec_env import ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
 MAX_TRAJECTORY_STEPS = 200

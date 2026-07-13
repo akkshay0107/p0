@@ -9,10 +9,10 @@ import torch.nn.init as init
 from torch import Tensor
 from torch.distributions import Categorical
 
-from src.format_config import FORMAT
-from src.model.cls_reducer import CLSReducer
-from src.model.fused_token_encoder import FusedTokenEncoder
-from src.model.structured_observation import (
+from p0.format_config import FORMAT
+from p0.model.cls_reducer import CLSReducer
+from p0.model.fused_token_encoder import FusedTokenEncoder
+from p0.model.structured_observation import (
     ALLY_NUM_TOKENS,
     ALLY_POKE_TOKENS,
     EVENT_COUNT,

@@ -7,13 +7,13 @@ import json
 import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
 from typing import Iterable
 
-from src.format_config import FORMAT, STAT_POINT_IMPUTER_VERSION
-from src.team_data.stat_points import StatPoints
+from p0.format_config import FORMAT, STAT_POINT_IMPUTER_VERSION
+from p0.paths import DEFAULT_PATHS
+from p0.team_data.stat_points import StatPoints
 
-_ROOT = Path(__file__).resolve().parents[2]
+_ROOT = DEFAULT_PATHS.repository_root
 _VALIDATOR = _ROOT / "scripts" / "validate_champions_team.js"
 _SHOWDOWN_VERSION = FORMAT.showdown_commit
 

@@ -4,13 +4,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from src.model.policy import PolicyNet
-from src.train.config import TrainingConfig
-from src.format_config import (
+from p0.format_config import (
     policy_model_config,
     runtime_manifest_sha256,
     validate_artifact_manifest_reference,
 )
+from p0.model.policy import PolicyNet
+from p0.train.config import TrainingConfig
 
 
 def default_device() -> torch.device:

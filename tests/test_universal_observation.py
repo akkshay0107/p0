@@ -2,9 +2,9 @@ import numpy as np
 import pytest
 import torch
 
-from src.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
-from src.model.observation_builder import _write_effects
-from src.model.structured_observation import (
+from p0.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
+from p0.model.observation_builder import _write_effects
+from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CATEGORICAL_WIDTH,
     MAX_EFFECTS,
@@ -21,7 +21,15 @@ def test_typed_effects_are_sorted_aligned_and_report_overflow():
     cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
     num = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
     entries = [
-        (EffectNamespace.POKEMON, effect_id, CounterKind.ACTION_COUNT, effect_id, 0, False, 0)
+        (
+            EffectNamespace.POKEMON,
+            effect_id,
+            CounterKind.ACTION_COUNT,
+            float(effect_id),
+            0.0,
+            False,
+            0.0,
+        )
         for effect_id in range(MAX_EFFECTS + 3, 0, -1)
     ]
 

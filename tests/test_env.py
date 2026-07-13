@@ -6,7 +6,7 @@ import pytest
 from poke_env.battle import DoubleBattle
 from poke_env.player.battle_order import PassBattleOrder
 
-from src.env import MegaEnv
+from p0.env import MegaEnv
 
 
 def test_action_validation_rejects_orders_outside_battle_order_space():

@@ -12,13 +12,13 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration, ServerC
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 
-from src.env import MegaEnv
-from src.format_config import FORMAT
-from src.model import observation_builder
-from src.model.policy import PolicyNet
-from src.team_picker import RandomTeamFromPool, load_team_pool
-from src.train.config import load_config
-from src.train.utils import load_checkpoint, policy_from_checkpoint
+from p0.env import MegaEnv
+from p0.format_config import FORMAT
+from p0.model import observation_builder
+from p0.model.policy import PolicyNet
+from p0.team_picker import RandomTeamFromPool, load_team_pool
+from p0.train.config import load_config
+from p0.train.utils import load_checkpoint, policy_from_checkpoint
 
 ACT_SIZE = FORMAT.action_size
 
@@ -222,8 +222,8 @@ class RLBotConfig:
 
 
 def parse_args(argv: list[str] | None = None) -> RLBotConfig:
-    root_dir = Path(__file__).resolve().parent.parent
     app_defaults = load_config()
+    root_dir = app_defaults.paths.repository_root
     bot_defaults = app_defaults.bot
     env_team_files = os.getenv("SHOWDOWN_TEAM_FILES", "")
     configured_team_files = [str(path) for path in bot_defaults.team_files]
@@ -278,7 +278,7 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     parser.add_argument(
         "--team-pool",
         choices=("all", "reduced"),
-        default=os.getenv("SHOWDOWN_TEAM_POOL", app_defaults.environment.team_pool),
+        default=os.getenv("SHOWDOWN_TEAM_POOL", app_defaults.environment.agent_team_source.pool),
         help="Named team pool under the teams directory.",
     )
     parser.add_argument(
@@ -334,8 +334,8 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     checkpoint_path = _resolve_path(root_dir, args.checkpoint)
     if checkpoint_path is None and not args.allow_random_init:
         checkpoint_path = _resolve_checkpoint_path(root_dir, checkpoint_path)
-    if args.top_p < 0.0 or args.top_p > 1.0:
-        raise ValueError("--top-p must be between 0.0 and 1.0.")
+    if not 0.0 < args.top_p <= 1.0:
+        raise ValueError("--top-p must be in (0.0, 1.0].")
     if args.max_concurrent_battles < 1:
         raise ValueError("--max-concurrent-battles must be at least 1.")
     if args.challenge_limit < 1:
@@ -368,7 +368,7 @@ def _configure_logging(level: str) -> None:
 
 
 async def run_bot(config: RLBotConfig) -> None:
-    root_dir = Path(__file__).resolve().parent.parent
+    root_dir = load_config().paths.repository_root
     team = (
         _load_team_pool(config.team_files)
         if config.team_files

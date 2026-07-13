@@ -14,9 +14,10 @@ from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
-from src.format_config import current_manifest
+from p0.format_config import current_manifest
+from p0.paths import DEFAULT_PATHS
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = DEFAULT_PATHS.repository_root
 DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
 DEFAULT_VOCAB = ROOT / "data" / "vocab.json"
 DEFAULT_MANIFEST = ROOT / "data" / "runtime_manifest.json"
@@ -175,7 +176,7 @@ def build(
     return coverage
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dex", type=Path, default=DEFAULT_DEX)
     parser.add_argument("--vocab", type=Path, default=DEFAULT_VOCAB)
@@ -185,6 +186,11 @@ if __name__ == "__main__":
         type=Path,
         help="Optional path for the reproducible coverage audit report",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     build(args.dex, args.vocab, args.manifest, args.coverage)
     print(json.dumps({"vocab": str(args.vocab), "manifest": str(args.manifest)}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

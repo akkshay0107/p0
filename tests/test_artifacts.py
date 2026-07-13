@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.model.policy import PolicyNet
-from src.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
-from src.train.utils import (
+from p0.model.policy import PolicyNet
+from p0.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
+from p0.train.utils import (
     load_checkpoint,
     policy_from_checkpoint,
     save_checkpoint,

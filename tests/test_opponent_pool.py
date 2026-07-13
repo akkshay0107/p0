@@ -3,8 +3,8 @@ from typing import Any, cast
 
 import torch
 
-from src.train.config import PoolConfig
-from src.train.opponent_pool import INIT_WR, SCORE_EPS, OpponentPool, _normalize
+from p0.train.config import PoolConfig
+from p0.train.opponent_pool import INIT_WR, SCORE_EPS, OpponentPool, _normalize
 
 
 def _fake_policy(value: float = 0.0) -> Any:

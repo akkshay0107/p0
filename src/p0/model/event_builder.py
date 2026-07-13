@@ -7,7 +7,7 @@ from weakref import WeakKeyDictionary, finalize
 from poke_env.battle import DoubleBattle
 from poke_env.battle.pokemon import Pokemon
 
-from src.model.tokenizer import tokenizer
+from p0.model.tokenizer import tokenizer
 
 
 class EventTypeId(IntEnum):

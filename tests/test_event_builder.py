@@ -1,4 +1,4 @@
-from src.model.event_builder import (
+from p0.model.event_builder import (
     BattleEvent,
     EventCollector,
     EventTypeId,

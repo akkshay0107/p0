@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from src.format_config import FORMAT
-from src.model.policy import PolicyNet
-from src.model.structured_observation import (
+from p0.format_config import FORMAT
+from p0.model.policy import PolicyNet
+from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CAT_KNOWNNESS_START,
     CAT_KNOWNNESS_WIDTH,
@@ -20,8 +20,8 @@ from src.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from src.train.config import TrainingConfig
-from src.train.train_loop import _run_batched_ppo
+from p0.train.config import TrainingConfig
+from p0.train.train_loop import _run_batched_ppo
 
 ACT_SIZE = FORMAT.action_size
 

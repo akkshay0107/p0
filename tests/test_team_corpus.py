@@ -2,8 +2,8 @@ from dataclasses import replace
 
 import pytest
 
-from src.team_data.stat_points import StatPoints
-from src.team_data.team_corpus import (
+from p0.team_data.stat_points import StatPoints
+from p0.team_data.team_corpus import (
     CanonicalTeam,
     TeamMember,
     TeamMetadata,

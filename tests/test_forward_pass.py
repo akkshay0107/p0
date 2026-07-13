@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from src.format_config import FORMAT
-from src.model.policy import EncodedObs, PolicyNet
-from src.model.structured_observation import (
+from p0.format_config import FORMAT
+from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
     EVENT_COUNT,
     NUMERICAL_WIDTH,
@@ -238,7 +238,7 @@ def test_cls_reducer_pokemon_tokens_alignment():
     """pokemon_tokens must be exactly the 24 pokemon tokens (original indices 1-24)."""
     import torch.nn as nn
 
-    from src.model.cls_reducer import CLSReducer
+    from p0.model.cls_reducer import CLSReducer
 
     reducer = CLSReducer(seq_len=SEQUENCE_LENGTH + 1, d_model=32, nhead=4, nlayer=1)
 

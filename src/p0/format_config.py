@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from p0.paths import DEFAULT_PATHS
+
 FORMAT_SPEC_VERSION = 1
 OBSERVATION_SCHEMA_VERSION = 2
 ACTION_SCHEMA_VERSION = "champions-mega-v1"
@@ -107,6 +109,7 @@ class RuntimeManifest:
         data["format"] = FormatSpec(**format_value)
         return cls(**data)
 
+
 def current_manifest(
     *,
     vocab_path: str | Path | None = None,
@@ -137,10 +140,12 @@ def policy_model_config(policy: Any) -> dict[str, Any]:
     }
 
 
-DEFAULT_RUNTIME_MANIFEST = Path(__file__).resolve().parents[1] / "data" / "runtime_manifest.json"
+DEFAULT_RUNTIME_MANIFEST = DEFAULT_PATHS.data_root / "runtime_manifest.json"
 
 
-def load_runtime_manifest(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> tuple[RuntimeManifest, str]:
+def load_runtime_manifest(
+    path: str | Path = DEFAULT_RUNTIME_MANIFEST,
+) -> tuple[RuntimeManifest, str]:
     """Strictly parse the global manifest and return it with its exact file identity."""
     path = Path(path)
     if not path.is_file():

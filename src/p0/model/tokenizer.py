@@ -15,6 +15,8 @@ from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
+from p0.paths import DEFAULT_PATHS
+
 CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
 
 
@@ -80,7 +82,9 @@ class PokemonTokenizer:
 
         self._side_conditions_str = vocab.get("side_conditions", {})
         self.side_conditions = {
-            condition: self._enum_vocab_id(self._side_conditions_str, condition, {condition.name: condition.name})
+            condition: self._enum_vocab_id(
+                self._side_conditions_str, condition, {condition.name: condition.name}
+            )
             for condition in SideCondition
         }
         _weathers_str = vocab.get("weathers", {})
@@ -98,20 +102,22 @@ class PokemonTokenizer:
             for weather in Weather
         }
         _fields_str = vocab.get("fields", {})
-        self.fields = {
-            field: self._enum_vocab_id(_fields_str, field) for field in Field
-        }
+        self.fields = {field: self._enum_vocab_id(_fields_str, field) for field in Field}
 
         _status_str = vocab.get("status", {})
         self.status = {
-            status: self._enum_vocab_id(_status_str, status, {
-                Status.BRN.name: "burn",
-                Status.FRZ.name: "freeze",
-                Status.PAR.name: "paralysis",
-                Status.PSN.name: "poison",
-                Status.SLP.name: "sleep",
-                Status.TOX.name: "toxic",
-            })
+            status: self._enum_vocab_id(
+                _status_str,
+                status,
+                {
+                    Status.BRN.name: "burn",
+                    Status.FRZ.name: "freeze",
+                    Status.PAR.name: "paralysis",
+                    Status.PSN.name: "poison",
+                    Status.SLP.name: "sleep",
+                    Status.TOX.name: "toxic",
+                },
+            )
             for status in Status
         }
 
@@ -125,11 +131,10 @@ class PokemonTokenizer:
         _trickroom_vocab = vocab.get("trickroom", {})
         self.trickroom_id: int = _trickroom_vocab.get("trickroom", 0)
 
-
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> PokemonTokenizer:
         if path is None:
-            path = Path(__file__).resolve().parents[2] / "data" / "vocab.json"
+            path = DEFAULT_PATHS.data_root / "vocab.json"
         with Path(path).open("r", encoding="utf-8") as f:
             return cls(json.load(f))
 

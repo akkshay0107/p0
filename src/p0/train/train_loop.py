@@ -15,20 +15,21 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
-from src.env import SimEnv
-from src.format_config import FORMAT
-from src.model.policy import EncodedObs, PolicyNet
-from src.model.structured_observation import (
+from p0.env import SimEnv
+from p0.format_config import FORMAT
+from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TOKEN_IDX_GLOBAL_FIELD_NUMERIC,
     StructuredObservation,
     is_teampreview,
 )
-from src.train.config import ARTIFACTS_DIR, GlobalConfig, TrainingConfig, load_config
-from src.train.opponent_pool import OpponentPool
-from src.train.rollout import RolloutBuffer, build_partition, collect_rollouts
-from src.train.utils import (
+from p0.paths import DEFAULT_PATHS
+from p0.train.config import GlobalConfig, TrainingConfig, load_config
+from p0.train.opponent_pool import OpponentPool
+from p0.train.rollout import RolloutBuffer, build_partition, collect_rollouts
+from p0.train.utils import (
     PPOScheduler,
     adamw_param_groups,
     default_device,
@@ -36,7 +37,7 @@ from src.train.utils import (
     policy_from_checkpoint,
     save_checkpoint,
 )
-from src.train.vec_env import ThreadVecEnv
+from p0.train.vec_env import ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
 
@@ -54,12 +55,12 @@ shutdown_requested = False
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
-ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_PATHS.artifacts_root.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(ARTIFACTS_DIR / "training.log", mode="w"),
+        logging.FileHandler(DEFAULT_PATHS.log_path, mode="w"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -540,8 +541,9 @@ def main():
                 SimEnv.build_env(
                     env_id=i,
                     server_port=8000 + i,
-                    team_pool=environment.team_pool,
-                    opponent_team_pool=environment.opponent_team_pool,
+                    team_pool=environment.agent_team_source.pool,
+                    opponent_team_pool=environment.opponent_team_source.pool,
+                    teams_root=paths.teams_root,
                 )
             )
             time.sleep(0.1)
@@ -571,7 +573,7 @@ def main():
 
         logging.info(f"Opponent pool: {pool}")
 
-        from src.train.rollout import create_trajectory_buffers
+        from p0.train.rollout import create_trajectory_buffers
 
         vec_env.reset()
         state1 = policy.initial_state(training.n_envs)
