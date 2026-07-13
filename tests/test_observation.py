@@ -17,9 +17,9 @@ from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
+from p0.battle.events import EventTypeId, RawBattleEvent
 from p0.env import SimEnv
 from p0.format_config import FORMAT
-from p0.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
 from p0.model.observation_builder import (
     _cached_imputed_stats,
     _get_ordered_pokemon,
@@ -52,8 +52,9 @@ from p0.model.structured_observation import (
     TokenType,
 )
 from p0.model.tokenizer import tokenizer
-from p0.team_data.stat_points import PrecomputedStats
-from p0.team_picker import RandomTeamFromPool
+from p0.runtime.live_event_capture import set_raw_events
+from p0.teams.source import ValidatedTeam
+from p0.teams.stat_points import PrecomputedStats
 
 
 def make_real_pokemon(
@@ -233,7 +234,7 @@ Modest Nature
 - Earth Power
 - Protect
 """
-    return RandomTeamFromPool([team])
+    return ValidatedTeam.from_showdown(team).packed
 
 
 def test_pokemon_categorical_real():
@@ -695,7 +696,7 @@ def test_events_join_to_current_slots_after_switch_and_are_consumed():
         "p1: Venusaur": switched_in,
     }
     battle._opponent_team = {"p2: Tyranitar": opponent}
-    EventCollector.set_raw_events(
+    set_raw_events(
         battle,
         [
             RawBattleEvent(("", "switch", "p1a: Venusaur", "Venusaur, L50", "100/100")),

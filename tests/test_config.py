@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from p0.model.config import ModelConfig
-from p0.train.config import GlobalConfig, TrainingConfig, load_config
+from p0.training.config import GlobalConfig, TrainingConfig, load_config
 
 
 def write_config(tmp_path, contents: str):
@@ -67,9 +67,10 @@ environment:
 
     assert config.paths.repository_root.is_absolute()
     assert config.paths.data_root == (Path(__file__).parents[1] / "relative-data").resolve()
-    assert config.environment.agent_team_source.path == (
-        Path(__file__).parents[1] / "team-pool"
-    ).resolve()
+    assert (
+        config.environment.agent_team_source.path
+        == (Path(__file__).parents[1] / "team-pool").resolve()
+    )
 
 
 def test_team_source_config_rejects_unknown_kind(tmp_path):
@@ -79,6 +80,12 @@ def test_team_source_config_rejects_unknown_kind(tmp_path):
     )
     with pytest.raises(ValueError, match="file_pool"):
         load_config(path)
+
+
+def test_future_corpus_team_source_is_a_config_discriminator_only():
+    from p0.training.config import TeamSourceConfig
+
+    assert TeamSourceConfig(kind="corpus").kind == "corpus"
 
 
 def test_bot_format_must_match_application_format(tmp_path):

@@ -32,7 +32,10 @@ def test_team_preview_codec_is_canonical_and_unique() -> None:
         for second in range(first + 1, 6)
     }
     assert len(actions) == 15
-    assert all(ActionCodec.decode_team_pair(action)[0] < ActionCodec.decode_team_pair(action)[1] for action in actions)
+    assert all(
+        ActionCodec.decode_team_pair(action)[0] < ActionCodec.decode_team_pair(action)[1]
+        for action in actions
+    )
     assert ActionCodec.team_selection(1, 8)[:4] == (0, 1, 2, 3)
 
 
@@ -66,7 +69,7 @@ def test_scalar_joint_constraints_match_policy_vectorization() -> None:
 
 
 def test_event_parser_import_does_not_install_poke_env_patches() -> None:
-    poke_env_patches.uninstall()
+    poke_env_patches.uninstall_for_tests()
     originals = (
         DoubleBattle.parse_message,
         Pokemon.switch_out,
@@ -98,15 +101,26 @@ def test_protocol_parser_accepts_an_injected_resource_resolver() -> None:
 
 
 def test_patch_installation_is_idempotent_and_reversible() -> None:
-    poke_env_patches.uninstall()
+    poke_env_patches.uninstall_for_tests()
     original = DoubleBattle.parse_message
     poke_env_patches.install()
     installed = DoubleBattle.parse_message
     poke_env_patches.install()
     assert DoubleBattle.parse_message is installed
     assert installed is not original
-    poke_env_patches.uninstall()
+    poke_env_patches.uninstall_for_tests()
     assert DoubleBattle.parse_message is original
+
+
+def test_patch_log_filter_is_scoped_to_the_injected_logger() -> None:
+    poke_env_patches.uninstall_for_tests()
+    target = logging.getLogger("test.poke-env")
+    other = logging.getLogger("test.other")
+    poke_env_patches.install(target)
+    record = logging.LogRecord("test", logging.WARNING, "", 0, "is active, but it's not", (), None)
+    assert not target.filter(record)
+    assert other.filter(record)
+    poke_env_patches.uninstall_for_tests()
 
 
 def test_live_adapter_and_pure_fixture_build_identical_observations() -> None:

@@ -14,9 +14,9 @@ from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.weather import Weather
 
+from p0.battle.events import BattleEvent, EventTypeId, ProtocolEventParser
 from p0.env import MegaEnv
 from p0.format_config import RuntimeManifest, validate_artifact_manifest_reference
-from p0.model.event_builder import BattleEvent, EventCollector, EventTypeId
 from p0.model.observation_builder import from_battle
 from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -30,7 +30,7 @@ from p0.model.structured_observation import (
     SideId,
     TokenType,
 )
-from p0.team_data.stat_points import BaseStats, StatPoints, calculate_stats
+from p0.teams.stat_points import BaseStats, StatPoints, calculate_stats
 
 
 def _action_battle() -> Any:
@@ -130,7 +130,7 @@ def test_golden_observation_shape_indices_and_enum_ids() -> None:
 def test_event_priority_order_and_overflow_are_stable() -> None:
     events = [BattleEvent(EventTypeId.DAMAGE, "p1a: Charizard", order=i) for i in range(65)]
     events.append(BattleEvent(EventTypeId.MOVE, "p2a: Venusaur", order=65))
-    selected = EventCollector.truncate_events(events, limit=EVENT_COUNT)
+    selected = ProtocolEventParser.truncate_events(events, limit=EVENT_COUNT)
     assert len(selected) == EVENT_COUNT
     assert [event.order for event in selected] == [*range(63), 65]
     assert selected[-1].event_type == EventTypeId.MOVE
@@ -147,6 +147,4 @@ def test_stat_formula_and_manifest_rejection_are_stable(tmp_path) -> None:
     manifest_path = tmp_path / "runtime_manifest.json"
     manifest_path.write_text(json.dumps(RuntimeManifest().to_dict()), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match"):
-        validate_artifact_manifest_reference(
-            {"runtime_manifest_sha256": "0" * 64}, manifest_path
-        )
+        validate_artifact_manifest_reference({"runtime_manifest_sha256": "0" * 64}, manifest_path)

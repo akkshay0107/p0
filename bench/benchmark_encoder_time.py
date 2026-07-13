@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from p0.model.structured_observation import EVENT_COUNT, SEQUENCE_LENGTH
 from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
-from p0.train.utils import default_device
+from p0.training.utils import default_device
 
 ACTION_MASK_TOKEN_COUNT = 1
 HISTORY_TOKEN_COUNT = 8

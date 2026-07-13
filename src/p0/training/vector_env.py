@@ -109,4 +109,4 @@ class ThreadVecEnv:
         return self.obs2_buffers.to(device, non_blocking=True)
 
     def shutdown(self):
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.executor.shutdown(wait=True, cancel_futures=True)

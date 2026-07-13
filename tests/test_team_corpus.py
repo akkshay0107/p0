@@ -2,16 +2,16 @@ from dataclasses import replace
 
 import pytest
 
-from p0.team_data.stat_points import StatPoints
-from p0.team_data.team_corpus import (
+from p0.teams.stat_points import StatPoints
+from p0.teams.team import (
     CanonicalTeam,
     TeamMember,
     TeamMetadata,
     TeamVariant,
     deduplicate_variants,
     validate_evidence_cutoff,
-    validate_variant,
 )
+from p0.teams.validation import validate_variant
 
 
 def _members():
@@ -100,6 +100,15 @@ def test_deduplication_merges_metadata_but_preserves_spread_variants():
     merged = next(item for item in result if item.spreads == first.spreads)
     assert merged.metadata.usage_count == 3
     assert merged.metadata.source_series == ("series-1", "series-2")
+
+
+def test_team_variant_serialization_round_trip_is_strict():
+    variant = _variant()
+    assert TeamVariant.from_dict(variant.to_dict()) == replace(
+        variant, team=variant.team.canonical()
+    )
+    with pytest.raises(ValueError, match="fields"):
+        TeamVariant.from_dict({**variant.to_dict(), "unexpected": True})
 
 
 def test_opponent_evidence_rejects_future_games():

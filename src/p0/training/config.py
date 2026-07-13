@@ -120,8 +120,8 @@ class TeamSourceConfig:
     path: Path | None = None
 
     def __post_init__(self) -> None:
-        if self.kind != "file_pool":
-            raise ValueError("TeamSourceConfig.kind must be 'file_pool'")
+        if self.kind not in {"file_pool", "corpus"}:
+            raise ValueError("TeamSourceConfig.kind must be 'file_pool' or future 'corpus'")
         if not self.pool.strip():
             raise ValueError("TeamSourceConfig.pool must not be empty")
 

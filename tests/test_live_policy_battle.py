@@ -1,0 +1,146 @@
+import asyncio
+import random
+
+import numpy as np
+import pytest
+import torch
+from poke_env import LocalhostServerConfiguration
+from poke_env.player import RandomPlayer
+
+from p0.format_config import FORMAT
+from p0.model.config import ModelConfig
+from p0.model.factory import PolicyFactory
+from p0.rl_player import RLPlayer
+from p0.runtime import poke_env_patches
+from p0.teams.source import FixedTeamSource
+
+TEAM = """
+Pikachu @ Light Ball
+Ability: Static
+Level: 50
+Jolly Nature
+- Fake Out
+- Protect
+- Thunderbolt
+- Electroweb
+
+Charizard @ Charizardite Y
+Ability: Blaze
+Level: 50
+Modest Nature
+- Heat Wave
+- Solar Beam
+- Protect
+- Weather Ball
+
+Whimsicott @ Focus Sash
+Ability: Prankster
+Level: 50
+Timid Nature
+- Moonblast
+- Tailwind
+- Encore
+- Protect
+
+Garchomp @ Sitrus Berry
+Ability: Rough Skin
+Level: 50
+Jolly Nature
+- Earthquake
+- Dragon Claw
+- Rock Slide
+- Protect
+
+Kingambit @ Black Glasses
+Ability: Defiant
+Level: 50
+Adamant Nature
+- Kowtow Cleave
+- Sucker Punch
+- Protect
+- Low Kick
+
+Glimmora @ Shuca Berry
+Ability: Corrosion
+Level: 50
+Modest Nature
+- Power Gem
+- Sludge Bomb
+- Earth Power
+- Protect
+"""
+
+
+class TrackedPolicyPlayer(RLPlayer):
+    def __init__(self, *args, **kwargs):
+        self.preview_decisions = 0
+        self.normal_decisions = 0
+        self.recurrent_states = []
+        super().__init__(*args, **kwargs)
+
+    def _get_action(self, battle):
+        action = super()._get_action(battle)
+        assert np.isfinite(action).all()
+        assert self.state is not None
+        self.recurrent_states.append(self.state)
+        if battle.teampreview:
+            self.preview_decisions += 1
+        else:
+            self.normal_decisions += 1
+        return action
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opponent_mode", ["self_policy", "random"])
+async def test_checkpoint_free_policy_completes_live_battle(
+    showdown_server,
+    opponent_mode,
+):
+    del showdown_server
+    torch.manual_seed(7)
+    poke_env_patches.install()
+    policy = PolicyFactory().create(ModelConfig.baseline()).eval()
+    first_source = FixedTeamSource(TEAM)
+    second_source = FixedTeamSource(TEAM)
+    first = TrackedPolicyPlayer(
+        policy=policy,
+        battle_format=FORMAT.battle_format,
+        server_configuration=LocalhostServerConfiguration,
+        team_source=first_source,
+        team_rng=random.Random(11),
+        max_concurrent_battles=1,
+    )
+    if opponent_mode == "self_policy":
+        second = TrackedPolicyPlayer(
+            policy=policy,
+            battle_format=FORMAT.battle_format,
+            server_configuration=LocalhostServerConfiguration,
+            team_source=second_source,
+            team_rng=random.Random(13),
+            max_concurrent_battles=1,
+        )
+    else:
+        second = RandomPlayer(
+            battle_format=FORMAT.battle_format,
+            server_configuration=LocalhostServerConfiguration,
+            team=second_source.sample(random.Random(13)).packed,
+            max_concurrent_battles=1,
+        )
+    try:
+        await asyncio.wait_for(first.battle_against(second, n_battles=1), timeout=60.0)
+    finally:
+        await first.ps_client.stop_listening()
+        await second.ps_client.stop_listening()
+        poke_env_patches.uninstall_for_tests()
+
+    assert first.preview_decisions >= 1
+    assert first.normal_decisions >= 1
+    assert first.recurrent_states
+    assert first.state is None
+    if isinstance(second, TrackedPolicyPlayer):
+        assert second.preview_decisions >= 1
+        assert second.normal_decisions >= 1
+        assert second.recurrent_states
+        assert second.state is None
+        assert first.recurrent_states[0] is not second.recurrent_states[0]

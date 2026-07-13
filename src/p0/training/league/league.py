@@ -1,25 +1,32 @@
-import json
 import logging
 from pathlib import Path
 from typing import Self
 
 import torch
 
-from p0.format_config import (
-    policy_model_config,
-    runtime_manifest_sha256,
-    validate_artifact_manifest_reference,
-)
 from p0.model.policy import PolicyNet
 from p0.model.structured_observation import StructuredObservation
-from p0.train.config import PoolConfig
+from p0.training.checkpoint import LEGACY_POLICY_STORE, PolicyStore
+from p0.training.config import PoolConfig
+from p0.training.league.repository import (
+    load_league_state,
+    save_league_state,
+    save_torch_artifact,
+)
+from p0.training.league.selection import pfsp_weight, sample_opponents
+from p0.training.league.signatures import (
+    DIV_MIN_SPREAD,
+    SCORE_EPS,
+    js_divergence,
+    normalize_scores,
+)
+from p0.training.league.state import LeagueState
 
 INIT_WR = 0.5
 SHADOW_ID = "shadow"
 alpha_shadow = 0.99  # ema decay rate of the shadow model
-
-SCORE_EPS = 0.05  # floor for not zeroing the product
-DIV_MIN_SPREAD = 0.01  # JSD spread below this is treated as uninformative
+REFERENCE_BATCH_SCHEMA = 1
+SIGNATURE_SCHEMA = 1
 
 
 def _normalize(
@@ -28,29 +35,26 @@ def _normalize(
     """Min-max candidate values into [eps, 1]. When the spread is too small to
     be meaningful, return a neutral 1.0 for every candidate so the factor drops
     out of a multiplicative score instead of annihilating it."""
-    lo, hi = min(values.values()), max(values.values())
-    if hi - lo < min_spread:
-        return {k: 1.0 for k in values}
-    return {k: eps + (1 - eps) * (v - lo) / (hi - lo) for k, v in values.items()}
+    return normalize_scores(values, min_spread, eps)
 
 
 def _js_divergence(p: torch.Tensor, q: torch.Tensor) -> float:
     """Computes the Jensen-Shannon divergence between two batched probability distributions.
     Expects p and q to be valid distributions that sum to 1 over their last dimension."""
-    m = 0.5 * (p + q)
-    safe_m = m.clamp_min(1e-12)
-
-    kl_p = torch.sum(torch.where(p > 0, p * torch.log2(p / safe_m), 0.0), dim=-1)
-    kl_q = torch.sum(torch.where(q > 0, q * torch.log2(q / safe_m), 0.0), dim=-1)
-
-    return (0.5 * kl_p + 0.5 * kl_q).mean().item()
+    return js_divergence(p, q)
 
 
 class OpponentPool:
-    def __init__(self, pool_dir: Path, config: PoolConfig):
+    def __init__(
+        self,
+        pool_dir: Path,
+        config: PoolConfig,
+        policy_store: PolicyStore = LEGACY_POLICY_STORE,
+    ):
         self.pool_dir = pool_dir
         self.pool_dir.mkdir(parents=True, exist_ok=True)
         self.config = config
+        self.policy_store = policy_store
         self.shadow_id: str | None = None
         self.anchor_ids: list[str] = []
         self.regular_ids: list[str] = []
@@ -86,20 +90,8 @@ class OpponentPool:
 
     def sample_many(self, count: int) -> list[str]:
         """Sample opponent IDs across shadow, anchors, and regulars without replacement."""
-        if count <= 0:
-            raise ValueError("Opponent count must be greater than zero.")
-
         roster = self.active_ids()
-        if not roster:
-            raise RuntimeError("OpponentPool is empty. Add an opponent before sampling.")
-
-        count = min(count, len(roster))
-        weights = torch.tensor(
-            [self._pfsp_weight(opponent_id) for opponent_id in roster],
-            dtype=torch.float32,
-        )
-        indices = torch.multinomial(weights, count, replacement=False)
-        return [roster[index] for index in indices.tolist()]
+        return sample_opponents(roster, self.win_rates, self.games, count, self.config)
 
     def update_win_rate(self, opponent_id: str, agent_wins: int, num_games: int = 1) -> None:
         if opponent_id not in self.win_rates:
@@ -118,21 +110,7 @@ class OpponentPool:
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint for opponent '{opponent_id}' not found at {path}")
 
-        checkpoint = torch.load(path, weights_only=True, map_location=device)
-        validate_artifact_manifest_reference(checkpoint)
-        config_value = checkpoint.get("model_config")
-        if not isinstance(config_value, dict):
-            raise ValueError(f"Opponent checkpoint {path} has no valid model configuration")
-        config = dict(config_value)
-        if not config:
-            raise ValueError(f"Opponent checkpoint {path} has no serialized model configuration")
-        try:
-            config["obs_dim"] = tuple(config["obs_dim"])
-            net = PolicyNet(**config)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid model configuration in opponent checkpoint {path}") from exc
-        net.load_state_dict(checkpoint["model_state_dict"])
-        return net.to(device).eval()
+        return self.policy_store.load_policy(path, device).eval()
 
     def add_anchor(self, policy: PolicyNet, id: str) -> bool:
         if self.contains(id):
@@ -208,8 +186,8 @@ class OpponentPool:
             return
 
         path = self._checkpoint_path(self.shadow_id)
-        checkpoint = torch.load(path, weights_only=True, map_location="cpu")
-        shadow_state = checkpoint["model_state_dict"]
+        shadow_policy = self.policy_store.load_policy(path, "cpu")
+        shadow_state = shadow_policy.state_dict()
         policy_state = policy.state_dict()
         for key, shadow_value in shadow_state.items():
             policy_value = policy_state[key].detach().cpu()
@@ -218,14 +196,8 @@ class OpponentPool:
                 shadow_value += (1 - alpha_shadow) * policy_value
             else:
                 shadow_state[key] = policy_value
-        torch.save(
-            {
-                "model_state_dict": shadow_state,
-                "runtime_manifest_sha256": runtime_manifest_sha256(),
-                "model_config": policy_model_config(policy),
-            },
-            path,
-        )
+        shadow_policy.load_state_dict(shadow_state)
+        self.policy_store.save_policy(path, shadow_policy)
         self.signatures.pop(self.shadow_id, None)
 
     def _regular_capacity(self) -> int:
@@ -244,24 +216,18 @@ class OpponentPool:
             )
 
     def _pfsp_weight(self, opponent_id: str) -> float:
-        # mix of competitive weighting + preferential hard weighting
-        wr = max(self.config.pool_wr_floor, self.win_rates[opponent_id])
-        base = wr * (1 - wr) + 0.3 * wr
-        # up-weight under-sampled opponents so their win rate (and thus anchor
-        # eligibility) converges faster; decays to ~0 as games accumulate
-        explore = self.config.pool_explore_coef / (1 + 0.2 * self.games.get(opponent_id, 0))
-        return base + explore
+        return pfsp_weight(self.win_rates[opponent_id], self.games.get(opponent_id, 0), self.config)
 
     def set_reference_batch(self, batch: dict[str, torch.Tensor]) -> None:
         """Install a fresh reference batch and recompute every signature against
         it. A new batch makes old signatures incomparable so all are rebuilt."""
         self.reference_batch = {k: v.cpu() for k, v in batch.items()}
-        torch.save(
+        save_torch_artifact(
+            self.pool_dir / "reference_batch.pt",
             {
-                "runtime_manifest_sha256": runtime_manifest_sha256(),
+                "league_reference_schema": REFERENCE_BATCH_SCHEMA,
                 "batch": self.reference_batch,
             },
-            self.pool_dir / "reference_batch.pt",
         )
 
         self.signatures.clear()
@@ -281,7 +247,8 @@ class OpponentPool:
         path = self.pool_dir / "reference_batch.pt"
         if path.exists():
             artifact = torch.load(path, weights_only=True, map_location="cpu")
-            validate_artifact_manifest_reference(artifact)
+            if artifact.get("league_reference_schema") != REFERENCE_BATCH_SCHEMA:
+                raise ValueError("Unsupported or missing league reference-batch schema")
             self.reference_batch = artifact["batch"]
 
     def _compute_signature(self, policy: PolicyNet) -> torch.Tensor | None:
@@ -329,14 +296,7 @@ class OpponentPool:
 
     def _register_opponent(self, opponent_id: str, policy: PolicyNet, role: str) -> None:
         """Saves the policy to disk, computes its signature, and tracks its state."""
-        torch.save(
-            {
-                "model_state_dict": policy.state_dict(),
-                "runtime_manifest_sha256": runtime_manifest_sha256(),
-                "model_config": policy_model_config(policy),
-            },
-            self._checkpoint_path(opponent_id),
-        )
+        self.policy_store.save_policy(self._checkpoint_path(opponent_id), policy)
 
         if role != "shadow":
             sig = self._compute_signature(policy)
@@ -370,50 +330,59 @@ class OpponentPool:
             self.shadow_id = None
 
     def save_state(self) -> None:
-        state = {
-            "runtime_manifest_sha256": runtime_manifest_sha256(),
-            "shadow_id": self.shadow_id,
-            "anchor_ids": self.anchor_ids,
-            "regular_ids": self.regular_ids,
-            "win_rates": self.win_rates,
-            "games": self.games,
-            "snapshots_since_anchor": self.snapshots_since_anchor,
-        }
-        with open(self.pool_dir / "pool_state.json", "w") as f:
-            json.dump(state, f, indent=2)
-        torch.save(
+        save_league_state(
+            self.pool_dir / "pool_state.json",
+            LeagueState(
+                shadow_id=self.shadow_id,
+                anchor_ids=list(self.anchor_ids),
+                regular_ids=list(self.regular_ids),
+                win_rates=dict(self.win_rates),
+                games=dict(self.games),
+                snapshots_since_anchor=self.snapshots_since_anchor,
+            ),
+        )
+        save_torch_artifact(
+            self.pool_dir / "pool_signatures.pt",
             {
-                "runtime_manifest_sha256": runtime_manifest_sha256(),
+                "league_signature_schema": SIGNATURE_SCHEMA,
                 "signatures": self.signatures,
             },
-            self.pool_dir / "pool_signatures.pt",
         )
 
     def _load_state(self) -> None:
         path = self.pool_dir / "pool_state.json"
-        if path.exists():
-            with open(path) as f:
-                state = json.load(f)
-            validate_artifact_manifest_reference(state)
-            self.shadow_id = state.get("shadow_id")
-            self.anchor_ids = state.get("anchor_ids", [])
-            self.regular_ids = state.get("regular_ids", [])
-            self.win_rates = state.get("win_rates", {})
-            self.games = state.get("games", {})
-            self.snapshots_since_anchor = state.get("snapshots_since_anchor", 0)
-        else:
-            self._load_from_checkpoints()
+        state = load_league_state(path)
+        if state is not None:
+            self.shadow_id = state.shadow_id
+            self.anchor_ids = state.anchor_ids
+            self.regular_ids = state.regular_ids
+            self.win_rates = state.win_rates
+            self.games = state.games
+            self.snapshots_since_anchor = state.snapshots_since_anchor
 
         self.load_reference_batch()
         path_sig = self.pool_dir / "pool_signatures.pt"
         if path_sig.exists():
             artifact = torch.load(path_sig, weights_only=True, map_location="cpu")
-            validate_artifact_manifest_reference(artifact)
+            if artifact.get("league_signature_schema") != SIGNATURE_SCHEMA:
+                raise ValueError("Unsupported or missing league signature schema")
             self.signatures = artifact["signatures"]
 
-        self._prune_missing_files()
+        missing = [
+            opponent_id
+            for opponent_id in self.active_ids()
+            if not self._checkpoint_path(opponent_id).exists()
+        ]
+        if missing:
+            raise ValueError(f"League state references missing policy snapshots: {missing}")
 
-    def _load_from_checkpoints(self) -> None:
+    def repair_from_checkpoints(self) -> None:
+        """Explicitly rebuild metadata from snapshots after operator confirmation."""
+        self.shadow_id = None
+        self.anchor_ids.clear()
+        self.regular_ids.clear()
+        self.win_rates.clear()
+        self.games.clear()
         existing_files = sorted(
             (
                 path
@@ -433,24 +402,16 @@ class OpponentPool:
             self.win_rates.setdefault(opponent_id, INIT_WR)
             self.games.setdefault(opponent_id, 0)
 
-    def _prune_missing_files(self) -> None:
-        existing_ids = {pt.stem for pt in self.pool_dir.glob("*.pt")}
-        if self.shadow_id not in existing_ids:
-            self.shadow_id = None
-        self.anchor_ids = [oid for oid in self.anchor_ids if oid in existing_ids]
-        self.regular_ids = [oid for oid in self.regular_ids if oid in existing_ids]
-        self.win_rates = {oid: wr for oid, wr in self.win_rates.items() if oid in self.active_ids()}
-        self.games = {oid: g for oid, g in self.games.items() if oid in self.active_ids()}
-        self.signatures = {
-            oid: sig for oid, sig in self.signatures.items() if oid in self.active_ids()
-        }
-        for opponent_id in self.active_ids():
-            self.win_rates.setdefault(opponent_id, INIT_WR)
-            self.games.setdefault(opponent_id, 0)
+        self.save_state()
 
     @classmethod
-    def load_or_create(cls, pool_dir: Path, config: PoolConfig) -> Self:
+    def load_or_create(
+        cls,
+        pool_dir: Path,
+        config: PoolConfig,
+        policy_store: PolicyStore = LEGACY_POLICY_STORE,
+    ) -> Self:
         """Load an existing pool from disk, or create an empty one."""
-        pool = cls(pool_dir, config)
+        pool = cls(pool_dir, config, policy_store)
         pool._load_state()
         return pool

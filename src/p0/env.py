@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 from typing import Optional, Union
 
@@ -5,7 +6,7 @@ import numpy as np
 import numpy.typing as npt
 from gymnasium.spaces import Box, MultiDiscrete
 from poke_env.battle import AbstractBattle, DoubleBattle
-from poke_env.environment.env import PokeEnv, _EnvPlayer
+from poke_env.environment.env import PokeEnv
 from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 from poke_env.ps_client import (
     AccountConfiguration,
@@ -21,20 +22,9 @@ from p0.model.structured_observation import StructuredObservation
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import PokeEnvOrderAdapter
 from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
-from p0.team_picker import load_team_pool
+from p0.teams.source import TeamSource
 
 ACT_SIZE = FORMAT.action_size
-
-class VGCEnvPlayer(_EnvPlayer):
-    async def _handle_battle_request(
-        self, battle: AbstractBattle, maybe_default_order: bool = False
-    ):
-        if battle.teampreview:
-            await self.battle_queue.async_put(battle)
-            order = await self.order_queue.async_get()
-            await self.ps_client.send_message(order.message, battle.battle_tag)
-        else:
-            await super()._handle_battle_request(battle, maybe_default_order)
 
 
 # modified from poke-env
@@ -60,7 +50,6 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         fake: bool = False,
         strict: bool = True,
     ):
-        poke_env_patches.install()
         super().__init__(
             account_configuration1=account_configuration1,
             account_configuration2=account_configuration2,
@@ -81,9 +70,10 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             fake=fake,
             strict=strict,
         )
-        # monkey patch
-        self.agent1.__class__ = VGCEnvPlayer
-        self.agent2.__class__ = VGCEnvPlayer
+        poke_env_patches.install(self.agent1.logger)
+        poke_env_patches.install(self.agent2.logger)
+        poke_env_patches.enable_environment_team_preview(self.agent1)
+        poke_env_patches.enable_environment_team_preview(self.agent2)
 
         self.fake = fake
         self.strict = strict
@@ -97,13 +87,15 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
 
     @staticmethod
     def single_action_mask(battle: DoubleBattle, pos: int) -> list[int]:
-        return list(LegalActionBuilder.legal_actions(PokeEnvBattleAdapter.decision_view(battle), pos))
+        return list(
+            LegalActionBuilder.legal_actions(PokeEnvBattleAdapter.decision_view(battle), pos)
+        )
 
     @staticmethod
     def get_action_mask(battle: AbstractBattle) -> list[int]:
         assert isinstance(battle, DoubleBattle)
         return (
-            LegalActionBuilder.mask(PokeEnvBattleAdapter.decision_view(battle))
+            LegalActionBuilder.mask(PokeEnvBattleAdapter.current_view(battle).decision)
             .reshape(-1)
             .astype(np.int64)
             .tolist()
@@ -198,10 +190,29 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
 
 
 class SimEnv(MegaEnv):
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        observation_builder: ObservationBuilder | None = None,
+        battle_adapter: type[PokeEnvBattleAdapter] = PokeEnvBattleAdapter,
+        legality_builder: type[LegalActionBuilder] = LegalActionBuilder,
+        order_adapter: type[PokeEnvOrderAdapter] = PokeEnvOrderAdapter,
+        agent_team_source: TeamSource | None = None,
+        opponent_team_source: TeamSource | None = None,
+        agent_rng: random.Random | None = None,
+        opponent_rng: random.Random | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self._observation_targets: dict[str, StructuredObservation] = {}
-        self._observation_builder = ObservationBuilder()
+        self._observation_builder = observation_builder or ObservationBuilder()
+        self._battle_adapter = battle_adapter
+        self._legality_builder = legality_builder
+        self._order_adapter = order_adapter
+        self._agent_team_source = agent_team_source
+        self._opponent_team_source = opponent_team_source
+        self._agent_rng = agent_rng or random.Random()
+        self._opponent_rng = opponent_rng or random.Random()
 
     def set_observation_targets(
         self,
@@ -224,31 +235,32 @@ class SimEnv(MegaEnv):
         opponent_team_pool: str = "all",
         teams_root: str | Path = "teams",
     ):
+        from p0.runtime.composition import build_sim_env
+        from p0.teams.source import FileTeamSource, FixedTeamSource
+
         if team is None:
-            agent_team = load_team_pool(Path(teams_root) / team_pool)
-            opponent_team = load_team_pool(Path(teams_root) / opponent_team_pool)
+            agent_source: TeamSource = FileTeamSource(Path(teams_root) / team_pool)
+            opponent_source: TeamSource = FileTeamSource(Path(teams_root) / opponent_team_pool)
         else:
-            agent_team = team
-            opponent_team = team
-        env = cls(
+            agent_source = opponent_source = FixedTeamSource(team)
+        return build_sim_env(
             account_configuration1=AccountConfiguration(f"TrainAgent_{env_id}", None),
             account_configuration2=AccountConfiguration(f"BestAgent_{env_id}", None),
-            server_configuration=ServerConfiguration(
-                f"ws://localhost:{server_port}/showdown/websocket",
-                "https://play.pokemonshowdown.com/action.php?",
-            ),
-            battle_format=FORMAT.battle_format,
-            accept_open_team_sheet=True,
-            start_timer_on_battle_start=False,
-            log_level=25,
-            # Poke-env accepts one team in its environment constructor. The
-            # players own their builders, so replace them after construction
-            # to support asymmetric agent/opponent team distributions.
-            team=agent_team,
+            server_port=server_port,
+            agent_team_source=agent_source,
+            opponent_team_source=opponent_source,
+            env_type=cls,
         )
-        env.agent1.update_team(agent_team)
-        env.agent2.update_team(opponent_team)
-        return env
+
+    def reset(self, seed: int | None = None, options=None):
+        if seed is not None:
+            self._agent_rng.seed(seed)
+            self._opponent_rng.seed(seed + 1)
+        if self._agent_team_source is not None:
+            self.agent1.update_team(self._agent_team_source.sample(self._agent_rng).packed)
+        if self._opponent_team_source is not None:
+            self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng).packed)
+        return super().reset(seed=seed, options=options)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         if not battle.finished:
@@ -257,7 +269,9 @@ class SimEnv(MegaEnv):
 
     def embed_battle(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
-        view = PokeEnvBattleAdapter.view(battle)
+        adapter = getattr(self, "_battle_adapter", PokeEnvBattleAdapter)
+        view = adapter.view(battle)
+        _ = view.decision
         builder = getattr(self, "_observation_builder", None)
         if builder is None:
             builder = self._observation_builder = ObservationBuilder()

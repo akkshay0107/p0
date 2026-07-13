@@ -20,8 +20,9 @@ from p0.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from p0.train.config import TrainingConfig
-from p0.train.train_loop import _run_batched_ppo
+from p0.training.config import TrainingConfig
+from p0.training.ppo import _run_batched_ppo
+from p0.training.trajectory import TrajectoryBatch
 
 ACT_SIZE = FORMAT.action_size
 
@@ -244,16 +245,18 @@ def test_ppo_warmup(dummy_obs):
     policy = PolicyNet(d_model=64, nhead=2, nlayer=1).to(device)
     policy.train()
 
-    episode = {
-        "obs": dummy_obs[0].unsqueeze(0),
-        "actions": torch.tensor([[1, 2]], dtype=torch.long),
-        "log_probs": torch.zeros(1),
-        "advantages": torch.ones(1),
-        "returns": torch.ones(1),
-        "values": torch.zeros(1),
-        "action_masks": torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
-        "length": 1,
-    }
+    episode = TrajectoryBatch(
+        observations=dummy_obs[0].unsqueeze(0),
+        actions=torch.tensor([[1, 2]], dtype=torch.long),
+        log_probs=torch.zeros(1),
+        advantages=torch.ones(1),
+        returns=torch.ones(1),
+        values=torch.zeros(1),
+        rewards=torch.zeros(1),
+        dones=torch.ones(1),
+        action_masks=torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
+        length=1,
+    )
     config = TrainingConfig(warmup_episodes=10)
 
     loss, _, steps = _run_batched_ppo([episode], policy, config, device, episode=0)

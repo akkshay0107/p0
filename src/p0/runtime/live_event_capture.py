@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from p0.model.event_builder import RawBattleEvent
+from p0.battle.events import RawBattleEvent
 
 _STATE_ATTRIBUTE = "_p0_live_event_state"
-_LAST_MOVE_ATTRIBUTE = "_p0_last_move"
 
 
 @dataclass(slots=True)
@@ -35,13 +34,9 @@ def consume_raw_events(battle: object) -> list[RawBattleEvent]:
 
 
 def last_move(pokemon: object) -> str | None:
-    value = getattr(pokemon, _LAST_MOVE_ATTRIBUTE, None)
-    return value if isinstance(value, str) else None
-
-
-def clear_last_move(pokemon: object) -> None:
-    if hasattr(pokemon, _LAST_MOVE_ATTRIBUTE):
-        delattr(pokemon, _LAST_MOVE_ATTRIBUTE)
+    value = getattr(pokemon, "last_move", None)
+    move_id = getattr(value, "id", None)
+    return move_id if isinstance(move_id, str) else None
 
 
 def capture_message(battle: object, split_message: list[str]) -> None:
@@ -54,6 +49,4 @@ def capture_message(battle: object, split_message: list[str]) -> None:
             pokemon = None
     if pokemon is not None and split_message[1] in {"-damage", "-heal"}:
         pre_hp = pokemon.current_hp_fraction
-    if pokemon is not None and len(split_message) > 3 and split_message[1] == "move":
-        setattr(pokemon, _LAST_MOVE_ATTRIBUTE, split_message[3])
     state_for(battle).raw_events.append(RawBattleEvent(tuple(split_message), pre_hp))

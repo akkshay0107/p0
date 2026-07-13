@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 import torch
 
-from p0.train.config import PoolConfig
-from p0.train.opponent_pool import INIT_WR, SCORE_EPS, OpponentPool, _normalize
+from p0.training.config import PoolConfig
+from p0.training.league.league import INIT_WR, SCORE_EPS, OpponentPool, _normalize
 
 
 def _fake_policy(value: float = 0.0) -> Any:
@@ -78,6 +79,16 @@ def test_update_win_rate_tracks_games_and_persists(tmp_path):
     pool.save_state()
     reloaded = OpponentPool.load_or_create(tmp_path, config)
     assert reloaded.games["ep20"] == 6
+
+
+def test_strict_load_reports_missing_referenced_snapshot(tmp_path):
+    config = PoolConfig()
+    pool = OpponentPool(tmp_path, config)
+    pool.add(cast(Any, _fake_policy()), "ep20")
+    pool.save_state()
+    (tmp_path / "ep20.pt").unlink()
+    with pytest.raises(ValueError, match="missing policy snapshots"):
+        OpponentPool.load_or_create(tmp_path, config)
 
 
 def test_maybe_promote_skips_when_no_candidate_meets_floor_or_games(tmp_path):

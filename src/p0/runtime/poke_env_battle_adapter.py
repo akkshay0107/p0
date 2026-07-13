@@ -6,10 +6,11 @@ from weakref import WeakKeyDictionary
 
 from poke_env.battle import DoubleBattle
 
+from p0.battle.events import ProtocolEventParser
 from p0.battle.legality import DecisionView, SlotDecision
-from p0.model.event_builder import EventCollector
-from p0.runtime.live_event_capture import last_move
-from p0.team_data.stat_points import PrecomputedStats
+from p0.model.tokenizer import tokenizer
+from p0.runtime.live_event_capture import consume_raw_events, last_move
+from p0.teams.stat_points import PrecomputedStats
 
 
 class PokeEnvBattleView:
@@ -116,7 +117,7 @@ class PokeEnvBattleView:
         return self._battle.get_pokemon(identifier)
 
     def consume_events(self):
-        return EventCollector.consume_events(self._battle)
+        return ProtocolEventParser.parse_events(consume_raw_events(self._battle), tokenizer)
 
     def last_move(self, pokemon):
         return last_move(pokemon)
@@ -132,6 +133,15 @@ class PokeEnvBattleAdapter:
             view = PokeEnvBattleView(battle)
             cls._views[battle] = view
         return view.refresh()
+
+    @classmethod
+    def current_view(cls, battle: DoubleBattle) -> PokeEnvBattleView:
+        """Return the decision's existing view, creating it only when necessary."""
+        view = cls._views.get(battle)
+        if view is None:
+            view = PokeEnvBattleView(battle)
+            cls._views[battle] = view
+        return view
 
     @staticmethod
     def decision_view(battle: DoubleBattle) -> DecisionView:

@@ -98,7 +98,7 @@ class EventResolver(Protocol):
 
 
 class ProtocolEventParser:
-    """Pure entry point; vocabulary resolution is injected by the compatibility parser."""
+    """Pure entry point with injected vocabulary resolution."""
 
     @staticmethod
     def get_hp_fraction(hp_status: str) -> float:

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from p0.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
+from p0.battle.events import EventTypeId, ProtocolEventParser, RawBattleEvent
 from p0.model.observation_builder import _write_effects
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
@@ -15,6 +15,7 @@ from p0.model.structured_observation import (
     EffectNamespace,
     StructuredObservation,
 )
+from p0.model.tokenizer import tokenizer
 
 
 def test_typed_effects_are_sorted_aligned_and_report_overflow():
@@ -49,7 +50,7 @@ def test_overflow_contract_rejects_unmarked_truncation():
 
 
 def test_event_parser_preserves_identity_target_and_evidence():
-    events = EventCollector.parse_events(
+    events = ProtocolEventParser.parse_events(
         [
             RawBattleEvent(
                 ("", "move", "p1a: Mew", "Metronome", "p2a: Gengar", "[from] ability: Dancer")
@@ -57,7 +58,8 @@ def test_event_parser_preserves_identity_target_and_evidence():
             RawBattleEvent(("", "-ability", "p2a: Gengar", "Cursed Body")),
             RawBattleEvent(("", "-fieldstart", "move: Trick Room")),
             RawBattleEvent(("", "-fieldend", "move: Trick Room")),
-        ]
+        ],
+        tokenizer,
     )
 
     assert events[0].target_id == "p2a: Gengar"

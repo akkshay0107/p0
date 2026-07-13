@@ -7,15 +7,14 @@ import torch
 from p0.format_config import FORMAT
 from p0.model.policy import ActOutput
 from p0.model.structured_observation import StructuredObservation
-from p0.train.config import TrainingConfig
-from p0.train.rollout import (
+from p0.training.config import TrainingConfig
+from p0.training.rollout import (
     RolloutBuffer,
     build_partition,
     collect_rollouts,
-    compute_gae_batch,
-    create_trajectory_buffers,
 )
-from p0.train.vec_env import ThreadVecEnv
+from p0.training.trajectory import TrajectoryStorage, compute_gae_batch
+from p0.training.vector_env import ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
 
@@ -249,8 +248,8 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
     vec_env = FakeVecEnv(config.n_envs)
     policy = FakePolicy(action=7)
     buffer = RolloutBuffer()
-    trajectories1 = create_trajectory_buffers(config.n_envs, max_steps=4)
-    trajectories2 = create_trajectory_buffers(config.n_envs, max_steps=4)
+    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
+    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
     state1 = torch.ones((config.n_envs, 1, 1))
     state2 = torch.ones((config.n_envs, 1, 1))
 
@@ -271,9 +270,9 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
     assert stats == (1, 1)
     assert pool.updates == [("opp", 1, 1)]
     assert len(buffer.trajectories) == 4
-    assert all(torch.all(episode["actions"] == 7) for episode in buffer.trajectories)
-    assert trajectories1["step_counts"].tolist() == [0, 0, 0]
-    assert trajectories2["step_counts"].tolist() == [0, 0, 0]
+    assert all(torch.all(episode.actions == 7) for episode in buffer.trajectories)
+    assert trajectories1.step_counts.tolist() == [0, 0, 0]
+    assert trajectories2.step_counts.tolist() == [0, 0, 0]
     assert torch.count_nonzero(next_state1) == 0
     assert torch.count_nonzero(next_state2) == 0
 
@@ -307,8 +306,8 @@ def test_pool_opponent_rotates_only_after_completed_battle():
         cast(Any, pool),
         config,
         cast(Any, {}),
-        create_trajectory_buffers(config.n_envs, max_steps=4),
-        create_trajectory_buffers(config.n_envs, max_steps=4),
+        TrajectoryStorage.allocate(config.n_envs, max_steps=4),
+        TrajectoryStorage.allocate(config.n_envs, max_steps=4),
         torch.ones((config.n_envs, 1, 1)),
         torch.ones((config.n_envs, 1, 1)),
         partition,

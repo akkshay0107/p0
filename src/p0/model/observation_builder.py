@@ -38,7 +38,7 @@ from p0.model.structured_observation import (
     effect_num_slice,
 )
 from p0.model.tokenizer import PokemonTokenizer, tokenizer
-from p0.team_data.stat_points import BaseStats, ImputationInput, PrecomputedStats, imputed_stats
+from p0.teams.stat_points import BaseStats, ImputationInput, PrecomputedStats, imputed_stats
 
 _DEFAULT_RESOURCES = default_runtime_resources()
 _MEGA_ITEMS = _DEFAULT_RESOURCES.mega_items

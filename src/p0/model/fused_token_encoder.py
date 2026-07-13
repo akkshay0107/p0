@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
+from p0.battle.events import EVENT_TYPE_COUNT
 from p0.format_config import FORMAT
-from p0.model.event_builder import EVENT_TYPE_COUNT
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
     ALLY_NUM_TOKENS,

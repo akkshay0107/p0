@@ -1,6 +1,6 @@
 import pytest
 
-from p0.team_data.stat_points import (
+from p0.teams.stat_points import (
     BaseStats,
     ImputationInput,
     Role,

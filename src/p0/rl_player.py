@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import random
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,16 +14,16 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 
 from p0.battle.legality import LegalActionBuilder
-from p0.env import MegaEnv
 from p0.format_config import FORMAT
 from p0.model.factory import PolicyFactory
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.runtime import poke_env_patches
+from p0.runtime.poke_env_action_adapter import PokeEnvOrderAdapter
 from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
-from p0.team_picker import RandomTeamFromPool, load_team_pool
-from p0.train.config import load_config
-from p0.train.utils import load_checkpoint, policy_from_checkpoint
+from p0.teams.source import FileTeamSource, TeamSource
+from p0.training.checkpoint import LEGACY_POLICY_STORE, PolicyStore
+from p0.training.config import load_config
 
 
 class RLPlayer(Player):
@@ -35,11 +36,29 @@ class RLPlayer(Player):
         policy: PolicyNet,
         top_p: float = 0.9,
         *args,
+        observation_builder: ObservationBuilder | None = None,
+        battle_adapter: type[PokeEnvBattleAdapter] = PokeEnvBattleAdapter,
+        legality_builder: type[LegalActionBuilder] = LegalActionBuilder,
+        order_adapter: type[PokeEnvOrderAdapter] = PokeEnvOrderAdapter,
+        team_source: TeamSource | None = None,
+        team_rng: random.Random | None = None,
         **kwargs,
     ):
+        self.team_source = team_source
+        self.team_rng = team_rng or random.Random()
+        if team_source is not None:
+            if "team" in kwargs:
+                raise ValueError("Pass either team or team_source, not both")
+            kwargs["team"] = team_source.sample(self.team_rng).packed
         super().__init__(*args, **kwargs)
+        poke_env_patches.install(self.logger)
         self.policy = policy
-        self.observation_builder = ObservationBuilder(resources=policy.resources)
+        self.observation_builder = observation_builder or ObservationBuilder(
+            resources=policy.resources
+        )
+        self.battle_adapter = battle_adapter
+        self.legality_builder = legality_builder
+        self.order_adapter = order_adapter
 
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
@@ -51,9 +70,9 @@ class RLPlayer(Player):
             self.state = self.policy.initial_state(1)
 
         assert isinstance(battle, DoubleBattle)
-        view = PokeEnvBattleAdapter.view(battle)
+        view = self.battle_adapter.view(battle)
         obs = self.observation_builder.build(view)
-        action_mask = torch.from_numpy(LegalActionBuilder.mask(view.decision))
+        action_mask = torch.from_numpy(self.legality_builder.mask(view.decision))
 
         obs = obs.unsqueeze(0).to(self.policy.device)
         action_mask = action_mask.unsqueeze(0).to(self.policy.device)
@@ -71,23 +90,25 @@ class RLPlayer(Player):
         assert isinstance(battle, DoubleBattle)
         if battle._wait:
             return DefaultBattleOrder()
-        return MegaEnv.action_to_order(self._get_action(battle), battle)
+        return self.order_adapter.action_to_order(self._get_action(battle), battle)
 
     def get_observation(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
-        return self.observation_builder.build(PokeEnvBattleAdapter.view(battle))
+        return self.observation_builder.build(self.battle_adapter.view(battle))
 
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
         # Reset state at the beginning of each battle's Team Preview
         self.state = None
         action = self._get_action(battle)
-        order = MegaEnv.action_to_order(action, battle)
+        order = self.order_adapter.action_to_order(action, battle)
         return order.message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
         # Reset state to prevent leaks or state carry-over across battles
         self.state = None
+        if self.team_source is not None:
+            self.update_team(self.team_source.sample(self.team_rng).packed)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -148,22 +169,6 @@ def _build_server_configuration(
     return LocalhostServerConfiguration
 
 
-def _load_team_pool(team_paths: Iterable[Path]) -> RandomTeamFromPool:
-    teams = []
-    for path in sorted(team_paths):
-        if not path.is_file():
-            continue
-        if path.name.startswith("."):
-            continue
-        teams.append(path.read_text(encoding="utf-8").strip())
-
-    teams = [team for team in teams if team]
-    if not teams:
-        raise FileNotFoundError("No usable team files were found for the bot.")
-
-    return RandomTeamFromPool(teams)
-
-
 def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
     if checkpoint is not None:
         if checkpoint.exists():
@@ -180,7 +185,11 @@ def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
     )
 
 
-def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> PolicyNet:
+def _load_policy(
+    checkpoint_path: Path | None,
+    allow_random_init: bool,
+    policy_store: PolicyStore = LEGACY_POLICY_STORE,
+) -> PolicyNet:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if checkpoint_path is None:
@@ -194,8 +203,8 @@ def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> Polic
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
-    policy = policy_from_checkpoint(checkpoint_path, device)
-    episode = load_checkpoint(checkpoint_path, policy)
+    policy = policy_store.load_policy(checkpoint_path, device)
+    episode = policy_store.load_training_state(checkpoint_path, policy)
     LOGGER.info(
         "Loaded checkpoint from %s%s",
         checkpoint_path,
@@ -371,16 +380,23 @@ def _configure_logging(level: str) -> None:
     )
 
 
-async def run_bot(config: RLBotConfig) -> None:
+async def run_bot(
+    config: RLBotConfig,
+    policy_store: PolicyStore = LEGACY_POLICY_STORE,
+) -> None:
     poke_env_patches.install()
     root_dir = load_config().paths.repository_root
-    team = (
-        _load_team_pool(config.team_files)
+    team_source = (
+        FileTeamSource.from_files(config.team_files)
         if config.team_files
-        else load_team_pool(root_dir / "teams" / config.team_pool)
+        else FileTeamSource(root_dir / "teams" / config.team_pool)
     )
     checkpoint_path = config.checkpoint_path
-    policy = _load_policy(checkpoint_path, allow_random_init=config.allow_random_init)
+    policy = _load_policy(
+        checkpoint_path,
+        allow_random_init=config.allow_random_init,
+        policy_store=policy_store,
+    )
     server_configuration = ServerConfiguration(
         config.websocket_url,
         config.authentication_url,
@@ -392,7 +408,7 @@ async def run_bot(config: RLBotConfig) -> None:
         account_configuration=account_configuration,
         battle_format=config.battle_format,
         server_configuration=server_configuration,
-        team=team,
+        team_source=team_source,
         accept_open_team_sheet=config.accept_open_team_sheet,
         max_concurrent_battles=config.max_concurrent_battles,
     )
