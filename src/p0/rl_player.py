@@ -12,15 +12,17 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration, ServerC
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 
+from p0.battle.legality import LegalActionBuilder
 from p0.env import MegaEnv
 from p0.format_config import FORMAT
-from p0.model import observation_builder
+from p0.model.factory import PolicyFactory
+from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
+from p0.runtime import poke_env_patches
+from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
 from p0.team_picker import RandomTeamFromPool, load_team_pool
 from p0.train.config import load_config
 from p0.train.utils import load_checkpoint, policy_from_checkpoint
-
-ACT_SIZE = FORMAT.action_size
 
 
 class RLPlayer(Player):
@@ -37,6 +39,7 @@ class RLPlayer(Player):
     ):
         super().__init__(*args, **kwargs)
         self.policy = policy
+        self.observation_builder = ObservationBuilder(resources=policy.resources)
 
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
@@ -47,9 +50,10 @@ class RLPlayer(Player):
         if self.state is None:
             self.state = self.policy.initial_state(1)
 
-        obs = self.get_observation(battle)
-        action_mask_list = MegaEnv.get_action_mask(battle)
-        action_mask = torch.tensor([action_mask_list[:ACT_SIZE], action_mask_list[ACT_SIZE:]])
+        assert isinstance(battle, DoubleBattle)
+        view = PokeEnvBattleAdapter.view(battle)
+        obs = self.observation_builder.build(view)
+        action_mask = torch.from_numpy(LegalActionBuilder.mask(view.decision))
 
         obs = obs.unsqueeze(0).to(self.policy.device)
         action_mask = action_mask.unsqueeze(0).to(self.policy.device)
@@ -71,7 +75,7 @@ class RLPlayer(Player):
 
     def get_observation(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
-        return observation_builder.from_battle(battle)
+        return self.observation_builder.build(PokeEnvBattleAdapter.view(battle))
 
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
@@ -183,7 +187,7 @@ def _load_policy(checkpoint_path: Path | None, allow_random_init: bool) -> Polic
         if not allow_random_init:
             raise ValueError("A checkpoint is required unless random init is explicitly allowed.")
         LOGGER.warning("Starting bot with randomly initialized policy weights.")
-        policy = PolicyNet().to(device)
+        policy = PolicyFactory().create().to(device)
         policy.eval()
         return policy
 
@@ -368,6 +372,7 @@ def _configure_logging(level: str) -> None:
 
 
 async def run_bot(config: RLBotConfig) -> None:
+    poke_env_patches.install()
     root_dir = load_config().paths.repository_root
     team = (
         _load_team_pool(config.team_files)

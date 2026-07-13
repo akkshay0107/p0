@@ -9,9 +9,11 @@ import time
 
 from poke_env.battle import DoubleBattle, Pokemon
 
-from p0.model.observation_builder import from_battle, from_battle_into
+from p0.battle.legality import LegalActionBuilder
+from p0.model.observation_builder import ObservationBuilder, from_battle, from_battle_into
 from p0.model.structured_observation import StructuredObservation
 from p0.model.tokenizer import tokenizer
+from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
 
 
 def _battle_fixture() -> DoubleBattle:
@@ -47,6 +49,8 @@ def _summary(samples: list[float]) -> tuple[float, float]:
 def benchmark(args: argparse.Namespace) -> None:
     battle = _battle_fixture()
     target = StructuredObservation.empty_batch(1)[0]
+    builder = ObservationBuilder(tokenizer)
+    view = PokeEnvBattleAdapter.view(battle)
     for _ in range(args.warmup):
         from_battle_into(battle, target, tokenizer)
 
@@ -58,8 +62,26 @@ def benchmark(args: argparse.Namespace) -> None:
         _measure(lambda: from_battle(battle, tokenizer), args.iterations)
         for _ in range(args.repeats)
     ]
+    view_write_samples = [
+        _measure(lambda: builder.build_into(view, target), args.iterations)
+        for _ in range(args.repeats)
+    ]
+    adapter_samples = [
+        _measure(lambda: PokeEnvBattleAdapter.view(battle), args.iterations)
+        for _ in range(args.repeats)
+    ]
+    legality_samples = [
+        _measure(
+            lambda: LegalActionBuilder.mask(PokeEnvBattleAdapter.decision_view(battle)),
+            args.iterations,
+        )
+        for _ in range(args.repeats)
+    ]
     write_median, write_iqr = _summary(write_samples)
     allocation_median, allocation_iqr = _summary(allocation_samples)
+    view_write_median, view_write_iqr = _summary(view_write_samples)
+    adapter_median, adapter_iqr = _summary(adapter_samples)
+    legality_median, legality_iqr = _summary(legality_samples)
     print(f"iterations={args.iterations} repeats={args.repeats} fixture_pokemon=6")
     print(f"write_samples_seconds={','.join(f'{sample:.8f}' for sample in write_samples)}")
     print(f"write_median_seconds={write_median:.8f}")
@@ -70,6 +92,12 @@ def benchmark(args: argparse.Namespace) -> None:
     )
     print(f"allocate_and_write_median_seconds={allocation_median:.8f}")
     print(f"allocate_and_write_iqr_seconds={allocation_iqr:.8f}")
+    print(f"view_write_median_seconds={view_write_median:.8f}")
+    print(f"view_write_iqr_seconds={view_write_iqr:.8f}")
+    print(f"cached_adapter_refresh_median_seconds={adapter_median:.8f}")
+    print(f"cached_adapter_refresh_iqr_seconds={adapter_iqr:.8f}")
+    print(f"decision_and_legality_median_seconds={legality_median:.8f}")
+    print(f"decision_and_legality_iqr_seconds={legality_iqr:.8f}")
 
 
 def parse_args() -> argparse.Namespace:

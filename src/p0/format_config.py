@@ -131,12 +131,19 @@ def policy_model_config(policy: Any) -> dict[str, Any]:
         # not carry architecture metadata. They can be persisted, but cannot be
         # loaded as a PolicyNet until a real manifest is supplied.
         return {}
+    config = getattr(policy, "config", None)
     return {
         "obs_dim": [int(policy.seq_len), int(policy.feat_dim)],
         "act_size": int(policy.act_size),
-        "d_model": int(policy.d_model),
-        "nhead": int(policy.actor.reducer.encoder.layers[0].nhead),
-        "nlayer": int(len(policy.actor.reducer.encoder.layers)),
+        "d_model": int(config.d_model if config is not None else policy.d_model),
+        "nhead": int(
+            config.nhead if config is not None else policy.actor.reducer.encoder.layers[0].nhead
+        ),
+        "nlayer": int(
+            config.reducer_layers
+            if config is not None
+            else len(policy.actor.reducer.encoder.layers)
+        ),
     }
 
 

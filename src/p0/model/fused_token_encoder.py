@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
-
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 
 from p0.format_config import FORMAT
 from p0.model.event_builder import EVENT_TYPE_COUNT
+from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
     ALLY_NUM_TOKENS,
     CAT_EFFECT_START,
@@ -33,11 +32,8 @@ from p0.model.structured_observation import (
     TokenType,
 )
 from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
-from p0.paths import DEFAULT_PATHS
 
 ACT_SIZE = FORMAT.action_size
-DATA_DIR = DEFAULT_PATHS.data_root
-
 NUM_COMPONENTS = 10
 NUM_TOKEN_TYPES = 6
 NUM_SIDES = 3
@@ -57,11 +53,9 @@ _NUMERIC_POS = tuple(range(2, 25, 2))  # (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22
 _FIELD_NUMERIC_POS = (26, 28, 30)
 
 
-def _load_vocab_sizes() -> dict[str, int]:
-    path = DATA_DIR / "vocab.json"
-    with path.open("r", encoding="utf-8") as f:
-        vocab = json.load(f)
-    return {name: len(values) + 1 for name, values in vocab.items()}
+def _load_vocab_sizes(resources: RuntimeResources | None = None) -> dict[str, int]:
+    resources = resources or default_runtime_resources()
+    return {name: len(values) + 1 for name, values in resources.vocab.items()}
 
 
 MOVE_DYNAMIC_WIDTH = 3  # pp fraction, last-move flag, legal-this-step
@@ -94,11 +88,10 @@ _TARGET_CLASS_ALIASES = {
 MOVE_STATIC_WIDTH = 7 + len(_TARGET_CLASSES)
 
 
-def _load_species_statics() -> torch.Tensor:
-    with (DATA_DIR / "vocab.json").open("r", encoding="utf-8") as f:
-        species_vocab = json.load(f)["species"]
-    with (DATA_DIR / "champions_dex.json").open("r", encoding="utf-8") as f:
-        dex_species = {entry["id"]: entry for entry in json.load(f)["species"]}
+def _load_species_statics(resources: RuntimeResources | None = None) -> torch.Tensor:
+    resources = resources or default_runtime_resources()
+    species_vocab = resources.vocab["species"]
+    dex_species = {entry["id"]: entry for entry in resources.dex["species"]}
 
     table = torch.zeros(len(species_vocab) + 1, SPECIES_STATIC_WIDTH)
     for name, idx in species_vocab.items():
@@ -116,12 +109,11 @@ def _load_species_statics() -> torch.Tensor:
     return table
 
 
-def _load_move_statics() -> torch.Tensor:
+def _load_move_statics(resources: RuntimeResources | None = None) -> torch.Tensor:
+    resources = resources or default_runtime_resources()
     """Static per-move scalars indexed by vocab move id (row 0 = padding)."""
-    with (DATA_DIR / "vocab.json").open("r", encoding="utf-8") as f:
-        moves_vocab = json.load(f)["moves"]
-    with (DATA_DIR / "champions_dex.json").open("r", encoding="utf-8") as f:
-        dex_moves = {entry["id"]: entry for entry in json.load(f)["moves"]}
+    moves_vocab = resources.vocab["moves"]
+    dex_moves = {entry["id"]: entry for entry in resources.dex["moves"]}
 
     table = torch.zeros(len(moves_vocab) + 1, MOVE_STATIC_WIDTH)
     for name, idx in moves_vocab.items():
@@ -152,12 +144,13 @@ def _load_move_statics() -> torch.Tensor:
     return table
 
 
-def _load_mechanic_tag_tables() -> dict[str, torch.Tensor]:
+def _load_mechanic_tag_tables(
+    resources: RuntimeResources | None = None,
+) -> dict[str, torch.Tensor]:
     """Load audited item and ability hook tables in one data-file pass."""
-    with (DATA_DIR / "vocab.json").open("r", encoding="utf-8") as stream:
-        vocab_data = json.load(stream)
-    with (DATA_DIR / "champions_dex.json").open("r", encoding="utf-8") as stream:
-        dex_data = json.load(stream)
+    resources = resources or default_runtime_resources()
+    vocab_data = resources.vocab
+    dex_data = resources.dex
 
     tables: dict[str, torch.Tensor] = {}
     for table_name in ("items", "abilities"):
@@ -222,12 +215,14 @@ class FusedTokenEncoder(nn.Module):
         d_model: int,
         nhead: int,
         dim_feedforward: int,
+        resources: RuntimeResources | None = None,
     ):
         super().__init__()
+        self.resources = resources or default_runtime_resources()
         self.d_model = d_model
         d_raw = 128  # lower dim for reduced memory
 
-        sizes = _load_vocab_sizes()
+        sizes = _load_vocab_sizes(self.resources)
         self.species_emb = nn.Embedding(sizes["species"], d_raw)
         self.ability_emb = nn.Embedding(sizes["abilities"], d_raw)
         self.item_emb = nn.Embedding(sizes["items"], d_raw)
@@ -248,7 +243,7 @@ class FusedTokenEncoder(nn.Module):
         self.species_static_proj = nn.Linear(SPECIES_STATIC_WIDTH, d_model)
         self.ability_proj = nn.Linear(d_raw, d_model)
         self.item_proj = nn.Linear(d_raw, d_model)
-        mechanic_tags = _load_mechanic_tag_tables()
+        mechanic_tags = _load_mechanic_tag_tables(self.resources)
         item_tags = mechanic_tags["items"]
         ability_tags = mechanic_tags["abilities"]
         self.item_mechanic_proj = nn.Linear(item_tags.shape[1], d_model, bias=False)
@@ -303,8 +298,8 @@ class FusedTokenEncoder(nn.Module):
 
         # cache component ids instead of creating them every forward pass
         self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
-        self.register_buffer("_species_statics", _load_species_statics())
-        self.register_buffer("_move_statics", _load_move_statics())
+        self.register_buffer("_species_statics", _load_species_statics(self.resources))
+        self.register_buffer("_move_statics", _load_move_statics(self.resources))
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
         self.register_buffer("_super_pos", torch.tensor(_SUPER_POS, dtype=torch.long))

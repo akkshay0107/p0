@@ -16,11 +16,9 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from p0.env import SimEnv
-from p0.format_config import FORMAT
+from p0.model.factory import PolicyFactory
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.model.structured_observation import (
-    NUMERICAL_WIDTH,
-    SEQUENCE_LENGTH,
     TOKEN_IDX_GLOBAL_FIELD_NUMERIC,
     StructuredObservation,
     is_teampreview,
@@ -38,8 +36,6 @@ from p0.train.utils import (
     save_checkpoint,
 )
 from p0.train.vec_env import ThreadVecEnv
-
-ACT_SIZE = FORMAT.action_size
 
 
 def handle_sigterm(signum, frame):
@@ -448,7 +444,7 @@ def main():
     policy = (
         policy_from_checkpoint(paths.checkpoint_path, device)
         if paths.checkpoint_path.exists()
-        else PolicyNet(obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH), act_size=ACT_SIZE).to(device)
+        else PolicyFactory().create().to(device)
     )
 
     if training.enable_optim and device.type == "cuda":

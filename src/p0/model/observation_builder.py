@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
-from typing import Mapping
-from weakref import WeakKeyDictionary
+from typing import Any, Mapping, cast
 
 import numpy as np
 import torch
@@ -12,7 +10,9 @@ from poke_env.battle.move import Move
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
 
-from p0.model.event_builder import BattleEvent, EventCollector
+from p0.battle.events import BattleEvent, ProtocolEventParser
+from p0.battle.views import BattleView
+from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
     CAT_KNOWNNESS_START,
     CATEGORICAL_WIDTH,
@@ -38,26 +38,13 @@ from p0.model.structured_observation import (
     effect_num_slice,
 )
 from p0.model.tokenizer import PokemonTokenizer, tokenizer
-from p0.paths import DEFAULT_PATHS
 from p0.team_data.stat_points import BaseStats, ImputationInput, PrecomputedStats, imputed_stats
 
-_DEX_PATH = DEFAULT_PATHS.data_root / "champions_dex.json"
-with _DEX_PATH.open("r", encoding="utf-8") as _stream:
-    _TRANSFORMATIONS = json.load(_stream)["transformations"]
-_MEGA_ITEMS = frozenset(
-    PokemonTokenizer.normalize_id(item)
-    for entry in _TRANSFORMATIONS
-    if entry.get("isMega")
-    for item in entry.get("requiredItems", [])
-)
-_MEGA_FORMS = frozenset(
-    PokemonTokenizer.normalize_id(entry["id"]) for entry in _TRANSFORMATIONS if entry.get("isMega")
-)
+_DEFAULT_RESOURCES = default_runtime_resources()
+_MEGA_ITEMS = _DEFAULT_RESOURCES.mega_items
+_MEGA_FORMS = _DEFAULT_RESOURCES.mega_forms
 
 _STACKABLE_SIDE_EFFECTS = frozenset({SideCondition.SPIKES, SideCondition.TOXIC_SPIKES})
-_BATTLE_STAT_CACHE: WeakKeyDictionary[DoubleBattle, dict[Pokemon, PrecomputedStats]] = (
-    WeakKeyDictionary()
-)
 
 
 def _knownness(value: object | None, resolved_id: int) -> Knownness:
@@ -194,7 +181,7 @@ def _has_exact_stats(pokemon: Pokemon) -> bool:
 
 def _pokemon_numeric_into(
     pokemon: Pokemon | None,
-    battle: DoubleBattle,
+    battle: Any,
     cond: int,
     orig_idx: int,
     move_slots: list[Move | None],
@@ -257,7 +244,10 @@ def _pokemon_numeric_into(
     row[31] = _is_mega_form(pokemon)
 
     last_move_id = None
-    custom_last_move = EventCollector.last_move(pokemon)
+    last_move_lookup = getattr(battle, "last_move", None)
+    if last_move_lookup is None:
+        from p0.runtime.live_event_capture import last_move as last_move_lookup
+    custom_last_move = last_move_lookup(pokemon)
     if custom_last_move:
         last_move_id = tokenizer.normalize_id(custom_last_move)
     elif pokemon.last_move:
@@ -330,24 +320,22 @@ def _pokemon_effects_into(
 
 
 def _ally_legality(
-    battle: DoubleBattle, active_idx: int, move_slots: list[Move | None]
+    battle: Any, active_idx: int, move_slots: list[Move | None]
 ) -> tuple[list[float], float]:
-    # mirrors MegaEnv.single_action_mask (env.py) without the action encoding
-    move_legal = [0.0] * MOVE_SLOTS
-    if battle._wait or (any(battle.force_switch) and not battle.force_switch[active_idx]):
-        return move_legal, 0.0
+    decision = getattr(battle, "decision", None)
+    if decision is None:
+        from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
 
-    can_switch_out = float(
-        bool(battle.available_switches[active_idx])
-        and not (battle.trapped[active_idx] or battle.maybe_trapped[active_idx])
-    )
-
-    available_move_ids = {move.id for move in battle.available_moves[active_idx]}
-    for i, move in enumerate(move_slots):
-        if move is not None and move.id in available_move_ids:
-            move_legal[i] = 1.0
-
-    return move_legal, can_switch_out
+        decision = PokeEnvBattleAdapter.decision_view(battle)
+    slot = decision.slots[active_idx]
+    any_force = decision.slots[0].force_switch or decision.slots[1].force_switch
+    if decision.wait or (any_force and not slot.force_switch):
+        return [0.0] * MOVE_SLOTS, 0.0
+    move_legal = [
+        float(index < len(slot.move_targets) and bool(slot.move_targets[index]))
+        for index in range(MOVE_SLOTS)
+    ]
+    return move_legal, float(bool(slot.switch_slots) and not slot.trapped)
 
 
 def _pad_team(
@@ -375,7 +363,7 @@ def _pad_team(
     return res
 
 
-def _selected_ally_pokemon(battle: DoubleBattle) -> set[Pokemon]:
+def _selected_ally_pokemon(battle: Any) -> set[Any]:
     """Return the persistent set of allies selected at team preview."""
     if battle.teampreview:
         return set(battle.team.values())
@@ -390,11 +378,11 @@ def _selected_ally_pokemon(battle: DoubleBattle) -> set[Pokemon]:
 
 
 def _get_ordered_pokemon(
-    battle: DoubleBattle,
+    battle: Any,
     is_opponent: bool,
-    selected_allies: set[Pokemon] | None = None,
-    orig_idx_map: Mapping[Pokemon, int] | None = None,
-) -> list[tuple[Pokemon | None, int, int | None]]:
+    selected_allies: set[Any] | None = None,
+    orig_idx_map: Mapping[Any, int] | None = None,
+) -> list[tuple[Any | None, int, int | None]]:
     # returns list of (pokemon, orig_id, active_id)
     active = battle.opponent_active_pokemon if is_opponent else battle.active_pokemon
     team = battle.opponent_team if is_opponent else battle.team
@@ -454,11 +442,11 @@ def _get_ordered_pokemon(
 
 
 def _slot_condition(
-    battle: DoubleBattle,
-    mon: Pokemon | None,
+    battle: Any,
+    mon: Any | None,
     seq_idx: int,
     is_opponent: bool,
-    selected_allies: set[Pokemon] | None = None,
+    selected_allies: set[Any] | None = None,
 ) -> int:
     if mon is None:
         return 0
@@ -476,7 +464,7 @@ def _slot_condition(
 
 
 def _global_field_token_into(
-    battle: DoubleBattle,
+    battle: Any,
     tok: PokemonTokenizer,
     categorical: np.ndarray,
     numerical: np.ndarray,
@@ -514,7 +502,7 @@ def _global_field_token_into(
 
 
 def _side_token_into(
-    battle: DoubleBattle,
+    battle: Any,
     conditions: dict[SideCondition, int],
     tok: PokemonTokenizer,
     fainted_count: int,
@@ -546,10 +534,10 @@ def _side_token_into(
 
 
 def _side_mega_available(
-    battle: DoubleBattle,
+    battle: Any,
     *,
     is_opponent: bool,
-    selected_allies: set[Pokemon] | None = None,
+    selected_allies: set[Any] | None = None,
 ) -> bool:
     if is_opponent:
         if battle.opponent_used_mega_evolve:
@@ -611,7 +599,7 @@ def _validate_output(out: StructuredObservation) -> None:
 
 
 def _event_location(
-    battle: DoubleBattle,
+    battle: BattleView,
     event: BattleEvent,
     pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
 ) -> tuple[SideId, int]:
@@ -631,7 +619,7 @@ def _event_location(
 
 
 def _event_target_location(
-    battle: DoubleBattle,
+    battle: BattleView,
     event: BattleEvent,
     pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
 ) -> tuple[SideId, int]:
@@ -644,15 +632,148 @@ def _event_target_location(
     return pokemon_to_slot.get(pokemon, (SideId.NONE, 0))
 
 
-def from_battle_into(
-    battle: AbstractBattle,
+class RosterLayout:
+    """Deterministic player-relative roster placement."""
+
+    @staticmethod
+    def selected_allies(battle: BattleView) -> set[Any]:
+        return set(_selected_ally_pokemon(battle))
+
+    @staticmethod
+    def ordered(
+        battle: BattleView,
+        is_opponent: bool,
+        selected_allies: set[Any] | None,
+        original_indices: Mapping[Any, int],
+    ):
+        return _get_ordered_pokemon(battle, is_opponent, selected_allies, original_indices)
+
+
+class StatResolver:
+    """Resolve exact, supplied, cached-imputed, or unknown level stats once."""
+
+    def __init__(
+        self,
+        cache: dict[Any, PrecomputedStats],
+        overrides: Mapping[Any, PrecomputedStats] | None,
+    ):
+        self.cache = cache
+        self.overrides = overrides
+
+    def resolve(self, pokemon: Pokemon | None, is_opponent: bool) -> PrecomputedStats | None:
+        if pokemon is None:
+            return None
+        supplied = self.overrides.get(pokemon) if self.overrides else None
+        if supplied is not None or (not is_opponent and _has_exact_stats(pokemon)):
+            return supplied
+        return _cached_imputed_stats(pokemon, self.cache)  # type: ignore[arg-type]
+
+
+class PokemonFeatureWriter:
+    def __init__(self, tok: PokemonTokenizer):
+        self.tokenizer = tok
+
+    def write_categorical(
+        self, pokemon: Pokemon | None, moves: list[Move | None], row: np.ndarray
+    ) -> None:
+        _pokemon_categorical_into(pokemon, self.tokenizer, moves, row)
+
+
+class EffectFeatureWriter:
+    """Typed Pokémon/side/field effect serialization."""
+
+    def __init__(self, tok: PokemonTokenizer):
+        self.tokenizer = tok
+
+    def write_pokemon(
+        self, pokemon: Pokemon | None, categorical: np.ndarray, numerical: np.ndarray
+    ) -> None:
+        _pokemon_effects_into(pokemon, self.tokenizer, categorical, numerical)
+
+
+class FieldFeatureWriter:
+    def __init__(self, tok: PokemonTokenizer):
+        self.tokenizer = tok
+
+    def write_global(
+        self, battle: BattleView, categorical: np.ndarray, numerical: np.ndarray
+    ) -> None:
+        _global_field_token_into(battle, self.tokenizer, categorical, numerical)
+
+    def write_side(
+        self,
+        battle: BattleView,
+        conditions: Mapping[SideCondition, int],
+        fainted_count: int,
+        mega_available: bool,
+        categorical: np.ndarray,
+        numerical: np.ndarray,
+    ) -> None:
+        _side_token_into(
+            battle,
+            dict(conditions),
+            self.tokenizer,
+            fainted_count,
+            mega_available,
+            categorical,
+            numerical,
+        )
+
+
+class EventTensorizer:
+    @staticmethod
+    def write(
+        battle: BattleView,
+        out: StructuredObservation,
+        pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
+    ) -> None:
+        untruncated_events = battle.consume_events()
+        event_overflow = max(0, len(untruncated_events) - EVENT_COUNT)
+        events = ProtocolEventParser.truncate_events(untruncated_events, limit=EVENT_COUNT)
+        events_cat = out.events_cat.numpy()
+        events_num = out.events_num.numpy()
+        events_side_ids = out.events_side_ids.numpy()
+        events_slot_ids = out.events_slot_ids.numpy()
+        events_cat.fill(0)
+        events_num.fill(0)
+        events_side_ids.fill(0)
+        events_slot_ids.fill(0)
+        for event_idx, event in enumerate(events):
+            side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
+            target_side_id, target_slot_id = _event_target_location(battle, event, pokemon_to_slot)
+            events_cat[event_idx] = (
+                event.event_type,
+                event.move_id,
+                event.item_id,
+                event.status_id,
+                min(event.order + 1, EVENT_COUNT),
+                event.effect_id,
+                event.ability_id,
+                event.flags,
+                target_side_id,
+                target_slot_id,
+            )
+            events_num[event_idx] = (
+                event.value,
+                event.order / float(EVENT_COUNT),
+                float(event_overflow),
+            )
+            events_side_ids[event_idx] = side_id
+            events_slot_ids[event_idx] = slot_id
+
+
+def from_view_into(
+    battle: BattleView,
     out: StructuredObservation,
     tok: PokemonTokenizer | None = None,
-    stat_overrides: Mapping[Pokemon, PrecomputedStats] | None = None,
+    stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
 ) -> None:
-    assert isinstance(battle, DoubleBattle)
     _validate_output(out)
     tok = tok or tokenizer
+    roster_layout = RosterLayout()
+    pokemon_writer = PokemonFeatureWriter(tok)
+    effect_writer = EffectFeatureWriter(tok)
+    field_writer = FieldFeatureWriter(tok)
 
     token_types = out.token_type_ids.numpy()
     sides = out.side_ids.numpy()
@@ -668,10 +789,11 @@ def from_battle_into(
     token_types[0] = TokenType.CLS
     sides[0] = SideId.NONE
 
-    selected_allies = _selected_ally_pokemon(battle)
+    selected_allies = roster_layout.selected_allies(battle)
     ally_orig_idx = {mon: i for i, mon in enumerate(battle.team.values())}
     opponent_orig_idx = {mon: i for i, mon in enumerate(battle.opponent_team.values())}
-    stat_cache = _BATTLE_STAT_CACHE.setdefault(battle, {})
+    stat_cache = battle.stat_cache
+    stat_resolver = StatResolver(stat_cache, stat_overrides)
 
     pokemon_to_slot = {}
 
@@ -680,7 +802,7 @@ def from_battle_into(
         (SideId.ALLY, False, ally_orig_idx),
         (SideId.OPPONENT, True, opponent_orig_idx),
     ):
-        ordered = _get_ordered_pokemon(
+        ordered = roster_layout.ordered(
             battle,
             is_opponent,
             selected_allies if not is_opponent else None,
@@ -698,19 +820,13 @@ def from_battle_into(
             token_types[idx] = TokenType.POKEMON_SUPER
             sides[idx] = side
             slots[idx] = slot_id
-            _pokemon_categorical_into(mon, tok, move_slots, categorical[idx])
+            pokemon_writer.write_categorical(mon, move_slots, categorical[idx])
             idx += 1
 
             token_types[idx] = TokenType.POKEMON_NUMERIC
             sides[idx] = side
             slots[idx] = slot_id
-            precomputed = stat_overrides.get(mon) if stat_overrides and mon else None
-            if (
-                precomputed is None
-                and mon is not None
-                and (is_opponent or not _has_exact_stats(mon))
-            ):
-                precomputed = _cached_imputed_stats(mon, stat_cache)
+            precomputed = stat_resolver.resolve(mon, is_opponent)
             _pokemon_numeric_into(
                 mon,
                 battle,
@@ -722,12 +838,12 @@ def from_battle_into(
                 is_opponent=is_opponent,
                 precomputed_stats=precomputed,
             )
-            _pokemon_effects_into(mon, tok, categorical[idx - 1], numerical[idx])
+            effect_writer.write_pokemon(mon, categorical[idx - 1], numerical[idx])
             idx += 1
 
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.NONE
-    _global_field_token_into(battle, tok, categorical[idx], numerical[idx + 1])
+    field_writer.write_global(battle, categorical[idx], numerical[idx + 1])
     idx += 1
     token_types[idx] = TokenType.FIELD_NUMERIC
     sides[idx] = SideId.NONE
@@ -741,10 +857,9 @@ def from_battle_into(
     )
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.ALLY
-    _side_token_into(
+    field_writer.write_side(
         battle,
         battle.side_conditions,
-        tok,
         ally_fainted,
         ally_mega_available,
         categorical[idx],
@@ -759,10 +874,9 @@ def from_battle_into(
     opp_mega_available = _side_mega_available(battle, is_opponent=True)
     token_types[idx] = TokenType.FIELD_SUPER
     sides[idx] = SideId.OPPONENT
-    _side_token_into(
+    field_writer.write_side(
         battle,
         battle.opponent_side_conditions,
-        tok,
         opp_fainted,
         opp_mega_available,
         categorical[idx],
@@ -776,41 +890,29 @@ def from_battle_into(
     if idx != SEQUENCE_LENGTH:
         raise RuntimeError(f"Structured observation length drifted to {idx}")
 
-    untruncated_events = EventCollector.consume_events(battle)
-    event_overflow = max(0, len(untruncated_events) - EVENT_COUNT)
-    events = EventCollector.truncate_events(untruncated_events, limit=EVENT_COUNT)
+    EventTensorizer.write(battle, out, pokemon_to_slot)
 
-    events_cat = out.events_cat.numpy()
-    events_num = out.events_num.numpy()
-    events_side_ids = out.events_side_ids.numpy()
-    events_slot_ids = out.events_slot_ids.numpy()
 
-    events_cat.fill(0)
-    events_num.fill(0)
-    events_side_ids.fill(0)
-    events_slot_ids.fill(0)
+def from_view(
+    battle: BattleView,
+    tok: PokemonTokenizer | None = None,
+    stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
+) -> StructuredObservation:
+    obs = StructuredObservation.empty_batch(1)[0]
+    from_view_into(battle, obs, tok, stat_overrides)
+    return obs
 
-    for event_idx, event in enumerate(events):
-        side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
-        target_side_id, target_slot_id = _event_target_location(battle, event, pokemon_to_slot)
 
-        events_cat[event_idx, 0] = event.event_type
-        events_cat[event_idx, 1] = event.move_id
-        events_cat[event_idx, 2] = event.item_id
-        events_cat[event_idx, 3] = event.status_id
-        events_cat[event_idx, 4] = min(event.order + 1, EVENT_COUNT)
-        events_cat[event_idx, 5] = event.effect_id
-        events_cat[event_idx, 6] = event.ability_id
-        events_cat[event_idx, 7] = event.flags
-        events_cat[event_idx, 8] = target_side_id
-        events_cat[event_idx, 9] = target_slot_id
+def from_battle_into(
+    battle: AbstractBattle,
+    out: StructuredObservation,
+    tok: PokemonTokenizer | None = None,
+    stat_overrides: Mapping[Pokemon, PrecomputedStats] | None = None,
+) -> None:
+    assert isinstance(battle, DoubleBattle)
+    from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
 
-        events_num[event_idx, 0] = event.value
-        events_num[event_idx, 1] = event.order / float(EVENT_COUNT)
-        events_num[event_idx, 2] = float(event_overflow)
-
-        events_side_ids[event_idx] = side_id
-        events_slot_ids[event_idx] = slot_id
+    from_view_into(cast(BattleView, PokeEnvBattleAdapter.view(battle)), out, tok, stat_overrides)
 
 
 def from_battle(
@@ -818,9 +920,37 @@ def from_battle(
     tok: PokemonTokenizer | None = None,
     stat_overrides: Mapping[Pokemon, PrecomputedStats] | None = None,
 ) -> StructuredObservation:
-    obs = StructuredObservation.empty_batch(1)[0]
-    from_battle_into(battle, obs, tok, stat_overrides)
-    return obs
+    assert isinstance(battle, DoubleBattle)
+    from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
+
+    return from_view(cast(BattleView, PokeEnvBattleAdapter.view(battle)), tok, stat_overrides)
+
+
+class ObservationBuilder:
+    """One resource-bound orchestrator for live and reconstructed battle views."""
+
+    def __init__(
+        self,
+        tok: PokemonTokenizer | None = None,
+        resources: RuntimeResources | None = None,
+    ):
+        self.resources = resources or _DEFAULT_RESOURCES
+        self.tokenizer = tok or self.resources.tokenizer
+
+    def build_into(
+        self,
+        battle: BattleView,
+        out: StructuredObservation,
+        stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
+    ) -> None:
+        from_view_into(battle, out, self.tokenizer, stat_overrides)
+
+    def build(
+        self,
+        battle: BattleView,
+        stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
+    ) -> StructuredObservation:
+        return from_view(battle, self.tokenizer, stat_overrides)
 
 
 def _is_mega_form(pokemon: Pokemon | None) -> bool:
@@ -832,7 +962,7 @@ def _is_mega_form(pokemon: Pokemon | None) -> bool:
     return PokemonTokenizer.normalize_id(species) in _MEGA_FORMS
 
 
-def _can_mega(pokemon: Pokemon | None, battle: DoubleBattle, active_idx: int | None = None) -> bool:
+def _can_mega(pokemon: Pokemon | None, battle: Any, active_idx: int | None = None) -> bool:
     if pokemon is None:
         return False
     if active_idx is not None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any, ClassVar
 
 import torch
 
@@ -130,6 +131,36 @@ class StructuredObservation:
     events_side_ids: torch.Tensor
     events_slot_ids: torch.Tensor
 
+    _FIELD_NAMES: ClassVar[tuple[str, ...]] = (
+        "token_type_ids",
+        "side_ids",
+        "slot_ids",
+        "categorical",
+        "numerical",
+        "events_cat",
+        "events_num",
+        "events_side_ids",
+        "events_slot_ids",
+    )
+    _FIELD_SPECS: ClassVar[tuple[tuple[str, tuple[int, ...], torch.dtype], ...]] = (
+        ("token_type_ids", (SEQUENCE_LENGTH,), torch.long),
+        ("side_ids", (SEQUENCE_LENGTH,), torch.long),
+        ("slot_ids", (SEQUENCE_LENGTH,), torch.long),
+        ("categorical", (SEQUENCE_LENGTH, CATEGORICAL_WIDTH), torch.long),
+        ("numerical", (SEQUENCE_LENGTH, NUMERICAL_WIDTH), torch.float32),
+        ("events_cat", (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), torch.long),
+        ("events_num", (EVENT_COUNT, EVENT_NUMERICAL_WIDTH), torch.float32),
+        ("events_side_ids", (EVENT_COUNT,), torch.long),
+        ("events_slot_ids", (EVENT_COUNT,), torch.long),
+    )
+
+    @classmethod
+    def _from_values(cls, values: list[torch.Tensor]) -> StructuredObservation:
+        return cls(**dict(zip(cls._FIELD_NAMES, values, strict=True)))
+
+    def _values(self) -> tuple[torch.Tensor, ...]:
+        return tuple(getattr(self, name) for name in self._FIELD_NAMES)
+
     def is_teampreview(self) -> torch.Tensor:
         return is_teampreview(self.numerical)
 
@@ -148,131 +179,68 @@ class StructuredObservation:
             raise ValueError("Effect overflow does not match the number of dropped effects")
 
     def clone(self) -> StructuredObservation:
-        return StructuredObservation(
-            token_type_ids=self.token_type_ids.clone(),
-            side_ids=self.side_ids.clone(),
-            slot_ids=self.slot_ids.clone(),
-            categorical=self.categorical.clone(),
-            numerical=self.numerical.clone(),
-            events_cat=self.events_cat.clone(),
-            events_num=self.events_num.clone(),
-            events_side_ids=self.events_side_ids.clone(),
-            events_slot_ids=self.events_slot_ids.clone(),
-        )
+        return self._from_values([tensor.clone() for tensor in self._values()])
 
     def to(self, *args, **kwargs) -> StructuredObservation:
-        return StructuredObservation(
-            token_type_ids=self.token_type_ids.to(*args, **kwargs),
-            side_ids=self.side_ids.to(*args, **kwargs),
-            slot_ids=self.slot_ids.to(*args, **kwargs),
-            categorical=self.categorical.to(*args, **kwargs),
-            numerical=self.numerical.to(*args, **kwargs),
-            events_cat=self.events_cat.to(*args, **kwargs),
-            events_num=self.events_num.to(*args, **kwargs),
-            events_side_ids=self.events_side_ids.to(*args, **kwargs),
-            events_slot_ids=self.events_slot_ids.to(*args, **kwargs),
-        )
+        return self._from_values([tensor.to(*args, **kwargs) for tensor in self._values()])
 
     def unsqueeze(self, dim: int) -> StructuredObservation:
-        return StructuredObservation(
-            token_type_ids=self.token_type_ids.unsqueeze(dim),
-            side_ids=self.side_ids.unsqueeze(dim),
-            slot_ids=self.slot_ids.unsqueeze(dim),
-            categorical=self.categorical.unsqueeze(dim),
-            numerical=self.numerical.unsqueeze(dim),
-            events_cat=self.events_cat.unsqueeze(dim),
-            events_num=self.events_num.unsqueeze(dim),
-            events_side_ids=self.events_side_ids.unsqueeze(dim),
-            events_slot_ids=self.events_slot_ids.unsqueeze(dim),
-        )
+        return self._from_values([tensor.unsqueeze(dim) for tensor in self._values()])
 
     def cpu(self) -> StructuredObservation:
         return self.to("cpu")
 
     def __getitem__(self, index) -> StructuredObservation:
-        return StructuredObservation(
-            token_type_ids=self.token_type_ids[index],
-            side_ids=self.side_ids[index],
-            slot_ids=self.slot_ids[index],
-            categorical=self.categorical[index],
-            numerical=self.numerical[index],
-            events_cat=self.events_cat[index],
-            events_num=self.events_num[index],
-            events_side_ids=self.events_side_ids[index],
-            events_slot_ids=self.events_slot_ids[index],
-        )
+        return self._from_values([tensor[index] for tensor in self._values()])
 
     @staticmethod
     def cat(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
-        return StructuredObservation(
-            token_type_ids=torch.cat([obs.token_type_ids for obs in observations], dim=dim),
-            side_ids=torch.cat([obs.side_ids for obs in observations], dim=dim),
-            slot_ids=torch.cat([obs.slot_ids for obs in observations], dim=dim),
-            categorical=torch.cat([obs.categorical for obs in observations], dim=dim),
-            numerical=torch.cat([obs.numerical for obs in observations], dim=dim),
-            events_cat=torch.cat([obs.events_cat for obs in observations], dim=dim),
-            events_num=torch.cat([obs.events_num for obs in observations], dim=dim),
-            events_side_ids=torch.cat([obs.events_side_ids for obs in observations], dim=dim),
-            events_slot_ids=torch.cat([obs.events_slot_ids for obs in observations], dim=dim),
+        if not observations:
+            raise ValueError("Cannot concatenate an empty observation list")
+        return StructuredObservation._from_values(
+            [
+                torch.cat([getattr(obs, name) for obs in observations], dim=dim)
+                for name in StructuredObservation._FIELD_NAMES
+            ]
         )
 
     @staticmethod
     def stack(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
-        return StructuredObservation(
-            token_type_ids=torch.stack([obs.token_type_ids for obs in observations], dim=dim),
-            side_ids=torch.stack([obs.side_ids for obs in observations], dim=dim),
-            slot_ids=torch.stack([obs.slot_ids for obs in observations], dim=dim),
-            categorical=torch.stack([obs.categorical for obs in observations], dim=dim),
-            numerical=torch.stack([obs.numerical for obs in observations], dim=dim),
-            events_cat=torch.stack([obs.events_cat for obs in observations], dim=dim),
-            events_num=torch.stack([obs.events_num for obs in observations], dim=dim),
-            events_side_ids=torch.stack([obs.events_side_ids for obs in observations], dim=dim),
-            events_slot_ids=torch.stack([obs.events_slot_ids for obs in observations], dim=dim),
+        if not observations:
+            raise ValueError("Cannot stack an empty observation list")
+        return StructuredObservation._from_values(
+            [
+                torch.stack([getattr(obs, name) for obs in observations], dim=dim)
+                for name in StructuredObservation._FIELD_NAMES
+            ]
         )
 
     @staticmethod
     def empty_batch(batch_size: int, pin_memory: bool = False) -> StructuredObservation:
-        return StructuredObservation(
-            token_type_ids=torch.zeros(
-                (batch_size, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=pin_memory
-            ),
-            side_ids=torch.zeros(
-                (batch_size, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=pin_memory
-            ),
-            slot_ids=torch.zeros(
-                (batch_size, SEQUENCE_LENGTH), dtype=torch.long, pin_memory=pin_memory
-            ),
-            categorical=torch.zeros(
-                (batch_size, SEQUENCE_LENGTH, CATEGORICAL_WIDTH),
-                dtype=torch.long,
-                pin_memory=pin_memory,
-            ),
-            numerical=torch.zeros(
-                (batch_size, SEQUENCE_LENGTH, NUMERICAL_WIDTH),
-                dtype=torch.float32,
-                pin_memory=pin_memory,
-            ),
-            events_cat=torch.zeros(
-                (batch_size, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH),
-                dtype=torch.long,
-                pin_memory=pin_memory,
-            ),
-            events_num=torch.zeros(
-                (batch_size, EVENT_COUNT, EVENT_NUMERICAL_WIDTH),
-                dtype=torch.float32,
-                pin_memory=pin_memory,
-            ),
-            events_side_ids=torch.zeros(
-                (batch_size, EVENT_COUNT),
-                dtype=torch.long,
-                pin_memory=pin_memory,
-            ),
-            events_slot_ids=torch.zeros(
-                (batch_size, EVENT_COUNT),
-                dtype=torch.long,
-                pin_memory=pin_memory,
-            ),
+        if type(batch_size) is not int or batch_size < 0:
+            raise ValueError("batch_size must be a non-negative integer")
+        return StructuredObservation._from_values(
+            [
+                torch.zeros((batch_size, *shape), dtype=dtype, pin_memory=pin_memory)
+                for _, shape, dtype in StructuredObservation._FIELD_SPECS
+            ]
         )
+
+    def validate(self, *, batch_rank: int | None = None) -> None:
+        for name, trailing_shape, dtype in self._FIELD_SPECS:
+            tensor: Any = getattr(self, name)
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"{name} must be a tensor")
+            if (
+                tensor.dtype != dtype
+                or tuple(tensor.shape[-len(trailing_shape) :]) != trailing_shape
+            ):
+                raise ValueError(
+                    f"Invalid {name}: expected trailing shape {trailing_shape} and {dtype}, "
+                    f"got {tuple(tensor.shape)} and {tensor.dtype}"
+                )
+            if batch_rank is not None and tensor.dim() != batch_rank + len(trailing_shape):
+                raise ValueError(f"Invalid {name} rank for batch_rank={batch_rank}")
 
 
 def is_teampreview(numerical: torch.Tensor) -> torch.Tensor:

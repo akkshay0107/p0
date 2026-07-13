@@ -9,9 +9,30 @@ import torch.nn.init as init
 from torch import Tensor
 from torch.distributions import Categorical
 
-from p0.format_config import FORMAT
+from p0.battle.actions import (
+    ACT_SIZE,
+    MOVE_END,
+    MOVE_START,
+)
+from p0.battle.actions import (
+    FORCED_ACTION as STRUGGLE_START,
+)
+from p0.battle.actions import (
+    MEGA_FORCED_ACTION as MEGA_STRUGGLE_START,
+)
+from p0.battle.actions import (
+    MEGA_MOVE_END as MEGA_END,
+)
+from p0.battle.actions import (
+    MEGA_MOVE_START as MEGA_START,
+)
+from p0.battle.actions import (
+    PASS_ACTION as PASS_START,
+)
 from p0.model.cls_reducer import CLSReducer
+from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
+from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
     ALLY_NUM_TOKENS,
     ALLY_POKE_TOKENS,
@@ -26,25 +47,12 @@ from p0.model.structured_observation import (
     is_teampreview,
 )
 
-ACT_SIZE = FORMAT.action_size
-
 # Only these entities are ever pointed at: the 6 allies (switch/TP/ally targets)
 # and the 2 opponent actives (move targets). Opponent bench rows get no keys.
 N_KEY_ENTITIES = TEAM_SIZE + 2
 
-# Action Space Layout Constants
-PASS_START = 0
-PASS_END = 1
-SWITCH_START = 1
-SWITCH_END = 7
-MOVE_START = 7
-MOVE_END = 27
-MEGA_START = 27
-MEGA_END = 47
-MEGA_STRUGGLE_START = 47
-STRUGGLE_START = 48
 TP_START = 0
-TP_END = 36
+TP_END = TEAM_SIZE**2
 
 
 class EncodedObs(NamedTuple):
@@ -122,6 +130,8 @@ class ActorPolicy(nn.Module):
         act_size: int,
         side_emb: nn.Embedding,
         seq_len: int = SEQUENCE_LENGTH,
+        history_tokens: int = 8,
+        dim_feedforward: int | None = None,
     ):
         super().__init__()
         self.act_size = act_size
@@ -134,6 +144,8 @@ class ActorPolicy(nn.Module):
             d_model=d_model,
             nhead=nhead,
             nlayer=nlayer,
+            n_hg=history_tokens,
+            dim_feedforward=dim_feedforward,
             use_history=True,
         )
 
@@ -449,25 +461,45 @@ class PolicyNet(nn.Module):
         d_model=512,
         nhead=8,
         nlayer=5,
+        *,
+        config: ModelConfig | None = None,
+        resources: RuntimeResources | None = None,
     ):
         super().__init__()
+        if config is None:
+            config = ModelConfig(
+                d_model=d_model,
+                nhead=nhead,
+                reducer_layers=nlayer,
+                history_tokens=8,
+                dim_feedforward=d_model * 4,
+            )
+        self.config = config
+        self.resources = resources or default_runtime_resources()
         self.seq_len, self.feat_dim = obs_dim
         self.act_size = act_size
-        self.d_model = d_model
+        self.d_model = config.d_model
 
         # shared backbone + policy head
-        self.encoder = FusedTokenEncoder(d_model, nhead, d_model * 4)
+        self.encoder = FusedTokenEncoder(
+            config.d_model,
+            config.nhead,
+            config.dim_feedforward,
+            self.resources,
+        )
         self.actor = ActorPolicy(
-            d_model,
-            nhead,
-            nlayer,
+            config.d_model,
+            config.nhead,
+            config.reducer_layers,
             act_size,
             self.encoder.side_emb,
             self.seq_len + 1 + EVENT_COUNT,  # +1 for action mask embedding, rest for event tokens
+            history_tokens=config.history_tokens,
+            dim_feedforward=config.dim_feedforward,
         )
 
         # value head
-        self.critic = ValueHead(d_model)
+        self.critic = ValueHead(config.d_model)
 
     @property
     def device(self) -> torch.device:
