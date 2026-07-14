@@ -3,11 +3,11 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
-from p0.env import SimEnv
 from p0.format_config import FORMAT
 from p0.model.structured_observation import (
     StructuredObservation,
 )
+from p0.runtime.env import SimEnv
 
 ACT_SIZE = FORMAT.action_size
 

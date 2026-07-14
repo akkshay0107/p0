@@ -12,39 +12,102 @@ if TYPE_CHECKING:
     from p0.battle.events import BattleEvent
 
 
+class NamedEffectView(Protocol):
+    """Enum-like protocol value (status, weather, field, volatile, type, ...)."""
+
+    @property
+    def name(self) -> str: ...
+
+
 class MoveView(Protocol):
-    id: str
-    type: Any
-    category: Any
-    current_pp: int | None
-    max_pp: int | None
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def type(self) -> Any: ...
+
+    @property
+    def category(self) -> Any: ...
+
+    @property
+    def current_pp(self) -> int | None: ...
+
+    @property
+    def max_pp(self) -> int | None: ...
 
 
 class PokemonView(Protocol):
-    species: str | None
-    base_species: str
-    ability: str | None
-    item: str | None
-    nature: str | None
-    moves: Mapping[str, MoveView]
-    type_1: Any
-    type_2: Any
-    status: Any
-    base_stats: Mapping[str, int]
-    stats: Mapping[str, int] | None
-    boosts: Mapping[str, int]
-    current_hp_fraction: float
-    protect_counter: int
-    first_turn: bool
-    weight: float
-    fainted: bool
-    revealed: bool
-    selected_in_teampreview: bool
-    effects: Mapping[Any, int]
-    status_counter: int
-    preparing: bool
-    last_move: MoveView | None
-    level: int | None
+    @property
+    def species(self) -> str | None: ...
+
+    @property
+    def base_species(self) -> str: ...
+
+    @property
+    def ability(self) -> str | None: ...
+
+    @property
+    def item(self) -> str | None: ...
+
+    @property
+    def nature(self) -> str | None: ...
+
+    @property
+    def moves(self) -> Mapping[str, Any]: ...
+
+    @property
+    def type_1(self) -> Any: ...
+
+    @property
+    def type_2(self) -> Any: ...
+
+    @property
+    def status(self) -> Any: ...
+
+    @property
+    def base_stats(self) -> Mapping[str, int]: ...
+
+    @property
+    def stats(self) -> Mapping[str, int | None] | None: ...
+
+    @property
+    def boosts(self) -> Mapping[str, int]: ...
+
+    @property
+    def current_hp_fraction(self) -> float: ...
+
+    @property
+    def protect_counter(self) -> int: ...
+
+    @property
+    def first_turn(self) -> bool: ...
+
+    @property
+    def weight(self) -> float: ...
+
+    @property
+    def fainted(self) -> bool: ...
+
+    @property
+    def revealed(self) -> bool: ...
+
+    @property
+    def selected_in_teampreview(self) -> bool: ...
+
+    @property
+    def effects(self) -> Mapping[Any, int]: ...
+
+    @property
+    def status_counter(self) -> int: ...
+
+    @property
+    def preparing(self) -> Any: ...
+
+    @property
+    def last_move(self) -> MoveView | None: ...
+
+    @property
+    def level(self) -> int | None: ...
 
 
 class FieldView(Protocol):

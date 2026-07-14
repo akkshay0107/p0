@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from p0.cli.build_vocab import build
 from p0.format_config import ACTION_CONTRACT, FORMAT, RuntimeManifest
-from p0.model.build_vocab import build
 from p0.model.fused_token_encoder import (
     FusedTokenEncoder,
     _load_mechanic_tag_tables,

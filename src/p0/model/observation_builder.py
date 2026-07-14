@@ -4,13 +4,9 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
-from poke_env.battle.field import Field
-from poke_env.battle.move import Move
-from poke_env.battle.pokemon import Pokemon
-from poke_env.battle.side_condition import SideCondition
 
 from p0.battle.events import BattleEvent, truncate_events
-from p0.battle.views import BattleView
+from p0.battle.views import BattleView, MoveView, PokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
     CAT_KNOWNNESS_START,
@@ -43,7 +39,10 @@ _DEFAULT_RESOURCES = default_runtime_resources()
 _MEGA_ITEMS = _DEFAULT_RESOURCES.mega_items
 _MEGA_FORMS = _DEFAULT_RESOURCES.mega_forms
 
-_STACKABLE_SIDE_EFFECTS = frozenset({SideCondition.SPIKES, SideCondition.TOXIC_SPIKES})
+# Named after the poke-env protocol enums the adapters hand over; matching on
+# member names keeps this module free of the poke-env dependency itself.
+_STACKABLE_SIDE_CONDITION_NAMES = frozenset({"SPIKES", "TOXIC_SPIKES"})
+_KNOWN_DURATION_FIELD_NAMES = frozenset({"TRICK_ROOM", "MAGIC_ROOM", "WONDER_ROOM"})
 _EMPTY_MOVE_SLOTS: tuple[None, ...] = (None,) * MOVE_SLOTS
 
 _TOKEN_TYPE_LAYOUT = np.asarray(
@@ -129,7 +128,7 @@ def _safe_fraction(num: float | int | None, den: float | int | None) -> float:
     return (num or 0) / den
 
 
-def _iter_move_slots(pokemon: Pokemon | None) -> tuple[Move | None, ...]:
+def _iter_move_slots(pokemon: PokemonView | None) -> tuple[MoveView | None, ...]:
     if pokemon is None:
         return _EMPTY_MOVE_SLOTS
     moves = tuple(pokemon.moves.values())[:MOVE_SLOTS]
@@ -137,9 +136,9 @@ def _iter_move_slots(pokemon: Pokemon | None) -> tuple[Move | None, ...]:
 
 
 def _pokemon_categorical_into(
-    pokemon: Pokemon | None,
+    pokemon: PokemonView | None,
     tok: PokemonTokenizer,
-    move_slots: tuple[Move | None, ...],
+    move_slots: tuple[MoveView | None, ...],
     row: np.ndarray,
 ) -> None:
     if pokemon is None:
@@ -173,7 +172,7 @@ def _pokemon_categorical_into(
     row[CAT_KNOWNNESS_START + 24] = _knownness(pokemon.nature, int(row[24]))
 
 
-def _imputation_input(pokemon: Pokemon) -> ImputationInput | None:
+def _imputation_input(pokemon: PokemonView) -> ImputationInput | None:
     if not pokemon.species or not pokemon.nature or len(pokemon.moves) != MOVE_SLOTS:
         return None
     moves = tuple(pokemon.moves.values())
@@ -190,7 +189,7 @@ def _imputation_input(pokemon: Pokemon) -> ImputationInput | None:
 
 
 def _cached_imputed_stats(
-    pokemon: Pokemon, cache: dict[Pokemon, PrecomputedStats]
+    pokemon: PokemonView, cache: dict[Any, PrecomputedStats]
 ) -> PrecomputedStats | None:
     result = cache.get(pokemon)
     if result is not None:
@@ -204,7 +203,7 @@ def _cached_imputed_stats(
 
 
 def _get_pokemon_level_stats(
-    pokemon: Pokemon,
+    pokemon: PokemonView,
     is_opponent: bool,
     precomputed: PrecomputedStats | None,
 ) -> tuple[tuple[float, ...], Provenance]:
@@ -219,7 +218,7 @@ def _get_pokemon_level_stats(
     return (0.0,) * 6, Provenance.UNKNOWN
 
 
-def _has_exact_stats(pokemon: Pokemon) -> bool:
+def _has_exact_stats(pokemon: PokemonView) -> bool:
     stats = pokemon.stats
     return stats is not None and all(
         stats.get(key) is not None for key in ("hp", "atk", "def", "spa", "spd", "spe")
@@ -227,11 +226,11 @@ def _has_exact_stats(pokemon: Pokemon) -> bool:
 
 
 def _pokemon_numeric_into(
-    pokemon: Pokemon | None,
+    pokemon: PokemonView | None,
     battle: BattleView,
     cond: int,
     orig_idx: int,
-    move_slots: tuple[Move | None, ...],
+    move_slots: tuple[MoveView | None, ...],
     row: np.ndarray,
     active_idx: int | None = None,
     is_opponent: bool = False,
@@ -331,7 +330,7 @@ def _pokemon_numeric_into(
 
 
 def _pokemon_effects_into(
-    pokemon: Pokemon | None,
+    pokemon: PokemonView | None,
     tok: PokemonTokenizer,
     categorical: np.ndarray,
     numerical: np.ndarray,
@@ -340,7 +339,7 @@ def _pokemon_effects_into(
         return
     effects = []
     for effect, counter in pokemon.effects.items():
-        effect_id = tok.volatiles.get(effect, 0)
+        effect_id = tok.volatiles[effect]
         remaining_known = effect.name.startswith(("YAWN", "PERISH"))
         kind = (
             CounterKind.KNOWN_REMAINING
@@ -364,7 +363,7 @@ def _pokemon_effects_into(
 
 
 def _ally_legality(
-    battle: BattleView, active_idx: int, move_slots: tuple[Move | None, ...]
+    battle: BattleView, active_idx: int, move_slots: tuple[MoveView | None, ...]
 ) -> tuple[list[float], float]:
     decision = battle.decision
     slot = decision.slots[active_idx]
@@ -379,8 +378,8 @@ def _ally_legality(
 
 
 def _pad_team(
-    res: list[tuple[Pokemon | None, int, int | None]],
-) -> list[tuple[Pokemon | None, int, int | None]]:
+    res: list[tuple[PokemonView | None, int, int | None]],
+) -> list[tuple[PokemonView | None, int, int | None]]:
     overflow = len(res) - TEAM_SIZE
     if overflow > 0:
         # only happens when an active slot placeholder pushes a 6-mon team list
@@ -438,8 +437,8 @@ def _get_ordered_pokemon(
             return _pad_team(res)
 
         # active slots are positional: left always at index 0, right at index 1
-        res: list[tuple[Pokemon | None, int, int | None]] = []
-        assigned: set[Pokemon] = set()
+        res: list[tuple[PokemonView | None, int, int | None]] = []
+        assigned: set[Any] = set()
         for mon in active:
             if mon is None:
                 res.append((None, -1, None))
@@ -518,7 +517,7 @@ def _global_field_token_into(
         effects.append(
             (
                 EffectNamespace.WEATHER,
-                tok.weathers.get(weather, 0),
+                tok.weathers[weather],
                 CounterKind.TURN_AGE,
                 float(max(0, battle.turn - start_turn)),
                 0.0,
@@ -527,12 +526,12 @@ def _global_field_token_into(
             )
         )
     for field, start_turn in battle.fields.items():
-        remaining_known = field in {Field.TRICK_ROOM, Field.MAGIC_ROOM, Field.WONDER_ROOM}
+        remaining_known = field.name in _KNOWN_DURATION_FIELD_NAMES
         age = float(max(0, battle.turn - start_turn))
         effects.append(
             (
                 EffectNamespace.FIELD,
-                tok.fields.get(field, 0),
+                tok.fields[field],
                 CounterKind.TURN_AGE,
                 age,
                 0.0,
@@ -560,10 +559,9 @@ def _side_token_into(
         return
     effects = []
     for condition, stored_value in conditions.items():
-        stackable = condition in _STACKABLE_SIDE_EFFECTS
-        effect_value = tok.side_conditions.get(condition, 0)
-        effect_id = int(effect_value)
-        remaining_known = condition == SideCondition.TAILWIND
+        stackable = condition.name in _STACKABLE_SIDE_CONDITION_NAMES
+        effect_id = int(tok.side_conditions[condition])
+        remaining_known = condition.name == "TAILWIND"
         age = 0.0 if stackable else float(max(0, battle.turn - stored_value))
         effects.append(
             (
@@ -650,7 +648,7 @@ def _validate_output(out: StructuredObservation) -> None:
 def _event_location(
     battle: BattleView,
     event: BattleEvent,
-    pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
+    pokemon_to_slot: dict[Any, tuple[SideId, int]],
 ) -> tuple[SideId, int]:
     entity_id = event.entity_id
     if entity_id is None:
@@ -670,7 +668,7 @@ def _event_location(
 def _event_target_location(
     battle: BattleView,
     event: BattleEvent,
-    pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
+    pokemon_to_slot: dict[Any, tuple[SideId, int]],
 ) -> tuple[SideId, int]:
     if event.target_id is None:
         return SideId.NONE, 0
@@ -682,7 +680,7 @@ def _event_target_location(
 
 
 def _resolve_stats(
-    pokemon: Pokemon | None,
+    pokemon: PokemonView | None,
     is_opponent: bool,
     cache: dict[Any, PrecomputedStats],
     overrides: Mapping[Any, PrecomputedStats] | None,
@@ -692,13 +690,13 @@ def _resolve_stats(
     supplied = overrides.get(pokemon) if overrides is not None else None
     if supplied is not None or (not is_opponent and _has_exact_stats(pokemon)):
         return supplied
-    return _cached_imputed_stats(pokemon, cache)  # type: ignore[arg-type]
+    return _cached_imputed_stats(pokemon, cache)
 
 
 def _write_events(
     battle: BattleView,
     out: StructuredObservation,
-    pokemon_to_slot: dict[Pokemon, tuple[SideId, int]],
+    pokemon_to_slot: dict[Any, tuple[SideId, int]],
 ) -> None:
     untruncated_events = battle.consume_events()
     event_overflow = max(0, len(untruncated_events) - EVENT_COUNT)
@@ -881,7 +879,7 @@ class ObservationBuilder:
         return obs
 
 
-def _is_mega_form(pokemon: Pokemon | None) -> bool:
+def _is_mega_form(pokemon: PokemonView | None) -> bool:
     if pokemon is None:
         return False
     species = pokemon.species
@@ -890,7 +888,7 @@ def _is_mega_form(pokemon: Pokemon | None) -> bool:
     return PokemonTokenizer.normalize_id(species) in _MEGA_FORMS
 
 
-def _can_mega(pokemon: Pokemon | None, battle: Any, active_idx: int | None = None) -> bool:
+def _can_mega(pokemon: PokemonView | None, battle: Any, active_idx: int | None = None) -> bool:
     if pokemon is None:
         return False
     if active_idx is not None:

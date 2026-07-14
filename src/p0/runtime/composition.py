@@ -7,10 +7,9 @@ from typing import TypeVar
 
 from poke_env.ps_client import AccountConfiguration, ServerConfiguration
 
-from p0.env import SimEnv
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
-from p0.runtime import poke_env_patches
+from p0.runtime.env import SimEnv
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import TeamSource
 
@@ -29,7 +28,6 @@ def build_sim_env(
     opponent_seed: int = 1,
     env_type: type[EnvT] = SimEnv,
 ) -> EnvT:
-    poke_env_patches.install()
     agent_rng = random.Random(agent_seed)
     opponent_rng = random.Random(opponent_seed)
     initial_agent_team = agent_team_source.sample(random.Random(agent_seed))

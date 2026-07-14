@@ -17,7 +17,6 @@ from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
 from p0.battle.events import EventTypeId, RawBattleEvent
-from p0.env import SimEnv
 from p0.format_config import FORMAT
 from p0.model.observation_builder import (
     ObservationBuilder,
@@ -53,6 +52,7 @@ from p0.model.structured_observation import (
     TokenType,
 )
 from p0.model.tokenizer import tokenizer
+from p0.runtime.env import SimEnv
 from p0.runtime.live_event_capture import set_raw_events
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import ValidatedTeam
@@ -299,8 +299,8 @@ def test_pokemon_categorical_and_numeric_rows_real():
     assert cat[12] == 0
 
     # 4 Move Categories (padded)
-    assert cat[13] == tokenizer.categories.get(MoveCategory.PHYSICAL)
-    assert cat[14] == tokenizer.categories.get(MoveCategory.SPECIAL)
+    assert cat[13] == tokenizer.categories[MoveCategory.PHYSICAL]
+    assert cat[14] == tokenizer.categories[MoveCategory.SPECIAL]
     assert cat[15] == 0
     assert cat[16] == 0
 

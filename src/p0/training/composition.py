@@ -11,12 +11,12 @@ from poke_env import AccountConfiguration
 from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
-from p0.env import SimEnv
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.runtime.composition import build_sim_env
+from p0.runtime.env import SimEnv
 from p0.runtime.showdown import start_showdown_servers
 from p0.teams.source import FileTeamSource
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore

@@ -19,7 +19,7 @@ cuda = ["torch>=2.11"]
 [project.scripts]
 p0-train = "p0.cli.train:main"
 p0-play = "p0.cli.play:main"
-p0-build-vocab = "p0.model.build_vocab:main"
+p0-build-vocab = "p0.cli.build_vocab:main"
 p0-export-training = "p0.cli.export_training:main"
 
 [build-system]
