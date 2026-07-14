@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import torch
 
@@ -156,10 +156,22 @@ class StructuredObservation:
 
     @classmethod
     def _from_values(cls, values: list[torch.Tensor]) -> StructuredObservation:
-        return cls(**dict(zip(cls._FIELD_NAMES, values, strict=True)))
+        if len(values) != len(cls._FIELD_NAMES):
+            raise ValueError(f"Expected {len(cls._FIELD_NAMES)} observation tensors")
+        return cls(*values)
 
-    def _values(self) -> tuple[torch.Tensor, ...]:
-        return tuple(getattr(self, name) for name in self._FIELD_NAMES)
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.token_type_ids,
+            self.side_ids,
+            self.slot_ids,
+            self.categorical,
+            self.numerical,
+            self.events_cat,
+            self.events_num,
+            self.events_side_ids,
+            self.events_slot_ids,
+        )
 
     def is_teampreview(self) -> torch.Tensor:
         return is_teampreview(self.numerical)
@@ -179,40 +191,36 @@ class StructuredObservation:
             raise ValueError("Effect overflow does not match the number of dropped effects")
 
     def clone(self) -> StructuredObservation:
-        return self._from_values([tensor.clone() for tensor in self._values()])
+        return self._from_values([tensor.clone() for tensor in self.tensors()])
 
     def to(self, *args, **kwargs) -> StructuredObservation:
-        return self._from_values([tensor.to(*args, **kwargs) for tensor in self._values()])
+        return self._from_values([tensor.to(*args, **kwargs) for tensor in self.tensors()])
 
     def unsqueeze(self, dim: int) -> StructuredObservation:
-        return self._from_values([tensor.unsqueeze(dim) for tensor in self._values()])
+        return self._from_values([tensor.unsqueeze(dim) for tensor in self.tensors()])
 
     def cpu(self) -> StructuredObservation:
         return self.to("cpu")
 
     def __getitem__(self, index) -> StructuredObservation:
-        return self._from_values([tensor[index] for tensor in self._values()])
+        return self._from_values([tensor[index] for tensor in self.tensors()])
 
     @staticmethod
     def cat(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
         if not observations:
             raise ValueError("Cannot concatenate an empty observation list")
+        columns = zip(*(observation.tensors() for observation in observations), strict=True)
         return StructuredObservation._from_values(
-            [
-                torch.cat([getattr(obs, name) for obs in observations], dim=dim)
-                for name in StructuredObservation._FIELD_NAMES
-            ]
+            [torch.cat(list(tensors), dim=dim) for tensors in columns]
         )
 
     @staticmethod
     def stack(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
         if not observations:
             raise ValueError("Cannot stack an empty observation list")
+        columns = zip(*(observation.tensors() for observation in observations), strict=True)
         return StructuredObservation._from_values(
-            [
-                torch.stack([getattr(obs, name) for obs in observations], dim=dim)
-                for name in StructuredObservation._FIELD_NAMES
-            ]
+            [torch.stack(list(tensors), dim=dim) for tensors in columns]
         )
 
     @staticmethod
@@ -227,10 +235,9 @@ class StructuredObservation:
         )
 
     def validate(self, *, batch_rank: int | None = None) -> None:
-        for name, trailing_shape, dtype in self._FIELD_SPECS:
-            tensor: Any = getattr(self, name)
-            if not isinstance(tensor, torch.Tensor):
-                raise ValueError(f"{name} must be a tensor")
+        for (name, trailing_shape, dtype), tensor in zip(
+            self._FIELD_SPECS, self.tensors(), strict=True
+        ):
             if (
                 tensor.dtype != dtype
                 or tuple(tensor.shape[-len(trailing_shape) :]) != trailing_shape

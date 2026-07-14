@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from p0.model.config import ModelConfig
 from p0.model.policy import PolicyNet
-from p0.model.resources import RuntimeResources, default_runtime_resources
+from p0.model.resources import RuntimeResources
 
 
-class PolicyFactory:
-    def __init__(self, resources: RuntimeResources | None = None):
-        self.resources = resources or default_runtime_resources()
-
-    def create(self, config: ModelConfig | None = None) -> PolicyNet:
-        return PolicyNet(config=config or ModelConfig.baseline(), resources=self.resources)
+def build_policy(config: ModelConfig, resources: RuntimeResources) -> PolicyNet:
+    """Construct a policy from validated architecture and runtime resources."""
+    return PolicyNet(config=config, resources=resources)

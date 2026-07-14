@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-from p0.model.structured_observation import SEQUENCE_LENGTH
 from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 
@@ -15,12 +14,12 @@ class CLSReducer(nn.Module):
 
     def __init__(
         self,
-        seq_len: int = SEQUENCE_LENGTH,
-        d_model: int = 512,
-        nhead: int = 8,
-        nlayer: int = 3,
-        dim_feedforward: int | None = None,
-        n_hg: int = 8,
+        seq_len: int,
+        d_model: int,
+        nhead: int,
+        nlayer: int,
+        dim_feedforward: int,
+        n_hg: int,
         use_history: bool = True,
     ):
         super().__init__()
@@ -28,8 +27,6 @@ class CLSReducer(nn.Module):
         self.d_model = d_model
         self.n_hg = n_hg if use_history else 0
         self.use_history = use_history
-        dim_feedforward = dim_feedforward or 4 * d_model
-
         self.cls_base = nn.Parameter(torch.empty(1, 1, d_model))
         # learned initial state with random per-slot init
         self.hg_init = nn.Parameter(torch.empty(1, self.n_hg, d_model))
@@ -61,7 +58,7 @@ class CLSReducer(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        state: torch.Tensor | None = None,
+        state: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns cls, history, all other tokens"""
@@ -76,10 +73,7 @@ class CLSReducer(nn.Module):
 
         cls_tok = self.cls_base.expand(B, -1, -1)
 
-        if state is None:
-            hg_prev = self.hg_init.expand(B, -1, -1)
-        else:
-            hg_prev = state.to(tokens.device)
+        hg_prev = state.to(tokens.device)
 
         # hg_prev empty if use history false
         seq = torch.cat([cls_tok, hg_prev, tokens[:, 1:]], dim=1)

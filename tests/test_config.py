@@ -1,3 +1,4 @@
+import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -28,18 +29,32 @@ def test_load_config_applies_partial_yaml_to_source_defaults(tmp_path):
     assert config.pool.pool_size == 50
 
 
-def test_load_config_rejects_unknown_fields(tmp_path):
-    path = write_config(tmp_path, "training:\n  unknown_value: 1\n")
-
-    with pytest.raises(ValueError, match="unknown TrainingConfig field"):
-        load_config(path)
-
-
-def test_load_config_rejects_invalid_values(tmp_path):
-    path = write_config(tmp_path, "training:\n  n_envs: 2\n  n_self_envs: 3\n")
-
-    with pytest.raises(ValueError, match="n_self_envs"):
-        load_config(path)
+def test_load_config_rejects_invalid_contracts_with_specific_errors(tmp_path):
+    cases = (
+        (
+            "unknown training field",
+            "training:\n  unknown_value: 1\n",
+            "unknown TrainingConfig field",
+        ),
+        ("invalid environment split", "training:\n  n_envs: 2\n  n_self_envs: 3\n", "n_self_envs"),
+        (
+            "removed team-source kind",
+            "environment:\n  agent_team_source:\n    kind: directory_magic\n",
+            "unknown TeamSourceConfig field",
+        ),
+        (
+            "mismatched bot format",
+            "bot:\n  battle_format: gen9anythinggoes\n",
+            "battle_format",
+        ),
+    )
+    for label, contents, message in cases:
+        try:
+            load_config(write_config(tmp_path, contents))
+        except ValueError as exc:
+            assert re.search(message, str(exc)), f"{label}: unexpected error: {exc}"
+        else:
+            pytest.fail(f"{label}: expected ValueError")
 
 
 def test_config_is_immutable(tmp_path):
@@ -69,29 +84,8 @@ environment:
     assert config.paths.data_root == (Path(__file__).parents[1] / "relative-data").resolve()
     assert (
         config.environment.agent_team_source.path
-        == (Path(__file__).parents[1] / "team-pool").resolve()
+        == (Path(__file__).parents[1] / "teams" / "team-pool").resolve()
     )
-
-
-def test_team_source_config_rejects_unknown_kind(tmp_path):
-    path = write_config(
-        tmp_path,
-        "environment:\n  agent_team_source:\n    kind: directory_magic\n",
-    )
-    with pytest.raises(ValueError, match="file_pool"):
-        load_config(path)
-
-
-def test_future_corpus_team_source_is_a_config_discriminator_only():
-    from p0.training.config import TeamSourceConfig
-
-    assert TeamSourceConfig(kind="corpus").kind == "corpus"
-
-
-def test_bot_format_must_match_application_format(tmp_path):
-    path = write_config(tmp_path, "bot:\n  battle_format: gen9anythinggoes\n")
-    with pytest.raises(ValueError, match="battle_format"):
-        load_config(path)
 
 
 def test_model_config_is_checkpoint_local_and_validated():

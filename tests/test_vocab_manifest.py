@@ -14,7 +14,7 @@ from p0.model.fused_token_encoder import (
     _load_move_statics,
     _load_species_statics,
 )
-from p0.model.resources import RuntimeResources
+from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.tokenizer import PokemonTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,15 +58,21 @@ def test_every_legal_content_key_resolves():
 
 def test_mechanics_tables_cover_the_vocab():
     vocab = json.loads((ROOT / "data/vocab.json").read_text())
-    assert _load_move_statics().shape[0] == len(vocab["moves"]) + 1
-    assert _load_species_statics().shape[0] == len(vocab["species"]) + 1
-    mechanic_tags = _load_mechanic_tag_tables()
+    resources = default_runtime_resources()
+    assert _load_move_statics(resources).shape[0] == len(vocab["moves"]) + 1
+    assert _load_species_statics(resources).shape[0] == len(vocab["species"]) + 1
+    mechanic_tags = _load_mechanic_tag_tables(resources)
     assert mechanic_tags["items"].shape[0] == len(vocab["items"]) + 1
     assert mechanic_tags["abilities"].shape[0] == len(vocab["abilities"]) + 1
 
 
 def test_item_and_ability_mechanics_are_wired_into_encoder():
-    encoder = FusedTokenEncoder(d_model=32, nhead=4, dim_feedforward=64)
+    encoder = FusedTokenEncoder(
+        d_model=32,
+        nhead=4,
+        dim_feedforward=64,
+        resources=default_runtime_resources(),
+    )
     assert encoder.item_mechanic_proj.in_features == encoder._item_mechanic_tags.shape[1]
     assert encoder.ability_mechanic_proj.in_features == encoder._ability_mechanic_tags.shape[1]
     assert encoder._item_mechanic_tags.count_nonzero() > 0

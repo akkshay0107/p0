@@ -11,6 +11,7 @@ from p0.env import SimEnv
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.runtime import poke_env_patches
+from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import TeamSource
 
 EnvT = TypeVar("EnvT", bound=SimEnv)
@@ -23,7 +24,7 @@ def build_sim_env(
     server_port: int,
     agent_team_source: TeamSource,
     opponent_team_source: TeamSource,
-    observation_builder: ObservationBuilder | None = None,
+    observation_builder: ObservationBuilder,
     agent_seed: int = 0,
     opponent_seed: int = 1,
     env_type: type[EnvT] = SimEnv,
@@ -45,6 +46,7 @@ def build_sim_env(
         log_level=25,
         team=initial_agent_team.packed,
         observation_builder=observation_builder,
+        battle_view_factory=battle_view,
         agent_team_source=agent_team_source,
         opponent_team_source=opponent_team_source,
         agent_rng=agent_rng,

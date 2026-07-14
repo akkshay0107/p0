@@ -9,10 +9,10 @@ import time
 
 from poke_env.battle import DoubleBattle, Pokemon
 
-from p0.battle.events import ProtocolEventParser, RawBattleEvent
-from p0.model.tokenizer import tokenizer
+from p0.battle.events import RawBattleEvent, parse_events
+from p0.model.resources import default_runtime_resources
 from p0.runtime.live_event_capture import capture_message, consume_raw_events
-from p0.runtime.poke_env_action_adapter import PokeEnvOrderAdapter
+from p0.runtime.poke_env_action_adapter import action_to_single_order
 
 
 def _battle_fixture() -> DoubleBattle:
@@ -42,16 +42,17 @@ def benchmark(args: argparse.Namespace) -> None:
     battle = _battle_fixture()
 
     def order_conversion() -> None:
-        PokeEnvOrderAdapter.action_to_single_order(0, battle, True, 0)
+        action_to_single_order(0, battle, True, 0)
 
     def event_capture() -> None:
         capture_message(battle, ["", "-weather", "none"])
         consume_raw_events(battle)
 
     raw_events = [RawBattleEvent(("", "move", "p1a: Charizard", "Protect", "p1a: Charizard"))]
+    resolver = default_runtime_resources().tokenizer
 
     def event_parse() -> None:
-        ProtocolEventParser.parse_events(raw_events, tokenizer)
+        parse_events(raw_events, resolver)
 
     order_median, order_iqr = _median(order_conversion, args.iterations, args.repeats)
     event_median, event_iqr = _median(event_capture, args.iterations, args.repeats)

@@ -89,7 +89,7 @@ cd pokemon-showdown && npm install && cd ..
 
 ### 2. PPO Training Loop
 
-The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.yaml.example` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.pool` and `environment.opponent_team_source.pool` independently.
+The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.yaml.example` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.path` and `environment.opponent_team_source.path` independently. Relative paths are resolved under `paths.teams_root`.
 
 Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins league-based self-play.
 

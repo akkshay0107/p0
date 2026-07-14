@@ -2,10 +2,12 @@ import pytest
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
+from p0.model.policy import EncodedObs
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
-    EVENT_COUNT,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
@@ -16,16 +18,13 @@ ACT_SIZE = FORMAT.action_size
 
 @pytest.fixture
 def policy_net():
-    return PolicyNet(
-        obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH),
-        act_size=ACT_SIZE,
-        d_model=128,
-        nhead=4,
-        nlayer=2,
+    return build_policy(
+        ModelConfig(128, 4, 2, 8, 512),
+        default_runtime_resources(),
     )
 
 
-def test_policy_net_forward_pass(policy_net):
+def test_policy_net_act_and_encoded_evaluate_shapes(policy_net):
     B = 16
     obs = StructuredObservation.empty_batch(B)
 
@@ -45,6 +44,17 @@ def test_policy_net_forward_pass(policy_net):
     assert out.value.shape == (B,)
 
     assert out.state.shape == (B, 8, 128)  # n_hg is 8
+
+    encoded = policy_net.encode(obs, action_mask)
+    actions = torch.full((B, 2), 7, dtype=torch.long)
+    with torch.no_grad():
+        evaluated = policy_net.evaluate(encoded, action_mask, actions, state)
+    assert evaluated.logits.shape == (B, 2, ACT_SIZE)
+    assert evaluated.log_probs.shape == (B,)
+    assert evaluated.entropy.shape == (B,)
+    assert evaluated.norm_entropy.shape == (B,)
+    assert evaluated.value.shape == (B,)
+    assert evaluated.state.shape == (B, 8, 128)
 
 
 def test_encoder_batches_all_pokemon_in_one_fusion_call(policy_net):
@@ -97,34 +107,7 @@ def test_encoded_obs_step_is_contiguous_time_major():
     assert step.numerical.is_contiguous()
 
 
-def test_policy_net_encoded_evaluate(policy_net):
-    B = 16
-    tokens = torch.randn((B, SEQUENCE_LENGTH + 1 + EVENT_COUNT, 128))
-    aux = torch.randn((B, 2, 4, 128))
-    numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
-
-    # Populate valid orig_idxs to prevent random switch actions from crashing
-    ally_indices = [1, 3, 5, 7, 9, 11]
-    for i, idx in enumerate(ally_indices):
-        numerical[:, idx + 1, 26] = (i + 1) / 6.0
-
-    enc = EncodedObs(tokens, aux, numerical)
-    action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
-    actions = torch.full((B, 2), 7, dtype=torch.long)
-    state = policy_net.initial_state(B)
-
-    with torch.no_grad():
-        out = policy_net.evaluate(enc, action_mask, actions, state)
-
-    assert out.logits.shape == (B, 2, ACT_SIZE)
-    assert out.log_probs.shape == (B,)
-    assert out.entropy.shape == (B,)
-    assert out.norm_entropy.shape == (B,)
-    assert out.value.shape == (B,)
-    assert out.state.shape == (B, 8, 128)
-
-
-def test_encode_requires_batched_observation_and_mask(policy_net):
+def test_policy_inputs_reject_unbatched_missing_mask_and_invalid_top_p(policy_net):
     obs = StructuredObservation.empty_batch(1)[0]
     action_mask = torch.ones((2, ACT_SIZE), dtype=torch.bool)
 
@@ -134,8 +117,6 @@ def test_encode_requires_batched_observation_and_mask(policy_net):
     with pytest.raises(TypeError):
         policy_net.encode(obs.unsqueeze(0))  # type: ignore[call-arg]
 
-
-def test_top_p_validation(policy_net):
     B = 1
     obs = StructuredObservation.empty_batch(B)
     action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
@@ -240,7 +221,14 @@ def test_cls_reducer_pokemon_tokens_alignment():
 
     from p0.model.cls_reducer import CLSReducer
 
-    reducer = CLSReducer(seq_len=SEQUENCE_LENGTH + 1, d_model=32, nhead=4, nlayer=1)
+    reducer = CLSReducer(
+        seq_len=SEQUENCE_LENGTH + 1,
+        d_model=32,
+        nhead=4,
+        nlayer=1,
+        dim_feedforward=128,
+        n_hg=8,
+    )
 
     class _Passthrough(nn.Module):
         def forward(self, seq, src_key_padding_mask=None):
@@ -249,6 +237,7 @@ def test_cls_reducer_pokemon_tokens_alignment():
     reducer.encoder = _Passthrough()  # type: ignore
     tokens = torch.randn(2, SEQUENCE_LENGTH + 1, 32)
 
-    _, _, pokemon_tokens = reducer(tokens, None, None)
+    state = reducer.hg_init.expand(tokens.size(0), -1, -1)
+    _, _, pokemon_tokens = reducer(tokens, state, None)
 
     torch.testing.assert_close(pokemon_tokens, tokens[:, 1:25])

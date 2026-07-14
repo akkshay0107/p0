@@ -1,12 +1,11 @@
 from types import SimpleNamespace
 from typing import cast
 
-import numpy as np
 import pytest
 from poke_env.battle import DoubleBattle
 from poke_env.player.battle_order import PassBattleOrder
 
-from p0.env import MegaEnv
+from p0.runtime.poke_env_action_adapter import action_to_single_order
 
 
 def test_action_validation_rejects_orders_outside_battle_order_space():
@@ -20,19 +19,19 @@ def test_action_validation_rejects_orders_outside_battle_order_space():
         ),
     )
 
-    order = MegaEnv._action_to_order_individual(
-        np.int64(0),
+    order = action_to_single_order(
+        0,
         battle,
         fake=False,
-        pos=0,
+        position=0,
     )
     assert str(order) == str(valid_order)
 
     battle.valid_orders[0].clear()
     with pytest.raises(ValueError, match="not in action space"):
-        MegaEnv._action_to_order_individual(
-            np.int64(0),
+        action_to_single_order(
+            0,
             battle,
             fake=False,
-            pos=0,
+            position=0,
         )

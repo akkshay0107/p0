@@ -66,7 +66,7 @@ class PPOUpdater:
         scaler: GradScaler,
         config: TrainingConfig,
         *,
-        cancel_requested: Callable[[], bool] = lambda: False,
+        cancel_requested: Callable[[], bool],
     ) -> None:
         self.policy = policy
         self.optimizer = optimizer
@@ -78,7 +78,7 @@ class PPOUpdater:
         self,
         trajectories: Sequence[TrajectoryBatch],
         episode: int,
-        entropy_coefficient: float | None = None,
+        entropy_coefficient: float,
     ) -> dict[str, Any]:
         return ppo_update(
             list(trajectories),
@@ -103,7 +103,7 @@ def _run_batched_ppo(
     config: TrainingConfig,
     device: torch.device,
     episode: int,
-    entropy_coef: float | None = None,
+    entropy_coef: float,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
     """
     Run PPO BPTT over a minibatch of variable-length episodes.
@@ -169,7 +169,7 @@ def _run_batched_ppo(
         "entropy_coef": 0.0,
     }
     total_steps = 0
-    curr_ent_coef = config.entropy_coef if entropy_coef is None else entropy_coef
+    curr_ent_coef = entropy_coef
 
     for t in range(max_steps):
         active_n = sum(1 for length in lengths if length > t)
@@ -213,19 +213,17 @@ def _run_batched_ppo(
                         f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
                     )
 
-            step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = (
-                compute_ppo_objective(
-                    curr_log_prob,
-                    curr_val,
-                    curr_normalized_entropy,
-                    old_log_probs_t,
-                    advantages_t,
-                    returns_t,
-                    is_tp_t,
-                    config,
-                    entropy_coefficient=curr_ent_coef,
-                    critic_only=is_warmup,
-                )
+            step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = compute_ppo_objective(
+                curr_log_prob,
+                curr_val,
+                curr_normalized_entropy,
+                old_log_probs_t,
+                advantages_t,
+                returns_t,
+                is_tp_t,
+                config,
+                entropy_coefficient=curr_ent_coef,
+                critic_only=is_warmup,
             )
 
         total_loss = total_loss + step_loss.sum()
@@ -272,9 +270,8 @@ def ppo_update(
     scaler: GradScaler,
     config: TrainingConfig,
     episode: int,
-    entropy_coef: float | None = None,
-    shutdown_requested: bool = False,
-    cancel_requested: Callable[[], bool] | None = None,
+    entropy_coef: float,
+    cancel_requested: Callable[[], bool],
 ) -> dict:
     policy.train()
     t0 = time.time()
@@ -304,11 +301,9 @@ def ppo_update(
         (config.batch_size + config.chunk_size - 1) // config.chunk_size
     )  # round up to nearest chunk
 
-    if entropy_coef is None:
-        entropy_coef = config.entropy_coef
     last_entropy_coef = entropy_coef
     for epoch_idx in range(config.ppo_epochs):
-        if shutdown_requested or (cancel_requested is not None and cancel_requested()):
+        if cancel_requested():
             break
         random.shuffle(episodes)
 
@@ -316,7 +311,7 @@ def ppo_update(
         epoch_kl = 0.0
 
         for batch_start in range(0, len(episodes), effective_batch_size):
-            if shutdown_requested or (cancel_requested is not None and cancel_requested()):
+            if cancel_requested():
                 break
 
             minibatch = episodes[batch_start : batch_start + effective_batch_size]
@@ -333,7 +328,7 @@ def ppo_update(
             minibatch_mean_kl = 0.0
 
             for chunk_idx in range(0, len(minibatch), config.chunk_size):
-                if cancel_requested is not None and cancel_requested():
+                if cancel_requested():
                     cancelled = True
                     break
                 chunk = minibatch[chunk_idx : chunk_idx + config.chunk_size]

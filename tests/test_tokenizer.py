@@ -5,20 +5,15 @@ from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.status import Status
 
-from p0.model.tokenizer import PokemonTokenizer, tokenizer
+from p0.model.tokenizer import PokemonTokenizer, Resolution, tokenizer
 
 
-def test_tokenizer_normalization():
-    """Verify that normalize_id handles punctuation, case-insensitivity, and None."""
+def test_tokenizer_normalization_and_table_resolution():
     assert PokemonTokenizer.normalize_id("Charizard-Mega-Y") == "charizardmegay"
     assert PokemonTokenizer.normalize_id("U-turn") == "uturn"
     assert PokemonTokenizer.normalize_id("Leech Seed") == "leechseed"
     assert PokemonTokenizer.normalize_id("  Thunderbolt  ") == "thunderbolt"
     assert PokemonTokenizer.normalize_id(None) == ""
-
-
-def test_tokenizer_id_for():
-    """Verify id_for retrieves elements from custom vocab dicts or defaults to 0."""
     custom_vocab = {
         "custom_table": {
             "apple": 1,
@@ -29,19 +24,17 @@ def test_tokenizer_id_for():
     assert tok.id_for("custom_table", "Apple") == 1
     assert tok.id_for("custom_table", "cherry") == 0
     assert tok.id_for("missing_table", "apple") == 0
+    species = PokemonTokenizer({"species": {"pikachu": 1}})
+    assert species.resolve("species", None) == (0, Resolution.KNOWN_NONE)
+    assert species.resolve("species", "missingno") == (0, Resolution.OOV)
+    assert species.resolve("species", "pikachu") == (1, Resolution.KNOWN)
 
 
-def test_tokenizer_status_id():
-    """Verify Status enum translation mapped to vocab values."""
+def test_tokenizer_domain_objects_and_missing_values():
     assert tokenizer.status_id(Status.BRN) == tokenizer.status[Status.BRN]
     assert tokenizer.status_id(Status.SLP) == tokenizer.status[Status.SLP]
     assert tokenizer.status_id(None) == 0
-    # Test unrecognized/invalid status (not in vocab mapping)
     assert tokenizer.status_id(cast(Status, "UNKNOWN_STATUS")) == 0
-
-
-def test_tokenizer_pokemon_attributes():
-    """Verify species, ability, item, type, and move attributes parsing using real poke_env objects."""
 
     p1 = Pokemon(gen=9, species="archaludon")
     assert tokenizer.species_id(p1) == tokenizer.vocab["species"]["archaludon"]
@@ -88,10 +81,6 @@ def test_tokenizer_pokemon_attributes():
     m3 = Move("protect", 9)
     assert tokenizer.move_category_id(m3) == 3
     assert tokenizer.move_category_id(None) == 0
-
-
-def test_tokenizer_nature():
-    """Verify that nature_id correctly extracts and maps Pokemon natures."""
     assert tokenizer.nature_id(None) == 0
 
     p = Pokemon(gen=9, species="pikachu")
@@ -113,6 +102,5 @@ def test_tokenizer_nature():
     assert adamant_id > 0
     assert tokenizer.natures_list[adamant_id] == "adamant"
 
-    # test fallback to 0/neutral
     p._nature = "unknown_nature"
     assert tokenizer.nature_id(p) == 0

@@ -8,7 +8,9 @@ from poke_env.player import RandomPlayer
 
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
-from p0.model.factory import PolicyFactory
+from p0.model.factory import build_policy
+from p0.model.observation_builder import ObservationBuilder
+from p0.model.resources import default_runtime_resources
 from p0.rl_player import RLPlayer
 from p0.runtime import poke_env_patches
 from p0.teams.source import FixedTeamSource
@@ -98,7 +100,8 @@ async def test_checkpoint_free_policy_completes_live_battle(
 ):
     torch.manual_seed(7)
     poke_env_patches.install()
-    policy = PolicyFactory().create(ModelConfig.baseline()).eval()
+    resources = default_runtime_resources()
+    policy = build_policy(ModelConfig.baseline(), resources).eval()
     first_source = FixedTeamSource(TEAM)
     second_source = FixedTeamSource(TEAM)
     first = TrackedPolicyPlayer(
@@ -107,6 +110,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
         server_configuration=showdown_server,
         team_source=first_source,
         team_rng=random.Random(11),
+        observation_builder=ObservationBuilder(resources),
         max_concurrent_battles=1,
     )
     if opponent_mode == "self_policy":
@@ -116,6 +120,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
             server_configuration=showdown_server,
             team_source=second_source,
             team_rng=random.Random(13),
+            observation_builder=ObservationBuilder(resources),
             max_concurrent_battles=1,
         )
     else:

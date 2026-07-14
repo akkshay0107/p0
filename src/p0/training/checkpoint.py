@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
@@ -16,9 +14,10 @@ from p0.format_config import (
     validate_artifact_runtime_contract,
 )
 from p0.model.config import ModelConfig
-from p0.model.factory import PolicyFactory
+from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
 from p0.model.resources import RuntimeResources
+from p0.persistence import atomic_torch_save
 
 CHECKPOINT_SCHEMA = "p0.checkpoint.v1"
 POLICY_ARTIFACT = "policy"
@@ -55,7 +54,7 @@ class PolicyStore(Protocol):
         optimizer: Any = None,
         scheduler: Any = None,
         scaler: Any = None,
-    ) -> int | None: ...
+    ) -> int: ...
 
 
 class CheckpointStore:
@@ -78,13 +77,13 @@ class CheckpointStore:
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
         artifact = self._policy_artifact(policy, POLICY_ARTIFACT, metadata)
-        _atomic_torch_save(path, artifact)
+        atomic_torch_save(path, artifact)
 
     def load_policy(self, path: Path, device: torch.device | str) -> PolicyNet:
         artifact = self._load_artifact(path)
         config = self._model_config(artifact, path)
         try:
-            policy = PolicyFactory(self._runtime_resources()).create(config).to(device)
+            policy = build_policy(config, self._runtime_resources()).to(device)
             policy.load_state_dict(artifact["model_state_dict"], strict=True)
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             raise ValueError(f"Invalid policy state in checkpoint {path}") from exc
@@ -110,7 +109,7 @@ class CheckpointStore:
             if service is not None:
                 training_state[f"{name}_state_dict"] = service.state_dict()
         artifact["training_state"] = training_state
-        _atomic_torch_save(path, artifact)
+        atomic_torch_save(path, artifact)
 
     def load_training_state(
         self,
@@ -120,16 +119,16 @@ class CheckpointStore:
         optimizer: Any = None,
         scheduler: Any = None,
         scaler: Any = None,
-    ) -> int | None:
+    ) -> int:
         if not path.exists():
-            return None
+            return 0
         artifact = self._load_artifact(path)
         expected = self._policy_config(policy).to_dict()
         actual = self._model_config(artifact, path).to_dict()
         if actual != expected:
             raise ValueError(f"Checkpoint {path} model configuration does not match the policy")
         if artifact["artifact_type"] == POLICY_ARTIFACT:
-            return None
+            return 0
         training_state = artifact.get("training_state")
         if not isinstance(training_state, Mapping):
             raise ValueError(f"Training checkpoint {path} has no valid training_state")
@@ -204,25 +203,10 @@ class CheckpointStore:
 
     @staticmethod
     def _policy_config(policy: PolicyNet) -> ModelConfig:
-        config = getattr(policy, "config", None)
+        config = policy.config
         if not isinstance(config, ModelConfig):
             raise ValueError("Only policies with a validated ModelConfig can be checkpointed")
         return config
-
-
-def _atomic_torch_save(path: Path, artifact: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    os.close(handle)
-    temporary_path = Path(temporary)
-    try:
-        torch.save(dict(artifact), temporary_path)
-        with temporary_path.open("rb") as stream:
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
 
 
 DEFAULT_POLICY_STORE = CheckpointStore()

@@ -9,11 +9,11 @@ import time
 
 from poke_env.battle import DoubleBattle, Pokemon
 
-from p0.battle.legality import LegalActionBuilder
-from p0.model.observation_builder import ObservationBuilder, from_battle, from_battle_into
+from p0.battle.legality import action_mask
+from p0.model.observation_builder import ObservationBuilder
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
-from p0.model.tokenizer import tokenizer
-from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
+from p0.runtime.poke_env_battle_adapter import battle_view, decision_view
 
 
 def _battle_fixture() -> DoubleBattle:
@@ -49,17 +49,17 @@ def _summary(samples: list[float]) -> tuple[float, float]:
 def benchmark(args: argparse.Namespace) -> None:
     battle = _battle_fixture()
     target = StructuredObservation.empty_batch(1)[0]
-    builder = ObservationBuilder(tokenizer)
-    view = PokeEnvBattleAdapter.view(battle)
+    builder = ObservationBuilder(default_runtime_resources())
+    view = battle_view(battle)
     for _ in range(args.warmup):
-        from_battle_into(battle, target, tokenizer)
+        builder.build_into(battle_view(battle), target)
 
     write_samples = [
-        _measure(lambda: from_battle_into(battle, target, tokenizer), args.iterations)
+        _measure(lambda: builder.build_into(battle_view(battle), target), args.iterations)
         for _ in range(args.repeats)
     ]
     allocation_samples = [
-        _measure(lambda: from_battle(battle, tokenizer), args.iterations)
+        _measure(lambda: builder.build(battle_view(battle)), args.iterations)
         for _ in range(args.repeats)
     ]
     view_write_samples = [
@@ -67,12 +67,11 @@ def benchmark(args: argparse.Namespace) -> None:
         for _ in range(args.repeats)
     ]
     adapter_samples = [
-        _measure(lambda: PokeEnvBattleAdapter.view(battle), args.iterations)
-        for _ in range(args.repeats)
+        _measure(lambda: battle_view(battle), args.iterations) for _ in range(args.repeats)
     ]
     legality_samples = [
         _measure(
-            lambda: LegalActionBuilder.mask(PokeEnvBattleAdapter.decision_view(battle)),
+            lambda: action_mask(decision_view(battle)),
             args.iterations,
         )
         for _ in range(args.repeats)

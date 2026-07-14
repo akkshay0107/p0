@@ -20,19 +20,21 @@ from p0.battle.events import EventTypeId, RawBattleEvent
 from p0.env import SimEnv
 from p0.format_config import FORMAT
 from p0.model.observation_builder import (
+    ObservationBuilder,
     _cached_imputed_stats,
     _get_ordered_pokemon,
     _get_pokemon_level_stats,
     _global_field_token_into,
     _iter_move_slots,
     _pokemon_categorical_into,
-    _pokemon_numeric_into,
     _side_mega_available,
     _side_token_into,
     _slot_condition,
-    from_battle,
-    from_battle_into,
 )
+from p0.model.observation_builder import (
+    _pokemon_numeric_into as _write_pokemon_numeric,
+)
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CATEGORICAL_WIDTH,
@@ -52,8 +54,25 @@ from p0.model.structured_observation import (
 )
 from p0.model.tokenizer import tokenizer
 from p0.runtime.live_event_capture import set_raw_events
+from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import ValidatedTeam
 from p0.teams.stat_points import PrecomputedStats
+
+_OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
+
+
+def from_battle(battle, tok=tokenizer, stat_overrides=None):
+    assert tok is _OBSERVATION_BUILDER.tokenizer
+    return _OBSERVATION_BUILDER.build(battle_view(battle), stat_overrides)
+
+
+def from_battle_into(battle, out, tok=tokenizer, stat_overrides=None):
+    assert tok is _OBSERVATION_BUILDER.tokenizer
+    _OBSERVATION_BUILDER.build_into(battle_view(battle), out, stat_overrides)
+
+
+def _pokemon_numeric_into(pokemon, battle, *args, **kwargs):
+    return _write_pokemon_numeric(pokemon, battle_view(battle), *args, **kwargs)
 
 
 def make_real_pokemon(
@@ -236,8 +255,7 @@ Modest Nature
     return ValidatedTeam.from_showdown(team).packed
 
 
-def test_pokemon_categorical_real():
-    """Verify that categorical rows are written correctly."""
+def test_pokemon_categorical_and_numeric_rows_real():
     # None Pokemon returns 24 zeros
     empty_cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
     _pokemon_categorical_into(None, tokenizer, _iter_move_slots(None), empty_cat)
@@ -290,10 +308,6 @@ def test_pokemon_categorical_real():
     assert cat[17] == tokenizer.status_id(Status.BRN)
 
     assert not cat[18:24].any()
-
-
-def test_pokemon_numeric_real():
-    """Verify that numerical rows are written correctly."""
     battle = make_real_battle()
 
     # None Pokemon returns mostly zeros except for condition flag (e.g. cond=1 -> row[2] = 1.0)
@@ -404,8 +418,7 @@ def test_pokemon_numeric_real():
     assert row_last_move[32] == 1.0  # First move slot matched last_move
 
 
-def test_get_ordered_pokemon_real():
-    """Verify that _get_ordered_pokemon correctly sequences active, switches, fainted, and drops using real Pokemon."""
+def test_ordered_pokemon_and_slot_conditions_real():
     p1 = make_real_pokemon(species="aerodactyl")
     p2 = make_real_pokemon(species="archaludon")
     p3 = make_real_pokemon(species="azumarill")
@@ -517,10 +530,6 @@ def test_get_ordered_pokemon_real():
     ordered_opp_le = _get_ordered_pokemon(battle_opp_left_empty, is_opponent=True)
     assert ordered_opp_le[0] == (None, -1, None)
     assert ordered_opp_le[1][0] == p2
-
-
-def test_slot_condition_real():
-    """Verify condition values assigned based on slot index, fainted, switches, or opponent using real Pokemon."""
     p1 = make_real_pokemon(species="aerodactyl")
     p_fainted = make_real_pokemon(species="camerupt", status=Status.FNT)
 
@@ -545,8 +554,7 @@ def test_slot_condition_real():
     assert _slot_condition(battle_sw, p2, 3, is_opponent=False) == -1
 
 
-def test_global_field_token_real():
-    """Verify that weather and Trick Room durations scale correctly in global fields using real battles."""
+def test_global_and_side_field_tokens_include_mega_availability():
     battle = make_real_battle(turn=3)
 
     # Rain duration: Rain started at turn 1. Duration = 5. Left: max(0, 5 - (3 - 1)) / 5 = 3 / 5 = 0.6
@@ -564,10 +572,6 @@ def test_global_field_token_real():
     assert not cat[:2].any()
     assert num[2] == 0.0  # teampreview
     assert num[3] == 3.0 / 24.0  # turn scaling
-
-
-def test_side_token_real():
-    """Verify side condition turns and fainted counts mapping using real battles."""
     battle = make_real_battle(turn=4)
     conditions = {
         SideCondition.TAILWIND: 2,  # duration=4. Left: max(0, 4 - (4 - 2)) / 4 = 2 / 4 = 0.5
@@ -604,9 +608,6 @@ def test_side_token_real():
         num=num_used,
     )
     assert num_used[4] == 0.0
-
-
-def test_side_mega_available_uses_selection_and_usage():
     mega = make_real_pokemon(species="charizard", item="charizarditey")
     regular = make_real_pokemon(species="dragonite", item="choicescarf")
     unused_mega = make_real_pokemon(species="aerodactyl", item="aerodactylite")
@@ -718,7 +719,7 @@ def test_events_join_to_current_slots_after_switch_and_are_consumed():
     assert torch.count_nonzero(next_obs.events_num) == 0
 
 
-def test_from_battle_into_overwrites_dirty_output():
+def test_from_battle_into_overwrites_and_validates_output_buffer():
     ally = make_real_pokemon(
         species="charizard",
         moves={"airslash": 10, "protect": 8},
@@ -778,9 +779,6 @@ def test_from_battle_into_overwrites_dirty_output():
     )
     assert torch.count_nonzero(out.categorical[0]) == 0
     assert torch.count_nonzero(out.numerical[0]) == 0
-
-
-def test_from_battle_into_validates_output_shape_and_dtype():
     battle = make_real_battle()
     invalid = StructuredObservation.empty_batch(1)[0]
     invalid.numerical = invalid.numerical.to(torch.float64)
@@ -789,7 +787,7 @@ def test_from_battle_into_validates_output_shape_and_dtype():
         from_battle_into(battle, invalid)
 
 
-def test_stat_resolution_distinguishes_imputed_and_unknown_without_fabrication():
+def test_stat_resolution_provenance_and_cache_behavior():
     pokemon = make_real_pokemon(species="charizard")
     pokemon._nature = None
     values, provenance = _get_pokemon_level_stats(pokemon, True, None)
@@ -800,9 +798,6 @@ def test_stat_resolution_distinguishes_imputed_and_unknown_without_fabrication()
     values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
     assert values == tuple(float(value) for value in expected.values)
     assert provenance == Provenance.IMPUTED
-
-
-def test_battle_stat_cache_avoids_rebuilding_static_imputation():
     pokemon = make_real_pokemon(
         species="charizard",
         moves={"heatwave": 10, "solarbeam": 10, "protect": 10, "weatherball": 10},
@@ -815,19 +810,35 @@ def test_battle_stat_cache_avoids_rebuilding_static_imputation():
     assert len(cache) == 1
 
 
-def test_sim_env_embed_battle_writes_configured_target():
+def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
     battle = make_real_battle()
+    from p0.runtime import poke_env_battle_adapter
+
+    original_decision_view = poke_env_battle_adapter.decision_view
+    decision_builds = 0
+
+    def counted_decision_view(current_battle):
+        nonlocal decision_builds
+        decision_builds += 1
+        return original_decision_view(current_battle)
+
+    monkeypatch.setattr(poke_env_battle_adapter, "decision_view", counted_decision_view)
     env = SimEnv.__new__(SimEnv)
     cast(Any, env).agent1 = SimpleNamespace(username=battle.player_username)
     cast(Any, env).agent2 = SimpleNamespace(username="other-player")
+    env._observation_builder = _OBSERVATION_BUILDER
+    env._battle_view_factory = battle_view
     out1 = StructuredObservation.empty_batch(1)[0]
     out2 = StructuredObservation.empty_batch(1)[0]
     env.set_observation_targets(out1, out2)
 
     result = env.embed_battle(battle)
+    mask = env.get_action_mask(battle)
 
     assert result is out1
     assert result.token_type_ids[0] == TokenType.CLS
+    assert len(mask) == FORMAT.action_size * 2
+    assert decision_builds == 1
 
 
 @pytest.mark.integration

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from p0.battle.events import EventTypeId, ProtocolEventParser, RawBattleEvent
+from p0.battle.events import EventTypeId, RawBattleEvent, parse_events
 from p0.model.observation_builder import _write_effects
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
@@ -50,7 +50,7 @@ def test_overflow_contract_rejects_unmarked_truncation():
 
 
 def test_event_parser_preserves_identity_target_and_evidence():
-    events = ProtocolEventParser.parse_events(
+    events = parse_events(
         [
             RawBattleEvent(
                 ("", "move", "p1a: Mew", "Metronome", "p2a: Gengar", "[from] ability: Dancer")

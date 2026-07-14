@@ -32,7 +32,7 @@ from p0.battle.actions import (
 from p0.model.cls_reducer import CLSReducer
 from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
-from p0.model.resources import RuntimeResources, default_runtime_resources
+from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
     ALLY_NUM_TOKENS,
     ALLY_POKE_TOKENS,
@@ -131,7 +131,7 @@ class ActorPolicy(nn.Module):
         side_emb: nn.Embedding,
         seq_len: int = SEQUENCE_LENGTH,
         history_tokens: int = 8,
-        dim_feedforward: int | None = None,
+        dim_feedforward: int = 2048,
     ):
         super().__init__()
         self.act_size = act_size
@@ -456,28 +456,15 @@ class PolicyNet(nn.Module):
 
     def __init__(
         self,
-        obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH),
-        act_size=ACT_SIZE,
-        d_model=512,
-        nhead=8,
-        nlayer=5,
-        *,
-        config: ModelConfig | None = None,
-        resources: RuntimeResources | None = None,
+        config: ModelConfig,
+        resources: RuntimeResources,
     ):
         super().__init__()
-        if config is None:
-            config = ModelConfig(
-                d_model=d_model,
-                nhead=nhead,
-                reducer_layers=nlayer,
-                history_tokens=8,
-                dim_feedforward=d_model * 4,
-            )
         self.config = config
-        self.resources = resources or default_runtime_resources()
-        self.seq_len, self.feat_dim = obs_dim
-        self.act_size = act_size
+        self.resources = resources
+        self.seq_len = SEQUENCE_LENGTH
+        self.feat_dim = NUMERICAL_WIDTH
+        self.act_size = ACT_SIZE
         self.d_model = config.d_model
 
         # shared backbone + policy head
@@ -491,7 +478,7 @@ class PolicyNet(nn.Module):
             config.d_model,
             config.nhead,
             config.reducer_layers,
-            act_size,
+            ACT_SIZE,
             self.encoder.side_emb,
             self.seq_len + 1 + EVENT_COUNT,  # +1 for action mask embedding, rest for event tokens
             history_tokens=config.history_tokens,

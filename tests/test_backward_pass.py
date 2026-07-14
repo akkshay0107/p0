@@ -2,7 +2,9 @@ import pytest
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.policy import PolicyNet
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CAT_KNOWNNESS_START,
@@ -131,7 +133,7 @@ def dummy_obs():
 def test_gradient_flow(dummy_obs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # smaller model for faster testing
-    policy = PolicyNet(d_model=64, nhead=2, nlayer=1).to(device)
+    policy = build_policy(ModelConfig(64, 2, 1, 8, 256), default_runtime_resources()).to(device)
     policy.train()
 
     obs = dummy_obs.to(device)
@@ -242,7 +244,7 @@ def test_gradient_flow(dummy_obs):
 
 def test_ppo_warmup(dummy_obs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    policy = PolicyNet(d_model=64, nhead=2, nlayer=1).to(device)
+    policy = build_policy(ModelConfig(64, 2, 1, 8, 256), default_runtime_resources()).to(device)
     policy.train()
 
     episode = TrajectoryBatch(
@@ -259,7 +261,9 @@ def test_ppo_warmup(dummy_obs):
     )
     config = TrainingConfig(warmup_episodes=10)
 
-    loss, _, steps = _run_batched_ppo([episode], policy, config, device, episode=0)
+    loss, _, steps = _run_batched_ppo(
+        [episode], policy, config, device, episode=0, entropy_coef=config.entropy_coef
+    )
     assert steps == 1
 
     policy.zero_grad(set_to_none=True)

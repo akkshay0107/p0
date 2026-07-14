@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,14 +21,13 @@ class ModelConfig:
     series_context_enabled: bool = False
 
     def __post_init__(self) -> None:
-        for name in (
-            "d_model",
-            "nhead",
-            "reducer_layers",
-            "history_tokens",
-            "dim_feedforward",
+        for name, value in (
+            ("d_model", self.d_model),
+            ("nhead", self.nhead),
+            ("reducer_layers", self.reducer_layers),
+            ("history_tokens", self.history_tokens),
+            ("dim_feedforward", self.dim_feedforward),
         ):
-            value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"ModelConfig.{name} must be a positive integer")
         if self.d_model % self.nhead:
@@ -74,13 +72,3 @@ class ModelConfig:
         if unknown or missing:
             raise ValueError(f"Invalid ModelConfig fields: missing={missing}, unknown={unknown}")
         return cls(**value)  # type: ignore[arg-type]
-
-    @classmethod
-    def from_legacy_policy(cls, policy: Any) -> ModelConfig:
-        return cls(
-            d_model=int(policy.d_model),
-            nhead=int(policy.actor.reducer.encoder.layers[0].nhead),
-            reducer_layers=len(policy.actor.reducer.encoder.layers),
-            history_tokens=int(policy.actor.reducer.n_hg),
-            dim_feedforward=int(policy.d_model) * 4,
-        )

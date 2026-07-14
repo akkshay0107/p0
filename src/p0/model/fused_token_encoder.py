@@ -6,7 +6,7 @@ import torch.nn.init as init
 
 from p0.battle.events import EVENT_TYPE_COUNT
 from p0.format_config import FORMAT
-from p0.model.resources import RuntimeResources, default_runtime_resources
+from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
     ALLY_NUM_TOKENS,
     CAT_EFFECT_START,
@@ -53,8 +53,7 @@ _NUMERIC_POS = tuple(range(2, 25, 2))  # (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22
 _FIELD_NUMERIC_POS = (26, 28, 30)
 
 
-def _load_vocab_sizes(resources: RuntimeResources | None = None) -> dict[str, int]:
-    resources = resources or default_runtime_resources()
+def _load_vocab_sizes(resources: RuntimeResources) -> dict[str, int]:
     return {name: len(values) + 1 for name, values in resources.vocab.items()}
 
 
@@ -88,8 +87,7 @@ _TARGET_CLASS_ALIASES = {
 MOVE_STATIC_WIDTH = 7 + len(_TARGET_CLASSES)
 
 
-def _load_species_statics(resources: RuntimeResources | None = None) -> torch.Tensor:
-    resources = resources or default_runtime_resources()
+def _load_species_statics(resources: RuntimeResources) -> torch.Tensor:
     species_vocab = resources.vocab["species"]
     dex_species = {entry["id"]: entry for entry in resources.dex["species"]}
 
@@ -109,8 +107,7 @@ def _load_species_statics(resources: RuntimeResources | None = None) -> torch.Te
     return table
 
 
-def _load_move_statics(resources: RuntimeResources | None = None) -> torch.Tensor:
-    resources = resources or default_runtime_resources()
+def _load_move_statics(resources: RuntimeResources) -> torch.Tensor:
     """Static per-move scalars indexed by vocab move id (row 0 = padding)."""
     moves_vocab = resources.vocab["moves"]
     dex_moves = {entry["id"]: entry for entry in resources.dex["moves"]}
@@ -145,10 +142,9 @@ def _load_move_statics(resources: RuntimeResources | None = None) -> torch.Tenso
 
 
 def _load_mechanic_tag_tables(
-    resources: RuntimeResources | None = None,
+    resources: RuntimeResources,
 ) -> dict[str, torch.Tensor]:
     """Load audited item and ability hook tables in one data-file pass."""
-    resources = resources or default_runtime_resources()
     vocab_data = resources.vocab
     dex_data = resources.dex
 
@@ -215,10 +211,10 @@ class FusedTokenEncoder(nn.Module):
         d_model: int,
         nhead: int,
         dim_feedforward: int,
-        resources: RuntimeResources | None = None,
+        resources: RuntimeResources,
     ):
         super().__init__()
-        self.resources = resources or default_runtime_resources()
+        self.resources = resources
         self.d_model = d_model
         d_raw = 128  # lower dim for reduced memory
 

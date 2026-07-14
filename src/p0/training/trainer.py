@@ -29,8 +29,8 @@ def build_reference_batch(collector: RolloutCollector, size: int = 64) -> dict[s
     flat_masks = torch.cat([trajectory.action_masks for trajectory in trajectories], dim=0)
     indices = torch.randperm(flat_masks.size(0))[: min(size, flat_masks.size(0))]
     result = {
-        name: getattr(flat_obs, name)[indices].clone()
-        for name in StructuredObservation._FIELD_NAMES
+        name: tensor[indices].clone()
+        for name, tensor in zip(StructuredObservation._FIELD_NAMES, flat_obs.tensors(), strict=True)
     }
     result["action_masks"] = flat_masks[indices].clone()
     return result
@@ -91,9 +91,7 @@ class PPOTrainer:
                 self.league.maybe_promote(build_reference_batch(self.collector))
                 self.league.save_state()
             metrics = {
-                key: float(value)
-                for key, value in stats.items()
-                if isinstance(value, (int, float))
+                key: float(value) for key, value in stats.items() if isinstance(value, (int, float))
             }
             metrics.update(
                 {

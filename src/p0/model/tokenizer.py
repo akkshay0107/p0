@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 
@@ -156,7 +157,7 @@ class PokemonTokenizer:
         member: object,
         aliases: dict[str, str] | None = None,
     ) -> int:
-        name = getattr(member, "name", str(member))
+        name = member.name if isinstance(member, Enum) else str(member)
         candidates = []
         if aliases and name in aliases:
             candidates.append(aliases[name])

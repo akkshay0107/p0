@@ -14,10 +14,10 @@ from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.weather import Weather
 
-from p0.battle.events import BattleEvent, EventTypeId, ProtocolEventParser
-from p0.env import MegaEnv
+from p0.battle.events import BattleEvent, EventTypeId, truncate_events
 from p0.format_config import current_manifest, validate_artifact_runtime_contract
-from p0.model.observation_builder import from_battle
+from p0.model.observation_builder import ObservationBuilder
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
@@ -30,6 +30,8 @@ from p0.model.structured_observation import (
     SideId,
     TokenType,
 )
+from p0.runtime.poke_env_action_adapter import action_to_order, action_to_single_order
+from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.stat_points import BaseStats, StatPoints, calculate_stats
 
 
@@ -51,21 +53,21 @@ def _action_battle() -> Any:
 
 def test_all_49_individual_action_ids_retain_their_meaning() -> None:
     battle = _action_battle()
-    assert "pass" in str(MegaEnv._action_to_order_individual(np.int64(0), battle, True, 0))
+    assert "pass" in str(action_to_single_order(0, battle, True, 0))
     for action in range(1, 7):
-        order = MegaEnv._action_to_order_individual(np.int64(action), battle, True, 0)
+        order = action_to_single_order(action, battle, True, 0)
         assert "switch" in str(order)
         assert order.order is list(battle.team.values())[action - 1]
 
     moves = list(battle.active_pokemon[0].moves.values())
     for action in range(7, 47):
-        order = MegaEnv._action_to_order_individual(np.int64(action), battle, True, 0)
+        order = action_to_single_order(action, battle, True, 0)
         assert order.order is moves[(action - 7) % 20 // 5]
         assert order.move_target == (action - 7) % 5 - 2
         assert bool(order.mega) is (action >= 27)
 
     for action, mega in ((47, True), (48, False)):
-        order = MegaEnv._action_to_order_individual(np.int64(action), battle, True, 0)
+        order = action_to_single_order(action, battle, True, 0)
         assert cast(Any, order.order).id == "struggle"
         assert bool(order.mega) is mega
 
@@ -73,7 +75,7 @@ def test_all_49_individual_action_ids_retain_their_meaning() -> None:
 def test_team_preview_pair_encoding_preserves_four_unique_members() -> None:
     battle = _action_battle()
     battle.teampreview = True
-    order = MegaEnv.action_to_order(np.array([1, 8], dtype=np.int64), battle)
+    order = action_to_order(np.array([1, 8], dtype=np.int64), battle)
     assert order.message == "/team 123456"
     selected = order.message.removeprefix("/team ")
     assert len(selected[:4]) == len(set(selected[:4])) == 4
@@ -100,7 +102,8 @@ def _golden_battle() -> DoubleBattle:
 
 
 def test_golden_observation_shape_indices_and_enum_ids() -> None:
-    observation = from_battle(_golden_battle())
+    battle = _golden_battle()
+    observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
     assert observation.token_type_ids.shape == (SEQUENCE_LENGTH,)
     assert observation.side_ids.shape == (SEQUENCE_LENGTH,)
     assert observation.slot_ids.shape == (SEQUENCE_LENGTH,)
@@ -130,7 +133,7 @@ def test_golden_observation_shape_indices_and_enum_ids() -> None:
 def test_event_priority_order_and_overflow_are_stable() -> None:
     events = [BattleEvent(EventTypeId.DAMAGE, "p1a: Charizard", order=i) for i in range(65)]
     events.append(BattleEvent(EventTypeId.MOVE, "p2a: Venusaur", order=65))
-    selected = ProtocolEventParser.truncate_events(events, limit=EVENT_COUNT)
+    selected = truncate_events(events, limit=EVENT_COUNT)
     assert len(selected) == EVENT_COUNT
     assert [event.order for event in selected] == [*range(63), 65]
     assert selected[-1].event_type == EventTypeId.MOVE

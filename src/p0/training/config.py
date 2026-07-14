@@ -12,31 +12,28 @@ from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS, ProjectPaths
 
 
-def _positive_ints(config: Any, *names: str) -> None:
-    for name in names:
-        value = getattr(config, name)
+def _positive_ints(owner: str, *values: tuple[str, object]) -> None:
+    for name, value in values:
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError(f"{config.__class__.__name__}.{name} must be a positive integer")
+            raise ValueError(f"{owner}.{name} must be a positive integer")
 
 
-def _positive(config: Any, *names: str) -> None:
-    for name in names:
-        value = getattr(config, name)
+def _positive(owner: str, *values: tuple[str, float]) -> None:
+    for name, value in values:
         if value <= 0:
-            raise ValueError(f"{config.__class__.__name__}.{name} must be greater than zero")
+            raise ValueError(f"{owner}.{name} must be greater than zero")
 
 
-def _non_negative(config: Any, *names: str) -> None:
-    for name in names:
-        if getattr(config, name) < 0:
-            raise ValueError(f"{config.__class__.__name__}.{name} must not be negative")
+def _non_negative(owner: str, *values: tuple[str, float]) -> None:
+    for name, value in values:
+        if value < 0:
+            raise ValueError(f"{owner}.{name} must not be negative")
 
 
-def _unit_interval(config: Any, *names: str) -> None:
-    for name in names:
-        value = getattr(config, name)
+def _unit_interval(owner: str, *values: tuple[str, float]) -> None:
+    for name, value in values:
         if not 0 <= value <= 1:
-            raise ValueError(f"{config.__class__.__name__}.{name} must be between 0 and 1")
+            raise ValueError(f"{owner}.{name} must be between 0 and 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,20 +64,39 @@ class TrainingConfig:
 
     def __post_init__(self) -> None:
         _positive_ints(
-            self,
-            "num_episodes",
-            "n_envs",
-            "n_pool_opponents",
-            "rollout_steps",
-            "batch_size",
-            "chunk_size",
-            "ppo_epochs",
+            type(self).__name__,
+            ("num_episodes", self.num_episodes),
+            ("n_envs", self.n_envs),
+            ("n_pool_opponents", self.n_pool_opponents),
+            ("rollout_steps", self.rollout_steps),
+            ("batch_size", self.batch_size),
+            ("chunk_size", self.chunk_size),
+            ("ppo_epochs", self.ppo_epochs),
         )
         if not 0 <= self.n_self_envs <= self.n_envs:
             raise ValueError("training.n_self_envs must be between 0 and training.n_envs")
-        _unit_interval(self, "gamma", "gae_lambda", "ramp_up_phase", "ramp_down_phase")
-        _non_negative(self, "clip_low", "clip_high", "value_coef", "entropy_coef", "target_kl")
-        _positive(self, "lr", "max_grad_norm", "teampreview_loss_mult", "teampreview_entropy_mult")
+        _unit_interval(
+            type(self).__name__,
+            ("gamma", self.gamma),
+            ("gae_lambda", self.gae_lambda),
+            ("ramp_up_phase", self.ramp_up_phase),
+            ("ramp_down_phase", self.ramp_down_phase),
+        )
+        _non_negative(
+            type(self).__name__,
+            ("clip_low", self.clip_low),
+            ("clip_high", self.clip_high),
+            ("value_coef", self.value_coef),
+            ("entropy_coef", self.entropy_coef),
+            ("target_kl", self.target_kl),
+        )
+        _positive(
+            type(self).__name__,
+            ("lr", self.lr),
+            ("max_grad_norm", self.max_grad_norm),
+            ("teampreview_loss_mult", self.teampreview_loss_mult),
+            ("teampreview_entropy_mult", self.teampreview_entropy_mult),
+        )
         if not 0 <= self.warmup_episodes <= self.num_episodes:
             raise ValueError("training.warmup_episodes must be between 0 and training.num_episodes")
         if self.ramp_up_phase + self.ramp_down_phase > 1:
@@ -100,14 +116,23 @@ class PoolConfig:
     pool_explore_coef: float = 0.3
 
     def __post_init__(self) -> None:
-        _positive_ints(self, "pool_size", "snapshot_interval", "pool_anchor_every")
-        _non_negative(self, "pool_anchor_min_games", "pool_explore_coef")
+        _positive_ints(
+            type(self).__name__,
+            ("pool_size", self.pool_size),
+            ("snapshot_interval", self.snapshot_interval),
+            ("pool_anchor_every", self.pool_anchor_every),
+        )
+        _non_negative(
+            type(self).__name__,
+            ("pool_anchor_min_games", self.pool_anchor_min_games),
+            ("pool_explore_coef", self.pool_explore_coef),
+        )
         _unit_interval(
-            self,
-            "pool_win_rate_smoothing",
-            "pool_wr_floor",
-            "pool_anchor_drop_wr",
-            "pool_anchor_min_wr",
+            type(self).__name__,
+            ("pool_win_rate_smoothing", self.pool_win_rate_smoothing),
+            ("pool_wr_floor", self.pool_wr_floor),
+            ("pool_anchor_drop_wr", self.pool_anchor_drop_wr),
+            ("pool_anchor_min_wr", self.pool_anchor_min_wr),
         )
         if self.pool_anchor_drop_wr > self.pool_anchor_min_wr:
             raise ValueError("pool.pool_anchor_drop_wr must not exceed pool.pool_anchor_min_wr")
@@ -115,15 +140,11 @@ class PoolConfig:
 
 @dataclass(frozen=True, slots=True)
 class TeamSourceConfig:
-    kind: str = "file_pool"
-    pool: str = "all"
-    path: Path | None = None
+    path: Path = Path("all")
 
     def __post_init__(self) -> None:
-        if self.kind not in {"file_pool", "corpus"}:
-            raise ValueError("TeamSourceConfig.kind must be 'file_pool' or future 'corpus'")
-        if not self.pool.strip():
-            raise ValueError("TeamSourceConfig.pool must not be empty")
+        if not str(self.path).strip():
+            raise ValueError("TeamSourceConfig.path must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,19 +226,11 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
         config.environment,
         agent_team_source=replace(
             config.environment.agent_team_source,
-            path=(
-                None
-                if config.environment.agent_team_source.path is None
-                else _resolve_path(config.environment.agent_team_source.path, repository_root)
-            ),
+            path=_resolve_path(config.environment.agent_team_source.path, paths.teams_root),
         ),
         opponent_team_source=replace(
             config.environment.opponent_team_source,
-            path=(
-                None
-                if config.environment.opponent_team_source.path is None
-                else _resolve_path(config.environment.opponent_team_source.path, repository_root)
-            ),
+            path=_resolve_path(config.environment.opponent_team_source.path, paths.teams_root),
         ),
     )
     return replace(config, paths=paths, bot=bot, environment=environment)

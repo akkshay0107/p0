@@ -14,8 +14,7 @@ RUNTIME_MANIFEST_SCHEMA = 2
 TENSOR_ABI = "champions-observation-event-v2"
 RESOURCE_FEATURE_ABI = "champions-dex-features-v1"
 
-# This is deliberately data, not a hash of the ActionCodec implementation. A reviewer can
-# understand every persisted action ID without inspecting Python bytecode or class layouts.
+# This is deliberately data, not a hash of the action-encoding implementation.
 ACTION_CONTRACT: dict[str, Any] = {
     "joint_width": 2,
     "action_count": 49,
@@ -285,7 +284,7 @@ def load_active_runtime_manifest(
             f"resource_feature_abi={manifest.resource_feature_abi!r}, code={RESOURCE_FEATURE_ABI!r}"
         )
     if manifest.action != ACTION_CONTRACT:
-        mismatches.append("action contract differs from the compiled ActionCodec contract")
+        mismatches.append("action contract differs from the compiled action-encoding contract")
     vocab_path = path.with_name("vocab.json")
     actual_vocab = sha256_json_file(vocab_path)
     if manifest.vocabulary_sha256 != actual_vocab:

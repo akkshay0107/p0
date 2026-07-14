@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Mapping
-from pathlib import Path
 
 import torch.optim as optim
 from poke_env import AccountConfiguration
@@ -13,7 +12,8 @@ from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from p0.env import SimEnv
-from p0.model.factory import PolicyFactory
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.runtime.composition import build_sim_env
@@ -29,10 +29,8 @@ from p0.training.utils import PPOScheduler, adamw_param_groups, default_device
 from p0.training.vector_env import ThreadVecEnv
 
 
-def _team_source(config: TeamSourceConfig, teams_root: Path) -> FileTeamSource:
-    if config.kind != "file_pool":
-        raise ValueError(f"Unsupported team source kind: {config.kind}")
-    return FileTeamSource(config.path or teams_root / config.pool)
+def _team_source(config: TeamSourceConfig) -> FileTeamSource:
+    return FileTeamSource(config.path)
 
 
 def _tensorboard_sink(writer: SummaryWriter):
@@ -72,7 +70,7 @@ def run_training(
     policy = (
         policy_store.load_policy(paths.checkpoint_path, device)
         if paths.checkpoint_path.exists()
-        else PolicyFactory(resources).create().to(device)
+        else build_policy(ModelConfig.baseline(), resources).to(device)
     )
     optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
     scaler = GradScaler(
@@ -81,10 +79,8 @@ def run_training(
     start = policy_store.load_training_state(
         paths.checkpoint_path, policy, optimizer=optimizer, scaler=scaler
     )
-    # Legacy checkpoints store the next zero-based episode to run.
-    start_episode = 0 if start is None else start
-    agent_source = _team_source(config.environment.agent_team_source, paths.teams_root)
-    opponent_source = _team_source(config.environment.opponent_team_source, paths.teams_root)
+    agent_source = _team_source(config.environment.agent_team_source)
+    opponent_source = _team_source(config.environment.opponent_team_source)
 
     with start_showdown_servers(
         training.n_envs,
@@ -135,7 +131,7 @@ def run_training(
                 metric_sink=_tensorboard_sink(writer),
                 cancel_requested=cancel_requested,
             )
-            trainer.run(start_episode)
+            trainer.run(start)
         finally:
             if writer is not None:
                 writer.close()

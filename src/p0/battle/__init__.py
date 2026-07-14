@@ -1,14 +1,16 @@
 """Pure battle-domain values and transformations."""
 
-from p0.battle.actions import ACT_SIZE, ActionCodec, ActionKind, SlotAction
-from p0.battle.legality import DecisionView, LegalActionBuilder, SlotDecision
+from p0.battle.actions import ACT_SIZE, ActionKind, SlotAction, decode_action, encode_action
+from p0.battle.legality import DecisionView, SlotDecision, action_mask, legal_actions
 
 __all__ = [
     "ACT_SIZE",
-    "ActionCodec",
     "ActionKind",
     "DecisionView",
-    "LegalActionBuilder",
     "SlotAction",
     "SlotDecision",
+    "action_mask",
+    "decode_action",
+    "encode_action",
+    "legal_actions",
 ]

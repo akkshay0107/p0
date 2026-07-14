@@ -13,14 +13,16 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration, ServerC
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 
-from p0.battle.legality import LegalActionBuilder
+from p0.battle.legality import action_mask
 from p0.format_config import FORMAT
-from p0.model.factory import PolicyFactory
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
+from p0.model.resources import default_runtime_resources
 from p0.runtime import poke_env_patches
-from p0.runtime.poke_env_action_adapter import PokeEnvOrderAdapter
-from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
+from p0.runtime.poke_env_action_adapter import action_to_order
+from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import FileTeamSource, TeamSource
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import load_config
@@ -36,16 +38,13 @@ class RLPlayer(Player):
         policy: PolicyNet,
         top_p: float = 0.9,
         *args,
-        observation_builder: ObservationBuilder | None = None,
-        battle_adapter: type[PokeEnvBattleAdapter] = PokeEnvBattleAdapter,
-        legality_builder: type[LegalActionBuilder] = LegalActionBuilder,
-        order_adapter: type[PokeEnvOrderAdapter] = PokeEnvOrderAdapter,
+        observation_builder: ObservationBuilder,
+        team_rng: random.Random,
         team_source: TeamSource | None = None,
-        team_rng: random.Random | None = None,
         **kwargs,
     ):
         self.team_source = team_source
-        self.team_rng = team_rng or random.Random()
+        self.team_rng = team_rng
         if team_source is not None:
             if "team" in kwargs:
                 raise ValueError("Pass either team or team_source, not both")
@@ -53,12 +52,7 @@ class RLPlayer(Player):
         super().__init__(*args, **kwargs)
         poke_env_patches.install(self.logger)
         self.policy = policy
-        self.observation_builder = observation_builder or ObservationBuilder(
-            resources=policy.resources
-        )
-        self.battle_adapter = battle_adapter
-        self.legality_builder = legality_builder
-        self.order_adapter = order_adapter
+        self.observation_builder = observation_builder
 
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
@@ -70,16 +64,16 @@ class RLPlayer(Player):
             self.state = self.policy.initial_state(1)
 
         assert isinstance(battle, DoubleBattle)
-        view = self.battle_adapter.view(battle)
+        view = battle_view(battle)
         obs = self.observation_builder.build(view)
-        action_mask = torch.from_numpy(self.legality_builder.mask(view.decision))
+        mask = torch.from_numpy(action_mask(view.decision))
 
         obs = obs.unsqueeze(0).to(self.policy.device)
-        action_mask = action_mask.unsqueeze(0).to(self.policy.device)
+        mask = mask.unsqueeze(0).to(self.policy.device)
         with torch.no_grad():
             out = self.policy.act_obs(
                 obs,
-                action_mask,
+                mask,
                 self.state,
                 top_p=self.top_p,
             )
@@ -90,18 +84,18 @@ class RLPlayer(Player):
         assert isinstance(battle, DoubleBattle)
         if battle._wait:
             return DefaultBattleOrder()
-        return self.order_adapter.action_to_order(self._get_action(battle), battle)
+        return action_to_order(self._get_action(battle), battle)
 
     def get_observation(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
-        return self.observation_builder.build(self.battle_adapter.view(battle))
+        return self.observation_builder.build(battle_view(battle))
 
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
         # Reset state at the beginning of each battle's Team Preview
         self.state = None
         action = self._get_action(battle)
-        order = self.order_adapter.action_to_order(action, battle)
+        order = action_to_order(action, battle)
         return order.message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
@@ -196,7 +190,8 @@ def _load_policy(
         if not allow_random_init:
             raise ValueError("A checkpoint is required unless random init is explicitly allowed.")
         LOGGER.warning("Starting bot with randomly initialized policy weights.")
-        policy = PolicyFactory().create().to(device)
+        resources = default_runtime_resources()
+        policy = build_policy(ModelConfig.baseline(), resources).to(device)
         policy.eval()
         return policy
 
@@ -206,9 +201,9 @@ def _load_policy(
     policy = policy_store.load_policy(checkpoint_path, device)
     episode = policy_store.load_training_state(checkpoint_path, policy)
     LOGGER.info(
-        "Loaded checkpoint from %s%s",
+        "Loaded checkpoint from %s (episode %d)",
         checkpoint_path,
-        f" (episode {episode})" if episode is not None else "",
+        episode,
     )
     LOGGER.info("Running inference on device: %s", device)
     policy.eval()
@@ -291,7 +286,9 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     parser.add_argument(
         "--team-pool",
         choices=("all", "reduced"),
-        default=os.getenv("SHOWDOWN_TEAM_POOL", app_defaults.environment.agent_team_source.pool),
+        default=os.getenv(
+            "SHOWDOWN_TEAM_POOL", str(app_defaults.environment.agent_team_source.path)
+        ),
         help="Named team pool under the teams directory.",
     )
     parser.add_argument(
@@ -375,7 +372,7 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
 
 def _configure_logging(level: str) -> None:
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
+        level=logging.getLevelNamesMapping().get(level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
@@ -405,6 +402,8 @@ async def run_bot(
     bot_player = RLPlayer(
         policy=policy,
         top_p=config.top_p,
+        observation_builder=ObservationBuilder(policy.resources),
+        team_rng=random.Random(),
         account_configuration=account_configuration,
         battle_format=config.battle_format,
         server_configuration=server_configuration,

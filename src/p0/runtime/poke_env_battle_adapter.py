@@ -6,7 +6,7 @@ from weakref import WeakKeyDictionary
 
 from poke_env.battle import DoubleBattle
 
-from p0.battle.events import ProtocolEventParser
+from p0.battle.events import parse_events
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.model.tokenizer import tokenizer
 from p0.runtime.live_event_capture import consume_raw_events, last_move
@@ -110,80 +110,83 @@ class PokeEnvBattleView:
     @property
     def decision(self) -> DecisionView:
         if self._decision is None:
-            self._decision = PokeEnvBattleAdapter.decision_view(self._battle)
+            self._decision = decision_view(self._battle)
         return self._decision
 
     def get_pokemon(self, identifier: str):
         return self._battle.get_pokemon(identifier)
 
     def consume_events(self):
-        return ProtocolEventParser.parse_events(consume_raw_events(self._battle), tokenizer)
+        return parse_events(consume_raw_events(self._battle), tokenizer)
 
     def last_move(self, pokemon):
         return last_move(pokemon)
 
 
-class PokeEnvBattleAdapter:
-    _views: WeakKeyDictionary[DoubleBattle, PokeEnvBattleView] = WeakKeyDictionary()
+_VIEWS: WeakKeyDictionary[DoubleBattle, PokeEnvBattleView] = WeakKeyDictionary()
 
-    @classmethod
-    def view(cls, battle: DoubleBattle) -> PokeEnvBattleView:
-        view = cls._views.get(battle)
-        if view is None:
-            view = PokeEnvBattleView(battle)
-            cls._views[battle] = view
-        return view.refresh()
 
-    @classmethod
-    def current_view(cls, battle: DoubleBattle) -> PokeEnvBattleView:
-        """Return the decision's existing view, creating it only when necessary."""
-        view = cls._views.get(battle)
-        if view is None:
-            view = PokeEnvBattleView(battle)
-            cls._views[battle] = view
-        return view
+def battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
+    view = current_battle_view(battle)
+    return view.refresh()
 
-    @staticmethod
-    def decision_view(battle: DoubleBattle) -> DecisionView:
-        slots: list[SlotDecision] = []
-        for position in (0, 1):
-            active = battle.active_pokemon[position]
-            available_ids = {move.id for move in battle.available_moves[position]}
-            move_targets = (
-                ()
-                if active is None
-                else tuple(
-                    tuple(battle.get_possible_showdown_targets(move, active))
-                    if move.id in available_ids
-                    else ()
-                    for move in active.moves.values()
-                )
+
+def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
+    """Return the decision's existing view, creating it only when necessary."""
+    view = _VIEWS.get(battle)
+    if view is None:
+        view = PokeEnvBattleView(battle)
+        _VIEWS[battle] = view
+    return view
+
+
+def decision_view(battle: DoubleBattle) -> DecisionView:
+    active_pokemon = battle.active_pokemon
+    available_moves = battle.available_moves
+    available_switches = battle.available_switches
+    team = tuple(battle.team.values())
+    trapped = battle.trapped
+    maybe_trapped = battle.maybe_trapped
+    force_switch = battle.force_switch
+    can_mega_evolve = battle.can_mega_evolve
+    slots: list[SlotDecision] = []
+    for position in (0, 1):
+        active = active_pokemon[position]
+        position_moves = available_moves[position]
+        available_ids = {move.id for move in position_moves}
+        move_targets = (
+            ()
+            if active is None
+            else tuple(
+                tuple(battle.get_possible_showdown_targets(move, active))
+                if move.id in available_ids
+                else ()
+                for move in active.moves.values()
             )
-            switches = {pokemon.base_species for pokemon in battle.available_switches[position]}
-            switch_slots = tuple(
-                index
-                for index, pokemon in enumerate(battle.team.values())
-                if pokemon.base_species in switches
-            )
-            forced_move = (
-                not any(move_targets)
-                and len(battle.available_moves[position]) == 1
-                and battle.available_moves[position][0].id in {"struggle", "recharge"}
-            )
-            slots.append(
-                SlotDecision(
-                    switch_slots=switch_slots,
-                    move_targets=move_targets,
-                    active=active is not None and not active.fainted,
-                    trapped=battle.trapped[position] or battle.maybe_trapped[position],
-                    force_switch=battle.force_switch[position],
-                    can_mega=battle.can_mega_evolve[position],
-                    forced_move=forced_move,
-                )
-            )
-        return DecisionView(
-            slots=(slots[0], slots[1]),
-            wait=battle._wait,
-            team_preview=battle.teampreview,
-            team_size=len(battle.team),
         )
+        switches = {pokemon.base_species for pokemon in available_switches[position]}
+        switch_slots = tuple(
+            index for index, pokemon in enumerate(team) if pokemon.base_species in switches
+        )
+        forced_move = (
+            not any(move_targets)
+            and len(position_moves) == 1
+            and position_moves[0].id in {"struggle", "recharge"}
+        )
+        slots.append(
+            SlotDecision(
+                switch_slots=switch_slots,
+                move_targets=move_targets,
+                active=active is not None and not active.fainted,
+                trapped=trapped[position] or maybe_trapped[position],
+                force_switch=force_switch[position],
+                can_mega=can_mega_evolve[position],
+                forced_move=forced_move,
+            )
+        )
+    return DecisionView(
+        slots=(slots[0], slots[1]),
+        wait=battle._wait,
+        team_preview=battle.teampreview,
+        team_size=len(team),
+    )

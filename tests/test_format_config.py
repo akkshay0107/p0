@@ -38,9 +38,7 @@ def test_runtime_manifest_round_trips_one_readable_contract(tmp_path):
     assert restored.tensor_abi == TENSOR_ABI
     assert restored.resource_feature_abi == RESOURCE_FEATURE_ABI
     assert restored.action == ACTION_CONTRACT
-    assert restored.runtime_contract_sha256 == canonical_json_sha256(
-        restored.runtime_contract()
-    )
+    assert restored.runtime_contract_sha256 == canonical_json_sha256(restored.runtime_contract())
 
 
 def test_canonical_hash_ignores_object_order_but_not_required_semantics():
@@ -68,16 +66,13 @@ def test_vocabulary_expansion_breaks_contract_but_dex_change_does_not(tmp_path):
     assert expanded.runtime_contract_sha256 != original.runtime_contract_sha256
 
 
-def test_manifest_rejects_tampered_contract_hash(tmp_path):
+def test_manifest_rejects_tampered_missing_unknown_and_legacy_contracts(tmp_path):
     vocab, dex = _resources(tmp_path)
     value = current_manifest(vocab_path=vocab, dex_path=dex).to_dict()
     value["runtime_contract"]["tensor_abi"] = "changed-without-rehashing"
     with pytest.raises(ValueError, match="does not match"):
         RuntimeManifest.from_dict(value)
 
-
-def test_manifest_rejects_missing_and_unknown_fields(tmp_path):
-    vocab, dex = _resources(tmp_path)
     value = current_manifest(vocab_path=vocab, dex_path=dex).to_dict()
     del value["runtime_contract"]["resource_feature_abi"]
     with pytest.raises(ValueError, match="missing"):
@@ -87,6 +82,11 @@ def test_manifest_rejects_missing_and_unknown_fields(tmp_path):
     value["runtime_contract"]["unplanned"] = True
     with pytest.raises(ValueError, match="unknown"):
         RuntimeManifest.from_dict(value)
+
+    manifest_path = tmp_path / "runtime_manifest.json"
+    _write_manifest(manifest_path, current_manifest(vocab_path=vocab, dex_path=dex))
+    with pytest.raises(ValueError, match="legacy checkpoint"):
+        validate_artifact_runtime_contract({"runtime_manifest_sha256": "0" * 64}, manifest_path)
 
 
 def test_artifact_validation_compares_only_runtime_contract(tmp_path):
@@ -105,22 +105,3 @@ def test_artifact_validation_compares_only_runtime_contract(tmp_path):
     artifact["runtime_contract_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="incompatible"):
         validate_artifact_runtime_contract(artifact, manifest_path)
-
-
-def test_legacy_manifest_reference_fails_cleanly(tmp_path):
-    vocab, dex = _resources(tmp_path)
-    manifest_path = tmp_path / "runtime_manifest.json"
-    _write_manifest(manifest_path, current_manifest(vocab_path=vocab, dex_path=dex))
-    with pytest.raises(ValueError, match="legacy checkpoint"):
-        validate_artifact_runtime_contract(
-            {"runtime_manifest_sha256": "0" * 64}, manifest_path
-        )
-
-
-def test_tokenizer_resolution_distinguishes_none_and_oov():
-    from p0.model.tokenizer import PokemonTokenizer, Resolution
-
-    tokenizer = PokemonTokenizer({"species": {"pikachu": 1}})
-    assert tokenizer.resolve("species", None) == (0, Resolution.KNOWN_NONE)
-    assert tokenizer.resolve("species", "missingno") == (0, Resolution.OOV)
-    assert tokenizer.resolve("species", "pikachu") == (1, Resolution.KNOWN)

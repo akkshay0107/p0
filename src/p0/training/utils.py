@@ -1,11 +1,8 @@
 import math
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-from p0.model.policy import PolicyNet
-from p0.training.checkpoint import DEFAULT_POLICY_STORE
 from p0.training.config import TrainingConfig
 
 
@@ -76,31 +73,3 @@ def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
-
-
-def save_checkpoint(
-    path: Path, episode: int, policy: PolicyNet, optimizer=None, scheduler=None, scaler=None
-):
-    DEFAULT_POLICY_STORE.save_training_state(
-        path,
-        episode,
-        policy,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-    )
-
-
-def policy_from_checkpoint(path: Path, device: torch.device | str) -> PolicyNet:
-    """Construct a policy from its serialized architecture before loading weights."""
-    return DEFAULT_POLICY_STORE.load_policy(path, device)
-
-
-def load_checkpoint(path: Path, policy: PolicyNet, optimizer=None, scheduler=None, scaler=None):
-    return DEFAULT_POLICY_STORE.load_training_state(
-        path,
-        policy,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-    )

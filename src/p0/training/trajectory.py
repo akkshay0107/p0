@@ -64,6 +64,7 @@ class TrajectoryBatch:
         for start in range(0, self.length, chunk_size):
             yield slice(start, min(start + chunk_size, self.length))
 
+
 @dataclass(slots=True)
 class TrajectoryStorage:
     step_counts: torch.Tensor
@@ -87,10 +88,7 @@ class TrajectoryStorage:
             raise ValueError("n_envs and max_steps must be positive")
         flat = StructuredObservation.empty_batch(n_envs * max_steps).to(device)
         observations = StructuredObservation._from_values(
-            [
-                value.reshape(n_envs, max_steps, *value.shape[1:])
-                for value in flat._values()
-            ]
+            [value.reshape(n_envs, max_steps, *value.shape[1:]) for value in flat.tensors()]
         )
         return cls(
             step_counts=torch.zeros(n_envs, dtype=torch.long, device=device),
@@ -114,10 +112,33 @@ class TrajectoryStorage:
                 f"{overflowing.tolist()}"
             )
 
-    def complete(self, env_id: int) -> TrajectoryBatch | None:
+    def record(
+        self,
+        env_ids: torch.Tensor,
+        observations: StructuredObservation,
+        actions: torch.Tensor,
+        log_probs: torch.Tensor,
+        values: torch.Tensor,
+        action_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Store one decision for each selected environment and return its step indices."""
+        self.ensure_capacity(env_ids)
+        steps = self.step_counts[env_ids]
+        for destination, source in zip(
+            self.observations.tensors(), observations.tensors(), strict=True
+        ):
+            destination[env_ids, steps] = source
+        self.actions[env_ids, steps] = actions
+        self.log_probs[env_ids, steps] = log_probs
+        self.values[env_ids, steps] = values
+        self.action_masks[env_ids, steps] = action_masks
+        self.step_counts[env_ids] += 1
+        return steps
+
+    def complete(self, env_id: int) -> TrajectoryBatch:
         length = int(self.step_counts[env_id].item())
         if length == 0:
-            return None
+            raise ValueError(f"Environment {env_id} has no trajectory steps to complete")
         batch = TrajectoryBatch(
             observations=self.observations[env_id, :length].clone(),
             actions=self.actions[env_id, :length].clone(),

@@ -21,7 +21,6 @@ class SwiGLUEncoderLayer(nn.Module):
         *,
         bias: bool = True,
         layer_norm_eps: float = 1e-5,
-        swiglu_hidden: int | None = None,
     ):
         super().__init__()
         if d_model % nhead != 0:
@@ -41,10 +40,8 @@ class SwiGLUEncoderLayer(nn.Module):
 
         # dim ff assumed for a gelu ffn (to live with the old impl that uses default torch transformer)
         # 2/3 correction to approx use same parameters
-        if swiglu_hidden is None:
-            swiglu_hidden = (2 * dim_feedforward) // 3
-            swiglu_hidden = (swiglu_hidden + 7) & ~7  # round up to nearest 8
-            # for p = 2^k, round up using (x + (p-1)) & ~(p-1) if needed to pad longer
+        swiglu_hidden = (2 * dim_feedforward) // 3
+        swiglu_hidden = (swiglu_hidden + 7) & ~7  # round up to nearest 8
 
         self.swiglu_hidden = swiglu_hidden
 
@@ -112,7 +109,6 @@ class SwiGLUTransformerEncoder(nn.Module):
         *,
         bias: bool = True,
         layer_norm_eps: float = 1e-5,
-        swiglu_hidden: int | None = None,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -123,7 +119,6 @@ class SwiGLUTransformerEncoder(nn.Module):
                     dim_feedforward=dim_feedforward,
                     bias=bias,
                     layer_norm_eps=layer_norm_eps,
-                    swiglu_hidden=swiglu_hidden,
                 )
                 for _ in range(num_layers)
             ]

@@ -39,9 +39,7 @@ class RolloutBuffer:
     def reset(self):
         self.trajectories: list[TrajectoryBatch] = []
 
-    def add_episode(self, episode: TrajectoryBatch | None):
-        if episode is None:
-            return
+    def add_episode(self, episode: TrajectoryBatch):
         self.trajectories.append(episode)
 
     def get_batches(self, device: torch.device, config: TrainingConfig):
@@ -80,7 +78,6 @@ def collect_rollouts(
     pool_wins = 0
     pool_total = 0
 
-    step_counts1 = trajectories1.step_counts
     step_counts2 = trajectories2.step_counts
 
     idx_all = torch.arange(n_envs)
@@ -99,8 +96,6 @@ def collect_rollouts(
             active_pool_policies[opponent_id] = pool.load_policy(opponent_id, str(device))
 
     for _ in range(config.rollout_steps):
-        trajectories1.ensure_capacity(idx_all)
-        trajectories2.ensure_capacity(self_idx_cpu)
         obs1_gpu = vec_env.get_batched_obs1(device)
         mask1_gpu = torch.from_numpy(masks1).to(device, non_blocking=True)
         obs2_gpu = vec_env.get_batched_obs2(device)
@@ -154,47 +149,26 @@ def collect_rollouts(
         obs1_cpu = vec_env.obs1_buffers
         obs2_cpu = vec_env.obs2_buffers
 
-        s1 = step_counts1
-        trajectories1.observations.categorical[idx_all, s1] = obs1_cpu.categorical
-        trajectories1.observations.numerical[idx_all, s1] = obs1_cpu.numerical
-        trajectories1.observations.token_type_ids[idx_all, s1] = obs1_cpu.token_type_ids
-        trajectories1.observations.side_ids[idx_all, s1] = obs1_cpu.side_ids
-        trajectories1.observations.slot_ids[idx_all, s1] = obs1_cpu.slot_ids
-        trajectories1.observations.events_cat[idx_all, s1] = obs1_cpu.events_cat
-        trajectories1.observations.events_num[idx_all, s1] = obs1_cpu.events_num
-        trajectories1.observations.events_side_ids[idx_all, s1] = obs1_cpu.events_side_ids
-        trajectories1.observations.events_slot_ids[idx_all, s1] = obs1_cpu.events_slot_ids
-        trajectories1.actions[idx_all, s1] = actions1_cpu
-        trajectories1.log_probs[idx_all, s1] = log_probs1_cpu
-        trajectories1.values[idx_all, s1] = values1_cpu
-        trajectories1.action_masks[idx_all, s1] = torch.from_numpy(masks1).to(torch.bool)
-        step_counts1 += 1
+        s1 = trajectories1.record(
+            idx_all,
+            obs1_cpu,
+            actions1_cpu,
+            log_probs1_cpu,
+            values1_cpu,
+            torch.from_numpy(masks1).to(torch.bool),
+        )
 
         has_self_play = self_idx_cpu.numel() > 0
         s2 = step_counts2[self_idx_cpu]
         if has_self_play:
-            trajectories2.observations.categorical[self_idx_cpu, s2] = obs2_cpu.categorical[self_idx_cpu]
-            trajectories2.observations.numerical[self_idx_cpu, s2] = obs2_cpu.numerical[self_idx_cpu]
-            trajectories2.observations.token_type_ids[self_idx_cpu, s2] = obs2_cpu.token_type_ids[
-                self_idx_cpu
-            ]
-            trajectories2.observations.side_ids[self_idx_cpu, s2] = obs2_cpu.side_ids[self_idx_cpu]
-            trajectories2.observations.slot_ids[self_idx_cpu, s2] = obs2_cpu.slot_ids[self_idx_cpu]
-            trajectories2.observations.events_cat[self_idx_cpu, s2] = obs2_cpu.events_cat[self_idx_cpu]
-            trajectories2.observations.events_num[self_idx_cpu, s2] = obs2_cpu.events_num[self_idx_cpu]
-            trajectories2.observations.events_side_ids[self_idx_cpu, s2] = obs2_cpu.events_side_ids[
-                self_idx_cpu
-            ]
-            trajectories2.observations.events_slot_ids[self_idx_cpu, s2] = obs2_cpu.events_slot_ids[
-                self_idx_cpu
-            ]
-            trajectories2.actions[self_idx_cpu, s2] = actions2_cpu[self_idx_cpu]
-            trajectories2.log_probs[self_idx_cpu, s2] = log_probs2_cpu[self_idx_cpu]
-            trajectories2.values[self_idx_cpu, s2] = values2_cpu[self_idx_cpu]
-            trajectories2.action_masks[self_idx_cpu, s2] = torch.from_numpy(masks2)[
-                self_idx_cpu
-            ].to(torch.bool)
-            step_counts2[self_idx_cpu] += 1
+            s2 = trajectories2.record(
+                self_idx_cpu,
+                obs2_cpu[self_idx_cpu],
+                actions2_cpu[self_idx_cpu],
+                log_probs2_cpu[self_idx_cpu],
+                values2_cpu[self_idx_cpu],
+                torch.from_numpy(masks2)[self_idx_cpu].to(torch.bool),
+            )
 
         env_actions = [
             {

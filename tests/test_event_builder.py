@@ -1,19 +1,22 @@
+import logging
+
+from poke_env.battle import DoubleBattle
+
 from p0.battle.events import (
     BattleEvent,
     EventTypeId,
-    ProtocolEventParser,
     RawBattleEvent,
+    truncate_events,
+)
+from p0.battle.events import (
+    parse_events as parse_protocol_events,
 )
 from p0.model.tokenizer import tokenizer
 from p0.runtime.live_event_capture import consume_raw_events, set_raw_events
 
 
-class MockBattle:
-    pass
-
-
 def parse_events(raw_events: list[RawBattleEvent]) -> list[BattleEvent]:
-    return ProtocolEventParser.parse_events(raw_events, tokenizer)
+    return parse_protocol_events(raw_events, tokenizer)
 
 
 def test_parse_events_returns_typed_events_in_protocol_order():
@@ -65,7 +68,7 @@ def test_truncate_events_keeps_priority_and_original_order():
     events = [BattleEvent(EventTypeId.DAMAGE, "p1a: Pikachu", order=order) for order in range(24)]
     events.append(BattleEvent(EventTypeId.MOVE, "p2a: Charizard", order=24))
 
-    selected = ProtocolEventParser.truncate_events(events)
+    selected = truncate_events(events)
 
     assert len(selected) == 24
     assert [event.order for event in selected] == [*range(23), 24]
@@ -73,7 +76,7 @@ def test_truncate_events_keeps_priority_and_original_order():
 
 
 def test_consume_events_clears_buffer_immediately():
-    battle = MockBattle()
+    battle = DoubleBattle("events", "player", logging.getLogger(__name__), 9)
     set_raw_events(
         battle,
         [RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard"))],

@@ -47,11 +47,9 @@ paths:
   log_path: artifacts/training.log
 environment:
   agent_team_source:
-    kind: file_pool
-    pool: all
+    path: all
   opponent_team_source:
-    kind: file_pool
-    pool: all
+    path: all
 bot:
   username: Bot
   battle_format: gen9championsvgc2026regmb

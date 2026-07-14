@@ -44,9 +44,7 @@ def test_sample_many_builds_roster_from_shadow_anchors_and_regulars(tmp_path, sn
     assert len(sampled) == len(set(sampled))
 
 
-def test_add_regular_evicts_lowest_win_rate_regular_and_keeps_anchors(
-    tmp_path, snapshot_store
-):
+def test_add_regular_evicts_lowest_win_rate_regular_and_keeps_anchors(tmp_path, snapshot_store):
     config = PoolConfig(pool_size=4)
     pool = OpponentPool(tmp_path, config, snapshot_store)
     pool.shadow_id = "shadow"
