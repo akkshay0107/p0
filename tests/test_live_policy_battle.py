@@ -4,7 +4,6 @@ import random
 import numpy as np
 import pytest
 import torch
-from poke_env import LocalhostServerConfiguration
 from poke_env.player import RandomPlayer
 
 from p0.format_config import FORMAT
@@ -97,7 +96,6 @@ async def test_checkpoint_free_policy_completes_live_battle(
     showdown_server,
     opponent_mode,
 ):
-    del showdown_server
     torch.manual_seed(7)
     poke_env_patches.install()
     policy = PolicyFactory().create(ModelConfig.baseline()).eval()
@@ -106,7 +104,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
     first = TrackedPolicyPlayer(
         policy=policy,
         battle_format=FORMAT.battle_format,
-        server_configuration=LocalhostServerConfiguration,
+        server_configuration=showdown_server,
         team_source=first_source,
         team_rng=random.Random(11),
         max_concurrent_battles=1,
@@ -115,7 +113,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
         second = TrackedPolicyPlayer(
             policy=policy,
             battle_format=FORMAT.battle_format,
-            server_configuration=LocalhostServerConfiguration,
+            server_configuration=showdown_server,
             team_source=second_source,
             team_rng=random.Random(13),
             max_concurrent_battles=1,
@@ -123,7 +121,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
     else:
         second = RandomPlayer(
             battle_format=FORMAT.battle_format,
-            server_configuration=LocalhostServerConfiguration,
+            server_configuration=showdown_server,
             team=second_source.sample(random.Random(13)).packed,
             max_concurrent_battles=1,
         )

@@ -6,7 +6,6 @@ from typing import Any, cast
 import numpy as np
 import pytest
 import torch
-from poke_env import LocalhostServerConfiguration
 from poke_env.battle import DoubleBattle, Pokemon
 from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
@@ -855,13 +854,13 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
 
     p1 = CapturePlayer(
         battle_format=battle_format,
-        server_configuration=LocalhostServerConfiguration,
+        server_configuration=showdown_server,
         team=sample_team,
         max_concurrent_battles=1,
     )
     p2 = RandomPlayer(
         battle_format=battle_format,
-        server_configuration=LocalhostServerConfiguration,
+        server_configuration=showdown_server,
         team=sample_team,
         max_concurrent_battles=1,
     )
