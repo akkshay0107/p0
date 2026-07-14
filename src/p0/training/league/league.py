@@ -6,7 +6,7 @@ import torch
 
 from p0.model.policy import PolicyNet
 from p0.model.structured_observation import StructuredObservation
-from p0.training.checkpoint import LEGACY_POLICY_STORE, PolicyStore
+from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import PoolConfig
 from p0.training.league.repository import (
     load_league_state,
@@ -49,7 +49,7 @@ class OpponentPool:
         self,
         pool_dir: Path,
         config: PoolConfig,
-        policy_store: PolicyStore = LEGACY_POLICY_STORE,
+        policy_store: PolicyStore = DEFAULT_POLICY_STORE,
     ):
         self.pool_dir = pool_dir
         self.pool_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +197,7 @@ class OpponentPool:
             else:
                 shadow_state[key] = policy_value
         shadow_policy.load_state_dict(shadow_state)
-        self.policy_store.save_policy(path, shadow_policy)
+        self.policy_store.save_policy(path, shadow_policy, metadata={"opponent_role": "shadow"})
         self.signatures.pop(self.shadow_id, None)
 
     def _regular_capacity(self) -> int:
@@ -296,7 +296,11 @@ class OpponentPool:
 
     def _register_opponent(self, opponent_id: str, policy: PolicyNet, role: str) -> None:
         """Saves the policy to disk, computes its signature, and tracks its state."""
-        self.policy_store.save_policy(self._checkpoint_path(opponent_id), policy)
+        self.policy_store.save_policy(
+            self._checkpoint_path(opponent_id),
+            policy,
+            metadata={"opponent_role": role},
+        )
 
         if role != "shadow":
             sig = self._compute_signature(policy)
@@ -409,7 +413,7 @@ class OpponentPool:
         cls,
         pool_dir: Path,
         config: PoolConfig,
-        policy_store: PolicyStore = LEGACY_POLICY_STORE,
+        policy_store: PolicyStore = DEFAULT_POLICY_STORE,
     ) -> Self:
         """Load an existing pool from disk, or create an empty one."""
         pool = cls(pool_dir, config, policy_store)

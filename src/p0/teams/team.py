@@ -8,8 +8,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Iterable, Mapping, cast
 
-from p0.format_config import FORMAT, STAT_POINT_IMPUTER_VERSION
-from p0.teams.stat_points import StatPoints
+from p0.format_config import FORMAT
+from p0.teams.stat_points import STAT_POINT_IMPUTER_VERSION, StatPoints
 
 
 def normalize_id(value: str) -> str:

@@ -22,7 +22,7 @@ from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import PokeEnvOrderAdapter
 from p0.runtime.poke_env_battle_adapter import PokeEnvBattleAdapter
 from p0.teams.source import FileTeamSource, TeamSource
-from p0.training.checkpoint import LEGACY_POLICY_STORE, PolicyStore
+from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import load_config
 
 
@@ -188,7 +188,7 @@ def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
 def _load_policy(
     checkpoint_path: Path | None,
     allow_random_init: bool,
-    policy_store: PolicyStore = LEGACY_POLICY_STORE,
+    policy_store: PolicyStore = DEFAULT_POLICY_STORE,
 ) -> PolicyNet:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -382,7 +382,7 @@ def _configure_logging(level: str) -> None:
 
 async def run_bot(
     config: RLBotConfig,
-    policy_store: PolicyStore = LEGACY_POLICY_STORE,
+    policy_store: PolicyStore = DEFAULT_POLICY_STORE,
 ) -> None:
     poke_env_patches.install()
     root_dir = load_config().paths.repository_root

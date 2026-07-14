@@ -10,6 +10,7 @@ from p0.battle.actions import ACT_SIZE, ActionCodec
 from p0.battle.events import EventTypeId, ProtocolEventParser, RawBattleEvent
 from p0.battle.legality import DecisionView, LegalActionBuilder, SlotDecision
 from p0.battle.views import FixtureBattleView
+from p0.format_config import ACTION_CONTRACT
 from p0.model.config import ModelConfig
 from p0.model.factory import PolicyFactory
 from p0.model.observation_builder import ObservationBuilder, from_battle, from_view
@@ -23,6 +24,27 @@ def test_action_codec_round_trips_all_49_ids() -> None:
     assert [ActionCodec.encode(ActionCodec.decode(action)) for action in range(ACT_SIZE)] == list(
         range(ACT_SIZE)
     )
+
+
+def test_runtime_action_contract_describes_the_codec() -> None:
+    assert ACTION_CONTRACT["action_count"] == ACT_SIZE
+    ranges = ACTION_CONTRACT["ranges"]
+    assert [(entry["start"], entry["end"]) for entry in ranges] == [
+        (0, 1),
+        (1, 7),
+        (7, 27),
+        (27, 47),
+        (47, 48),
+        (48, 49),
+    ]
+    assert [ActionCodec.decode(index).kind.name.lower() for index in (0, 1, 7, 27, 47, 48)] == [
+        "pass",
+        "switch",
+        "move",
+        "move",
+        "forced_move",
+        "forced_move",
+    ]
 
 
 def test_team_preview_codec_is_canonical_and_unique() -> None:

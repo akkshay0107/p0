@@ -11,6 +11,7 @@ from typing import Mapping
 STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
 STAT_POINT_LIMIT = 32
 STAT_POINT_TOTAL_LIMIT = 66
+STAT_POINT_IMPUTER_VERSION = 1
 
 NATURE_IMPACTS: dict[str, tuple[str, str]] = {
     "adamant": ("atk", "spa"),

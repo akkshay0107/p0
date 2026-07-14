@@ -112,6 +112,15 @@ You would have to move the trained model to a specific location and have the inf
 
 The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.yaml.example`.
 
+### Runtime compatibility
+
+`data/runtime_manifest.json` contains one human-readable, load-breaking runtime contract.
+Checkpoints reference its `runtime_contract_sha256`. Vocabulary, action-layout, tensor-ABI,
+or resource-feature-ABI changes require a new checkpoint or an explicit transfer tool.
+Dex balance/learnset changes and Showdown revisions are recorded as mechanics provenance;
+they do not prevent an existing policy from loading and continuing training. Old checkpoint
+dictionaries containing `runtime_manifest_sha256` are intentionally unsupported.
+
 ## Development verification
 
 Run the standard checkpoint gates from the repository root:

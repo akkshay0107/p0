@@ -19,7 +19,7 @@ from p0.model.resources import default_runtime_resources
 from p0.runtime.composition import build_sim_env
 from p0.runtime.showdown import start_showdown_servers
 from p0.teams.source import FileTeamSource
-from p0.training.checkpoint import LEGACY_POLICY_STORE, PolicyStore
+from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import GlobalConfig, TeamSourceConfig
 from p0.training.league.league import OpponentPool
 from p0.training.ppo import PPOUpdater
@@ -63,7 +63,7 @@ def _close_vector_env(vector_env: ThreadVecEnv) -> None:
 def run_training(
     config: GlobalConfig,
     *,
-    policy_store: PolicyStore = LEGACY_POLICY_STORE,
+    policy_store: PolicyStore = DEFAULT_POLICY_STORE,
     cancel_requested: Callable[[], bool] = lambda: False,
 ) -> None:
     training, paths = config.training, config.paths
@@ -74,9 +74,7 @@ def run_training(
         if paths.checkpoint_path.exists()
         else PolicyFactory(resources).create().to(device)
     )
-    optimizer = optim.AdamW(
-        adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6
-    )
+    optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
     scaler = GradScaler(
         "cuda", enabled=training.enable_optim and device.type == "cuda", init_scale=512.0
     )
@@ -99,12 +97,8 @@ def run_training(
             for index, server in enumerate(servers):
                 envs.append(
                     build_sim_env(
-                        account_configuration1=AccountConfiguration(
-                            f"TrainAgent_{index}", None
-                        ),
-                        account_configuration2=AccountConfiguration(
-                            f"BestAgent_{index}", None
-                        ),
+                        account_configuration1=AccountConfiguration(f"TrainAgent_{index}", None),
+                        account_configuration2=AccountConfiguration(f"BestAgent_{index}", None),
                         server_port=server.port,
                         agent_team_source=agent_source,
                         opponent_team_source=opponent_source,

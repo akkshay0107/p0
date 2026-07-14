@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import load_runtime_manifest, sha256_file
+from p0.format_config import load_active_runtime_manifest
 from p0.model.tokenizer import PokemonTokenizer, tokenizer
 from p0.paths import DEFAULT_PATHS
 
@@ -34,16 +34,11 @@ class RuntimeResources:
     @classmethod
     def from_manifest(cls, manifest_path: str | Path) -> RuntimeResources:
         path = Path(manifest_path)
-        manifest, _ = load_runtime_manifest(path)
+        load_active_runtime_manifest(path)
         vocab_path = path.with_name("vocab.json")
         dex_path = path.with_name("champions_dex.json")
-        actual_vocab = sha256_file(vocab_path)
-        actual_dex = sha256_file(dex_path)
-        if actual_vocab != manifest.vocab_sha256 or actual_dex != manifest.champions_dex_sha256:
-            raise ValueError(
-                "Runtime resources do not match runtime_manifest.json: "
-                f"vocab={actual_vocab}, dex={actual_dex}"
-            )
+        # Dex and Showdown identities are provenance. Updated mechanics remain loadable
+        # as long as the resource feature ABI and vocabulary are unchanged.
         return cls.from_files(vocab_path, dex_path)
 
     @classmethod
@@ -86,13 +81,8 @@ class RuntimeResources:
 @lru_cache(maxsize=1)
 def default_runtime_resources() -> RuntimeResources:
     manifest_path = DEFAULT_PATHS.data_root / "runtime_manifest.json"
-    manifest, _ = load_runtime_manifest(manifest_path)
-    vocab_path = manifest_path.with_name("vocab.json")
+    load_active_runtime_manifest(manifest_path)
     dex_path = manifest_path.with_name("champions_dex.json")
-    actual_vocab = sha256_file(vocab_path)
-    actual_dex = sha256_file(dex_path)
-    if actual_vocab != manifest.vocab_sha256 or actual_dex != manifest.champions_dex_sha256:
-        raise ValueError("Default resources do not match runtime_manifest.json")
     with dex_path.open("r", encoding="utf-8") as stream:
         dex = json.load(stream)
     return RuntimeResources.from_data(tokenizer.vocab, dex, shared_tokenizer=tokenizer)

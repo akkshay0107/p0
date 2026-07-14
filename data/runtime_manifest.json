@@ -1,19 +1,62 @@
 {
-  "action_schema_version": "champions-mega-v1",
-  "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
-  "event_schema_version": 2,
-  "format": {
-    "action_size": 49,
+  "manifest_schema": 2,
+  "mechanics_provenance": {
     "battle_format": "gen9championsvgc2026regmb",
     "bo3_format": "gen9championsvgc2026regmbbo3",
-    "generation": 9,
-    "mod": "champions",
+    "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
     "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
   },
-  "format_spec_version": 1,
-  "observation_schema_version": 2,
-  "replay_compiler_version": 0,
-  "stat_point_imputer_version": 1,
-  "vocab_schema_version": 1,
-  "vocab_sha256": "00ea78cfb89fa15447cebaed1a080d3694af1aad2dd32ca85cf0dced83b05146"
+  "runtime_contract": {
+    "action": {
+      "action_count": 49,
+      "joint_constraints": ["no_duplicate_switch", "at_most_one_mega"],
+      "joint_width": 2,
+      "ranges": [
+        {
+          "end": 1,
+          "meaning": "pass",
+          "start": 0
+        },
+        {
+          "end": 7,
+          "meaning": "switch",
+          "roster_slots": 6,
+          "start": 1
+        },
+        {
+          "end": 27,
+          "meaning": "move",
+          "move_slots": 4,
+          "start": 7,
+          "targets": [-2, -1, 0, 1, 2]
+        },
+        {
+          "end": 47,
+          "meaning": "mega_move",
+          "move_slots": 4,
+          "start": 27,
+          "targets": [-2, -1, 0, 1, 2]
+        },
+        {
+          "end": 48,
+          "meaning": "mega_forced_move",
+          "start": 47
+        },
+        {
+          "end": 49,
+          "meaning": "forced_move",
+          "start": 48
+        }
+      ],
+      "team_preview": {
+        "encoding": "ordered_roster_pair",
+        "joint_unique": true,
+        "roster_size": 6
+      }
+    },
+    "resource_feature_abi": "champions-dex-features-v1",
+    "tensor_abi": "champions-observation-event-v2",
+    "vocabulary_sha256": "b8380f7f6324664087d88c9ab62a27d5185602d46ad001de05627a3a18f3e752"
+  },
+  "runtime_contract_sha256": "6e53dd60fd926d57defa8e0d3ed312e65ee3f72ec0dd147c4237c8540e7284e4"
 }

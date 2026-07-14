@@ -17,8 +17,22 @@ def _fake_policy(value: float = 0.0) -> Any:
     )
 
 
-def test_sample_many_builds_roster_from_shadow_anchors_and_regulars(tmp_path):
-    pool = OpponentPool(tmp_path, PoolConfig())
+class _SnapshotStore:
+    def save_policy(self, path, policy, **kwargs):
+        torch.save(policy.state_dict(), path)
+
+    def load_policy(self, path, device):
+        state = torch.load(path, weights_only=True)
+        return _fake_policy(float(state["weight"].item()))
+
+
+@pytest.fixture
+def snapshot_store():
+    return _SnapshotStore()
+
+
+def test_sample_many_builds_roster_from_shadow_anchors_and_regulars(tmp_path, snapshot_store):
+    pool = OpponentPool(tmp_path, PoolConfig(), snapshot_store)
     pool.shadow_id = "shadow"
     pool.anchor_ids = ["seed-a", "seed-b"]
     pool.regular_ids = ["ep20", "ep40"]
@@ -30,9 +44,11 @@ def test_sample_many_builds_roster_from_shadow_anchors_and_regulars(tmp_path):
     assert len(sampled) == len(set(sampled))
 
 
-def test_add_regular_evicts_lowest_win_rate_regular_and_keeps_anchors(tmp_path):
+def test_add_regular_evicts_lowest_win_rate_regular_and_keeps_anchors(
+    tmp_path, snapshot_store
+):
     config = PoolConfig(pool_size=4)
-    pool = OpponentPool(tmp_path, config)
+    pool = OpponentPool(tmp_path, config, snapshot_store)
     pool.shadow_id = "shadow"
     pool.anchor_ids = ["seed"]
     pool.regular_ids = ["weak", "strong"]
@@ -67,9 +83,9 @@ def test_normalize_neutral_when_spread_too_small():
     assert out["b"] == 1.0
 
 
-def test_update_win_rate_tracks_games_and_persists(tmp_path):
+def test_update_win_rate_tracks_games_and_persists(tmp_path, snapshot_store):
     config = PoolConfig()
-    pool = OpponentPool(tmp_path, config)
+    pool = OpponentPool(tmp_path, config, snapshot_store)
     pool.add(cast(Any, _fake_policy()), "ep20")
 
     pool.update_win_rate("ep20", agent_wins=1, num_games=4)
@@ -77,23 +93,23 @@ def test_update_win_rate_tracks_games_and_persists(tmp_path):
     assert pool.games["ep20"] == 6
 
     pool.save_state()
-    reloaded = OpponentPool.load_or_create(tmp_path, config)
+    reloaded = OpponentPool.load_or_create(tmp_path, config, snapshot_store)
     assert reloaded.games["ep20"] == 6
 
 
-def test_strict_load_reports_missing_referenced_snapshot(tmp_path):
+def test_strict_load_reports_missing_referenced_snapshot(tmp_path, snapshot_store):
     config = PoolConfig()
-    pool = OpponentPool(tmp_path, config)
+    pool = OpponentPool(tmp_path, config, snapshot_store)
     pool.add(cast(Any, _fake_policy()), "ep20")
     pool.save_state()
     (tmp_path / "ep20.pt").unlink()
     with pytest.raises(ValueError, match="missing policy snapshots"):
-        OpponentPool.load_or_create(tmp_path, config)
+        OpponentPool.load_or_create(tmp_path, config, snapshot_store)
 
 
-def test_maybe_promote_skips_when_no_candidate_meets_floor_or_games(tmp_path):
+def test_maybe_promote_skips_when_no_candidate_meets_floor_or_games(tmp_path, snapshot_store):
     config = PoolConfig(pool_anchor_every=1, pool_anchor_min_wr=0.4, pool_anchor_min_games=10)
-    pool = OpponentPool(tmp_path, config)
+    pool = OpponentPool(tmp_path, config, snapshot_store)
     pool.regular_ids = ["lowwr", "fewgames"]
     pool.win_rates = {"lowwr": 0.3, "fewgames": 0.9}
     pool.games = {"lowwr": 50, "fewgames": 2}
@@ -105,9 +121,9 @@ def test_maybe_promote_skips_when_no_candidate_meets_floor_or_games(tmp_path):
     assert pool.snapshots_since_anchor == 1
 
 
-def test_maybe_promote_prefers_candidate_strong_on_both_axes(tmp_path):
+def test_maybe_promote_prefers_candidate_strong_on_both_axes(tmp_path, snapshot_store):
     config = PoolConfig(pool_anchor_every=1, pool_anchor_min_wr=0.4, pool_anchor_min_games=0)
-    pool = OpponentPool(tmp_path, config)
+    pool = OpponentPool(tmp_path, config, snapshot_store)
     pool.anchor_ids = ["anchor"]
     pool.regular_ids = ["comp_only", "both", "div_only"]
     pool.win_rates = {
@@ -132,9 +148,9 @@ def test_maybe_promote_prefers_candidate_strong_on_both_axes(tmp_path):
     assert pool.snapshots_since_anchor == 0
 
 
-def test_set_reference_batch_invalidates_stale_signatures(tmp_path):
+def test_set_reference_batch_invalidates_stale_signatures(tmp_path, snapshot_store):
     config = PoolConfig()
-    pool = OpponentPool(tmp_path, config)
+    pool = OpponentPool(tmp_path, config, snapshot_store)
     pool.anchor_ids = ["ghost"]  # active but has no checkpoint on disk
     pool.win_rates = {"ghost": 0.5}
     pool.signatures = {"ghost": _dist([1.0, 0.0, 0.0], [1.0, 0.0, 0.0])}

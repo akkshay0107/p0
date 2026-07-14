@@ -1,11 +1,12 @@
 import json
+import shutil
 import subprocess
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
-from p0.format_config import FORMAT, RuntimeManifest
+from p0.format_config import ACTION_CONTRACT, FORMAT, RuntimeManifest
 from p0.model.build_vocab import build
 from p0.model.fused_token_encoder import (
     FusedTokenEncoder,
@@ -13,6 +14,7 @@ from p0.model.fused_token_encoder import (
     _load_move_statics,
     _load_species_statics,
 )
+from p0.model.resources import RuntimeResources
 from p0.model.tokenizer import PokemonTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +26,25 @@ def test_active_contract_is_reg_m_b_and_manifest_matches_sources():
     )
     assert FORMAT.battle_format == "gen9championsvgc2026regmb"
     assert FORMAT.bo3_format == "gen9championsvgc2026regmbbo3"
-    assert manifest.format == FORMAT
-    assert manifest.vocab_schema_version == 1
+    assert manifest.battle_format == FORMAT.battle_format
+    assert manifest.bo3_format == FORMAT.bo3_format
+    assert manifest.action == ACTION_CONTRACT
+    assert len(manifest.runtime_contract_sha256) == 64
+
+
+def test_runtime_resources_allow_updated_dex_content(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    for name in ("runtime_manifest.json", "vocab.json", "champions_dex.json"):
+        shutil.copy2(ROOT / "data" / name, data / name)
+    dex_path = data / "champions_dex.json"
+    dex = json.loads(dex_path.read_text())
+    dex["moves"][0]["basePower"] = int(dex["moves"][0].get("basePower", 0)) + 1
+    dex_path.write_text(json.dumps(dex), encoding="utf-8")
+
+    resources = RuntimeResources.from_manifest(data / "runtime_manifest.json")
+
+    assert resources.dex["moves"][0]["basePower"] == dex["moves"][0]["basePower"]
 
 
 def test_every_legal_content_key_resolves():

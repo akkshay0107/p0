@@ -248,8 +248,8 @@ class FusedTokenEncoder(nn.Module):
         ability_tags = mechanic_tags["abilities"]
         self.item_mechanic_proj = nn.Linear(item_tags.shape[1], d_model, bias=False)
         self.ability_mechanic_proj = nn.Linear(ability_tags.shape[1], d_model, bias=False)
-        self.register_buffer("_item_mechanic_tags", item_tags)
-        self.register_buffer("_ability_mechanic_tags", ability_tags)
+        self.register_buffer("_item_mechanic_tags", item_tags, persistent=False)
+        self.register_buffer("_ability_mechanic_tags", ability_tags, persistent=False)
         self.status_proj = nn.Linear(d_raw, d_model)
         self.nature_proj = nn.Linear(d_raw, d_model)
         self.typed_effect_set = MultiAggDeepSet(d_raw + 16 + 16 + EFFECT_NUMERICAL_WIDTH, d_model)
@@ -298,8 +298,10 @@ class FusedTokenEncoder(nn.Module):
 
         # cache component ids instead of creating them every forward pass
         self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
-        self.register_buffer("_species_statics", _load_species_statics(self.resources))
-        self.register_buffer("_move_statics", _load_move_statics(self.resources))
+        self.register_buffer(
+            "_species_statics", _load_species_statics(self.resources), persistent=False
+        )
+        self.register_buffer("_move_statics", _load_move_statics(self.resources), persistent=False)
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
         self.register_buffer("_super_pos", torch.tensor(_SUPER_POS, dtype=torch.long))

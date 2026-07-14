@@ -16,7 +16,7 @@ from poke_env.battle.weather import Weather
 
 from p0.battle.events import BattleEvent, EventTypeId, ProtocolEventParser
 from p0.env import MegaEnv
-from p0.format_config import RuntimeManifest, validate_artifact_manifest_reference
+from p0.format_config import current_manifest, validate_artifact_runtime_contract
 from p0.model.observation_builder import from_battle
 from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
@@ -145,6 +145,6 @@ def test_stat_formula_and_manifest_rejection_are_stable(tmp_path) -> None:
     assert stats == (155, 93, 98, 177, 105, 152)
 
     manifest_path = tmp_path / "runtime_manifest.json"
-    manifest_path.write_text(json.dumps(RuntimeManifest().to_dict()), encoding="utf-8")
-    with pytest.raises(ValueError, match="does not match"):
-        validate_artifact_manifest_reference({"runtime_manifest_sha256": "0" * 64}, manifest_path)
+    manifest_path.write_text(json.dumps(current_manifest().to_dict()), encoding="utf-8")
+    with pytest.raises(ValueError, match="legacy checkpoint"):
+        validate_artifact_runtime_contract({"runtime_manifest_sha256": "0" * 64}, manifest_path)
