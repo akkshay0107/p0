@@ -1,6 +1,6 @@
 # p0: Reinforcement Learning for Pokémon VGC
 
-`p0` is a self-play reinforcement learning engine for Pokemon VGC. The current codebase is being refactored toward roster-independent Champions play and public Bo3 replay pretraining.
+`p0` is a self-play reinforcement learning engine for Pokemon VGC. The current codebase is being refactored toward roster-independent Champions play and public Bo3 replay pretraining. NOTE: everything below is mostly stale (when I was training with a smaller vocab and a fixed set of teams). I will be updating it after I build out more features.
 
 ---
 
