@@ -6,7 +6,7 @@ from weakref import WeakKeyDictionary
 
 from poke_env.battle import DoubleBattle
 
-from p0.battle.events import parse_events
+from p0.battle.events import BattleEvent, parse_events
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.model.tokenizer import tokenizer
 from p0.runtime.live_event_capture import consume_raw_events, last_move
@@ -16,11 +16,13 @@ from p0.teams.stat_points import PrecomputedStats
 class PokeEnvBattleView:
     """Cached facade with explicit properties and no copied per-decision graph."""
 
-    __slots__ = ("_battle", "_decision", "stat_cache")
+    __slots__ = ("_battle", "_decision", "_events", "_events_key", "stat_cache")
 
     def __init__(self, battle: DoubleBattle):
         self._battle = battle
         self._decision: DecisionView | None = None
+        self._events: list[BattleEvent] = []
+        self._events_key: int = -1  # id() is never negative, so -1 forces the first drain
         self.stat_cache: dict[object, PrecomputedStats] = {}
 
     def refresh(self) -> PokeEnvBattleView:
@@ -117,7 +119,15 @@ class PokeEnvBattleView:
         return self._battle.get_pokemon(identifier)
 
     def consume_events(self):
-        return parse_events(consume_raw_events(self._battle), tokenizer)
+        # The raw buffer drains once per decision; repeated observation builds
+        # for the same decision (value/policy passes, candidate scoring) see the
+        # identical event window. Consecutive requests are distinct objects, so
+        # object identity is a safe per-decision key.
+        key = id(self._battle.last_request)
+        if key != self._events_key:
+            self._events = parse_events(consume_raw_events(self._battle), tokenizer)
+            self._events_key = key
+        return self._events
 
     def last_move(self, pokemon):
         return last_move(pokemon)

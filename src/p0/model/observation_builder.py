@@ -5,7 +5,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from p0.battle.events import BattleEvent, truncate_events
+from p0.battle.events import EVENT_DIAGNOSTICS, BattleEvent, truncate_events
 from p0.battle.views import BattleView, MoveView, PokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
@@ -640,24 +640,40 @@ def _side_token_into(
     num[4] = float(mega_available)
 
 
+def _ground_identifier(
+    battle: BattleView,
+    entity_id: str,
+    pokemon_to_slot: dict[Any, tuple[SideId, int]],
+) -> tuple[SideId, int]:
+    # Side identifiers arrive as bare "p1"/"p2" or "p1: Username"; Pokemon
+    # identifiers carry a position letter ("p1a: Name"), so the third
+    # character distinguishes the two without a lookup.
+    if len(entity_id) >= 2 and (len(entity_id) == 2 or entity_id[2] == ":"):
+        prefix = entity_id[:2]
+        if prefix in ("p1", "p2"):
+            side = SideId.ALLY if prefix == battle.player_role else SideId.OPPONENT
+            return side, 0
+
+    try:
+        pokemon = battle.get_pokemon(entity_id)
+    except (AssertionError, IndexError, KeyError, ValueError):
+        EVENT_DIAGNOSTICS["grounding_misses"] += 1
+        return SideId.NONE, 0
+    location = pokemon_to_slot.get(pokemon)
+    if location is None:
+        EVENT_DIAGNOSTICS["grounding_misses"] += 1
+        return SideId.NONE, 0
+    return location
+
+
 def _event_location(
     battle: BattleView,
     event: BattleEvent,
     pokemon_to_slot: dict[Any, tuple[SideId, int]],
 ) -> tuple[SideId, int]:
-    entity_id = event.entity_id
-    if entity_id is None:
+    if event.entity_id is None:
         return SideId.NONE, 0
-
-    if entity_id in ("p1", "p2"):
-        side = SideId.ALLY if entity_id == battle.player_role else SideId.OPPONENT
-        return side, 0
-
-    try:
-        pokemon = battle.get_pokemon(entity_id)
-    except (AssertionError, IndexError, KeyError, ValueError):
-        return SideId.NONE, 0
-    return pokemon_to_slot.get(pokemon, (SideId.NONE, 0))
+    return _ground_identifier(battle, event.entity_id, pokemon_to_slot)
 
 
 def _event_target_location(
@@ -667,11 +683,7 @@ def _event_target_location(
 ) -> tuple[SideId, int]:
     if event.target_id is None:
         return SideId.NONE, 0
-    try:
-        pokemon = battle.get_pokemon(event.target_id)
-    except (AssertionError, IndexError, KeyError, ValueError):
-        return SideId.NONE, 0
-    return pokemon_to_slot.get(pokemon, (SideId.NONE, 0))
+    return _ground_identifier(battle, event.target_id, pokemon_to_slot)
 
 
 def _write_events(
@@ -693,12 +705,14 @@ def _write_events(
     for event_idx, event in enumerate(events):
         side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
         target_side_id, target_slot_id = _event_target_location(battle, event, pokemon_to_slot)
+        # Order is re-compacted to the post-truncation index so the positional
+        # vocabulary never saturates and the order scalar stays inside [0, 1).
         events_cat[event_idx] = (
             event.event_type,
             event.move_id,
             event.item_id,
             event.status_id,
-            min(event.order + 1, EVENT_COUNT),
+            event_idx + 1,
             event.effect_id,
             event.ability_id,
             event.flags,
@@ -707,7 +721,7 @@ def _write_events(
         )
         events_num[event_idx] = (
             event.value,
-            event.order / float(EVENT_COUNT),
+            event_idx / float(EVENT_COUNT),
             float(event_overflow),
         )
         events_side_ids[event_idx] = side_id

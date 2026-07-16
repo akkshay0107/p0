@@ -117,6 +117,10 @@ def test_protocol_parser_accepts_an_injected_resource_resolver() -> None:
         def effect_id_for(self, table: str, name: str | None) -> int:
             return 0
 
+        def resolve(self, table: str, name: str | None) -> tuple[int, str]:
+            resolved = self.id_for(table, name)
+            return resolved, "known" if resolved else "oov"
+
     events = parse_events(
         [RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard"))],
         Resolver(),

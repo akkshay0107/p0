@@ -219,9 +219,9 @@ class FixtureBattleView:
         return self.identifiers[identifier]
 
     def consume_events(self) -> list[BattleEvent]:
-        events = self.events
-        self.events = []
-        return events
+        # Fixture views are per-decision; repeated builds of the same decision
+        # must observe the identical event window (idempotent consume).
+        return self.events
 
     def last_move(self, pokemon: Any) -> str | None:
         move = pokemon.last_move

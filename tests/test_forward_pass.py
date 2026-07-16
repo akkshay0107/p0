@@ -233,3 +233,57 @@ def test_cls_reducer_pokemon_tokens_alignment():
     _, _, pokemon_tokens = reducer(tokens, state, None)
 
     torch.testing.assert_close(pokemon_tokens, tokens[:, 1:13])
+
+
+def test_event_targets_do_not_alias(policy_net):
+    """Crossed actor/target slots must produce distinct event tokens (audit §1.5)."""
+    from p0.battle.events import EventTypeId
+    from p0.model.structured_observation import SideId
+
+    def encode_event(actor_slot: int, target_slot: int) -> torch.Tensor:
+        obs = StructuredObservation.empty_batch(1)
+        obs.events_cat[0, 0, 0] = EventTypeId.MOVE
+        obs.events_side_ids[0, 0] = SideId.ALLY
+        obs.events_slot_ids[0, 0] = actor_slot
+        obs.events_cat[0, 0, 8] = SideId.OPPONENT
+        obs.events_cat[0, 0, 9] = target_slot
+        action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
+        with torch.no_grad():
+            tokens, _ = policy_net.encoder(obs, action_mask)
+        return tokens[0, -64]  # first event token row
+
+    crossed_a = encode_event(actor_slot=1, target_slot=2)
+    crossed_b = encode_event(actor_slot=2, target_slot=1)
+
+    assert not torch.allclose(crossed_a, crossed_b, atol=1e-6)
+
+
+def test_event_effect_namespaces(policy_net):
+    """Event effect ids are tagged with the vocab table they index (audit §1.1)."""
+    from p0.battle.events import EventTypeId
+    from p0.model.structured_observation import EffectNamespace
+
+    namespaces = policy_net.encoder._event_effect_namespace
+    assert namespaces[EventTypeId.WEATHER_START] == EffectNamespace.WEATHER
+    assert namespaces[EventTypeId.WEATHER_END] == EffectNamespace.WEATHER
+    assert namespaces[EventTypeId.FIELD_START] == EffectNamespace.FIELD
+    assert namespaces[EventTypeId.FIELD_END] == EffectNamespace.FIELD
+    assert namespaces[EventTypeId.SIDE_START] == EffectNamespace.SIDE
+    assert namespaces[EventTypeId.SIDE_END] == EffectNamespace.SIDE
+    assert namespaces[EventTypeId.EFFECT_START] == EffectNamespace.POKEMON
+    assert namespaces[EventTypeId.EFFECT_END] == EffectNamespace.POKEMON
+    assert namespaces[EventTypeId.CANT] == EffectNamespace.POKEMON
+    assert namespaces[EventTypeId.MOVE] == EffectNamespace.NONE
+
+    def encode_first_event(event_type: EventTypeId) -> torch.Tensor:
+        obs = StructuredObservation.empty_batch(1)
+        obs.events_cat[0, 0, 0] = event_type
+        obs.events_cat[0, 0, 5] = 1  # same effect id in both namespaces
+        action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
+        with torch.no_grad():
+            tokens, _ = policy_net.encoder(obs, action_mask)
+        return tokens[0, -64]
+
+    weather = encode_first_event(EventTypeId.WEATHER_START)
+    volatile = encode_first_event(EventTypeId.EFFECT_START)
+    assert not torch.allclose(weather, volatile, atol=1e-6)

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-from p0.battle.events import EVENT_TYPE_COUNT
+from p0.battle.events import EVENT_TYPE_COUNT, EventTypeId
 from p0.format_config import FORMAT
 from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
@@ -30,6 +30,7 @@ from p0.model.structured_observation import (
     OWNER_TOKENS,
     POKEMON_TOKENS,
     SEQUENCE_LENGTH,
+    EffectNamespace,
     StructuredObservation,
     TokenType,
 )
@@ -92,6 +93,24 @@ _TARGET_CLASS_ALIASES = {
     "any": "selectedpokemon",
 }
 MOVE_STATIC_WIDTH = 7 + len(_TARGET_CLASSES)
+
+# Event effect ids index four independently-numbered vocab tables; the event
+# type determines which one, so the namespace tag is derived from it. This
+# mirrors the state path, which always pairs effect_emb with a namespace term.
+_EVENT_EFFECT_NAMESPACE: dict[EventTypeId, EffectNamespace] = {
+    EventTypeId.WEATHER_START: EffectNamespace.WEATHER,
+    EventTypeId.WEATHER_END: EffectNamespace.WEATHER,
+    EventTypeId.FIELD_START: EffectNamespace.FIELD,
+    EventTypeId.FIELD_END: EffectNamespace.FIELD,
+    EventTypeId.FIELD_ACTIVATE: EffectNamespace.FIELD,
+    EventTypeId.SIDE_START: EffectNamespace.SIDE,
+    EventTypeId.SIDE_END: EffectNamespace.SIDE,
+    EventTypeId.EFFECT_START: EffectNamespace.POKEMON,
+    EventTypeId.EFFECT_END: EffectNamespace.POKEMON,
+    EventTypeId.CANT: EffectNamespace.POKEMON,
+    EventTypeId.SINGLEMOVE: EffectNamespace.POKEMON,
+    EventTypeId.ACTIVATE: EffectNamespace.POKEMON,
+}
 
 
 def _load_vocab_sizes(resources: RuntimeResources) -> dict[str, int]:
@@ -208,6 +227,7 @@ class FusedTokenEncoder(nn.Module):
     _poke_pos: torch.Tensor
     _owner_pos: torch.Tensor
     _pokemon_scalar_idx: torch.Tensor
+    _event_effect_namespace: torch.Tensor
     _component_ids: torch.Tensor
     _species_statics: torch.Tensor
     _move_statics: torch.Tensor
@@ -324,6 +344,16 @@ class FusedTokenEncoder(nn.Module):
         self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_model)
         self.event_flag_emb = nn.Embedding(8, d_model)
         self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_model)
+        # reuse the state path's namespace codes so both paths share geometry
+        self.event_namespace_proj = nn.Linear(16, d_model, bias=False)
+        # a learned role transform on the target endpoint keeps the shared
+        # side/slot tables (attention join to the owner token) while breaking
+        # the actor/target swap symmetry of a purely additive tag sum
+        self.target_role_proj = nn.Linear(d_model, d_model, bias=False)
+        namespace_by_type = torch.zeros(EVENT_TYPE_COUNT, dtype=torch.long)
+        for event_type, namespace in _EVENT_EFFECT_NAMESPACE.items():
+            namespace_by_type[event_type] = namespace
+        self.register_buffer("_event_effect_namespace", namespace_by_type, persistent=False)
 
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
@@ -575,16 +605,32 @@ class FusedTokenEncoder(nn.Module):
             dim=-1,
         )
 
-        event_tokens = self.event_proj(event_feats)
-        event_tokens = (
-            event_tokens
-            + self.event_type_emb(events_cat[..., 0])
-            + self.side_emb(events_side_ids)
-            + self.slot_emb(events_slot_ids)
-            + self.order_pos_emb(events_cat[..., 4])
+        # what happened: event type, the effect-vocab namespace it implies,
+        # and its modifier flags
+        event_types = events_cat[..., 0]
+        what = (
+            self.event_type_emb(event_types)
+            + self.event_namespace_proj(
+                self.effect_namespace_emb(self._event_effect_namespace[event_types])
+            )
             + self.event_flag_emb(events_cat[..., 7])
-            + self.side_emb(events_cat[..., 8])
-            + self.slot_emb(events_cat[..., 9])
+        )
+        # the actor's coordinates join directly to its owner Pokemon token;
+        # the target's pass through a role transform so crossed actor/target
+        # pairs stay distinguishable
+        actor = self.side_emb(events_side_ids) + self.slot_emb(events_slot_ids)
+        target = self.target_role_proj(
+            self.side_emb(events_cat[..., 8]) + self.slot_emb(events_cat[..., 9])
+        )
+        # when: position within this decision's event window
+        when = self.order_pos_emb(events_cat[..., 4])
+
+        event_tokens = (
+            self.event_proj(event_feats)
+            + what
+            + actor
+            + target
+            + when
             + self.token_type_emb.weight[int(TokenType.EVENT)]
         )
 

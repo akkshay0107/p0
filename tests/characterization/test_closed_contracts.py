@@ -189,6 +189,46 @@ def test_event_priority_order_and_overflow_are_stable() -> None:
     assert selected[-1].event_type == EventTypeId.MOVE
 
 
+def test_event_v4_contract_is_pinned() -> None:
+    """Pin the event-v4 contract: new protocol coverage and re-tiered truncation."""
+    from p0.battle.events import (
+        EVENT_TYPE_COUNT,
+        HIGH_PRIORITY_EVENTS,
+        MEDIUM_PRIORITY_EVENTS,
+    )
+
+    assert EVENT_TYPE_COUNT == 44
+    assert EventTypeId.CANT == 31
+    assert EventTypeId.PREPARE == 32
+    assert EventTypeId.SINGLEMOVE == 33
+    assert EventTypeId.BOOST_SET == 34
+    assert EventTypeId.BOOST_CLEAR == 35
+    assert EventTypeId.BOOST_SWAP == 36
+    assert EventTypeId.BOOST_INVERT == 37
+    assert EventTypeId.BOOST_COPY == 38
+    assert EventTypeId.TRANSFORM == 39
+    assert EventTypeId.ABILITY_END == 40
+    assert EventTypeId.ACTIVATE == 41
+    assert EventTypeId.FIELD_ACTIVATE == 42
+    assert EventTypeId.NO_TARGET == 43
+
+    # structural/state transitions must outrank routine numeric events
+    structural = {
+        EventTypeId.MEGA,
+        EventTypeId.WEATHER_START,
+        EventTypeId.FIELD_START,
+        EventTypeId.SIDE_START,
+        EventTypeId.EFFECT_START,
+        EventTypeId.ABILITY,
+        EventTypeId.ITEM_TRANSFER,
+        EventTypeId.DRAG,
+        EventTypeId.CANT,
+    }
+    assert structural <= HIGH_PRIORITY_EVENTS
+    assert {EventTypeId.DAMAGE, EventTypeId.HEAL, EventTypeId.BOOST} <= MEDIUM_PRIORITY_EVENTS
+    assert HIGH_PRIORITY_EVENTS.isdisjoint(MEDIUM_PRIORITY_EVENTS)
+
+
 def test_stat_formula_and_manifest_rejection_are_stable(tmp_path) -> None:
     stats = calculate_stats(
         BaseStats(78, 84, 78, 109, 85, 100),

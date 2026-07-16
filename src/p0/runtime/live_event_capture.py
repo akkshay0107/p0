@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from poke_env.battle import DoubleBattle, Pokemon
 
-from p0.battle.events import RawBattleEvent
+from p0.battle.events import RawBattleEvent, build_raw_event
 
 
 def _events_for(battle: DoubleBattle) -> list[RawBattleEvent]:
@@ -31,13 +31,10 @@ def last_move(pokemon: Pokemon) -> str | None:
 
 
 def capture_message(battle: DoubleBattle, split_message: list[str]) -> None:
-    pre_hp = None
-    pokemon = None
-    if len(split_message) > 2 and split_message[1] in {"-damage", "-heal", "move"}:
+    def pre_hp_for(identifier: str) -> float | None:
         try:
-            pokemon = battle.get_pokemon(split_message[2])
+            return battle.get_pokemon(identifier).current_hp_fraction
         except (AssertionError, IndexError, KeyError, ValueError):
-            pokemon = None
-    if pokemon is not None and split_message[1] in {"-damage", "-heal"}:
-        pre_hp = pokemon.current_hp_fraction
-    _events_for(battle).append(RawBattleEvent(tuple(split_message), pre_hp))
+            return None
+
+    _events_for(battle).append(build_raw_event(split_message, pre_hp_for))

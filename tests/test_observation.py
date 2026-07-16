@@ -675,7 +675,7 @@ def test_from_battle_real_end_to_end():
     assert obs.side_ids[15] == SideId.OPPONENT
 
 
-def test_events_join_to_current_slots_after_switch_and_are_consumed():
+def test_events_ground_to_slots_and_are_idempotent():
     switched_out = make_real_pokemon(species="charizard")
     switched_in = make_real_pokemon(species="venusaur")
     opponent = make_real_pokemon(species="tyranitar")
@@ -708,9 +708,72 @@ def test_events_join_to_current_slots_after_switch_and_are_consumed():
     assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
     assert obs.events_slot_ids[:2].tolist() == [1, 1]
 
+    # rebuilding the same decision yields the identical event window
+    rebuilt_obs = from_battle(battle, tokenizer)
+    assert torch.equal(rebuilt_obs.events_cat, obs.events_cat)
+    assert torch.equal(rebuilt_obs.events_num, obs.events_num)
+
+    # a new decision (new request) drains a fresh, now-empty window
+    battle._last_request = {"turn": "next"}
     next_obs = from_battle(battle, tokenizer)
     assert torch.count_nonzero(next_obs.events_cat) == 0
     assert torch.count_nonzero(next_obs.events_num) == 0
+
+
+def test_side_events_ground_to_owning_side():
+    ally = make_real_pokemon(species="charizard")
+    opponent = make_real_pokemon(species="venusaur")
+    battle = make_real_battle(
+        active_pokemon=[ally, None],
+        opponent_active_pokemon=[opponent, None],
+        team=[ally],
+        opponent_team=[opponent],
+    )
+    # Showdown side identifiers carry the username: "p1: Username", not "p1".
+    set_raw_events(
+        battle,
+        [
+            RawBattleEvent(("", "-sidestart", "p1: SomeUser", "move: Tailwind")),
+            RawBattleEvent(("", "-sidestart", "p2: OtherUser", "move: Light Screen")),
+        ],
+    )
+
+    obs = from_battle(battle, tokenizer)
+
+    assert obs.events_cat[:2, 0].tolist() == [EventTypeId.SIDE_START, EventTypeId.SIDE_START]
+    assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
+    assert obs.events_slot_ids[:2].tolist() == [0, 0]
+    assert obs.events_cat[0, 5].item() > 0  # tailwind resolved in side_conditions
+
+
+def test_event_order_recompacts():
+    ally = make_real_pokemon(species="charizard")
+    opponent = make_real_pokemon(species="venusaur")
+    battle = make_real_battle(
+        active_pokemon=[ally, None],
+        opponent_active_pokemon=[opponent, None],
+        team=[ally],
+        opponent_team=[opponent],
+    )
+    battle._team = {"p1: Charizard": ally}
+    overflow = 6
+    # low-priority flood followed by high-priority moves: survivors keep gapped
+    # original orders, which must re-compact into a dense positional range
+    raw_events = [
+        RawBattleEvent(("", "-boost", "p1a: Charizard", "atk", "1"))
+        for _ in range(EVENT_COUNT + overflow - 10)
+    ]
+    raw_events.extend(
+        RawBattleEvent(("", "move", "p1a: Charizard", "Tackle", "p2a: Venusaur")) for _ in range(10)
+    )
+    set_raw_events(battle, raw_events)
+
+    obs = from_battle(battle, tokenizer)
+
+    # positional ids stay dense in [1, EVENT_COUNT]; the order scalar stays in [0, 1)
+    assert obs.events_cat[:, 4].tolist() == list(range(1, EVENT_COUNT + 1))
+    assert obs.events_num[:, 1].max().item() < 1.0
+    assert obs.events_num[:, 2].max().item() == float(overflow)
 
 
 def test_from_battle_into_overwrites_and_validates_output_buffer():
