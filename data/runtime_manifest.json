@@ -55,8 +55,8 @@
       }
     },
     "resource_feature_abi": "champions-dex-features-v1",
-    "tensor_abi": "champions-observation-event-v2",
+    "tensor_abi": "champions-observation-event-v3",
     "vocabulary_sha256": "b8380f7f6324664087d88c9ab62a27d5185602d46ad001de05627a3a18f3e752"
   },
-  "runtime_contract_sha256": "6e53dd60fd926d57defa8e0d3ed312e65ee3f72ec0dd147c4237c8540e7284e4"
+  "runtime_contract_sha256": "5a20a0598995174dbd0490b18c5c2ee7e8f17d1bc35318083a0b4a980cc7a26d"
 }

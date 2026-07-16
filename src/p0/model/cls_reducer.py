@@ -4,7 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
+from p0.model.structured_observation import POKEMON_TOKENS
 from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
+
+_N_POKEMON_TOKENS = len(POKEMON_TOKENS)
 
 
 class CLSReducer(nn.Module):
@@ -96,6 +99,6 @@ class CLSReducer(nn.Module):
         else:
             hg = hg_candidate
 
-        # extract only the 24 pokemon tokens (skipping CLS at idx 0, and field tokens at idx 25+).
-        pokemon_tokens = enc[:, 1 + self.n_hg : 1 + self.n_hg + 24]
+        # extract only the pokemon tokens (skipping CLS at idx 0, and owner tokens after them)
+        pokemon_tokens = enc[:, 1 + self.n_hg : 1 + self.n_hg + _N_POKEMON_TOKENS]
         return cls, hg, pokemon_tokens

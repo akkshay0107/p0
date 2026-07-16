@@ -73,7 +73,7 @@ def test_event_parser_preserves_identity_target_and_evidence():
     assert events[2].effect_id > 0
 
 
-def test_schema_v2_allocates_explicit_event_overflow_channel():
+def test_schema_allocates_explicit_event_overflow_channel():
     obs = StructuredObservation.empty_batch(2)
     obs.events_num[0, 0, 2] = 7
     assert obs.overflow_totals() == (0, 7)

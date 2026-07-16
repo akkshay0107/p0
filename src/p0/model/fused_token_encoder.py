@@ -8,8 +8,9 @@ from p0.battle.events import EVENT_TYPE_COUNT
 from p0.format_config import FORMAT
 from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
-    ALLY_NUM_TOKENS,
     CAT_EFFECT_START,
+    CAT_IDX_STATUS,
+    CAT_IDX_STATUS_COUNTER_KIND,
     CAT_KNOWNNESS_START,
     CAT_KNOWNNESS_WIDTH,
     CATEGORICAL_WIDTH,
@@ -23,42 +24,48 @@ from p0.model.structured_observation import (
     NUM_IDX_MOVE_LAST,
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_MOVE_PP,
+    NUM_IDX_STATUS_COUNTER,
+    NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
+    OWNER_TOKENS,
+    POKEMON_TOKENS,
     SEQUENCE_LENGTH,
-    TOKEN_IDX_ALLY_SIDE_SUPER,
-    TOKEN_IDX_GLOBAL_FIELD_SUPER,
-    TOKEN_IDX_OPPONENT_SIDE_SUPER,
     StructuredObservation,
     TokenType,
 )
 from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 ACT_SIZE = FORMAT.action_size
-NUM_COMPONENTS = 10
-NUM_TOKEN_TYPES = 6
+NUM_COMPONENTS = 14
+NUM_TOKEN_TYPES = 4
 NUM_SIDES = 3
 NUM_SLOTS = 7
 
 # 0 CLS
-# 1,3,...,23 pokemon super tokens
-# 2,4,...,24 pokemon numeric tokens
-# 25 Global-field super
-# 26 Global-field numeric
-# 27 Ally-side super
-# 28 Ally-side numeric
-# 29 Opponent-side super
-# 30 Opponent-side numeric
-_SUPER_POS = tuple(range(1, 24, 2))  # (1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
-_NUMERIC_POS = tuple(range(2, 25, 2))  # (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)
-_FIELD_NUMERIC_POS = (26, 28, 30)
-
-
-def _load_vocab_sizes(resources: RuntimeResources) -> dict[str, int]:
-    return {name: len(values) + 1 for name, values in resources.vocab.items()}
-
+# 1-12 pokemon tokens (one fused token per Pokemon)
+# 13 Global-field, 14 Ally-side, 15 Opponent-side (one fused token per owner)
+_POKE_POS = POKEMON_TOKENS
+_OWNER_POS = OWNER_TOKENS
 
 MOVE_DYNAMIC_WIDTH = 3  # pp fraction, last-move flag, legal-this-step
+STATUS_DYNAMIC_WIDTH = 1  # status counter (turns asleep / toxic stage)
 SPECIES_STATIC_WIDTH = 9  # six base stats, weight, mega flag, forme relationship
+
+# Pokemon-owned scalars: everything in the base+provenance numeric row except the
+# fields owned by a narrower record (move dynamics -> MoveRecord, status counter
+# -> StatusRecord). Effects live past NUM_EFFECT_START and are owned by the
+# typed-effect deepset, so they are excluded structurally.
+_MOVE_DYN_IDX = frozenset(
+    index
+    for start in (NUM_IDX_MOVE_PP, NUM_IDX_MOVE_LAST, NUM_IDX_MOVE_LEGAL)
+    for index in range(start, start + MOVE_SLOTS)
+)
+_POKEMON_SCALAR_IDX = tuple(
+    index
+    for index in range(NUM_EFFECT_START)
+    if index not in _MOVE_DYN_IDX and index != NUM_IDX_STATUS_COUNTER
+)
+POKEMON_SCALAR_WIDTH = len(_POKEMON_SCALAR_IDX)
 
 _TARGET_CLASSES = (
     "self",
@@ -85,6 +92,10 @@ _TARGET_CLASS_ALIASES = {
     "any": "selectedpokemon",
 }
 MOVE_STATIC_WIDTH = 7 + len(_TARGET_CLASSES)
+
+
+def _load_vocab_sizes(resources: RuntimeResources) -> dict[str, int]:
+    return {name: len(values) + 1 for name, values in resources.vocab.items()}
 
 
 def _load_species_statics(resources: RuntimeResources) -> torch.Tensor:
@@ -194,12 +205,9 @@ class MultiAggDeepSet(nn.Module):
 
 class FusedTokenEncoder(nn.Module):
     # Buffers registered dynamically by torch need explicit declarations for Pyright.
-    _super_pos: torch.Tensor
-    _numeric_pos: torch.Tensor
-    _field_numeric_pos: torch.Tensor
-    _active_num_pos: torch.Tensor
-    _effect_super_pos: torch.Tensor
-    _effect_numeric_pos: torch.Tensor
+    _poke_pos: torch.Tensor
+    _owner_pos: torch.Tensor
+    _pokemon_scalar_idx: torch.Tensor
     _component_ids: torch.Tensor
     _species_statics: torch.Tensor
     _move_statics: torch.Tensor
@@ -237,6 +245,10 @@ class FusedTokenEncoder(nn.Module):
 
         self.species_proj = nn.Linear(d_raw, d_model)
         self.species_static_proj = nn.Linear(SPECIES_STATIC_WIDTH, d_model)
+        self.register_buffer(
+            "_species_statics", _load_species_statics(self.resources), persistent=False
+        )
+
         self.ability_proj = nn.Linear(d_raw, d_model)
         self.item_proj = nn.Linear(d_raw, d_model)
         mechanic_tags = _load_mechanic_tag_tables(self.resources)
@@ -246,44 +258,43 @@ class FusedTokenEncoder(nn.Module):
         self.ability_mechanic_proj = nn.Linear(ability_tags.shape[1], d_model, bias=False)
         self.register_buffer("_item_mechanic_tags", item_tags, persistent=False)
         self.register_buffer("_ability_mechanic_tags", ability_tags, persistent=False)
-        self.status_proj = nn.Linear(d_raw, d_model)
+
+        # pooled type summary plus a non-pooled primary-type signal, so
+        # order-sensitive mechanics (Revelation Dance) have a slot-aware channel
+        self.type_set = MultiAggDeepSet(d_raw, d_model)
+        self.primary_type_proj = nn.Linear(d_raw, d_model)
+
+        # each move fuses its identity (move/type/category embeddings), static dex scalars,
+        # and its own dynamics (pp fraction, last-used flag, legal-this-step)
+        # in one projection. The same record is pooled into the Pokemon token (query side)
+        # and down-projected for the pointer keys (key side)
+        self.move_proj = nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH + MOVE_DYNAMIC_WIDTH, d_model)
+        self.move_pos_emb = nn.Embedding(4, d_model)
+        self.register_buffer("_move_statics", _load_move_statics(self.resources), persistent=False)
+
+        # the status owns its identity and its counter dynamics as one record
+        self.status_proj = nn.Linear(d_raw + 16 + STATUS_DYNAMIC_WIDTH, d_model)
+
         self.nature_proj = nn.Linear(d_raw, d_model)
+
         self.typed_effect_set = MultiAggDeepSet(d_raw + 16 + 16 + EFFECT_NUMERICAL_WIDTH, d_model)
+
+        # Pokemon-owned dynamics (boosts, hp, protect counter, ...) are one more
+        # component of the Pokemon fusion kernel, not a second sequence token.
+        self.pokemon_scalar_proj = nn.Sequential(
+            nn.Linear(POKEMON_SCALAR_WIDTH, d_model),
+            nn.GELU(),
+        )
+        self.register_buffer(
+            "_pokemon_scalar_idx", torch.tensor(_POKEMON_SCALAR_IDX, dtype=torch.long)
+        )
+
         self.knownness_proj = nn.Linear(CAT_KNOWNNESS_WIDTH * 16, d_model)
 
+        # one internal fusion pass over all of the components above
         self.component_emb = nn.Embedding(NUM_COMPONENTS, d_model)
-        self.move_pos_emb = nn.Embedding(4, d_model)
-        self.token_type_emb = nn.Embedding(NUM_TOKEN_TYPES, d_model)
-        self.side_emb = nn.Embedding(NUM_SIDES, d_model)
-        self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
-
-        self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_model)
-        self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_model)
-        self.event_flag_emb = nn.Embedding(8, d_model)
-        self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_model)
-
-        # each move gets a move embedding, a type embedding, a category embedding,
-        # and a static scalar vector (base power, max pp, priority, accuracy)
-        self.move_proj = nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH, d_model)
-        # mixes the per-slot dynamic move state into the aux channel so the
-        # pointer move keys see more than the static move identity
-        self.move_dyn_proj = nn.Linear(MOVE_DYNAMIC_WIDTH, d_model)
-        self.type_set = MultiAggDeepSet(d_raw, d_model)
-        self.numeric_proj = nn.Sequential(
-            nn.Linear(NUMERICAL_WIDTH, d_model),
-            nn.GELU(),
-        )
-        self.field_numeric_proj = nn.Sequential(
-            nn.Linear(NUMERICAL_WIDTH, d_model),
-            nn.GELU(),
-        )
-        self.action_mask_proj = nn.Sequential(
-            nn.Linear(2 * ACT_SIZE, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-        self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
-
+        # cache component ids instead of creating them every forward pass
+        self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
         self.mon_fusion = SwiGLUTransformerEncoder(
             d_model=d_model,
             nhead=nhead,
@@ -292,36 +303,33 @@ class FusedTokenEncoder(nn.Module):
         )
         self.mon_fusion_token = nn.Parameter(torch.empty(1, 1, d_model))
 
-        # cache component ids instead of creating them every forward pass
-        self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
-        self.register_buffer(
-            "_species_statics", _load_species_statics(self.resources), persistent=False
+        # field/side-owned scalars (turn, team-preview flag, fainted count,
+        # mega availability) fused into the single owner token
+        self.owner_scalar_proj = nn.Sequential(
+            nn.Linear(NUM_PROVENANCE_START, d_model),
+            nn.GELU(),
         )
-        self.register_buffer("_move_statics", _load_move_statics(self.resources), persistent=False)
+
+        self.token_type_emb = nn.Embedding(NUM_TOKEN_TYPES, d_model)
+        self.side_emb = nn.Embedding(NUM_SIDES, d_model)
+        self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
+        self.action_mask_proj = nn.Sequential(
+            nn.Linear(2 * ACT_SIZE, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
+
+        self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_model)
+        self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_model)
+        self.event_flag_emb = nn.Embedding(8, d_model)
+        self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_model)
+
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
-        self.register_buffer("_super_pos", torch.tensor(_SUPER_POS, dtype=torch.long))
-        self.register_buffer("_numeric_pos", torch.tensor(_NUMERIC_POS, dtype=torch.long))
-        self.register_buffer(
-            "_field_numeric_pos", torch.tensor(_FIELD_NUMERIC_POS, dtype=torch.long)
-        )
-        self.register_buffer("_active_num_pos", torch.tensor(ALLY_NUM_TOKENS[:2], dtype=torch.long))
-        self.register_buffer(
-            "_effect_super_pos",
-            torch.tensor(
-                _SUPER_POS
-                + (
-                    TOKEN_IDX_GLOBAL_FIELD_SUPER,
-                    TOKEN_IDX_ALLY_SIDE_SUPER,
-                    TOKEN_IDX_OPPONENT_SIDE_SUPER,
-                ),
-                dtype=torch.long,
-            ),
-        )
-        self.register_buffer(
-            "_effect_numeric_pos",
-            torch.tensor(_NUMERIC_POS + _FIELD_NUMERIC_POS, dtype=torch.long),
-        )
+        self.register_buffer("_poke_pos", torch.tensor(_POKE_POS, dtype=torch.long))
+        self.register_buffer("_owner_pos", torch.tensor(_OWNER_POS, dtype=torch.long))
+
         self._init_weights()
 
     @torch.no_grad()
@@ -337,30 +345,15 @@ class FusedTokenEncoder(nn.Module):
         init.normal_(self.mon_fusion_token, std=emb_gain)
         init.normal_(self.action_mask_token, std=emb_gain)
 
-    def _append_action_mask_token(
-        self,
-        tokens: torch.Tensor,
-        action_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        B = tokens.size(0)
-        if action_mask.shape != (B, 2, ACT_SIZE):
-            raise ValueError(
-                f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
-            )
-        flat_mask = action_mask.reshape(B, -1).to(tokens.dtype)
-
-        mask_token = self.action_mask_token.expand(B, -1, -1)
-        mask_token = mask_token + self.action_mask_proj(flat_mask).unsqueeze(1)
-        return torch.cat([tokens, mask_token], dim=1)
-
     def _embed_pokemon_components(
-        self, categorical: torch.Tensor
+        self, categorical: torch.Tensor, numerical: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # see _pokemon_categorical in observation_builder
-        # for the order of the categorical features
+        # see _pokemon_categorical_into / _pokemon_numeric_into in
+        # observation_builder for the order of the per-Pokemon features
         species_ids = categorical[..., 0]
         species = self.species_proj(self.species_emb(species_ids))
         species = species + self.species_static_proj(self._species_statics[species_ids])
+
         ability_ids = categorical[..., 1]
         item_ids = categorical[..., 2]
         ability = self.ability_proj(self.ability_emb(ability_ids))
@@ -368,27 +361,57 @@ class FusedTokenEncoder(nn.Module):
         item = self.item_proj(self.item_emb(item_ids))
         item = item + self.item_mechanic_proj(self._item_mechanic_tags[item_ids])
 
+        # non-pooled primary-type channel
+        # some moves like revelation dance rely on the primary type
         type_summary = self.type_set(self.type_emb(categorical[..., 3:5]))
+        primary_type = self.primary_type_proj(self.type_emb(categorical[..., 3]))
 
+        # MoveRecord: identity + static dex scalars + move-owned dynamics fused once
         move_ids = categorical[..., 5:9]
+        move_dynamics = torch.stack(
+            [
+                numerical[..., NUM_IDX_MOVE_PP : NUM_IDX_MOVE_PP + MOVE_SLOTS],
+                numerical[..., NUM_IDX_MOVE_LAST : NUM_IDX_MOVE_LAST + MOVE_SLOTS],
+                numerical[..., NUM_IDX_MOVE_LEGAL : NUM_IDX_MOVE_LEGAL + MOVE_SLOTS],
+            ],
+            dim=-1,
+        )
         move_parts = torch.cat(
             [
                 self.move_emb(move_ids),
                 self.type_emb(categorical[..., 9:13]),
                 self.category_emb(categorical[..., 13:17]),
                 self._move_statics[move_ids],
+                move_dynamics,
             ],
             dim=-1,
         )
-
         # pos emb added here to break permutation invariance
         # the model downstream needs to know which slot is which
         # for a1 to choose the indices
         move_embs = self.move_proj(move_parts) + self.move_pos_emb.weight
 
-        status = self.status_proj(self.status_emb(categorical[..., 17]))
+        # StatusRecord: identity + counter semantics + counter value fused once
+        status = self.status_proj(
+            torch.cat(
+                [
+                    self.status_emb(categorical[..., CAT_IDX_STATUS]),
+                    self.counter_kind_emb(categorical[..., CAT_IDX_STATUS_COUNTER_KIND]),
+                    numerical[..., NUM_IDX_STATUS_COUNTER : NUM_IDX_STATUS_COUNTER + 1],
+                ],
+                dim=-1,
+            )
+        )
 
         nature = self.nature_proj(self.nature_emb(categorical[..., 24]))
+
+        effects = self._embed_typed_effects(categorical, numerical)
+        scalars = self.pokemon_scalar_proj(numerical[..., self._pokemon_scalar_idx])
+        knownness = self.knownness_proj(
+            self.knownness_emb(
+                categorical[..., CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH]
+            ).flatten(-2)
+        )
 
         # combine all components into (N, NUM_COMPONENTS, d_model)
         # Note: move_embs is (..., 4, d_model), others are (..., d_model)
@@ -398,9 +421,13 @@ class FusedTokenEncoder(nn.Module):
                 ability.unsqueeze(-2),
                 item.unsqueeze(-2),
                 type_summary.unsqueeze(-2),
+                primary_type.unsqueeze(-2),
                 move_embs,
                 status.unsqueeze(-2),
                 nature.unsqueeze(-2),
+                effects.unsqueeze(-2),
+                scalars.unsqueeze(-2),
+                knownness.unsqueeze(-2),
             ],
             dim=-2,
         )
@@ -414,10 +441,12 @@ class FusedTokenEncoder(nn.Module):
 
         return fused[:, 0], move_embs
 
-    def _embed_pokemon_super(self, categorical: torch.Tensor) -> torch.Tensor:
+    def _embed_pokemon_super(
+        self, categorical: torch.Tensor, numerical: torch.Tensor
+    ) -> torch.Tensor:
         """Embed Pokemon rows without exposing pointer-head auxiliary features."""
-        super_token, _ = self._embed_pokemon_components(categorical)
-        return super_token
+        fused_token, _ = self._embed_pokemon_components(categorical, numerical)
+        return fused_token
 
     def _embed_typed_effects(
         self, categorical: torch.Tensor, numerical: torch.Tensor
@@ -438,6 +467,22 @@ class FusedTokenEncoder(nn.Module):
             dim=-1,
         )
         return self.typed_effect_set(features, mask=effect_num[..., 0] > 0.5)
+
+    def _append_action_mask_token(
+        self,
+        tokens: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        B = tokens.size(0)
+        if action_mask.shape != (B, 2, ACT_SIZE):
+            raise ValueError(
+                f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
+            )
+        flat_mask = action_mask.reshape(B, -1).to(tokens.dtype)
+
+        mask_token = self.action_mask_token.expand(B, -1, -1)
+        mask_token = mask_token + self.action_mask_proj(flat_mask).unsqueeze(1)
+        return torch.cat([tokens, mask_token], dim=1)
 
     def forward(
         self,
@@ -485,45 +530,24 @@ class FusedTokenEncoder(nn.Module):
             dtype=self.mon_fusion_token.dtype,
         )
 
-        n_super = len(_SUPER_POS)
-        super_cats = categorical[:, self._super_pos, :].flatten(0, 1)
-        super_out, all_move_embs = self._embed_pokemon_components(super_cats)
+        n_poke = len(_POKE_POS)
+        poke_cats = categorical[:, self._poke_pos, :].flatten(0, 1)
+        poke_nums = numerical[:, self._poke_pos, :].flatten(0, 1)
+        poke_out, all_move_embs = self._embed_pokemon_components(poke_cats, poke_nums)
 
-        x[:, self._super_pos, :] = super_out.unflatten(0, (batch_size, n_super)).to(x.dtype)
-        aux_moves = all_move_embs.unflatten(0, (batch_size, n_super))[:, :2]
+        x[:, self._poke_pos, :] = poke_out.unflatten(0, (batch_size, n_poke)).to(x.dtype)
+        # the two active allies' MoveRecords double as the pointer-head move
+        # keys; the records already carry pp/legality state, so no extra patch
+        aux_moves = all_move_embs.unflatten(0, (batch_size, n_poke))[:, :2]
 
-        # the move embeddings above are state-blind; without this the pointer
-        # head only learns pp / encore / choice-lock nuance indirectly through z
-        active_num = numerical[:, self._active_num_pos, :]
-        move_dyn = torch.stack(
-            [
-                active_num[..., NUM_IDX_MOVE_PP : NUM_IDX_MOVE_PP + MOVE_SLOTS],
-                active_num[..., NUM_IDX_MOVE_LAST : NUM_IDX_MOVE_LAST + MOVE_SLOTS],
-                active_num[..., NUM_IDX_MOVE_LEGAL : NUM_IDX_MOVE_LEGAL + MOVE_SLOTS],
-            ],
-            dim=-1,
-        )
-        aux_moves = aux_moves + self.move_dyn_proj(move_dyn)
-
-        x[:, self._numeric_pos, :] = self.numeric_proj(numerical[:, self._numeric_pos, :]).to(
-            x.dtype
-        )
-
-        x[:, self._field_numeric_pos, :] = self.field_numeric_proj(
-            numerical[:, self._field_numeric_pos, :]
-        ).to(x.dtype)
-
-        x[:, self._effect_super_pos, :] += self._embed_typed_effects(
-            categorical[:, self._effect_super_pos, :],
-            numerical[:, self._effect_numeric_pos, :],
-        ).to(x.dtype)
-        pokemon_knownness = categorical[
-            :,
-            self._super_pos,
-            CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH,
-        ]
-        x[:, self._super_pos, :] += self.knownness_proj(
-            self.knownness_emb(pokemon_knownness).flatten(-2)
+        # field / ally-side / opponent-side owners: one fused token each, from
+        # the owner's typed effects plus its own scalars
+        x[:, self._owner_pos, :] = (
+            self._embed_typed_effects(
+                categorical[:, self._owner_pos, :],
+                numerical[:, self._owner_pos, :],
+            )
+            + self.owner_scalar_proj(numerical[:, self._owner_pos, :NUM_PROVENANCE_START])
         ).to(x.dtype)
 
         out_tokens = (
@@ -569,5 +593,4 @@ class FusedTokenEncoder(nn.Module):
         event_tokens = event_tokens * event_mask
 
         out_tokens = torch.cat([out_tokens, event_tokens.to(out_tokens.dtype)], dim=1)
-
         return out_tokens, aux_moves

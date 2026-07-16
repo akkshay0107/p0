@@ -6,14 +6,20 @@ from typing import ClassVar
 
 import torch
 
+# every entity (Pokemon, global field, ally side, opponent side) is one
+# fused token; its categorical and numerical features live on the same row index.
+OBSERVATION_SCHEMA_VERSION = 3
+
 TEAM_SIZE = 6
 MOVE_SLOTS = 4
-MAX_EFFECTS = 16
-SEQUENCE_LENGTH = 1 + TEAM_SIZE * 2 * 2 + 3 * 2
+MAX_EFFECTS = 12
+SEQUENCE_LENGTH = 1 + TEAM_SIZE * 2 + 3
 POKEMON_IDENTITY_WIDTH = 25
+CAT_IDX_STATUS = 17
 CAT_KNOWNNESS_START = 25
 CAT_KNOWNNESS_WIDTH = POKEMON_IDENTITY_WIDTH
-CAT_EFFECT_START = 52
+CAT_IDX_STATUS_COUNTER_KIND = CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
+CAT_EFFECT_START = CAT_IDX_STATUS_COUNTER_KIND + 1
 EFFECT_CATEGORICAL_WIDTH = 3
 CATEGORICAL_WIDTH = CAT_EFFECT_START + MAX_EFFECTS * EFFECT_CATEGORICAL_WIDTH
 
@@ -32,36 +38,33 @@ EVENT_NUMERICAL_WIDTH = 3
 EVENT_ORDER_VOCAB_SIZE = EVENT_COUNT + 1
 
 TOKEN_IDX_CLS = 0
-TOKEN_IDX_GLOBAL_FIELD_SUPER = 25
-TOKEN_IDX_GLOBAL_FIELD_NUMERIC = 26
-TOKEN_IDX_ALLY_SIDE_SUPER = 27
-TOKEN_IDX_ALLY_SIDE_NUMERIC = 28
-TOKEN_IDX_OPPONENT_SIDE_SUPER = 29
-TOKEN_IDX_OPPONENT_SIDE_NUMERIC = 30
+TOKEN_IDX_GLOBAL_FIELD = 13
+TOKEN_IDX_ALLY_SIDE = 14
+TOKEN_IDX_OPPONENT_SIDE = 15
 
 NUM_IDX_TEAM_PREVIEW = 2
-NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction
+NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction (MoveRecord dynamic)
 NUM_IDX_ORIG_IDX_RATIO = 26
 NUM_IDX_FAINTED = 27
-NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot "was the last move used" (actives only)
-NUM_IDX_MOVE_LEGAL = 50  # 50-53: per-move-slot "legal this step" (allies only)
+NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot "was the last move used" (MoveRecord dynamic)
+NUM_IDX_STATUS_COUNTER = 36  # StatusRecord dynamic (turns asleep / toxic stage)
+NUM_IDX_MOVE_LEGAL = 50  # 50-53: per-move-slot "legal this step" (MoveRecord dynamic)
 NUM_IDX_CAN_SWITCH_OUT = 54  # active allies only
 NUM_IDX_REVEALED = 55  # has appeared on the field this battle
 
 
-ALLY_POKE_TOKENS = (1, 3, 5, 7, 9, 11)
-ALLY_NUM_TOKENS = (2, 4, 6, 8, 10, 12)
-ALL_NUM_TOKENS = (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)
-TARGET_SEQ_INDICES = (3, 1, TOKEN_IDX_CLS, 13, 15)
+ALLY_POKE_TOKENS = (1, 2, 3, 4, 5, 6)
+OPPONENT_POKE_TOKENS = (7, 8, 9, 10, 11, 12)
+POKEMON_TOKENS = ALLY_POKE_TOKENS + OPPONENT_POKE_TOKENS
+OWNER_TOKENS = (TOKEN_IDX_GLOBAL_FIELD, TOKEN_IDX_ALLY_SIDE, TOKEN_IDX_OPPONENT_SIDE)
+TARGET_SEQ_INDICES = (2, 1, TOKEN_IDX_CLS, 7, 8)
 
 
 class TokenType(IntEnum):
     CLS = 0
-    POKEMON_SUPER = 1
-    POKEMON_NUMERIC = 2
-    FIELD_SUPER = 3
-    FIELD_NUMERIC = 4
-    EVENT = 5
+    POKEMON = 1
+    FIELD = 2
+    EVENT = 3
 
 
 class SideId(IntEnum):
@@ -251,4 +254,4 @@ class StructuredObservation:
 
 
 def is_teampreview(numerical: torch.Tensor) -> torch.Tensor:
-    return numerical[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, NUM_IDX_TEAM_PREVIEW] > 0.5
+    return numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] > 0.5

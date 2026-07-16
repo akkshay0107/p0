@@ -11,7 +11,7 @@ from typing import Any, Mapping
 from p0.paths import DEFAULT_PATHS
 
 RUNTIME_MANIFEST_SCHEMA = 2
-TENSOR_ABI = "champions-observation-event-v2"
+TENSOR_ABI = "champions-observation-event-v3"
 RESOURCE_FEATURE_ABI = "champions-dex-features-v1"
 
 # This is deliberately data, not a hash of the action-encoding implementation.

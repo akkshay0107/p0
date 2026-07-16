@@ -29,9 +29,8 @@ def test_policy_net_act_and_encoded_evaluate_shapes(policy_net):
     obs = StructuredObservation.empty_batch(B)
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
-    ally_indices = [1, 3, 5, 7, 9, 11]
-    for i, idx in enumerate(ally_indices):
-        obs.numerical[:, idx + 1, 26] = (i + 1) / 6.0
+    for i, idx in enumerate(range(1, 7)):
+        obs.numerical[:, idx, 26] = (i + 1) / 6.0
 
     action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
     state = policy_net.initial_state(B)
@@ -75,7 +74,7 @@ def test_encoder_batches_all_pokemon_in_one_fusion_call(policy_net):
     finally:
         handle.remove()
 
-    assert calls == [(B * 12, 11, 128)]
+    assert calls == [(B * 12, 15, 128)]
 
     with torch.no_grad():
         separate = [policy_net.encode(obs[i : i + 1], action_mask[i : i + 1]) for i in range(B)]
@@ -150,9 +149,10 @@ def test_nature_embedding_correctness(policy_net):
     cat1[0, 24] = 5  # arbitrary nature ID
     cat2 = torch.zeros((1, CATEGORICAL_WIDTH), dtype=torch.long)
     cat2[0, 24] = 12  # different nature ID
+    num = torch.zeros((1, NUMERICAL_WIDTH))
 
-    out1 = encoder._embed_pokemon_super(cat1)
-    out2 = encoder._embed_pokemon_super(cat2)
+    out1 = encoder._embed_pokemon_super(cat1, num)
+    out2 = encoder._embed_pokemon_super(cat2, num)
     assert not torch.allclose(out1, out2), (
         "Changing nature did not change the Pokemon super embedding"
     )
@@ -163,30 +163,22 @@ def test_fainted_pokemon_visible(policy_net):
     obs = StructuredObservation.empty_batch(B)
 
     obs.token_type_ids[0, 0] = 0  # CLS
-    for i in range(1, 13):
-        obs.token_type_ids[0, i] = 1 if i % 2 == 1 else 2  # Super or Numeric
+    for i in range(1, 7):
+        obs.token_type_ids[0, i] = 1  # POKEMON
         obs.side_ids[0, i] = 1  # ALLY
-        obs.slot_ids[0, i] = (i - 1) // 2 + 1
-    for i in range(13, 25):
-        obs.token_type_ids[0, i] = 1 if i % 2 == 1 else 2  # Super or Numeric
+        obs.slot_ids[0, i] = i
+    for i in range(7, 13):
+        obs.token_type_ids[0, i] = 1  # POKEMON
         obs.side_ids[0, i] = 2  # OPPONENT
-        obs.slot_ids[0, i] = (i - 13) // 2 + 1
+        obs.slot_ids[0, i] = i - 6
 
-    obs.token_type_ids[0, 25] = 3  # FIELD_SUPER
-    obs.token_type_ids[0, 26] = 4  # FIELD_NUMERIC
-    obs.token_type_ids[0, 27] = 3  # FIELD_SUPER
-    obs.token_type_ids[0, 28] = 4  # FIELD_NUMERIC
-    obs.side_ids[0, 27] = 1
-    obs.side_ids[0, 28] = 1
-    obs.token_type_ids[0, 29] = 3  # FIELD_SUPER
-    obs.token_type_ids[0, 30] = 4  # FIELD_NUMERIC
-    obs.side_ids[0, 29] = 2
-    obs.side_ids[0, 30] = 2
+    obs.token_type_ids[0, 13:16] = 2  # FIELD owners
+    obs.side_ids[0, 14] = 1
+    obs.side_ids[0, 15] = 2
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
-    ally_indices = [1, 3, 5, 7, 9, 11]
-    for i, idx in enumerate(ally_indices):
-        obs.numerical[:, idx + 1, 26] = (i + 1) / 6.0
+    for i, idx in enumerate(range(1, 7)):
+        obs.numerical[:, idx, 26] = (i + 1) / 6.0
 
     action_mask = torch.ones((B, 2, ACT_SIZE), dtype=torch.bool)
     actions = torch.full((B, 2), 7, dtype=torch.long)
@@ -195,8 +187,8 @@ def test_fainted_pokemon_visible(policy_net):
     with torch.no_grad():
         out_active = policy_net.evaluate_obs(obs, action_mask, actions, state)
 
-    # Mark Ally Pokemon 2 (numeric at index 4) as fainted (fainted flag at 27)
-    obs.numerical[:, 4, 27] = 1.0
+    # Mark Ally Pokemon 2 (token index 2) as fainted (fainted flag at 27)
+    obs.numerical[:, 2, 27] = 1.0
 
     with torch.no_grad():
         out_fainted = policy_net.evaluate_obs(obs, action_mask, actions, state)
@@ -204,9 +196,9 @@ def test_fainted_pokemon_visible(policy_net):
     assert not torch.allclose(out_active.logits, out_fainted.logits, atol=1e-5)
 
     # Modify the features of the fainted pokemon:
-    obs.categorical[:, 3, 0] = 41  # species
-    obs.categorical[:, 3, 14] = 2  # move category
-    obs.numerical[:, 4, 0] = 0.99  # numeric stat
+    obs.categorical[:, 2, 0] = 41  # species
+    obs.categorical[:, 2, 14] = 2  # move category
+    obs.numerical[:, 2, 0] = 0.99  # numeric stat
 
     with torch.no_grad():
         out_modified = policy_net.evaluate_obs(obs, action_mask, actions, state)
@@ -216,7 +208,7 @@ def test_fainted_pokemon_visible(policy_net):
 
 
 def test_cls_reducer_pokemon_tokens_alignment():
-    """pokemon_tokens must be exactly the 24 pokemon tokens (original indices 1-24)."""
+    """pokemon_tokens must be exactly the 12 pokemon tokens (original indices 1-12)."""
     import torch.nn as nn
 
     from p0.model.cls_reducer import CLSReducer
@@ -240,4 +232,4 @@ def test_cls_reducer_pokemon_tokens_alignment():
     state = reducer.hg_init.expand(tokens.size(0), -1, -1)
     _, _, pokemon_tokens = reducer(tokens, state, None)
 
-    torch.testing.assert_close(pokemon_tokens, tokens[:, 1:25])
+    torch.testing.assert_close(pokemon_tokens, tokens[:, 1:13])

@@ -661,24 +661,18 @@ def test_from_battle_real_end_to_end():
     assert obs.events_slot_ids.shape == (EVENT_COUNT,)
 
     assert obs.token_type_ids[0] == TokenType.CLS
-    assert obs.token_type_ids[1] == TokenType.POKEMON_SUPER
-    assert obs.token_type_ids[2] == TokenType.POKEMON_NUMERIC
-    assert obs.token_type_ids[25] == TokenType.FIELD_SUPER
-    assert obs.token_type_ids[26] == TokenType.FIELD_NUMERIC
-    assert obs.token_type_ids[27] == TokenType.FIELD_SUPER
-    assert obs.token_type_ids[28] == TokenType.FIELD_NUMERIC
-    assert obs.token_type_ids[29] == TokenType.FIELD_SUPER
-    assert obs.token_type_ids[30] == TokenType.FIELD_NUMERIC
+    assert obs.token_type_ids[1] == TokenType.POKEMON
+    assert obs.token_type_ids[12] == TokenType.POKEMON
+    assert obs.token_type_ids[13] == TokenType.FIELD
+    assert obs.token_type_ids[14] == TokenType.FIELD
+    assert obs.token_type_ids[15] == TokenType.FIELD
 
     assert obs.side_ids[0] == SideId.NONE
     assert obs.side_ids[1] == SideId.ALLY
-    assert obs.side_ids[13] == SideId.OPPONENT
-    assert obs.side_ids[25] == SideId.NONE
-    assert obs.side_ids[26] == SideId.NONE
-    assert obs.side_ids[27] == SideId.ALLY
-    assert obs.side_ids[28] == SideId.ALLY
-    assert obs.side_ids[29] == SideId.OPPONENT
-    assert obs.side_ids[30] == SideId.OPPONENT
+    assert obs.side_ids[7] == SideId.OPPONENT
+    assert obs.side_ids[13] == SideId.NONE
+    assert obs.side_ids[14] == SideId.ALLY
+    assert obs.side_ids[15] == SideId.OPPONENT
 
 
 def test_events_join_to_current_slots_after_switch_and_are_consumed():
@@ -940,12 +934,12 @@ def test_concurrent_universal_effect_stress_state():
 
     obs = from_battle(battle, tokenizer)
 
-    assert obs.numerical[2, NUM_IDX_EFFECT_COUNT] == 9
-    assert obs.numerical[28, NUM_IDX_EFFECT_COUNT] == 7
-    assert obs.numerical[26, NUM_IDX_EFFECT_COUNT] == 6
+    assert obs.numerical[1, NUM_IDX_EFFECT_COUNT] == 9
+    assert obs.numerical[14, NUM_IDX_EFFECT_COUNT] == 7
+    assert obs.numerical[13, NUM_IDX_EFFECT_COUNT] == 6
     assert obs.numerical[:, NUM_IDX_EFFECT_OVERFLOW].sum() == 0
     pokemon_effects = obs.categorical[1, CAT_EFFECT_START::EFFECT_CATEGORICAL_WIDTH]
     assert torch.count_nonzero(pokemon_effects) == 9
-    namespaces = obs.categorical[25, CAT_EFFECT_START + 2 :: EFFECT_CATEGORICAL_WIDTH]
+    namespaces = obs.categorical[13, CAT_EFFECT_START + 2 :: EFFECT_CATEGORICAL_WIDTH]
     assert EffectNamespace.FIELD in namespaces
     assert EffectNamespace.WEATHER in namespaces

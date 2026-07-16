@@ -19,12 +19,22 @@ from p0.format_config import current_manifest, validate_artifact_runtime_contrac
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
+    CAT_EFFECT_START,
+    CAT_IDX_STATUS_COUNTER_KIND,
     CATEGORICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
     EVENT_NUMERICAL_WIDTH,
+    MAX_EFFECTS,
+    NUM_EFFECT_START,
+    NUM_IDX_STATUS_COUNTER,
     NUMERICAL_WIDTH,
+    OBSERVATION_SCHEMA_VERSION,
     SEQUENCE_LENGTH,
+    TOKEN_IDX_ALLY_SIDE,
+    TOKEN_IDX_GLOBAL_FIELD,
+    TOKEN_IDX_OPPONENT_SIDE,
+    CounterKind,
     Knownness,
     Provenance,
     SideId,
@@ -111,23 +121,63 @@ def test_golden_observation_shape_indices_and_enum_ids() -> None:
     assert observation.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
     assert observation.events_cat.shape == (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH)
     assert observation.events_num.shape == (EVENT_COUNT, EVENT_NUMERICAL_WIDTH)
-    assert observation.token_type_ids[[0, 1, 2, 25, 26]].tolist() == [
+    assert observation.token_type_ids[[0, 1, 12, 13, 14, 15]].tolist() == [
         TokenType.CLS,
-        TokenType.POKEMON_SUPER,
-        TokenType.POKEMON_NUMERIC,
-        TokenType.FIELD_SUPER,
-        TokenType.FIELD_NUMERIC,
+        TokenType.POKEMON,
+        TokenType.POKEMON,
+        TokenType.FIELD,
+        TokenType.FIELD,
+        TokenType.FIELD,
     ]
-    assert observation.side_ids[[0, 1, 13, 27, 29]].tolist() == [
+    assert observation.side_ids[[0, 1, 7, 13, 14, 15]].tolist() == [
         SideId.NONE,
         SideId.ALLY,
         SideId.OPPONENT,
+        SideId.NONE,
         SideId.ALLY,
         SideId.OPPONENT,
     ]
     assert [member.value for member in Knownness] == [0, 1, 2, 3, 4]
     assert [member.value for member in Provenance] == [0, 1, 2, 3, 4, 5]
-    assert observation.numerical[2, 5].item() == pytest.approx(0.73)
+    assert observation.numerical[1, 5].item() == pytest.approx(0.73)
+
+
+def test_schema_v3_owned_entity_layout_is_pinned() -> None:
+    """Pin the v3 owned-entity layout: one fused token per owner, no numeric tokens."""
+    assert OBSERVATION_SCHEMA_VERSION == 3
+    assert SEQUENCE_LENGTH == 16
+    assert MAX_EFFECTS == 12
+    assert CATEGORICAL_WIDTH == 87
+    assert NUMERICAL_WIDTH == 126
+    assert CAT_IDX_STATUS_COUNTER_KIND == 50
+    assert CAT_EFFECT_START == 51
+    assert NUM_IDX_STATUS_COUNTER == 36
+    assert NUM_EFFECT_START == 64
+    assert (TOKEN_IDX_GLOBAL_FIELD, TOKEN_IDX_ALLY_SIDE, TOKEN_IDX_OPPONENT_SIDE) == (13, 14, 15)
+    # the v2 super/numeric token-pair split is retired
+    assert [member.name for member in TokenType] == ["CLS", "POKEMON", "FIELD", "EVENT"]
+
+
+def test_status_record_owns_counter_semantics() -> None:
+    """StatusRecord (plan §3.1): SLP ages publicly, TOX stacks, others are presence-only."""
+    from poke_env.battle.status import Status
+
+    from p0.model.observation_builder import _status_counter_kind
+
+    assert _status_counter_kind(Status.SLP) == CounterKind.TURN_AGE
+    assert _status_counter_kind(Status.TOX) == CounterKind.STACK_COUNT
+    assert _status_counter_kind(Status.BRN) == CounterKind.PRESENCE_ONLY
+    assert _status_counter_kind(Status.PAR) == CounterKind.PRESENCE_ONLY
+    assert _status_counter_kind(Status.FRZ) == CounterKind.PRESENCE_ONLY
+    assert _status_counter_kind(None) == CounterKind.PRESENCE_ONLY
+
+    battle = _golden_battle()
+    ally = next(iter(battle.team.values()))
+    ally._status = Status.TOX
+    ally._status_counter = 2
+    observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
+    assert observation.categorical[1, CAT_IDX_STATUS_COUNTER_KIND] == CounterKind.STACK_COUNT
+    assert observation.numerical[1, NUM_IDX_STATUS_COUNTER].item() == pytest.approx(2 / 5)
 
 
 def test_event_priority_order_and_overflow_are_stable() -> None:

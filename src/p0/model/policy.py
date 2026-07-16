@@ -34,7 +34,6 @@ from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
 from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
-    ALLY_NUM_TOKENS,
     ALLY_POKE_TOKENS,
     EVENT_COUNT,
     NUM_IDX_ORIG_IDX_RATIO,
@@ -118,7 +117,7 @@ class ActorPolicy(nn.Module):
 
     target_entity_indices: Tensor
     ally_poke_entities: Tensor
-    ally_num_tokens: Tensor
+    ally_token_pos: Tensor
     batch_indices: Tensor
     all_a: Tensor
 
@@ -149,8 +148,7 @@ class ActorPolicy(nn.Module):
             use_history=True,
         )
 
-        self.w_k_super = nn.Linear(d_model, self.d_k)
-        self.w_k_num = nn.Linear(d_model, self.d_k)
+        self.w_k_entity = nn.Linear(d_model, self.d_k)
         self.w_k_move = nn.Linear(d_model, self.d_k)
 
         # fused query projector for the 4 query types
@@ -171,19 +169,19 @@ class ActorPolicy(nn.Module):
         self.target_self_key = nn.Parameter(torch.empty(self.d_k))
         self.pointer_temp = nn.Parameter(torch.tensor(0.01))
 
-        # entity i is built from the pokemon token pair (1 + 2i, 2 + 2i); the
-        # learned self key is appended after the N_KEY_ENTITIES real entities
+        # entity i is the single fused pokemon token at sequence position 1 + i;
+        # the learned self key is appended after the N_KEY_ENTITIES real entities
         target_entities = [
-            N_KEY_ENTITIES if t == TOKEN_IDX_CLS else (t - 1) // 2 for t in TARGET_SEQ_INDICES
+            N_KEY_ENTITIES if t == TOKEN_IDX_CLS else t - 1 for t in TARGET_SEQ_INDICES
         ]
         self.register_buffer(
             "target_entity_indices", torch.tensor(target_entities, dtype=torch.long)
         )
         self.register_buffer(
             "ally_poke_entities",
-            torch.tensor([(t - 1) // 2 for t in ALLY_POKE_TOKENS], dtype=torch.long),
+            torch.tensor([t - 1 for t in ALLY_POKE_TOKENS], dtype=torch.long),
         )
-        self.register_buffer("ally_num_tokens", torch.tensor(ALLY_NUM_TOKENS, dtype=torch.long))
+        self.register_buffer("ally_token_pos", torch.tensor(ALLY_POKE_TOKENS, dtype=torch.long))
         self.register_buffer("all_a", torch.arange(TP_END, dtype=torch.long))
 
         self._init_weights()
@@ -201,10 +199,7 @@ class ActorPolicy(nn.Module):
 
     def _compute_keys(self, tokens_ctx: Tensor) -> Tensor:
         B = tokens_ctx.size(0)
-        k_tokens = tokens_ctx[:, : 2 * N_KEY_ENTITIES]
-        k_super = self.w_k_super(k_tokens[:, 0::2])
-        k_num = self.w_k_num(k_tokens[:, 1::2])
-        k_entity = k_super + k_num
+        k_entity = self.w_k_entity(tokens_ctx[:, :N_KEY_ENTITIES])
 
         k_self = self.target_self_key.unsqueeze(0).unsqueeze(1).expand(B, 1, -1)
         k_entity_extended = torch.cat([k_entity, k_self], dim=1)
@@ -246,9 +241,7 @@ class ActorPolicy(nn.Module):
 
         k_ally = k_entity_extended[:, self.ally_poke_entities, :]
         switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / math.sqrt(self.d_k)
-        orig_ids = torch.round(
-            numerical[:, self.ally_num_tokens, NUM_IDX_ORIG_IDX_RATIO] * 6
-        ).long()
+        orig_ids = torch.round(numerical[:, self.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
         orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
         logits.scatter_(1, orig_ids, switch_scores.to(logits.dtype))
         action_keys.scatter_(

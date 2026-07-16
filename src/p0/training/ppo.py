@@ -14,7 +14,7 @@ from torch.amp import GradScaler, autocast
 
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.model.structured_observation import (
-    TOKEN_IDX_GLOBAL_FIELD_NUMERIC,
+    TOKEN_IDX_GLOBAL_FIELD,
     StructuredObservation,
     is_teampreview,
 )
@@ -207,8 +207,8 @@ def _run_batched_ppo(
                         f"  action_masks_t (p1): {action_masks_t[idx, 0].nonzero().squeeze(-1).tolist()}\n"
                         f"  action_masks_t (p2): {action_masks_t[idx, 1].nonzero().squeeze(-1).tolist()}\n"
                         f"  is_tp_t: {is_tp_t[idx].item()}\n"
-                        "  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4]: "
-                        f"{enc_t.numerical[idx, TOKEN_IDX_GLOBAL_FIELD_NUMERIC, :4].tolist()}\n"
+                        "  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD, :4]: "
+                        f"{enc_t.numerical[idx, TOKEN_IDX_GLOBAL_FIELD, :4].tolist()}\n"
                         f"  old_log_prob: {old_log_probs_t[idx].item()}\n"
                         f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
                     )

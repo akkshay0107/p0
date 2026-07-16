@@ -7,6 +7,7 @@ from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_STATUS_COUNTER_KIND,
     CAT_KNOWNNESS_START,
     CAT_KNOWNNESS_WIDTH,
     CATEGORICAL_WIDTH,
@@ -35,71 +36,61 @@ def dummy_obs():
 
     token_type_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
     token_type_ids[:, 0] = TokenType.CLS
-    token_type_ids[:, 1:13] = TokenType.POKEMON_SUPER
-    token_type_ids[:, 13:25] = TokenType.POKEMON_NUMERIC
-    token_type_ids[:, 25] = TokenType.FIELD_SUPER
-    token_type_ids[:, 26] = TokenType.FIELD_NUMERIC
-    token_type_ids[:, 27] = TokenType.FIELD_SUPER
-    token_type_ids[:, 28] = TokenType.FIELD_NUMERIC
-    token_type_ids[:, 29] = TokenType.FIELD_SUPER
-    token_type_ids[:, 30] = TokenType.FIELD_NUMERIC
+    token_type_ids[:, 1:13] = TokenType.POKEMON
+    token_type_ids[:, 13:16] = TokenType.FIELD
 
     side_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
-    side_ids[:, 1:13] = SideId.ALLY
-    side_ids[:, 13:25] = SideId.OPPONENT
-    side_ids[:, 25:27] = SideId.NONE
-    side_ids[:, 27:29] = SideId.ALLY
-    side_ids[:, 29:31] = SideId.OPPONENT
+    side_ids[:, 1:7] = SideId.ALLY
+    side_ids[:, 7:13] = SideId.OPPONENT
+    side_ids[:, 13] = SideId.NONE
+    side_ids[:, 14] = SideId.ALLY
+    side_ids[:, 15] = SideId.OPPONENT
 
     slot_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
     for i in range(6):
-        # 1, 2 for first pokemon, 3, 4 for second pokemon, etc.
-        slot_ids[:, 1 + 2 * i : 1 + 2 * i + 2] = i + 1
-        slot_ids[:, 13 + 2 * i : 13 + 2 * i + 2] = i + 1
+        slot_ids[:, 1 + i] = i + 1
+        slot_ids[:, 7 + i] = i + 1
 
     # Populate categorical with random IDs respecting vocab limits
     categorical = torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long)
 
-    # Pokemon tokens (1-24)
+    # Pokemon tokens (1-12)
     # species (0): 1-34
-    categorical[:, 1:25, 0] = torch.randint(1, 35, (B, 24))
+    categorical[:, 1:13, 0] = torch.randint(1, 35, (B, 12))
     # ability (1): 1-23
-    categorical[:, 1:25, 1] = torch.randint(1, 24, (B, 24))
+    categorical[:, 1:13, 1] = torch.randint(1, 24, (B, 12))
     # item (2): 1-18
-    categorical[:, 1:25, 2] = torch.randint(1, 19, (B, 24))
+    categorical[:, 1:13, 2] = torch.randint(1, 19, (B, 12))
     # types (3,4): 1-18
-    categorical[:, 1:25, 3:5] = torch.randint(1, 19, (B, 24, 2))
+    categorical[:, 1:13, 3:5] = torch.randint(1, 19, (B, 12, 2))
     # moves (5-8): 1-69
-    categorical[:, 1:25, 5:9] = torch.randint(1, 70, (B, 24, 4))
+    categorical[:, 1:13, 5:9] = torch.randint(1, 70, (B, 12, 4))
     # move_types (9-12): 1-18
-    categorical[:, 1:25, 9:13] = torch.randint(1, 19, (B, 24, 4))
+    categorical[:, 1:13, 9:13] = torch.randint(1, 19, (B, 12, 4))
     # move_categories (13-16): 1-3
-    categorical[:, 1:25, 13:17] = torch.randint(1, 4, (B, 24, 4))
+    categorical[:, 1:13, 13:17] = torch.randint(1, 4, (B, 12, 4))
     # status (17): 1-6
-    categorical[:, 1:25, 17] = torch.randint(1, 7, (B, 24))
-    categorical[:, 1:25, CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH] = (
-        torch.randint(1, 5, (B, 24, CAT_KNOWNNESS_WIDTH))
+    categorical[:, 1:13, 17] = torch.randint(1, 7, (B, 12))
+    # status counter kind: 0-4
+    categorical[:, 1:13, CAT_IDX_STATUS_COUNTER_KIND] = torch.randint(0, 5, (B, 12))
+    categorical[:, 1:13, CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH] = (
+        torch.randint(1, 5, (B, 12, CAT_KNOWNNESS_WIDTH))
     )
 
     # Numerical features
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
 
-    effect_super = (1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29)
-    effect_numeric = (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30)
-    for super_idx, numeric_idx in zip(effect_super, effect_numeric, strict=True):
+    for token_idx in range(1, 16):
         categorical[
-            :, super_idx, CAT_EFFECT_START : CAT_EFFECT_START + EFFECT_CATEGORICAL_WIDTH
+            :, token_idx, CAT_EFFECT_START : CAT_EFFECT_START + EFFECT_CATEGORICAL_WIDTH
         ] = torch.tensor((1, 1, 1))
-        numerical[:, numeric_idx, NUM_EFFECT_START : NUM_EFFECT_START + EFFECT_NUMERICAL_WIDTH] = (
-            1.0
-        )
+        numerical[:, token_idx, NUM_EFFECT_START : NUM_EFFECT_START + EFFECT_NUMERICAL_WIDTH] = 1.0
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
-    ally_indices = [1, 3, 5, 7, 9, 11]
-    for i, idx in enumerate(ally_indices):
-        numerical[:, idx + 1, 26] = (i + 1) / 6.0
+    for i, idx in enumerate(range(1, 7)):
+        numerical[:, idx, 26] = (i + 1) / 6.0
 
-    numerical[:, 26, 2] = 1.0
+    numerical[:, 13, 2] = 1.0
 
     events_cat = torch.zeros((B, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), dtype=torch.long)
     events_cat[..., 0] = torch.randint(1, 19, (B, EVENT_COUNT))
