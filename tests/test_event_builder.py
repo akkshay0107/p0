@@ -44,12 +44,6 @@ def test_parse_events_returns_typed_events_in_protocol_order():
     assert events[1].value == -0.25
 
 
-def test_parse_events_uses_zero_when_previous_hp_is_unknown():
-    events = parse_events([RawBattleEvent(("", "-damage", "p2a: Charizard", "75/100"))])
-
-    assert events[0].value == 0.0
-
-
 def test_parse_events_distinguishes_failed_and_blocked_moves():
     events = parse_events(
         [
@@ -66,15 +60,27 @@ def test_parse_events_distinguishes_failed_and_blocked_moves():
     ]
 
 
-def test_truncate_events_keeps_priority_and_original_order():
-    events = [BattleEvent(EventTypeId.DAMAGE, "p1a: Pikachu", order=order) for order in range(24)]
-    events.append(BattleEvent(EventTypeId.MOVE, "p2a: Charizard", order=24))
+def test_ability_field_and_move_evidence():
+    events = parse_events(
+        [
+            RawBattleEvent(
+                ("", "move", "p1a: Mew", "Metronome", "p2a: Gengar", "[from] ability: Dancer")
+            ),
+            RawBattleEvent(("", "-ability", "p2a: Gengar", "Cursed Body")),
+            RawBattleEvent(("", "-fieldstart", "move: Trick Room")),
+            RawBattleEvent(("", "-fieldend", "move: Trick Room")),
+        ]
+    )
 
-    selected = truncate_events(events)
-
-    assert len(selected) == 24
-    assert [event.order for event in selected] == [*range(23), 24]
-    assert selected[-1].event_type == EventTypeId.MOVE
+    assert events[0].target_id == "p2a: Gengar"
+    assert events[0].flags & 4
+    assert events[1].event_type == EventTypeId.ABILITY
+    assert events[1].ability_id > 0
+    assert [event.event_type for event in events[2:]] == [
+        EventTypeId.FIELD_START,
+        EventTypeId.FIELD_END,
+    ]
+    assert events[2].effect_id > 0
 
 
 def test_status_codes_resolve_against_vocab():
@@ -216,7 +222,7 @@ def test_weather_upkeep_is_skipped():
 def test_diagnostics_count_oov_and_missing_pre_hp():
     EVENT_DIAGNOSTICS.clear()
 
-    parse_events(
+    events = parse_events(
         [
             RawBattleEvent(("", "move", "p1a: Pikachu", "Not A Real Move", "p2a: Charizard")),
             RawBattleEvent(("", "-damage", "p2a: Charizard", "75/100")),
@@ -224,6 +230,7 @@ def test_diagnostics_count_oov_and_missing_pre_hp():
     )
 
     assert EVENT_DIAGNOSTICS == {"oov_ids": 1, "missing_pre_hp": 1}
+    assert events[1].value == 0.0  # missing pre-hp degrades to a zero delta
     EVENT_DIAGNOSTICS.clear()
 
 

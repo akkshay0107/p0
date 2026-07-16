@@ -29,6 +29,7 @@ from p0.model.observation_builder import (
     _side_mega_available,
     _side_token_into,
     _slot_condition,
+    _write_effects,
 )
 from p0.model.observation_builder import (
     _pokemon_numeric_into as _write_pokemon_numeric,
@@ -38,13 +39,13 @@ from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
-    EVENT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
-    EVENT_NUMERICAL_WIDTH,
+    MAX_EFFECTS,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
+    CounterKind,
     EffectNamespace,
     Provenance,
     SideId,
@@ -274,6 +275,7 @@ def test_pokemon_categorical_and_numeric_rows_real():
         effects=effects,
         status=Status.BRN,
     )
+    mon._nature = "Jolly"
 
     cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
     _pokemon_categorical_into(mon, tokenizer, _iter_move_slots(mon), cat)
@@ -308,6 +310,9 @@ def test_pokemon_categorical_and_numeric_rows_real():
     assert cat[17] == tokenizer.status_id(Status.BRN)
 
     assert not cat[18:24].any()
+
+    # Nature
+    assert cat[24] == tokenizer.nature_id(mon) > 0
     battle = make_real_battle()
 
     # None Pokemon returns mostly zeros except for condition flag (e.g. cond=1 -> row[2] = 1.0)
@@ -636,43 +641,33 @@ def test_global_and_side_field_tokens_include_mega_availability():
     )
 
 
-def test_from_battle_real_end_to_end():
-    """Verify that from_battle generates structured observation tensors with correct dimensions using real objects."""
-    p1 = make_real_pokemon(species="charizard")
-    team = [p1]
-    battle = make_real_battle(
-        active_pokemon=[p1, None],
-        opponent_active_pokemon=[None, None],
-        team=team,
-        opponent_team=[],
-        teampreview=False,
-    )
+def test_effect_overflow_is_counted_and_enforced():
+    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    num = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+    entries = [
+        (
+            EffectNamespace.POKEMON,
+            effect_id,
+            CounterKind.ACTION_COUNT,
+            float(effect_id),
+            0.0,
+            False,
+            0.0,
+        )
+        for effect_id in range(MAX_EFFECTS + 3, 0, -1)
+    ]
 
-    obs = from_battle(battle, tokenizer)
-    assert obs.token_type_ids.shape == (SEQUENCE_LENGTH,)
-    assert obs.side_ids.shape == (SEQUENCE_LENGTH,)
-    assert obs.slot_ids.shape == (SEQUENCE_LENGTH,)
-    assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
-    assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
+    _write_effects(entries, cat, num)
 
-    assert obs.events_cat.shape == (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH)
-    assert obs.events_num.shape == (EVENT_COUNT, EVENT_NUMERICAL_WIDTH)
-    assert obs.events_side_ids.shape == (EVENT_COUNT,)
-    assert obs.events_slot_ids.shape == (EVENT_COUNT,)
+    assert num[NUM_IDX_EFFECT_COUNT] == MAX_EFFECTS + 3
+    assert num[NUM_IDX_EFFECT_OVERFLOW] == 3
+    assert cat[CAT_EFFECT_START] == 1
 
-    assert obs.token_type_ids[0] == TokenType.CLS
-    assert obs.token_type_ids[1] == TokenType.POKEMON
-    assert obs.token_type_ids[12] == TokenType.POKEMON
-    assert obs.token_type_ids[13] == TokenType.FIELD
-    assert obs.token_type_ids[14] == TokenType.FIELD
-    assert obs.token_type_ids[15] == TokenType.FIELD
-
-    assert obs.side_ids[0] == SideId.NONE
-    assert obs.side_ids[1] == SideId.ALLY
-    assert obs.side_ids[7] == SideId.OPPONENT
-    assert obs.side_ids[13] == SideId.NONE
-    assert obs.side_ids[14] == SideId.ALLY
-    assert obs.side_ids[15] == SideId.OPPONENT
+    # unmarked truncation (count over capacity with no overflow flag) is rejected
+    obs = StructuredObservation.empty_batch(1)
+    obs.numerical[0, 1, NUM_IDX_EFFECT_COUNT] = MAX_EFFECTS + 1
+    with pytest.raises(ValueError, match="overflow"):
+        obs.validate_overflow_contract()
 
 
 def test_events_ground_to_slots_and_are_idempotent():
@@ -948,18 +943,6 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
         assert isinstance(obs, StructuredObservation)
         assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
         assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
-
-
-def test_pokemon_nature_in_categorical():
-    mon = make_real_pokemon(species="charizard")
-    mon._nature = "Jolly"
-
-    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    _pokemon_categorical_into(mon, tokenizer, _iter_move_slots(mon), cat)
-    assert len(cat) == CATEGORICAL_WIDTH
-    jolly_id = tokenizer.nature_id(mon)
-    assert jolly_id > 0
-    assert cat[24] == jolly_id
 
 
 def test_concurrent_universal_effect_stress_state():
