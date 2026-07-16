@@ -1,13 +1,11 @@
 import asyncio
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
 import pytest
 import torch
-from poke_env import LocalhostServerConfiguration
 from poke_env.battle import DoubleBattle, Pokemon
 from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
@@ -18,35 +16,64 @@ from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 from poke_env.player import RandomPlayer
 
-from src.env import SimEnv
-from src.model.event_builder import EventCollector, EventTypeId, RawBattleEvent
-from src.model.observation_builder import (
-    _cached_raw_stats,
-    _estimate_stat_by_nature,
+from p0.battle.events import EventTypeId, RawBattleEvent
+from p0.format_config import FORMAT
+from p0.model.observation_builder import (
+    ObservationBuilder,
+    _cached_imputed_stats,
     _get_ordered_pokemon,
+    _get_pokemon_level_stats,
     _global_field_token_into,
     _iter_move_slots,
     _pokemon_categorical_into,
-    _pokemon_numeric_into,
     _side_mega_available,
     _side_token_into,
     _slot_condition,
-    from_battle,
-    from_battle_into,
+    _write_effects,
 )
-from src.model.structured_observation import (
+from p0.model.observation_builder import (
+    _pokemon_numeric_into as _write_pokemon_numeric,
+)
+from p0.model.resources import default_runtime_resources
+from p0.model.structured_observation import (
+    CAT_EFFECT_START,
     CATEGORICAL_WIDTH,
-    EVENT_CATEGORICAL_WIDTH,
+    EFFECT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
-    EVENT_NUMERICAL_WIDTH,
+    MAX_EFFECTS,
+    NUM_IDX_EFFECT_COUNT,
+    NUM_IDX_EFFECT_OVERFLOW,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
+    CounterKind,
+    EffectNamespace,
+    Provenance,
     SideId,
     StructuredObservation,
     TokenType,
 )
-from src.model.tokenizer import tokenizer
-from src.team_picker import RandomTeamFromPool
+from p0.model.tokenizer import tokenizer
+from p0.runtime.env import SimEnv
+from p0.runtime.live_event_capture import set_raw_events
+from p0.runtime.poke_env_battle_adapter import battle_view
+from p0.teams.source import ValidatedTeam
+from p0.teams.stat_points import PrecomputedStats
+
+_OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
+
+
+def from_battle(battle, tok=tokenizer, stat_overrides=None):
+    assert tok is _OBSERVATION_BUILDER.tokenizer
+    return _OBSERVATION_BUILDER.build(battle_view(battle), stat_overrides)
+
+
+def from_battle_into(battle, out, tok=tokenizer, stat_overrides=None):
+    assert tok is _OBSERVATION_BUILDER.tokenizer
+    _OBSERVATION_BUILDER.build_into(battle_view(battle), out, stat_overrides)
+
+
+def _pokemon_numeric_into(pokemon, battle, *args, **kwargs):
+    return _write_pokemon_numeric(pokemon, battle_view(battle), *args, **kwargs)
 
 
 def make_real_pokemon(
@@ -166,25 +193,70 @@ def make_real_battle(
 
 @pytest.fixture(scope="module")
 def battle_format():
-    return "gen9championsvgc2026regma"
+    return FORMAT.battle_format
 
 
 @pytest.fixture(scope="module")
 def sample_team():
-    root_dir = Path(__file__).resolve().parent.parent
-    teams_dir = root_dir / "teams"
-    if not teams_dir.exists():
-        pytest.skip("No teams directory found.")
-    team_files = [
-        path.read_text(encoding="utf-8")
-        for path in teams_dir.iterdir()
-        if path.is_file() and not path.name.startswith(".")
-    ]
-    return RandomTeamFromPool(team_files)
+    team = """
+Pikachu @ Light Ball
+Ability: Static
+Level: 50
+Jolly Nature
+- Fake Out
+- Protect
+- Thunderbolt
+- Electroweb
+
+Charizard @ Charizardite Y
+Ability: Blaze
+Level: 50
+Modest Nature
+- Heat Wave
+- Solar Beam
+- Protect
+- Weather Ball
+
+Whimsicott @ Focus Sash
+Ability: Prankster
+Level: 50
+Timid Nature
+- Moonblast
+- Tailwind
+- Encore
+- Protect
+
+Garchomp @ Sitrus Berry
+Ability: Rough Skin
+Level: 50
+Jolly Nature
+- Earthquake
+- Dragon Claw
+- Rock Slide
+- Protect
+
+Kingambit @ Black Glasses
+Ability: Defiant
+Level: 50
+Adamant Nature
+- Kowtow Cleave
+- Sucker Punch
+- Protect
+- Low Kick
+
+Glimmora @ Shuca Berry
+Ability: Toxic Debris
+Level: 50
+Modest Nature
+- Power Gem
+- Sludge Bomb
+- Earth Power
+- Protect
+"""
+    return ValidatedTeam.from_showdown(team).packed
 
 
-def test_pokemon_categorical_real():
-    """Verify that categorical rows are written correctly."""
+def test_pokemon_categorical_and_numeric_rows_real():
     # None Pokemon returns 24 zeros
     empty_cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
     _pokemon_categorical_into(None, tokenizer, _iter_move_slots(None), empty_cat)
@@ -203,6 +275,7 @@ def test_pokemon_categorical_real():
         effects=effects,
         status=Status.BRN,
     )
+    mon._nature = "Jolly"
 
     cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
     _pokemon_categorical_into(mon, tokenizer, _iter_move_slots(mon), cat)
@@ -228,21 +301,18 @@ def test_pokemon_categorical_real():
     assert cat[12] == 0
 
     # 4 Move Categories (padded)
-    assert cat[13] == tokenizer.categories.get(MoveCategory.PHYSICAL)
-    assert cat[14] == tokenizer.categories.get(MoveCategory.SPECIAL)
+    assert cat[13] == tokenizer.categories[MoveCategory.PHYSICAL]
+    assert cat[14] == tokenizer.categories[MoveCategory.SPECIAL]
     assert cat[15] == 0
     assert cat[16] == 0
 
     # Status
     assert cat[17] == tokenizer.status_id(Status.BRN)
 
-    # 6 Volatiles
-    vol_ids = cat[18:24]
-    assert sum(1 for v in vol_ids if v > 0) == 2
+    assert not cat[18:24].any()
 
-
-def test_pokemon_numeric_real():
-    """Verify that numerical rows are written correctly."""
+    # Nature
+    assert cat[24] == tokenizer.nature_id(mon) > 0
     battle = make_real_battle()
 
     # None Pokemon returns mostly zeros except for condition flag (e.g. cond=1 -> row[2] = 1.0)
@@ -308,8 +378,6 @@ def test_pokemon_numeric_real():
     assert row[28] == 1.0  # cond == 1
     assert row[29] == 0.0  # cond == 2
     assert row[36] == 3.0 / 5.0  # Status counter
-    assert row[37] == 2.0 / 4.0  # Confusion duration (max 4)
-    assert row[38] == 1.0 / 4.0  # Disable duration (max 4)
     assert row[42] == 1.0  # Preparing (preparing_move is not None)
 
     battle._can_mega_evolve = [True, False]
@@ -355,8 +423,7 @@ def test_pokemon_numeric_real():
     assert row_last_move[32] == 1.0  # First move slot matched last_move
 
 
-def test_get_ordered_pokemon_real():
-    """Verify that _get_ordered_pokemon correctly sequences active, switches, fainted, and drops using real Pokemon."""
+def test_ordered_pokemon_and_slot_conditions_real():
     p1 = make_real_pokemon(species="aerodactyl")
     p2 = make_real_pokemon(species="archaludon")
     p3 = make_real_pokemon(species="azumarill")
@@ -468,10 +535,6 @@ def test_get_ordered_pokemon_real():
     ordered_opp_le = _get_ordered_pokemon(battle_opp_left_empty, is_opponent=True)
     assert ordered_opp_le[0] == (None, -1, None)
     assert ordered_opp_le[1][0] == p2
-
-
-def test_slot_condition_real():
-    """Verify condition values assigned based on slot index, fainted, switches, or opponent using real Pokemon."""
     p1 = make_real_pokemon(species="aerodactyl")
     p_fainted = make_real_pokemon(species="camerupt", status=Status.FNT)
 
@@ -496,8 +559,7 @@ def test_slot_condition_real():
     assert _slot_condition(battle_sw, p2, 3, is_opponent=False) == -1
 
 
-def test_global_field_token_real():
-    """Verify that weather and Trick Room durations scale correctly in global fields using real battles."""
+def test_global_and_side_field_tokens_include_mega_availability():
     battle = make_real_battle(turn=3)
 
     # Rain duration: Rain started at turn 1. Duration = 5. Left: max(0, 5 - (3 - 1)) / 5 = 3 / 5 = 0.6
@@ -508,22 +570,13 @@ def test_global_field_token_real():
     battle._teampreview = False
 
     cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    num = np.zeros(4, dtype=np.float32)
+    num = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
     _global_field_token_into(battle, tokenizer, cat, num)
     assert len(cat) == CATEGORICAL_WIDTH
-    assert len(num) == 4
-
-    assert cat[0] == tokenizer.weathers.get(Weather.RAINDANCE)
-    assert cat[1] == tokenizer.id_for("trickroom", "trickroom")
-
-    assert abs(num[0] - 0.6) < 1e-5
-    assert abs(num[1] - 0.8) < 1e-5
+    assert len(num) == NUMERICAL_WIDTH
+    assert not cat[:2].any()
     assert num[2] == 0.0  # teampreview
     assert num[3] == 3.0 / 24.0  # turn scaling
-
-
-def test_side_token_real():
-    """Verify side condition turns and fainted counts mapping using real battles."""
     battle = make_real_battle(turn=4)
     conditions = {
         SideCondition.TAILWIND: 2,  # duration=4. Left: max(0, 4 - (4 - 2)) / 4 = 2 / 4 = 0.5
@@ -532,7 +585,7 @@ def test_side_token_real():
     }
 
     cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    num = np.zeros(5, dtype=np.float32)
+    num = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
     _side_token_into(
         battle,
         conditions,
@@ -543,22 +596,13 @@ def test_side_token_real():
         num=num,
     )
     assert len(cat) == CATEGORICAL_WIDTH
-    assert len(num) == 5
-
-    assert cat[0] == tokenizer.side_conditions.get(SideCondition.AURORA_VEIL)
-    assert cat[1] == tokenizer.side_conditions.get(SideCondition.TAILWIND)
-    toxic_spikes = tokenizer.side_conditions.get(SideCondition.TOXIC_SPIKES)
-    assert toxic_spikes is not None
-    assert cat[2] == toxic_spikes.get(2)
-
-    assert abs(num[0] - 0.4) < 1e-5
-    assert abs(num[1] - 0.5) < 1e-5
-    assert abs(num[2] - 1.0) < 1e-5
+    assert len(num) == NUMERICAL_WIDTH
+    assert not cat[:3].any()
     assert abs(num[3] - 0.5) < 1e-5  # 3 fainted out of 6
     assert num[4] == 1.0  # mega still available
 
     cat_used = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    num_used = np.zeros(5, dtype=np.float32)
+    num_used = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
     _side_token_into(
         battle,
         conditions,
@@ -569,9 +613,6 @@ def test_side_token_real():
         num=num_used,
     )
     assert num_used[4] == 0.0
-
-
-def test_side_mega_available_uses_selection_and_usage():
     mega = make_real_pokemon(species="charizard", item="charizarditey")
     regular = make_real_pokemon(species="dragonite", item="choicescarf")
     unused_mega = make_real_pokemon(species="aerodactyl", item="aerodactylite")
@@ -600,52 +641,36 @@ def test_side_mega_available_uses_selection_and_usage():
     )
 
 
-def test_from_battle_real_end_to_end():
-    """Verify that from_battle generates structured observation tensors with correct dimensions using real objects."""
-    p1 = make_real_pokemon(species="charizard")
-    team = [p1]
-    battle = make_real_battle(
-        active_pokemon=[p1, None],
-        opponent_active_pokemon=[None, None],
-        team=team,
-        opponent_team=[],
-        teampreview=False,
-    )
+def test_effect_overflow_is_counted_and_enforced():
+    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
+    num = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
+    entries = [
+        (
+            EffectNamespace.POKEMON,
+            effect_id,
+            CounterKind.ACTION_COUNT,
+            float(effect_id),
+            0.0,
+            False,
+            0.0,
+        )
+        for effect_id in range(MAX_EFFECTS + 3, 0, -1)
+    ]
 
-    obs = from_battle(battle, tokenizer)
-    assert obs.token_type_ids.shape == (SEQUENCE_LENGTH,)
-    assert obs.side_ids.shape == (SEQUENCE_LENGTH,)
-    assert obs.slot_ids.shape == (SEQUENCE_LENGTH,)
-    assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
-    assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
+    _write_effects(entries, cat, num)
 
-    assert obs.events_cat.shape == (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH)
-    assert obs.events_num.shape == (EVENT_COUNT, EVENT_NUMERICAL_WIDTH)
-    assert obs.events_side_ids.shape == (EVENT_COUNT,)
-    assert obs.events_slot_ids.shape == (EVENT_COUNT,)
+    assert num[NUM_IDX_EFFECT_COUNT] == MAX_EFFECTS + 3
+    assert num[NUM_IDX_EFFECT_OVERFLOW] == 3
+    assert cat[CAT_EFFECT_START] == 1
 
-    assert obs.token_type_ids[0] == TokenType.CLS
-    assert obs.token_type_ids[1] == TokenType.POKEMON_SUPER
-    assert obs.token_type_ids[2] == TokenType.POKEMON_NUMERIC
-    assert obs.token_type_ids[25] == TokenType.FIELD_SUPER
-    assert obs.token_type_ids[26] == TokenType.FIELD_NUMERIC
-    assert obs.token_type_ids[27] == TokenType.FIELD_SUPER
-    assert obs.token_type_ids[28] == TokenType.FIELD_NUMERIC
-    assert obs.token_type_ids[29] == TokenType.FIELD_SUPER
-    assert obs.token_type_ids[30] == TokenType.FIELD_NUMERIC
-
-    assert obs.side_ids[0] == SideId.NONE
-    assert obs.side_ids[1] == SideId.ALLY
-    assert obs.side_ids[13] == SideId.OPPONENT
-    assert obs.side_ids[25] == SideId.NONE
-    assert obs.side_ids[26] == SideId.NONE
-    assert obs.side_ids[27] == SideId.ALLY
-    assert obs.side_ids[28] == SideId.ALLY
-    assert obs.side_ids[29] == SideId.OPPONENT
-    assert obs.side_ids[30] == SideId.OPPONENT
+    # unmarked truncation (count over capacity with no overflow flag) is rejected
+    obs = StructuredObservation.empty_batch(1)
+    obs.numerical[0, 1, NUM_IDX_EFFECT_COUNT] = MAX_EFFECTS + 1
+    with pytest.raises(ValueError, match="overflow"):
+        obs.validate_overflow_contract()
 
 
-def test_events_join_to_current_slots_after_switch_and_are_consumed():
+def test_events_ground_to_slots_and_are_idempotent():
     switched_out = make_real_pokemon(species="charizard")
     switched_in = make_real_pokemon(species="venusaur")
     opponent = make_real_pokemon(species="tyranitar")
@@ -660,7 +685,7 @@ def test_events_join_to_current_slots_after_switch_and_are_consumed():
         "p1: Venusaur": switched_in,
     }
     battle._opponent_team = {"p2: Tyranitar": opponent}
-    EventCollector.set_raw_events(
+    set_raw_events(
         battle,
         [
             RawBattleEvent(("", "switch", "p1a: Venusaur", "Venusaur, L50", "100/100")),
@@ -678,12 +703,75 @@ def test_events_join_to_current_slots_after_switch_and_are_consumed():
     assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
     assert obs.events_slot_ids[:2].tolist() == [1, 1]
 
+    # rebuilding the same decision yields the identical event window
+    rebuilt_obs = from_battle(battle, tokenizer)
+    assert torch.equal(rebuilt_obs.events_cat, obs.events_cat)
+    assert torch.equal(rebuilt_obs.events_num, obs.events_num)
+
+    # a new decision (new request) drains a fresh, now-empty window
+    battle._last_request = {"turn": "next"}
     next_obs = from_battle(battle, tokenizer)
     assert torch.count_nonzero(next_obs.events_cat) == 0
     assert torch.count_nonzero(next_obs.events_num) == 0
 
 
-def test_from_battle_into_overwrites_dirty_output():
+def test_side_events_ground_to_owning_side():
+    ally = make_real_pokemon(species="charizard")
+    opponent = make_real_pokemon(species="venusaur")
+    battle = make_real_battle(
+        active_pokemon=[ally, None],
+        opponent_active_pokemon=[opponent, None],
+        team=[ally],
+        opponent_team=[opponent],
+    )
+    # Showdown side identifiers carry the username: "p1: Username", not "p1".
+    set_raw_events(
+        battle,
+        [
+            RawBattleEvent(("", "-sidestart", "p1: SomeUser", "move: Tailwind")),
+            RawBattleEvent(("", "-sidestart", "p2: OtherUser", "move: Light Screen")),
+        ],
+    )
+
+    obs = from_battle(battle, tokenizer)
+
+    assert obs.events_cat[:2, 0].tolist() == [EventTypeId.SIDE_START, EventTypeId.SIDE_START]
+    assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
+    assert obs.events_slot_ids[:2].tolist() == [0, 0]
+    assert obs.events_cat[0, 5].item() > 0  # tailwind resolved in side_conditions
+
+
+def test_event_order_recompacts():
+    ally = make_real_pokemon(species="charizard")
+    opponent = make_real_pokemon(species="venusaur")
+    battle = make_real_battle(
+        active_pokemon=[ally, None],
+        opponent_active_pokemon=[opponent, None],
+        team=[ally],
+        opponent_team=[opponent],
+    )
+    battle._team = {"p1: Charizard": ally}
+    overflow = 6
+    # low-priority flood followed by high-priority moves: survivors keep gapped
+    # original orders, which must re-compact into a dense positional range
+    raw_events = [
+        RawBattleEvent(("", "-boost", "p1a: Charizard", "atk", "1"))
+        for _ in range(EVENT_COUNT + overflow - 10)
+    ]
+    raw_events.extend(
+        RawBattleEvent(("", "move", "p1a: Charizard", "Tackle", "p2a: Venusaur")) for _ in range(10)
+    )
+    set_raw_events(battle, raw_events)
+
+    obs = from_battle(battle, tokenizer)
+
+    # positional ids stay dense in [1, EVENT_COUNT]; the order scalar stays in [0, 1)
+    assert obs.events_cat[:, 4].tolist() == list(range(1, EVENT_COUNT + 1))
+    assert obs.events_num[:, 1].max().item() < 1.0
+    assert obs.events_num[:, 2].max().item() == float(overflow)
+
+
+def test_from_battle_into_overwrites_and_validates_output_buffer():
     ally = make_real_pokemon(
         species="charizard",
         moves={"airslash": 10, "protect": 8},
@@ -743,9 +831,6 @@ def test_from_battle_into_overwrites_dirty_output():
     )
     assert torch.count_nonzero(out.categorical[0]) == 0
     assert torch.count_nonzero(out.numerical[0]) == 0
-
-
-def test_from_battle_into_validates_output_shape_and_dtype():
     battle = make_real_battle()
     invalid = StructuredObservation.empty_batch(1)[0]
     invalid.numerical = invalid.numerical.to(torch.float64)
@@ -754,72 +839,91 @@ def test_from_battle_into_validates_output_shape_and_dtype():
         from_battle_into(battle, invalid)
 
 
-def test_raw_stat_estimation_cache_matches_repeated_result():
+def test_stat_resolution_provenance_and_cache_behavior():
+    pokemon = make_real_pokemon(species="charizard")
+    pokemon._nature = None
+    values, provenance = _get_pokemon_level_stats(pokemon, True, None)
+    assert values == (0.0,) * 6
+    assert provenance == Provenance.UNKNOWN
+
+    expected = PrecomputedStats((155, 93, 98, 177, 105, 152))
+    values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
+    assert values == tuple(float(value) for value in expected.values)
+    assert provenance == Provenance.IMPUTED
+    pokemon = make_real_pokemon(
+        species="charizard",
+        moves={"heatwave": 10, "solarbeam": 10, "protect": 10, "weatherball": 10},
+    )
+    pokemon._nature = "modest"
+    cache = {}
+    first = _cached_imputed_stats(pokemon, cache)
+    second = _cached_imputed_stats(pokemon, cache)
+    assert first is second
+    assert len(cache) == 1
+
+
+def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
     battle = make_real_battle()
-    opponent = make_real_pokemon(species="charizard")
-    _cached_raw_stats.cache_clear()
+    from p0.runtime import poke_env_battle_adapter
 
-    first = _estimate_stat_by_nature(opponent, battle)
-    after_first = _cached_raw_stats.cache_info()
-    second = _estimate_stat_by_nature(opponent, battle)
-    after_second = _cached_raw_stats.cache_info()
+    original_decision_view = poke_env_battle_adapter.decision_view
+    decision_builds = 0
 
-    assert first == second
-    assert after_first.misses == 1
-    assert after_second.hits == 1
+    def counted_decision_view(current_battle):
+        nonlocal decision_builds
+        decision_builds += 1
+        return original_decision_view(current_battle)
 
-
-def test_sim_env_embed_battle_writes_configured_target():
-    battle = make_real_battle()
+    monkeypatch.setattr(poke_env_battle_adapter, "decision_view", counted_decision_view)
     env = SimEnv.__new__(SimEnv)
     cast(Any, env).agent1 = SimpleNamespace(username=battle.player_username)
     cast(Any, env).agent2 = SimpleNamespace(username="other-player")
+    env._observation_builder = _OBSERVATION_BUILDER
+    env._battle_view_factory = battle_view
     out1 = StructuredObservation.empty_batch(1)[0]
     out2 = StructuredObservation.empty_batch(1)[0]
     env.set_observation_targets(out1, out2)
 
     result = env.embed_battle(battle)
+    mask = env.get_action_mask(battle)
 
     assert result is out1
     assert result.token_type_ids[0] == TokenType.CLS
+    assert len(mask) == FORMAT.action_size * 2
+    assert decision_builds == 1
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_observation_builder_live(showdown_server, battle_format, sample_team):
-    """
-    Spins up two RandomPlayers against the live local Showdown server.
-    Hooks into `teampreview` and `choose_move` to extract live DoubleBattle states,
-    and runs `from_battle` to verify the resulting observation arrays.
-    """
+    """Exercise observation construction against the real local Showdown protocol."""
     captured_battles = []
     captured_errors = []
 
     class CapturePlayer(RandomPlayer):
         def teampreview(self, battle):
             try:
-                obs = from_battle(battle, tokenizer)
-                captured_battles.append((battle.turn, battle.teampreview, obs))
-            except Exception as e:
-                captured_errors.append(f"teampreview: {e}")
+                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
+            except Exception as exc:
+                captured_errors.append(f"teampreview: {exc}")
             return super().teampreview(battle)
 
         def choose_move(self, battle):
             try:
-                obs = from_battle(battle, tokenizer)
-                captured_battles.append((battle.turn, battle.teampreview, obs))
-            except Exception as e:
-                captured_errors.append(f"choose_move: {e}")
+                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
+            except Exception as exc:
+                captured_errors.append(f"choose_move: {exc}")
             return super().choose_move(battle)
 
     p1 = CapturePlayer(
         battle_format=battle_format,
-        server_configuration=LocalhostServerConfiguration,
+        server_configuration=showdown_server,
         team=sample_team,
         max_concurrent_battles=1,
     )
     p2 = RandomPlayer(
         battle_format=battle_format,
-        server_configuration=LocalhostServerConfiguration,
+        server_configuration=showdown_server,
         team=sample_team,
         max_concurrent_battles=1,
     )
@@ -828,46 +932,60 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
         await asyncio.wait_for(p1.battle_against(p2, n_battles=1), timeout=15.0)
     except asyncio.TimeoutError:
         pytest.fail(f"Battle timed out. Internal errors: {captured_errors}")
-    except Exception as e:
-        pytest.fail(f"Battle failed with exception: {e}. Internal errors: {captured_errors}")
+    except Exception as exc:
+        pytest.fail(f"Battle failed with exception: {exc}. Internal errors: {captured_errors}")
 
-    if captured_errors:
-        pytest.fail(f"Errors occurred during observation building: {captured_errors}")
-
-    assert len(captured_battles) > 0, "No battle states were captured."
-
-    seen_teampreview = False
-    seen_normal_turn = False
-
-    for _, is_teampreview, obs in captured_battles:
+    assert not captured_errors
+    assert captured_battles
+    assert any(is_teampreview for is_teampreview, _ in captured_battles)
+    assert any(not is_teampreview for is_teampreview, _ in captured_battles)
+    for _, obs in captured_battles:
         assert isinstance(obs, StructuredObservation)
-
-        cat = obs.categorical
-        num = obs.numerical
-
-        assert cat.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
-        assert num.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
-
-        global_field_num = num[26]
-        if is_teampreview:
-            seen_teampreview = True
-            # teampreview flag is at index 2 in Global Field numerical array
-            assert global_field_num[2].item() == 1.0
-        else:
-            seen_normal_turn = True
-            assert global_field_num[2].item() == 0.0
-
-    assert seen_teampreview, "Did not capture a teampreview state."
-    assert seen_normal_turn, "Did not capture a normal turn state."
+        assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
+        assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
 
 
-def test_pokemon_nature_in_categorical():
-    mon = make_real_pokemon(species="charizard")
-    mon._nature = "Jolly"
+def test_concurrent_universal_effect_stress_state():
+    mon = make_real_pokemon(
+        effects={
+            Effect.TAUNT: 1,
+            Effect.LEECH_SEED: 1,
+            Effect.SUBSTITUTE: 1,
+            Effect.SALT_CURE: 1,
+            Effect.ENCORE: 1,
+            Effect.DISABLE: 1,
+            Effect.YAWN: 2,
+            Effect.PERISH3: 3,
+            Effect.TRAPPED: 1,
+        }
+    )
+    battle = make_real_battle(active_pokemon=[mon, None], team=[mon], turn=3)
+    battle._side_conditions = {
+        SideCondition.REFLECT: 1,
+        SideCondition.LIGHT_SCREEN: 1,
+        SideCondition.AURORA_VEIL: 1,
+        SideCondition.TAILWIND: 1,
+        SideCondition.SAFEGUARD: 1,
+        SideCondition.SPIKES: 3,
+        SideCondition.TOXIC_SPIKES: 2,
+    }
+    battle._weather = {Weather.RAINDANCE: 1}
+    battle._fields = {
+        Field.GRASSY_TERRAIN: 1,
+        Field.TRICK_ROOM: 1,
+        Field.WONDER_ROOM: 1,
+        Field.MAGIC_ROOM: 1,
+        Field.GRAVITY: 1,
+    }
 
-    cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
-    _pokemon_categorical_into(mon, tokenizer, _iter_move_slots(mon), cat)
-    assert len(cat) == CATEGORICAL_WIDTH
-    jolly_id = tokenizer.nature_id(mon)
-    assert jolly_id > 0
-    assert cat[24] == jolly_id
+    obs = from_battle(battle, tokenizer)
+
+    assert obs.numerical[1, NUM_IDX_EFFECT_COUNT] == 9
+    assert obs.numerical[14, NUM_IDX_EFFECT_COUNT] == 7
+    assert obs.numerical[13, NUM_IDX_EFFECT_COUNT] == 6
+    assert obs.numerical[:, NUM_IDX_EFFECT_OVERFLOW].sum() == 0
+    pokemon_effects = obs.categorical[1, CAT_EFFECT_START::EFFECT_CATEGORICAL_WIDTH]
+    assert torch.count_nonzero(pokemon_effects) == 9
+    namespaces = obs.categorical[13, CAT_EFFECT_START + 2 :: EFFECT_CATEGORICAL_WIDTH]
+    assert EffectNamespace.FIELD in namespaces
+    assert EffectNamespace.WEATHER in namespaces

@@ -20,6 +20,5 @@ clear_dir() {
 clear_dir "artifacts/runs"
 clear_dir "artifacts/replays"
 clear_dir "artifacts/checkpoints"
-clear_dir "artifacts/eval"
 
 echo "Done."

@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+pip-wheel-metadata/
 
 # Virtual environments
 .test
@@ -17,6 +18,10 @@ wheels/
 teams/.pastes
 .ruff_cache
 .pytest_cache
+.coverage
+htmlcov/
+.mypy_cache/
+.pyright/
 
 # Inverts
 !.python-version
@@ -26,12 +31,29 @@ teams/.pastes
 # backups, training.log) live under a single dir
 artifacts/
 
+# Generated raw data and local caches. Canonical contracts remain tracked.
+data/raw/
+data/cache/
+data/*.tmp
+!data/vocab.json
+!data/champions_dex.json
+!data/runtime_manifest.json
+data/champions_coverage.json
+
 # Training related
 *.log
-.ppoconfig
+config.yaml
 
 # Scratch dir for small experiments
 scratch/
 
+# Temporary local work directories
+tmp/
+temp/
+
 # Training export
 *.tar.gz
+*.zip
+
+# Incomplete documentation
+docs/

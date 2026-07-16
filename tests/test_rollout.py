@@ -4,18 +4,19 @@ from typing import Any, cast
 import numpy as np
 import torch
 
-from src.lookups import ACT_SIZE
-from src.model.policy import ActOutput
-from src.model.structured_observation import StructuredObservation
-from src.train.config import PPOConfig
-from src.train.rollout import (
+from p0.format_config import FORMAT
+from p0.model.policy import ActOutput
+from p0.model.structured_observation import StructuredObservation
+from p0.training.config import TrainingConfig
+from p0.training.rollout import (
     RolloutBuffer,
     build_partition,
     collect_rollouts,
-    compute_gae_batch,
-    create_trajectory_buffers,
 )
-from src.train.vec_env import ThreadVecEnv
+from p0.training.trajectory import TrajectoryStorage, compute_gae_batch
+from p0.training.vector_env import ThreadVecEnv
+
+ACT_SIZE = FORMAT.action_size
 
 
 class FakePolicy:
@@ -202,7 +203,7 @@ def test_compute_gae_batch_matches_single_episode_reference():
 
 
 def test_build_partition_assigns_static_pool_groups():
-    config = PPOConfig(n_envs=6, n_self_envs=2, n_pool_opponents=2)
+    config = TrainingConfig(n_envs=6, n_self_envs=2, n_pool_opponents=2)
     pool = FakePool(["opp-a", "opp-b"])
 
     partition = build_partition(
@@ -222,7 +223,7 @@ def test_build_partition_assigns_static_pool_groups():
 
 
 def test_build_partition_falls_back_to_all_self_play_for_empty_pool():
-    config = PPOConfig(n_envs=4, n_self_envs=1)
+    config = TrainingConfig(n_envs=4, n_self_envs=1)
     partition = build_partition(
         config,
         cast(Any, FakePool([])),
@@ -236,7 +237,7 @@ def test_build_partition_falls_back_to_all_self_play_for_empty_pool():
 
 
 def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
-    config = PPOConfig(
+    config = TrainingConfig(
         n_envs=3,
         n_self_envs=1,
         n_pool_opponents=1,
@@ -247,8 +248,8 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
     vec_env = FakeVecEnv(config.n_envs)
     policy = FakePolicy(action=7)
     buffer = RolloutBuffer()
-    trajectories1 = create_trajectory_buffers(config.n_envs, max_steps=4)
-    trajectories2 = create_trajectory_buffers(config.n_envs, max_steps=4)
+    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
+    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
     state1 = torch.ones((config.n_envs, 1, 1))
     state2 = torch.ones((config.n_envs, 1, 1))
 
@@ -269,9 +270,9 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
     assert stats == (1, 1)
     assert pool.updates == [("opp", 1, 1)]
     assert len(buffer.trajectories) == 4
-    assert all(torch.all(episode["actions"] == 7) for episode in buffer.trajectories)
-    assert trajectories1["step_counts"].tolist() == [0, 0, 0]
-    assert trajectories2["step_counts"].tolist() == [0, 0, 0]
+    assert all(torch.all(episode.actions == 7) for episode in buffer.trajectories)
+    assert trajectories1.step_counts.tolist() == [0, 0, 0]
+    assert trajectories2.step_counts.tolist() == [0, 0, 0]
     assert torch.count_nonzero(next_state1) == 0
     assert torch.count_nonzero(next_state2) == 0
 
@@ -286,7 +287,7 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
 
 
 def test_pool_opponent_rotates_only_after_completed_battle():
-    config = PPOConfig(
+    config = TrainingConfig(
         n_envs=3,
         n_self_envs=1,
         n_pool_opponents=1,
@@ -305,8 +306,8 @@ def test_pool_opponent_rotates_only_after_completed_battle():
         cast(Any, pool),
         config,
         cast(Any, {}),
-        create_trajectory_buffers(config.n_envs, max_steps=4),
-        create_trajectory_buffers(config.n_envs, max_steps=4),
+        TrajectoryStorage.allocate(config.n_envs, max_steps=4),
+        TrajectoryStorage.allocate(config.n_envs, max_steps=4),
         torch.ones((config.n_envs, 1, 1)),
         torch.ones((config.n_envs, 1, 1)),
         partition,

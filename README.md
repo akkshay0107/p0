@@ -1,6 +1,6 @@
 # p0: Reinforcement Learning for Pokémon VGC
 
-`p0` is a self-play reinforcement learning engine for Pokemon VGC. It uses a model free, recurrent approach and is trained without using any human data. Due to compute constraints, it plays within a very restricted metagame of 7 teams (for now) and does not support playing on ladder. I hope to expand this to support the entire game in the near future (if I can get access to GPUs for training).
+`p0` is a self-play reinforcement learning engine for Pokemon VGC. The current codebase is being refactored toward roster-independent Champions play and public Bo3 replay pretraining. NOTE: everything below is mostly stale (when I was training with a smaller vocab and a fixed set of teams). I will be updating it after I build out more features.
 
 ---
 
@@ -11,10 +11,8 @@
 - [Modules](#modules)
 - [Workflow Guide](#workflow-guide)
   - [1. Setup & Installation](#1-setup--installation)
-  - [2. Replay Generation](#2-replay-generation)
-  - [3. Behavioural Cloning Bootstrapping](#3-behavioural-cloning-bootstrapping)
-  - [4. PPO Training Loop](#4-ppo-training-loop)
-  - [5. Local Play](#5-local-play)
+  - [2. PPO Training Loop](#2-ppo-training-loop)
+  - [3. Local Play](#3-local-play)
 - [Utility Scripts](#utility-scripts)
 - [References](#references)
 - [Contributing](#contributing)
@@ -49,15 +47,14 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 
 ## Modules
 
-### 1. `src/` (Source)
+### 1. `src/p0/` (Source)
 
-- **`model/`**: Defines the neural network architecture. Contains the custom tokenizer, structured observation builders, the fused SwiGLU token encoder, and the dual actor-critic policy networks.
-- **`train/`**: Contains the PPO training loop, rollout buffers, vectorized environment management (spinning up local Node.js Showdown servers), behavioural cloning scripts, and the opponent pool (league) system.
-- **`heuristic/`**: Contains rule-based baseline agents and scripts used for generating initial replays for Behavioural Cloning.
+- **`model/`**: Defines the tokenizer, structured observations, encoder, and actor-critic policy.
+- **`train/`**: Contains PPO rollout, optimization, vector-environment, and league code.
 
 ### 2. `bench/` (Benchmarks)
 
-Scripts to benchmark system and model performance. This includes measuring inference times (action prediction and encoder throughput) as well as evaluating win rates for heuristic bots and policy models.
+Scripts to benchmark system and model performance, including inference and encoder throughput.
 
 ### 3. `tests/` (Tests)
 
@@ -90,33 +87,19 @@ Next, install the Node.js dependencies required by the local Pokémon Showdown s
 cd pokemon-showdown && npm install && cd ..
 ```
 
-### 2. Replay Generation
+### 2. PPO Training Loop
 
-Generate offline replays by pitting heuristic rule-based bots against each other. This creates the dataset for the model to learn the basics. This runs entirely on the CPU and takes a while (~20 mins with n = 5000 battles) to generate replays. It ends up generating more than the number asked due to recording both sides in mirror bot matches.
-
-```bash
-uv run python ./src/heuristic/replay_gen.py -n 2500
-```
-
-### 3. Behavioural Cloning Bootstrapping
-
-Train the initial neural network policy using supervised learning to predict the actions taken by the heuristics in the generated replays. This bootstraps the initial `OpponentPool` and gives the model a competent starting point before RL begins. I mainly see this as a way to save compute at the start of a run, the randomly initialized model does catch up in quality to the best seed policy in around 200k steps.
-
-```bash
-uv run python ./src/train/seed_pool.py
-```
-
-### 4. PPO Training Loop
+The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.yaml.example` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.path` and `environment.opponent_team_source.path` independently. Relative paths are resolved under `paths.teams_root`.
 
 Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins league-based self-play.
 
 ```bash
-uv run python ./src/train/train_loop.py
+uv run p0-train
 ```
 
 _Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Loss, etc.) are exported to TensorBoard. You can view them by running `tensorboard --logdir ./artifacts/runs/ppo_training/`._
 
-### 5. Local Play
+### 3. Local Play
 
 You would have to move the trained model to a specific location and have the infra and client (which are slightly outdated since they were meant for v1) setup in order to play against the model locally with the usual showdown interface. Unfortunately, this part is slightly flaky since I haven't worked on it recently. See [p0-infra](https://github.com/akkshay0107/p0-infra) for more details.
 
@@ -125,8 +108,31 @@ You would have to move the trained model to a specific location and have the inf
 ## Utility Scripts
 
 - **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
-- **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and `.ppoconfig` into a `tar.gz` archive. I use it for moving stuff between remote servers while training.
-- **`reset_pool.sh`**: Clears out the current `OpponentPool` (snapshots inside `artifacts/checkpoints/pool/`) while retaining the heuristic seed models. If you want to reset the training phase without redoing replay gen / behaviour cloning.
+- **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and the active `config.yaml` snapshot into a `tar.gz` archive. I use it for moving stuff between remote servers while training.
+
+The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.yaml.example`.
+
+### Runtime compatibility
+
+`data/runtime_manifest.json` contains one human-readable, load-breaking runtime contract.
+Checkpoints reference its `runtime_contract_sha256`. Vocabulary, action-layout, tensor-ABI,
+or resource-feature-ABI changes require a new checkpoint or an explicit transfer tool.
+Dex balance/learnset changes and Showdown revisions are recorded as mechanics provenance;
+they do not prevent an existing policy from loading and continuing training. Old checkpoint
+dictionaries containing `runtime_manifest_sha256` are intentionally unsupported.
+
+## Development verification
+
+Run the standard checkpoint gates from the repository root:
+
+```bash
+uv run ruff check src tests
+uv run pyright
+uv run pytest -q
+uv build
+```
+
+The installed command-line interfaces are `p0-train`, `p0-play`, `p0-build-vocab`, and `p0-export-training`.
 
 ---
 

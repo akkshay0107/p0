@@ -1,104 +1,69 @@
 from types import SimpleNamespace
 from typing import Any, cast
 
-import numpy as np
 import torch
 from poke_env.battle import DoubleBattle
 
-from src.env import MegaEnv
-from src.lookups import ACT_SIZE
-from src.model.policy import PolicyNet
-from src.model.structured_observation import (
-    NUMERICAL_WIDTH,
-    SEQUENCE_LENGTH,
+from p0.battle.legality import legal_actions
+from p0.format_config import FORMAT
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
+from p0.model.resources import default_runtime_resources
+from p0.model.structured_observation import (
     StructuredObservation,
 )
+from p0.runtime.poke_env_action_adapter import action_to_single_order, single_order_to_action
+from p0.runtime.poke_env_battle_adapter import decision_view
+
+ACT_SIZE = FORMAT.action_size
+
+
+def _struggle_battle(move_id: str, can_mega: bool) -> DoubleBattle:
+    mock_active = SimpleNamespace(moves={"tackle": SimpleNamespace(id="tackle")}, fainted=False)
+    return cast(
+        DoubleBattle,
+        SimpleNamespace(
+            player_username="player",
+            battle_tag="battle",
+            teampreview=False,
+            _wait=False,
+            force_switch=[False, False],
+            trapped=[False, False],
+            maybe_trapped=[False, False],
+            active_pokemon=[mock_active, None],
+            available_moves=[[SimpleNamespace(id=move_id)], []],
+            available_switches=[[], []],
+            team={},
+            can_mega_evolve=[can_mega, False],
+            valid_orders=[[], []],
+            get_possible_showdown_targets=lambda move, mon: [0],
+        ),
+    )
 
 
 def test_struggle_env_roundtrip():
-    # Mock move
-    mock_struggle = SimpleNamespace(id="struggle")
-    mock_tackle = SimpleNamespace(id="tackle")
-    mock_active = SimpleNamespace(moves={"tackle": mock_tackle}, fainted=False)
+    battle = _struggle_battle("struggle", can_mega=False)
+    assert list(legal_actions(decision_view(battle), 0)) == [48]
 
-    # Mock battle
-    battle = cast(
-        DoubleBattle,
-        SimpleNamespace(
-            player_username="player",
-            battle_tag="battle",
-            teampreview=False,
-            _wait=False,
-            force_switch=[False, False],
-            trapped=[False, False],
-            maybe_trapped=[False, False],
-            active_pokemon=[mock_active, None],
-            available_moves=[[mock_struggle], []],
-            available_switches=[[], []],
-            team={},
-            can_mega_evolve=[False, False],
-            valid_orders=[[], []],
-            get_possible_showdown_targets=lambda move, mon: [0],
-        ),
-    )
-
-    mask = MegaEnv.single_action_mask(battle, 0)
-    assert mask == [48]
-
-    order = MegaEnv._action_to_order_individual(np.int64(48), battle, fake=True, pos=0)
+    order = action_to_single_order(48, battle, fake=True, position=0)
     assert cast(Any, order.order).id == "struggle"
     assert not order.mega
+    assert single_order_to_action(order, battle, fake=True, position=0) == 48
 
-    action = MegaEnv._order_to_action_individual(order, battle, fake=True, pos=0)
-    assert action == 48
-
-
-def test_mega_struggle_env_roundtrip():
-    mock_struggle = SimpleNamespace(id="recharge")
-    mock_tackle = SimpleNamespace(id="tackle")
-    mock_active = SimpleNamespace(moves={"tackle": mock_tackle}, fainted=False)
-
-    battle = cast(
-        DoubleBattle,
-        SimpleNamespace(
-            player_username="player",
-            battle_tag="battle",
-            teampreview=False,
-            _wait=False,
-            force_switch=[False, False],
-            trapped=[False, False],
-            maybe_trapped=[False, False],
-            active_pokemon=[mock_active, None],
-            available_moves=[[mock_struggle], []],
-            available_switches=[[], []],
-            team={},
-            can_mega_evolve=[True, False],
-            valid_orders=[[], []],
-            get_possible_showdown_targets=lambda move, mon: [0],
-        ),
-    )
-
-    mask = MegaEnv.single_action_mask(battle, 0)
+    mega_battle = _struggle_battle("recharge", can_mega=True)
+    mask = list(legal_actions(decision_view(mega_battle), 0))
     assert 48 in mask
     assert 47 in mask
 
-    order = MegaEnv._action_to_order_individual(np.int64(47), battle, fake=True, pos=0)
+    order = action_to_single_order(47, mega_battle, fake=True, position=0)
     assert cast(Any, order.order).id == "recharge"
     assert order.mega
-
-    action = MegaEnv._order_to_action_individual(order, battle, fake=True, pos=0)
-    assert action == 47
+    assert single_order_to_action(order, mega_battle, fake=True, position=0) == 47
 
 
 def test_struggle_policy_logits():
     B = 2
-    policy = PolicyNet(
-        obs_dim=(SEQUENCE_LENGTH, NUMERICAL_WIDTH),
-        act_size=ACT_SIZE,
-        d_model=64,
-        nhead=2,
-        nlayer=1,
-    )
+    policy = build_policy(ModelConfig(64, 2, 1, 8, 256), default_runtime_resources())
 
     obs = StructuredObservation.empty_batch(B)
     obs.numerical[:, :, -1] = 0.5  # fake ratios so orig_ids aren't all 0
