@@ -179,6 +179,58 @@ class BotConfig:
             raise ValueError("bot.top_p must be in (0, 1]")
 
 
+# The bc, corpus, and evaluation sections are reserved here so their
+# workstreams only ever touch their own dataclass's field list; adding a new
+# root section requires editing GlobalConfig and load_config in one place.
+@dataclass(frozen=True, slots=True)
+class BCConfig:
+    chunk_length: int = 16
+    batch_decisions: int = 256
+    learning_rate: float = 3e-4
+    amp: bool = True
+    shards_dir: str = "artifacts/shards"
+
+    def __post_init__(self) -> None:
+        _positive_ints(
+            type(self).__name__,
+            ("chunk_length", self.chunk_length),
+            ("batch_decisions", self.batch_decisions),
+        )
+        _positive(type(self).__name__, ("learning_rate", self.learning_rate))
+        if not self.shards_dir.strip():
+            raise ValueError("bc.shards_dir must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusConfig:
+    manifest_path: str = "teams/corpus_manifest.json"
+    agent_split: str = "train"
+    sampling_policy: str = "usage_weighted"
+    allow_mirror: bool = True
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("manifest_path", self.manifest_path),
+            ("agent_split", self.agent_split),
+            ("sampling_policy", self.sampling_policy),
+        ):
+            if not value.strip():
+                raise ValueError(f"corpus.{name} must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class EvalConfig:
+    episodes_per_matchup: int = 20
+    seed: int = 0
+    report_dir: str = "artifacts/eval"
+
+    def __post_init__(self) -> None:
+        _positive_ints(type(self).__name__, ("episodes_per_matchup", self.episodes_per_matchup))
+        _non_negative(type(self).__name__, ("seed", self.seed))
+        if not self.report_dir.strip():
+            raise ValueError("evaluation.report_dir must not be empty")
+
+
 @dataclass(frozen=True, slots=True)
 class GlobalConfig:
     training: TrainingConfig = TrainingConfig()
@@ -186,6 +238,9 @@ class GlobalConfig:
     paths: ProjectPaths = DEFAULT_PATHS
     environment: EnvironmentConfig = EnvironmentConfig()
     bot: BotConfig = BotConfig()
+    bc: BCConfig = BCConfig()
+    corpus: CorpusConfig = CorpusConfig()
+    evaluation: EvalConfig = EvalConfig()
 
     def __post_init__(self) -> None:
         if self.training.n_pool_opponents > self.pool.pool_size:
@@ -292,6 +347,9 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
             paths=_build_section(ProjectPaths, values["paths"]),
             environment=_build_environment(values["environment"]),
             bot=_build_section(BotConfig, values["bot"], bot=True),
+            bc=_build_section(BCConfig, values["bc"]),
+            corpus=_build_section(CorpusConfig, values["corpus"]),
+            evaluation=_build_section(EvalConfig, values["evaluation"]),
         )
         return _resolve_paths(config)
     except (OSError, OmegaConfBaseException, TypeError, ValueError) as exc:

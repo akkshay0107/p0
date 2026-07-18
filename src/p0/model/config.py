@@ -19,6 +19,7 @@ class ModelConfig:
     history_tokens: int
     dim_feedforward: int
     series_context_enabled: bool = False
+    series_tokens: int = 4
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -27,6 +28,7 @@ class ModelConfig:
             ("reducer_layers", self.reducer_layers),
             ("history_tokens", self.history_tokens),
             ("dim_feedforward", self.dim_feedforward),
+            ("series_tokens", self.series_tokens),
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"ModelConfig.{name} must be a positive integer")
@@ -53,6 +55,7 @@ class ModelConfig:
             "history_tokens": self.history_tokens,
             "dim_feedforward": self.dim_feedforward,
             "series_context_enabled": self.series_context_enabled,
+            "series_tokens": self.series_tokens,
         }
 
     @classmethod
@@ -66,6 +69,7 @@ class ModelConfig:
             "history_tokens",
             "dim_feedforward",
             "series_context_enabled",
+            "series_tokens",
         }
         unknown = sorted(set(value) - expected)
         missing = sorted(expected - set(value))

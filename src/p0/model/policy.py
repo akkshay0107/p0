@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import torch
 import torch.nn as nn
@@ -81,6 +81,34 @@ class EvalOutput(NamedTuple):
     value: Tensor
     state: Tensor
     logits: Tensor
+
+
+class CandidateScorer(Protocol):
+    """Pinned seam for behaviour-cloning candidate marginalization.
+
+    The BC workstream implements this on ActorPolicy; the series-context
+    workstream conditions initial_state independently. The contract: run the
+    recurrent reducer once per observation, expand only the action-scoring
+    stage across each decision's candidate joint actions, apply the
+    sequential second-action mask per candidate first action, and return
+    joint log-probabilities without advancing recurrent state more than once
+    per observation.
+
+    Candidates use the shard ragged encoding: candidate_offsets has length
+    T + 1 and decision t owns candidate_values[offsets[t]:offsets[t + 1]]
+    rows of joint action pairs. The result is flat per-candidate joint
+    log-probabilities aligned with candidate_values rows; the marginal NLL
+    is the negative log of each decision's summed candidate probability.
+    """
+
+    def score_joint_candidates(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        state: Tensor,
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> Tensor: ...
 
 
 class ValueHead(nn.Module):

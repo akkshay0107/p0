@@ -59,3 +59,18 @@ bot:
   accept_open_team_sheet: true
   allow_random_init: false
   log_level: INFO
+bc:
+  chunk_length: 16
+  batch_decisions: 256
+  learning_rate: 0.0003
+  amp: true
+  shards_dir: artifacts/shards
+corpus:
+  manifest_path: teams/corpus_manifest.json
+  agent_split: train
+  sampling_policy: usage_weighted
+  allow_mirror: true
+evaluation:
+  episodes_per_matchup: 20
+  seed: 0
+  report_dir: artifacts/eval

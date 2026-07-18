@@ -8,6 +8,7 @@ from p0.model.policy import EncodedObs
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
+    EVENT_COUNT,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
@@ -250,7 +251,7 @@ def test_event_targets_do_not_alias(policy_net):
         action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
         with torch.no_grad():
             tokens, _ = policy_net.encoder(obs, action_mask)
-        return tokens[0, -64]  # first event token row
+        return tokens[0, -EVENT_COUNT]  # first event token row
 
     crossed_a = encode_event(actor_slot=1, target_slot=2)
     crossed_b = encode_event(actor_slot=2, target_slot=1)
@@ -282,7 +283,7 @@ def test_event_effect_namespaces(policy_net):
         action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
         with torch.no_grad():
             tokens, _ = policy_net.encoder(obs, action_mask)
-        return tokens[0, -64]
+        return tokens[0, -EVENT_COUNT]
 
     weather = encode_first_event(EventTypeId.WEATHER_START)
     volatile = encode_first_event(EventTypeId.EFFECT_START)

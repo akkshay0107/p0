@@ -185,7 +185,7 @@ def test_event_priority_order_and_overflow_are_stable() -> None:
     events.append(BattleEvent(EventTypeId.MOVE, "p2a: Venusaur", order=65))
     selected = truncate_events(events, limit=EVENT_COUNT)
     assert len(selected) == EVENT_COUNT
-    assert [event.order for event in selected] == [*range(63), 65]
+    assert [event.order for event in selected] == [*range(EVENT_COUNT - 1), 65]
     assert selected[-1].event_type == EventTypeId.MOVE
 
 
@@ -241,3 +241,51 @@ def test_stat_formula_and_manifest_rejection_are_stable(tmp_path) -> None:
     manifest_path.write_text(json.dumps(current_manifest().to_dict()), encoding="utf-8")
     with pytest.raises(ValueError, match="legacy checkpoint"):
         validate_artifact_runtime_contract({"runtime_manifest_sha256": "0" * 64}, manifest_path)
+
+
+def test_shared_contract_versions_and_enums_are_pinned() -> None:
+    """Pin the cross-workstream schema constants frozen for the worktree split."""
+    from p0.battle.series import MAX_PRIOR_GAMES, SERIES_SUMMARY_SCHEMA_VERSION
+    from p0.replays.schema import (
+        REPLAY_IR_SCHEMA_VERSION,
+        DecisionType,
+        GameEndReason,
+        GroupingMethod,
+        LabelKind,
+        MaskProvenance,
+    )
+    from p0.replays.shards import SHARD_ARTIFACT_SCHEMA
+    from p0.teams.corpus import CORPUS_MANIFEST_SCHEMA, CorpusSplit, SamplingPolicy
+
+    assert REPLAY_IR_SCHEMA_VERSION == 1
+    assert SERIES_SUMMARY_SCHEMA_VERSION == 1
+    assert MAX_PRIOR_GAMES == 2
+    assert SHARD_ARTIFACT_SCHEMA == "p0.replay_shard.v1"
+    assert CORPUS_MANIFEST_SCHEMA == "p0.team_corpus.v1"
+
+    pinned = {
+        GroupingMethod: ["UNSPECIFIED", "PARENT_ROOM", "FALLBACK_SAME_PLAYERS"],
+        GameEndReason: ["UNSPECIFIED", "NORMAL", "FORFEIT", "TIMEOUT"],
+        DecisionType: [
+            "UNSPECIFIED",
+            "TEAM_PREVIEW",
+            "TURN",
+            "FORCED_SWITCH",
+            "PIVOT_SWITCH",
+            "FORCED_PASS",
+        ],
+        LabelKind: ["UNSPECIFIED", "EXACT", "PARTIAL", "UNKNOWN"],
+        MaskProvenance: ["UNSPECIFIED", "CONSERVATIVE_RECONSTRUCTED", "ORACLE_REQUEST"],
+        CorpusSplit: ["UNSPECIFIED", "TRAIN", "VALIDATION", "TEST", "HELD_OUT_ARCHETYPE"],
+        SamplingPolicy: [
+            "UNSPECIFIED",
+            "USAGE_WEIGHTED",
+            "UNIFORM_CANONICAL",
+            "UNIFORM_ARCHETYPE",
+            "RARE_COVERAGE",
+            "MATCHUP_BALANCED",
+        ],
+    }
+    for enum_cls, names in pinned.items():
+        assert [member.name for member in enum_cls] == names
+        assert [member.value for member in enum_cls] == list(range(len(names)))
