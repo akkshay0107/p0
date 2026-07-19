@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from p0.cli.corpus import _variants_from_showdown
 from p0.cli.corpus import main as corpus_main
 from p0.format_config import FORMAT, current_manifest
 from p0.model.tokenizer import PokemonTokenizer
@@ -216,3 +217,30 @@ def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> 
         is_agent=True,
     )
     assert isinstance(source, CorpusTeamSource)
+
+
+def test_variants_from_showdown_with_dex() -> None:
+    mock_dex = {
+        "species": [
+            {
+                "name": "Pikachu",
+                "baseStats": {"hp": 35, "atk": 55, "def": 40, "spa": 50, "spd": 50, "spe": 90},
+            }
+        ],
+        "moves": [
+            {"name": "Thunderbolt", "category": "Special"},
+            {"name": "Fake Out", "category": "Physical"},
+        ],
+    }
+    showdown_text = "\n\n".join(
+        "Pikachu @ Light Ball\nAbility: Static\nJolly Nature\n- Fake Out\n- Thunderbolt"
+        for _ in range(6)
+    )
+    variants = _variants_from_showdown(showdown_text, dex=mock_dex)
+    assert len(variants) == 1
+    variant = variants[0]
+    assert len(variant.spreads) == 6
+    # Verify exact spreads were imputed rather than the default fallback
+    assert any(spread != StatPoints(hp=2, spa=32, spe=32) for spread in variant.spreads)
+    # Verify role/archetype tags reflect classified roles
+    assert "imputed" in variant.metadata.archetype_tags

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from p0.format_config import FORMAT, current_manifest
 from p0.model.tokenizer import PokemonTokenizer
+from p0.paths import DEFAULT_PATHS
 from p0.teams.corpus import TeamCorpusManifest
 from p0.teams.corpus_build import (
     CorpusBuilder,
@@ -15,12 +18,20 @@ from p0.teams.corpus_build import (
     audit_corpus,
     populate_pool_directories,
 )
-from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamVariant
+from p0.teams.stat_points import (
+    BaseStats,
+    ImputationInput,
+    Role,
+    StatPoints,
+    select_candidate,
+)
+from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamVariant, normalize_id
 from p0.teams.validation import validate_many
 
 
-def _variants_from_showdown(text: str) -> tuple[TeamVariant, ...]:
+def _variants_from_showdown(
+    text: str, dex: Mapping[str, Any] | None = None
+) -> tuple[TeamVariant, ...]:
     from p0.teams.source import _PACKER
 
     members = _PACKER.parse_showdown_team(text)
@@ -28,11 +39,32 @@ def _variants_from_showdown(text: str) -> tuple[TeamVariant, ...]:
         raise ValueError(
             f"Showdown text contains {len(members)} members (expected a positive multiple of 6)"
         )
+    species_by_id = (
+        {
+            normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): entry
+            for entry in dex.get("species", ())
+            if isinstance(entry, Mapping)
+        }
+        if isinstance(dex, Mapping)
+        else {}
+    )
+    move_categories = (
+        {
+            normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): str(
+                entry.get("category", "")
+            )
+            for entry in dex.get("moves", ())
+            if isinstance(entry, Mapping)
+        }
+        if isinstance(dex, Mapping)
+        else {}
+    )
+
     variants: list[TeamVariant] = []
     for i in range(0, len(members), 6):
         team_members = tuple(
             TeamMember(
-                species=m.species or "",
+                species=m.species or m.nickname or "",
                 item=m.item or "",
                 ability=m.ability or "",
                 moves=tuple(m.moves),
@@ -43,20 +75,62 @@ def _variants_from_showdown(text: str) -> tuple[TeamVariant, ...]:
             for m in members[i : i + 6]
         )
         team = CanonicalTeam(team_members)
-        spreads = tuple(StatPoints(hp=2, spa=32, spe=32) for _ in team_members)
+        spreads_list: list[StatPoints] = []
+        roles_list: list[Role] = []
+        for m in team_members:
+            species_entry = species_by_id.get(normalize_id(m.species).casefold())
+            base_mapping = (
+                species_entry.get("baseStats") if isinstance(species_entry, Mapping) else None
+            )
+            if isinstance(base_mapping, Mapping):
+                try:
+                    moves = m.moves
+                    categories = tuple(
+                        move_categories.get(normalize_id(move).casefold(), "") for move in moves
+                    )
+                    imp_input = ImputationInput(
+                        species=m.species,
+                        nature=m.nature or "serious",
+                        item=m.item,
+                        ability=m.ability,
+                        moves=moves,
+                        move_categories=categories,
+                        base_stats=BaseStats.from_mapping(base_mapping),
+                        level=m.level,
+                    )
+                    candidate = select_candidate(imp_input, seed=0)
+                    spreads_list.append(candidate.points)
+                    roles_list.append(candidate.role)
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            spreads_list.append(StatPoints(hp=2, spa=32, spe=32))
+        spreads = tuple(spreads_list)
+        if roles_list:
+            if any(role == Role.TRICK_ROOM for role in roles_list):
+                archetype_tags = ("trick-room", "imputed")
+            elif any(role == Role.SPEED_CONTROL for role in roles_list):
+                archetype_tags = ("speed-control", "imputed")
+            elif any(role in (Role.PHYSICAL, Role.SPECIAL, Role.MIXED) for role in roles_list):
+                archetype_tags = ("offense", "imputed")
+            else:
+                archetype_tags = ("balance", "imputed")
+        else:
+            archetype_tags = ("balance",)
+
         metadata = TeamMetadata(
             source_series=("cli-import",),
             source_replays=(),
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-01T00:00:00Z",
             usage_count=1,
-            archetype_tags=("balance",),
+            archetype_tags=archetype_tags,
         )
         variants.append(TeamVariant(team=team, spreads=spreads, metadata=metadata))
     return tuple(variants)
 
 
-def _load_variants(path: Path) -> tuple[TeamVariant, ...]:
+def _load_variants(path: Path, dex: Mapping[str, Any] | None = None) -> tuple[TeamVariant, ...]:
     if not path.exists():
         raise FileNotFoundError(f"Input path does not exist: {path}")
     files: list[Path] = []
@@ -85,7 +159,7 @@ def _load_variants(path: Path) -> tuple[TeamVariant, ...]:
         else:
             text = file_path.read_text(encoding="utf-8").strip()
             if text:
-                variants.extend(_variants_from_showdown(text))
+                variants.extend(_variants_from_showdown(text, dex=dex))
     return tuple(variants)
 
 
@@ -155,7 +229,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     if args.command == "build":
-        variants = _load_variants(args.input)
+        dex_path = DEFAULT_PATHS.data_root / "champions_dex.json"
+        dex = json.loads(dex_path.read_text(encoding="utf-8")) if dex_path.is_file() else None
+        variants = _load_variants(args.input, dex=dex)
         tokenizer = PokemonTokenizer.from_file()
         split_policy = SplitPolicy(
             ratio_train=args.train_ratio,

@@ -292,3 +292,42 @@ def test_mirroring_control_sample_pair(tmp_path: Path) -> None:
     source_single = CorpusTeamSource(spec_single)
     with pytest.raises(ValueError, match="Cannot sample non-mirror pair"):
         source_single.sample_pair(rng)
+
+
+def test_sampling_policy_matchup_balanced_and_lazy_caching(tmp_path: Path) -> None:
+    # Under USAGE_WEIGHTED policy, canonical and archetype indexes should remain uninitialized (None) until explicitly requested
+    e1 = _make_entry(1, canonical_index=1, usage_count=100)
+    e2 = _make_entry(2, canonical_index=2, usage_count=100)
+    path, manifest = _write_manifest(tmp_path, (e1, e2))
+    spec_usage = CorpusSourceSpec(
+        corpus_path=str(path),
+        corpus_hash=manifest.corpus_hash,
+        format_id=FORMAT.battle_format,
+        split=CorpusSplit.TRAIN,
+        seed=700,
+        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
+    )
+    source_usage = CorpusTeamSource(spec_usage)
+    assert source_usage._by_canonical is None
+    assert source_usage._by_archetype is None
+    # Sampling should succeed without building unneeded indexes
+    rng = random.Random(700)
+    assert source_usage.sample(rng) is not None
+
+    # Under MATCHUP_BALANCED policy, canonical index should be built during prepare_sampling
+    spec_matchup = CorpusSourceSpec(
+        corpus_path=str(path),
+        corpus_hash=manifest.corpus_hash,
+        format_id=FORMAT.battle_format,
+        split=CorpusSplit.TRAIN,
+        seed=701,
+        sampling_policy=SamplingPolicy.MATCHUP_BALANCED,
+        allow_mirror=False,
+    )
+    source_matchup = CorpusTeamSource(spec_matchup)
+    assert source_matchup._by_canonical is not None
+    assert source_matchup._canonical_keys is not None
+    assert len(source_matchup._canonical_keys) == 2
+    # Verify non-mirror sampling with exclusion works cleanly under MATCHUP_BALANCED
+    t1, t2 = source_matchup.sample_pair(rng)
+    assert t1.team_hash != t2.team_hash
