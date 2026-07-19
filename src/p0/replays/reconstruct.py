@@ -48,6 +48,10 @@ def normalize_id(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
 
 
+def _zero_boosts() -> dict[str, int]:
+    return {stat: 0 for stat in ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")}
+
+
 class _ReplayResolver(EventResolver):
     """Resolve known-looking names without coupling replay code to model vocabularies."""
 
@@ -62,17 +66,37 @@ class _ReplayResolver(EventResolver):
 
 
 @dataclass(frozen=True, slots=True)
+class ReplayName:
+    """Enum-like placeholder used when OTS omits move mechanics."""
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayMove:
+    """Minimal move view required by the offline observation builder."""
+
+    id: str
+    type: ReplayName = ReplayName("unknown")
+    category: ReplayName = ReplayName("unknown")
+    current_pp: int | None = None
+    max_pp: int | None = None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class ReplayPokemon:
     species: str
-    moves: tuple[str, ...] = ()
+    moves: Mapping[str, ReplayMove] = field(default_factory=dict)
     current_hp_fraction: float = 1.0
     fainted: bool = False
     revealed: bool = True
     selected_in_teampreview: bool = False
     ability: str | None = None
     item: str | None = None
+    nature: str | None = None
+    base_stats_data: Mapping[str, int] = field(default_factory=dict)
     status: Any = None
-    boosts: Mapping[str, int] = field(default_factory=dict)
+    boosts: Mapping[str, int] = field(default_factory=_zero_boosts)
     level: int | None = 50
 
     @property
@@ -89,7 +113,7 @@ class ReplayPokemon:
 
     @property
     def base_stats(self) -> Mapping[str, int]:
-        return {}
+        return self.base_stats_data
 
     @property
     def stats(self) -> Mapping[str, int | None]:
@@ -251,6 +275,10 @@ def impute_stat_points(
     return tuple(estimates)
 
 
+def _replay_moves(names: tuple[str, ...]) -> dict[str, ReplayMove]:
+    return {name: ReplayMove(name) for name in names}
+
+
 class _ReplayState:
     def __init__(self, document: ReplayDocument):
         self.turn = 0
@@ -260,13 +288,25 @@ class _ReplayState:
             [
                 ReplayPokemon(
                     species,
-                    tuple(
-                        str(move)
-                        for move in document.ots[side]
-                        .revealed_details.get(species, {})
-                        .get("moves", ())
-                        if isinstance(move, str)
+                    _replay_moves(
+                        tuple(
+                            str(move)
+                            for move in document.ots[side]
+                            .revealed_details.get(species, {})
+                            .get("moves", ())
+                            if isinstance(move, str)
+                        )
                     ),
+                    ability=str(
+                        document.ots[side].revealed_details.get(species, {}).get("ability", "")
+                    )
+                    or None,
+                    item=str(document.ots[side].revealed_details.get(species, {}).get("item", ""))
+                    or None,
+                    nature=str(
+                        document.ots[side].revealed_details.get(species, {}).get("nature", "")
+                    )
+                    or None,
                 )
                 for species in document.ots[side].revealed_species
             ]
@@ -705,6 +745,8 @@ reconstruct_game = reconstruct_perspective
 
 
 __all__ = [
+    "ReplayMove",
+    "ReplayName",
     "ReplayPokemon",
     "ReconstructedPerspective",
     "ReconstructedSnapshot",
