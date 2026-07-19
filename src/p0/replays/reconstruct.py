@@ -141,7 +141,7 @@ class ReplayPokemon:
 
     @property
     def preparing(self) -> Any:
-        return None
+        return 0.0
 
     @property
     def last_move(self) -> None:

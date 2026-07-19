@@ -63,8 +63,14 @@ bc:
   chunk_length: 16
   batch_decisions: 256
   learning_rate: 0.0003
+  epochs: 1
+  validation_batches: 0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  seed: 0
   amp: true
   shards_dir: artifacts/shards
+  checkpoint_path: artifacts/bc_checkpoint.pt
 corpus:
   manifest_path: teams/corpus_manifest.json
   agent_split: train

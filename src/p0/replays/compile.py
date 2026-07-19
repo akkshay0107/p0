@@ -195,6 +195,11 @@ def _perspective_tensors(
         observation = builder.build(snapshot.view, overrides)
         observation.validate(batch_rank=0)
         observation.validate_overflow_contract()
+        if any(
+            tensor.is_floating_point() and not torch.isfinite(tensor).all()
+            for tensor in observation.tensors()
+        ):
+            raise ValueError("Replay observation contains a non-finite tensor value")
         for name, tensor in zip(
             StructuredObservation._FIELD_NAMES, observation.tensors(), strict=True
         ):

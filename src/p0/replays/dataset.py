@@ -7,6 +7,7 @@ import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from pickle import UnpicklingError
 from typing import Any
 
 import torch
@@ -336,6 +337,11 @@ class LazyReplayDataset:
         self, entry: ShardIndexEntry
     ) -> tuple[Mapping[str, Any], Mapping[str, torch.Tensor], list[Mapping[str, Any]]]:
         path = self._root / entry.filename
+        root = self._root.resolve()
+        resolved_path = path.resolve()
+        if root not in resolved_path.parents:
+            raise ValueError(f"Shard filename escapes the manifest directory: {entry.filename!r}")
+        path = resolved_path
         if not path.is_file():
             raise ValueError(f"Shard file is missing: {path}")
         if self.verify_hashes:
@@ -346,7 +352,7 @@ class LazyReplayDataset:
             raise ValueError(f"Shard byte-size mismatch for {path}")
         try:
             payload = torch.load(path, weights_only=True, map_location="cpu")
-        except (OSError, RuntimeError, EOFError) as exc:
+        except (OSError, RuntimeError, EOFError, UnpicklingError) as exc:
             raise ValueError(f"Unable to load shard {path}") from exc
         if not isinstance(payload, Mapping):
             raise ValueError(f"Malformed shard {path}: expected a mapping")

@@ -63,6 +63,9 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v3_shard(tmp_path: Path
     shard_path = built.manifest_path.parent / manifest.shards[0].filename
     payload = torch.load(shard_path, weights_only=True, map_location="cpu")
     tensors = payload["tensors"]
+    assert all(
+        torch.isfinite(tensor).all() for tensor in tensors.values() if tensor.is_floating_point()
+    )
     assert tensors["categorical"].shape[0] == manifest.decisions
     assert tensors["action_mask"].shape == (4, 2, 49)
     assert tensors["candidate_offsets"].tolist() == [0, 0, 1, 1, 2]
