@@ -1,8 +1,14 @@
+from dataclasses import fields
+
 import pytest
 import torch
 import torch.nn as nn
 
 from p0.battle.series import MAX_PRIOR_GAMES, GameSummary, SideGameSummary
+from p0.format_config import FORMAT
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
+from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.model.series_context import (
     GAME_SCALAR_WIDTH,
@@ -16,6 +22,15 @@ from p0.model.series_context import (
     SeriesFeatures,
     SeriesStateConditioner,
     tensorize_series,
+)
+from p0.model.structured_observation import (
+    CATEGORICAL_WIDTH,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_COUNT,
+    EVENT_NUMERICAL_WIDTH,
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
+    StructuredObservation,
 )
 
 
@@ -207,3 +222,95 @@ def test_conditioner_gate_admits_context() -> None:
     state_a = conditioner(hg_init, torch.randn(2, SERIES_TOKENS, D_MODEL))
     state_b = conditioner(hg_init, torch.randn(2, SERIES_TOKENS, D_MODEL))
     assert not torch.equal(state_a, state_b)
+
+
+def _policy(enabled: bool) -> PolicyNet:
+    torch.manual_seed(0)
+    config = ModelConfig(
+        d_model=64,
+        nhead=4,
+        reducer_layers=1,
+        history_tokens=8,
+        dim_feedforward=128,
+        series_context_enabled=enabled,
+        series_tokens=SERIES_TOKENS,
+    )
+    return build_policy(config, default_runtime_resources())
+
+
+def _dummy_obs(batch_size: int) -> StructuredObservation:
+    return StructuredObservation(
+        token_type_ids=torch.zeros((batch_size, SEQUENCE_LENGTH), dtype=torch.long),
+        side_ids=torch.zeros((batch_size, SEQUENCE_LENGTH), dtype=torch.long),
+        slot_ids=torch.zeros((batch_size, SEQUENCE_LENGTH), dtype=torch.long),
+        categorical=torch.zeros((batch_size, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
+        numerical=torch.zeros((batch_size, SEQUENCE_LENGTH, NUMERICAL_WIDTH)),
+        events_cat=torch.zeros(
+            (batch_size, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), dtype=torch.long
+        ),
+        events_num=torch.zeros((batch_size, EVENT_COUNT, EVENT_NUMERICAL_WIDTH)),
+        events_side_ids=torch.zeros((batch_size, EVENT_COUNT), dtype=torch.long),
+        events_slot_ids=torch.zeros((batch_size, EVENT_COUNT), dtype=torch.long),
+    )
+
+
+def test_disabled_policy_has_no_series_modules() -> None:
+    policy = _policy(enabled=False)
+    assert not any(name.startswith("series") for name in policy.state_dict())
+    empty = SeriesFeatures.stack([tensorize_series((), player_index=0, tokenizer=_tokenizer())])
+    with pytest.raises(ValueError, match="series_context_enabled"):
+        policy.initial_series_state(empty)
+
+
+def test_series_embeddings_shared_with_battle_encoder() -> None:
+    policy = _policy(enabled=True)
+    assert policy.series.species_emb is policy.encoder.species_emb
+    assert policy.series.move_emb is policy.encoder.move_emb
+    assert policy.series.item_emb is policy.encoder.item_emb
+    assert policy.series.ability_emb is policy.encoder.ability_emb
+    # tied tables appear under both prefixes in the state dict but only once
+    # in the optimizer-facing parameter list
+    named = dict(policy.named_parameters())
+    assert "encoder.species_emb.weight" in named
+    assert "series.species_emb.weight" not in named
+    assert "series.species_emb.weight" in policy.state_dict()
+
+
+def test_initial_series_state_matches_initial_state_at_init() -> None:
+    policy = _policy(enabled=True)
+    tokenizer = _tokenizer()
+    empty = tensorize_series((), player_index=0, tokenizer=tokenizer)
+    with_game = tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=tokenizer)
+    features = SeriesFeatures.stack([empty, with_game])
+    # the zero-initialized gate makes conditioning an exact no-op until trained
+    assert torch.equal(policy.initial_series_state(features), policy.initial_state(2))
+
+
+def test_game2_gradients_reach_series_encoder_but_not_game1() -> None:
+    policy = _policy(enabled=True)
+    with torch.no_grad():
+        policy.series_conditioner.gate.fill_(0.5)
+    obs = _dummy_obs(1)
+    action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.uint8)
+
+    game1_out = policy.act_obs(obs, action_mask, policy.initial_state(1))
+    # retain_grad so grads would be observable if the Game 2 graph reached
+    # these Game 1 execution tensors
+    game1_out.value.retain_grad()
+    game1_out.state.retain_grad()
+    features = SeriesFeatures.stack(
+        [tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=_tokenizer())]
+    )
+    for field in fields(SeriesFeatures):
+        assert not getattr(features, field.name).requires_grad
+
+    state = policy.initial_series_state(features)
+    game2_out = policy.act_obs(obs, action_mask, state)
+    loss = game2_out.value.mean() - game2_out.log_probs.mean()
+    loss.backward()
+
+    assert policy.series.series_queries.grad is not None
+    assert policy.series.poke_proj.weight.grad is not None
+    assert policy.series.poke_proj.weight.grad.abs().sum() > 0
+    assert policy.series_conditioner.gate.grad is not None
+    assert game1_out.value.grad is None and game1_out.state.grad is None

@@ -313,15 +313,15 @@ def test_model_config_series_fields() -> None:
     config = ModelConfig.baseline()
     assert config.series_tokens == 4 and not config.series_context_enabled
     assert ModelConfig.from_dict(config.to_dict()) == config
-    with pytest.raises(ValueError, match="disabled during the refactor baseline"):
-        ModelConfig(
-            d_model=64,
-            nhead=4,
-            reducer_layers=1,
-            history_tokens=2,
-            dim_feedforward=128,
-            series_context_enabled=True,
-        )
+    enabled = ModelConfig(
+        d_model=64,
+        nhead=4,
+        reducer_layers=1,
+        history_tokens=2,
+        dim_feedforward=128,
+        series_context_enabled=True,
+    )
+    assert ModelConfig.from_dict(enabled.to_dict()) == enabled
     stale = config.to_dict()
     del stale["series_tokens"]
     with pytest.raises(ValueError, match=r"missing=\['series_tokens'\]"):

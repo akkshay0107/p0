@@ -34,8 +34,6 @@ class ModelConfig:
                 raise ValueError(f"ModelConfig.{name} must be a positive integer")
         if self.d_model % self.nhead:
             raise ValueError("ModelConfig.d_model must be divisible by nhead")
-        if self.series_context_enabled:
-            raise ValueError("Series context remains disabled during the refactor baseline")
 
     @classmethod
     def baseline(cls) -> ModelConfig:
