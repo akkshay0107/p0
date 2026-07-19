@@ -33,6 +33,11 @@ from p0.model.cls_reducer import CLSReducer
 from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
 from p0.model.resources import RuntimeResources
+from p0.model.series_context import (
+    SeriesContextEncoder,
+    SeriesFeatures,
+    SeriesStateConditioner,
+)
 from p0.model.structured_observation import (
     ALLY_POKE_TOKENS,
     EVENT_COUNT,
@@ -509,12 +514,43 @@ class PolicyNet(nn.Module):
         # value head
         self.critic = ValueHead(config.d_model)
 
+        # only construct the series modules when enabled so the disabled
+        # state_dict layout stays identical and strict checkpoint loading of
+        # pre-series artifacts keeps working
+        if config.series_context_enabled:
+            self.series = SeriesContextEncoder(
+                config.d_model,
+                config.nhead,
+                config.dim_feedforward,
+                config.series_tokens,
+                self.encoder.species_emb,
+                self.encoder.move_emb,
+                self.encoder.item_emb,
+                self.encoder.ability_emb,
+            )
+            self.series_conditioner = SeriesStateConditioner(
+                config.d_model, config.nhead, config.history_tokens
+            )
+
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
     def initial_state(self, batch_size: int) -> Tensor:
         return self.actor.reducer.hg_init.expand(batch_size, -1, -1).to(self.device)
+
+    def initial_series_state(self, features: SeriesFeatures) -> Tensor:
+        """Initial recurrent state conditioned on prior-game summaries.
+
+        The context is re-encoded from raw summaries inside the current game's
+        graph, so gradients reach the series encoder but never any earlier
+        game's execution tensors. Zero-game features yield the learned Game 1
+        prior; callers that want plain hg_init use initial_state instead.
+        """
+        if not self.config.series_context_enabled:
+            raise ValueError("initial_series_state requires series_context_enabled")
+        context = self.series(features)
+        return self.series_conditioner(self.actor.reducer.hg_init.to(self.device), context)
 
     def encode(
         self,

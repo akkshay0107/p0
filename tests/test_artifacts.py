@@ -4,10 +4,12 @@ from pathlib import Path
 import pytest
 import torch
 
+from p0.battle.series import GameSummary, SideGameSummary
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
+from p0.model.series_context import SeriesFeatures, tensorize_series
 from p0.training.checkpoint import CHECKPOINT_SCHEMA, DEFAULT_POLICY_STORE
 
 _EXPORT_SPEC = importlib.util.spec_from_file_location(
@@ -58,6 +60,40 @@ def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path):
         )
         for name in state
     )
+
+
+def test_series_policy_checkpoint_round_trip(tmp_path):
+    path = tmp_path / "policy.pt"
+    config = ModelConfig(32, 4, 1, 8, 128, series_context_enabled=True, series_tokens=2)
+    original = build_policy(config, default_runtime_resources())
+    with torch.no_grad():
+        original.series_conditioner.gate.fill_(0.25)
+    DEFAULT_POLICY_STORE.save_policy(path, original)
+
+    restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
+    assert restored.config.series_context_enabled
+    assert restored.config.series_tokens == 2
+    assert torch.equal(restored.series_conditioner.gate, original.series_conditioner.gate)
+
+    side = SideGameSummary(
+        leads=("charizard", "garchomp"),
+        brought=("charizard", "garchomp", "pikachu"),
+        mega_species="",
+        moves_used={"charizard": ("flamethrower",)},
+        revealed_items={},
+        revealed_abilities={},
+        revealed_formes=(),
+        switch_count=1,
+        pivot_count=0,
+    )
+    game = GameSummary(game_number=1, winner=0, series_score=(1, 0), turns=5, sides=(side, side))
+    features = SeriesFeatures.stack(
+        [tensorize_series((game,), 0, default_runtime_resources().tokenizer)]
+    )
+    with torch.no_grad():
+        assert torch.equal(
+            restored.initial_series_state(features), original.initial_series_state(features)
+        )
 
 
 def test_checkpoint_rejects_incompatible_and_legacy_contracts(tmp_path):
