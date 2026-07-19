@@ -191,6 +191,20 @@ def test_encoder_rejects_unbatched_features() -> None:
         _encoder()(single)
 
 
+def test_encoder_rejects_grad_carrying_features() -> None:
+    batch = _mixed_batch()
+    leaky = SeriesFeatures(
+        **{
+            field.name: getattr(batch, field.name)
+            for field in fields(SeriesFeatures)
+            if field.name != "poke_scalars"
+        },
+        poke_scalars=batch.poke_scalars.clone().requires_grad_(True),
+    )
+    with pytest.raises(ValueError, match="must not require grad"):
+        _encoder()(leaky)
+
+
 def test_encoder_grads_reach_projections() -> None:
     encoder = _encoder()
     context = encoder(_mixed_batch())

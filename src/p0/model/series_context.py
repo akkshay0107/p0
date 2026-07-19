@@ -262,6 +262,12 @@ class SeriesContextEncoder(nn.Module):
                 init.normal_(module.weight, std=emb_gain)
 
     def _validate_batch(self, features: SeriesFeatures) -> int:
+        # series context is re-encoded from grad-free summaries inside the
+        # current game's graph; a grad-carrying input would smuggle an autograd
+        # edge across the game boundary
+        for field in fields(SeriesFeatures):
+            if getattr(features, field.name).requires_grad:
+                raise ValueError(f"SeriesFeatures.{field.name} must not require grad")
         shape = features.species.shape
         expected = (MAX_PRIOR_GAMES, SERIES_SIDES, SERIES_POKEMON_SLOTS)
         if len(shape) != 4 or shape[1:] != expected:
