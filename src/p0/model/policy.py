@@ -433,6 +433,20 @@ class ActorPolicy(nn.Module):
         candidate_values: Tensor,
         candidate_offsets: Tensor,
     ) -> Tensor:
+        """Score candidates while preserving the pinned scorer return type."""
+        scores, _ = self.score_joint_candidates_with_state(
+            enc, action_mask, state, candidate_values, candidate_offsets
+        )
+        return scores
+
+    def score_joint_candidates_with_state(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        state: Tensor,
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         """Score ragged joint candidates after one recurrent reducer pass."""
         batch_size = enc.tokens.size(0)
         if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
@@ -454,12 +468,11 @@ class ActorPolicy(nn.Module):
             raise ValueError("candidate_offsets must start at zero and end at candidate count")
         if torch.any(offsets[1:] < offsets[:-1]):
             raise ValueError("candidate_offsets must be nondecreasing")
+        z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
         if candidate_values.numel() == 0:
-            return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
+            return candidate_values.new_empty((0,), dtype=enc.tokens.dtype), next_state
         if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
             raise ValueError("candidate action ids are outside the action contract")
-
-        z, _, tokens_ctx = self.reducer(enc.tokens, state, None)
         k_entity_extended = self._compute_keys(tokens_ctx)
         logits1, keys1 = self._compute_pointer_logits(
             z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
@@ -492,7 +505,7 @@ class ActorPolicy(nn.Module):
         log_prob_second = F.log_softmax(candidate_logits[:, 1], dim=-1).gather(
             1, second_actions.unsqueeze(1)
         )
-        return (log_prob_first + log_prob_second).squeeze(1)
+        return (log_prob_first + log_prob_second).squeeze(1), next_state
 
     def _apply_sequential_masks(
         self,
