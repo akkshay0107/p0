@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn as nn
 
 from p0.battle.series import MAX_PRIOR_GAMES, GameSummary, SideGameSummary
 from p0.model.resources import default_runtime_resources
@@ -11,9 +12,12 @@ from p0.model.series_context import (
     SERIES_POKEMON_SLOTS,
     SERIES_SIDES,
     SIDE_SCALAR_WIDTH,
+    SeriesContextEncoder,
     SeriesFeatures,
+    SeriesStateConditioner,
     tensorize_series,
 )
+
 
 def _side(lead_a: str, lead_b: str, extra: str) -> SideGameSummary:
     return SideGameSummary(
@@ -122,3 +126,84 @@ def test_stack_batches_features() -> None:
     assert torch.equal(batch.species[0], single.species)
     with pytest.raises(ValueError, match="at least one"):
         SeriesFeatures.stack([])
+
+
+D_MODEL = 32
+D_RAW = 16
+SERIES_TOKENS = 3
+
+
+def _encoder() -> SeriesContextEncoder:
+    vocab = default_runtime_resources().vocab
+    torch.manual_seed(0)
+    return SeriesContextEncoder(
+        d_model=D_MODEL,
+        nhead=4,
+        dim_feedforward=64,
+        series_tokens=SERIES_TOKENS,
+        species_emb=nn.Embedding(len(vocab["species"]) + 1, D_RAW),
+        move_emb=nn.Embedding(len(vocab["moves"]) + 1, D_RAW),
+        item_emb=nn.Embedding(len(vocab["items"]) + 1, D_RAW),
+        ability_emb=nn.Embedding(len(vocab["abilities"]) + 1, D_RAW),
+    )
+
+
+def _mixed_batch() -> SeriesFeatures:
+    tokenizer = _tokenizer()
+    with_games = tensorize_series(
+        (_game(1, 0, (1, 0)), _game(2, 1, (1, 1))), player_index=0, tokenizer=tokenizer
+    )
+    empty = tensorize_series((), player_index=0, tokenizer=tokenizer)
+    return SeriesFeatures.stack([with_games, empty])
+
+
+def test_encoder_output_shape() -> None:
+    context = _encoder()(_mixed_batch())
+    assert context.shape == (2, SERIES_TOKENS, D_MODEL)
+    assert torch.isfinite(context).all()
+
+
+def test_empty_rows_return_learned_empty_context() -> None:
+    encoder = _encoder()
+    context = encoder(_mixed_batch())
+    assert torch.equal(context[1], encoder.empty_context[0])
+    assert not torch.equal(context[0], encoder.empty_context[0])
+
+
+def test_encoder_rejects_unbatched_features() -> None:
+    single = tensorize_series((), player_index=0, tokenizer=_tokenizer())
+    with pytest.raises(ValueError, match="batched"):
+        _encoder()(single)
+
+
+def test_encoder_grads_reach_projections() -> None:
+    encoder = _encoder()
+    context = encoder(_mixed_batch())
+    # a plain sum has near-zero gradient through the encoder's final LayerNorm
+    # (the normalized output sums to a constant), so square first
+    context.pow(2).sum().backward()
+    assert encoder.series_queries.grad is not None
+    assert encoder.poke_proj.weight.grad is not None
+    assert encoder.poke_proj.weight.grad.abs().sum() > 0
+
+
+def test_conditioner_zero_gate_is_identity() -> None:
+    torch.manual_seed(0)
+    conditioner = SeriesStateConditioner(D_MODEL, nhead=4, history_tokens=8)
+    hg_init = torch.randn(1, 8, D_MODEL)
+    context = torch.randn(5, SERIES_TOKENS, D_MODEL)
+    state = conditioner(hg_init, context)
+    assert torch.equal(state, hg_init.expand(5, -1, -1))
+    with pytest.raises(ValueError, match="hg_init"):
+        conditioner(torch.randn(1, 4, D_MODEL), context)
+
+
+def test_conditioner_gate_admits_context() -> None:
+    torch.manual_seed(0)
+    conditioner = SeriesStateConditioner(D_MODEL, nhead=4, history_tokens=8)
+    with torch.no_grad():
+        conditioner.gate.fill_(1.0)
+    hg_init = torch.randn(1, 8, D_MODEL)
+    state_a = conditioner(hg_init, torch.randn(2, SERIES_TOKENS, D_MODEL))
+    state_b = conditioner(hg_init, torch.randn(2, SERIES_TOKENS, D_MODEL))
+    assert not torch.equal(state_a, state_b)
