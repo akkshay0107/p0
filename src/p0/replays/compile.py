@@ -54,14 +54,18 @@ def _normalized(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
 
 
-def _hydrate_base_stats(view: Any, dex: Mapping[str, Any]) -> None:
-    base_stats = {
+def _species_base_stats(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    """Index the dex by normalized species id. Callers must build this once per compile."""
+    return {
         _normalized(str(entry.get("id", entry.get("name", "")))): {
             str(key): int(value) for key, value in entry.get("baseStats", {}).items()
         }
         for entry in dex.get("species", ())
         if isinstance(entry, Mapping) and isinstance(entry.get("baseStats"), Mapping)
     }
+
+
+def _hydrate_base_stats(view: Any, base_stats: Mapping[str, Mapping[str, int]]) -> None:
     for team in (view.team, view.opponent_team):
         for pokemon in team.values():
             stats = base_stats.get(_normalized(pokemon.species))
@@ -158,6 +162,7 @@ def _perspective_tensors(
     *,
     builder: ObservationBuilder,
     stat_estimates: tuple[Any, ...],
+    base_stats: Mapping[str, Mapping[str, int]],
 ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
@@ -166,8 +171,10 @@ def _perspective_tensors(
         for estimate in stat_estimates
         if estimate.precomputed is not None
     }
+    winner = game.document.outcome.winner
+    outcome = 0.0 if winner < 0 else (1.0 if winner == perspective.player else -1.0)
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
-        _hydrate_base_stats(snapshot.view, builder.resources.dex)
+        _hydrate_base_stats(snapshot.view, base_stats)
         snapshot.view.stat_cache = {}
         overrides = {}
         for side, team in ((0, snapshot.view.team), (1, snapshot.view.opponent_team)):
@@ -202,10 +209,7 @@ def _perspective_tensors(
         )
         values["candidate_values"].extend(evidence.candidates)
         values["candidate_offsets"].append(len(values["candidate_values"]))
-        winner = game.document.outcome.winner
-        values["outcome"].append(
-            0.0 if winner < 0 else (1.0 if winner == perspective.player else -1.0)
-        )
+        values["outcome"].append(outcome)
     return fields, values
 
 
@@ -280,6 +284,7 @@ def write_tensor_shards(
     root = Path(output_dir) / runtime_hash
     root.mkdir(parents=True, exist_ok=True)
     builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
+    base_stats = _species_base_stats(builder.resources.dex)
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     current_games: list[tuple[CompiledGame, ReconstructedPerspective, GameSummary | None]] = []
@@ -303,7 +308,11 @@ def write_tensor_shards(
                     game.document, dex=builder.resources.dex
                 )
             fields, values = _perspective_tensors(
-                game, perspective, builder=builder, stat_estimates=estimate_cache[game.replay_id]
+                game,
+                perspective,
+                builder=builder,
+                stat_estimates=estimate_cache[game.replay_id],
+                base_stats=base_stats,
             )
             for name in field_values:
                 field_values[name].extend(fields[name])
@@ -337,12 +346,13 @@ def write_tensor_shards(
         current_games = []
         current_decisions = 0
 
+    games_by_series: dict[str, dict[str, CompiledGame]] = {}
+    for compiled_game in result.games:
+        games_by_series.setdefault(compiled_game.series_id, {})[compiled_game.replay_id] = (
+            compiled_game
+        )
     for group in result.series:
-        group_games = {
-            game.replay_id: game
-            for game in result.games
-            if game.series_id == group.record.series_id
-        }
+        group_games = games_by_series.get(group.record.series_id, {})
         score = [0, 0]
         group_items: list[tuple[CompiledGame, ReconstructedPerspective, GameSummary | None]] = []
         for game in group.games:

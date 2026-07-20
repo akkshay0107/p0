@@ -167,31 +167,25 @@ class BCTrainer:
     ) -> tuple[Tensor, _RunTotals]:
         observations = game.observations[start:end].to(self.device)
         action_mask = game.action_mask[start:end].to(self.device)
-        candidate_start = int(game.candidate_offsets[start].item())
-        candidate_end = int(game.candidate_offsets[end].item())
-        candidates = game.candidate_values[candidate_start:candidate_end].to(self.device)
-        offsets = game.candidate_offsets[start : end + 1] - candidate_start
-        offsets = offsets.to(self.device)
+        # Read the ragged boundaries on the host once; per-decision .item() would sync
+        # against the accelerator on every step of the loop below.
+        offsets = game.candidate_offsets[start : end + 1].tolist()
+        candidate_start = offsets[0]
+        candidates = game.candidate_values[candidate_start : offsets[-1]].to(self.device)
         labels = game.label_kind[start:end].to(self.device)
         loss_mask = game.loss_mask[start:end].to(self.device)
         encoded = self.policy.encode(observations, action_mask)
         self.optimizer.zero_grad(set_to_none=True)
-        total_loss = torch.zeros((), device=self.device)
-        exact_nll = 0.0
-        partial_nll = 0.0
-        labeled_decisions = 0
-        exact_decisions = 0
-        partial_decisions = 0
+        # The recurrent state forces one scoring call per decision, but the objective is
+        # ragged, so it runs once over the whole chunk.
+        chunk_log_probs = []
         for index in range(end - start):
-            candidate_left = int(offsets[index].item())
-            candidate_right = int(offsets[index + 1].item())
+            candidate_left = offsets[index] - candidate_start
+            candidate_right = offsets[index + 1] - candidate_start
             one_encoded = EncodedObs(
                 encoded.tokens[index : index + 1],
                 encoded.aux[index : index + 1],
                 encoded.numerical[index : index + 1],
-            )
-            one_offsets = torch.tensor(
-                [0, candidate_right - candidate_left], dtype=torch.long, device=self.device
             )
             with autocast(device_type=self.device.type, enabled=self.amp_enabled):
                 log_probs, state = self.policy.actor.score_joint_candidates_with_state(
@@ -199,23 +193,29 @@ class BCTrainer:
                     action_mask[index : index + 1],
                     state,
                     candidates[candidate_left:candidate_right],
-                    one_offsets,
+                    torch.tensor(
+                        [0, candidate_right - candidate_left],
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
                 )
-                objective = compute_bc_objective(
-                    log_probs,
-                    one_offsets,
-                    labels[index : index + 1],
-                    loss_mask[index : index + 1],
-                )
-            total_loss = total_loss + objective.loss * objective.labeled_count
-            exact_nll += objective.exact_nll.detach().item() * objective.exact_count
-            partial_nll += objective.partial_nll.detach().item() * objective.partial_count
-            labeled_decisions += objective.labeled_count
-            exact_decisions += objective.exact_count
-            partial_decisions += objective.partial_count
+            chunk_log_probs.append(log_probs)
+        objective = compute_bc_objective(
+            torch.cat(chunk_log_probs),
+            torch.tensor(
+                [offset - candidate_start for offset in offsets],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            labels,
+            loss_mask,
+        )
+        labeled_decisions = objective.labeled_count
+        exact_decisions = objective.exact_count
+        partial_decisions = objective.partial_count
         loss_sum = 0.0
         if labeled_decisions:
-            loss = total_loss / labeled_decisions
+            loss = objective.loss
             if not torch.isfinite(loss):
                 raise ValueError(
                     f"Non-finite BC loss in series {game.series_id}, game {game.game_number}"
@@ -228,8 +228,8 @@ class BCTrainer:
             loss_sum = loss.detach().item() * labeled_decisions
         return state.detach(), _RunTotals(
             loss=loss_sum,
-            exact_nll=exact_nll,
-            partial_nll=partial_nll,
+            exact_nll=objective.exact_nll.detach().item() * exact_decisions,
+            partial_nll=objective.partial_nll.detach().item() * partial_decisions,
             decisions=end - start,
             labeled_decisions=labeled_decisions,
             exact_decisions=exact_decisions,

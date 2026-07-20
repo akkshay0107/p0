@@ -333,14 +333,13 @@ class LazyReplayDataset:
         end: int,
         history: tuple[GameSummary, ...],
     ) -> ReplayGameChunk:
-        candidate_start = int(tensors["candidate_offsets"][start].item())
-        candidate_end = int(tensors["candidate_offsets"][end].item())
+        candidate_bounds = tensors["candidate_offsets"][start : end + 1]
+        candidate_start = int(candidate_bounds[0])
+        candidate_end = int(candidate_bounds[-1])
         observation = StructuredObservation._from_values(
             [tensors[name][start:end].clone() for name, *_ in observation_field_specs()]
         )
-        candidate_offsets = (
-            tensors["candidate_offsets"][start : end + 1] - candidate_start
-        ).clone()
+        candidate_offsets = candidate_bounds - candidate_start
         return ReplayGameChunk(
             series_id=str(item["series_id"]),
             game_number=int(item["game_number"]),
