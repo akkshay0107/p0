@@ -103,3 +103,13 @@ def test_cli_parser_help() -> None:
     assert args.checkpoint == Path("dummy_checkpoint.pt")
     assert args.episodes == 5
     assert args.opponent_checkpoint is None
+
+
+def test_eval_player_early_validation_fails() -> None:
+    from p0.evaluation.harness import EvalRandomPlayer
+    import random
+
+    with pytest.raises(
+        ValueError, match="EvalPlayer requires either team_source or a team in kwargs"
+    ):
+        EvalRandomPlayer(team_rng=random.Random(0))

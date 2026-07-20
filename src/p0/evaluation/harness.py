@@ -85,13 +85,12 @@ Modest Nature
 logger = logging.getLogger(__name__)
 
 
-def wilson_score_interval(wins: int, total: int, confidence: float = 0.95) -> tuple[float, float]:
-    """Calculate the Wilson score interval for a binomial proportion.
+def wilson_score_interval(wins: int, total: int) -> tuple[float, float]:
+    """Calculate the Wilson 95% score interval for a binomial proportion.
 
     Arguments:
       wins: Number of successes (wins)
       total: Total number of trials (games)
-      confidence: Confidence level (e.g. 0.95)
 
     Returns:
       A tuple (lower_bound, upper_bound)
@@ -99,7 +98,6 @@ def wilson_score_interval(wins: int, total: int, confidence: float = 0.95) -> tu
     if total == 0:
         return 0.0, 0.0
     p = wins / total
-    # For 95% confidence, z = 1.96
     z = 1.96
 
     denominator = 1 + (z**2) / total
@@ -111,11 +109,54 @@ def wilson_score_interval(wins: int, total: int, confidence: float = 0.95) -> tu
     return max(0.0, lower), min(1.0, upper)
 
 
-class EvalPlayer(RLPlayer):
-    """An RLPlayer subclass that tracks the history and teams used during evaluation."""
+class EvalPlayerMixin:
+    """Mixin to track history and teams used during evaluation."""
 
+    team_source: TeamSource | None
+    team_rng: random.Random
     current_team_packed: str | None
     history: list[tuple[str | None, bool]]
+
+    def _init_eval(
+        self,
+        team_rng: random.Random,
+        team_source: TeamSource | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        self.team_source = team_source
+        self.team_rng = team_rng
+        self.history = []
+
+        if team_source is not None:
+            if "team" in kwargs:
+                raise ValueError("Pass either team or team_source, not both")
+            initial_team = team_source.sample(team_rng).packed
+            kwargs["team"] = initial_team
+            self.current_team_packed = initial_team
+        else:
+            self.current_team_packed = kwargs.get("team")
+
+        if self.current_team_packed is None:
+            raise ValueError("EvalPlayer requires either team_source or a team in kwargs")
+
+        return kwargs
+
+    def update_team(self, team: str | Teambuilder) -> None:
+        super().update_team(team)  # type: ignore
+        if isinstance(team, str):
+            self.current_team_packed = team
+
+    def _battle_finished_callback(self, battle: AbstractBattle) -> None:
+        won = battle.won if battle.won is not None else False
+        self.history.append((self.current_team_packed, won))
+        if hasattr(self, "state"):
+            self.state = None
+        if self.team_source is not None:
+            self.update_team(self.team_source.sample(self.team_rng).packed)
+
+
+class EvalPlayer(EvalPlayerMixin, RLPlayer):
+    """An RLPlayer subclass that tracks the history and teams used during evaluation."""
 
     def __init__(
         self,
@@ -125,16 +166,7 @@ class EvalPlayer(RLPlayer):
         team_source: TeamSource | None = None,
         **kwargs: Any,
     ) -> None:
-        if team_source is not None:
-            if "team" in kwargs:
-                raise ValueError("Pass either team or team_source, not both")
-            initial_team = team_source.sample(team_rng).packed
-            kwargs["team"] = initial_team
-            self.current_team_packed = initial_team
-        else:
-            self.current_team_packed = kwargs.get("team")
-
-        self.history = []
+        kwargs = self._init_eval(team_rng, team_source, **kwargs)
         super().__init__(
             policy,
             *args,
@@ -143,24 +175,9 @@ class EvalPlayer(RLPlayer):
             **kwargs,
         )
 
-    def update_team(self, team: str | Teambuilder) -> None:
-        super().update_team(team)
-        if isinstance(team, str):
-            self.current_team_packed = team
 
-    def _battle_finished_callback(self, battle: AbstractBattle) -> None:
-        won = battle.won if battle.won is not None else False
-        self.history.append((self.current_team_packed, won))
-        self.state = None
-        if self.team_source is not None:
-            self.update_team(self.team_source.sample(self.team_rng).packed)
-
-
-class EvalRandomPlayer(RandomPlayer):
+class EvalRandomPlayer(EvalPlayerMixin, RandomPlayer):
     """A RandomPlayer subclass that tracks history and teams used during evaluation."""
-
-    current_team_packed: str | None
-    history: list[tuple[str | None, bool]]
 
     def __init__(
         self,
@@ -169,31 +186,9 @@ class EvalRandomPlayer(RandomPlayer):
         team_source: TeamSource | None = None,
         **kwargs: Any,
     ) -> None:
-        self.team_source = team_source
-        self.team_rng = team_rng
-        if team_source is not None:
-            if "team" in kwargs:
-                raise ValueError("Pass either team or team_source, not both")
-            initial_team = team_source.sample(team_rng).packed
-            kwargs["team"] = initial_team
-            self.current_team_packed = initial_team
-        else:
-            self.current_team_packed = kwargs.get("team")
-
-        self.history = []
+        kwargs = self._init_eval(team_rng, team_source, **kwargs)
         super().__init__(*args, **kwargs)
         poke_env_patches.install(self.logger)
-
-    def update_team(self, team: str | Teambuilder) -> None:
-        super().update_team(team)
-        if isinstance(team, str):
-            self.current_team_packed = team
-
-    def _battle_finished_callback(self, battle: AbstractBattle) -> None:
-        won = battle.won if battle.won is not None else False
-        self.history.append((self.current_team_packed, won))
-        if self.team_source is not None:
-            self.update_team(self.team_source.sample(self.team_rng).packed)
 
 
 @dataclass(frozen=True, slots=True)
