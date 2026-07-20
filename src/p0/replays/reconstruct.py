@@ -48,6 +48,37 @@ def normalize_id(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
 
 
+def _species_base_stats(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    """Index the dex by normalized species id."""
+    return {
+        normalize_id(str(entry.get("id", entry.get("name", "")))): {
+            str(key): int(value) for key, value in entry.get("baseStats", {}).items()
+        }
+        for entry in dex.get("species", ())
+        if isinstance(entry, Mapping) and isinstance(entry.get("baseStats"), Mapping)
+    }
+
+
+def _make_replay_pokemon(
+    species: str,
+    base_stats_index: Mapping[str, Mapping[str, int]],
+    moves: Mapping[str, ReplayMove] | None = None,
+    ability: str | None = None,
+    item: str | None = None,
+    nature: str | None = None,
+) -> ReplayPokemon:
+    normalized = normalize_id(species)
+    base_stats = base_stats_index.get(normalized, {})
+    return ReplayPokemon(
+        species=species,
+        moves=moves if moves is not None else {},
+        ability=ability,
+        item=item,
+        nature=nature,
+        base_stats_data=base_stats,
+    )
+
+
 def _zero_boosts() -> dict[str, int]:
     return {stat: 0 for stat in ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")}
 
@@ -280,38 +311,32 @@ def _replay_moves(names: tuple[str, ...]) -> dict[str, ReplayMove]:
 
 
 class _ReplayState:
-    def __init__(self, document: ReplayDocument):
+    def __init__(self, document: ReplayDocument, dex: Mapping[str, Any]):
         self.turn = 0
         self.used_mega = [False, False]
         self.active: list[list[ReplayPokemon | None]] = [[None, None], [None, None]]
-        self.teams: list[list[ReplayPokemon]] = [
-            [
-                ReplayPokemon(
-                    species,
-                    _replay_moves(
-                        tuple(
-                            str(move)
-                            for move in document.ots[side]
-                            .revealed_details.get(species, {})
-                            .get("moves", ())
-                            if isinstance(move, str)
-                        )
-                    ),
-                    ability=str(
-                        document.ots[side].revealed_details.get(species, {}).get("ability", "")
-                    )
-                    or None,
-                    item=str(document.ots[side].revealed_details.get(species, {}).get("item", ""))
-                    or None,
-                    nature=str(
-                        document.ots[side].revealed_details.get(species, {}).get("nature", "")
-                    )
-                    or None,
+        self.base_stats_index = _species_base_stats(dex)
+        self.teams: list[list[ReplayPokemon]] = []
+        for side in (0, 1):
+            side_teams = []
+            for species in document.ots[side].revealed_species:
+                details = document.ots[side].revealed_details.get(species, {})
+                moves_tuple = tuple(
+                    str(move) for move in details.get("moves", ()) if isinstance(move, str)
                 )
-                for species in document.ots[side].revealed_species
-            ]
-            for side in (0, 1)
-        ]
+                ability = str(details.get("ability", "")) or None
+                item = str(details.get("item", "")) or None
+                nature = str(details.get("nature", "")) or None
+                pokemon = _make_replay_pokemon(
+                    species=species,
+                    base_stats_index=self.base_stats_index,
+                    moves=_replay_moves(moves_tuple),
+                    ability=ability,
+                    item=item,
+                    nature=nature,
+                )
+                side_teams.append(pokemon)
+            self.teams.append(side_teams)
         self.hp: dict[str, float] = {}
         self.fainted: set[str] = set()
 
@@ -323,7 +348,7 @@ class _ReplayState:
         for pokemon in self.teams[side]:
             if normalize_id(pokemon.species) == normalized:
                 return pokemon
-        pokemon = ReplayPokemon(species)
+        pokemon = _make_replay_pokemon(species, self.base_stats_index)
         if len(self.teams[side]) < 6:
             self.teams[side].append(pokemon)
         return pokemon
@@ -658,11 +683,16 @@ def reconstruct_perspective(
     *,
     perspective: int,
     max_candidates: int = 256,
+    dex: Mapping[str, Any] | None = None,
 ) -> ReconstructedPerspective:
     """Build pre-decision player-relative views while enforcing causal cutoffs."""
     if perspective not in (0, 1):
         raise ValueError("perspective must be 0 or 1")
-    state = _ReplayState(document)
+    if dex is None:
+        from p0.model.resources import default_runtime_resources
+
+        dex = default_runtime_resources().dex
+    state = _ReplayState(document, dex)
     counters: Counter[str] = Counter()
     snapshots: list[ReconstructedSnapshot] = []
     decisions: list[DecisionRecord] = []
@@ -734,10 +764,11 @@ def reconstruct_both(
     document: ReplayDocument,
     *,
     max_candidates: int = 256,
+    dex: Mapping[str, Any] | None = None,
 ) -> tuple[ReconstructedPerspective, ReconstructedPerspective]:
     return (
-        reconstruct_perspective(document, perspective=0, max_candidates=max_candidates),
-        reconstruct_perspective(document, perspective=1, max_candidates=max_candidates),
+        reconstruct_perspective(document, perspective=0, max_candidates=max_candidates, dex=dex),
+        reconstruct_perspective(document, perspective=1, max_candidates=max_candidates, dex=dex),
     )
 
 
