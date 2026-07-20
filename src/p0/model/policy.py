@@ -5,6 +5,7 @@ from typing import NamedTuple, Protocol
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.init as init
 from torch import Tensor
 from torch.distributions import Categorical
@@ -423,6 +424,88 @@ class ActorPolicy(nn.Module):
         dist2 = Categorical(logits=logits[:, 1])
         log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
         return logits, log_probs, next_state, z
+
+    def score_joint_candidates(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        state: Tensor,
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> Tensor:
+        """Score candidates while preserving the pinned scorer return type."""
+        scores, _ = self.score_joint_candidates_with_state(
+            enc, action_mask, state, candidate_values, candidate_offsets
+        )
+        return scores
+
+    def score_joint_candidates_with_state(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        state: Tensor,
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Score ragged joint candidates after one recurrent reducer pass."""
+        batch_size = enc.tokens.size(0)
+        if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
+            raise ValueError("candidate_values must have shape (candidates, 2)")
+        if candidate_values.dtype != torch.long:
+            raise ValueError("candidate_values must use torch.long action ids")
+        if candidate_offsets.dim() != 1 or candidate_offsets.numel() != batch_size + 1:
+            raise ValueError("candidate_offsets must have one boundary per observation")
+        if action_mask.shape != (batch_size, 2, self.act_size):
+            raise ValueError("action_mask shape does not match encoded observations")
+        if state.size(0) != batch_size:
+            raise ValueError("state batch size does not match encoded observations")
+        if state.device != enc.tokens.device:
+            raise ValueError("state and encoded observations must share a device")
+        if candidate_values.device != enc.tokens.device or action_mask.device != enc.tokens.device:
+            raise ValueError("candidate tensors and action_mask must share the encoded device")
+        offsets = candidate_offsets.to(device=enc.tokens.device, dtype=torch.long)
+        if offsets[0].item() != 0 or offsets[-1].item() != candidate_values.size(0):
+            raise ValueError("candidate_offsets must start at zero and end at candidate count")
+        if torch.any(offsets[1:] < offsets[:-1]):
+            raise ValueError("candidate_offsets must be nondecreasing")
+        z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
+        if candidate_values.numel() == 0:
+            return candidate_values.new_empty((0,), dtype=enc.tokens.dtype), next_state
+        if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
+            raise ValueError("candidate action ids are outside the action contract")
+        k_entity_extended = self._compute_keys(tokens_ctx)
+        logits1, keys1 = self._compute_pointer_logits(
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
+        )
+        counts = offsets[1:] - offsets[:-1]
+        candidate_batch = torch.repeat_interleave(
+            torch.arange(batch_size, device=enc.tokens.device), counts
+        )
+        first_actions = candidate_values[:, 0]
+        second_actions = candidate_values[:, 1]
+        candidate_ctx = keys1[candidate_batch, first_actions]
+        logits2, _ = self._compute_pointer_logits(
+            z[candidate_batch],
+            k_entity_extended[candidate_batch],
+            enc.aux[candidate_batch, 1],
+            enc.numerical[candidate_batch],
+            head_idx=1,
+            ctx_a1=candidate_ctx,
+        )
+        candidate_logits = torch.stack((logits1[candidate_batch], logits2), dim=1)
+        candidate_logits = self._apply_sequential_masks(
+            candidate_logits,
+            first_actions,
+            action_mask[candidate_batch],
+            is_teampreview(enc.numerical[candidate_batch]),
+        )
+        log_prob_first = F.log_softmax(candidate_logits[:, 0], dim=-1).gather(
+            1, first_actions.unsqueeze(1)
+        )
+        log_prob_second = F.log_softmax(candidate_logits[:, 1], dim=-1).gather(
+            1, second_actions.unsqueeze(1)
+        )
+        return (log_prob_first + log_prob_second).squeeze(1), next_state
 
     def _apply_sequential_masks(
         self,

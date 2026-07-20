@@ -1,0 +1,358 @@
+"""Behaviour-cloning objectives over exact and ragged replay labels."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+from torch import Tensor
+from torch.amp import GradScaler, autocast
+
+from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.series_context import SeriesFeatures, tensorize_series
+from p0.replays.dataset import ReplayGameChunk
+from p0.replays.schema import LabelKind
+from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
+from p0.training.config import BCConfig
+
+
+@dataclass(frozen=True, slots=True)
+class BCObjective:
+    """Loss and detached reporting values for one candidate-scored batch."""
+
+    loss: Tensor
+    exact_nll: Tensor
+    partial_nll: Tensor
+    marginal_log_probs: Tensor
+    exact_count: int
+    partial_count: int
+    labeled_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class BCTrainMetrics:
+    """Aggregated metrics from a bounded recurrent BC run."""
+
+    loss: float
+    exact_nll: float
+    partial_nll: float
+    decisions: int
+    labeled_decisions: int
+    exact_decisions: int
+    partial_decisions: int
+    updates: int
+    peak_memory_bytes: int
+
+
+@dataclass(slots=True)
+class _RunTotals:
+    """Running sums over chunks. loss, exact_nll and partial_nll are weighted sums."""
+
+    loss: float = 0.0
+    exact_nll: float = 0.0
+    partial_nll: float = 0.0
+    decisions: int = 0
+    labeled_decisions: int = 0
+    exact_decisions: int = 0
+    partial_decisions: int = 0
+    updates: int = 0
+
+    def add(self, chunk: _RunTotals) -> None:
+        self.loss += chunk.loss
+        self.exact_nll += chunk.exact_nll
+        self.partial_nll += chunk.partial_nll
+        self.decisions += chunk.decisions
+        self.labeled_decisions += chunk.labeled_decisions
+        self.exact_decisions += chunk.exact_decisions
+        self.partial_decisions += chunk.partial_decisions
+        self.updates += int(chunk.labeled_decisions > 0)
+
+
+class BCTrainer:
+    """Train a policy on complete game chunks with detached truncated BPTT."""
+
+    def __init__(
+        self,
+        policy: PolicyNet,
+        dataset: Iterable[ReplayGameChunk],
+        config: BCConfig,
+        *,
+        device: torch.device | str = "cpu",
+        optimizer: torch.optim.Optimizer | None = None,
+        checkpoint_store: CheckpointStore = DEFAULT_POLICY_STORE,
+    ) -> None:
+        self.policy = policy.to(device)
+        self.dataset = dataset
+        self.config = config
+        self.device = torch.device(device)
+        self.optimizer = optimizer or torch.optim.AdamW(
+            self.policy.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        self.amp_enabled = config.amp and self.device.type == "cuda"
+        self.scaler = GradScaler(device=self.device.type, enabled=self.amp_enabled)
+        self.checkpoint_store = checkpoint_store
+        torch.manual_seed(config.seed)
+
+    def train(self) -> BCTrainMetrics:
+        """Run configured epochs over the streaming dataset."""
+        self.policy.train()
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+        totals = _RunTotals()
+        for _ in range(self.config.epochs):
+            for game in self.dataset:
+                self._train_game(game, totals)
+        peak_memory = (
+            torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
+        )
+        return BCTrainMetrics(
+            loss=totals.loss / max(totals.labeled_decisions, 1),
+            exact_nll=totals.exact_nll / max(totals.exact_decisions, 1),
+            partial_nll=totals.partial_nll / max(totals.partial_decisions, 1),
+            decisions=totals.decisions,
+            labeled_decisions=totals.labeled_decisions,
+            exact_decisions=totals.exact_decisions,
+            partial_decisions=totals.partial_decisions,
+            updates=totals.updates,
+            peak_memory_bytes=peak_memory,
+        )
+
+    def save_checkpoint(self, path: str | Path, *, epoch: int) -> None:
+        """Persist the policy and optimizer state through the checkpoint seam."""
+        self.checkpoint_store.save_training_state(
+            Path(path),
+            epoch,
+            self.policy,
+            optimizer=self.optimizer,
+            scaler=self.scaler,
+        )
+
+    def load_checkpoint(self, path: str | Path) -> int:
+        """Restore a BC training state and return its completed epoch."""
+        return self.checkpoint_store.load_training_state(
+            Path(path),
+            self.policy,
+            optimizer=self.optimizer,
+            scaler=self.scaler,
+        )
+
+    def _initial_state(self, game: ReplayGameChunk) -> Tensor:
+        if not self.policy.config.series_context_enabled:
+            return self.policy.initial_state(1)
+        features = tensorize_series(
+            game.summary_inputs,
+            player_index=game.player,
+            tokenizer=self.policy.resources.tokenizer,
+        )
+        return self.policy.initial_series_state(SeriesFeatures.stack([features]))
+
+    def _train_game(self, game: ReplayGameChunk, totals: _RunTotals) -> None:
+        state = self._initial_state(game)
+        chunk_length = min(self.config.chunk_length, self.config.batch_decisions)
+        for start in range(0, game.length, chunk_length):
+            end = min(start + chunk_length, game.length)
+            state, metrics = self._train_chunk(game, start, end, state)
+            totals.add(metrics)
+
+    def _train_chunk(
+        self,
+        game: ReplayGameChunk,
+        start: int,
+        end: int,
+        state: Tensor,
+    ) -> tuple[Tensor, _RunTotals]:
+        observations = game.observations[start:end].to(self.device)
+        action_mask = game.action_mask[start:end].to(self.device)
+        # Read the ragged boundaries on the host once; per-decision .item() would sync
+        # against the accelerator on every step of the loop below.
+        offsets = game.candidate_offsets[start : end + 1].tolist()
+        candidate_start = offsets[0]
+        candidates = game.candidate_values[candidate_start : offsets[-1]].to(self.device)
+        labels = game.label_kind[start:end].to(self.device)
+        loss_mask = game.loss_mask[start:end].to(self.device)
+        encoded = self.policy.encode(observations, action_mask)
+        self.optimizer.zero_grad(set_to_none=True)
+        # The recurrent state forces one scoring call per decision, but the objective is
+        # ragged, so it runs once over the whole chunk.
+        chunk_log_probs = []
+        for index in range(end - start):
+            candidate_left = offsets[index] - candidate_start
+            candidate_right = offsets[index + 1] - candidate_start
+            one_encoded = EncodedObs(
+                encoded.tokens[index : index + 1],
+                encoded.aux[index : index + 1],
+                encoded.numerical[index : index + 1],
+            )
+            with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                log_probs, state = self.policy.actor.score_joint_candidates_with_state(
+                    one_encoded,
+                    action_mask[index : index + 1],
+                    state,
+                    candidates[candidate_left:candidate_right],
+                    torch.tensor(
+                        [0, candidate_right - candidate_left],
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                )
+            chunk_log_probs.append(log_probs)
+        objective = compute_bc_objective(
+            torch.cat(chunk_log_probs),
+            torch.tensor(
+                [offset - candidate_start for offset in offsets],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            labels,
+            loss_mask,
+        )
+        labeled_decisions = objective.labeled_count
+        exact_decisions = objective.exact_count
+        partial_decisions = objective.partial_count
+        loss_sum = 0.0
+        if labeled_decisions:
+            loss = objective.loss
+            if not torch.isfinite(loss):
+                raise ValueError(
+                    f"Non-finite BC loss in series {game.series_id}, game {game.game_number}"
+                )
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            loss_sum = loss.detach().item() * labeled_decisions
+        return state.detach(), _RunTotals(
+            loss=loss_sum,
+            exact_nll=objective.exact_nll.detach().item() * exact_decisions,
+            partial_nll=objective.partial_nll.detach().item() * partial_decisions,
+            decisions=end - start,
+            labeled_decisions=labeled_decisions,
+            exact_decisions=exact_decisions,
+            partial_decisions=partial_decisions,
+        )
+
+
+def _validate_objective_inputs(
+    candidate_log_probs: Tensor,
+    candidate_offsets: Tensor,
+    label_kind: Tensor,
+    loss_mask: Tensor,
+) -> Tensor:
+    if candidate_log_probs.dim() != 1:
+        raise ValueError("candidate_log_probs must be one-dimensional")
+    if candidate_offsets.dim() != 1 or candidate_offsets.dtype != torch.long:
+        raise ValueError("candidate_offsets must be a one-dimensional torch.long tensor")
+    if label_kind.dim() != 1 or loss_mask.dim() != 1:
+        raise ValueError("label_kind and loss_mask must be one-dimensional")
+    if label_kind.numel() + 1 != candidate_offsets.numel():
+        raise ValueError("candidate_offsets must have one boundary per decision")
+    if label_kind.numel() != loss_mask.numel():
+        raise ValueError("label_kind and loss_mask must have matching lengths")
+    if candidate_offsets.device != candidate_log_probs.device:
+        candidate_offsets = candidate_offsets.to(candidate_log_probs.device)
+    if (
+        label_kind.device != candidate_log_probs.device
+        or loss_mask.device != candidate_log_probs.device
+    ):
+        raise ValueError("objective tensors must share a device")
+    if (
+        candidate_offsets[0].item() != 0
+        or candidate_offsets[-1].item() != candidate_log_probs.numel()
+    ):
+        raise ValueError("candidate_offsets must start at zero and end at candidate count")
+    if torch.any(candidate_offsets[1:] < candidate_offsets[:-1]):
+        raise ValueError("candidate_offsets must be nondecreasing")
+    if torch.any((loss_mask < 0) | (loss_mask > 1)):
+        raise ValueError("loss_mask values must be in [0, 1]")
+    return candidate_offsets
+
+
+def _ragged_logsumexp(candidate_log_probs: Tensor, offsets: Tensor) -> Tensor:
+    decision_count = offsets.numel() - 1
+    counts = offsets[1:] - offsets[:-1]
+    row_ids = torch.repeat_interleave(
+        torch.arange(decision_count, device=candidate_log_probs.device), counts
+    )
+    row_max = torch.full(
+        (decision_count,),
+        float("-inf"),
+        dtype=candidate_log_probs.dtype,
+        device=candidate_log_probs.device,
+    )
+    row_max.scatter_reduce_(0, row_ids, candidate_log_probs, reduce="amax", include_self=True)
+    # A decision with no candidates keeps row_max at -inf; shifting by it would give nan.
+    gathered_max = row_max[row_ids]
+    shifted = torch.where(
+        torch.isfinite(gathered_max),
+        candidate_log_probs - gathered_max,
+        torch.zeros_like(candidate_log_probs),
+    )
+    row_sum = torch.zeros_like(row_max)
+    row_sum.scatter_add_(0, row_ids, torch.exp(shifted))
+    return torch.where(
+        torch.isfinite(row_max),
+        row_max + torch.log(row_sum),
+        torch.full_like(row_max, float("-inf")),
+    )
+
+
+def compute_bc_objective(
+    candidate_log_probs: Tensor,
+    candidate_offsets: Tensor,
+    label_kind: Tensor,
+    loss_mask: Tensor,
+) -> BCObjective:
+    """Compute exact and candidate-marginalized NLL without dropping unknown steps."""
+    offsets = _validate_objective_inputs(
+        candidate_log_probs, candidate_offsets, label_kind, loss_mask
+    )
+    exact = label_kind == int(LabelKind.EXACT)
+    partial = label_kind == int(LabelKind.PARTIAL)
+    unknown = label_kind == int(LabelKind.UNKNOWN)
+    if torch.any(~(exact | partial | unknown)):
+        raise ValueError("label_kind contains an unsupported label")
+    counts = offsets[1:] - offsets[:-1]
+    if torch.any(exact & (counts != 1)):
+        raise ValueError("EXACT labels must have exactly one candidate")
+    if torch.any(partial & (counts < 2)):
+        raise ValueError("PARTIAL labels must have at least two candidates")
+    if torch.any(unknown & (counts != 0)):
+        raise ValueError("UNKNOWN labels must not have candidates")
+    if torch.any(unknown & (loss_mask != 0)):
+        raise ValueError("UNKNOWN labels must have a zero loss mask")
+    if torch.any((exact | partial) & (loss_mask == 0)):
+        raise ValueError("Labeled decisions must have a nonzero loss mask")
+
+    # EXACT decisions carry exactly one candidate, so their marginal is that candidate's
+    # log-probability and the exact and marginal objectives coincide.
+    marginal_log_probs = _ragged_logsumexp(candidate_log_probs, offsets)
+    # UNKNOWN decisions have no candidates, so their marginal is -inf; the mask must zero
+    # them by selection rather than by multiplication, which would give nan.
+    per_decision_loss = torch.where(
+        loss_mask > 0,
+        -marginal_log_probs * loss_mask,
+        torch.zeros_like(marginal_log_probs),
+    )
+    mask_total = loss_mask.sum()
+    labeled_count = int(mask_total.item())
+    exact_count = int(exact.sum().item())
+    partial_count = int(partial.sum().item())
+    exact_nll = (-marginal_log_probs[exact]).sum() / max(exact_count, 1)
+    partial_nll = (-marginal_log_probs[partial]).sum() / max(partial_count, 1)
+    return BCObjective(
+        loss=per_decision_loss.sum() / mask_total.clamp_min(1.0),
+        exact_nll=exact_nll,
+        partial_nll=partial_nll,
+        marginal_log_probs=marginal_log_probs,
+        exact_count=exact_count,
+        partial_count=partial_count,
+        labeled_count=labeled_count,
+    )
+
+
+__all__ = ["BCObjective", "compute_bc_objective"]

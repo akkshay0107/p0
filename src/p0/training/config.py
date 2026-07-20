@@ -187,18 +187,30 @@ class BCConfig:
     chunk_length: int = 16
     batch_decisions: int = 256
     learning_rate: float = 3e-4
+    epochs: int = 1
+    weight_decay: float = 0.0
+    max_grad_norm: float = 1.0
+    seed: int = 0
     amp: bool = True
     shards_dir: str = "artifacts/shards"
+    checkpoint_path: str = "artifacts/bc_checkpoint.pt"
 
     def __post_init__(self) -> None:
         _positive_ints(
             type(self).__name__,
             ("chunk_length", self.chunk_length),
             ("batch_decisions", self.batch_decisions),
+            ("epochs", self.epochs),
         )
         _positive(type(self).__name__, ("learning_rate", self.learning_rate))
+        _non_negative(type(self).__name__, ("weight_decay", self.weight_decay))
+        _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))
+        if type(self.seed) is not int:
+            raise ValueError("bc.seed must be an integer")
         if not self.shards_dir.strip():
             raise ValueError("bc.shards_dir must not be empty")
+        if not self.checkpoint_path.strip():
+            raise ValueError("bc.checkpoint_path must not be empty")
 
 
 @dataclass(frozen=True, slots=True)

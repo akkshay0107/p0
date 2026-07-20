@@ -230,3 +230,48 @@ def load_shard_manifest(
     """Validate a shard manifest against the active runtime before any tensor load."""
     validate_artifact_runtime_contract(value, manifest_path)
     return ShardManifest.from_dict(value)
+
+
+def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
+    """Check a shard tensor payload against the frozen layout above.
+
+    Shared by compilation and loading so a writer cannot emit a payload the
+    reader would reject.
+    """
+    expected = {
+        name: (shape, dtype)
+        for name, shape, dtype in (*observation_field_specs(), *SHARD_TENSOR_SPECS)
+    }
+    if set(tensors) != set(expected):
+        raise ValueError(
+            f"Shard tensor fields mismatch; missing={sorted(set(expected) - set(tensors))}, "
+            f"unknown={sorted(set(tensors) - set(expected))}"
+        )
+    for name, (shape, dtype) in expected.items():
+        tensor = tensors[name]
+        if not isinstance(tensor, torch.Tensor) or tensor.dtype != dtype:
+            raise ValueError(f"Shard tensor {name} has an invalid type or dtype")
+        if len(tensor.shape) != len(shape) or any(
+            declared != -1 and actual != declared
+            for actual, declared in zip(tensor.shape, shape, strict=True)
+        ):
+            raise ValueError(
+                f"Shard tensor {name} has shape {tuple(tensor.shape)}, expected {shape}"
+            )
+    decisions = tensors["loss_mask"].shape[0]
+    candidate_offsets = tensors["candidate_offsets"]
+    if (
+        candidate_offsets.shape != (decisions + 1,)
+        or candidate_offsets[0].item() != 0
+        or candidate_offsets[-1].item() != tensors["candidate_values"].shape[0]
+        or torch.any(candidate_offsets[1:] < candidate_offsets[:-1])
+    ):
+        raise ValueError("Shard candidate_offsets must bound every candidate row")
+    for name in ("game_offsets", "series_offsets"):
+        offsets = tensors[name]
+        if (
+            offsets[0].item() != 0
+            or offsets[-1].item() != decisions
+            or torch.any(offsets[1:] < offsets[:-1])
+        ):
+            raise ValueError(f"Shard {name} must be nondecreasing and end at decisions")
