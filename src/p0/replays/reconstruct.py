@@ -59,6 +59,16 @@ def _species_base_stats(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
     }
 
 
+_BASE_STATS_CACHE: dict[int, dict[str, dict[str, int]]] = {}
+
+
+def _get_base_stats_index(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    dex_id = id(dex)
+    if dex_id not in _BASE_STATS_CACHE:
+        _BASE_STATS_CACHE[dex_id] = _species_base_stats(dex)
+    return _BASE_STATS_CACHE[dex_id]
+
+
 def _make_replay_pokemon(
     species: str,
     base_stats_index: Mapping[str, Mapping[str, int]],
@@ -315,7 +325,7 @@ class _ReplayState:
         self.turn = 0
         self.used_mega = [False, False]
         self.active: list[list[ReplayPokemon | None]] = [[None, None], [None, None]]
-        self.base_stats_index = _species_base_stats(dex)
+        self.base_stats_index = _get_base_stats_index(dex)
         self.teams: list[list[ReplayPokemon]] = []
         for side in (0, 1):
             side_teams = []
