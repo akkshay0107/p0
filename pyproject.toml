@@ -23,6 +23,7 @@ p0-build-vocab = "p0.cli.build_vocab:main"
 p0-export-training = "p0.cli.export_training:main"
 p0-replays = "p0.cli.replays:main"
 p0-corpus = "p0.cli.corpus:main"
+p0-eval = "p0.cli.eval:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

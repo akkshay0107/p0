@@ -54,25 +54,6 @@ def _normalized(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
 
 
-def _species_base_stats(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
-    """Index the dex by normalized species id. Callers must build this once per compile."""
-    return {
-        _normalized(str(entry.get("id", entry.get("name", "")))): {
-            str(key): int(value) for key, value in entry.get("baseStats", {}).items()
-        }
-        for entry in dex.get("species", ())
-        if isinstance(entry, Mapping) and isinstance(entry.get("baseStats"), Mapping)
-    }
-
-
-def _hydrate_base_stats(view: Any, base_stats: Mapping[str, Mapping[str, int]]) -> None:
-    for team in (view.team, view.opponent_team):
-        for pokemon in team.values():
-            stats = base_stats.get(_normalized(pokemon.species))
-            if stats:
-                object.__setattr__(pokemon, "base_stats_data", stats)
-
-
 def _summary_side(document: ReplayDocument, side: int) -> SideGameSummary | None:
     ots = document.ots[side]
     species = tuple(_normalized(value) for value in ots.revealed_species)
@@ -162,7 +143,6 @@ def _perspective_tensors(
     *,
     builder: ObservationBuilder,
     stat_estimates: tuple[Any, ...],
-    base_stats: Mapping[str, Mapping[str, int]],
 ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
@@ -174,7 +154,6 @@ def _perspective_tensors(
     winner = game.document.outcome.winner
     outcome = 0.0 if winner < 0 else (1.0 if winner == perspective.player else -1.0)
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
-        _hydrate_base_stats(snapshot.view, base_stats)
         snapshot.view.stat_cache = {}
         overrides = {}
         for side, team in ((0, snapshot.view.team), (1, snapshot.view.opponent_team)):
@@ -284,7 +263,6 @@ def write_tensor_shards(
     root = Path(output_dir) / runtime_hash
     root.mkdir(parents=True, exist_ok=True)
     builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
-    base_stats = _species_base_stats(builder.resources.dex)
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     current_games: list[tuple[CompiledGame, ReconstructedPerspective, GameSummary | None]] = []
@@ -312,7 +290,6 @@ def write_tensor_shards(
                 perspective,
                 builder=builder,
                 stat_estimates=estimate_cache[game.replay_id],
-                base_stats=base_stats,
             )
             for name in field_values:
                 field_values[name].extend(fields[name])
@@ -542,7 +519,7 @@ def compile_documents(
                     item.provenance == "UNKNOWN" for item in estimates
                 )
                 imputation_confidence_sum += sum(item.confidence for item in estimates)
-            perspectives = reconstruct_both(document, max_candidates=max_candidates)
+            perspectives = reconstruct_both(document, max_candidates=max_candidates, dex=dex)
             compiled = CompiledGame(
                 group.record.series_id,
                 game_number,
