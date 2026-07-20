@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable, Mapping
 
@@ -11,6 +12,7 @@ from poke_env import AccountConfiguration
 from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
+from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
@@ -18,9 +20,9 @@ from p0.model.resources import default_runtime_resources
 from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
 from p0.runtime.showdown import start_showdown_servers
-from p0.teams.source import FileTeamSource
+from p0.teams.source import FileTeamSource, TeamSource
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
-from p0.training.config import GlobalConfig, TeamSourceConfig
+from p0.training.config import CorpusConfig, GlobalConfig, TeamSourceConfig
 from p0.training.league.league import OpponentPool
 from p0.training.ppo import PPOUpdater
 from p0.training.rollout import RolloutCollector
@@ -29,7 +31,51 @@ from p0.training.utils import PPOScheduler, adamw_param_groups, default_device
 from p0.training.vector_env import ThreadVecEnv
 
 
-def _team_source(config: TeamSourceConfig) -> FileTeamSource:
+def _team_source(
+    config: TeamSourceConfig,
+    *,
+    corpus_config: CorpusConfig | None = None,
+    seed: int = 0,
+    is_agent: bool = True,
+) -> TeamSource:
+    path = config.path
+    if path.is_dir() and (path / "corpus_manifest.json").exists():
+        path = path / "corpus_manifest.json"
+
+    if path.suffix == ".json" or (path.is_file() and path.name.endswith(".json")):
+        from p0.teams.corpus import CorpusSourceSpec, CorpusSplit, SamplingPolicy
+        from p0.teams.corpus_source import CorpusTeamSource
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        corpus_hash = str(raw.get("corpus_hash", ""))
+        format_id = str(raw.get("format_id", FORMAT.battle_format))
+
+        split = CorpusSplit.TRAIN
+        policy = SamplingPolicy.USAGE_WEIGHTED
+        allow_mirror = True
+        if corpus_config is not None:
+            split_name = corpus_config.agent_split.upper() if is_agent else "TRAIN"
+            try:
+                split = CorpusSplit[split_name]
+            except KeyError:
+                split = CorpusSplit.TRAIN
+            policy_name = corpus_config.sampling_policy.upper()
+            try:
+                policy = SamplingPolicy[policy_name]
+            except KeyError:
+                policy = SamplingPolicy.USAGE_WEIGHTED
+            allow_mirror = corpus_config.allow_mirror
+
+        spec = CorpusSourceSpec(
+            corpus_path=str(path),
+            corpus_hash=corpus_hash,
+            format_id=format_id,
+            split=split,
+            seed=seed,
+            sampling_policy=policy,
+            allow_mirror=allow_mirror,
+        )
+        return CorpusTeamSource(spec)
     return FileTeamSource(config.path)
 
 
@@ -79,8 +125,18 @@ def run_training(
     start = policy_store.load_training_state(
         paths.checkpoint_path, policy, optimizer=optimizer, scaler=scaler
     )
-    agent_source = _team_source(config.environment.agent_team_source)
-    opponent_source = _team_source(config.environment.opponent_team_source)
+    agent_source = _team_source(
+        config.environment.agent_team_source,
+        corpus_config=config.corpus,
+        seed=0,
+        is_agent=True,
+    )
+    opponent_source = _team_source(
+        config.environment.opponent_team_source,
+        corpus_config=config.corpus,
+        seed=1,
+        is_agent=False,
+    )
 
     with start_showdown_servers(
         training.n_envs,

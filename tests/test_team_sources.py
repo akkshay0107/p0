@@ -86,13 +86,16 @@ def test_validate_many_preserves_order_and_parses_diagnostics():
     def runner(*args, **kwargs):
         calls.append(kwargs["input"])
         return subprocess.CompletedProcess(
-            args[0], 0, stdout='{"valid": true, "packedTeam": "packed", "problems": []}', stderr=""
+            args[0],
+            0,
+            stdout='[{"valid": true, "packedTeam": "packed", "problems": []}, {"valid": true, "packedTeam": "packed", "problems": []}]',
+            stderr="",
         )
 
     variants = (_variant(), _variant())
     results = validate_many(variants, runner=runner)
     assert [result.team_hash for result in results] == [item.team.team_hash for item in variants]
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_validated_team_rejects_untrusted_packed_values():
