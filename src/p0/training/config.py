@@ -188,7 +188,6 @@ class BCConfig:
     batch_decisions: int = 256
     learning_rate: float = 3e-4
     epochs: int = 1
-    validation_batches: int = 0
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     seed: int = 0
@@ -204,11 +203,7 @@ class BCConfig:
             ("epochs", self.epochs),
         )
         _positive(type(self).__name__, ("learning_rate", self.learning_rate))
-        _non_negative(
-            type(self).__name__,
-            ("validation_batches", self.validation_batches),
-            ("weight_decay", self.weight_decay),
-        )
+        _non_negative(type(self).__name__, ("weight_decay", self.weight_decay))
         _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))
         if type(self.seed) is not int:
             raise ValueError("bc.seed must be an integer")

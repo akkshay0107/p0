@@ -19,24 +19,18 @@ from p0.format_config import (
 )
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save
+from p0.replays.schema import _is_sha256, _require_fields
 from p0.replays.shards import (
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
-    SHARD_TENSOR_SPECS,
     ShardIndexEntry,
     load_shard_manifest,
     observation_field_specs,
+    validate_shard_tensors,
 )
 
 SPLIT_ARTIFACT_SCHEMA = "p0.replay_split.v1"
 SPLITS = frozenset({"train", "validation", "test"})
-
-
-def _require_fields(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
-    missing = sorted(expected - value.keys())
-    unknown = sorted(value.keys() - expected)
-    if missing or unknown:
-        raise ValueError(f"Invalid {owner} fields; missing={missing}, unknown={unknown}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,13 +50,7 @@ class SeriesSplitManifest:
                 f"Unsupported split artifact schema {self.artifact_schema!r}; "
                 f"expected {SPLIT_ARTIFACT_SCHEMA}"
             )
-        if (
-            not isinstance(self.runtime_contract_sha256, str)
-            or len(self.runtime_contract_sha256) != 64
-            or any(
-                character not in "0123456789abcdef" for character in self.runtime_contract_sha256
-            )
-        ):
+        if not _is_sha256(self.runtime_contract_sha256):
             raise ValueError("SeriesSplitManifest.runtime_contract_sha256 must be a SHA-256 digest")
         if type(self.seed) is not int:
             raise ValueError("SeriesSplitManifest.seed must be an integer")
@@ -168,7 +156,6 @@ class ReplayGameChunk:
     candidate_offsets: torch.Tensor
     outcome: torch.Tensor
     summary_inputs: tuple[GameSummary, ...]
-    summary: GameSummary | None
 
     def __post_init__(self) -> None:
         if self.player not in (0, 1) or self.game_number < 1:
@@ -215,44 +202,6 @@ class ReplayGameChunk:
         )
 
 
-def _validate_loaded_tensors(tensors: Mapping[str, Any]) -> None:
-    expected = {
-        name: (shape, dtype)
-        for name, shape, dtype in (*observation_field_specs(), *SHARD_TENSOR_SPECS)
-    }
-    if set(tensors) != set(expected):
-        raise ValueError("Shard tensor fields do not match the frozen shard contract")
-    for name, (shape, dtype) in expected.items():
-        tensor = tensors[name]
-        if not isinstance(tensor, torch.Tensor) or tensor.dtype != dtype:
-            raise ValueError(f"Shard tensor {name} has an invalid dtype")
-        if len(tensor.shape) != len(shape) or any(
-            declared != -1 and actual != declared
-            for actual, declared in zip(tensor.shape, shape, strict=True)
-        ):
-            raise ValueError(
-                f"Shard tensor {name} has shape {tuple(tensor.shape)}, expected {shape}"
-            )
-    decisions = tensors["loss_mask"].shape[0]
-    candidates = tensors["candidate_values"].shape[0]
-    candidate_offsets = tensors["candidate_offsets"]
-    if (
-        candidate_offsets.shape != (decisions + 1,)
-        or candidate_offsets[0].item() != 0
-        or candidate_offsets[-1].item() != candidates
-        or torch.any(candidate_offsets[1:] < candidate_offsets[:-1])
-    ):
-        raise ValueError("Shard candidate_offsets are invalid")
-    for name in ("game_offsets", "series_offsets"):
-        offsets = tensors[name]
-        if (
-            offsets[0].item() != 0
-            or offsets[-1].item() != decisions
-            or torch.any(offsets[1:] < offsets[:-1])
-        ):
-            raise ValueError(f"Shard {name} are invalid")
-
-
 class LazyReplayDataset:
     """Stream complete game perspectives while keeping one shard resident."""
 
@@ -272,10 +221,10 @@ class LazyReplayDataset:
             raise ValueError(f"Unsupported dataset split {split!r}")
         if split is not None and split_manifest is None:
             raise ValueError("A split_manifest is required when split is selected")
-        if isinstance(split_manifest, SeriesSplitManifest):
-            loaded_split = split_manifest
-        elif split_manifest is None:
+        if split_manifest is None:
             loaded_split = None
+        elif isinstance(split_manifest, SeriesSplitManifest):
+            loaded_split = split_manifest
         else:
             loaded_split = load_split_manifest(split_manifest, runtime_manifest_path)
         if loaded_split is not None and (
@@ -287,55 +236,52 @@ class LazyReplayDataset:
         self.runtime_manifest_path = Path(runtime_manifest_path)
         self.verify_hashes = verify_hashes
         self._root = self.manifest_path.parent
+        # Resolving the selection here keeps the streaming loop free of split branching.
+        self._selected_series: frozenset[str] | None = (
+            None
+            if split is None or loaded_split is None
+            else frozenset(
+                series_id
+                for series_id, assigned in loaded_split.assignments.items()
+                if assigned == split
+            )
+        )
 
     def __iter__(self) -> Iterator[ReplayGameChunk]:
-        prior_summaries: dict[str, dict[int, GameSummary]] = {}
-        split_manifest = self.split_manifest
+        selected = self._selected_series
+        # Keyed by game number because both perspectives of a game repeat its summary.
+        summaries_by_game: dict[str, dict[int, GameSummary]] = {}
         for entry in self.manifest.shards:
-            payload, tensors, summaries = self._load_shard(entry)
-            shard_summaries: dict[str, dict[int, GameSummary]] = {}
+            tensors, summaries = self._load_shard(entry)
             for item in summaries:
-                summary = item.get("summary")
-                if summary is None:
-                    continue
-                parsed = GameSummary.from_dict(summary)
-                shard_summaries.setdefault(str(item["series_id"]), {})[int(item["game_number"])] = (
-                    parsed
-                )
-            for series_id, games in shard_summaries.items():
-                prior_summaries.setdefault(series_id, {}).update(games)
-            game_offsets = tensors["game_offsets"]
+                summary_value = item["summary"]
+                if summary_value is not None:
+                    series = summaries_by_game.setdefault(str(item["series_id"]), {})
+                    series[int(item["game_number"])] = GameSummary.from_dict(summary_value)
+            game_offsets = tensors["game_offsets"].tolist()
             for game_index, item in enumerate(summaries):
                 series_id = str(item["series_id"])
-                if (
-                    self.split is not None
-                    and split_manifest is not None
-                    and split_manifest.assignments.get(series_id) != self.split
-                ):
+                if selected is not None and series_id not in selected:
                     continue
-                start = int(game_offsets[game_index].item())
-                end = int(game_offsets[game_index + 1].item())
-                summary_value = item.get("summary")
-                summary = None if summary_value is None else GameSummary.from_dict(summary_value)
+                game_number = int(item["game_number"])
                 history = tuple(
-                    summary_item
-                    for game_number, summary_item in sorted(prior_summaries[series_id].items())
-                    if game_number < int(item["game_number"])
+                    summary
+                    for prior_number, summary in sorted(
+                        summaries_by_game.get(series_id, {}).items()
+                    )
+                    if prior_number < game_number
                 )
                 yield self._chunk(
                     tensors,
                     item,
-                    start,
-                    end,
+                    game_offsets[game_index],
+                    game_offsets[game_index + 1],
                     history,
-                    summary,
                 )
-            for series_id, games in shard_summaries.items():
-                prior_summaries.setdefault(series_id, {}).update(games)
 
     def _load_shard(
         self, entry: ShardIndexEntry
-    ) -> tuple[Mapping[str, Any], Mapping[str, torch.Tensor], list[Mapping[str, Any]]]:
+    ) -> tuple[Mapping[str, torch.Tensor], list[Mapping[str, Any]]]:
         path = self._root / entry.filename
         root = self._root.resolve()
         resolved_path = path.resolve()
@@ -363,7 +309,7 @@ class LazyReplayDataset:
         summaries = payload.get(SHARD_SUMMARY_KEY)
         if not isinstance(tensors, Mapping) or not isinstance(summaries, list):
             raise ValueError(f"Malformed shard payload {path}")
-        _validate_loaded_tensors(tensors)
+        validate_shard_tensors(tensors)
         if len(summaries) != tensors["game_offsets"].numel() - 1:
             raise ValueError(f"Shard summary count does not match game offsets in {path}")
         if (
@@ -377,7 +323,7 @@ class LazyReplayDataset:
             isinstance(item, Mapping) and required_summary_fields <= set(item) for item in summaries
         ):
             raise ValueError(f"Shard summaries must be objects in {path}")
-        return payload, tensors, summaries
+        return tensors, summaries
 
     @staticmethod
     def _chunk(
@@ -386,7 +332,6 @@ class LazyReplayDataset:
         start: int,
         end: int,
         history: tuple[GameSummary, ...],
-        summary: GameSummary | None,
     ) -> ReplayGameChunk:
         candidate_start = int(tensors["candidate_offsets"][start].item())
         candidate_end = int(tensors["candidate_offsets"][end].item())
@@ -412,7 +357,6 @@ class LazyReplayDataset:
             candidate_offsets=candidate_offsets,
             outcome=tensors["outcome"][start:end].clone(),
             summary_inputs=history,
-            summary=summary,
         )
 
 

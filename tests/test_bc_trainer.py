@@ -35,7 +35,6 @@ def _chunk(label_kind: list[int], candidate_values: list[tuple[int, int]], offse
         candidate_offsets=torch.tensor(offsets, dtype=torch.long),
         outcome=torch.ones(length),
         summary_inputs=(),
-        summary=None,
     )
 
 

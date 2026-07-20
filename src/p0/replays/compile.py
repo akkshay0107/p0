@@ -35,25 +35,13 @@ from p0.replays.scrape import load_raw_replay, read_fetch_index
 from p0.replays.shards import (
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
-    SHARD_TENSOR_SPECS,
     ShardIndexEntry,
     ShardManifest,
     observation_field_specs,
+    validate_shard_tensors,
 )
 
-
-class _IdentityMapping(dict[Any, Any]):
-    """Mapping adapter for replay objects whose state is intentionally unhashable."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._values: dict[int, Any] = {}
-
-    def get(self, key: object, default: Any = None) -> Any:
-        return self._values.get(id(key), default)
-
-    def __setitem__(self, key: object, value: Any) -> None:
-        self._values[id(key)] = value
+EMPTY_CANDIDATE_ACTION = (-1, -1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,10 +129,7 @@ def _game_summary(
         winner=winner,
         series_score=series_score,
         turns=game.document.outcome.turns,
-        sides=(
-            (first_side, second_side)[canonical_roles.index(0)],
-            (first_side, second_side)[canonical_roles.index(1)],
-        ),
+        sides=(first_side, second_side) if canonical_roles == (0, 1) else (second_side, first_side),
     )
 
 
@@ -152,19 +137,8 @@ def _runtime_hash(manifest_path: str | Path) -> str:
     return load_active_runtime_manifest(manifest_path).runtime_contract_sha256
 
 
-def _empty_candidate_action() -> tuple[int, int]:
-    return (-1, -1)
-
-
-def _perspective_tensors(
-    game: CompiledGame,
-    perspective: ReconstructedPerspective,
-    *,
-    builder: ObservationBuilder,
-    stat_estimates: tuple[Any, ...],
-) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
-    fields = {name: [] for name, _, _ in observation_field_specs()}
-    values: dict[str, list[Any]] = {
+def _empty_scalar_values() -> dict[str, list[Any]]:
+    return {
         "action_mask": [],
         "mask_provenance": [],
         "label_kind": [],
@@ -176,6 +150,17 @@ def _perspective_tensors(
         "candidate_offsets": [0],
         "outcome": [],
     }
+
+
+def _perspective_tensors(
+    game: CompiledGame,
+    perspective: ReconstructedPerspective,
+    *,
+    builder: ObservationBuilder,
+    stat_estimates: tuple[Any, ...],
+) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
+    fields = {name: [] for name, _, _ in observation_field_specs()}
+    values = _empty_scalar_values()
     estimates = {
         (estimate.side, _normalized(estimate.species)): estimate.precomputed
         for estimate in stat_estimates
@@ -183,8 +168,8 @@ def _perspective_tensors(
     }
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
         _hydrate_base_stats(snapshot.view, builder.resources.dex)
-        snapshot.view.stat_cache = _IdentityMapping()
-        overrides = _IdentityMapping()
+        snapshot.view.stat_cache = {}
+        overrides = {}
         for side, team in ((0, snapshot.view.team), (1, snapshot.view.opponent_team)):
             for pokemon in team.values():
                 precomputed = estimates.get(
@@ -213,7 +198,7 @@ def _perspective_tensors(
         values["loss_mask"].append(float(evidence.label_kind is not LabelKind.UNKNOWN))
         values["decision_type"].append(int(decision.decision_type))
         values["exact_action"].append(
-            evidence.candidates[0] if evidence.candidates else _empty_candidate_action()
+            evidence.candidates[0] if evidence.candidates else EMPTY_CANDIDATE_ACTION
         )
         values["candidate_values"].extend(evidence.candidates)
         values["candidate_offsets"].append(len(values["candidate_values"]))
@@ -247,50 +232,6 @@ def _tensorize_values(
     return tensors
 
 
-def _validate_tensor_payload(tensors: Mapping[str, torch.Tensor]) -> None:
-    expected = {
-        name: (shape, dtype)
-        for name, shape, dtype in (*observation_field_specs(), *SHARD_TENSOR_SPECS)
-    }
-    if set(tensors) != set(expected):
-        raise ValueError(
-            f"Shard tensor fields mismatch; missing={sorted(set(expected) - set(tensors))}, "
-            f"unknown={sorted(set(tensors) - set(expected))}"
-        )
-    for name, (shape, dtype) in expected.items():
-        tensor = tensors[name]
-        if not isinstance(tensor, torch.Tensor) or tensor.dtype != dtype:
-            raise ValueError(f"Shard tensor {name} has unexpected type or dtype")
-        if len(tensor.shape) != len(shape):
-            raise ValueError(
-                f"Shard tensor {name} has shape {tuple(tensor.shape)}, expected {shape}"
-            )
-        for actual, declared in zip(tensor.shape, shape, strict=True):
-            if declared != -1 and actual != declared:
-                raise ValueError(
-                    f"Shard tensor {name} has shape {tuple(tensor.shape)}, expected {shape}"
-                )
-    decisions = tensors["loss_mask"].shape[0]
-    candidates = tensors["candidate_values"].shape[0]
-    offsets = tensors["candidate_offsets"]
-    if (
-        offsets.shape != (decisions + 1,)
-        or offsets[0].item() != 0
-        or offsets[-1].item() != candidates
-    ):
-        raise ValueError("Shard candidate_offsets must bound every candidate row")
-    if torch.any(offsets[1:] < offsets[:-1]):
-        raise ValueError("Shard candidate_offsets must be nondecreasing")
-    for name in ("game_offsets", "series_offsets"):
-        offsets = tensors[name]
-        if (
-            offsets[0].item() != 0
-            or torch.any(offsets[1:] < offsets[:-1])
-            or offsets[-1].item() != decisions
-        ):
-            raise ValueError(f"Shard {name} must be nondecreasing and end at decisions")
-
-
 def _save_shard(
     root: Path,
     index: int,
@@ -298,7 +239,7 @@ def _save_shard(
     summaries: list[dict[str, Any]],
     runtime_hash: str,
 ) -> ShardIndexEntry:
-    _validate_tensor_payload(tensors)
+    validate_shard_tensors(tensors)
     if len(summaries) != tensors["game_offsets"].numel() - 1:
         raise ValueError("Shard summary count must match game count")
     filename = f"shard-{index:05d}.pt"
@@ -338,7 +279,7 @@ def write_tensor_shards(
     runtime_hash = _runtime_hash(manifest_path)
     root = Path(output_dir) / runtime_hash
     root.mkdir(parents=True, exist_ok=True)
-    builder = ObservationBuilder(resources or default_runtime_resources())
+    builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     current_games: list[tuple[CompiledGame, ReconstructedPerspective, GameSummary | None]] = []
@@ -350,45 +291,30 @@ def write_tensor_shards(
         if not current_games:
             return
         field_values = {name: [] for name, _, _ in observation_field_specs()}
-        scalar_values: dict[str, list[Any]] = {
-            "action_mask": [],
-            "mask_provenance": [],
-            "label_kind": [],
-            "label_confidence": [],
-            "loss_mask": [],
-            "decision_type": [],
-            "exact_action": [],
-            "candidate_values": [],
-            "candidate_offsets": [0],
-            "outcome": [],
-        }
+        scalar_values = _empty_scalar_values()
         game_offsets = [0]
         series_offsets = [0]
         summaries: list[dict[str, Any]] = []
         series_ids: list[str] = []
         estimate_cache: dict[str, tuple[Any, ...]] = {}
         for game, perspective, summary in current_games:
-            estimates = estimate_cache.get(game.replay_id)
-            if estimates is None:
-                estimates = impute_stat_points(game.document, dex=builder.resources.dex)
-                estimate_cache[game.replay_id] = estimates
+            if game.replay_id not in estimate_cache:
+                estimate_cache[game.replay_id] = impute_stat_points(
+                    game.document, dex=builder.resources.dex
+                )
             fields, values = _perspective_tensors(
-                game, perspective, builder=builder, stat_estimates=estimates
+                game, perspective, builder=builder, stat_estimates=estimate_cache[game.replay_id]
             )
             for name in field_values:
                 field_values[name].extend(fields[name])
+            # Candidate offsets are per perspective, so rebase them onto the shard's flat rows.
+            candidate_base = len(scalar_values["candidate_values"])
             for name in scalar_values:
-                if name == "candidate_values":
+                if name != "candidate_offsets":
                     scalar_values[name].extend(values[name])
-                elif name == "candidate_offsets":
-                    candidate_base = len(scalar_values["candidate_values"]) - len(
-                        values["candidate_values"]
-                    )
-                    scalar_values[name].extend(
-                        candidate_base + offset for offset in values[name][1:]
-                    )
-                else:
-                    scalar_values[name].extend(values[name])
+            scalar_values["candidate_offsets"].extend(
+                candidate_base + offset for offset in values["candidate_offsets"][1:]
+            )
             game_offsets.append(len(scalar_values["loss_mask"]))
             summaries.append(
                 {
@@ -452,16 +378,32 @@ def write_tensor_shards(
 def compile_to_shards(
     documents: Iterable[ReplayDocument],
     output_dir: str | Path,
-    **kwargs: Any,
+    *,
+    format_id: str | None = None,
+    max_candidates: int = 256,
+    dex: Mapping[str, Any] | None = None,
+    imputation_seed: int = 0,
+    max_decisions_per_shard: int = 4096,
+    manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
+    resources: RuntimeResources | None = None,
+    created_at: str | None = None,
 ) -> ShardBuildResult:
     """Compile normalized replay documents and persist their tensor shards."""
-    shard_kwargs = {
-        key: kwargs.pop(key)
-        for key in tuple(kwargs)
-        if key in {"max_decisions_per_shard", "manifest_path", "resources", "created_at"}
-    }
-    result = compile_documents(documents, **kwargs)
-    return write_tensor_shards(result, output_dir, **shard_kwargs)
+    result = compile_documents(
+        documents,
+        format_id=format_id,
+        max_candidates=max_candidates,
+        dex=dex,
+        imputation_seed=imputation_seed,
+    )
+    return write_tensor_shards(
+        result,
+        output_dir,
+        max_decisions_per_shard=max_decisions_per_shard,
+        manifest_path=manifest_path,
+        resources=resources,
+        created_at=created_at,
+    )
 
 
 @dataclass(frozen=True, slots=True)
