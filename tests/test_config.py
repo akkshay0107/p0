@@ -92,13 +92,60 @@ def test_model_config_is_checkpoint_local_and_validated():
     config = ModelConfig.baseline()
     assert config.d_model == 512
     assert config.history_tokens == 8
+    assert config.prelude_layers == 1
+    assert config.coda_layers == 1
+    assert config.core_repeats == 1
+    assert not config.core_weights_tied
+    assert config.pass_embedding_enabled
     with pytest.raises(ValueError, match="divisible"):
         ModelConfig(63, 8, 1, 8, 256)
 
 
+def test_model_config_depth_round_trip_and_supported_variants():
+    config = ModelConfig(
+        d_model=64,
+        nhead=4,
+        prelude_layers=1,
+        history_tokens=8,
+        dim_feedforward=128,
+        coda_layers=1,
+        core_repeats=3,
+        core_weights_tied=True,
+        pass_embedding_enabled=False,
+    )
+
+    assert ModelConfig.from_dict(config.to_dict()) == config
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    (
+        ({"core_repeats": 0}, "core_repeats"),
+        ({"prelude_layers": 2}, "prelude_layers"),
+        ({"coda_layers": 2}, "coda_layers"),
+        ({"core_weights_tied": True}, "core_weights_tied"),
+    ),
+)
+def test_model_config_rejects_unsupported_depth_combinations(kwargs, message):
+    config_payload = ModelConfig(32, 4, 1, 8, 128).to_dict()
+    config_payload.update(kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        ModelConfig.from_dict(config_payload)
+
+
 @pytest.mark.parametrize(
     "field",
-    ("d_model", "nhead", "reducer_layers", "history_tokens", "dim_feedforward", "series_tokens"),
+    (
+        "d_model",
+        "nhead",
+        "prelude_layers",
+        "history_tokens",
+        "dim_feedforward",
+        "coda_layers",
+        "core_repeats",
+        "series_tokens",
+    ),
 )
 def test_model_config_rejects_boolean_integer_fields(field):
     payload = ModelConfig.baseline().to_dict()
@@ -108,9 +155,13 @@ def test_model_config_rejects_boolean_integer_fields(field):
         ModelConfig.from_dict(payload)
 
 
-def test_model_config_rejects_non_boolean_flags():
+@pytest.mark.parametrize(
+    "field",
+    ("core_weights_tied", "pass_embedding_enabled", "series_context_enabled"),
+)
+def test_model_config_rejects_non_boolean_flags(field):
     payload = ModelConfig.baseline().to_dict()
-    payload["series_context_enabled"] = 1
+    payload[field] = 1
 
     with pytest.raises(ValueError, match="boolean"):
         ModelConfig.from_dict(payload)
@@ -118,11 +169,11 @@ def test_model_config_rejects_non_boolean_flags():
 
 def test_model_config_rejects_malformed_missing_and_unknown_fields():
     payload = ModelConfig.baseline().to_dict()
-    del payload["reducer_layers"]
+    del payload["prelude_layers"]
     payload["unexpected"] = 1
 
     with pytest.raises(
         ValueError,
-        match=r"missing=\['reducer_layers'\], unknown=\['unexpected'\]",
+        match=r"missing=\['prelude_layers'\], unknown=\['unexpected'\]",
     ):
         ModelConfig.from_dict(payload)

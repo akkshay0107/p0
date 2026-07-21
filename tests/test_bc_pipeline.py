@@ -23,7 +23,7 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path) -> None:
         ModelConfig(
             d_model=64,
             nhead=4,
-            reducer_layers=1,
+            prelude_layers=1,
             history_tokens=8,
             dim_feedforward=128,
             series_context_enabled=True,

@@ -243,7 +243,7 @@ def _policy(enabled: bool) -> PolicyNet:
     config = ModelConfig(
         d_model=64,
         nhead=4,
-        reducer_layers=1,
+        prelude_layers=1,
         history_tokens=8,
         dim_feedforward=128,
         series_context_enabled=enabled,

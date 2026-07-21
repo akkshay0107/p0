@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from p0.model.structured_observation import POKEMON_TOKENS
-from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
+from p0.model.swiglu_encoder import SwiGLUEncoderLayer
 
 _N_POKEMON_TOKENS = len(POKEMON_TOKENS)
 
@@ -20,14 +20,27 @@ class CLSReducer(nn.Module):
         seq_len: int,
         d_model: int,
         nhead: int,
-        nlayer: int,
+        prelude_layers: int,
         dim_feedforward: int,
         n_hg: int,
+        core_repeats: int = 1,
+        coda_layers: int = 1,
+        core_weights_tied: bool = False,
         use_history: bool = True,
     ):
         super().__init__()
+        if prelude_layers != 1 or coda_layers != 1:
+            raise ValueError("CLSReducer requires one prelude layer and one coda layer")
+        if core_repeats <= 0:
+            raise ValueError("CLSReducer.core_repeats must be positive")
+        if core_weights_tied and core_repeats == 1:
+            raise ValueError("CLSReducer.core_weights_tied requires repeated core layers")
         self.seq_len = seq_len
         self.d_model = d_model
+        self.prelude_layers = prelude_layers
+        self.core_repeats = core_repeats
+        self.coda_layers = coda_layers
+        self.core_weights_tied = core_weights_tied
         self.n_hg = n_hg if use_history else 0
         self.use_history = use_history
         self.cls_base = nn.Parameter(torch.empty(1, 1, d_model))
@@ -37,12 +50,34 @@ class CLSReducer(nn.Module):
             # per-channel gate so each history dimension can keep or refresh independently
             self.hg_gate = nn.Parameter(torch.zeros(1, self.n_hg, d_model))
 
-        self.encoder = SwiGLUTransformerEncoder(
+        self.prelude = SwiGLUEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
-            num_layers=nlayer,
         )
+        if core_weights_tied:
+            core = SwiGLUEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+            )
+            core_layers = [core] * core_repeats
+        else:
+            core_layers = [
+                SwiGLUEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                )
+                for _ in range(core_repeats)
+            ]
+        self.core_layers = nn.ModuleList(core_layers)
+        self.coda = SwiGLUEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+        )
+        self.norm = nn.LayerNorm(d_model)
         self._init_weights()
 
     @torch.no_grad()
@@ -67,16 +102,25 @@ class CLSReducer(nn.Module):
         """Returns cls, history, all other tokens"""
         if tokens.dim() == 2:
             tokens = tokens.unsqueeze(0)
+        if tokens.dim() != 3:
+            raise ValueError("tokens must have shape (batch, sequence, d_model)")
 
         B, S, D = tokens.shape
         if S != self.seq_len or D != self.d_model:
             raise ValueError(
                 f"Got token shape ({S}, {D}). Expected ({self.seq_len}, {self.d_model})."
             )
+        if state.shape != (B, self.n_hg, self.d_model):
+            raise ValueError(
+                f"Got recurrent state shape {tuple(state.shape)}. "
+                f"Expected ({B}, {self.n_hg}, {self.d_model})."
+            )
+        if padding_mask is not None and padding_mask.shape != (B, S):
+            raise ValueError(f"Expected padding_mask shape ({B}, {S})")
 
-        cls_tok = self.cls_base.expand(B, -1, -1)
+        cls_tok = self.cls_base.to(device=tokens.device, dtype=tokens.dtype).expand(B, -1, -1)
 
-        hg_prev = state.to(tokens.device)
+        hg_prev = state.to(device=tokens.device, dtype=tokens.dtype)
 
         # hg_prev empty if use history false
         seq = torch.cat([cls_tok, hg_prev, tokens[:, 1:]], dim=1)
@@ -85,9 +129,14 @@ class CLSReducer(nn.Module):
         if padding_mask is not None:
             enc_mask = torch.zeros(B, seq.size(1), dtype=torch.bool, device=seq.device)
             # CLS and HG tokens are never padded. tokens[:, 1:] corresponds to padding_mask[:, 1:]
-            enc_mask[:, 1 + self.n_hg :] = padding_mask[:, 1:]
+            enc_mask[:, 1 + self.n_hg :] = padding_mask.to(
+                device=seq.device, dtype=torch.bool
+            )[:, 1:]
 
-        enc = self.encoder(seq, src_key_padding_mask=enc_mask)
+        enc = self.prelude(seq, src_key_padding_mask=enc_mask)
+        for layer in self.core_layers:
+            enc = layer(enc, src_key_padding_mask=enc_mask)
+        enc = self.norm(self.coda(enc, src_key_padding_mask=enc_mask))
 
         cls = enc[:, 0]
         # empty if use history is false (n_hg = 0)
