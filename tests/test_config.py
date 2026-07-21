@@ -94,3 +94,35 @@ def test_model_config_is_checkpoint_local_and_validated():
     assert config.history_tokens == 8
     with pytest.raises(ValueError, match="divisible"):
         ModelConfig(63, 8, 1, 8, 256)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("d_model", "nhead", "reducer_layers", "history_tokens", "dim_feedforward", "series_tokens"),
+)
+def test_model_config_rejects_boolean_integer_fields(field):
+    payload = ModelConfig.baseline().to_dict()
+    payload[field] = True
+
+    with pytest.raises(ValueError, match="positive integer"):
+        ModelConfig.from_dict(payload)
+
+
+def test_model_config_rejects_non_boolean_flags():
+    payload = ModelConfig.baseline().to_dict()
+    payload["series_context_enabled"] = 1
+
+    with pytest.raises(ValueError, match="boolean"):
+        ModelConfig.from_dict(payload)
+
+
+def test_model_config_rejects_malformed_missing_and_unknown_fields():
+    payload = ModelConfig.baseline().to_dict()
+    del payload["reducer_layers"]
+    payload["unexpected"] = 1
+
+    with pytest.raises(
+        ValueError,
+        match=r"missing=\['reducer_layers'\], unknown=\['unexpected'\]",
+    ):
+        ModelConfig.from_dict(payload)

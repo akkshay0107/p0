@@ -116,6 +116,37 @@ def test_checkpoint_rejects_incompatible_and_legacy_contracts(tmp_path):
         DEFAULT_POLICY_STORE.load_policy(path, "cpu")
 
 
+@pytest.mark.parametrize(
+    "mutate, message",
+    (
+        (lambda config: config.pop("reducer_layers"), "Invalid model configuration"),
+        (lambda config: config.update({"unknown": 1}), "Invalid model configuration"),
+        (lambda config: config.update({"d_model": True}), "Invalid model configuration"),
+    ),
+)
+def test_checkpoint_rejects_malformed_model_configuration(tmp_path, mutate, message):
+    path = tmp_path / "policy.pt"
+    DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
+    artifact = torch.load(path, weights_only=False)
+    mutate(artifact["model_config"])
+    torch.save(artifact, path)
+
+    with pytest.raises(ValueError, match=message):
+        DEFAULT_POLICY_STORE.load_policy(path, "cpu")
+
+
+def test_training_checkpoint_rejects_state_config_mismatch(tmp_path):
+    path = tmp_path / "policy.pt"
+    DEFAULT_POLICY_STORE.save_training_state(path, 1, _small_policy())
+    artifact = torch.load(path, weights_only=False)
+    artifact["model_config"]["d_model"] = 64
+    torch.save(artifact, path)
+
+    policy = _small_policy()
+    with pytest.raises(ValueError, match="model configuration does not match"):
+        DEFAULT_POLICY_STORE.load_training_state(path, policy)
+
+
 def test_atomic_checkpoint_failure_preserves_previous_file(tmp_path, monkeypatch):
     path = tmp_path / "policy.pt"
     path.write_bytes(b"previous")

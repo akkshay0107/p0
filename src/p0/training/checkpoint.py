@@ -168,7 +168,7 @@ class CheckpointStore:
     def _load_artifact(self, path: Path) -> Mapping[str, Any]:
         try:
             artifact = torch.load(path, weights_only=True, map_location="cpu")
-        except (OSError, RuntimeError, EOFError) as exc:
+        except (OSError, RuntimeError, EOFError, ValueError, IndexError) as exc:
             raise ValueError(f"Unable to read checkpoint {path}") from exc
         if not isinstance(artifact, Mapping):
             raise ValueError(f"Malformed checkpoint {path}: expected a mapping")
@@ -187,6 +187,7 @@ class CheckpointStore:
         if not isinstance(provenance, Mapping):
             raise ValueError(f"Checkpoint {path} provenance must be a mapping")
         validate_artifact_runtime_contract(artifact, self.manifest_path)
+        self._model_config(artifact, path)
         return artifact
 
     def _runtime_resources(self) -> RuntimeResources:
