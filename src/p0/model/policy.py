@@ -159,12 +159,16 @@ class ActorPolicy(nn.Module):
         self,
         d_model: int,
         nhead: int,
-        nlayer: int,
+        prelude_layers: int,
         act_size: int,
         side_emb: nn.Embedding,
         seq_len: int = SEQUENCE_LENGTH,
         history_tokens: int = 8,
         dim_feedforward: int = 2048,
+        core_repeats: int = 1,
+        coda_layers: int = 1,
+        core_weights_tied: bool = False,
+        pass_embedding_enabled: bool = True,
     ):
         super().__init__()
         self.act_size = act_size
@@ -176,9 +180,12 @@ class ActorPolicy(nn.Module):
             seq_len=seq_len,
             d_model=d_model,
             nhead=nhead,
-            nlayer=nlayer,
+            prelude_layers=prelude_layers,
             n_hg=history_tokens,
             dim_feedforward=dim_feedforward,
+            core_repeats=core_repeats,
+            coda_layers=coda_layers,
+            core_weights_tied=core_weights_tied,
             use_history=True,
         )
 
@@ -198,7 +205,11 @@ class ActorPolicy(nn.Module):
         )
 
         self.mega_emb = nn.Parameter(torch.empty(self.d_k))
-        self.pass_key = nn.Parameter(torch.empty(self.d_k))
+        self.pass_embedding_enabled = pass_embedding_enabled
+        if pass_embedding_enabled:
+            self.pass_embedding = nn.Parameter(torch.empty(self.d_k))
+        else:
+            self.register_buffer("pass_embedding", torch.zeros(self.d_k))
         self.struggle_key = nn.Parameter(torch.empty(self.d_k))
         self.target_self_key = nn.Parameter(torch.empty(self.d_k))
         self.pointer_temp = nn.Parameter(torch.tensor(0.01))
@@ -223,7 +234,8 @@ class ActorPolicy(nn.Module):
     @torch.no_grad()
     def _init_weights(self):
         init.normal_(self.mega_emb, std=0.02)
-        init.normal_(self.pass_key, std=0.02)
+        if self.pass_embedding_enabled:
+            init.normal_(self.pass_embedding, std=0.02)
         init.normal_(self.struggle_key, std=0.02)
         init.normal_(self.target_self_key, std=0.02)
         for module in self.modules():
@@ -268,10 +280,14 @@ class ActorPolicy(nn.Module):
         logits = torch.zeros((B, self.act_size + 1), device=device)
         action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
-        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)).to(
+        logits[:, PASS_START] = (
+            (q_pass * self.pass_embedding).sum(dim=-1) / math.sqrt(self.d_k)
+        ).to(
             logits.dtype
         )
-        action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
+        action_keys[:, PASS_START] = self.pass_embedding.unsqueeze(0).expand(B, -1).to(
+            action_keys.dtype
+        )
 
         k_ally = k_entity_extended[:, self.ally_poke_entities, :]
         switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / math.sqrt(self.d_k)
@@ -586,12 +602,16 @@ class PolicyNet(nn.Module):
         self.actor = ActorPolicy(
             config.d_model,
             config.nhead,
-            config.reducer_layers,
+            config.prelude_layers,
             ACT_SIZE,
             self.encoder.side_emb,
             self.seq_len + 1 + EVENT_COUNT,  # +1 for action mask embedding, rest for event tokens
             history_tokens=config.history_tokens,
             dim_feedforward=config.dim_feedforward,
+            core_repeats=config.core_repeats,
+            coda_layers=config.coda_layers,
+            core_weights_tied=config.core_weights_tied,
+            pass_embedding_enabled=config.pass_embedding_enabled,
         )
 
         # value head

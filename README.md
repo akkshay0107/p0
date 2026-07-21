@@ -114,6 +114,12 @@ The former `.ppoconfig` format is no longer accepted; migrate its flat keys into
 
 ### Runtime compatibility
 
+The reducer-depth benchmark measures all unified depth and pass-embedding variants using the project baseline model dimensions by default, on the project default device. Device and model dimensions have optional overrides. Timing, batch, depth, dtype, and seed inputs have practical defaults; optional BC validation requires a compatible checkpoint and tensor artifact.
+
+For a default-sized run:
+
+    uv run python bench/benchmark_reducer_depth.py --dtype float32 --seed 7 --warmup 2 --iterations 5 --repeats 5 --batch-size 2 --time-steps 4 --deep-core-repeats 3
+
 `data/runtime_manifest.json` contains one human-readable, load-breaking runtime contract.
 Checkpoints reference its `runtime_contract_sha256`. Vocabulary, action-layout, tensor-ABI,
 or resource-feature-ABI changes require a new checkpoint or an explicit transfer tool.

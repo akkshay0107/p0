@@ -20,7 +20,7 @@ ACT_SIZE = FORMAT.action_size
 @pytest.fixture
 def policy_net():
     return build_policy(
-        ModelConfig(128, 4, 2, 8, 512),
+        ModelConfig(128, 4, 1, 8, 512, core_repeats=2),
         default_runtime_resources(),
     )
 
@@ -218,7 +218,7 @@ def test_cls_reducer_pokemon_tokens_alignment():
         seq_len=SEQUENCE_LENGTH + 1,
         d_model=32,
         nhead=4,
-        nlayer=1,
+        prelude_layers=1,
         dim_feedforward=128,
         n_hg=8,
     )
@@ -227,13 +227,76 @@ def test_cls_reducer_pokemon_tokens_alignment():
         def forward(self, seq, src_key_padding_mask=None):
             return seq
 
-    reducer.encoder = _Passthrough()  # type: ignore
+    passthrough = _Passthrough()
+    reducer.prelude = passthrough  # type: ignore[reportAttributeAccessIssue]
+    reducer.core_layers = nn.ModuleList([passthrough])
+    reducer.coda = passthrough  # type: ignore[reportAttributeAccessIssue]
+    reducer.norm = nn.Identity()  # type: ignore[reportAttributeAccessIssue]
     tokens = torch.randn(2, SEQUENCE_LENGTH + 1, 32)
 
     state = reducer.hg_init.expand(tokens.size(0), -1, -1)
     _, _, pokemon_tokens = reducer(tokens, state, None)
 
     torch.testing.assert_close(pokemon_tokens, tokens[:, 1:13])
+
+
+def test_reducer_core_topology_parameterization_and_gradient_flow():
+    from p0.model.cls_reducer import CLSReducer
+
+    def build_reducer(core_repeats, core_weights_tied=False):
+        return CLSReducer(
+            seq_len=SEQUENCE_LENGTH + 1,
+            d_model=32,
+            nhead=4,
+            prelude_layers=1,
+            dim_feedforward=128,
+            n_hg=8,
+            core_repeats=core_repeats,
+            core_weights_tied=core_weights_tied,
+        )
+
+    baseline = build_reducer(1)
+    untied = build_reducer(3)
+    tied = build_reducer(3, core_weights_tied=True)
+
+    assert len(baseline.core_layers) == 1
+    assert len(untied.core_layers) == 3
+    assert len({id(layer) for layer in untied.core_layers}) == 3
+    assert len({id(layer) for layer in tied.core_layers}) == 1
+    assert sum(parameter.numel() for parameter in baseline.parameters()) == sum(
+        parameter.numel() for parameter in tied.parameters()
+    ) < sum(parameter.numel() for parameter in untied.parameters())
+
+    tokens = torch.randn(2, SEQUENCE_LENGTH + 1, 32)
+    state = untied.hg_init.expand(2, -1, -1)
+    cls, next_state, pokemon_tokens = untied(tokens, state)
+    assert cls.shape == (2, 32)
+    assert next_state.shape == (2, 8, 32)
+    assert pokemon_tokens.shape == (2, 12, 32)
+
+    cls.sum().backward()
+    assert all(any(parameter.grad is not None for parameter in layer.parameters()) for layer in untied.core_layers)
+
+
+def test_pass_embedding_setting_changes_actor_parameterization():
+    from p0.model.factory import build_policy
+
+    enabled = build_policy(
+        ModelConfig(32, 4, 1, 8, 128, pass_embedding_enabled=True),
+        default_runtime_resources(),
+    )
+    disabled = build_policy(
+        ModelConfig(32, 4, 1, 8, 128, pass_embedding_enabled=False),
+        default_runtime_resources(),
+    )
+
+    assert enabled.actor.pass_embedding_enabled
+    assert not disabled.actor.pass_embedding_enabled
+    assert isinstance(enabled.actor.pass_embedding, torch.nn.Parameter)
+    assert not isinstance(disabled.actor.pass_embedding, torch.nn.Parameter)
+    enabled_count = sum(parameter.numel() for parameter in enabled.parameters())
+    disabled_count = sum(parameter.numel() for parameter in disabled.parameters())
+    assert enabled_count - disabled_count == enabled.actor.d_k
 
 
 def test_event_targets_do_not_alias(policy_net):
