@@ -47,6 +47,7 @@ class PPOTrainer:
     def run(self, start_episode: int = 0) -> None:
         self.collector.vector_env.reset()
         refresh_interval = self.training_config.magnet_refresh_interval
+        completed_episode = start_episode
         for episode in range(start_episode, self.training_config.num_episodes):
             if self.cancel_requested():
                 self._save(episode)
@@ -64,6 +65,7 @@ class PPOTrainer:
             )
             if not trajectories:
                 logging.warning("No trajectories collected, skipping update")
+                completed_episode = episode + 1
                 continue
             stats = self.updater.update(trajectories, episode, alpha)
             if (episode + 1) % refresh_interval == 0:
@@ -81,8 +83,11 @@ class PPOTrainer:
             )
             phase = "warmup" if episode < self.training_config.warmup_episodes else "train"
             self.metric_sink(metrics, episode + 1, phase)
+            completed_episode = episode + 1
             if (episode + 1) % 10 == 0:
                 self._save(episode + 1)
+        if completed_episode % 10 != 0:
+            self._save(completed_episode)
 
     def _save(self, episode: int) -> None:
         self.policy_store.save_training_state(

@@ -100,7 +100,7 @@ def test_benchmark_covers_depths_and_labels_gated_metrics():
         assert variant["median_seconds_per_batch"] > 0
         assert variant["iqr_seconds_per_batch"] >= 0
         assert variant["tokens_per_second"] > 0
-        assert variant["peak_bptt_memory_bytes"] > 0
+        assert variant["peak_training_memory_bytes"] > 0
         assert variant["validation_bc_nll"]["status"] == "unavailable"
         assert variant["self_play_strength"]["status"] == "unavailable"
 

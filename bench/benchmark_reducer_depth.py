@@ -111,7 +111,7 @@ class VariantResult:
     median_seconds_per_batch: float
     iqr_seconds_per_batch: float
     tokens_per_second: float
-    peak_bptt_memory_bytes: int
+    peak_training_memory_bytes: int
     validation_bc_nll: Metric
     self_play_strength: Metric
 
@@ -317,7 +317,7 @@ def _run_variant(
         median_seconds_per_batch=median,
         iqr_seconds_per_batch=iqr,
         tokens_per_second=token_count / median,
-        peak_bptt_memory_bytes=_peak_memory(policy, encoded, memory, device),
+        peak_training_memory_bytes=_peak_memory(policy, encoded, memory, device),
         validation_bc_nll=_validation_metric(policy, validation_artifact, device, dtype),
         self_play_strength=Metric.unavailable("self-play smoke configuration was not supplied"),
     )
@@ -462,7 +462,7 @@ def benchmark(args: argparse.Namespace) -> None:
         print(f"median_seconds_per_batch={variant['median_seconds_per_batch']:.8f}")
         print(f"iqr_seconds_per_batch={variant['iqr_seconds_per_batch']:.8f}")
         print(f"median_tokens_per_second={variant['tokens_per_second']:.2f}")
-        print(f"peak_bptt_memory_bytes={variant['peak_bptt_memory_bytes']}")
+        print(f"peak_training_memory_bytes={variant['peak_training_memory_bytes']}")
         _print_metric("validation_bc_nll", variant["validation_bc_nll"])
         _print_metric("self_play_strength", variant["self_play_strength"])
 

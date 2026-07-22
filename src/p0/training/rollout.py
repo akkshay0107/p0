@@ -19,6 +19,7 @@ from p0.training.trajectory import (
     TrajectoryStorage,
     prepare_trajectory_batches,
 )
+from p0.training.utils import amp_enabled
 from p0.training.vector_env import ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
@@ -239,7 +240,7 @@ def collect_rollouts(
             torch.cat([first, second], dim=0)
             for first, second in zip(memory1_inputs, memory2_inputs, strict=True)
         )
-        with torch.amp.autocast(device_type=device.type, enabled=config.enable_optim):
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled(config, device)):
             current_out = policy.act_obs(current_obs, current_mask, *current_memory)
 
         actions1 = current_out.actions[:n_envs]
@@ -371,4 +372,3 @@ class RolloutCollector:
 
     def reset_completed(self) -> None:
         self.buffer.reset()
-

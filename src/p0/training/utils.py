@@ -10,6 +10,11 @@ def default_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def amp_enabled(config: TrainingConfig, device: torch.device) -> bool:
+    """Enable FP16 autocast only on CUDA devices."""
+    return config.enable_optim and device.type == "cuda"
+
+
 class PPOScheduler:
     def __init__(self, config: TrainingConfig):
         self.alpha_value = config.magnet_alpha

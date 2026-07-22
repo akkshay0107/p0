@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from p0.format_config import FORMAT
@@ -107,3 +108,13 @@ def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
     changed_last = trainer._history_inputs(changed_ancient, slice(51, 52))
     for original_part, changed_part in zip(original_last, changed_last, strict=True):
         torch.testing.assert_close(original_part, changed_part)
+
+
+def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
+    chunk = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1])
+    trainer = _trainer(chunk)
+    trainer.dataset = iter((chunk,))
+    trainer.config = BCConfig(epochs=2, amp=False)
+
+    with pytest.raises(ValueError, match="re-iterable"):
+        trainer.train()

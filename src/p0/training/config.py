@@ -190,6 +190,16 @@ class CorpusConfig:
         ):
             if not value.strip():
                 raise ValueError(f"corpus.{name} must not be empty")
+        if self.agent_split.upper() not in {"TRAIN", "VALIDATION", "TEST"}:
+            raise ValueError("corpus.agent_split must be train, validation, or test")
+        if self.sampling_policy.upper() not in {
+            "USAGE_WEIGHTED",
+            "UNIFORM_CANONICAL",
+            "UNIFORM_ARCHETYPE",
+            "RARE_COVERAGE",
+            "MATCHUP_BALANCED",
+        }:
+            raise ValueError("corpus.sampling_policy is not supported")
 
 
 @dataclass(frozen=True, slots=True)

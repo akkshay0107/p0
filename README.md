@@ -108,7 +108,7 @@ You would have to move the trained model to a specific location and have the inf
 ## Utility Scripts
 
 - **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
-- **`export_training.py`**: Exports the entire training state - current PPO weights, opponent pool backups, and the active `config.yaml` snapshot into a `tar.gz` archive. I use it for moving stuff between remote servers while training.
+- **`export_training.py`**: Exports the current training artifacts, runtime contracts, and active `config.yaml` snapshot into a `tar.gz` archive.
 
 The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.yaml.example`.
 

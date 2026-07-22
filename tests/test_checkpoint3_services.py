@@ -8,6 +8,7 @@ from p0.runtime import showdown
 from p0.training.config import TrainingConfig
 from p0.training.ppo import compute_ppo_objective
 from p0.training.trainer import PPOTrainer
+from p0.training.utils import amp_enabled
 
 
 def test_pure_ppo_objective_clips_and_weights_team_preview():
@@ -28,6 +29,14 @@ def test_pure_ppo_objective_clips_and_weights_team_preview():
     assert total.shape == policy.shape == value.shape == ratio.shape == log_ratio.shape == (2,)
     assert ratio.tolist() == pytest.approx([2.0, 0.5])
     assert total[0] != total[1]
+
+
+def test_ppo_amp_is_cuda_only():
+    config = TrainingConfig(enable_optim=True)
+
+    assert not amp_enabled(config, torch.device("cpu"))
+    assert amp_enabled(config, torch.device("cuda"))
+    assert not amp_enabled(TrainingConfig(enable_optim=False), torch.device("cuda"))
 
 
 def test_showdown_group_rolls_back_servers_when_later_start_fails(monkeypatch):
@@ -91,3 +100,33 @@ def test_trainer_cancellation_saves_once_before_collecting(tmp_path):
     )
     trainer.run()
     assert [(path, episode) for path, episode, _, _ in saved] == [(tmp_path / "checkpoint.pt", 0)]
+
+
+def test_trainer_saves_final_completed_episode(tmp_path):
+    saved = []
+
+    class Store:
+        def save_training_state(self, path, episode, policy, **kwargs):
+            saved.append((path, episode))
+
+    collector = SimpleNamespace(vector_env=SimpleNamespace(reset=lambda: None))
+    updater = SimpleNamespace(
+        optimizer=SimpleNamespace(param_groups=[{"lr": 0.0}]),
+        scaler=object(),
+    )
+    trainer = PPOTrainer(
+        policy=cast(Any, object()),
+        policy_store=cast(Any, Store()),
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        collector=cast(Any, collector),
+        updater=cast(Any, updater),
+        magnet=cast(Any, object()),
+        scheduler=cast(Any, object()),
+        training_config=TrainingConfig(
+            num_episodes=2, warmup_episodes=0, magnet_refresh_interval=1
+        ),
+    )
+
+    trainer.run(start_episode=2)
+
+    assert saved == [(tmp_path / "checkpoint.pt", 2)]

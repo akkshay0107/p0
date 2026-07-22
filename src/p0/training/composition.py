@@ -55,15 +55,9 @@ def _team_source(
         allow_mirror = True
         if corpus_config is not None:
             split_name = corpus_config.agent_split.upper() if is_agent else "TRAIN"
-            try:
-                split = CorpusSplit[split_name]
-            except KeyError:
-                split = CorpusSplit.TRAIN
+            split = CorpusSplit[split_name]
             policy_name = corpus_config.sampling_policy.upper()
-            try:
-                policy = SamplingPolicy[policy_name]
-            except KeyError:
-                policy = SamplingPolicy.USAGE_WEIGHTED
+            policy = SamplingPolicy[policy_name]
             allow_mirror = corpus_config.allow_mirror
 
         spec = CorpusSourceSpec(

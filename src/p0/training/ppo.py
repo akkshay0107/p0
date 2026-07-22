@@ -20,6 +20,7 @@ from p0.model.structured_observation import StructuredObservation, is_teamprevie
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.trajectory import TrajectoryBatch
+from p0.training.utils import amp_enabled
 
 
 def magnet_kl_per_step(live_logits: torch.Tensor, magnet_logits: torch.Tensor) -> torch.Tensor:
@@ -242,7 +243,8 @@ def _run_batched_ppo(
 
     all_obs = StructuredObservation.cat([ep.observations for ep in episodes], dim=0)
     all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0).to(device)
-    with autocast(device_type=device.type, enabled=config.enable_optim):
+    use_amp = amp_enabled(config, device)
+    with autocast(device_type=device.type, enabled=use_amp):
         all_enc = policy.encode(all_obs, all_action_masks)
     if is_warmup:
         all_enc = all_enc._replace(tokens=all_enc.tokens.detach(), aux=all_enc.aux.detach())
@@ -258,7 +260,7 @@ def _run_batched_ppo(
     magnet_memory: tuple[torch.Tensor, ...] | None = None
     if not is_warmup:
         with torch.inference_mode(), autocast(
-            device_type=device.type, enabled=config.enable_optim
+            device_type=device.type, enabled=use_amp
         ):
             magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
             magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
@@ -272,7 +274,7 @@ def _run_batched_ppo(
         "kl_div": torch.tensor(0.0, device=device),
         "clip_frac": torch.tensor(0.0, device=device),
     }
-    with autocast(device_type=device.type, enabled=config.enable_optim):
+    with autocast(device_type=device.type, enabled=use_amp):
         out = policy.evaluate(
             all_enc,
             all_action_masks,
@@ -402,6 +404,7 @@ def ppo_update(
             expected_minibatch_steps = sum(ep.length for ep in minibatch)
             should_skip = False
             cancelled = False
+            non_finite_loss = False
             minibatch_mean_kl = 0.0
 
             for chunk_idx in range(0, len(minibatch), config.minibatch_size):
@@ -430,9 +433,11 @@ def ppo_update(
                         scaler.scale(scaled_loss).backward()
                     else:
                         logging.warning(
-                            f"Non-finite chunk loss at episode {episode}, skipping backward "
-                            f"for {batch_steps} steps (minibatch gradient will be undercounted)"
+                            f"Non-finite chunk loss at episode {episode}; "
+                            "discarding the entire minibatch"
                         )
+                        non_finite_loss = True
+                        break
 
                 # Check KL early at the chunk level to save processing remaining chunks
                 should_skip, minibatch_mean_kl = _kl_exceeds_target(
@@ -445,11 +450,16 @@ def ppo_update(
                 optimizer.zero_grad(set_to_none=True)
                 break
             if minibatch_steps > 0:
-                if should_skip:
+                if should_skip or non_finite_loss:
+                    reason = (
+                        "non-finite loss"
+                        if non_finite_loss
+                        else f"KL={minibatch_mean_kl:.4f} > {config.target_kl:.4f}"
+                    )
                     logging.info(
                         f"Skipping minibatch at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
                         f"batch {batch_start // effective_batch_size + 1} "
-                        f"(minibatch KL={minibatch_mean_kl:.4f} > {config.target_kl:.4f})"
+                        f"({reason})"
                     )
                     optimizer.zero_grad(set_to_none=True)
                     num_skipped += 1

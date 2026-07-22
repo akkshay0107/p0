@@ -51,6 +51,11 @@ def test_load_config_rejects_invalid_contracts_with_specific_errors(tmp_path):
             "bot:\n  battle_format: gen9anythinggoes\n",
             "battle_format",
         ),
+        (
+            "invalid corpus sampling policy",
+            "corpus:\n  sampling_policy: made_up\n",
+            "sampling_policy",
+        ),
     )
     for label, contents, message in cases:
         try:
