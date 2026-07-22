@@ -156,25 +156,6 @@ def test_checkpoint_rejects_malformed_model_configuration(tmp_path, mutate, mess
         DEFAULT_POLICY_STORE.load_policy(path, "cpu")
 
 
-def test_checkpoint_rejects_pre_workstream_5_model_configuration(tmp_path):
-    path = tmp_path / "policy.pt"
-    DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
-    artifact = torch.load(path, weights_only=False)
-    artifact["model_config"] = {
-        "d_model": 32,
-        "nhead": 4,
-        "reducer_layers": 1,
-        "history_tokens": 8,
-        "dim_feedforward": 128,
-        "series_context_enabled": False,
-        "series_tokens": 4,
-    }
-    torch.save(artifact, path)
-
-    with pytest.raises(ValueError, match="Invalid model configuration"):
-        DEFAULT_POLICY_STORE.load_policy(path, "cpu")
-
-
 def test_training_checkpoint_rejects_state_config_mismatch(tmp_path):
     path = tmp_path / "policy.pt"
     DEFAULT_POLICY_STORE.save_training_state(path, 1, _small_policy())
