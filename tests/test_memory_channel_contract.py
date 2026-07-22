@@ -1,3 +1,5 @@
+from typing import cast
+
 import torch
 
 from p0.battle.series import GameSummary, SideGameSummary
@@ -23,6 +25,7 @@ from p0.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
+from p0.model.swiglu_encoder import SwiGLUEncoderLayer
 from p0.training.config import TrainingConfig
 from p0.training.ppo import _run_batched_ppo
 from p0.training.trajectory import TrajectoryBatch
@@ -97,7 +100,8 @@ def test_event_compression_has_gradient_paths() -> None:
     output = policy.encoder._encode_events(obs, policy.device)
     output.square().mean().backward()
     assert policy.encoder.event_type_emb.weight.grad is not None
-    assert policy.encoder.event_encoder.layers[0].qkv_proj.weight.grad is not None
+    event_layer = cast(SwiGLUEncoderLayer, policy.encoder.event_encoder.layers[0])
+    assert event_layer.qkv_proj.weight.grad is not None
     assert policy.encoder.event_pool_queries.grad is not None
     assert policy.encoder.event_value_proj.weight.grad is not None
 
