@@ -151,9 +151,19 @@ class BCTrainer:
         series = self.policy.encode_series(SeriesFeatures.stack([features]))
         return series, features.game_mask.unsqueeze(0).to(self.device)
 
-    def _history_inputs(self, local_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def _history_inputs(
+        self,
+        local_tokens: Tensor,
+        target_slice: slice | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        start = 0 if target_slice is None or target_slice.start is None else target_slice.start
+        stop = (
+            local_tokens.size(0)
+            if target_slice is None or target_slice.stop is None
+            else target_slice.stop
+        )
         windows: list[tuple[Tensor, Tensor, Tensor]] = []
-        for target in range(local_tokens.size(0)):
+        for target in range(start, stop):
             left = max(0, target - HISTORY_WINDOW)
             windows.append(pack_history_tokens(local_tokens[left:target].unsqueeze(0)))
         if not windows:
@@ -164,36 +174,68 @@ class BCTrainer:
         return packed, masks, ages
 
     def _train_game(self, game: ReplayGameChunk, totals: _RunTotals) -> None:
-        observations = game.observations.to(self.device)
-        action_mask = game.action_mask.to(self.device)
-        # Read the ragged boundaries on the host once; per-decision .item() would sync
-        # against the accelerator on every step of the loop below.
-        offsets = game.candidate_offsets.to(self.device)
-        candidates = game.candidate_values.to(self.device)
-        labels = game.label_kind.to(self.device)
-        loss_mask = game.loss_mask.to(self.device)
+        for start in range(0, game.length, self.config.batch_decisions):
+            target_slice = slice(start, min(start + self.config.batch_decisions, game.length))
+            self._train_window(game, target_slice, totals)
+
+    def _train_window(
+        self,
+        game: ReplayGameChunk,
+        target_slice: slice,
+        totals: _RunTotals,
+    ) -> None:
+        start = target_slice.start
+        stop = target_slice.stop
+        if start is None or stop is None or not 0 <= start < stop <= game.length:
+            raise ValueError("target_slice must select a non-empty in-game decision window")
+
+        # Recompute the producing graph for every optimizer update. Only the explicit
+        # left context is encoded; a local token has no dependency on earlier rows.
+        context_start = max(0, start - HISTORY_WINDOW)
+        observations = game.observations[context_start:stop].to(self.device)
+        action_mask = game.action_mask[context_start:stop].to(self.device)
         encoded = self.policy.encode(observations, action_mask)
         local_tokens = self.policy.local_history_tokens(encoded)
-        history_tokens, history_mask, history_age_ids = self._history_inputs(local_tokens)
+        relative_start = start - context_start
+        relative_stop = stop - context_start
+        target_encoded = encoded._replace(
+            tokens=encoded.tokens[relative_start:relative_stop],
+            aux=encoded.aux[relative_start:relative_stop],
+            numerical=encoded.numerical[relative_start:relative_stop],
+        )
+        target_mask = action_mask[relative_start:relative_stop]
+        history_tokens, history_mask, history_age_ids = self._history_inputs(
+            local_tokens, slice(relative_start, relative_stop)
+        )
         series_tokens, series_mask = self._series_inputs(game)
-        series_tokens = series_tokens.expand(game.length, -1, -1)
-        series_mask = series_mask.expand(game.length, -1)
+        target_count = stop - start
+        series_tokens = series_tokens.expand(target_count, -1, -1)
+        series_mask = series_mask.expand(target_count, -1)
+
+        candidate_start = int(game.candidate_offsets[start])
+        candidate_end = int(game.candidate_offsets[stop])
+        candidate_values = game.candidate_values[candidate_start:candidate_end].to(self.device)
+        candidate_offsets = (game.candidate_offsets[start : stop + 1] - candidate_start).to(
+            self.device
+        )
+        labels = game.label_kind[start:stop].to(self.device)
+        loss_mask = game.loss_mask[start:stop].to(self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
             log_probs = self.policy.actor.score_joint_candidates(
-                encoded,
-                action_mask,
+                target_encoded,
+                target_mask,
                 series_tokens,
                 series_mask,
                 history_tokens,
                 history_mask,
                 history_age_ids,
-                candidates,
-                offsets,
+                candidate_values,
+                candidate_offsets,
             )
         objective = compute_bc_objective(
             log_probs,
-            offsets,
+            candidate_offsets,
             labels,
             loss_mask,
         )
@@ -218,7 +260,7 @@ class BCTrainer:
                 loss=loss_sum,
                 exact_nll=objective.exact_nll.detach().item() * exact_decisions,
                 partial_nll=objective.partial_nll.detach().item() * partial_decisions,
-                decisions=game.length,
+                decisions=target_count,
                 labeled_decisions=labeled_decisions,
                 exact_decisions=exact_decisions,
                 partial_decisions=partial_decisions,

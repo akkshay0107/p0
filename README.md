@@ -138,6 +138,18 @@ uv run pytest -q
 uv build
 ```
 
+The BC `batch_decisions` setting is an explicit target-window budget. Each window
+recomputes its local context under current weights before updating, while retaining
+past-only context and the fixed 48-decision cap. PPO can receive validated simulator
+series features through its training-side rollout provider; live protocol summary
+production remains a separate deployment concern.
+
+Run the memory-channel performance baseline with:
+
+```bash
+uv run python bench/benchmark_memory_channel.py --batch-size 8 --iterations 20
+```
+
 The installed command-line interfaces are `p0-train`, `p0-play`, `p0-build-vocab`, and `p0-export-training`.
 
 ---

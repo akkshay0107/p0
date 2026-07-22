@@ -25,7 +25,7 @@ from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import CorpusConfig, GlobalConfig, TeamSourceConfig
 from p0.training.league.league import OpponentPool
 from p0.training.ppo import PPOUpdater
-from p0.training.rollout import RolloutCollector
+from p0.training.rollout import RolloutCollector, SeriesContextProvider
 from p0.training.trainer import PPOTrainer
 from p0.training.utils import PPOScheduler, adamw_param_groups, default_device
 from p0.training.vector_env import ThreadVecEnv
@@ -109,6 +109,7 @@ def run_training(
     *,
     policy_store: PolicyStore = DEFAULT_POLICY_STORE,
     cancel_requested: Callable[[], bool] = lambda: False,
+    series_context: SeriesContextProvider | None = None,
 ) -> None:
     training, paths = config.training, config.paths
     resources = default_runtime_resources()
@@ -166,7 +167,13 @@ def run_training(
                 league.set_shadow(policy)
                 league.add(policy, "ep0")
                 league.save_state()
-            collector = RolloutCollector(vector_env, policy, league, training)
+            collector = RolloutCollector(
+                vector_env,
+                policy,
+                league,
+                training,
+                series_context=series_context,
+            )
             updater = PPOUpdater(
                 policy,
                 optimizer,

@@ -71,7 +71,7 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
 
     assert metrics.decisions == 2
     assert metrics.labeled_decisions == 2
-    assert metrics.updates == 1
+    assert metrics.updates == 2
     assert torch.isfinite(torch.tensor(metrics.loss))
     assert any(
         not torch.equal(before[name], parameter)
@@ -89,3 +89,21 @@ def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
     assert metrics.decisions == 2
     assert metrics.labeled_decisions == 1
     assert metrics.exact_decisions == 1
+
+
+def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
+    chunk = _chunk([int(LabelKind.EXACT)] * 4, [(7, 8)] * 4, [0, 1, 2, 3, 4])
+    trainer = _trainer(chunk, minibatch_size=2)
+    local_tokens = torch.randn(52, trainer.policy.d_model)
+
+    whole = trainer._history_inputs(local_tokens)
+    window = trainer._history_inputs(local_tokens, slice(48, 52))
+    for whole_part, window_part in zip(whole, window, strict=True):
+        torch.testing.assert_close(whole_part[48:], window_part)
+
+    changed_ancient = local_tokens.clone()
+    changed_ancient[0] += 1000.0
+    original_last = trainer._history_inputs(local_tokens, slice(51, 52))
+    changed_last = trainer._history_inputs(changed_ancient, slice(51, 52))
+    for original_part, changed_part in zip(original_last, changed_last, strict=True):
+        torch.testing.assert_close(original_part, changed_part)

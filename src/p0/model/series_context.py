@@ -78,6 +78,12 @@ class SeriesFeatures:
             }
         )
 
+    def to(self, device: torch.device | str) -> SeriesFeatures:
+        """Move feature tensors without changing their grad-free contract."""
+        return SeriesFeatures(
+            **{field.name: getattr(self, field.name).to(device) for field in fields(self)}
+        )
+
 
 def _side_species(side: SideGameSummary) -> tuple[str, ...]:
     # brought lists observed members only and always includes the leads when
@@ -138,6 +144,11 @@ def _empty_features() -> SeriesFeatures:
         game_number=torch.zeros(MAX_PRIOR_GAMES, dtype=torch.long),
         game_mask=torch.zeros(MAX_PRIOR_GAMES, dtype=torch.bool),
     )
+
+
+def empty_series_features() -> SeriesFeatures:
+    """Return the canonical all-padding series input for training adapters."""
+    return _empty_features()
 
 
 def tensorize_series(

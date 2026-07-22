@@ -324,6 +324,8 @@ def test_model_config_has_only_scaling_fields() -> None:
     stale["history_tokens"] = 8
     with pytest.raises(ValueError, match=r"unknown=.*history_tokens"):
         ModelConfig.from_dict(stale)
+    with pytest.raises(ValueError, match="low-width event channel"):
+        ModelConfig(d_model=96, nhead=3, reducer_layers=1, dim_feedforward=128)
 
 
 def test_reserved_config_sections(tmp_path) -> None:

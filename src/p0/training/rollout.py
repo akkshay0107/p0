@@ -1,5 +1,9 @@
 """Typed rollout collection over injected runtime and league services."""
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Protocol
+
 import numpy as np
 import torch
 
@@ -7,6 +11,7 @@ from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import PolicyNet
+from p0.model.series_context import SeriesFeatures, empty_series_features
 from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.league.league import OpponentPool
@@ -29,10 +34,39 @@ __all__ = [
     "EnvPartition",
     "RolloutBuffer",
     "BattleMemoryBuffer",
+    "RolloutSeriesContext",
+    "SeriesContextProvider",
     "assign_pool_opponents",
     "build_partition",
     "collect_rollouts",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutSeriesContext:
+    """Training-side series state for one environment and player perspective."""
+
+    series_id: str | None = None
+    game_number: int = 1
+    features: SeriesFeatures | None = None
+
+    def __post_init__(self) -> None:
+        if self.series_id is not None and not self.series_id:
+            raise ValueError("RolloutSeriesContext.series_id must be non-empty when provided")
+        if self.game_number < 1:
+            raise ValueError("RolloutSeriesContext.game_number must be positive")
+
+
+class SeriesContextProvider(Protocol):
+    """Inject simulator-produced causal summaries into training rollouts."""
+
+    def current(self, env_id: int, player: int) -> RolloutSeriesContext:
+        """Return the context used by the next decision for one player."""
+        ...
+
+    def on_game_end(self, env_id: int, info: Mapping[str, object]) -> None:
+        """Advance the provider after the simulator reports a completed game."""
+        ...
 
 
 class RolloutBuffer:
@@ -68,7 +102,7 @@ class BattleMemoryBuffer:
             raise ValueError("history token batch does not match selected environments")
         for env_id, token in zip(env_ids.tolist(), history_tokens, strict=True):
             entries = self.tokens[env_id]
-            entries.append(token.detach().to(torch.float32))
+            entries.append(token.detach().to(device="cpu", dtype=torch.float32))
             if len(entries) > HISTORY_WINDOW:
                 del entries[0]
 
@@ -87,8 +121,10 @@ class BattleMemoryBuffer:
         if series_mask.shape != (env_ids.numel(), SERIES_SLOTS):
             raise ValueError("series mask batch does not match the fixed two-slot contract")
         for env_id, tokens, mask in zip(env_ids.tolist(), series_tokens, series_mask, strict=True):
-            self.series_tokens[env_id] = tokens.detach().to(torch.float32).clone()
-            self.series_masks[env_id] = mask.detach().bool().clone()
+            self.series_tokens[env_id] = (
+                tokens.detach().to(device="cpu", dtype=torch.float32).clone()
+            )
+            self.series_masks[env_id] = mask.detach().to(device="cpu", dtype=torch.bool).clone()
 
     def clear_series(self, env_id: int) -> None:
         self.series_tokens[env_id] = None
@@ -134,6 +170,26 @@ class BattleMemoryBuffer:
         )
 
 
+def _sync_series_context(
+    policy: PolicyNet,
+    memory: BattleMemoryBuffer,
+    env_ids: torch.Tensor,
+    contexts: list[RolloutSeriesContext],
+) -> None:
+    """Encode and install the raw context for selected environments."""
+    if env_ids.numel() == 0:
+        return
+    if len(contexts) != env_ids.numel():
+        raise ValueError("series contexts must match selected environments")
+    features = SeriesFeatures.stack(
+        [context.features or empty_series_features() for context in contexts]
+    )
+    with torch.inference_mode():
+        encoded = policy.encode_series(features)
+    masks = features.game_mask
+    memory.set_series(env_ids, encoded, masks)
+
+
 @torch.inference_mode()
 def collect_rollouts(
     vec_env: ThreadVecEnv,
@@ -147,6 +203,7 @@ def collect_rollouts(
     memory1: BattleMemoryBuffer,
     memory2: BattleMemoryBuffer,
     partition: EnvPartition,
+    series_context: SeriesContextProvider | None = None,
 ) -> tuple[int, int]:
     """
     Collect one rollout with statically assigned self-play and pool-play environments.
@@ -165,6 +222,32 @@ def collect_rollouts(
 
     idx_all = torch.arange(n_envs)
     self_idx_cpu = partition.self_mask_cpu.nonzero().squeeze(-1)
+    contexts1 = (
+        [series_context.current(env_id, 0) for env_id in range(n_envs)]
+        if series_context is not None
+        else [RolloutSeriesContext() for _ in range(n_envs)]
+    )
+    contexts2 = (
+        [series_context.current(env_id, 1) for env_id in range(n_envs)]
+        if series_context is not None
+        else [RolloutSeriesContext() for _ in range(n_envs)]
+    )
+    if series_context is not None:
+        _sync_series_context(policy, memory1, idx_all, contexts1)
+        _sync_series_context(policy, memory2, idx_all, contexts2)
+    trajectories1.set_context(
+        idx_all,
+        [context.series_id for context in contexts1],
+        torch.tensor([context.game_number for context in contexts1], dtype=torch.long),
+    )
+    trajectories2.set_context(
+        self_idx_cpu,
+        [contexts2[env_id].series_id for env_id in self_idx_cpu.tolist()],
+        torch.tensor(
+            [contexts2[env_id].game_number for env_id in self_idx_cpu.tolist()],
+            dtype=torch.long,
+        ),
+    )
     next_pool_opponents: dict[int, str] = {}
     if partition.pool_idx.numel() > 0:
         roster = pool.sample_many(config.n_pool_opponents)
@@ -246,6 +329,9 @@ def collect_rollouts(
             torch.from_numpy(masks1).to(torch.bool),
             memory1_inputs[0].to(device="cpu"),
             memory1_inputs[1].to(device="cpu"),
+            series_features=(
+                [context.features for context in contexts1] if series_context is not None else None
+            ),
         )
 
         has_self_play = self_idx_cpu.numel() > 0
@@ -260,6 +346,11 @@ def collect_rollouts(
                 torch.from_numpy(masks2)[self_idx_cpu].to(torch.bool),
                 memory2_self_inputs[0].to(device="cpu"),
                 memory2_self_inputs[1].to(device="cpu"),
+                series_features=(
+                    [contexts2[env_id].features for env_id in self_idx_cpu.tolist()]
+                    if series_context is not None
+                    else None
+                ),
             )
 
         env_actions = [
@@ -305,8 +396,37 @@ def collect_rollouts(
 
                 memory1.reset(i)
                 memory2.reset(i)
-                if opponent_id != "self":
+                if series_context is not None:
+                    series_context.on_game_end(i, infos[i])
+                    contexts1[i] = series_context.current(i, 0)
+                    contexts2[i] = series_context.current(i, 1)
+                    _sync_series_context(
+                        policy,
+                        memory1,
+                        torch.tensor([i], dtype=torch.long),
+                        [contexts1[i]],
+                    )
+                    _sync_series_context(
+                        policy,
+                        memory2,
+                        torch.tensor([i], dtype=torch.long),
+                        [contexts2[i]],
+                    )
+                    trajectories1.set_context(
+                        torch.tensor([i], dtype=torch.long),
+                        [contexts1[i].series_id],
+                        torch.tensor([contexts1[i].game_number], dtype=torch.long),
+                    )
+                    if partition.self_mask_cpu[i]:
+                        trajectories2.set_context(
+                            torch.tensor([i], dtype=torch.long),
+                            [contexts2[i].series_id],
+                            torch.tensor([contexts2[i].game_number], dtype=torch.long),
+                        )
+                if opponent_id != "self" and series_context is None:
                     memory2.clear_series(i)
+                    partition.opponent_ids[i] = next_pool_opponents[i]
+                elif opponent_id != "self":
                     partition.opponent_ids[i] = next_pool_opponents[i]
 
         masks1 = next_masks1
@@ -331,18 +451,20 @@ class RolloutCollector:
         config: TrainingConfig,
         *,
         max_trajectory_steps: int = 200,
+        series_context: SeriesContextProvider | None = None,
     ) -> None:
         self.vector_env = vector_env
         self.policy = policy
         self.league = league
         self.config = config
+        self.series_context = series_context
         self.buffer = RolloutBuffer()
         self.active_policies: dict[str, PolicyNet] = {}
         self.first = TrajectoryStorage.allocate(
-            config.n_envs, max_trajectory_steps, d_model=policy.d_model
+            config.n_envs, max_trajectory_steps, d_model=policy.d_model, player_index=0
         )
         self.second = TrajectoryStorage.allocate(
-            config.n_envs, max_trajectory_steps, d_model=policy.d_model
+            config.n_envs, max_trajectory_steps, d_model=policy.d_model, player_index=1
         )
         self.partition: EnvPartition = build_partition(config, league, policy.device)
         self.memory1 = BattleMemoryBuffer(config.n_envs, policy.d_model)
@@ -363,6 +485,7 @@ class RolloutCollector:
             self.memory1,
             self.memory2,
             self.partition,
+            self.series_context,
         )
         return stats
 

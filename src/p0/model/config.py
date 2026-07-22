@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from p0.model.architecture_contract import EVENT_RAW_WIDTH
+
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
@@ -29,6 +31,8 @@ class ModelConfig:
                 raise ValueError(f"ModelConfig.{name} must be a positive integer")
         if self.d_model % self.nhead:
             raise ValueError("ModelConfig.d_model must be divisible by nhead")
+        if EVENT_RAW_WIDTH % self.nhead:
+            raise ValueError("ModelConfig.nhead must divide the fixed low-width event channel")
 
     @classmethod
     def baseline(cls) -> ModelConfig:
