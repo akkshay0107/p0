@@ -14,6 +14,7 @@ from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
     EVENT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
+    EVENT_METADATA_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     MAX_EFFECTS,
     MOVE_SLOTS,
@@ -49,7 +50,6 @@ _EMPTY_MOVE_SLOTS: tuple[None, ...] = (None,) * MOVE_SLOTS
 
 _TOKEN_TYPE_LAYOUT = np.asarray(
     (
-        TokenType.CLS,
         *(TokenType.POKEMON for _ in range(TEAM_SIZE * 2)),
         TokenType.FIELD,
         TokenType.FIELD,
@@ -59,7 +59,6 @@ _TOKEN_TYPE_LAYOUT = np.asarray(
 )
 _SIDE_LAYOUT = np.asarray(
     (
-        SideId.NONE,
         *(SideId.ALLY for _ in range(TEAM_SIZE)),
         *(SideId.OPPONENT for _ in range(TEAM_SIZE)),
         SideId.NONE,
@@ -70,7 +69,6 @@ _SIDE_LAYOUT = np.asarray(
 )
 _SLOT_LAYOUT = np.asarray(
     (
-        0,
         *(slot for _ in range(2) for slot in range(1, TEAM_SIZE + 1)),
         0,
         0,
@@ -698,10 +696,13 @@ def _write_events(
     events_num = out.events_num.numpy()
     events_side_ids = out.events_side_ids.numpy()
     events_slot_ids = out.events_slot_ids.numpy()
+    events_metadata = out.events_metadata.numpy()
     events_cat.fill(0)
     events_num.fill(0)
     events_side_ids.fill(0)
     events_slot_ids.fill(0)
+    events_metadata.fill(0)
+    events_metadata[:] = (len(untruncated_events), event_overflow)
     for event_idx, event in enumerate(events):
         side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
         target_side_id, target_slot_id = _event_target_location(battle, event, pokemon_to_slot)
@@ -722,7 +723,6 @@ def _write_events(
         events_num[event_idx] = (
             event.value,
             event_idx / float(EVENT_COUNT),
-            float(event_overflow),
         )
         events_side_ids[event_idx] = side_id
         events_slot_ids[event_idx] = slot_id
@@ -753,7 +753,7 @@ def _write_observation(
 
     pokemon_to_slot = {}
 
-    idx = 1
+    idx = 0
     for side, is_opponent, orig_idx_map in (
         (SideId.ALLY, False, ally_orig_idx),
         (SideId.OPPONENT, True, opponent_orig_idx),
@@ -859,6 +859,7 @@ def _validate_output(out: StructuredObservation) -> None:
         ),
         ("events_side_ids", out.events_side_ids, (EVENT_COUNT,), torch.long),
         ("events_slot_ids", out.events_slot_ids, (EVENT_COUNT,), torch.long),
+        ("events_metadata", out.events_metadata, (EVENT_METADATA_WIDTH,), torch.float32),
     )
     for name, tensor, shape, dtype in expected:
         if tensor.device.type != "cpu":

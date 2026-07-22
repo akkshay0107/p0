@@ -6,14 +6,21 @@ from typing import ClassVar
 
 import torch
 
+from p0.model.architecture_contract import (
+    OBSERVATION_ENTITY_COUNT,
+    OBSERVATION_SCHEMA_VERSION,
+    RAW_EVENT_COUNT,
+    SELF_TARGET_SENTINEL,
+)
+
+__all__ = ["OBSERVATION_SCHEMA_VERSION"]
+
 # every entity (Pokemon, global field, ally side, opponent side) is one
 # fused token; its categorical and numerical features live on the same row index.
-OBSERVATION_SCHEMA_VERSION = 3
-
 TEAM_SIZE = 6
 MOVE_SLOTS = 4
 MAX_EFFECTS = 12
-SEQUENCE_LENGTH = 1 + TEAM_SIZE * 2 + 3
+SEQUENCE_LENGTH = OBSERVATION_ENTITY_COUNT
 POKEMON_IDENTITY_WIDTH = 25
 CAT_IDX_STATUS = 17
 CAT_KNOWNNESS_START = 25
@@ -32,15 +39,15 @@ NUM_IDX_EFFECT_COUNT = NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
 NUM_IDX_EFFECT_OVERFLOW = NUM_IDX_EFFECT_COUNT + 1
 NUMERICAL_WIDTH = NUM_IDX_EFFECT_OVERFLOW + 1
 
-EVENT_COUNT = 48
+EVENT_COUNT = RAW_EVENT_COUNT
 EVENT_CATEGORICAL_WIDTH = 10
-EVENT_NUMERICAL_WIDTH = 3
+EVENT_NUMERICAL_WIDTH = 2
+EVENT_METADATA_WIDTH = 2
 EVENT_ORDER_VOCAB_SIZE = EVENT_COUNT + 1
 
-TOKEN_IDX_CLS = 0
-TOKEN_IDX_GLOBAL_FIELD = 13
-TOKEN_IDX_ALLY_SIDE = 14
-TOKEN_IDX_OPPONENT_SIDE = 15
+TOKEN_IDX_GLOBAL_FIELD = 12
+TOKEN_IDX_ALLY_SIDE = 13
+TOKEN_IDX_OPPONENT_SIDE = 14
 
 NUM_IDX_TEAM_PREVIEW = 2
 NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction (MoveRecord dynamic)
@@ -53,18 +60,17 @@ NUM_IDX_CAN_SWITCH_OUT = 54  # active allies only
 NUM_IDX_REVEALED = 55  # has appeared on the field this battle
 
 
-ALLY_POKE_TOKENS = (1, 2, 3, 4, 5, 6)
-OPPONENT_POKE_TOKENS = (7, 8, 9, 10, 11, 12)
+ALLY_POKE_TOKENS = (0, 1, 2, 3, 4, 5)
+OPPONENT_POKE_TOKENS = (6, 7, 8, 9, 10, 11)
 POKEMON_TOKENS = ALLY_POKE_TOKENS + OPPONENT_POKE_TOKENS
 OWNER_TOKENS = (TOKEN_IDX_GLOBAL_FIELD, TOKEN_IDX_ALLY_SIDE, TOKEN_IDX_OPPONENT_SIDE)
-TARGET_SEQ_INDICES = (2, 1, TOKEN_IDX_CLS, 7, 8)
+TARGET_SEQ_INDICES = (1, 0, SELF_TARGET_SENTINEL, 6, 7)
 
 
 class TokenType(IntEnum):
-    CLS = 0
-    POKEMON = 1
-    FIELD = 2
-    EVENT = 3
+    POKEMON = 0
+    FIELD = 1
+    EVENT = 2
 
 
 class SideId(IntEnum):
@@ -133,6 +139,7 @@ class StructuredObservation:
     events_num: torch.Tensor
     events_side_ids: torch.Tensor
     events_slot_ids: torch.Tensor
+    events_metadata: torch.Tensor
 
     _FIELD_NAMES: ClassVar[tuple[str, ...]] = (
         "token_type_ids",
@@ -144,6 +151,7 @@ class StructuredObservation:
         "events_num",
         "events_side_ids",
         "events_slot_ids",
+        "events_metadata",
     )
     _FIELD_SPECS: ClassVar[tuple[tuple[str, tuple[int, ...], torch.dtype], ...]] = (
         ("token_type_ids", (SEQUENCE_LENGTH,), torch.long),
@@ -155,6 +163,7 @@ class StructuredObservation:
         ("events_num", (EVENT_COUNT, EVENT_NUMERICAL_WIDTH), torch.float32),
         ("events_side_ids", (EVENT_COUNT,), torch.long),
         ("events_slot_ids", (EVENT_COUNT,), torch.long),
+        ("events_metadata", (EVENT_METADATA_WIDTH,), torch.float32),
     )
 
     @classmethod
@@ -174,6 +183,7 @@ class StructuredObservation:
             self.events_num,
             self.events_side_ids,
             self.events_slot_ids,
+            self.events_metadata,
         )
 
     def is_teampreview(self) -> torch.Tensor:
@@ -182,16 +192,24 @@ class StructuredObservation:
     def overflow_totals(self) -> tuple[int, int]:
         """Return effect and event overflow counts for telemetry and corpus audits."""
         effect_overflow = int(self.numerical[..., NUM_IDX_EFFECT_OVERFLOW].sum().item())
-        event_overflow = int(self.events_num[..., 2].amax().item())
+        event_overflow = int(self.events_metadata[..., 1].amax().item())
         return effect_overflow, event_overflow
 
     def validate_overflow_contract(self) -> None:
-        """Reject counts that imply silent effect truncation."""
+        """Reject counts that imply silent effect or event truncation."""
         counts = self.numerical[..., NUM_IDX_EFFECT_COUNT]
         overflow = self.numerical[..., NUM_IDX_EFFECT_OVERFLOW]
         expected = torch.clamp(counts - MAX_EFFECTS, min=0)
         if not torch.equal(overflow, expected):
             raise ValueError("Effect overflow does not match the number of dropped effects")
+        event_total = (self.events_cat[..., 0] != 0).sum(dim=-1)
+        declared_total = self.events_metadata[..., 0].to(event_total.dtype)
+        declared_overflow = self.events_metadata[..., 1].to(event_total.dtype)
+        expected_overflow = torch.clamp(declared_total - EVENT_COUNT, min=0)
+        if torch.any(declared_total < event_total) or not torch.equal(
+            declared_overflow, expected_overflow
+        ):
+            raise ValueError("Event metadata does not match the retained event records")
 
     def clone(self) -> StructuredObservation:
         return self._from_values([tensor.clone() for tensor in self.tensors()])
@@ -230,12 +248,21 @@ class StructuredObservation:
     def empty_batch(batch_size: int, pin_memory: bool = False) -> StructuredObservation:
         if type(batch_size) is not int or batch_size < 0:
             raise ValueError("batch_size must be a non-negative integer")
-        return StructuredObservation._from_values(
+        observation = StructuredObservation._from_values(
             [
                 torch.zeros((batch_size, *shape), dtype=dtype, pin_memory=pin_memory)
                 for _, shape, dtype in StructuredObservation._FIELD_SPECS
             ]
         )
+        observation.token_type_ids[:, TOKEN_IDX_GLOBAL_FIELD:] = TokenType.FIELD
+        observation.side_ids[:, :TEAM_SIZE] = SideId.ALLY
+        observation.side_ids[:, TEAM_SIZE : 2 * TEAM_SIZE] = SideId.OPPONENT
+        observation.side_ids[:, TOKEN_IDX_ALLY_SIDE] = SideId.ALLY
+        observation.side_ids[:, TOKEN_IDX_OPPONENT_SIDE] = SideId.OPPONENT
+        slots = torch.arange(1, TEAM_SIZE + 1, dtype=torch.long)
+        observation.slot_ids[:, :TEAM_SIZE] = slots
+        observation.slot_ids[:, TEAM_SIZE : 2 * TEAM_SIZE] = slots
+        return observation
 
     def validate(self, *, batch_rank: int | None = None) -> None:
         for (name, trailing_shape, dtype), tensor in zip(

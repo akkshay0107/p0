@@ -35,62 +35,61 @@ def dummy_obs():
     B = 2
 
     token_type_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
-    token_type_ids[:, 0] = TokenType.CLS
-    token_type_ids[:, 1:13] = TokenType.POKEMON
-    token_type_ids[:, 13:16] = TokenType.FIELD
+    token_type_ids[:, 0:12] = TokenType.POKEMON
+    token_type_ids[:, 12:15] = TokenType.FIELD
 
     side_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
-    side_ids[:, 1:7] = SideId.ALLY
-    side_ids[:, 7:13] = SideId.OPPONENT
-    side_ids[:, 13] = SideId.NONE
-    side_ids[:, 14] = SideId.ALLY
-    side_ids[:, 15] = SideId.OPPONENT
+    side_ids[:, 0:6] = SideId.ALLY
+    side_ids[:, 6:12] = SideId.OPPONENT
+    side_ids[:, 12] = SideId.NONE
+    side_ids[:, 13] = SideId.ALLY
+    side_ids[:, 14] = SideId.OPPONENT
 
     slot_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
     for i in range(6):
-        slot_ids[:, 1 + i] = i + 1
-        slot_ids[:, 7 + i] = i + 1
+        slot_ids[:, i] = i + 1
+        slot_ids[:, 6 + i] = i + 1
 
     # Populate categorical with random IDs respecting vocab limits
     categorical = torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long)
 
-    # Pokemon tokens (1-12)
+    # Pokemon tokens (0-11)
     # species (0): 1-34
-    categorical[:, 1:13, 0] = torch.randint(1, 35, (B, 12))
+    categorical[:, 0:12, 0] = torch.randint(1, 35, (B, 12))
     # ability (1): 1-23
-    categorical[:, 1:13, 1] = torch.randint(1, 24, (B, 12))
+    categorical[:, 0:12, 1] = torch.randint(1, 24, (B, 12))
     # item (2): 1-18
-    categorical[:, 1:13, 2] = torch.randint(1, 19, (B, 12))
+    categorical[:, 0:12, 2] = torch.randint(1, 19, (B, 12))
     # types (3,4): 1-18
-    categorical[:, 1:13, 3:5] = torch.randint(1, 19, (B, 12, 2))
+    categorical[:, 0:12, 3:5] = torch.randint(1, 19, (B, 12, 2))
     # moves (5-8): 1-69
-    categorical[:, 1:13, 5:9] = torch.randint(1, 70, (B, 12, 4))
+    categorical[:, 0:12, 5:9] = torch.randint(1, 70, (B, 12, 4))
     # move_types (9-12): 1-18
-    categorical[:, 1:13, 9:13] = torch.randint(1, 19, (B, 12, 4))
+    categorical[:, 0:12, 9:13] = torch.randint(1, 19, (B, 12, 4))
     # move_categories (13-16): 1-3
-    categorical[:, 1:13, 13:17] = torch.randint(1, 4, (B, 12, 4))
+    categorical[:, 0:12, 13:17] = torch.randint(1, 4, (B, 12, 4))
     # status (17): 1-6
-    categorical[:, 1:13, 17] = torch.randint(1, 7, (B, 12))
+    categorical[:, 0:12, 17] = torch.randint(1, 7, (B, 12))
     # status counter kind: 0-4
-    categorical[:, 1:13, CAT_IDX_STATUS_COUNTER_KIND] = torch.randint(0, 5, (B, 12))
-    categorical[:, 1:13, CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH] = (
+    categorical[:, 0:12, CAT_IDX_STATUS_COUNTER_KIND] = torch.randint(0, 5, (B, 12))
+    categorical[:, 0:12, CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH] = (
         torch.randint(1, 5, (B, 12, CAT_KNOWNNESS_WIDTH))
     )
 
     # Numerical features
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
 
-    for token_idx in range(1, 16):
+    for token_idx in range(15):
         categorical[
             :, token_idx, CAT_EFFECT_START : CAT_EFFECT_START + EFFECT_CATEGORICAL_WIDTH
         ] = torch.tensor((1, 1, 1))
         numerical[:, token_idx, NUM_EFFECT_START : NUM_EFFECT_START + EFFECT_NUMERICAL_WIDTH] = 1.0
 
     # Populate valid orig_idxs to prevent random switch actions from crashing
-    for i, idx in enumerate(range(1, 7)):
+    for i, idx in enumerate(range(0, 6)):
         numerical[:, idx, 26] = (i + 1) / 6.0
 
-    numerical[:, 13, 2] = 1.0
+    numerical[:, 12, 2] = 1.0
 
     events_cat = torch.zeros((B, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), dtype=torch.long)
     events_cat[..., 0] = torch.randint(1, 19, (B, EVENT_COUNT))
@@ -118,13 +117,14 @@ def dummy_obs():
         events_num=events_num,
         events_side_ids=events_side_ids,
         events_slot_ids=events_slot_ids,
+        events_metadata=torch.zeros((B, 2)),
     )
 
 
 def test_gradient_flow(dummy_obs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # smaller model for faster testing
-    policy = build_policy(ModelConfig(64, 2, 1, 8, 256), default_runtime_resources()).to(device)
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources()).to(device)
     policy.train()
 
     obs = dummy_obs.to(device)
@@ -132,7 +132,7 @@ def test_gradient_flow(dummy_obs):
     # allow all actions for now
     action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.uint8).to(device)
 
-    out = policy.act_obs(obs, action_mask, policy.initial_state(2))
+    out = policy.act_obs(obs, action_mask, *policy.empty_memory(2))
     # random loss fn involving both value and policy paths
     loss = out.value.mean() - out.log_probs.mean()
 
@@ -145,6 +145,7 @@ def test_gradient_flow(dummy_obs):
 
     # not all used every turn
     conditional_params = [
+        "series.",  # this single-step test supplies masked Game 1 memory slots
         "actor.pass_emb",
         "actor.switch_meta_emb",
         "actor.move_meta_emb",
@@ -154,7 +155,6 @@ def test_gradient_flow(dummy_obs):
         "actor.target_self_multi_emb",
         "actor.move_proj",
         "actor.tp_meta_emb",
-        "actor.reducer.hg_gate",  # since test only on a single step
         "actor.q_switch_proj1",
         "actor.q_pass_proj1",
     ]
@@ -235,7 +235,7 @@ def test_gradient_flow(dummy_obs):
 
 def test_ppo_warmup(dummy_obs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    policy = build_policy(ModelConfig(64, 2, 1, 8, 256), default_runtime_resources()).to(device)
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources()).to(device)
     policy.train()
 
     episode = TrajectoryBatch(

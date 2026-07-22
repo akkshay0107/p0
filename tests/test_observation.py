@@ -768,7 +768,7 @@ def test_event_order_recompacts():
     # positional ids stay dense in [1, EVENT_COUNT]; the order scalar stays in [0, 1)
     assert obs.events_cat[:, 4].tolist() == list(range(1, EVENT_COUNT + 1))
     assert obs.events_num[:, 1].max().item() < 1.0
-    assert obs.events_num[:, 2].max().item() == float(overflow)
+    assert obs.events_metadata[1].item() == float(overflow)
 
 
 def test_from_battle_into_overwrites_and_validates_output_buffer():
@@ -829,8 +829,8 @@ def test_from_battle_into_overwrites_and_validates_output_buffer():
     assert expected.events_slot_ids is not None and torch.equal(
         out.events_slot_ids, expected.events_slot_ids
     )
-    assert torch.count_nonzero(out.categorical[0]) == 0
-    assert torch.count_nonzero(out.numerical[0]) == 0
+    assert not torch.any(out.categorical == 99)
+    assert not torch.any(out.numerical == 99)
     battle = make_real_battle()
     invalid = StructuredObservation.empty_batch(1)[0]
     invalid.numerical = invalid.numerical.to(torch.float64)
@@ -888,7 +888,7 @@ def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
     mask = env.get_action_mask(battle)
 
     assert result is out1
-    assert result.token_type_ids[0] == TokenType.CLS
+    assert result.token_type_ids[0] == TokenType.POKEMON
     assert len(mask) == FORMAT.action_size * 2
     assert decision_builds == 1
 
@@ -980,12 +980,12 @@ def test_concurrent_universal_effect_stress_state():
 
     obs = from_battle(battle, tokenizer)
 
-    assert obs.numerical[1, NUM_IDX_EFFECT_COUNT] == 9
-    assert obs.numerical[14, NUM_IDX_EFFECT_COUNT] == 7
-    assert obs.numerical[13, NUM_IDX_EFFECT_COUNT] == 6
+    assert obs.numerical[0, NUM_IDX_EFFECT_COUNT] == 9
+    assert obs.numerical[13, NUM_IDX_EFFECT_COUNT] == 7
+    assert obs.numerical[12, NUM_IDX_EFFECT_COUNT] == 6
     assert obs.numerical[:, NUM_IDX_EFFECT_OVERFLOW].sum() == 0
-    pokemon_effects = obs.categorical[1, CAT_EFFECT_START::EFFECT_CATEGORICAL_WIDTH]
+    pokemon_effects = obs.categorical[0, CAT_EFFECT_START::EFFECT_CATEGORICAL_WIDTH]
     assert torch.count_nonzero(pokemon_effects) == 9
-    namespaces = obs.categorical[13, CAT_EFFECT_START + 2 :: EFFECT_CATEGORICAL_WIDTH]
+    namespaces = obs.categorical[12, CAT_EFFECT_START + 2 :: EFFECT_CATEGORICAL_WIDTH]
     assert EffectNamespace.FIELD in namespaces
     assert EffectNamespace.WEATHER in namespaces

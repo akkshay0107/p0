@@ -6,6 +6,7 @@ import torch.nn.init as init
 
 from p0.battle.events import EVENT_TYPE_COUNT, EventTypeId
 from p0.format_config import FORMAT
+from p0.model.architecture_contract import EVENT_RAW_WIDTH, POOLED_EVENT_COUNT
 from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
@@ -16,6 +17,7 @@ from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
     EFFECT_NUMERICAL_WIDTH,
+    EVENT_METADATA_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     EVENT_ORDER_VOCAB_SIZE,
     MAX_EFFECTS,
@@ -38,13 +40,12 @@ from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 ACT_SIZE = FORMAT.action_size
 NUM_COMPONENTS = 14
-NUM_TOKEN_TYPES = 4
+NUM_TOKEN_TYPES = 3
 NUM_SIDES = 3
 NUM_SLOTS = 7
 
-# 0 CLS
-# 1-12 pokemon tokens (one fused token per Pokemon)
-# 13 Global-field, 14 Ally-side, 15 Opponent-side (one fused token per owner)
+# 0-11 pokemon tokens (one fused token per Pokemon)
+# 12 Global-field, 13 Ally-side, 14 Opponent-side (one fused token per owner)
 _POKE_POS = POKEMON_TOKENS
 _OWNER_POS = OWNER_TOKENS
 
@@ -244,7 +245,7 @@ class FusedTokenEncoder(nn.Module):
         super().__init__()
         self.resources = resources
         self.d_model = d_model
-        d_raw = 128  # lower dim for reduced memory
+        d_raw = EVENT_RAW_WIDTH
 
         sizes = _load_vocab_sizes(self.resources)
         self.species_emb = nn.Embedding(sizes["species"], d_raw)
@@ -340,20 +341,38 @@ class FusedTokenEncoder(nn.Module):
         )
         self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
 
-        self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_model)
-        self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_model)
-        self.event_flag_emb = nn.Embedding(8, d_model)
-        self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_model)
-        # reuse the state path's namespace codes so both paths share geometry
-        self.event_namespace_proj = nn.Linear(16, d_model, bias=False)
+        # Event records stay in d_raw until the eight learned pooling queries
+        # emit full-width reducer tokens.
+        self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_raw)
+        self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_raw)
+        self.event_flag_emb = nn.Embedding(8, d_raw)
+        self.event_side_emb = nn.Embedding(NUM_SIDES, d_raw)
+        self.event_slot_emb = nn.Embedding(NUM_SLOTS, d_raw)
+        self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_raw)
+        self.event_namespace_proj = nn.Linear(16, d_raw, bias=False)
         # a learned role transform on the target endpoint keeps the shared
         # side/slot tables (attention join to the owner token) while breaking
         # the actor/target swap symmetry of a purely additive tag sum
-        self.target_role_proj = nn.Linear(d_model, d_model, bias=False)
+        self.target_role_proj = nn.Linear(d_raw, d_raw, bias=False)
         namespace_by_type = torch.zeros(EVENT_TYPE_COUNT, dtype=torch.long)
         for event_type, namespace in _EVENT_EFFECT_NAMESPACE.items():
             namespace_by_type[event_type] = namespace
         self.register_buffer("_event_effect_namespace", namespace_by_type, persistent=False)
+
+        if d_raw % nhead:
+            raise ValueError(f"Event width {d_raw} must be divisible by nhead {nhead}")
+        self.event_encoder = SwiGLUTransformerEncoder(
+            d_model=d_raw,
+            nhead=nhead,
+            dim_feedforward=max(64, dim_feedforward // 8),
+            num_layers=1,
+        )
+        self.event_pool_queries = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
+        self.event_key_proj = nn.Linear(d_raw, d_model)
+        self.event_value_proj = nn.Linear(d_raw, d_model)
+        self.event_pool_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.event_metadata_proj = nn.Linear(EVENT_METADATA_WIDTH, d_model)
+        self.empty_event_tokens = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
 
         # cache fixed sequence-position indices so advanced indexing uses pre-allocated
         # device tensors rather than constructing a new index tensor on every forward pass.
@@ -374,6 +393,8 @@ class FusedTokenEncoder(nn.Module):
                 init.normal_(module.weight, std=emb_gain)
         init.normal_(self.mon_fusion_token, std=emb_gain)
         init.normal_(self.action_mask_token, std=emb_gain)
+        init.normal_(self.event_pool_queries, std=emb_gain)
+        init.normal_(self.empty_event_tokens, std=emb_gain)
 
     def _embed_pokemon_components(
         self, categorical: torch.Tensor, numerical: torch.Tensor
@@ -463,8 +484,8 @@ class FusedTokenEncoder(nn.Module):
         )
         components = components + self.component_emb(self._component_ids)
 
-        # input from boolean masking is always (N, C), so components is (N, NUM_COMPONENTS, d_model)
-        # prepend the fusion token (cls) and run through the mon_fusion transformer
+        # The internal fusion query remains the Pokemon super-token. It is not
+        # an observation-level row and is therefore unaffected by CLS removal.
         N = components.shape[0]
         fusion_token = self.mon_fusion_token.expand(N, 1, -1)
         fused = self.mon_fusion(torch.cat([fusion_token, components], dim=1))
@@ -497,6 +518,64 @@ class FusedTokenEncoder(nn.Module):
             dim=-1,
         )
         return self.typed_effect_set(features, mask=effect_num[..., 0] > 0.5)
+
+    def _encode_events(self, obs: StructuredObservation, device: torch.device) -> torch.Tensor:
+        events_cat = obs.events_cat.long().to(device)
+        events_num = obs.events_num.float().to(device)
+        events_side_ids = obs.events_side_ids.long().to(device)
+        events_slot_ids = obs.events_slot_ids.long().to(device)
+        event_metadata = obs.events_metadata.float().to(device)
+
+        event_types = events_cat[..., 0]
+        event_feats = torch.cat(
+            [
+                self.move_emb(events_cat[..., 1]),
+                self.item_emb(events_cat[..., 2]),
+                self.status_emb(events_cat[..., 3]),
+                self.effect_emb(events_cat[..., 5]),
+                self.ability_emb(events_cat[..., 6]),
+                events_num,
+            ],
+            dim=-1,
+        )
+        what = (
+            self.event_type_emb(event_types)
+            + self.event_namespace_proj(
+                self.effect_namespace_emb(self._event_effect_namespace[event_types])
+            )
+            + self.event_flag_emb(events_cat[..., 7])
+        )
+        actor = self.event_side_emb(events_side_ids) + self.event_slot_emb(events_slot_ids)
+        target = self.target_role_proj(
+            self.event_side_emb(events_cat[..., 8]) + self.event_slot_emb(events_cat[..., 9])
+        )
+        when = self.order_pos_emb(events_cat[..., 4])
+        raw = self.event_proj(event_feats) + what + actor + target + when
+        event_mask = events_cat[..., 0] != 0
+        raw = raw.masked_fill(~event_mask.unsqueeze(-1), 0.0)
+
+        # Fully masked key sets are undefined for attention. An empty window
+        # gets one deterministic computational anchor and is replaced by the
+        # learned empty output after pooling.
+        has_events = event_mask.any(dim=-1)
+        padding = (~event_mask).clone()
+        padding[~has_events, 0] = False
+        contextual = self.event_encoder(raw, src_key_padding_mask=padding)
+
+        queries = self.event_pool_queries.expand(raw.size(0), -1, -1)
+        pooled, _ = self.event_pool_attn(
+            queries,
+            self.event_key_proj(contextual),
+            self.event_value_proj(contextual),
+            key_padding_mask=padding,
+            need_weights=False,
+        )
+        pooled = pooled + self.event_metadata_proj(event_metadata).unsqueeze(1)
+        return torch.where(
+            has_events[:, None, None],
+            pooled,
+            self.empty_event_tokens.expand(raw.size(0), -1, -1).to(pooled.dtype),
+        )
 
     def _append_action_mask_token(
         self,
@@ -588,55 +667,8 @@ class FusedTokenEncoder(nn.Module):
         )
         out_tokens = self._append_action_mask_token(out_tokens, action_mask)
 
-        events_cat = obs.events_cat.long().to(device)
-        events_num = obs.events_num.float().to(device)
-        events_side_ids = obs.events_side_ids.long().to(device)
-        events_slot_ids = obs.events_slot_ids.long().to(device)
-
-        event_feats = torch.cat(
-            [
-                self.move_emb(events_cat[..., 1]),
-                self.item_emb(events_cat[..., 2]),
-                self.status_emb(events_cat[..., 3]),
-                self.effect_emb(events_cat[..., 5]),
-                self.ability_emb(events_cat[..., 6]),
-                events_num,
-            ],
-            dim=-1,
-        )
-
-        # what happened: event type, the effect-vocab namespace it implies,
-        # and its modifier flags
-        event_types = events_cat[..., 0]
-        what = (
-            self.event_type_emb(event_types)
-            + self.event_namespace_proj(
-                self.effect_namespace_emb(self._event_effect_namespace[event_types])
-            )
-            + self.event_flag_emb(events_cat[..., 7])
-        )
-        # the actor's coordinates join directly to its owner Pokemon token;
-        # the target's pass through a role transform so crossed actor/target
-        # pairs stay distinguishable
-        actor = self.side_emb(events_side_ids) + self.slot_emb(events_slot_ids)
-        target = self.target_role_proj(
-            self.side_emb(events_cat[..., 8]) + self.slot_emb(events_cat[..., 9])
-        )
-        # when: position within this decision's event window
-        when = self.order_pos_emb(events_cat[..., 4])
-
-        event_tokens = (
-            self.event_proj(event_feats)
-            + what
-            + actor
-            + target
-            + when
-            + self.token_type_emb.weight[int(TokenType.EVENT)]
-        )
-
-        # zero out embeddings for padded event slots to prevent slot/pos/side embedding bleeding
-        event_mask = (events_cat[..., 0] != 0).to(event_tokens.dtype).unsqueeze(-1)
-        event_tokens = event_tokens * event_mask
+        event_tokens = self._encode_events(obs, device)
+        event_tokens = event_tokens + self.token_type_emb.weight[int(TokenType.EVENT)]
 
         out_tokens = torch.cat([out_tokens, event_tokens.to(out_tokens.dtype)], dim=1)
         return out_tokens, aux_moves

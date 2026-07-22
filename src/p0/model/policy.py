@@ -30,24 +30,26 @@ from p0.battle.actions import (
 from p0.battle.actions import (
     PASS_ACTION as PASS_START,
 )
-from p0.model.cls_reducer import CLSReducer
+from p0.model.architecture_contract import (
+    HISTORY_WINDOW,
+    SELF_TARGET_SENTINEL,
+    SERIES_SLOTS,
+)
+from p0.model.cls_reducer import MemoryReducer
 from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
 from p0.model.resources import RuntimeResources
 from p0.model.series_context import (
     SeriesContextEncoder,
     SeriesFeatures,
-    SeriesStateConditioner,
 )
 from p0.model.structured_observation import (
     ALLY_POKE_TOKENS,
-    EVENT_COUNT,
     NUM_IDX_ORIG_IDX_RATIO,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TARGET_SEQ_INDICES,
     TEAM_SIZE,
-    TOKEN_IDX_CLS,
     StructuredObservation,
     is_teampreview,
 )
@@ -77,7 +79,7 @@ class ActOutput(NamedTuple):
     actions: Tensor
     log_probs: Tensor
     value: Tensor
-    state: Tensor
+    history_token: Tensor
 
 
 class EvalOutput(NamedTuple):
@@ -85,19 +87,17 @@ class EvalOutput(NamedTuple):
     entropy: Tensor
     norm_entropy: Tensor
     value: Tensor
-    state: Tensor
+    history_token: Tensor
     logits: Tensor
 
 
 class CandidateScorer(Protocol):
     """Pinned seam for behaviour-cloning candidate marginalization.
 
-    The BC workstream implements this on ActorPolicy; the series-context
-    workstream conditions initial_state independently. The contract: run the
-    recurrent reducer once per observation, expand only the action-scoring
+    The contract: run the stateless reducer once per observation, expand only the action-scoring
     stage across each decision's candidate joint actions, apply the
     sequential second-action mask per candidate first action, and return
-    joint log-probabilities without advancing recurrent state more than once
+    joint log-probabilities after one fixed-window reducer pass
     per observation.
 
     Candidates use the shard ragged encoding: candidate_offsets has length
@@ -111,14 +111,18 @@ class CandidateScorer(Protocol):
         self,
         enc: EncodedObs,
         action_mask: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
         candidate_values: Tensor,
         candidate_offsets: Tensor,
     ) -> Tensor: ...
 
 
 class ValueHead(nn.Module):
-    """Feedforward critic head over the recurrent CLS summary."""
+    """Feedforward critic head over the post-memory summary."""
 
     def __init__(
         self,
@@ -147,7 +151,7 @@ class ValueHead(nn.Module):
 
 
 class ActorPolicy(nn.Module):
-    """Stateful actor policy path using Pointer Head."""
+    """Stateless actor policy path using the fixed memory reducer."""
 
     target_entity_indices: Tensor
     ally_poke_entities: Tensor
@@ -159,16 +163,10 @@ class ActorPolicy(nn.Module):
         self,
         d_model: int,
         nhead: int,
-        prelude_layers: int,
+        nlayer: int,
         act_size: int,
         side_emb: nn.Embedding,
-        seq_len: int = SEQUENCE_LENGTH,
-        history_tokens: int = 8,
         dim_feedforward: int = 2048,
-        core_repeats: int = 1,
-        coda_layers: int = 1,
-        core_weights_tied: bool = False,
-        pass_embedding_enabled: bool = True,
     ):
         super().__init__()
         self.act_size = act_size
@@ -176,17 +174,11 @@ class ActorPolicy(nn.Module):
         self.d_model = d_model
         self.d_k = d_model // 4
 
-        self.reducer = CLSReducer(
-            seq_len=seq_len,
+        self.reducer = MemoryReducer(
             d_model=d_model,
             nhead=nhead,
-            prelude_layers=prelude_layers,
-            n_hg=history_tokens,
+            nlayer=nlayer,
             dim_feedforward=dim_feedforward,
-            core_repeats=core_repeats,
-            coda_layers=coda_layers,
-            core_weights_tied=core_weights_tied,
-            use_history=True,
         )
 
         self.w_k_entity = nn.Linear(d_model, self.d_k)
@@ -205,26 +197,22 @@ class ActorPolicy(nn.Module):
         )
 
         self.mega_emb = nn.Parameter(torch.empty(self.d_k))
-        self.pass_embedding_enabled = pass_embedding_enabled
-        if pass_embedding_enabled:
-            self.pass_embedding = nn.Parameter(torch.empty(self.d_k))
-        else:
-            self.register_buffer("pass_embedding", torch.zeros(self.d_k))
+        self.pass_key = nn.Parameter(torch.empty(self.d_k))
         self.struggle_key = nn.Parameter(torch.empty(self.d_k))
         self.target_self_key = nn.Parameter(torch.empty(self.d_k))
         self.pointer_temp = nn.Parameter(torch.tensor(0.01))
 
-        # entity i is the single fused pokemon token at sequence position 1 + i;
-        # the learned self key is appended after the N_KEY_ENTITIES real entities
+        # Entity keys are emitted as the first twelve outputs of the reducer;
+        # the learned self key is appended after the real target entities.
         target_entities = [
-            N_KEY_ENTITIES if t == TOKEN_IDX_CLS else t - 1 for t in TARGET_SEQ_INDICES
+            N_KEY_ENTITIES if t == SELF_TARGET_SENTINEL else t for t in TARGET_SEQ_INDICES
         ]
         self.register_buffer(
             "target_entity_indices", torch.tensor(target_entities, dtype=torch.long)
         )
         self.register_buffer(
             "ally_poke_entities",
-            torch.tensor([t - 1 for t in ALLY_POKE_TOKENS], dtype=torch.long),
+            torch.tensor(ALLY_POKE_TOKENS, dtype=torch.long),
         )
         self.register_buffer("ally_token_pos", torch.tensor(ALLY_POKE_TOKENS, dtype=torch.long))
         self.register_buffer("all_a", torch.arange(TP_END, dtype=torch.long))
@@ -234,8 +222,7 @@ class ActorPolicy(nn.Module):
     @torch.no_grad()
     def _init_weights(self):
         init.normal_(self.mega_emb, std=0.02)
-        if self.pass_embedding_enabled:
-            init.normal_(self.pass_embedding, std=0.02)
+        init.normal_(self.pass_key, std=0.02)
         init.normal_(self.struggle_key, std=0.02)
         init.normal_(self.target_self_key, std=0.02)
         for module in self.modules():
@@ -280,14 +267,10 @@ class ActorPolicy(nn.Module):
         logits = torch.zeros((B, self.act_size + 1), device=device)
         action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
-        logits[:, PASS_START] = (
-            (q_pass * self.pass_embedding).sum(dim=-1) / math.sqrt(self.d_k)
-        ).to(
+        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)).to(
             logits.dtype
         )
-        action_keys[:, PASS_START] = self.pass_embedding.unsqueeze(0).expand(B, -1).to(
-            action_keys.dtype
-        )
+        action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
 
         k_ally = k_entity_extended[:, self.ally_poke_entities, :]
         switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / math.sqrt(self.d_k)
@@ -374,12 +357,24 @@ class ActorPolicy(nn.Module):
         self,
         enc: EncodedObs,
         action_mask: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
         *,
         top_p: float = 1.0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
-        k_entity_extended = self._compute_keys(tokens_ctx)
+        reduced = self.reducer(
+            enc.tokens,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
+        z = reduced.cls
+        k_entity_extended = self._compute_keys(reduced.pokemon)
 
         logits1, keys1 = self._compute_pointer_logits(
             z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
@@ -407,17 +402,29 @@ class ActorPolicy(nn.Module):
         a2 = dist2.sample()
         log_probs = dist1.log_prob(a1) + dist2.log_prob(a2)
         actions = torch.stack([a1, a2], dim=-1)
-        return actions, log_probs, next_state, z
+        return actions, log_probs, z, reduced.local_history_token
 
     def score(
         self,
         enc: EncodedObs,
         action_mask: Tensor,
         actions: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
-        k_entity_extended = self._compute_keys(tokens_ctx)
+        reduced = self.reducer(
+            enc.tokens,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
+        z = reduced.cls
+        k_entity_extended = self._compute_keys(reduced.pokemon)
 
         logits1, keys1 = self._compute_pointer_logits(
             z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
@@ -439,31 +446,21 @@ class ActorPolicy(nn.Module):
         dist1 = Categorical(logits=logits[:, 0])
         dist2 = Categorical(logits=logits[:, 1])
         log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
-        return logits, log_probs, next_state, z
+        return logits, log_probs, z, reduced.local_history_token
 
     def score_joint_candidates(
         self,
         enc: EncodedObs,
         action_mask: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
         candidate_values: Tensor,
         candidate_offsets: Tensor,
     ) -> Tensor:
-        """Score candidates while preserving the pinned scorer return type."""
-        scores, _ = self.score_joint_candidates_with_state(
-            enc, action_mask, state, candidate_values, candidate_offsets
-        )
-        return scores
-
-    def score_joint_candidates_with_state(
-        self,
-        enc: EncodedObs,
-        action_mask: Tensor,
-        state: Tensor,
-        candidate_values: Tensor,
-        candidate_offsets: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """Score ragged joint candidates after one recurrent reducer pass."""
+        """Score ragged candidates after one stateless reducer pass."""
         batch_size = enc.tokens.size(0)
         if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
             raise ValueError("candidate_values must have shape (candidates, 2)")
@@ -473,10 +470,8 @@ class ActorPolicy(nn.Module):
             raise ValueError("candidate_offsets must have one boundary per observation")
         if action_mask.shape != (batch_size, 2, self.act_size):
             raise ValueError("action_mask shape does not match encoded observations")
-        if state.size(0) != batch_size:
-            raise ValueError("state batch size does not match encoded observations")
-        if state.device != enc.tokens.device:
-            raise ValueError("state and encoded observations must share a device")
+        if series_tokens.size(0) != batch_size or history_tokens.size(0) != batch_size:
+            raise ValueError("memory inputs must match encoded observation batch size")
         if candidate_values.device != enc.tokens.device or action_mask.device != enc.tokens.device:
             raise ValueError("candidate tensors and action_mask must share the encoded device")
         offsets = candidate_offsets.to(device=enc.tokens.device, dtype=torch.long)
@@ -484,12 +479,20 @@ class ActorPolicy(nn.Module):
             raise ValueError("candidate_offsets must start at zero and end at candidate count")
         if torch.any(offsets[1:] < offsets[:-1]):
             raise ValueError("candidate_offsets must be nondecreasing")
-        z, next_state, tokens_ctx = self.reducer(enc.tokens, state, None)
+        reduced = self.reducer(
+            enc.tokens,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
         if candidate_values.numel() == 0:
-            return candidate_values.new_empty((0,), dtype=enc.tokens.dtype), next_state
+            return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
         if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
             raise ValueError("candidate action ids are outside the action contract")
-        k_entity_extended = self._compute_keys(tokens_ctx)
+        z = reduced.cls
+        k_entity_extended = self._compute_keys(reduced.pokemon)
         logits1, keys1 = self._compute_pointer_logits(
             z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
         )
@@ -521,7 +524,7 @@ class ActorPolicy(nn.Module):
         log_prob_second = F.log_softmax(candidate_logits[:, 1], dim=-1).gather(
             1, second_actions.unsqueeze(1)
         )
-        return (log_prob_first + log_prob_second).squeeze(1), next_state
+        return (log_prob_first + log_prob_second).squeeze(1)
 
     def _apply_sequential_masks(
         self,
@@ -570,14 +573,7 @@ class ActorPolicy(nn.Module):
 
 
 class PolicyNet(nn.Module):
-    """
-    Refactored Pokemon Policy Network with explicit Actor/Critic split.
-    Name kept the same to be consistent with training loop. Might be fixed later.
-
-    Both heads read the stateful (recurrent) reducer output: the actor builds
-    pointer logits from it, the critic is a feedforward head on its CLS.
-    Both share a common FusedTokenEncoder for efficiency.
-    """
+    """Policy network with explicit immutable memory inputs."""
 
     def __init__(
         self,
@@ -602,58 +598,51 @@ class PolicyNet(nn.Module):
         self.actor = ActorPolicy(
             config.d_model,
             config.nhead,
-            config.prelude_layers,
+            config.reducer_layers,
             ACT_SIZE,
             self.encoder.side_emb,
-            self.seq_len + 1 + EVENT_COUNT,  # +1 for action mask embedding, rest for event tokens
-            history_tokens=config.history_tokens,
             dim_feedforward=config.dim_feedforward,
-            core_repeats=config.core_repeats,
-            coda_layers=config.coda_layers,
-            core_weights_tied=config.core_weights_tied,
-            pass_embedding_enabled=config.pass_embedding_enabled,
         )
 
         # value head
         self.critic = ValueHead(config.d_model)
 
-        # only construct the series modules when enabled so the disabled
-        # state_dict layout stays identical and strict checkpoint loading of
-        # pre-series artifacts keeps working
-        if config.series_context_enabled:
-            self.series = SeriesContextEncoder(
-                config.d_model,
-                config.nhead,
-                config.dim_feedforward,
-                config.series_tokens,
-                self.encoder.species_emb,
-                self.encoder.move_emb,
-                self.encoder.item_emb,
-                self.encoder.ability_emb,
-            )
-            self.series_conditioner = SeriesStateConditioner(
-                config.d_model, config.nhead, config.history_tokens
-            )
+        self.series = SeriesContextEncoder(
+            config.d_model,
+            config.nhead,
+            config.dim_feedforward,
+            self.encoder.species_emb,
+            self.encoder.move_emb,
+            self.encoder.item_emb,
+            self.encoder.ability_emb,
+        )
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def initial_state(self, batch_size: int) -> Tensor:
-        return self.actor.reducer.hg_init.expand(batch_size, -1, -1).to(self.device)
+    def encode_series(self, features: SeriesFeatures) -> Tensor:
+        """Encode completed-game summaries into the fixed two series slots."""
+        return self.series(features)
 
-    def initial_series_state(self, features: SeriesFeatures) -> Tensor:
-        """Initial recurrent state conditioned on prior-game summaries.
+    def local_history_tokens(self, encoded: EncodedObs) -> Tensor:
+        """Generate causal per-decision tokens without memory interaction."""
+        return self.actor.reducer.local_summary(encoded.tokens)
 
-        The context is re-encoded from raw summaries inside the current game's
-        graph, so gradients reach the series encoder but never any earlier
-        game's execution tensors. Zero-game features yield the learned Game 1
-        prior; callers that want plain hg_init use initial_state instead.
-        """
-        if not self.config.series_context_enabled:
-            raise ValueError("initial_series_state requires series_context_enabled")
-        context = self.series(features)
-        return self.series_conditioner(self.actor.reducer.hg_init.to(self.device), context)
+    def empty_memory(self, batch_size: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Create explicit masked memory inputs for an independent Game 1."""
+        if type(batch_size) is not int or batch_size < 0:
+            raise ValueError("batch_size must be a non-negative integer")
+        device = self.device
+        dtype = next(self.parameters()).dtype
+        series = torch.zeros((batch_size, SERIES_SLOTS, self.d_model), device=device, dtype=dtype)
+        series_mask = torch.zeros((batch_size, SERIES_SLOTS), device=device, dtype=torch.bool)
+        history = torch.zeros(
+            (batch_size, HISTORY_WINDOW, self.d_model), device=device, dtype=dtype
+        )
+        history_mask = torch.zeros((batch_size, HISTORY_WINDOW), device=device, dtype=torch.bool)
+        history_age_ids = torch.zeros((batch_size, HISTORY_WINDOW), device=device, dtype=torch.long)
+        return series, series_mask, history, history_mask, history_age_ids
 
     def encode(
         self,
@@ -669,7 +658,11 @@ class PolicyNet(nn.Module):
         self,
         enc: EncodedObs,
         action_mask: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
         *,
         top_p: float = 1.0,
     ) -> ActOutput:
@@ -681,19 +674,41 @@ class PolicyNet(nn.Module):
         # evaluation/play only.
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
-        actions, log_probs, next_state, z = self.actor.sample(enc, action_mask, state, top_p=top_p)
-        return ActOutput(actions, log_probs, self.critic(z), next_state)
+        actions, log_probs, z, local_history = self.actor.sample(
+            enc,
+            action_mask,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+            top_p=top_p,
+        )
+        return ActOutput(actions, log_probs, self.critic(z), local_history)
 
     def evaluate(
         self,
         enc: EncodedObs,
         action_mask: Tensor,
         actions: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
         *,
         critic_only: bool = False,
     ) -> EvalOutput:
-        logits, log_probs, next_state, z = self.actor.score(enc, action_mask, actions, state)
+        logits, log_probs, z, local_history = self.actor.score(
+            enc,
+            action_mask,
+            actions,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
         if critic_only:
             z = z.detach()
         value = self.critic(z)
@@ -712,24 +727,41 @@ class PolicyNet(nn.Module):
             torch.zeros_like(entropy),
         )
 
-        return EvalOutput(log_probs, entropy, norm_entropy, value, next_state, logits)
+        return EvalOutput(log_probs, entropy, norm_entropy, value, local_history, logits)
 
     def act_obs(
         self,
         obs: StructuredObservation,
         action_mask: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
         *,
         top_p: float = 1.0,
     ) -> ActOutput:
-        return self.act(self.encode(obs, action_mask), action_mask, state, top_p=top_p)
+        return self.act(
+            self.encode(obs, action_mask),
+            action_mask,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+            top_p=top_p,
+        )
 
     def evaluate_obs(
         self,
         obs: StructuredObservation,
         action_mask: Tensor,
         actions: Tensor,
-        state: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
         *,
         critic_only: bool = False,
     ) -> EvalOutput:
@@ -737,6 +769,10 @@ class PolicyNet(nn.Module):
             self.encode(obs, action_mask),
             action_mask,
             actions,
-            state,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
             critic_only=critic_only,
         )

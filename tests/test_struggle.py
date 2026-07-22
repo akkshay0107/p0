@@ -63,7 +63,7 @@ def test_struggle_env_roundtrip():
 
 def test_struggle_policy_logits():
     B = 2
-    policy = build_policy(ModelConfig(64, 2, 1, 8, 256), default_runtime_resources())
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
 
     obs = StructuredObservation.empty_batch(B)
     obs.numerical[:, :, -1] = 0.5  # fake ratios so orig_ids aren't all 0
@@ -72,11 +72,12 @@ def test_struggle_policy_logits():
     action_mask[:, 0, 48] = True
     action_mask[:, 1, 47] = True
 
-    state = policy.initial_state(B)
     enc = policy.encode(obs, action_mask)
+    memory = policy.empty_memory(B)
 
-    z, next_state, tokens_ctx = policy.actor.reducer(enc.tokens, state, None)
-    k_entity_extended = policy.actor._compute_keys(tokens_ctx)
+    reduced = policy.actor.reducer(enc.tokens, *memory)
+    z = reduced.cls
+    k_entity_extended = policy.actor._compute_keys(reduced.pokemon)
     logits, keys = policy.actor._compute_pointer_logits(
         z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
     )
@@ -88,7 +89,7 @@ def test_struggle_policy_logits():
     )
 
     actions = torch.tensor([[48, 47], [48, 47]])
-    out = policy.evaluate(enc, action_mask, actions, state)
+    out = policy.evaluate(enc, action_mask, actions, *memory)
 
     assert torch.isfinite(out.logits[:, 0, 48]).all()
 
