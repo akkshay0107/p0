@@ -32,7 +32,7 @@ def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path):
 
     restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
     assert restored.d_model == original.d_model
-    assert len(restored.actor.reducer.core_layers) == 1
+    assert len(restored.actor.reducer.encoder.layers) == 1
     assert DEFAULT_POLICY_STORE.load_training_state(path, restored) == 7
     artifact = torch.load(path, weights_only=False)
     assert artifact["artifact_schema"] == CHECKPOINT_SCHEMA
@@ -90,17 +90,13 @@ def test_series_policy_checkpoint_round_trip(tmp_path):
         assert torch.equal(restored.encode_series(features), original.encode_series(features))
 
 
-def test_deep_tied_checkpoint_round_trip_is_deterministic(tmp_path):
+def test_deep_checkpoint_round_trip_is_deterministic(tmp_path):
     path = tmp_path / "policy.pt"
     config = ModelConfig(
         d_model=32,
         nhead=4,
-        prelude_layers=1,
-        history_tokens=8,
+        reducer_layers=3,
         dim_feedforward=128,
-        core_repeats=3,
-        core_weights_tied=True,
-        pass_embedding_enabled=False,
     )
     original = build_policy(config, default_runtime_resources())
     DEFAULT_POLICY_STORE.save_policy(path, original)
@@ -108,7 +104,8 @@ def test_deep_tied_checkpoint_round_trip_is_deterministic(tmp_path):
     restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
 
     assert restored.config == config
-    assert restored.actor.reducer.core_layers[0] is restored.actor.reducer.core_layers[1]
+    assert len(restored.actor.reducer.encoder.layers) == 3
+    assert restored.actor.reducer.encoder.layers[0] is not restored.actor.reducer.encoder.layers[1]
     for name, parameter in original.state_dict().items():
         torch.testing.assert_close(parameter, restored.state_dict()[name])
 
@@ -143,7 +140,7 @@ def test_checkpoint_rejects_incompatible_and_legacy_contracts(tmp_path):
 @pytest.mark.parametrize(
     "mutate, message",
     (
-        (lambda config: config.pop("prelude_layers"), "Invalid model configuration"),
+        (lambda config: config.pop("reducer_layers"), "Invalid model configuration"),
         (lambda config: config.update({"unknown": 1}), "Invalid model configuration"),
         (lambda config: config.update({"d_model": True}), "Invalid model configuration"),
     ),
