@@ -27,6 +27,7 @@ from p0.model.structured_observation import (
 )
 from p0.model.swiglu_encoder import SwiGLUEncoderLayer
 from p0.training.config import TrainingConfig
+from p0.training.magnet import Magnet
 from p0.training.ppo import _run_batched_ppo
 from p0.training.trajectory import TrajectoryBatch
 
@@ -204,10 +205,11 @@ def test_ppo_reencodes_raw_series_features_inside_the_current_graph() -> None:
     loss, _, _ = _run_batched_ppo(
         [episode],
         policy,
+        Magnet(policy),
         TrainingConfig(enable_optim=False, warmup_episodes=0),
         policy.device,
         episode=1,
-        entropy_coef=0.0,
+        alpha=0.0,
     )
     loss.backward()
     assert policy.series.series_queries.grad is not None

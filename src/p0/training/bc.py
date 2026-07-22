@@ -101,6 +101,8 @@ class BCTrainer:
 
     def train(self) -> BCTrainMetrics:
         """Run configured epochs over the streaming dataset."""
+        if self.config.epochs > 1 and iter(self.dataset) is self.dataset:
+            raise ValueError("BC datasets must be re-iterable when epochs is greater than one")
         self.policy.train()
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -189,29 +191,9 @@ class BCTrainer:
         if start is None or stop is None or not 0 <= start < stop <= game.length:
             raise ValueError("target_slice must select a non-empty in-game decision window")
 
-        # Recompute the producing graph for every optimizer update. Only the explicit
-        # left context is encoded; a local token has no dependency on earlier rows.
         context_start = max(0, start - HISTORY_WINDOW)
         observations = game.observations[context_start:stop].to(self.device)
         action_mask = game.action_mask[context_start:stop].to(self.device)
-        encoded = self.policy.encode(observations, action_mask)
-        local_tokens = self.policy.local_history_tokens(encoded)
-        relative_start = start - context_start
-        relative_stop = stop - context_start
-        target_encoded = encoded._replace(
-            tokens=encoded.tokens[relative_start:relative_stop],
-            aux=encoded.aux[relative_start:relative_stop],
-            numerical=encoded.numerical[relative_start:relative_stop],
-        )
-        target_mask = action_mask[relative_start:relative_stop]
-        history_tokens, history_mask, history_age_ids = self._history_inputs(
-            local_tokens, slice(relative_start, relative_stop)
-        )
-        series_tokens, series_mask = self._series_inputs(game)
-        target_count = stop - start
-        series_tokens = series_tokens.expand(target_count, -1, -1)
-        series_mask = series_mask.expand(target_count, -1)
-
         candidate_start = int(game.candidate_offsets[start])
         candidate_end = int(game.candidate_offsets[stop])
         candidate_values = game.candidate_values[candidate_start:candidate_end].to(self.device)
@@ -222,11 +204,26 @@ class BCTrainer:
         loss_mask = game.loss_mask[start:stop].to(self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+            encoded = self.policy.encode(observations, action_mask)
+            local_tokens = self.policy.local_history_tokens(encoded)
+            relative_start = start - context_start
+            relative_stop = stop - context_start
+            target_encoded = encoded._replace(
+                tokens=encoded.tokens[relative_start:relative_stop],
+                aux=encoded.aux[relative_start:relative_stop],
+                numerical=encoded.numerical[relative_start:relative_stop],
+            )
+            target_mask = action_mask[relative_start:relative_stop]
+            history_tokens, history_mask, history_age_ids = self._history_inputs(
+                local_tokens, slice(relative_start, relative_stop)
+            )
+            series_tokens, series_mask = self._series_inputs(game)
+            target_count = stop - start
             log_probs = self.policy.actor.score_joint_candidates(
                 target_encoded,
                 target_mask,
-                series_tokens,
-                series_mask,
+                series_tokens.expand(target_count, -1, -1),
+                series_mask.expand(target_count, -1),
                 history_tokens,
                 history_mask,
                 history_age_ids,

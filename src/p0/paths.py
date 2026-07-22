@@ -14,7 +14,7 @@ class ProjectPaths:
     teams_root: Path
     artifacts_root: Path
     showdown_root: Path
-    pool_dir: Path
+    gauntlet_dir: Path
     checkpoint_path: Path
     runs_dir: Path
     replays_dir: Path
@@ -31,7 +31,7 @@ class ProjectPaths:
             teams_root=root / "teams",
             artifacts_root=artifacts,
             showdown_root=root / "pokemon-showdown",
-            pool_dir=artifacts / "checkpoints" / "pool",
+            gauntlet_dir=artifacts / "checkpoints" / "gauntlet",
             checkpoint_path=artifacts / "checkpoints" / "ppo_checkpoint.pt",
             runs_dir=artifacts / "runs",
             replays_dir=artifacts / "replays",
@@ -58,7 +58,7 @@ def _default_paths() -> ProjectPaths:
                 teams_root=paths.teams_root,
                 artifacts_root=paths.artifacts_root,
                 showdown_root=paths.showdown_root,
-                pool_dir=paths.pool_dir,
+                gauntlet_dir=paths.gauntlet_dir,
                 checkpoint_path=paths.checkpoint_path,
                 runs_dir=paths.runs_dir,
                 replays_dir=paths.replays_dir,

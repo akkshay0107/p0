@@ -24,6 +24,7 @@ from p0.model.structured_observation import (
     TokenType,
 )
 from p0.training.config import TrainingConfig
+from p0.training.magnet import Magnet
 from p0.training.ppo import _run_batched_ppo
 from p0.training.trajectory import TrajectoryBatch
 
@@ -251,9 +252,10 @@ def test_ppo_warmup(dummy_obs):
         length=1,
     )
     config = TrainingConfig(warmup_episodes=10)
+    magnet = Magnet(policy)
 
     loss, _, steps = _run_batched_ppo(
-        [episode], policy, config, device, episode=0, entropy_coef=config.entropy_coef
+        [episode], policy, magnet, config, device, episode=0, alpha=config.magnet_alpha
     )
     assert steps == 1
 

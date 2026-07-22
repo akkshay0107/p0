@@ -45,6 +45,7 @@ class PolicyStore(Protocol):
         optimizer: Any = None,
         scheduler: Any = None,
         scaler: Any = None,
+        magnet: Any = None,
     ) -> None: ...
 
     def load_training_state(
@@ -55,6 +56,7 @@ class PolicyStore(Protocol):
         optimizer: Any = None,
         scheduler: Any = None,
         scaler: Any = None,
+        magnet: Any = None,
     ) -> int: ...
 
 
@@ -99,6 +101,7 @@ class CheckpointStore:
         optimizer: Any = None,
         scheduler: Any = None,
         scaler: Any = None,
+        magnet: Any = None,
     ) -> None:
         artifact = self._policy_artifact(policy, TRAINING_ARTIFACT)
         training_state: dict[str, Any] = {"episode": int(episode)}
@@ -106,6 +109,7 @@ class CheckpointStore:
             ("optimizer", optimizer),
             ("scheduler", scheduler),
             ("scaler", scaler),
+            ("magnet", magnet),
         ):
             if service is not None:
                 training_state[f"{name}_state_dict"] = service.state_dict()
@@ -120,6 +124,7 @@ class CheckpointStore:
         optimizer: Any = None,
         scheduler: Any = None,
         scaler: Any = None,
+        magnet: Any = None,
     ) -> int:
         if not path.exists():
             return 0
@@ -143,6 +148,13 @@ class CheckpointStore:
                 key = f"{name}_state_dict"
                 if service is not None and key in training_state:
                     service.load_state_dict(training_state[key])
+            if magnet is not None:
+                # older checkpoints predate the magnet; treat resume as a refresh
+                # boundary and seed it from the freshly loaded live policy
+                if "magnet_state_dict" in training_state:
+                    magnet.load_state_dict(training_state["magnet_state_dict"])
+                else:
+                    magnet.refresh(policy)
             episode = training_state["episode"]
             if type(episode) is not int or episode < 0:
                 raise ValueError("episode must be a non-negative integer")

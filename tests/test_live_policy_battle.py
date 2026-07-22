@@ -1,9 +1,11 @@
 import asyncio
 import random
+from typing import cast
 
 import numpy as np
 import pytest
 import torch
+from poke_env.battle import DoubleBattle
 from poke_env.player import RandomPlayer
 
 from p0.format_config import FORMAT
@@ -82,7 +84,7 @@ class TrackedPolicyPlayer(RLPlayer):
     def _get_action(self, battle):
         action = super()._get_action(battle)
         assert np.isfinite(action).all()
-        self.history_tokens.append(self._battle_history[self._battle_key(battle)][-1])
+        self.history_tokens.append(self._battle_history[self._battle_key(cast(DoubleBattle, battle))][-1])
         if battle.teampreview:
             self.preview_decisions += 1
         else:
