@@ -76,14 +76,13 @@ class TrackedPolicyPlayer(RLPlayer):
     def __init__(self, *args, **kwargs):
         self.preview_decisions = 0
         self.normal_decisions = 0
-        self.recurrent_states = []
+        self.history_tokens = []
         super().__init__(*args, **kwargs)
 
     def _get_action(self, battle):
         action = super()._get_action(battle)
         assert np.isfinite(action).all()
-        assert self.state is not None
-        self.recurrent_states.append(self.state)
+        self.history_tokens.append(self._battle_history[self._battle_key(battle)][-1])
         if battle.teampreview:
             self.preview_decisions += 1
         else:
@@ -139,11 +138,11 @@ async def test_checkpoint_free_policy_completes_live_battle(
 
     assert first.preview_decisions >= 1
     assert first.normal_decisions >= 1
-    assert first.recurrent_states
-    assert first.state is None
+    assert first.history_tokens
+    assert not first._battle_history
     if isinstance(second, TrackedPolicyPlayer):
         assert second.preview_decisions >= 1
         assert second.normal_decisions >= 1
-        assert second.recurrent_states
-        assert second.state is None
-        assert first.recurrent_states[0] is not second.recurrent_states[0]
+        assert second.history_tokens
+        assert not second._battle_history
+        assert first.history_tokens[0] is not second.history_tokens[0]

@@ -44,7 +44,7 @@ class TrainingConfig:
     n_pool_opponents: int = 4
     rollout_steps: int = 320
     batch_size: int = 128
-    chunk_size: int = 32
+    minibatch_size: int = 32
     gamma: float = 0.99
     gae_lambda: float = 0.97
     clip_low: float = 0.2
@@ -70,7 +70,7 @@ class TrainingConfig:
             ("n_pool_opponents", self.n_pool_opponents),
             ("rollout_steps", self.rollout_steps),
             ("batch_size", self.batch_size),
-            ("chunk_size", self.chunk_size),
+            ("minibatch_size", self.minibatch_size),
             ("ppo_epochs", self.ppo_epochs),
         )
         if not 0 <= self.n_self_envs <= self.n_envs:
@@ -184,7 +184,6 @@ class BotConfig:
 # root section requires editing GlobalConfig and load_config in one place.
 @dataclass(frozen=True, slots=True)
 class BCConfig:
-    chunk_length: int = 16
     batch_decisions: int = 256
     learning_rate: float = 3e-4
     epochs: int = 1
@@ -198,7 +197,6 @@ class BCConfig:
     def __post_init__(self) -> None:
         _positive_ints(
             type(self).__name__,
-            ("chunk_length", self.chunk_length),
             ("batch_decisions", self.batch_decisions),
             ("epochs", self.epochs),
         )

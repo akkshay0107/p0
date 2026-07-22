@@ -149,8 +149,16 @@ class EvalPlayerMixin:
     def _battle_finished_callback(self, battle: AbstractBattle) -> None:
         won = battle.won if battle.won is not None else False
         self.history.append((self.current_team_packed, won))
-        if hasattr(self, "state"):
-            self.state = None
+        battle_history = getattr(self, "_battle_history", None)
+        if isinstance(battle_history, dict):
+            battle_history.pop(str(getattr(battle, "battle_tag", "")), None)
+        if battle.finished and getattr(battle, "_p0_series_complete", True):
+            series_key = getattr(battle, "_p0_series_id", None)
+            if series_key is not None:
+                for attribute in ("_series_tokens", "_series_summaries"):
+                    series_state = getattr(self, attribute, None)
+                    if isinstance(series_state, dict):
+                        series_state.pop(str(series_key), None)
         if self.team_source is not None:
             self.update_team(self.team_source.sample(self.team_rng).packed)
 

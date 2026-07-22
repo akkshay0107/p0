@@ -22,7 +22,7 @@ collect_export_files = _EXPORT_MODULE.collect_export_files
 
 
 def _small_policy() -> PolicyNet:
-    return build_policy(ModelConfig(32, 4, 1, 8, 128), default_runtime_resources())
+    return build_policy(ModelConfig(32, 4, 1, 128), default_runtime_resources())
 
 
 def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path):
@@ -64,16 +64,12 @@ def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path):
 
 def test_series_policy_checkpoint_round_trip(tmp_path):
     path = tmp_path / "policy.pt"
-    config = ModelConfig(32, 4, 1, 8, 128, series_context_enabled=True, series_tokens=2)
+    config = ModelConfig(32, 4, 1, 128)
     original = build_policy(config, default_runtime_resources())
-    with torch.no_grad():
-        original.series_conditioner.gate.fill_(0.25)
     DEFAULT_POLICY_STORE.save_policy(path, original)
 
     restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
-    assert restored.config.series_context_enabled
-    assert restored.config.series_tokens == 2
-    assert torch.equal(restored.series_conditioner.gate, original.series_conditioner.gate)
+    assert restored.config == config
 
     side = SideGameSummary(
         leads=("charizard", "garchomp"),
@@ -91,9 +87,7 @@ def test_series_policy_checkpoint_round_trip(tmp_path):
         [tensorize_series((game,), 0, default_runtime_resources().tokenizer)]
     )
     with torch.no_grad():
-        assert torch.equal(
-            restored.initial_series_state(features), original.initial_series_state(features)
-        )
+        assert torch.equal(restored.encode_series(features), original.encode_series(features))
 
 
 def test_deep_tied_checkpoint_round_trip_is_deterministic(tmp_path):
@@ -136,6 +130,13 @@ def test_checkpoint_rejects_incompatible_and_legacy_contracts(tmp_path):
         path,
     )
     with pytest.raises(ValueError, match="legacy checkpoint"):
+        DEFAULT_POLICY_STORE.load_policy(path, "cpu")
+
+    DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
+    legacy = dict(torch.load(path, weights_only=False))
+    legacy["artifact_schema"] = "p0.checkpoint.v1"
+    torch.save(legacy, path)
+    with pytest.raises(ValueError, match="Unsupported checkpoint schema"):
         DEFAULT_POLICY_STORE.load_policy(path, "cpu")
 
 

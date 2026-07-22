@@ -9,6 +9,7 @@ from p0.model.policy import ActOutput
 from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.rollout import (
+    BattleMemoryBuffer,
     RolloutBuffer,
     build_partition,
     collect_rollouts,
@@ -23,17 +24,20 @@ class FakePolicy:
     def __init__(self, action: int):
         self.action = action
         self.device = torch.device("cpu")
+        self.d_model = 1
         self.batch_sizes: list[int] = []
-
-    def initial_state(self, batch_size: int) -> torch.Tensor:
-        return torch.zeros((batch_size, 1, 1))
 
     def act_obs(
         self,
         obs: StructuredObservation,
         action_mask: torch.Tensor,
-        state: torch.Tensor,
+        series_tokens: torch.Tensor,
+        series_mask: torch.Tensor,
+        history_tokens: torch.Tensor,
+        history_mask: torch.Tensor,
+        history_age_ids: torch.Tensor,
     ) -> ActOutput:
+        del series_tokens, series_mask, history_tokens, history_mask, history_age_ids
         batch_size = action_mask.size(0)
         self.batch_sizes.append(batch_size)
         actions = torch.full((batch_size, 2), self.action, dtype=torch.long)
@@ -41,7 +45,7 @@ class FakePolicy:
             actions=actions,
             log_probs=torch.full((batch_size,), -0.5),
             value=torch.full((batch_size,), 0.25),
-            state=state + 1,
+            history_token=torch.ones((batch_size, 1)),
         )
 
 
@@ -250,10 +254,10 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
     buffer = RolloutBuffer()
     trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
     trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
-    state1 = torch.ones((config.n_envs, 1, 1))
-    state2 = torch.ones((config.n_envs, 1, 1))
+    memory1 = BattleMemoryBuffer(config.n_envs, 1)
+    memory2 = BattleMemoryBuffer(config.n_envs, 1)
 
-    stats, next_state1, next_state2 = collect_rollouts(
+    stats = collect_rollouts(
         cast(Any, vec_env),
         cast(Any, policy),
         buffer,
@@ -262,8 +266,8 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
         cast(Any, {}),
         trajectories1,
         trajectories2,
-        state1,
-        state2,
+        memory1,
+        memory2,
         partition,
     )
 
@@ -273,8 +277,8 @@ def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
     assert all(torch.all(episode.actions == 7) for episode in buffer.trajectories)
     assert trajectories1.step_counts.tolist() == [0, 0, 0]
     assert trajectories2.step_counts.tolist() == [0, 0, 0]
-    assert torch.count_nonzero(next_state1) == 0
-    assert torch.count_nonzero(next_state2) == 0
+    assert all(not entries for entries in memory1.tokens)
+    assert all(not entries for entries in memory2.tokens)
 
     side_two_actions = [
         actions[f"agent2-{env_id}"] for env_id, actions in enumerate(vec_env.received_actions[0])
@@ -299,7 +303,7 @@ def test_pool_opponent_rotates_only_after_completed_battle():
 
     vec_env = FakeVecEnv(config.n_envs)
     policy = FakePolicy(action=7)
-    stats, _, _ = collect_rollouts(
+    stats = collect_rollouts(
         cast(Any, vec_env),
         cast(Any, policy),
         RolloutBuffer(),
@@ -308,8 +312,8 @@ def test_pool_opponent_rotates_only_after_completed_battle():
         cast(Any, {}),
         TrajectoryStorage.allocate(config.n_envs, max_steps=4),
         TrajectoryStorage.allocate(config.n_envs, max_steps=4),
-        torch.ones((config.n_envs, 1, 1)),
-        torch.ones((config.n_envs, 1, 1)),
+        BattleMemoryBuffer(config.n_envs, 1),
+        BattleMemoryBuffer(config.n_envs, 1),
         partition,
     )
 

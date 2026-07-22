@@ -106,8 +106,9 @@ def test_cli_parser_help() -> None:
 
 
 def test_eval_player_early_validation_fails() -> None:
-    from p0.evaluation.harness import EvalRandomPlayer
     import random
+
+    from p0.evaluation.harness import EvalRandomPlayer
 
     with pytest.raises(
         ValueError, match="EvalPlayer requires either team_source or a team in kwargs"

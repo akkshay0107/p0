@@ -23,11 +23,8 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path) -> None:
         ModelConfig(
             d_model=64,
             nhead=4,
-            prelude_layers=1,
-            history_tokens=8,
+            reducer_layers=1,
             dim_feedforward=128,
-            series_context_enabled=True,
-            series_tokens=2,
         ),
         default_runtime_resources(),
     )
@@ -35,7 +32,6 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path) -> None:
         policy,
         dataset,
         BCConfig(
-            chunk_length=2,
             batch_decisions=2,
             learning_rate=1e-3,
             epochs=1,

@@ -10,7 +10,9 @@ import torch
 from torch import Tensor
 from torch.amp import GradScaler, autocast
 
-from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.architecture_contract import HISTORY_WINDOW
+from p0.model.cls_reducer import pack_history_tokens
+from p0.model.policy import PolicyNet
 from p0.model.series_context import SeriesFeatures, tensorize_series
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
@@ -33,7 +35,7 @@ class BCObjective:
 
 @dataclass(frozen=True, slots=True)
 class BCTrainMetrics:
-    """Aggregated metrics from a bounded recurrent BC run."""
+    """Aggregated metrics from a stateless complete-game BC run."""
 
     loss: float
     exact_nll: float
@@ -71,7 +73,7 @@ class _RunTotals:
 
 
 class BCTrainer:
-    """Train a policy on complete game chunks with detached truncated BPTT."""
+    """Train a policy on complete games with gathered immutable history."""
 
     def __init__(
         self,
@@ -140,73 +142,58 @@ class BCTrainer:
             scaler=self.scaler,
         )
 
-    def _initial_state(self, game: ReplayGameChunk) -> Tensor:
-        if not self.policy.config.series_context_enabled:
-            return self.policy.initial_state(1)
+    def _series_inputs(self, game: ReplayGameChunk) -> tuple[Tensor, Tensor]:
         features = tensorize_series(
             game.summary_inputs,
             player_index=game.player,
             tokenizer=self.policy.resources.tokenizer,
         )
-        return self.policy.initial_series_state(SeriesFeatures.stack([features]))
+        series = self.policy.encode_series(SeriesFeatures.stack([features]))
+        return series, features.game_mask.unsqueeze(0).to(self.device)
+
+    def _history_inputs(self, local_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        windows: list[tuple[Tensor, Tensor, Tensor]] = []
+        for target in range(local_tokens.size(0)):
+            left = max(0, target - HISTORY_WINDOW)
+            windows.append(pack_history_tokens(local_tokens[left:target].unsqueeze(0)))
+        if not windows:
+            raise ValueError("A replay game must contain at least one decision")
+        packed = torch.cat([window[0] for window in windows], dim=0)
+        masks = torch.cat([window[1] for window in windows], dim=0)
+        ages = torch.cat([window[2] for window in windows], dim=0)
+        return packed, masks, ages
 
     def _train_game(self, game: ReplayGameChunk, totals: _RunTotals) -> None:
-        state = self._initial_state(game)
-        chunk_length = min(self.config.chunk_length, self.config.batch_decisions)
-        for start in range(0, game.length, chunk_length):
-            end = min(start + chunk_length, game.length)
-            state, metrics = self._train_chunk(game, start, end, state)
-            totals.add(metrics)
-
-    def _train_chunk(
-        self,
-        game: ReplayGameChunk,
-        start: int,
-        end: int,
-        state: Tensor,
-    ) -> tuple[Tensor, _RunTotals]:
-        observations = game.observations[start:end].to(self.device)
-        action_mask = game.action_mask[start:end].to(self.device)
+        observations = game.observations.to(self.device)
+        action_mask = game.action_mask.to(self.device)
         # Read the ragged boundaries on the host once; per-decision .item() would sync
         # against the accelerator on every step of the loop below.
-        offsets = game.candidate_offsets[start : end + 1].tolist()
-        candidate_start = offsets[0]
-        candidates = game.candidate_values[candidate_start : offsets[-1]].to(self.device)
-        labels = game.label_kind[start:end].to(self.device)
-        loss_mask = game.loss_mask[start:end].to(self.device)
+        offsets = game.candidate_offsets.to(self.device)
+        candidates = game.candidate_values.to(self.device)
+        labels = game.label_kind.to(self.device)
+        loss_mask = game.loss_mask.to(self.device)
         encoded = self.policy.encode(observations, action_mask)
+        local_tokens = self.policy.local_history_tokens(encoded)
+        history_tokens, history_mask, history_age_ids = self._history_inputs(local_tokens)
+        series_tokens, series_mask = self._series_inputs(game)
+        series_tokens = series_tokens.expand(game.length, -1, -1)
+        series_mask = series_mask.expand(game.length, -1)
         self.optimizer.zero_grad(set_to_none=True)
-        # The recurrent state forces one scoring call per decision, but the objective is
-        # ragged, so it runs once over the whole chunk.
-        chunk_log_probs = []
-        for index in range(end - start):
-            candidate_left = offsets[index] - candidate_start
-            candidate_right = offsets[index + 1] - candidate_start
-            one_encoded = EncodedObs(
-                encoded.tokens[index : index + 1],
-                encoded.aux[index : index + 1],
-                encoded.numerical[index : index + 1],
+        with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+            log_probs = self.policy.actor.score_joint_candidates(
+                encoded,
+                action_mask,
+                series_tokens,
+                series_mask,
+                history_tokens,
+                history_mask,
+                history_age_ids,
+                candidates,
+                offsets,
             )
-            with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-                log_probs, state = self.policy.actor.score_joint_candidates_with_state(
-                    one_encoded,
-                    action_mask[index : index + 1],
-                    state,
-                    candidates[candidate_left:candidate_right],
-                    torch.tensor(
-                        [0, candidate_right - candidate_left],
-                        dtype=torch.long,
-                        device=self.device,
-                    ),
-                )
-            chunk_log_probs.append(log_probs)
         objective = compute_bc_objective(
-            torch.cat(chunk_log_probs),
-            torch.tensor(
-                [offset - candidate_start for offset in offsets],
-                dtype=torch.long,
-                device=self.device,
-            ),
+            log_probs,
+            offsets,
             labels,
             loss_mask,
         )
@@ -226,14 +213,16 @@ class BCTrainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             loss_sum = loss.detach().item() * labeled_decisions
-        return state.detach(), _RunTotals(
-            loss=loss_sum,
-            exact_nll=objective.exact_nll.detach().item() * exact_decisions,
-            partial_nll=objective.partial_nll.detach().item() * partial_decisions,
-            decisions=end - start,
-            labeled_decisions=labeled_decisions,
-            exact_decisions=exact_decisions,
-            partial_decisions=partial_decisions,
+        totals.add(
+            _RunTotals(
+                loss=loss_sum,
+                exact_nll=objective.exact_nll.detach().item() * exact_decisions,
+                partial_nll=objective.partial_nll.detach().item() * partial_decisions,
+                decisions=game.length,
+                labeled_decisions=labeled_decisions,
+                exact_decisions=exact_decisions,
+                partial_decisions=partial_decisions,
+            )
         )
 
 

@@ -4,7 +4,7 @@ Both offline replay reconstruction and the live runtime produce these
 records, and the series-context encoder in p0.model consumes them, so the
 schema lives in the pure battle layer. A game's summary never contains
 later-game information; series context for Game N is re-encoded from the
-summaries of games before N, never carried as live recurrent state.
+summaries of games before N, encoded afresh as explicit series context.
 
 All identifiers are normalized ids (the output form of
 p0.teams.team.normalize_id: lowercase alphanumeric), never vocabulary ids,

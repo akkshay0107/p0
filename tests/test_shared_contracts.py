@@ -309,28 +309,26 @@ def test_corpus_source_spec_validates() -> None:
         )
 
 
-def test_model_config_series_fields() -> None:
+def test_model_config_has_only_scaling_fields() -> None:
     config = ModelConfig.baseline()
-    assert config.series_tokens == 4 and not config.series_context_enabled
+    assert config.dim_feedforward == 2048
     assert ModelConfig.from_dict(config.to_dict()) == config
     enabled = ModelConfig(
         d_model=64,
         nhead=4,
-        prelude_layers=1,
-        history_tokens=2,
+        reducer_layers=1,
         dim_feedforward=128,
-        series_context_enabled=True,
     )
     assert ModelConfig.from_dict(enabled.to_dict()) == enabled
     stale = config.to_dict()
-    del stale["series_tokens"]
-    with pytest.raises(ValueError, match=r"missing=\['series_tokens'\]"):
+    stale["history_tokens"] = 8
+    with pytest.raises(ValueError, match=r"unknown=.*history_tokens"):
         ModelConfig.from_dict(stale)
 
 
 def test_reserved_config_sections(tmp_path) -> None:
     config = load_config("config.yaml.example")
-    assert config.bc.chunk_length == 16
+    assert config.bc.batch_decisions == 256
     assert config.corpus.agent_split == "train"
     assert config.evaluation.episodes_per_matchup == 20
     bad = tmp_path / "config.yaml"

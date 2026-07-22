@@ -13,13 +13,14 @@ from p0.format_config import (
     load_active_runtime_manifest,
     validate_artifact_runtime_contract,
 )
+from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
 from p0.model.resources import RuntimeResources
 from p0.persistence import atomic_torch_save
 
-CHECKPOINT_SCHEMA = "p0.checkpoint.v1"
+CHECKPOINT_SCHEMA = CHECKPOINT_ARTIFACT_SCHEMA
 POLICY_ARTIFACT = "policy"
 TRAINING_ARTIFACT = "training"
 

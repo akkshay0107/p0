@@ -4,6 +4,8 @@ import numpy as np
 import torch
 
 from p0.format_config import FORMAT
+from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
+from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
@@ -26,6 +28,7 @@ MAX_TRAJECTORY_STEPS = 200
 __all__ = [
     "EnvPartition",
     "RolloutBuffer",
+    "BattleMemoryBuffer",
     "assign_pool_opponents",
     "build_partition",
     "collect_rollouts",
@@ -51,6 +54,86 @@ class RolloutBuffer:
         )
 
 
+class BattleMemoryBuffer:
+    """Explicit per-battle immutable local-token storage."""
+
+    def __init__(self, n_envs: int, d_model: int):
+        self.tokens: list[list[torch.Tensor]] = [[] for _ in range(n_envs)]
+        self.series_tokens: list[torch.Tensor | None] = [None for _ in range(n_envs)]
+        self.series_masks: list[torch.Tensor | None] = [None for _ in range(n_envs)]
+        self.d_model = d_model
+
+    def append(self, env_ids: torch.Tensor, history_tokens: torch.Tensor) -> None:
+        if history_tokens.shape != (env_ids.numel(), self.d_model):
+            raise ValueError("history token batch does not match selected environments")
+        for env_id, token in zip(env_ids.tolist(), history_tokens, strict=True):
+            entries = self.tokens[env_id]
+            entries.append(token.detach().to(torch.float32))
+            if len(entries) > HISTORY_WINDOW:
+                del entries[0]
+
+    def reset(self, env_id: int) -> None:
+        """Reset one game's history while preserving any active series context."""
+        self.tokens[env_id].clear()
+
+    def set_series(
+        self,
+        env_ids: torch.Tensor,
+        series_tokens: torch.Tensor,
+        series_mask: torch.Tensor,
+    ) -> None:
+        if series_tokens.shape != (env_ids.numel(), SERIES_SLOTS, self.d_model):
+            raise ValueError("series token batch does not match the fixed two-slot contract")
+        if series_mask.shape != (env_ids.numel(), SERIES_SLOTS):
+            raise ValueError("series mask batch does not match the fixed two-slot contract")
+        for env_id, tokens, mask in zip(env_ids.tolist(), series_tokens, series_mask, strict=True):
+            self.series_tokens[env_id] = tokens.detach().to(torch.float32).clone()
+            self.series_masks[env_id] = mask.detach().bool().clone()
+
+    def clear_series(self, env_id: int) -> None:
+        self.series_tokens[env_id] = None
+        self.series_masks[env_id] = None
+
+    def inputs(
+        self,
+        env_ids: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        history = []
+        masks = []
+        ages = []
+        for env_id in env_ids.tolist():
+            current = self.tokens[env_id]
+            values = (
+                torch.stack(current).to(device=device, dtype=dtype).unsqueeze(0)
+                if current
+                else torch.zeros((1, 0, self.d_model), device=device, dtype=dtype)
+            )
+            packed, mask, age = pack_history_tokens(values)
+            history.append(packed[0])
+            masks.append(mask[0])
+            ages.append(age[0])
+        series = []
+        series_masks = []
+        for env_id in env_ids.tolist():
+            stored_tokens = self.series_tokens[env_id]
+            stored_mask = self.series_masks[env_id]
+            if stored_tokens is None or stored_mask is None:
+                series.append(torch.zeros((SERIES_SLOTS, self.d_model), device=device, dtype=dtype))
+                series_masks.append(torch.zeros((SERIES_SLOTS,), device=device, dtype=torch.bool))
+            else:
+                series.append(stored_tokens.to(device=device, dtype=dtype))
+                series_masks.append(stored_mask.to(device=device))
+        return (
+            torch.stack(series),
+            torch.stack(series_masks),
+            torch.stack(history),
+            torch.stack(masks),
+            torch.stack(ages),
+        )
+
+
 @torch.inference_mode()
 def collect_rollouts(
     vec_env: ThreadVecEnv,
@@ -61,10 +144,10 @@ def collect_rollouts(
     active_pool_policies: dict[str, PolicyNet],
     trajectories1: TrajectoryStorage,
     trajectories2: TrajectoryStorage,
-    state1: torch.Tensor,
-    state2: torch.Tensor,
+    memory1: BattleMemoryBuffer,
+    memory2: BattleMemoryBuffer,
     partition: EnvPartition,
-) -> tuple[tuple[int, int], torch.Tensor, torch.Tensor]:
+) -> tuple[int, int]:
     """
     Collect one rollout with statically assigned self-play and pool-play environments.
     Pool snapshots change only after that environment completes a battle.
@@ -105,38 +188,43 @@ def collect_rollouts(
             [obs1_gpu, obs2_gpu[partition.self_idx]],
         )
         current_mask = torch.cat([mask1_gpu, mask2_gpu[partition.self_idx]])
-        current_state = torch.cat([state1, state2[partition.self_idx]])
+        memory1_inputs = memory1.inputs(torch.arange(n_envs), device, torch.float32)
+        memory2_self_inputs = memory2.inputs(partition.self_idx, device, torch.float32)
+        current_memory = tuple(
+            torch.cat([first, second], dim=0)
+            for first, second in zip(memory1_inputs, memory2_self_inputs, strict=True)
+        )
         with torch.amp.autocast(device_type=device.type, enabled=config.enable_optim):
-            current_out = policy.act_obs(current_obs, current_mask, current_state)
+            current_out = policy.act_obs(current_obs, current_mask, *current_memory)
 
         actions1 = current_out.actions[:n_envs]
         log_probs1 = current_out.log_probs[:n_envs]
         values1 = current_out.value[:n_envs]
-        next_state1 = current_out.state[:n_envs].to(torch.float32)
 
         actions2 = torch.zeros_like(actions1)
         log_probs2 = torch.zeros_like(log_probs1)
         values2 = torch.zeros_like(values1)
-        next_state2 = state2.clone()
 
         if partition.self_idx.numel() > 0:
             self_slice = slice(n_envs, None)
             actions2[partition.self_idx] = current_out.actions[self_slice]
             log_probs2[partition.self_idx] = current_out.log_probs[self_slice]
             values2[partition.self_idx] = current_out.value[self_slice]
-            next_state2[partition.self_idx] = current_out.state[self_slice].to(torch.float32)
+            memory2.append(partition.self_idx, current_out.history_token[self_slice])
+
+        memory1.append(torch.arange(n_envs), current_out.history_token[:n_envs])
 
         for opponent_id, group_idx in partition.pool_groups():
             with torch.amp.autocast(device_type=device.type, enabled=config.enable_optim):
                 group_out = active_pool_policies[opponent_id].act_obs(
                     obs2_gpu[group_idx],
                     mask2_gpu[group_idx],
-                    state2[group_idx],
+                    *memory2.inputs(group_idx, device, torch.float32),
                 )
             actions2[group_idx] = group_out.actions
             log_probs2[group_idx] = group_out.log_probs
             values2[group_idx] = group_out.value
-            next_state2[group_idx] = group_out.state.to(torch.float32)
+            memory2.append(group_idx, group_out.history_token)
 
         # store actions in traj before step to avoid overwrite
         # and needing to clone, instead of with step results
@@ -156,6 +244,8 @@ def collect_rollouts(
             log_probs1_cpu,
             values1_cpu,
             torch.from_numpy(masks1).to(torch.bool),
+            memory1_inputs[0].to(device="cpu"),
+            memory1_inputs[1].to(device="cpu"),
         )
 
         has_self_play = self_idx_cpu.numel() > 0
@@ -168,6 +258,8 @@ def collect_rollouts(
                 log_probs2_cpu[self_idx_cpu],
                 values2_cpu[self_idx_cpu],
                 torch.from_numpy(masks2)[self_idx_cpu].to(torch.bool),
+                memory2_self_inputs[0].to(device="cpu"),
+                memory2_self_inputs[1].to(device="cpu"),
             )
 
         env_actions = [
@@ -211,34 +303,25 @@ def collect_rollouts(
                     pool_total += 1
                     pool.update_win_rate(opponent_id, int(won))
 
-                # reset to each policy's learned initial state (hg_init is no
-                # longer zeros); the BPTT recompute starts episodes from
-                # initial_state, so the rollout reset must match it
-                next_state1[i : i + 1] = policy.initial_state(1)
+                memory1.reset(i)
+                memory2.reset(i)
                 if opponent_id != "self":
+                    memory2.clear_series(i)
                     partition.opponent_ids[i] = next_pool_opponents[i]
-                    next_state2[i : i + 1] = active_pool_policies[
-                        next_pool_opponents[i]
-                    ].initial_state(1)
-                else:
-                    next_state2[i : i + 1] = policy.initial_state(1)
 
         masks1 = next_masks1
         masks2 = next_masks2
-        state1 = next_state1
-        state2 = next_state2
-
     # cleanup inactive policies
     active_ids = {opponent_id for opponent_id, _ in partition.pool_groups()}
     keys_to_remove = [k for k in active_pool_policies.keys() if k not in active_ids]
     for k in keys_to_remove:
         del active_pool_policies[k]
 
-    return (pool_wins, pool_total), state1, state2
+    return pool_wins, pool_total
 
 
 class RolloutCollector:
-    """Own loaded opponents, recurrent state, and active trajectory storage."""
+    """Own loaded opponents, battle memory, and active trajectory storage."""
 
     def __init__(
         self,
@@ -255,20 +338,20 @@ class RolloutCollector:
         self.config = config
         self.buffer = RolloutBuffer()
         self.active_policies: dict[str, PolicyNet] = {}
-        self.first = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
-        self.second = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
+        self.first = TrajectoryStorage.allocate(
+            config.n_envs, max_trajectory_steps, d_model=policy.d_model
+        )
+        self.second = TrajectoryStorage.allocate(
+            config.n_envs, max_trajectory_steps, d_model=policy.d_model
+        )
         self.partition: EnvPartition = build_partition(config, league, policy.device)
-        self.state1 = policy.initial_state(config.n_envs)
-        self.state2 = policy.initial_state(config.n_envs)
-        with torch.no_grad():
-            self.state2 = self.state2.clone()
-            for opponent_id, indices in self.partition.pool_groups():
-                opponent = league.load_policy(opponent_id, str(policy.device))
-                self.active_policies[opponent_id] = opponent
-                self.state2[indices] = opponent.initial_state(indices.numel())
+        self.memory1 = BattleMemoryBuffer(config.n_envs, policy.d_model)
+        self.memory2 = BattleMemoryBuffer(config.n_envs, policy.d_model)
+        for opponent_id, _ in self.partition.pool_groups():
+            self.active_policies[opponent_id] = league.load_policy(opponent_id, str(policy.device))
 
     def collect(self) -> tuple[int, int]:
-        stats, self.state1, self.state2 = collect_rollouts(
+        stats = collect_rollouts(
             self.vector_env,
             self.policy,
             self.buffer,
@@ -277,8 +360,8 @@ class RolloutCollector:
             self.active_policies,
             self.first,
             self.second,
-            self.state1,
-            self.state2,
+            self.memory1,
+            self.memory2,
             self.partition,
         )
         return stats

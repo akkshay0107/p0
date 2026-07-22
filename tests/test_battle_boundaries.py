@@ -80,7 +80,7 @@ def test_scalar_joint_constraints_match_policy_vectorization() -> None:
     )
     base = torch.from_numpy(action_mask(view)).unsqueeze(0)
     resources = default_runtime_resources()
-    policy = build_policy(ModelConfig(32, 2, 1, 8, 128), resources)
+    policy = build_policy(ModelConfig(32, 2, 1, 128), resources)
     for first in legal_actions(view, 0):
         logits = torch.zeros((1, 2, ACT_SIZE))
         masked = policy.actor._apply_sequential_masks(
@@ -193,7 +193,7 @@ def test_live_adapter_and_pure_fixture_build_identical_observations() -> None:
 
 def test_factory_shares_resources_and_preserves_state_dict_layout() -> None:
     resources = default_runtime_resources()
-    config = ModelConfig(32, 2, 1, 8, 128)
+    config = ModelConfig(32, 2, 1, 128)
     direct = PolicyNet(config, resources)
     policy = build_policy(config, resources)
     builder = ObservationBuilder(resources=resources)
