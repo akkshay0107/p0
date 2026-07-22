@@ -38,7 +38,7 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 - **Token Fusion Encoder**: Combines categorical embeds and numerical values per Pokemon, routing them through a single-layer encoder. Each Pokemon, global-field, and side-owner row is fused directly; event rows are encoded at low width and pooled into eight fixed event tokens. The custom implementation of a SwiGLU variant was built for fun to try something new. Other tokens for the global field status or the side conditions on each side are also fused at this layer.
 - **Autoregressive Policy Pointer Head**: Uses a pointer-attention network to select actions. The first head predicts action `a1` for the first active Pokemon. This selection is embedded and passed as context to the second head to predict action `a2` for the second active Pokemon. Sequential masking prevents invalid choices (such as duplicate switch targets or multiple mega evolutions in a single turn).
 - **Inbuilt Team Preview Handling**: The same policy used for battling can also be used for team picking at the team preview stage. The input is differentiated through a team preview flag in the observation.
-- **League-Style Training (PFSP & Anchored Pool)**: Trains against past snapshots of itself and a shadow model (updated through EMA) with PFSP sampling. Anchors policies that have diverse play styles through an approximate test. Unlike AlphaStar, I do not train exploiter agents (since I would like my minimal step budget to go towards training the main agent; this might be considered with a larger budget).
+- **Magnetic Mirror-Descent Self-Play**: Runs the live policy on both seats of every environment and regularizes PPO toward a slowly refreshed frozen magnet with a reverse-KL penalty. This preserves strategic diversity in one stochastic policy without a checkpoint league or recurrent BPTT loop.
 - **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with two fixed prior-game slots and full attention over a 75-position layout. BC and PPO batch complete games or bounded target windows without recurrent state APIs. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
 - **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
 - **Mixed Precision (FP16) & CUDA Graph Compilation**: Optional but speeds up training by around 1.7x on the few short runs I have done on a T4.
@@ -50,7 +50,7 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 ### 1. `src/p0/` (Source)
 
 - **`model/`**: Defines the tokenizer, structured observations, encoder, and actor-critic policy.
-- **`train/`**: Contains PPO rollout, optimization, vector-environment, and league code.
+- **`training/`**: Contains fixed-memory PPO rollout, optimization, vector-environment, and magnet services.
 
 ### 2. `bench/` (Benchmarks)
 
@@ -91,13 +91,13 @@ cd pokemon-showdown && npm install && cd ..
 
 The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.yaml.example` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.path` and `environment.opponent_team_source.path` independently. Relative paths are resolved under `paths.teams_root`.
 
-Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins league-based self-play.
+Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins all-self-play with magnetic regularization.
 
 ```bash
 uv run p0-train
 ```
 
-_Note: Training metrics (Win Rate, KL Divergence, Explained Variance, Entropy Loss, etc.) are exported to TensorBoard. You can view them by running `tensorboard --logdir ./artifacts/runs/ppo_training/`._
+_Note: Training metrics (magnet KL, PPO KL, explained variance, normalized entropy, and gradient diagnostics) are exported to TensorBoard. You can view them by running `tensorboard --logdir ./artifacts/runs/ppo_training/`._
 
 ### 3. Local Play
 

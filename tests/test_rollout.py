@@ -12,7 +12,6 @@ from p0.training.config import TrainingConfig
 from p0.training.rollout import (
     BattleMemoryBuffer,
     RolloutBuffer,
-    build_partition,
     collect_rollouts,
 )
 from p0.training.trajectory import TrajectoryStorage, compute_gae_batch
@@ -51,40 +50,6 @@ class FakePolicy:
 
     def encode_series(self, features):
         return features.game_mask.to(dtype=torch.float32).unsqueeze(-1)
-
-
-class FakePool:
-    def __init__(self, opponent_ids: list[str]):
-        self.opponent_ids = opponent_ids
-        self.updates: list[tuple[str, int, int]] = []
-        self.loaded: dict[str, FakePolicy] = {}
-
-    def __len__(self) -> int:
-        return len(self.opponent_ids)
-
-    def sample_many(self, count: int) -> list[str]:
-        return self.opponent_ids[:count]
-
-    def load_policy(self, opponent_id: str, device: str) -> FakePolicy:
-        del device
-        policy = FakePolicy(action=8)
-        self.loaded[opponent_id] = policy
-        return policy
-
-    def update_win_rate(self, opponent_id: str, agent_wins: int, num_games: int = 1) -> None:
-        self.updates.append((opponent_id, agent_wins, num_games))
-
-
-class RotatingFakePool(FakePool):
-    def __init__(self):
-        super().__init__(["old", "new"])
-        self.sample_calls = 0
-
-    def sample_many(self, count: int) -> list[str]:
-        del count
-        opponent_id = "old" if self.sample_calls == 0 else "new"
-        self.sample_calls += 1
-        return [opponent_id]
 
 
 class FakeVecEnv:
@@ -234,131 +199,42 @@ def test_compute_gae_batch_matches_single_episode_reference():
         assert torch.count_nonzero(actual[episode_idx, length:]) == 0
 
 
-def test_build_partition_assigns_static_pool_groups():
-    config = TrainingConfig(n_envs=6, n_self_envs=2, n_pool_opponents=2)
-    pool = FakePool(["opp-a", "opp-b"])
-
-    partition = build_partition(
-        config,
-        cast(Any, pool),
-        torch.device("cpu"),
-    )
-
-    assert partition.self_idx.tolist() == [0, 1]
-    assert partition.pool_idx.tolist() == [2, 3, 4, 5]
-    assert partition.opponent_ids == ["self", "self", "opp-a", "opp-b", "opp-a", "opp-b"]
-    assert [(name, idx.tolist()) for name, idx in partition.pool_groups()] == [
-        ("opp-a", [2, 4]),
-        ("opp-b", [3, 5]),
-    ]
-    assert partition.self_mask_cpu.tolist() == [True, True, False, False, False, False]
-
-
-def test_build_partition_falls_back_to_all_self_play_for_empty_pool():
-    config = TrainingConfig(n_envs=4, n_self_envs=1)
-    partition = build_partition(
-        config,
-        cast(Any, FakePool([])),
-        torch.device("cpu"),
-    )
-
-    assert partition.self_idx.tolist() == [0, 1, 2, 3]
-    assert partition.pool_idx.numel() == 0
-    assert partition.pool_groups() == ()
-    assert partition.opponent_ids == ["self", "self", "self", "self"]
-
-
-def test_collect_rollouts_counts_pool_games_and_excludes_pool_side_two():
-    config = TrainingConfig(
-        n_envs=3,
-        n_self_envs=1,
-        n_pool_opponents=1,
-        rollout_steps=1,
-    )
-    pool = FakePool(["opp"])
-    partition = build_partition(config, cast(Any, pool), torch.device("cpu"))
+def test_collect_rollouts_records_both_self_play_streams():
+    config = TrainingConfig(n_envs=3, rollout_steps=1)
     vec_env = FakeVecEnv(config.n_envs)
     policy = FakePolicy(action=7)
     buffer = RolloutBuffer()
-    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
-    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
+    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1, player_index=0)
+    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1, player_index=1)
     memory1 = BattleMemoryBuffer(config.n_envs, 1)
     memory2 = BattleMemoryBuffer(config.n_envs, 1)
 
-    stats = collect_rollouts(
+    collect_rollouts(
         cast(Any, vec_env),
         cast(Any, policy),
         buffer,
-        cast(Any, pool),
         config,
-        cast(Any, {}),
         trajectories1,
         trajectories2,
         memory1,
         memory2,
-        partition,
     )
 
-    assert stats == (1, 1)
-    assert pool.updates == [("opp", 1, 1)]
-    assert len(buffer.trajectories) == 4
+    assert len(buffer.trajectories) == 2 * config.n_envs
     assert all(torch.all(episode.actions == 7) for episode in buffer.trajectories)
     assert trajectories1.step_counts.tolist() == [0, 0, 0]
     assert trajectories2.step_counts.tolist() == [0, 0, 0]
     assert all(not entries for entries in memory1.tokens)
     assert all(not entries for entries in memory2.tokens)
-
     side_two_actions = [
         actions[f"agent2-{env_id}"] for env_id, actions in enumerate(vec_env.received_actions[0])
     ]
-    assert side_two_actions[0].tolist() == [7, 7]
-    assert side_two_actions[1].tolist() == [8, 8]
-    assert side_two_actions[2].tolist() == [8, 8]
-    assert policy.batch_sizes == [4]
-    assert pool.loaded["opp"].batch_sizes == [2]
-
-
-def test_pool_opponent_rotates_only_after_completed_battle():
-    config = TrainingConfig(
-        n_envs=3,
-        n_self_envs=1,
-        n_pool_opponents=1,
-        rollout_steps=1,
-    )
-    pool = RotatingFakePool()
-    partition = build_partition(config, cast(Any, pool), torch.device("cpu"))
-    assert partition.opponent_ids == ["self", "old", "old"]
-
-    vec_env = FakeVecEnv(config.n_envs)
-    policy = FakePolicy(action=7)
-    stats = collect_rollouts(
-        cast(Any, vec_env),
-        cast(Any, policy),
-        RolloutBuffer(),
-        cast(Any, pool),
-        config,
-        cast(Any, {}),
-        TrajectoryStorage.allocate(config.n_envs, max_steps=4),
-        TrajectoryStorage.allocate(config.n_envs, max_steps=4),
-        BattleMemoryBuffer(config.n_envs, 1),
-        BattleMemoryBuffer(config.n_envs, 1),
-        partition,
-    )
-
-    assert stats == (1, 1)
-    assert pool.updates == [("old", 1, 1)]
-    assert partition.opponent_ids == ["self", "new", "new"]
+    assert all(action.tolist() == [7, 7] for action in side_two_actions)
+    assert policy.batch_sizes == [2 * config.n_envs]
 
 
 def test_rollout_provider_preserves_series_context_without_cross_game_history():
-    config = TrainingConfig(
-        n_envs=3,
-        n_self_envs=1,
-        n_pool_opponents=1,
-        rollout_steps=2,
-    )
-    pool = FakePool(["opp"])
-    partition = build_partition(config, cast(Any, pool), torch.device("cpu"))
+    config = TrainingConfig(n_envs=3, rollout_steps=2)
     vec_env = FakeVecEnv(config.n_envs)
     provider = FakeSeriesProvider(config.n_envs)
     trajectories1 = TrajectoryStorage.allocate(
@@ -375,19 +251,16 @@ def test_rollout_provider_preserves_series_context_without_cross_game_history():
         cast(Any, vec_env),
         cast(Any, FakePolicy(action=7)),
         buffer,
-        cast(Any, pool),
         config,
-        cast(Any, {}),
         trajectories1,
         trajectories2,
         memory1,
         memory2,
-        partition,
         provider,
     )
 
     assert provider.completed == [0, 1, 2, 0, 1, 2]
-    second_game = buffer.trajectories[4]
+    second_game = buffer.trajectories[6]
     assert second_game.series_id == "series-0"
     assert second_game.game_number == 2
     assert second_game.player == 0
@@ -395,3 +268,4 @@ def test_rollout_provider_preserves_series_context_without_cross_game_history():
     assert second_game.series_tokens is None
     assert second_game.series_mask is None
     assert all(not entries for entries in memory1.tokens)
+

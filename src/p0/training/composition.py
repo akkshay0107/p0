@@ -23,7 +23,7 @@ from p0.runtime.showdown import start_showdown_servers
 from p0.teams.source import FileTeamSource, TeamSource
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import CorpusConfig, GlobalConfig, TeamSourceConfig
-from p0.training.league.league import OpponentPool
+from p0.training.magnet import Magnet
 from p0.training.ppo import PPOUpdater
 from p0.training.rollout import RolloutCollector, SeriesContextProvider
 from p0.training.trainer import PPOTrainer
@@ -123,8 +123,9 @@ def run_training(
     scaler = GradScaler(
         "cuda", enabled=training.enable_optim and device.type == "cuda", init_scale=512.0
     )
+    magnet = Magnet(policy)
     start = policy_store.load_training_state(
-        paths.checkpoint_path, policy, optimizer=optimizer, scaler=scaler
+        paths.checkpoint_path, policy, optimizer=optimizer, scaler=scaler, magnet=magnet
     )
     agent_source = _team_source(
         config.environment.agent_team_source,
@@ -162,15 +163,9 @@ def run_training(
                 )
             vector_env = ThreadVecEnv(envs)
             writer = SummaryWriter(log_dir=str(paths.runs_dir / "ppo_training"))
-            league = OpponentPool.load_or_create(paths.pool_dir, config.pool, policy_store)
-            if len(league) == 0 or league.shadow_id is None:
-                league.set_shadow(policy)
-                league.add(policy, "ep0")
-                league.save_state()
             collector = RolloutCollector(
                 vector_env,
                 policy,
-                league,
                 training,
                 series_context=series_context,
             )
@@ -179,6 +174,7 @@ def run_training(
                 optimizer,
                 scaler,
                 training,
+                magnet,
                 cancel_requested=cancel_requested,
             )
             trainer = PPOTrainer(
@@ -187,10 +183,9 @@ def run_training(
                 checkpoint_path=paths.checkpoint_path,
                 collector=collector,
                 updater=updater,
-                league=league,
+                magnet=magnet,
                 scheduler=PPOScheduler(training),
                 training_config=training,
-                pool_config=config.pool,
                 metric_sink=_tensorboard_sink(writer),
                 cancel_requested=cancel_requested,
             )

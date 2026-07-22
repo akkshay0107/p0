@@ -40,8 +40,6 @@ def _unit_interval(owner: str, *values: tuple[str, float]) -> None:
 class TrainingConfig:
     num_episodes: int = 2000
     n_envs: int = 8
-    n_self_envs: int = 4
-    n_pool_opponents: int = 4
     rollout_steps: int = 320
     batch_size: int = 128
     minibatch_size: int = 32
@@ -51,43 +49,42 @@ class TrainingConfig:
     clip_high: float = 0.28
     lr: float = 6e-5
     value_coef: float = 0.05
-    entropy_coef: float = 0.03
+    magnet_alpha: float = 0.03
+    magnet_refresh_interval: int = 20
+    residual_entropy_coef: float = 0.0
     max_grad_norm: float = 1.0
     target_kl: float = 0.015
     ppo_epochs: int = 6
     teampreview_loss_mult: float = 1.5
-    teampreview_entropy_mult: float = 2.0
+    teampreview_alpha_mult: float = 2.0
     enable_optim: bool = True
     warmup_episodes: int = 20
     ramp_up_phase: float = 0.1
-    ramp_down_phase: float = 0.2
 
     def __post_init__(self) -> None:
         _positive_ints(
             type(self).__name__,
             ("num_episodes", self.num_episodes),
             ("n_envs", self.n_envs),
-            ("n_pool_opponents", self.n_pool_opponents),
             ("rollout_steps", self.rollout_steps),
             ("batch_size", self.batch_size),
             ("minibatch_size", self.minibatch_size),
             ("ppo_epochs", self.ppo_epochs),
+            ("magnet_refresh_interval", self.magnet_refresh_interval),
         )
-        if not 0 <= self.n_self_envs <= self.n_envs:
-            raise ValueError("training.n_self_envs must be between 0 and training.n_envs")
         _unit_interval(
             type(self).__name__,
             ("gamma", self.gamma),
             ("gae_lambda", self.gae_lambda),
             ("ramp_up_phase", self.ramp_up_phase),
-            ("ramp_down_phase", self.ramp_down_phase),
         )
         _non_negative(
             type(self).__name__,
             ("clip_low", self.clip_low),
             ("clip_high", self.clip_high),
             ("value_coef", self.value_coef),
-            ("entropy_coef", self.entropy_coef),
+            ("magnet_alpha", self.magnet_alpha),
+            ("residual_entropy_coef", self.residual_entropy_coef),
             ("target_kl", self.target_kl),
         )
         _positive(
@@ -95,47 +92,14 @@ class TrainingConfig:
             ("lr", self.lr),
             ("max_grad_norm", self.max_grad_norm),
             ("teampreview_loss_mult", self.teampreview_loss_mult),
-            ("teampreview_entropy_mult", self.teampreview_entropy_mult),
+            ("teampreview_alpha_mult", self.teampreview_alpha_mult),
         )
         if not 0 <= self.warmup_episodes <= self.num_episodes:
             raise ValueError("training.warmup_episodes must be between 0 and training.num_episodes")
-        if self.ramp_up_phase + self.ramp_down_phase > 1:
-            raise ValueError("training.ramp_up_phase + training.ramp_down_phase must not exceed 1")
-
-
-@dataclass(frozen=True, slots=True)
-class PoolConfig:
-    pool_size: int = 50
-    snapshot_interval: int = 20
-    pool_anchor_every: int = 10
-    pool_win_rate_smoothing: float = 0.1
-    pool_wr_floor: float = 0.1
-    pool_anchor_drop_wr: float = 0.05
-    pool_anchor_min_wr: float = 0.4
-    pool_anchor_min_games: int = 20
-    pool_explore_coef: float = 0.3
-
-    def __post_init__(self) -> None:
-        _positive_ints(
-            type(self).__name__,
-            ("pool_size", self.pool_size),
-            ("snapshot_interval", self.snapshot_interval),
-            ("pool_anchor_every", self.pool_anchor_every),
-        )
-        _non_negative(
-            type(self).__name__,
-            ("pool_anchor_min_games", self.pool_anchor_min_games),
-            ("pool_explore_coef", self.pool_explore_coef),
-        )
-        _unit_interval(
-            type(self).__name__,
-            ("pool_win_rate_smoothing", self.pool_win_rate_smoothing),
-            ("pool_wr_floor", self.pool_wr_floor),
-            ("pool_anchor_drop_wr", self.pool_anchor_drop_wr),
-            ("pool_anchor_min_wr", self.pool_anchor_min_wr),
-        )
-        if self.pool_anchor_drop_wr > self.pool_anchor_min_wr:
-            raise ValueError("pool.pool_anchor_drop_wr must not exceed pool.pool_anchor_min_wr")
+        if self.magnet_refresh_interval > self.num_episodes:
+            raise ValueError(
+                "training.magnet_refresh_interval must not exceed training.num_episodes"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,17 +208,12 @@ class EvalConfig:
 @dataclass(frozen=True, slots=True)
 class GlobalConfig:
     training: TrainingConfig = TrainingConfig()
-    pool: PoolConfig = PoolConfig()
     paths: ProjectPaths = DEFAULT_PATHS
     environment: EnvironmentConfig = EnvironmentConfig()
     bot: BotConfig = BotConfig()
     bc: BCConfig = BCConfig()
     corpus: CorpusConfig = CorpusConfig()
     evaluation: EvalConfig = EvalConfig()
-
-    def __post_init__(self) -> None:
-        if self.training.n_pool_opponents > self.pool.pool_size:
-            raise ValueError("training.n_pool_opponents must not exceed pool.pool_size")
 
 
 def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root) -> Path:
@@ -271,7 +230,7 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
         teams_root=_resolve_path(config.paths.teams_root, repository_root),
         artifacts_root=_resolve_path(config.paths.artifacts_root, repository_root),
         showdown_root=_resolve_path(config.paths.showdown_root, repository_root),
-        pool_dir=_resolve_path(config.paths.pool_dir, repository_root),
+        gauntlet_dir=_resolve_path(config.paths.gauntlet_dir, repository_root),
         checkpoint_path=_resolve_path(config.paths.checkpoint_path, repository_root),
         runs_dir=_resolve_path(config.paths.runs_dir, repository_root),
         replays_dir=_resolve_path(config.paths.replays_dir, repository_root),
@@ -353,7 +312,6 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
             raise ValueError(f"unknown root configuration section(s): {names}")
         config = GlobalConfig(
             training=_build_section(TrainingConfig, values["training"]),
-            pool=_build_section(PoolConfig, values["pool"]),
             paths=_build_section(ProjectPaths, values["paths"]),
             environment=_build_environment(values["environment"]),
             bot=_build_section(BotConfig, values["bot"], bot=True),

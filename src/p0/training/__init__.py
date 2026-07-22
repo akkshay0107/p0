@@ -1,1 +1,1 @@
-"""Training orchestration built from runtime, league, and persistence services."""
+"""Training orchestration built from runtime, magnet, and persistence services."""

@@ -12,10 +12,7 @@ def default_device() -> torch.device:
 
 class PPOScheduler:
     def __init__(self, config: TrainingConfig):
-        self.ent_max = config.entropy_coef
-        self.ent_min = 0.1 * config.entropy_coef
-        self.ramp_down_start = int((1 - config.ramp_down_phase) * config.num_episodes)
-        self.ramp_down_len = config.num_episodes - self.ramp_down_start
+        self.alpha_value = config.magnet_alpha
 
         self.lr_max = config.lr
         self.lr_min = 0.1 * config.lr
@@ -23,16 +20,14 @@ class PPOScheduler:
         self.ramp_up_end = int(config.ramp_up_phase * config.num_episodes)
         self.decay_len = config.num_episodes - self.ramp_up_end
 
-    def entropy_coef(self, t: int):
-        """
-        Entropy coefficient scheduling. Flat into linear decay
-        """
-        if t < self.ramp_down_start:
-            return self.ent_max
+    def alpha(self, t: int) -> float:
+        """MMD magnet coefficient. Constant for a QRE fixed point.
 
-        prog = (t - self.ramp_down_start) / self.ramp_down_len
-        prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]
-        return prog * self.ent_min + (1 - prog) * self.ent_max
+        Annealing ``alpha`` downward late in training pushes the fixed point
+        toward Nash; kept constant here as the first-cut default.
+        """
+        del t
+        return self.alpha_value
 
     def lr(self, t: int):
         """

@@ -5,23 +5,24 @@ import pytest
 import torch
 
 from p0.runtime import showdown
-from p0.training.config import PoolConfig, TrainingConfig
+from p0.training.config import TrainingConfig
 from p0.training.ppo import compute_ppo_objective
 from p0.training.trainer import PPOTrainer
 
 
 def test_pure_ppo_objective_clips_and_weights_team_preview():
-    config = TrainingConfig(teampreview_loss_mult=2.0, teampreview_entropy_mult=3.0)
+    config = TrainingConfig(teampreview_loss_mult=2.0, teampreview_alpha_mult=3.0)
     total, policy, value, ratio, log_ratio = compute_ppo_objective(
         torch.log(torch.tensor([2.0, 0.5])),
         torch.tensor([0.0, 1.0]),
         torch.tensor([0.5, 0.5]),
         torch.zeros(2),
+        torch.zeros(2),
+        torch.zeros(2),
         torch.ones(2),
-        torch.tensor([1.0, 1.0]),
         torch.tensor([True, False]),
         config,
-        entropy_coefficient=0.1,
+        alpha=0.1,
         critic_only=False,
     )
     assert total.shape == policy.shape == value.shape == ratio.shape == log_ratio.shape == (2,)
@@ -81,10 +82,11 @@ def test_trainer_cancellation_saves_once_before_collecting(tmp_path):
         checkpoint_path=tmp_path / "checkpoint.pt",
         collector=cast(Any, collector),
         updater=cast(Any, updater),
-        league=cast(Any, object()),
+        magnet=cast(Any, object()),
         scheduler=cast(Any, object()),
-        training_config=TrainingConfig(num_episodes=1, warmup_episodes=0),
-        pool_config=PoolConfig(),
+        training_config=TrainingConfig(
+            num_episodes=1, warmup_episodes=0, magnet_refresh_interval=1
+        ),
         cancel_requested=lambda: True,
     )
     trainer.run()
