@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import signal
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -14,7 +15,7 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 
 from p0.battle.legality import action_mask
-from p0.battle.series import MAX_PRIOR_GAMES, GameSummary
+from p0.battle.series import MAX_PRIOR_GAMES
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
@@ -23,7 +24,6 @@ from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.model.series_context import SeriesFeatures, tensorize_series
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
@@ -61,10 +61,11 @@ class RLPlayer(Player):
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
         self.top_p = top_p
+        self.top_p = top_p
         self._memory_model_id = id(policy)
         self._battle_history: dict[str, list[torch.Tensor]] = {}
         self._series_tokens: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._series_summaries: dict[str, tuple[GameSummary, ...]] = {}
+        self._prior_game_histories: dict[str, list[torch.Tensor]] = {}
 
     @staticmethod
     def _battle_key(battle: DoubleBattle) -> str:
@@ -77,60 +78,29 @@ class RLPlayer(Player):
     def _series_key(battle: DoubleBattle) -> str:
         return str(getattr(battle, "_p0_series_id", RLPlayer._battle_key(battle).split("-game")[0]))
 
-    def set_series_summaries(
+    def set_series_game_histories(
         self,
         series_id: str,
-        summaries: tuple[GameSummary, ...],
-        player_index: int,
+        game_histories: Sequence[torch.Tensor],
     ) -> None:
-        """Install causally completed-game summaries for the next game."""
-        if len(summaries) > MAX_PRIOR_GAMES:
+        """Resample completed game turn histories into series tokens for subsequent games."""
+        if len(game_histories) > MAX_PRIOR_GAMES:
             raise ValueError(
-                f"At most {MAX_PRIOR_GAMES} completed game summaries can condition a game"
+                f"At most {MAX_PRIOR_GAMES} completed game histories can condition a game"
             )
-        features = tensorize_series(
-            summaries, player_index=player_index, tokenizer=self.policy.resources.tokenizer
-        )
-        encoded = self.policy.encode_series(SeriesFeatures.stack([features])).detach()
-        mask = features.game_mask.unsqueeze(0)
-        self._series_summaries[series_id] = summaries
-        self._series_tokens[series_id] = (encoded, mask)
-
-    def record_completed_game_summary(
-        self,
-        battle: DoubleBattle,
-        summary: GameSummary,
-        player_index: int,
-    ) -> None:
-        """Validate and install one causal summary before the next series game.
-
-        Replay compilation and live integration both use ``GameSummary`` as the
-        schema boundary. The live adapter supplies the completed-game summary;
-        this method enforces game ordering, canonical perspective, and the same
-        two-game encoder path used by BC.
-        """
-        series_key = self._series_key(battle)
-        prior = self._series_summaries.get(series_key, ())
-        expected_game = len(prior) + 1
-        if summary.game_number != expected_game:
-            raise ValueError(
-                f"Expected completed game {expected_game} for series {series_key!r}, "
-                f"got {summary.game_number}"
-            )
-        completed = (*prior, summary)
-        self._series_summaries[series_key] = completed
-        if len(completed) <= MAX_PRIOR_GAMES:
-            self.set_series_summaries(series_key, completed, player_index)
-        else:
-            # A completed third game has no next game to condition; retain only
-            # the validated audit record until the series cleanup callback.
-            self._series_tokens.pop(series_key, None)
+        prepared_histories = []
+        for hist in game_histories:
+            if hist.dim() == 2:
+                hist = hist.unsqueeze(0)
+            prepared_histories.append(hist.to(self.policy.device))
+        tokens, mask = self.policy.encode_series(prepared_histories)
+        self._series_tokens[series_id] = (tokens.detach(), mask.detach())
 
     def invalidate_memory_for_model_reload(self) -> None:
         """Drop orchestration tensors when a policy artifact is replaced."""
         self._battle_history.clear()
         self._series_tokens.clear()
-        self._series_summaries.clear()
+        self._prior_game_histories.clear()
         self._memory_model_id = id(self.policy)
 
     def _memory_inputs(self, battle: DoubleBattle):
@@ -139,7 +109,7 @@ class RLPlayer(Player):
         key = self._battle_key(battle)
         history = self._battle_history.get(key, [])
         if history:
-            values = torch.stack(history).unsqueeze(0).to(self.policy.device)
+            values = torch.stack(history[-HISTORY_WINDOW:]).unsqueeze(0).to(self.policy.device)
         else:
             values = torch.zeros((1, 0, self.policy.d_model), device=self.policy.device)
         history_tokens, history_mask, history_age_ids = pack_history_tokens(values)
@@ -161,8 +131,6 @@ class RLPlayer(Player):
         key = self._battle_key(battle)
         entries = self._battle_history.setdefault(key, [])
         entries.append(token.detach().to(torch.float32).cpu())
-        if len(entries) > HISTORY_WINDOW:
-            del entries[0]
 
     def _get_action(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
@@ -197,11 +165,23 @@ class RLPlayer(Player):
     def _battle_finished_callback(self, battle: AbstractBattle):
         if not isinstance(battle, DoubleBattle):
             return
-        self._battle_history.pop(self._battle_key(battle), None)
+        key = self._battle_key(battle)
+        series_key = self._series_key(battle)
+        history = self._battle_history.pop(key, None)
+        full_game_history = (
+            torch.stack(history).unsqueeze(0)
+            if history
+            else torch.zeros((1, 0, self.policy.d_model))
+        )
+        prior = self._prior_game_histories.get(series_key, [])
+        updated = [*prior, full_game_history]
+        self._prior_game_histories[series_key] = updated
+        if len(updated) <= MAX_PRIOR_GAMES:
+            self.set_series_game_histories(series_key, updated)
+
         if battle.finished and getattr(battle, "_p0_series_complete", True):
-            series_key = self._series_key(battle)
             self._series_tokens.pop(series_key, None)
-            self._series_summaries.pop(series_key, None)
+            self._prior_game_histories.pop(series_key, None)
         if self.team_source is not None:
             self.update_team(self.team_source.sample(self.team_rng).packed)
 

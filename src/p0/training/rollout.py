@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -11,7 +11,6 @@ from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import PolicyNet
-from p0.model.series_context import SeriesFeatures, empty_series_features
 from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.trajectory import (
@@ -41,7 +40,7 @@ class RolloutSeriesContext:
 
     series_id: str | None = None
     game_number: int = 1
-    features: SeriesFeatures | None = None
+    features: Any | None = None
 
     def __post_init__(self) -> None:
         if self.series_id is not None and not self.series_id:
@@ -110,9 +109,9 @@ class BattleMemoryBuffer:
         series_mask: torch.Tensor,
     ) -> None:
         if series_tokens.shape != (env_ids.numel(), SERIES_SLOTS, self.d_model):
-            raise ValueError("series token batch does not match the fixed two-slot contract")
+            raise ValueError("series token batch does not match the series slot contract")
         if series_mask.shape != (env_ids.numel(), SERIES_SLOTS):
-            raise ValueError("series mask batch does not match the fixed two-slot contract")
+            raise ValueError("series mask batch does not match the series slot contract")
         for env_id, tokens, mask in zip(env_ids.tolist(), series_tokens, series_mask, strict=True):
             self.series_tokens[env_id] = (
                 tokens.detach().to(device="cpu", dtype=torch.float32).clone()
@@ -174,12 +173,9 @@ def _sync_series_context(
         return
     if len(contexts) != env_ids.numel():
         raise ValueError("series contexts must match selected environments")
-    features = SeriesFeatures.stack(
-        [context.features or empty_series_features() for context in contexts]
-    )
+    histories = [getattr(context, "features", None) for context in contexts]
     with torch.inference_mode():
-        encoded = policy.encode_series(features)
-    masks = features.game_mask
+        encoded, masks = policy.encode_series(histories)
     memory.set_series(env_ids, encoded, masks)
 
 

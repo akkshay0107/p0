@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any
 
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.series_context import SeriesFeatures
+from p0.model.architecture_contract import SERIES_SLOTS
 from p0.model.structured_observation import StructuredObservation
 
 
@@ -25,7 +26,7 @@ class TrajectoryBatch:
     advantages: torch.Tensor | None = None
     series_tokens: torch.Tensor | None = None
     series_mask: torch.Tensor | None = None
-    series_features: SeriesFeatures | None = None
+    series_features: Any | None = None
     series_id: str | None = None
     game_number: int = 1
     player: int | None = None
@@ -107,7 +108,7 @@ class TrajectoryStorage:
     max_steps: int
     series_tokens: torch.Tensor | None = None
     series_masks: torch.Tensor | None = None
-    series_features: list[SeriesFeatures | None] | None = None
+    series_features: list[Any | None] | None = None
     series_ids: list[str | None] | None = None
     game_numbers: torch.Tensor | None = None
     player_index: int | None = None
@@ -132,16 +133,16 @@ class TrajectoryStorage:
         if player_index is not None and player_index not in (0, 1):
             raise ValueError("player_index must be 0 or 1 when provided")
         series_tokens = (
-            torch.zeros((n_envs, 2, d_model), dtype=torch.float32, device=device)
+            torch.zeros((n_envs, SERIES_SLOTS, d_model), dtype=torch.float32, device=device)
             if d_model is not None
             else None
         )
         series_masks = (
-            torch.zeros((n_envs, 2), dtype=torch.bool, device=device)
+            torch.zeros((n_envs, SERIES_SLOTS), dtype=torch.bool, device=device)
             if d_model is not None
             else None
         )
-        series_features: list[SeriesFeatures | None] | None = None
+        series_features: list[Any | None] | None = None
         series_ids: list[str | None] | None = None
         game_numbers: torch.Tensor | None = None
         if d_model is not None:
@@ -209,7 +210,7 @@ class TrajectoryStorage:
         action_masks: torch.Tensor,
         series_tokens: torch.Tensor | None = None,
         series_mask: torch.Tensor | None = None,
-        series_features: list[SeriesFeatures | None] | None = None,
+        series_features: list[Any | None] | None = None,
     ) -> torch.Tensor:
         """Store one decision for each selected environment and return its step indices."""
         self.ensure_capacity(env_ids)

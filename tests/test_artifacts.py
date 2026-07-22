@@ -4,12 +4,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from p0.battle.series import GameSummary, SideGameSummary
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.model.series_context import SeriesFeatures, tensorize_series
 from p0.training.checkpoint import CHECKPOINT_SCHEMA, DEFAULT_POLICY_STORE
 
 _EXPORT_SPEC = importlib.util.spec_from_file_location(
@@ -71,23 +69,12 @@ def test_series_policy_checkpoint_round_trip(tmp_path):
     restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
     assert restored.config == config
 
-    side = SideGameSummary(
-        leads=("charizard", "garchomp"),
-        brought=("charizard", "garchomp", "pikachu"),
-        mega_species="",
-        moves_used={"charizard": ("flamethrower",)},
-        revealed_items={},
-        revealed_abilities={},
-        revealed_formes=(),
-        switch_count=1,
-        pivot_count=0,
-    )
-    game = GameSummary(game_number=1, winner=0, series_score=(1, 0), turns=5, sides=(side, side))
-    features = SeriesFeatures.stack(
-        [tensorize_series((game,), 0, default_runtime_resources().tokenizer)]
-    )
+    histories = [torch.randn(1, 10, config.d_model)]
     with torch.no_grad():
-        assert torch.equal(restored.encode_series(features), original.encode_series(features))
+        rest_t, rest_m = restored.encode_series(histories)
+        orig_t, orig_m = original.encode_series(histories)
+        assert torch.equal(rest_t, orig_t)
+        assert torch.equal(rest_m, orig_m)
 
 
 def test_deep_checkpoint_round_trip_is_deterministic(tmp_path):

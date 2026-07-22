@@ -40,8 +40,7 @@ from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
 from p0.model.resources import RuntimeResources
 from p0.model.series_context import (
-    SeriesContextEncoder,
-    SeriesFeatures,
+    DynamicSeriesResampler,
 )
 from p0.model.structured_observation import (
     ALLY_POKE_TOKENS,
@@ -607,23 +606,20 @@ class PolicyNet(nn.Module):
         # value head
         self.critic = ValueHead(config.d_model)
 
-        self.series = SeriesContextEncoder(
+        self.series = DynamicSeriesResampler(
             config.d_model,
             config.nhead,
             config.dim_feedforward,
-            self.encoder.species_emb,
-            self.encoder.move_emb,
-            self.encoder.item_emb,
-            self.encoder.ability_emb,
+            num_layers=config.reducer_layers,
         )
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def encode_series(self, features: SeriesFeatures) -> Tensor:
-        """Encode completed-game summaries into the fixed two series slots."""
-        return self.series(features)
+    def encode_series(self, histories) -> tuple[Tensor, Tensor]:
+        """Encode completed game turn histories into series tokens and mask."""
+        return self.series(histories)
 
     def local_history_tokens(self, encoded: EncodedObs) -> Tensor:
         """Generate causal per-decision tokens without memory interaction."""

@@ -1,215 +1,62 @@
-from dataclasses import fields
-
-import pytest
 import torch
-import torch.nn as nn
 
-from p0.battle.series import MAX_PRIOR_GAMES, GameSummary, SideGameSummary
+from p0.model.architecture_contract import SERIES_SLOTS, SERIES_TOKENS_PER_GAME
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.model.series_context import (
-    GAME_SCALAR_WIDTH,
-    PLAN_TAGS,
-    POKE_SCALAR_WIDTH,
-    SERIES_MOVE_SLOTS,
-    SERIES_POKEMON_SLOTS,
-    SERIES_SIDES,
-    SIDE_SCALAR_WIDTH,
-    SeriesContextEncoder,
-    SeriesFeatures,
-    tensorize_series,
-)
-from p0.model.structured_observation import (
-    CATEGORICAL_WIDTH,
-    EVENT_CATEGORICAL_WIDTH,
-    EVENT_COUNT,
-    EVENT_NUMERICAL_WIDTH,
-    NUMERICAL_WIDTH,
-    SEQUENCE_LENGTH,
-    StructuredObservation,
-)
-
-
-def _side(lead_a: str, lead_b: str, extra: str) -> SideGameSummary:
-    return SideGameSummary(
-        leads=(lead_a, lead_b),
-        brought=(lead_a, lead_b, extra),
-        mega_species="",
-        moves_used={lead_a: ("flamethrower", "protect")},
-        revealed_items={lead_a: "leftovers"},
-        revealed_abilities={lead_a: "blaze"},
-        revealed_formes=(),
-        switch_count=3,
-        pivot_count=1,
-        plan_tags=("weather", "notatag"),
-    )
-
-
-def _game(game_number: int, winner: int, score: tuple[int, int]) -> GameSummary:
-    return GameSummary(
-        game_number=game_number,
-        winner=winner,
-        series_score=score,
-        turns=12,
-        sides=(
-            _side("charizard", "garchomp", "pikachu"),
-            _side("incineroar", "pikachu", "charizard"),
-        ),
-        speed_observations=("charizard>incineroar",),
-    )
-
-
-def _tokenizer():
-    return default_runtime_resources().tokenizer
-
-
-def test_empty_series_is_all_padding() -> None:
-    features = tensorize_series((), player_index=0, tokenizer=_tokenizer())
-    shape = (MAX_PRIOR_GAMES, SERIES_SIDES, SERIES_POKEMON_SLOTS)
-    assert features.species.shape == shape
-    assert features.moves.shape == (*shape, SERIES_MOVE_SLOTS)
-    assert features.poke_scalars.shape == (*shape, POKE_SCALAR_WIDTH)
-    assert features.side_scalars.shape == (MAX_PRIOR_GAMES, SERIES_SIDES, SIDE_SCALAR_WIDTH)
-    assert features.game_scalars.shape == (MAX_PRIOR_GAMES, GAME_SCALAR_WIDTH)
-    assert not features.game_mask.any()
-    assert features.species.eq(0).all() and features.game_scalars.eq(0.0).all()
-
-
-def test_perspective_flip() -> None:
-    tokenizer = _tokenizer()
-    game = _game(1, winner=1, score=(0, 1))
-    p0_view = tensorize_series((game,), player_index=0, tokenizer=tokenizer)
-    p1_view = tensorize_series((game,), player_index=1, tokenizer=tokenizer)
-
-    charizard = tokenizer.id_for("species", "charizard")
-    incineroar = tokenizer.id_for("species", "incineroar")
-    assert p0_view.species[0, 0, 0] == charizard and p0_view.species[0, 1, 0] == incineroar
-    assert p1_view.species[0, 0, 0] == incineroar and p1_view.species[0, 1, 0] == charizard
-
-    assert p0_view.game_scalars[0, 0] == -1.0 and p1_view.game_scalars[0, 0] == 1.0
-    assert p0_view.game_scalars[0, 1] == 0.0 and p0_view.game_scalars[0, 2] == 0.5
-    assert p1_view.game_scalars[0, 1] == 0.5 and p1_view.game_scalars[0, 2] == 0.0
-    assert p0_view.game_mask[0] and not p0_view.game_mask[1]
-    assert p0_view.game_number.tolist() == [1, 0]
-
-
-def test_side_features() -> None:
-    tokenizer = _tokenizer()
-    features = tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=tokenizer)
-
-    assert features.item[0, 0, 0] == tokenizer.id_for("items", "leftovers")
-    assert features.ability[0, 0, 0] == tokenizer.id_for("abilities", "blaze")
-    assert features.moves[0, 0, 0, 0] == tokenizer.id_for("moves", "flamethrower")
-    assert features.moves[0, 0, 0, 1] == tokenizer.id_for("moves", "protect")
-    assert features.moves[0, 0, 0, 2] == 0
-
-    lead_scalars = features.poke_scalars[0, 0, 0]
-    bench_scalars = features.poke_scalars[0, 0, 2]
-    assert lead_scalars.tolist() == [1.0, 0.0, 0.0, 1.0, 0.5]
-    assert bench_scalars.tolist() == [0.0, 0.0, 0.0, 1.0, 0.0]
-    assert features.poke_scalars[0, 0, 3].eq(0.0).all()
-
-    side_row = features.side_scalars[0, 0]
-    assert side_row[0] == pytest.approx(0.3) and side_row[1] == pytest.approx(0.1)
-    weather_slot = 2 + PLAN_TAGS.index("weather")
-    assert side_row[weather_slot] == 1.0
-    assert side_row[2:].sum() == 1.0
-
-
-def test_tensorize_validation() -> None:
-    tokenizer = _tokenizer()
-    with pytest.raises(ValueError, match="player_index"):
-        tensorize_series((), player_index=2, tokenizer=tokenizer)
-    games = (_game(1, 0, (1, 0)), _game(2, 1, (1, 1)), _game(3, 0, (2, 1)))
-    with pytest.raises(ValueError, match="At most"):
-        tensorize_series(games, player_index=0, tokenizer=tokenizer)
-    with pytest.raises(ValueError, match="in order"):
-        tensorize_series((_game(2, 0, (1, 0)),), player_index=0, tokenizer=tokenizer)
-
-
-def test_stack_batches_features() -> None:
-    tokenizer = _tokenizer()
-    single = tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=tokenizer)
-    empty = tensorize_series((), player_index=0, tokenizer=tokenizer)
-    batch = SeriesFeatures.stack([single, empty])
-    assert batch.species.shape[0] == 2
-    assert batch.game_mask.tolist() == [[True, False], [False, False]]
-    assert torch.equal(batch.species[0], single.species)
-    with pytest.raises(ValueError, match="at least one"):
-        SeriesFeatures.stack([])
-
+from p0.model.series_context import DynamicSeriesResampler
 
 D_MODEL = 32
-D_RAW = 16
 
 
-def _encoder() -> SeriesContextEncoder:
-    vocab = default_runtime_resources().vocab
+def _resampler() -> DynamicSeriesResampler:
     torch.manual_seed(0)
-    return SeriesContextEncoder(
+    return DynamicSeriesResampler(
         d_model=D_MODEL,
         nhead=4,
         dim_feedforward=64,
-        species_emb=nn.Embedding(len(vocab["species"]) + 1, D_RAW),
-        move_emb=nn.Embedding(len(vocab["moves"]) + 1, D_RAW),
-        item_emb=nn.Embedding(len(vocab["items"]) + 1, D_RAW),
-        ability_emb=nn.Embedding(len(vocab["abilities"]) + 1, D_RAW),
+        num_summary_tokens=SERIES_TOKENS_PER_GAME,
+        num_layers=2,
     )
 
 
-def _mixed_batch() -> SeriesFeatures:
-    tokenizer = _tokenizer()
-    with_games = tensorize_series(
-        (_game(1, 0, (1, 0)), _game(2, 1, (1, 1))), player_index=0, tokenizer=tokenizer
-    )
-    empty = tensorize_series((), player_index=0, tokenizer=tokenizer)
-    return SeriesFeatures.stack([with_games, empty])
+def test_resample_single_game_shape() -> None:
+    resampler = _resampler()
+    batch_size = 2
+    turns = 15
+    history = torch.randn(batch_size, turns, D_MODEL)
+    output = resampler.resample_single_game(history)
+    assert output.shape == (batch_size, SERIES_TOKENS_PER_GAME, D_MODEL)
+    assert torch.isfinite(output).all()
 
 
-def test_encoder_output_shape() -> None:
-    context = _encoder()(_mixed_batch())
-    assert context.shape == (2, MAX_PRIOR_GAMES, D_MODEL)
-    assert torch.isfinite(context).all()
+def test_resample_empty_game() -> None:
+    resampler = _resampler()
+    batch_size = 2
+    empty_history = torch.zeros(batch_size, 0, D_MODEL)
+    output = resampler.resample_single_game(empty_history)
+    assert output.shape == (batch_size, SERIES_TOKENS_PER_GAME, D_MODEL)
+    assert torch.equal(output[0], resampler.empty_game_context[0])
 
 
-def test_empty_rows_return_learned_empty_context() -> None:
-    encoder = _encoder()
-    context = encoder(_mixed_batch())
-    assert torch.equal(context[1], encoder.empty_context[0])
-    assert not torch.equal(context[0], encoder.empty_context[0])
+def test_series_context_encoding_shapes() -> None:
+    resampler = _resampler()
+    batch_size = 2
+    game1 = torch.randn(batch_size, 10, D_MODEL)
+    game2 = torch.randn(batch_size, 20, D_MODEL)
 
+    # 2 completed prior games
+    series_tokens, series_mask = resampler([game1, game2])
+    assert series_tokens.shape == (batch_size, SERIES_SLOTS, D_MODEL)
+    assert series_mask.shape == (batch_size, SERIES_SLOTS)
+    assert series_mask.all()
 
-def test_encoder_rejects_unbatched_features() -> None:
-    single = tensorize_series((), player_index=0, tokenizer=_tokenizer())
-    with pytest.raises(ValueError, match="batched"):
-        _encoder()(single)
-
-
-def test_encoder_rejects_grad_carrying_features() -> None:
-    batch = _mixed_batch()
-    leaky = SeriesFeatures(
-        **{
-            field.name: getattr(batch, field.name)
-            for field in fields(SeriesFeatures)
-            if field.name != "poke_scalars"
-        },
-        poke_scalars=batch.poke_scalars.clone().requires_grad_(True),
-    )
-    with pytest.raises(ValueError, match="must not require grad"):
-        _encoder()(leaky)
-
-
-def test_encoder_grads_reach_projections() -> None:
-    encoder = _encoder()
-    context = encoder(_mixed_batch())
-    # a plain sum has near-zero gradient through the encoder's final LayerNorm
-    # (the normalized output sums to a constant), so square first
-    context.pow(2).sum().backward()
-    assert encoder.series_queries.grad is not None
-    assert encoder.poke_proj.weight.grad is not None
-    assert encoder.poke_proj.weight.grad.abs().sum() > 0
+    # 1 completed prior game
+    series_tokens_1, series_mask_1 = resampler([game1])
+    assert series_tokens_1.shape == (batch_size, SERIES_SLOTS, D_MODEL)
+    assert series_mask_1[:, :4].all()
+    assert not series_mask_1[:, 4:].any()
 
 
 def _policy() -> PolicyNet:
@@ -223,51 +70,9 @@ def _policy() -> PolicyNet:
     return build_policy(config, default_runtime_resources())
 
 
-def _dummy_obs(batch_size: int) -> StructuredObservation:
-    return StructuredObservation(
-        token_type_ids=torch.zeros((batch_size, SEQUENCE_LENGTH), dtype=torch.long),
-        side_ids=torch.zeros((batch_size, SEQUENCE_LENGTH), dtype=torch.long),
-        slot_ids=torch.zeros((batch_size, SEQUENCE_LENGTH), dtype=torch.long),
-        categorical=torch.zeros((batch_size, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long),
-        numerical=torch.zeros((batch_size, SEQUENCE_LENGTH, NUMERICAL_WIDTH)),
-        events_cat=torch.zeros(
-            (batch_size, EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), dtype=torch.long
-        ),
-        events_num=torch.zeros((batch_size, EVENT_COUNT, EVENT_NUMERICAL_WIDTH)),
-        events_side_ids=torch.zeros((batch_size, EVENT_COUNT), dtype=torch.long),
-        events_slot_ids=torch.zeros((batch_size, EVENT_COUNT), dtype=torch.long),
-        events_metadata=torch.zeros((batch_size, 2)),
-    )
-
-
-def test_series_embeddings_shared_with_battle_encoder() -> None:
+def test_policy_series_resampler() -> None:
     policy = _policy()
-    assert policy.series.species_emb is policy.encoder.species_emb
-    assert policy.series.move_emb is policy.encoder.move_emb
-    assert policy.series.item_emb is policy.encoder.item_emb
-    assert policy.series.ability_emb is policy.encoder.ability_emb
-    # tied tables appear under both prefixes in the state dict but only once
-    # in the optimizer-facing parameter list
-    named = dict(policy.named_parameters())
-    assert "encoder.species_emb.weight" in named
-    assert "series.species_emb.weight" not in named
-    assert "series.species_emb.weight" in policy.state_dict()
-
-
-def test_series_encoder_outputs_one_token_per_completed_game() -> None:
-    policy = _policy()
-    empty = tensorize_series((), player_index=0, tokenizer=_tokenizer())
-    game = tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=_tokenizer())
-    features = SeriesFeatures.stack([empty, game])
-    context = policy.encode_series(features)
-    assert context.shape == (2, MAX_PRIOR_GAMES, policy.d_model)
-    assert torch.equal(context[0], policy.series.empty_context[0])
-    assert not torch.equal(context[1, 0], policy.series.empty_context[0, 0])
-
-
-def test_series_encoder_gradients_are_local_to_each_game_slot() -> None:
-    encoder = _encoder()
-    context = encoder(_mixed_batch())
-    context[0, 0].square().sum().backward()
-    assert encoder.series_queries.grad is not None
-    assert encoder.poke_proj.weight.grad is not None
+    game1 = torch.randn(1, 12, policy.d_model)
+    tokens, mask = policy.encode_series([game1])
+    assert tokens.shape == (1, SERIES_SLOTS, policy.d_model)
+    assert mask.shape == (1, SERIES_SLOTS)

@@ -108,7 +108,7 @@ class MemoryReducer(nn.Module):
         batch = current_tokens.size(0)
         expected = (batch, SERIES_SLOTS, self.d_model)
         if series_tokens.shape != expected or series_mask.shape != (batch, SERIES_SLOTS):
-            raise ValueError("series tokens or mask do not match the fixed two-slot contract")
+            raise ValueError("series tokens or mask do not match the series slot contract")
         expected_history = (batch, HISTORY_WINDOW, self.d_model)
         if history_tokens.shape != expected_history:
             raise ValueError("history tokens do not match the fixed 48-slot contract")
@@ -131,7 +131,7 @@ class MemoryReducer(nn.Module):
         history_mask: Tensor,
         history_age_ids: Tensor,
     ) -> ReducerOutput:
-        """Run full attention over one fixed 75-position memory window."""
+        """Run full attention over the fixed memory window."""
         self._validate_inputs(
             current_tokens,
             series_tokens,
@@ -188,8 +188,3 @@ class MemoryReducer(nn.Module):
             query, current_tokens, current_tokens, need_weights=False
         )
         return summary[:, 0]
-
-
-# Keep the old import path usable for external callers while exposing the new
-# stateless semantics. It intentionally has no recurrent parameters or state.
-CLSReducer = MemoryReducer

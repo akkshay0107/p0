@@ -2,7 +2,6 @@ from typing import cast
 
 import torch
 
-from p0.battle.series import GameSummary, SideGameSummary
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import (
     CURRENT_REDUCER_TOKEN_COUNT,
@@ -16,7 +15,6 @@ from p0.model.cls_reducer import MemoryReducer, pack_history_tokens
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.model.series_context import tensorize_series
 from p0.model.structured_observation import (
     EVENT_COUNT,
     EVENT_METADATA_WIDTH,
@@ -44,8 +42,8 @@ def test_fixed_memory_and_observation_contract() -> None:
     assert observation.events_num.shape == (2, 64, EVENT_NUMERICAL_WIDTH)
     assert observation.events_metadata.shape == (2, EVENT_METADATA_WIDTH)
     assert set(TokenType) == {TokenType.POKEMON, TokenType.FIELD, TokenType.EVENT}
-    assert (CURRENT_TOKEN_COUNT, CURRENT_REDUCER_TOKEN_COUNT, REDUCER_MAX_LENGTH) == (24, 25, 75)
-    assert (HISTORY_WINDOW, SERIES_SLOTS, POOLED_EVENT_COUNT) == (48, 2, 8)
+    assert (CURRENT_TOKEN_COUNT, CURRENT_REDUCER_TOKEN_COUNT, REDUCER_MAX_LENGTH) == (24, 25, 81)
+    assert (HISTORY_WINDOW, SERIES_SLOTS, POOLED_EVENT_COUNT) == (48, 8, 8)
 
 
 def test_empty_events_are_finite_deterministic_and_pooled() -> None:
@@ -112,7 +110,8 @@ def test_reducer_uses_fixed_padding_only_memory_attention() -> None:
     reducer = MemoryReducer(32, 4, 1, 64)
     current = torch.randn(2, CURRENT_TOKEN_COUNT, 32)
     series = torch.randn(2, SERIES_SLOTS, 32)
-    series_mask = torch.tensor([[False, False], [True, False]])
+    series_mask = torch.zeros(2, SERIES_SLOTS, dtype=torch.bool)
+    series_mask[1, :4] = True
     history = torch.randn(2, HISTORY_WINDOW, 32)
     history_mask = torch.zeros(2, HISTORY_WINDOW, dtype=torch.bool)
     ages = torch.zeros(2, HISTORY_WINDOW, dtype=torch.long)
@@ -166,27 +165,7 @@ def test_policy_exposes_24_current_tokens_and_immutable_history_token() -> None:
 
 def test_ppo_reencodes_raw_series_features_inside_the_current_graph() -> None:
     policy = _policy()
-    side = SideGameSummary(
-        leads=("pikachu", "charizard"),
-        brought=("pikachu", "charizard"),
-        mega_species="",
-        moves_used={},
-        revealed_items={},
-        revealed_abilities={},
-        revealed_formes=(),
-        switch_count=0,
-        pivot_count=0,
-    )
-    summary = GameSummary(
-        game_number=1,
-        winner=0,
-        series_score=(1, 0),
-        turns=1,
-        sides=(side, side),
-    )
-    series_features = tensorize_series(
-        (summary,), player_index=0, tokenizer=policy.resources.tokenizer
-    )
+    game1_history = torch.randn(1, 10, policy.d_model)
     observation = StructuredObservation.empty_batch(1)
     action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
     episode = TrajectoryBatch(
@@ -200,7 +179,7 @@ def test_ppo_reencodes_raw_series_features_inside_the_current_graph() -> None:
         length=1,
         returns=torch.zeros(1),
         advantages=torch.ones(1),
-        series_features=series_features,
+        series_features=[game1_history],
     )
     loss, _, _ = _run_batched_ppo(
         [episode],
@@ -212,4 +191,4 @@ def test_ppo_reencodes_raw_series_features_inside_the_current_graph() -> None:
         alpha=0.0,
     )
     loss.backward()
-    assert policy.series.series_queries.grad is not None
+    assert policy.series.summary_queries.grad is not None

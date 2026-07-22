@@ -207,12 +207,13 @@ def test_fainted_pokemon_visible(policy_net):
 
 
 def test_memory_reducer_pokemon_tokens_alignment():
+    from p0.model.architecture_contract import SERIES_SLOTS
     from p0.model.cls_reducer import MemoryReducer
 
     reducer = MemoryReducer(32, 4, 1, 128)
     current = torch.randn(2, 24, 32)
-    series = torch.zeros(2, 2, 32)
-    series_mask = torch.zeros(2, 2, dtype=torch.bool)
+    series = torch.zeros(2, SERIES_SLOTS, 32)
+    series_mask = torch.zeros(2, SERIES_SLOTS, dtype=torch.bool)
     history = torch.zeros(2, 48, 32)
     history_mask = torch.zeros(2, 48, dtype=torch.bool)
     ages = torch.zeros(2, 48, dtype=torch.long)

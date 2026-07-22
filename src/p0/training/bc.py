@@ -13,7 +13,6 @@ from torch.amp import GradScaler, autocast
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import PolicyNet
-from p0.model.series_context import SeriesFeatures, tensorize_series
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
@@ -145,13 +144,9 @@ class BCTrainer:
         )
 
     def _series_inputs(self, game: ReplayGameChunk) -> tuple[Tensor, Tensor]:
-        features = tensorize_series(
-            game.summary_inputs,
-            player_index=game.player,
-            tokenizer=self.policy.resources.tokenizer,
-        )
-        series = self.policy.encode_series(SeriesFeatures.stack([features]))
-        return series, features.game_mask.unsqueeze(0).to(self.device)
+        histories = getattr(game, "prior_game_histories", None)
+        series, mask = self.policy.encode_series(histories)
+        return series.to(self.device), mask.to(self.device)
 
     def _history_inputs(
         self,

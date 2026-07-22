@@ -157,8 +157,7 @@ def test_benchmark_reports_validation_nll_for_compatible_artifacts(tmp_path):
     result = run_benchmark(_benchmark_config(checkpoint=checkpoint, validation_artifact=validation))
 
     assert all(
-        variant["validation_bc_nll"]["status"] == "available"
-        for variant in result["variants"]
+        variant["validation_bc_nll"]["status"] == "available" for variant in result["variants"]
     )
     assert all(variant["validation_bc_nll"]["value"] >= 0 for variant in result["variants"])
     assert encoded.numerical.shape == (1, SEQUENCE_LENGTH, NUMERICAL_WIDTH)

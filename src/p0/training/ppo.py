@@ -15,7 +15,6 @@ from torch.amp import GradScaler, autocast
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import EncodedObs, PolicyNet
-from p0.model.series_context import SeriesFeatures
 from p0.model.structured_observation import StructuredObservation, is_teampreview
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
@@ -149,38 +148,34 @@ def _build_memory_inputs(
     history_tokens = torch.stack(history_parts)
     history_mask = torch.stack(history_mask_parts)
     history_age_ids = torch.stack(history_age_parts)
-
-    encoded_series: list[torch.Tensor | None] = [None] * len(episodes)
+    encoded_series: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(episodes)
     raw_series_indices = [
         index for index, episode_item in enumerate(episodes) if episode_item.series_features is not None
     ]
     if raw_series_indices:
-        raw_feature_values: list[SeriesFeatures] = []
+        raw_feature_values = []
         for index in raw_series_indices:
             features = episodes[index].series_features
             if features is None:
                 raise RuntimeError("series feature index construction drifted")
             raw_feature_values.append(features)
-        raw_features = SeriesFeatures.stack(raw_feature_values)
-        raw_encoded = policy.encode_series(raw_features)
+        raw_encoded, raw_masks = policy.encode_series(raw_feature_values)
         for batch_index, episode_index in enumerate(raw_series_indices):
-            encoded_series[episode_index] = raw_encoded[batch_index]
+            encoded_series[episode_index] = (raw_encoded[batch_index], raw_masks[batch_index])
 
     series_token_parts = []
     series_mask_parts = []
     for episode_index, episode_item in enumerate(episodes):
-        encoded_series_item = encoded_series[episode_index]
-        if encoded_series_item is not None:
-            features = episode_item.series_features
-            if features is None:
-                raise RuntimeError("encoded series context is missing its source features")
+        encoded_tuple = encoded_series[episode_index]
+        if encoded_tuple is not None:
+            encoded_tok, encoded_msk = encoded_tuple
             series_token_parts.append(
-                encoded_series_item.to(device=device, dtype=dtype)
+                encoded_tok.to(device=device, dtype=dtype)
                 .unsqueeze(0)
                 .expand(episode_item.length, -1, -1)
             )
             series_mask_parts.append(
-                features.game_mask.to(device=device).unsqueeze(0).expand(episode_item.length, -1)
+                encoded_msk.to(device=device).unsqueeze(0).expand(episode_item.length, -1)
             )
         elif episode_item.series_tokens is None:
             series_token_parts.append(

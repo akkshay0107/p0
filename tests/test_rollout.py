@@ -5,8 +5,8 @@ import numpy as np
 import torch
 
 from p0.format_config import FORMAT
+from p0.model.architecture_contract import SERIES_SLOTS
 from p0.model.policy import ActOutput
-from p0.model.series_context import empty_series_features
 from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.rollout import (
@@ -48,8 +48,12 @@ class FakePolicy:
             history_token=torch.ones((batch_size, 1)),
         )
 
-    def encode_series(self, features):
-        return features.game_mask.to(dtype=torch.float32).unsqueeze(-1)
+    def encode_series(self, histories):
+        batch_size = len(histories) if isinstance(histories, list) and histories else 1
+        return (
+            torch.zeros((batch_size, SERIES_SLOTS, self.d_model)),
+            torch.zeros((batch_size, SERIES_SLOTS), dtype=torch.bool),
+        )
 
 
 class FakeVecEnv:
@@ -107,8 +111,7 @@ class FakeSeriesProvider:
     def __init__(self, n_envs: int):
         self.game_numbers = [1 for _ in range(n_envs)]
         self.completed: list[int] = []
-        self.features = empty_series_features()
-        self.features.game_mask[0] = True
+        self.features = torch.randn(1, 5, 1)
 
     def current(self, env_id: int, player: int):
         from p0.training.rollout import RolloutSeriesContext
