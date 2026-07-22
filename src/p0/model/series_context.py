@@ -78,6 +78,12 @@ class SeriesFeatures:
             }
         )
 
+    def to(self, device: torch.device | str) -> SeriesFeatures:
+        """Move feature tensors without changing their grad-free contract."""
+        return SeriesFeatures(
+            **{field.name: getattr(self, field.name).to(device) for field in fields(self)}
+        )
+
 
 def _side_species(side: SideGameSummary) -> tuple[str, ...]:
     # brought lists observed members only and always includes the leads when
@@ -138,6 +144,11 @@ def _empty_features() -> SeriesFeatures:
         game_number=torch.zeros(MAX_PRIOR_GAMES, dtype=torch.long),
         game_mask=torch.zeros(MAX_PRIOR_GAMES, dtype=torch.bool),
     )
+
+
+def empty_series_features() -> SeriesFeatures:
+    """Return the canonical all-padding series input for training adapters."""
+    return _empty_features()
 
 
 def tensorize_series(
@@ -205,7 +216,6 @@ class SeriesContextEncoder(nn.Module):
         d_model: int,
         nhead: int,
         dim_feedforward: int,
-        series_tokens: int,
         species_emb: nn.Embedding,
         move_emb: nn.Embedding,
         item_emb: nn.Embedding,
@@ -221,7 +231,6 @@ class SeriesContextEncoder(nn.Module):
             if emb.embedding_dim != d_raw:
                 raise ValueError(f"{name} width {emb.embedding_dim} does not match {d_raw}")
         self.d_model = d_model
-        self.series_tokens = series_tokens
         self.species_emb = species_emb
         self.move_emb = move_emb
         self.item_emb = item_emb
@@ -235,8 +244,8 @@ class SeriesContextEncoder(nn.Module):
         # 2-row self/opponent table local to this module; the battle side table
         # is 3-row with different index semantics (field/ally/opponent)
         self.side_emb = nn.Embedding(SERIES_SIDES, d_model)
-        self.series_queries = nn.Parameter(torch.empty(1, series_tokens, d_model))
-        self.empty_context = nn.Parameter(torch.empty(1, series_tokens, d_model))
+        self.series_queries = nn.Parameter(torch.empty(1, MAX_PRIOR_GAMES, d_model))
+        self.empty_context = nn.Parameter(torch.empty(1, MAX_PRIOR_GAMES, d_model))
         self.encoder = SwiGLUTransformerEncoder(
             d_model=d_model,
             nhead=nhead,
@@ -322,8 +331,8 @@ class SeriesContextEncoder(nn.Module):
 
         game_tokens = self.game_scalar_proj(game_scalars) + self.game_number_emb(game_number)
 
-        # (B, G, tokens-per-game, d): flatten side/pokemon structure per game,
-        # then games into one sequence behind the query tokens
+        # Encode each completed game independently so each fixed series slot
+        # contains exactly one summary and no game can attend to another.
         per_game = torch.cat(
             [
                 poke_tokens.flatten(2, 3),
@@ -335,12 +344,15 @@ class SeriesContextEncoder(nn.Module):
         per_game = per_game + self.game_pos_emb(
             torch.arange(MAX_PRIOR_GAMES, device=device)
         ).unsqueeze(1)
-        sequence = torch.cat(
-            [self.series_queries.expand(batch_size, -1, -1), per_game.flatten(1, 2)], dim=1
+        queries = (
+            self.series_queries.expand(batch_size, -1, -1)
+            + self.game_pos_emb(torch.arange(MAX_PRIOR_GAMES, device=device))[None]
+        )
+        sequence = torch.cat([queries.unsqueeze(2), per_game], dim=2)
+        sequence = sequence.reshape(
+            batch_size * MAX_PRIOR_GAMES, 1 + _TOKENS_PER_GAME, self.d_model
         )
 
-        # queries are never padded; padded Pokemon slots and whole padded games
-        # are excluded from attention instead of being zeroed
         poke_padding = (poke_scalars[..., 3] < 0.5).flatten(2, 3)
         record_padding = torch.zeros(
             batch_size,
@@ -352,46 +364,16 @@ class SeriesContextEncoder(nn.Module):
         game_padding = torch.cat([poke_padding, record_padding], dim=2) | ~game_mask[:, :, None]
         padding = torch.cat(
             [
-                torch.zeros(batch_size, self.series_tokens, dtype=torch.bool, device=device),
-                game_padding.flatten(1, 2),
+                torch.zeros(batch_size, MAX_PRIOR_GAMES, 1, dtype=torch.bool, device=device),
+                game_padding,
             ],
-            dim=1,
-        )
+            dim=2,
+        ).reshape(batch_size * MAX_PRIOR_GAMES, 1 + _TOKENS_PER_GAME)
 
-        encoded = self.encoder(sequence, src_key_padding_mask=padding)[:, : self.series_tokens]
-        has_games = game_mask.any(dim=-1)
+        encoded = self.encoder(sequence, src_key_padding_mask=padding)[:, 0]
+        encoded = encoded.reshape(batch_size, MAX_PRIOR_GAMES, self.d_model)
         return torch.where(
-            has_games[:, None, None],
+            game_mask[:, :, None],
             encoded,
             self.empty_context.expand(batch_size, -1, -1).to(encoded.dtype),
         )
-
-
-class SeriesStateConditioner(nn.Module):
-    """Condition the learned initial recurrent state on series context tokens.
-
-    The per-channel gate is zero-initialized, so a freshly constructed
-    conditioner returns hg_init unchanged for any context; enabling series
-    context on a warm-started policy is behavior-preserving at step zero.
-    """
-
-    def __init__(self, d_model: int, nhead: int, history_tokens: int):
-        super().__init__()
-        self.history_tokens = history_tokens
-        self.query_bias = nn.Parameter(torch.empty(1, history_tokens, d_model))
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.gate = nn.Parameter(torch.zeros(1, history_tokens, d_model))
-        with torch.no_grad():
-            init.normal_(self.query_bias, std=d_model**-0.5)
-            init.orthogonal_(self.attn.out_proj.weight, gain=1.0)
-            init.zeros_(self.attn.out_proj.bias)
-
-    def forward(self, hg_init: Tensor, context: Tensor) -> Tensor:
-        if hg_init.shape[:2] != (1, self.history_tokens):
-            raise ValueError(
-                f"Expected hg_init (1, {self.history_tokens}, d); got {tuple(hg_init.shape)}"
-            )
-        batch_size = context.size(0)
-        queries = (hg_init + self.query_bias).expand(batch_size, -1, -1)
-        delta, _ = self.attn(queries, context, context, need_weights=False)
-        return hg_init.expand(batch_size, -1, -1) + self.gate * delta

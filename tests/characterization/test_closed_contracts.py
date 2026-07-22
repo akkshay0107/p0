@@ -121,16 +121,16 @@ def test_golden_observation_shape_indices_and_enum_ids() -> None:
     assert observation.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
     assert observation.events_cat.shape == (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH)
     assert observation.events_num.shape == (EVENT_COUNT, EVENT_NUMERICAL_WIDTH)
-    assert observation.token_type_ids[[0, 1, 12, 13, 14, 15]].tolist() == [
-        TokenType.CLS,
+    assert observation.token_type_ids[[0, 1, 6, 12, 13, 14]].tolist() == [
+        TokenType.POKEMON,
         TokenType.POKEMON,
         TokenType.POKEMON,
         TokenType.FIELD,
         TokenType.FIELD,
         TokenType.FIELD,
     ]
-    assert observation.side_ids[[0, 1, 7, 13, 14, 15]].tolist() == [
-        SideId.NONE,
+    assert observation.side_ids[[0, 1, 6, 12, 13, 14]].tolist() == [
+        SideId.ALLY,
         SideId.ALLY,
         SideId.OPPONENT,
         SideId.NONE,
@@ -139,13 +139,13 @@ def test_golden_observation_shape_indices_and_enum_ids() -> None:
     ]
     assert [member.value for member in Knownness] == [0, 1, 2, 3, 4]
     assert [member.value for member in Provenance] == [0, 1, 2, 3, 4, 5]
-    assert observation.numerical[1, 5].item() == pytest.approx(0.73)
+    assert observation.numerical[0, 5].item() == pytest.approx(0.73)
 
 
-def test_schema_v3_owned_entity_layout_is_pinned() -> None:
-    """Pin the v3 owned-entity layout: one fused token per owner, no numeric tokens."""
-    assert OBSERVATION_SCHEMA_VERSION == 3
-    assert SEQUENCE_LENGTH == 16
+def test_schema_v4_owned_entity_layout_is_pinned() -> None:
+    """Pin the v4 owned-entity layout and fixed memory-channel dimensions."""
+    assert OBSERVATION_SCHEMA_VERSION == 4
+    assert SEQUENCE_LENGTH == 15
     assert MAX_EFFECTS == 12
     assert CATEGORICAL_WIDTH == 87
     assert NUMERICAL_WIDTH == 126
@@ -153,9 +153,9 @@ def test_schema_v3_owned_entity_layout_is_pinned() -> None:
     assert CAT_EFFECT_START == 51
     assert NUM_IDX_STATUS_COUNTER == 36
     assert NUM_EFFECT_START == 64
-    assert (TOKEN_IDX_GLOBAL_FIELD, TOKEN_IDX_ALLY_SIDE, TOKEN_IDX_OPPONENT_SIDE) == (13, 14, 15)
+    assert (TOKEN_IDX_GLOBAL_FIELD, TOKEN_IDX_ALLY_SIDE, TOKEN_IDX_OPPONENT_SIDE) == (12, 13, 14)
     # the v2 super/numeric token-pair split is retired
-    assert [member.name for member in TokenType] == ["CLS", "POKEMON", "FIELD", "EVENT"]
+    assert [member.name for member in TokenType] == ["POKEMON", "FIELD", "EVENT"]
 
 
 def test_status_record_owns_counter_semantics() -> None:
@@ -176,8 +176,8 @@ def test_status_record_owns_counter_semantics() -> None:
     ally._status = Status.TOX
     ally._status_counter = 2
     observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
-    assert observation.categorical[1, CAT_IDX_STATUS_COUNTER_KIND] == CounterKind.STACK_COUNT
-    assert observation.numerical[1, NUM_IDX_STATUS_COUNTER].item() == pytest.approx(2 / 5)
+    assert observation.categorical[0, CAT_IDX_STATUS_COUNTER_KIND] == CounterKind.STACK_COUNT
+    assert observation.numerical[0, NUM_IDX_STATUS_COUNTER].item() == pytest.approx(2 / 5)
 
 
 def test_event_priority_order_and_overflow_are_stable() -> None:
@@ -260,7 +260,7 @@ def test_shared_contract_versions_and_enums_are_pinned() -> None:
     assert REPLAY_IR_SCHEMA_VERSION == 1
     assert SERIES_SUMMARY_SCHEMA_VERSION == 1
     assert MAX_PRIOR_GAMES == 2
-    assert SHARD_ARTIFACT_SCHEMA == "p0.replay_shard.v1"
+    assert SHARD_ARTIFACT_SCHEMA == "p0.replay_shard.v2"
     assert CORPUS_MANIFEST_SCHEMA == "p0.team_corpus.v1"
 
     pinned = {

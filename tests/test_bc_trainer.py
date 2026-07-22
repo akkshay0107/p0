@@ -38,17 +38,16 @@ def _chunk(label_kind: list[int], candidate_values: list[tuple[int, int]], offse
     )
 
 
-def _trainer(chunk: ReplayGameChunk, *, chunk_length: int = 2) -> BCTrainer:
+def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
     policy = build_policy(
-        ModelConfig(64, 4, 1, 8, 128),
+        ModelConfig(64, 4, 1, 128),
         default_runtime_resources(),
     )
     return BCTrainer(
         policy,
         (chunk,),
         BCConfig(
-            chunk_length=chunk_length,
-            batch_decisions=2,
+            batch_decisions=minibatch_size,
             learning_rate=1e-3,
             epochs=1,
             amp=False,
@@ -63,7 +62,7 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
         [(7, 8), (7, 8)],
         [0, 1, 2],
     )
-    trainer = _trainer(chunk, chunk_length=1)
+    trainer = _trainer(chunk, minibatch_size=1)
     before = {
         name: parameter.detach().clone() for name, parameter in trainer.policy.named_parameters()
     }
@@ -80,7 +79,7 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
     )
 
 
-def test_unknown_decision_advances_recurrence_without_policy_loss() -> None:
+def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
     chunk = _chunk(
         [int(LabelKind.UNKNOWN), int(LabelKind.EXACT)],
         [(7, 8)],
@@ -90,3 +89,21 @@ def test_unknown_decision_advances_recurrence_without_policy_loss() -> None:
     assert metrics.decisions == 2
     assert metrics.labeled_decisions == 1
     assert metrics.exact_decisions == 1
+
+
+def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
+    chunk = _chunk([int(LabelKind.EXACT)] * 4, [(7, 8)] * 4, [0, 1, 2, 3, 4])
+    trainer = _trainer(chunk, minibatch_size=2)
+    local_tokens = torch.randn(52, trainer.policy.d_model)
+
+    whole = trainer._history_inputs(local_tokens)
+    window = trainer._history_inputs(local_tokens, slice(48, 52))
+    for whole_part, window_part in zip(whole, window, strict=True):
+        torch.testing.assert_close(whole_part[48:], window_part)
+
+    changed_ancient = local_tokens.clone()
+    changed_ancient[0] += 1000.0
+    original_last = trainer._history_inputs(local_tokens, slice(51, 52))
+    changed_last = trainer._history_inputs(changed_ancient, slice(51, 52))
+    for original_part, changed_part in zip(original_last, changed_last, strict=True):
+        torch.testing.assert_close(original_part, changed_part)

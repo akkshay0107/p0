@@ -35,11 +35,11 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 ## Features
 
 - **Custom Tokenizer & Observation Builder**: Converts Pokemon VGC game states (species, items, moves, abilities, status conditions, active/bench volatiles, side conditions) into tokens mapped from a pre-built game vocabulary. The categorical tokens and the remaining numerical features from the battle are packed into a structured observation used downstream.
-- **Token Fusion Encoder**: Combines categorical embeds and numerical values per Pokemon, routing them through a single-layer encoder. The `[CLS]` token of the encoder output is used as a "super token" for each Pokemon. The custom implementation of a SwiGLU variant was built for fun to try something new. I do not particularly know if it is any more effective than the default GELU version. It is slightly quicker though due to not implementing the unused features. Other tokens for the global field status or the side conditions on each side are also fused at this layer.
+- **Token Fusion Encoder**: Combines categorical embeds and numerical values per Pokemon, routing them through a single-layer encoder. Each Pokemon, global-field, and side-owner row is fused directly; event rows are encoded at low width and pooled into eight fixed event tokens. The custom implementation of a SwiGLU variant was built for fun to try something new. Other tokens for the global field status or the side conditions on each side are also fused at this layer.
 - **Autoregressive Policy Pointer Head**: Uses a pointer-attention network to select actions. The first head predicts action `a1` for the first active Pokemon. This selection is embedded and passed as context to the second head to predict action `a2` for the second active Pokemon. Sequential masking prevents invalid choices (such as duplicate switch targets or multiple mega evolutions in a single turn).
 - **Inbuilt Team Preview Handling**: The same policy used for battling can also be used for team picking at the team preview stage. The input is differentiated through a team preview flag in the observation.
 - **League-Style Training (PFSP & Anchored Pool)**: Trains against past snapshots of itself and a shadow model (updated through EMA) with PFSP sampling. Anchors policies that have diverse play styles through an approximate test. Unlike AlphaStar, I do not train exploiter agents (since I would like my minimal step budget to go towards training the main agent; this might be considered with a larger budget).
-- **Recurrent Policy Training**: Runs Backpropagation Through Time (BPTT) over games to train recurrent memory tokens that are part of the encoder. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
+- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with two fixed prior-game slots and full attention over a 75-position layout. BC and PPO batch complete games or bounded target windows without recurrent state APIs. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
 - **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
 - **Mixed Precision (FP16) & CUDA Graph Compilation**: Optional but speeds up training by around 1.7x on the few short runs I have done on a T4.
 
@@ -114,11 +114,11 @@ The former `.ppoconfig` format is no longer accepted; migrate its flat keys into
 
 ### Runtime compatibility
 
-The reducer-depth benchmark measures all unified depth and pass-embedding variants using the project baseline model dimensions by default, on the project default device. Device and model dimensions have optional overrides. Timing, batch, depth, dtype, and seed inputs have practical defaults; optional BC validation requires a compatible checkpoint and tensor artifact.
+The reducer-depth benchmark measures baseline and deeper fixed memory-reducer variants using the project baseline model dimensions by default, on the project default device. Device and model dimensions have optional overrides. Timing, batch, depth, dtype, and seed inputs have practical defaults; optional BC validation requires a compatible checkpoint and tensor artifact.
 
 For a default-sized run:
 
-    uv run python bench/benchmark_reducer_depth.py --dtype float32 --seed 7 --warmup 2 --iterations 5 --repeats 5 --batch-size 2 --time-steps 4 --deep-core-repeats 3
+    uv run python bench/benchmark_reducer_depth.py --dtype float32 --seed 7 --warmup 2 --iterations 5 --repeats 5 --batch-size 2 --time-steps 4 --deep-reducer-layers 3
 
 `data/runtime_manifest.json` contains one human-readable, load-breaking runtime contract.
 Checkpoints reference its `runtime_contract_sha256`. Vocabulary, action-layout, tensor-ABI,
@@ -136,6 +136,18 @@ uv run ruff check src tests
 uv run pyright
 uv run pytest -q
 uv build
+```
+
+The BC `batch_decisions` setting is an explicit target-window budget. Each window
+recomputes its local context under current weights before updating, while retaining
+past-only context and the fixed 48-decision cap. PPO can receive validated simulator
+series features through its training-side rollout provider; live protocol summary
+production remains a separate deployment concern.
+
+Run the memory-channel performance baseline with:
+
+```bash
+uv run python bench/benchmark_memory_channel.py --batch-size 8 --iterations 20
 ```
 
 The installed command-line interfaces are `p0-train`, `p0-play`, `p0-build-vocab`, and `p0-export-training`.

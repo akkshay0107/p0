@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 from p0.battle.series import MAX_PRIOR_GAMES, GameSummary, SideGameSummary
-from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
@@ -20,7 +19,6 @@ from p0.model.series_context import (
     SIDE_SCALAR_WIDTH,
     SeriesContextEncoder,
     SeriesFeatures,
-    SeriesStateConditioner,
     tensorize_series,
 )
 from p0.model.structured_observation import (
@@ -145,7 +143,6 @@ def test_stack_batches_features() -> None:
 
 D_MODEL = 32
 D_RAW = 16
-SERIES_TOKENS = 3
 
 
 def _encoder() -> SeriesContextEncoder:
@@ -155,7 +152,6 @@ def _encoder() -> SeriesContextEncoder:
         d_model=D_MODEL,
         nhead=4,
         dim_feedforward=64,
-        series_tokens=SERIES_TOKENS,
         species_emb=nn.Embedding(len(vocab["species"]) + 1, D_RAW),
         move_emb=nn.Embedding(len(vocab["moves"]) + 1, D_RAW),
         item_emb=nn.Embedding(len(vocab["items"]) + 1, D_RAW),
@@ -174,7 +170,7 @@ def _mixed_batch() -> SeriesFeatures:
 
 def test_encoder_output_shape() -> None:
     context = _encoder()(_mixed_batch())
-    assert context.shape == (2, SERIES_TOKENS, D_MODEL)
+    assert context.shape == (2, MAX_PRIOR_GAMES, D_MODEL)
     assert torch.isfinite(context).all()
 
 
@@ -216,38 +212,13 @@ def test_encoder_grads_reach_projections() -> None:
     assert encoder.poke_proj.weight.grad.abs().sum() > 0
 
 
-def test_conditioner_zero_gate_is_identity() -> None:
-    torch.manual_seed(0)
-    conditioner = SeriesStateConditioner(D_MODEL, nhead=4, history_tokens=8)
-    hg_init = torch.randn(1, 8, D_MODEL)
-    context = torch.randn(5, SERIES_TOKENS, D_MODEL)
-    state = conditioner(hg_init, context)
-    assert torch.equal(state, hg_init.expand(5, -1, -1))
-    with pytest.raises(ValueError, match="hg_init"):
-        conditioner(torch.randn(1, 4, D_MODEL), context)
-
-
-def test_conditioner_gate_admits_context() -> None:
-    torch.manual_seed(0)
-    conditioner = SeriesStateConditioner(D_MODEL, nhead=4, history_tokens=8)
-    with torch.no_grad():
-        conditioner.gate.fill_(1.0)
-    hg_init = torch.randn(1, 8, D_MODEL)
-    state_a = conditioner(hg_init, torch.randn(2, SERIES_TOKENS, D_MODEL))
-    state_b = conditioner(hg_init, torch.randn(2, SERIES_TOKENS, D_MODEL))
-    assert not torch.equal(state_a, state_b)
-
-
-def _policy(enabled: bool) -> PolicyNet:
+def _policy() -> PolicyNet:
     torch.manual_seed(0)
     config = ModelConfig(
         d_model=64,
         nhead=4,
-        prelude_layers=1,
-        history_tokens=8,
+        reducer_layers=1,
         dim_feedforward=128,
-        series_context_enabled=enabled,
-        series_tokens=SERIES_TOKENS,
     )
     return build_policy(config, default_runtime_resources())
 
@@ -265,19 +236,12 @@ def _dummy_obs(batch_size: int) -> StructuredObservation:
         events_num=torch.zeros((batch_size, EVENT_COUNT, EVENT_NUMERICAL_WIDTH)),
         events_side_ids=torch.zeros((batch_size, EVENT_COUNT), dtype=torch.long),
         events_slot_ids=torch.zeros((batch_size, EVENT_COUNT), dtype=torch.long),
+        events_metadata=torch.zeros((batch_size, 2)),
     )
 
 
-def test_disabled_policy_has_no_series_modules() -> None:
-    policy = _policy(enabled=False)
-    assert not any(name.startswith("series") for name in policy.state_dict())
-    empty = SeriesFeatures.stack([tensorize_series((), player_index=0, tokenizer=_tokenizer())])
-    with pytest.raises(ValueError, match="series_context_enabled"):
-        policy.initial_series_state(empty)
-
-
 def test_series_embeddings_shared_with_battle_encoder() -> None:
-    policy = _policy(enabled=True)
+    policy = _policy()
     assert policy.series.species_emb is policy.encoder.species_emb
     assert policy.series.move_emb is policy.encoder.move_emb
     assert policy.series.item_emb is policy.encoder.item_emb
@@ -290,41 +254,20 @@ def test_series_embeddings_shared_with_battle_encoder() -> None:
     assert "series.species_emb.weight" in policy.state_dict()
 
 
-def test_initial_series_state_matches_initial_state_at_init() -> None:
-    policy = _policy(enabled=True)
-    tokenizer = _tokenizer()
-    empty = tensorize_series((), player_index=0, tokenizer=tokenizer)
-    with_game = tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=tokenizer)
-    features = SeriesFeatures.stack([empty, with_game])
-    # the zero-initialized gate makes conditioning an exact no-op until trained
-    assert torch.equal(policy.initial_series_state(features), policy.initial_state(2))
+def test_series_encoder_outputs_one_token_per_completed_game() -> None:
+    policy = _policy()
+    empty = tensorize_series((), player_index=0, tokenizer=_tokenizer())
+    game = tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=_tokenizer())
+    features = SeriesFeatures.stack([empty, game])
+    context = policy.encode_series(features)
+    assert context.shape == (2, MAX_PRIOR_GAMES, policy.d_model)
+    assert torch.equal(context[0], policy.series.empty_context[0])
+    assert not torch.equal(context[1, 0], policy.series.empty_context[0, 0])
 
 
-def test_game2_gradients_reach_series_encoder_but_not_game1() -> None:
-    policy = _policy(enabled=True)
-    with torch.no_grad():
-        policy.series_conditioner.gate.fill_(0.5)
-    obs = _dummy_obs(1)
-    action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.uint8)
-
-    game1_out = policy.act_obs(obs, action_mask, policy.initial_state(1))
-    # retain_grad so grads would be observable if the Game 2 graph reached
-    # these Game 1 execution tensors
-    game1_out.value.retain_grad()
-    game1_out.state.retain_grad()
-    features = SeriesFeatures.stack(
-        [tensorize_series((_game(1, 0, (1, 0)),), player_index=0, tokenizer=_tokenizer())]
-    )
-    for field in fields(SeriesFeatures):
-        assert not getattr(features, field.name).requires_grad
-
-    state = policy.initial_series_state(features)
-    game2_out = policy.act_obs(obs, action_mask, state)
-    loss = game2_out.value.mean() - game2_out.log_probs.mean()
-    loss.backward()
-
-    assert policy.series.series_queries.grad is not None
-    assert policy.series.poke_proj.weight.grad is not None
-    assert policy.series.poke_proj.weight.grad.abs().sum() > 0
-    assert policy.series_conditioner.gate.grad is not None
-    assert game1_out.value.grad is None and game1_out.state.grad is None
+def test_series_encoder_gradients_are_local_to_each_game_slot() -> None:
+    encoder = _encoder()
+    context = encoder(_mixed_batch())
+    context[0, 0].square().sum().backward()
+    assert encoder.series_queries.grad is not None
+    assert encoder.poke_proj.weight.grad is not None

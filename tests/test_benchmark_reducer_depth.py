@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from p0.battle.actions import ACT_SIZE
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
@@ -30,17 +31,23 @@ def _benchmark_config(**overrides):
         "seed": 7,
         "warmup": 1,
         "iterations": 1,
-        "repeats": 5,
+        "repeats": 2,
         "batch_size": 1,
         "time_steps": 1,
         "d_model": 8,
         "nhead": 2,
         "dim_feedforward": 32,
-        "history_tokens": 1,
-        "deep_core_repeats": 2,
+        "deep_reducer_layers": 2,
     }
     values.update(overrides)
     return BenchmarkConfig(**values)
+
+
+def _small_policy(reducer_layers: int = 1):
+    return build_policy(
+        ModelConfig(8, 2, reducer_layers, 32),
+        default_runtime_resources(),
+    )
 
 
 def test_benchmark_config_requires_explicit_and_compatible_inputs():
@@ -49,7 +56,7 @@ def test_benchmark_config_requires_explicit_and_compatible_inputs():
     with pytest.raises(ValueError, match="supplied together"):
         _benchmark_config(checkpoint=Path("checkpoint.pt"))
     with pytest.raises(ValueError, match="at least two"):
-        _benchmark_config(deep_core_repeats=1)
+        _benchmark_config(deep_reducer_layers=1)
 
 
 def test_benchmark_uses_project_default_device_when_not_overridden():
@@ -63,7 +70,7 @@ def test_benchmark_model_defaults_match_baseline_config():
     assert _MODULE.DEFAULT_MODEL_CONFIG.d_model == 512
     assert _MODULE.DEFAULT_MODEL_CONFIG.nhead == 8
     assert _MODULE.DEFAULT_MODEL_CONFIG.dim_feedforward == 2048
-    assert _MODULE.DEFAULT_MODEL_CONFIG.history_tokens == 8
+    assert _MODULE.DEFAULT_MODEL_CONFIG.reducer_layers == 5
 
 
 def test_benchmark_cli_defaults_use_baseline_and_bench_timing(monkeypatch):
@@ -75,28 +82,21 @@ def test_benchmark_cli_defaults_use_baseline_and_bench_timing(monkeypatch):
     assert config.d_model == ModelConfig.baseline().d_model
     assert config.nhead == ModelConfig.baseline().nhead
     assert config.dim_feedforward == ModelConfig.baseline().dim_feedforward
-    assert config.history_tokens == ModelConfig.baseline().history_tokens
+    assert config.deep_reducer_layers == 3
     assert config.warmup == 10
     assert config.iterations == 10
     assert config.repeats == 5
 
 
-def test_benchmark_covers_modes_and_labels_gated_metrics():
+def test_benchmark_covers_depths_and_labels_gated_metrics():
     result = run_benchmark(_benchmark_config())
 
     assert result["benchmark_schema"] == "p0.reducer_depth_benchmark.v1"
-    assert len(result["variants"]) == 6
-    assert {variant["mode"] for variant in result["variants"]} == {
-        "baseline_untied_no_pass",
-        "baseline_untied_pass",
-        "deeper_untied_no_pass",
-        "deeper_untied_pass",
-        "tied_core_no_pass",
-        "tied_core_pass",
-    }
+    assert len(result["variants"]) == 2
+    assert {variant["mode"] for variant in result["variants"]} == {"baseline", "deep"}
     for variant in result["variants"]:
         assert variant["parameter_count"] > 0
-        assert len(variant["samples_seconds_per_batch"]) == 5
+        assert len(variant["samples_seconds_per_batch"]) == 2
         assert variant["median_seconds_per_batch"] > 0
         assert variant["iqr_seconds_per_batch"] >= 0
         assert variant["tokens_per_second"] > 0
@@ -112,30 +112,13 @@ def test_benchmark_restores_global_rng_state_and_reports_architecture():
     after = torch.random.get_rng_state()
 
     assert torch.equal(after, before)
-    baseline = next(
-        variant
-        for variant in result["variants"]
-        if variant["mode"] == "baseline_untied_pass"
-    )
-    assert baseline["architecture"]["core_repeats"] == 1
-    assert baseline["architecture"]["core_weights_tied"] is False
-    assert baseline["architecture"]["pass_embedding_enabled"] is True
+    baseline = next(variant for variant in result["variants"] if variant["mode"] == "baseline")
+    assert baseline["architecture"]["reducer_layers"] == 1
 
 
 def test_benchmark_rejects_incompatible_checkpoint(tmp_path):
     checkpoint = tmp_path / "incompatible.pt"
-    policy = build_policy(
-        ModelConfig(
-            d_model=8,
-            nhead=2,
-            prelude_layers=1,
-            history_tokens=1,
-            dim_feedforward=32,
-            core_repeats=4,
-        ),
-        default_runtime_resources(),
-    )
-    DEFAULT_POLICY_STORE.save_policy(checkpoint, policy)
+    DEFAULT_POLICY_STORE.save_policy(checkpoint, _small_policy(reducer_layers=4))
 
     with pytest.raises(ValueError, match="incompatible with the requested benchmark"):
         run_benchmark(
@@ -149,20 +132,11 @@ def test_benchmark_rejects_incompatible_checkpoint(tmp_path):
 def test_benchmark_reports_validation_nll_for_compatible_artifacts(tmp_path):
     checkpoint = tmp_path / "baseline.pt"
     validation = tmp_path / "validation.pt"
-    policy = build_policy(
-        ModelConfig(
-            d_model=8,
-            nhead=2,
-            prelude_layers=1,
-            history_tokens=1,
-            dim_feedforward=32,
-            pass_embedding_enabled=True,
-        ),
-        default_runtime_resources(),
-    )
+    policy = _small_policy()
     observation = StructuredObservation.empty_batch(1)
-    action_mask = torch.ones((1, 2, 49), dtype=torch.bool)
+    action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
     encoded = policy.encode(observation, action_mask)
+    memory = policy.empty_memory(1)
     torch.save(
         {
             "tokens": encoded.tokens,
@@ -170,22 +144,21 @@ def test_benchmark_reports_validation_nll_for_compatible_artifacts(tmp_path):
             "numerical": encoded.numerical,
             "action_mask": action_mask,
             "actions": torch.zeros((1, 2), dtype=torch.long),
-            "state": policy.initial_state(1),
+            "series_tokens": memory[0],
+            "series_mask": memory[1],
+            "history_tokens": memory[2],
+            "history_mask": memory[3],
+            "history_age_ids": memory[4],
         },
         validation,
     )
     DEFAULT_POLICY_STORE.save_policy(checkpoint, policy)
 
-    result = run_benchmark(
-        _benchmark_config(checkpoint=checkpoint, validation_artifact=validation)
-    )
+    result = run_benchmark(_benchmark_config(checkpoint=checkpoint, validation_artifact=validation))
 
     assert all(
         variant["validation_bc_nll"]["status"] == "available"
         for variant in result["variants"]
     )
-    assert all(
-        variant["validation_bc_nll"]["value"] >= 0
-        for variant in result["variants"]
-    )
+    assert all(variant["validation_bc_nll"]["value"] >= 0 for variant in result["variants"])
     assert encoded.numerical.shape == (1, SEQUENCE_LENGTH, NUMERICAL_WIDTH)

@@ -1,7 +1,7 @@
 """Compiled tensor-shard artifact contract for streaming behaviour cloning.
 
 This module owns the derived-tensor layer: bounded shard files holding
-stacked schema-v3 observations and label tensors for whole chronological
+stacked schema-v4 observations and label tensors for whole chronological
 games, plus the manifest and index that tie a compiled corpus to one runtime
 contract. It may import torch and the observation schema; p0.replays.schema
 must stay torch-free, and nothing here may import p0.runtime.
@@ -29,7 +29,7 @@ from p0.replays.schema import (
     _require_iso_timestamp,
 )
 
-SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v1"
+SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v2"
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
 # T is the shard's decision count and C its total candidate count. Candidates
@@ -37,7 +37,7 @@ SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v1"
 # T + 1 and decision t owns candidate_values[offsets[t]:offsets[t + 1]] rows
 # of joint action pairs. exact_action rows are meaningful only where
 # label_kind is EXACT; loss_mask is zero on UNKNOWN decisions so they keep
-# recurrent state chronological without contributing policy loss.
+# chronological context without contributing policy loss.
 # game_offsets and series_offsets delimit whole chronological games and
 # series within the shard. outcome is the optional value target.
 SHARD_TENSOR_SPECS: tuple[tuple[str, tuple[int, ...], torch.dtype], ...] = (

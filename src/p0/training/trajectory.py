@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Iterator
 
 import torch
 
 from p0.format_config import FORMAT
+from p0.model.series_context import SeriesFeatures
 from p0.model.structured_observation import StructuredObservation
 
 
@@ -23,10 +23,22 @@ class TrajectoryBatch:
     length: int
     returns: torch.Tensor | None = None
     advantages: torch.Tensor | None = None
+    series_tokens: torch.Tensor | None = None
+    series_mask: torch.Tensor | None = None
+    series_features: SeriesFeatures | None = None
+    series_id: str | None = None
+    game_number: int = 1
+    player: int | None = None
 
     def __post_init__(self) -> None:
         if self.length <= 0:
             raise ValueError("Completed trajectories must contain at least one step")
+        if self.game_number < 1:
+            raise ValueError("Trajectory game_number must be positive")
+        if self.player is not None and self.player not in (0, 1):
+            raise ValueError("Trajectory player must be 0 or 1 when provided")
+        if self.series_id is not None and not self.series_id:
+            raise ValueError("Trajectory series_id must be non-empty when provided")
         if any(
             tensor.size(0) != self.length
             for tensor in (
@@ -42,6 +54,17 @@ class TrajectoryBatch:
         for name, tensor in (("returns", self.returns), ("advantages", self.advantages)):
             if tensor is not None and tensor.size(0) != self.length:
                 raise ValueError(f"Trajectory {name} length does not match")
+        if (self.series_tokens is None) != (self.series_mask is None):
+            raise ValueError("series_tokens and series_mask must be provided together")
+        if self.series_tokens is not None:
+            if self.series_mask is None:
+                raise ValueError("series_mask is required with series_tokens")
+            if self.series_tokens.dim() != 2 or self.series_mask.shape != (
+                self.series_tokens.size(0),
+            ):
+                raise ValueError("Invalid fixed series context shapes")
+        if self.series_features is not None and self.series_tokens is not None:
+            raise ValueError("Use raw series_features or encoded series_tokens, not both")
         self.observations.validate(batch_rank=1)
 
     def to(self, device: torch.device | str) -> TrajectoryBatch:
@@ -56,13 +79,19 @@ class TrajectoryBatch:
             dones=self.dones.to(device),
             returns=None if self.returns is None else self.returns.to(device),
             advantages=None if self.advantages is None else self.advantages.to(device),
+            series_tokens=None if self.series_tokens is None else self.series_tokens.to(device),
+            series_mask=None if self.series_mask is None else self.series_mask.to(device),
+            series_features=self.series_features,
         )
 
-    def recurrent_chunks(self, chunk_size: int) -> Iterator[slice]:
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-        for start in range(0, self.length, chunk_size):
-            yield slice(start, min(start + chunk_size, self.length))
+    def target_slices(self, target_size: int) -> list[slice]:
+        """Return independent target windows for bounded PPO recomputation."""
+        if target_size <= 0:
+            raise ValueError("target_size must be positive")
+        return [
+            slice(start, min(start + target_size, self.length))
+            for start in range(0, self.length, target_size)
+        ]
 
 
 @dataclass(slots=True)
@@ -76,6 +105,12 @@ class TrajectoryStorage:
     dones: torch.Tensor
     action_masks: torch.Tensor
     max_steps: int
+    series_tokens: torch.Tensor | None = None
+    series_masks: torch.Tensor | None = None
+    series_features: list[SeriesFeatures | None] | None = None
+    series_ids: list[str | None] | None = None
+    game_numbers: torch.Tensor | None = None
+    player_index: int | None = None
 
     @classmethod
     def allocate(
@@ -83,6 +118,8 @@ class TrajectoryStorage:
         n_envs: int,
         max_steps: int,
         device: torch.device | str = "cpu",
+        d_model: int | None = None,
+        player_index: int | None = None,
     ) -> TrajectoryStorage:
         if n_envs <= 0 or max_steps <= 0:
             raise ValueError("n_envs and max_steps must be positive")
@@ -90,6 +127,27 @@ class TrajectoryStorage:
         observations = StructuredObservation._from_values(
             [value.reshape(n_envs, max_steps, *value.shape[1:]) for value in flat.tensors()]
         )
+        if d_model is not None and d_model <= 0:
+            raise ValueError("d_model must be positive when provided")
+        if player_index is not None and player_index not in (0, 1):
+            raise ValueError("player_index must be 0 or 1 when provided")
+        series_tokens = (
+            torch.zeros((n_envs, 2, d_model), dtype=torch.float32, device=device)
+            if d_model is not None
+            else None
+        )
+        series_masks = (
+            torch.zeros((n_envs, 2), dtype=torch.bool, device=device)
+            if d_model is not None
+            else None
+        )
+        series_features: list[SeriesFeatures | None] | None = None
+        series_ids: list[str | None] | None = None
+        game_numbers: torch.Tensor | None = None
+        if d_model is not None:
+            series_features = [None for _ in range(n_envs)]
+        series_ids = [None for _ in range(n_envs)]
+        game_numbers = torch.ones(n_envs, dtype=torch.long, device=device)
         return cls(
             step_counts=torch.zeros(n_envs, dtype=torch.long, device=device),
             observations=observations,
@@ -102,7 +160,36 @@ class TrajectoryStorage:
                 (n_envs, max_steps, 2, FORMAT.action_size), dtype=torch.bool, device=device
             ),
             max_steps=max_steps,
+            series_tokens=series_tokens,
+            series_masks=series_masks,
+            series_features=series_features,
+            series_ids=series_ids,
+            game_numbers=game_numbers,
+            player_index=player_index,
         )
+
+    def set_context(
+        self,
+        env_ids: torch.Tensor,
+        series_ids: list[str | None],
+        game_numbers: torch.Tensor,
+    ) -> None:
+        """Set the causal boundary metadata for the next recorded decisions."""
+        if self.series_ids is None or self.game_numbers is None:
+            raise RuntimeError("TrajectoryStorage was not initialized with context metadata")
+        if len(series_ids) != env_ids.numel() or game_numbers.shape != (env_ids.numel(),):
+            raise ValueError("Trajectory context metadata must match selected environments")
+        if game_numbers.dtype != torch.long:
+            raise ValueError("Trajectory game_numbers must use torch.long")
+        if torch.any(game_numbers < 1):
+            raise ValueError("Trajectory game_numbers must be positive")
+        for env_id, series_id, game_number in zip(
+            env_ids.tolist(), series_ids, game_numbers.tolist(), strict=True
+        ):
+            if series_id is not None and not series_id:
+                raise ValueError("Trajectory series_id must be non-empty when provided")
+            self.series_ids[env_id] = series_id
+            self.game_numbers[env_id] = game_number
 
     def ensure_capacity(self, env_ids: torch.Tensor) -> None:
         overflowing = env_ids[self.step_counts[env_ids] >= self.max_steps]
@@ -120,6 +207,9 @@ class TrajectoryStorage:
         log_probs: torch.Tensor,
         values: torch.Tensor,
         action_masks: torch.Tensor,
+        series_tokens: torch.Tensor | None = None,
+        series_mask: torch.Tensor | None = None,
+        series_features: list[SeriesFeatures | None] | None = None,
     ) -> torch.Tensor:
         """Store one decision for each selected environment and return its step indices."""
         self.ensure_capacity(env_ids)
@@ -132,6 +222,19 @@ class TrajectoryStorage:
         self.log_probs[env_ids, steps] = log_probs
         self.values[env_ids, steps] = values
         self.action_masks[env_ids, steps] = action_masks
+        if (
+            self.series_tokens is not None
+            and self.series_masks is not None
+            and series_tokens is not None
+            and series_mask is not None
+        ):
+            self.series_tokens[env_ids] = series_tokens.to(self.series_tokens)
+            self.series_masks[env_ids] = series_mask.to(self.series_masks)
+        if self.series_features is not None and series_features is not None:
+            if len(series_features) != env_ids.numel():
+                raise ValueError("series_features must have one entry per selected environment")
+            for env_id, features in zip(env_ids.tolist(), series_features, strict=True):
+                self.series_features[env_id] = features
         self.step_counts[env_ids] += 1
         return steps
 
@@ -139,6 +242,7 @@ class TrajectoryStorage:
         length = int(self.step_counts[env_id].item())
         if length == 0:
             raise ValueError(f"Environment {env_id} has no trajectory steps to complete")
+        raw_series_features = None if self.series_features is None else self.series_features[env_id]
         batch = TrajectoryBatch(
             observations=self.observations[env_id, :length].clone(),
             actions=self.actions[env_id, :length].clone(),
@@ -148,6 +252,20 @@ class TrajectoryStorage:
             dones=self.dones[env_id, :length].clone(),
             action_masks=self.action_masks[env_id, :length].clone(),
             length=length,
+            series_tokens=(
+                None
+                if raw_series_features is not None or self.series_tokens is None
+                else self.series_tokens[env_id].clone()
+            ),
+            series_mask=(
+                None
+                if raw_series_features is not None or self.series_masks is None
+                else self.series_masks[env_id].clone()
+            ),
+            series_features=raw_series_features,
+            series_id=None if self.series_ids is None else self.series_ids[env_id],
+            game_number=(1 if self.game_numbers is None else int(self.game_numbers[env_id].item())),
+            player=self.player_index,
         )
         self.step_counts[env_id] = 0
         return batch

@@ -1,4 +1,4 @@
-"""Benchmark the unified reducer depth variants."""
+"""Benchmark fixed memory-reducer depth variants."""
 
 from __future__ import annotations
 
@@ -12,26 +12,21 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.profiler
 from torch import Tensor
 
 from p0.battle.actions import ACT_SIZE
+from p0.model.architecture_contract import CURRENT_REDUCER_TOKEN_COUNT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import NUMERICAL_WIDTH, SEQUENCE_LENGTH
+from p0.model.structured_observation import StructuredObservation
 from p0.training.checkpoint import CheckpointStore
 from p0.training.utils import default_device
 
 BENCHMARK_SCHEMA = "p0.reducer_depth_benchmark.v1"
-PASS_EMBEDDING_SETTINGS = (False, True)
-MODE_SETTINGS = (
-    ("baseline_untied", 1, False),
-    ("deeper_untied", None, False),
-    ("tied_core", None, True),
-)
+MODE_SETTINGS = (("baseline", 1), ("deep", None))
 DTYPE_NAMES = {
     "float16": torch.float16,
     "float32": torch.float32,
@@ -42,7 +37,7 @@ DEFAULT_MODEL_CONFIG = ModelConfig.baseline()
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkConfig:
-    """Inputs and timing controls for a reducer benchmark."""
+    """Inputs and timing controls for a reducer-depth benchmark."""
 
     dtype: str
     seed: int
@@ -54,8 +49,7 @@ class BenchmarkConfig:
     d_model: int
     nhead: int
     dim_feedforward: int
-    history_tokens: int
-    deep_core_repeats: int
+    deep_reducer_layers: int
     device: str | None = None
     checkpoint: Path | None = None
     validation_artifact: Path | None = None
@@ -74,13 +68,12 @@ class BenchmarkConfig:
             ("d_model", self.d_model),
             ("nhead", self.nhead),
             ("dim_feedforward", self.dim_feedforward),
-            ("history_tokens", self.history_tokens),
-            ("deep_core_repeats", self.deep_core_repeats),
+            ("deep_reducer_layers", self.deep_reducer_layers),
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"benchmark {name} must be a positive integer")
-        if self.deep_core_repeats < 2:
-            raise ValueError("benchmark deep_core_repeats must be at least two")
+        if self.deep_reducer_layers < 2:
+            raise ValueError("benchmark deep_reducer_layers must be at least two")
         if self.d_model % self.nhead:
             raise ValueError("benchmark d_model must be divisible by nhead")
         if (self.checkpoint is None) != (self.validation_artifact is None):
@@ -111,8 +104,6 @@ class Metric:
 
 @dataclass(frozen=True, slots=True)
 class VariantResult:
-    """One reducer mode and pass-embedding setting."""
-
     mode: str
     architecture: dict[str, int | bool]
     parameter_count: int
@@ -147,22 +138,6 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _sample(
-    reducer: nn.Module,
-    tokens: Tensor,
-    state: Tensor,
-    device: torch.device,
-    iterations: int,
-) -> float:
-    synchronize(device)
-    start = time.perf_counter()
-    with torch.inference_mode():
-        for _ in range(iterations):
-            _run_reducer_sequence(reducer, tokens, state)
-    synchronize(device)
-    return (time.perf_counter() - start) / iterations
-
-
 def _summary(samples: list[float]) -> tuple[float, float]:
     median = statistics.median(samples)
     if len(samples) < 2:
@@ -171,165 +146,102 @@ def _summary(samples: list[float]) -> tuple[float, float]:
     return median, quartiles[2] - quartiles[0]
 
 
-def _make_config(
-    benchmark: BenchmarkConfig,
-    *,
-    core_repeats: int,
-    core_weights_tied: bool,
-    pass_embedding_enabled: bool,
-) -> ModelConfig:
+def _make_config(benchmark: BenchmarkConfig, reducer_layers: int) -> ModelConfig:
     return ModelConfig(
         d_model=benchmark.d_model,
         nhead=benchmark.nhead,
-        prelude_layers=1,
-        history_tokens=benchmark.history_tokens,
+        reducer_layers=reducer_layers,
         dim_feedforward=benchmark.dim_feedforward,
-        coda_layers=1,
-        core_repeats=core_repeats,
-        core_weights_tied=core_weights_tied,
-        pass_embedding_enabled=pass_embedding_enabled,
     )
 
 
-def _build_tokens(
+def _repeat_memory(memory: tuple[Tensor, ...], repeats: int) -> tuple[Tensor, ...]:
+    return tuple(value.repeat_interleave(repeats, dim=0) for value in memory)
+
+
+def _build_inputs(
     policy: PolicyNet,
     benchmark: BenchmarkConfig,
     device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[Tensor, Tensor]:
-    sequence_length = policy.actor.reducer.seq_len
-    tokens = torch.randn(
-        benchmark.batch_size,
-        benchmark.time_steps,
-        sequence_length,
-        benchmark.d_model,
-        device=device,
-        dtype=dtype,
+) -> tuple[EncodedObs, Tensor, tuple[Tensor, ...]]:
+    observations = StructuredObservation.empty_batch(benchmark.batch_size).to(device)
+    action_mask = torch.ones(
+        (benchmark.batch_size, 2, ACT_SIZE), dtype=torch.bool, device=device
     )
-    state = policy.initial_state(benchmark.batch_size).to(device=device, dtype=dtype)
-    return tokens, state
+    encoded = policy.encode(observations, action_mask)
+    if benchmark.time_steps == 1:
+        return encoded, action_mask, policy.empty_memory(benchmark.batch_size)
+    return (
+        EncodedObs(
+            tokens=encoded.tokens.repeat_interleave(benchmark.time_steps, dim=0),
+            aux=encoded.aux.repeat_interleave(benchmark.time_steps, dim=0),
+            numerical=encoded.numerical.repeat_interleave(benchmark.time_steps, dim=0),
+        ),
+        action_mask.repeat_interleave(benchmark.time_steps, dim=0),
+        _repeat_memory(policy.empty_memory(benchmark.batch_size), benchmark.time_steps),
+    )
 
 
-def _run_reducer_sequence(
-    reducer: nn.Module,
-    tokens: Tensor,
-    state: Tensor,
-) -> tuple[Tensor, Tensor]:
-    loss = tokens.new_zeros(())
-    for time_index in range(tokens.size(1)):
-        cls, state, _ = reducer(tokens[:, time_index], state)
-        loss = loss + cls.square().mean()
-    return state, loss
+def _sample(
+    policy: PolicyNet,
+    encoded: EncodedObs,
+    memory: tuple[Tensor, ...],
+    device: torch.device,
+    iterations: int,
+) -> float:
+    synchronize(device)
+    start = time.perf_counter()
+    with torch.inference_mode():
+        for _ in range(iterations):
+            policy.actor.reducer(encoded.tokens, *memory)
+    synchronize(device)
+    return (time.perf_counter() - start) / iterations
 
 
-def _peak_cpu_bptt_memory(
-    reducer: nn.Module,
-    tokens: Tensor,
-    state: Tensor,
+def _peak_memory(
+    policy: PolicyNet,
+    encoded: EncodedObs,
+    memory: tuple[Tensor, ...],
+    device: torch.device,
 ) -> int:
+    policy.zero_grad(set_to_none=True)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU],
         profile_memory=True,
         record_shapes=False,
-        acc_events=True,
     ) as profile:
-        _, loss = _run_reducer_sequence(reducer, tokens, state)
-        loss.backward()
-
+        reduced = policy.actor.reducer(encoded.tokens, *memory)
+        reduced.cls.square().mean().backward()
     current = 0
     peak = 0
     for event in profile.events() or ():
         current += event.cpu_memory_usage
         peak = max(peak, current)
-    return max(0, peak)
-
-
-def _peak_bptt_memory(
-    reducer: nn.Module,
-    tokens: Tensor,
-    state: Tensor,
-    device: torch.device,
-) -> int:
-    reducer.zero_grad(set_to_none=True)
+    policy.zero_grad(set_to_none=True)
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-        _, loss = _run_reducer_sequence(reducer, tokens, state)
-        loss.backward()
-        peak = int(torch.cuda.max_memory_allocated(device))
-    else:
-        peak = _peak_cpu_bptt_memory(reducer, tokens, state)
-    reducer.zero_grad(set_to_none=True)
-    return peak
+        peak = max(peak, int(torch.cuda.max_memory_allocated(device)))
+    return max(1, peak)
 
 
 def _load_validation_artifact(path: Path) -> dict[str, Tensor]:
-    try:
-        value = torch.load(path, weights_only=True, map_location="cpu")
-    except (OSError, RuntimeError, EOFError, ValueError, IndexError) as exc:
-        raise ValueError(f"Unable to read validation artifact {path}") from exc
+    value = torch.load(path, weights_only=True, map_location="cpu")
     if not isinstance(value, Mapping):
         raise ValueError(f"Validation artifact {path} must be a mapping")
-    expected = {"tokens", "aux", "numerical", "action_mask", "actions", "state"}
-    unknown = sorted(
-        (key for key in value if type(key) is not str or key not in expected),
-        key=repr,
-    )
-    missing = sorted(expected - set(value))
-    if unknown or missing:
-        raise ValueError(
-            f"Invalid validation artifact fields: missing={missing}, unknown={unknown}"
-        )
-    if not all(isinstance(value[name], Tensor) for name in expected):
-        raise ValueError(f"Validation artifact {path} must contain tensors only")
+    expected = {
+        "tokens",
+        "aux",
+        "numerical",
+        "action_mask",
+        "actions",
+        "series_tokens",
+        "series_mask",
+        "history_tokens",
+        "history_mask",
+        "history_age_ids",
+    }
+    if set(value) != expected or not all(isinstance(value[name], Tensor) for name in expected):
+        raise ValueError(f"Invalid validation artifact fields in {path}")
     return {name: value[name] for name in expected}
-
-
-def _validate_validation_artifact(
-    artifact: Mapping[str, Tensor],
-    policy: PolicyNet,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[EncodedObs, Tensor, Tensor, Tensor]:
-    tokens = artifact["tokens"].to(device=device, dtype=dtype)
-    aux = artifact["aux"].to(device=device, dtype=dtype)
-    numerical = artifact["numerical"].to(device=device, dtype=dtype)
-    action_mask = artifact["action_mask"].to(device=device, dtype=torch.bool)
-    actions = artifact["actions"].to(device=device, dtype=torch.long)
-    state = artifact["state"].to(device=device, dtype=dtype)
-    batch_size = tokens.size(0)
-    if tokens.shape != (
-        batch_size,
-        policy.actor.reducer.seq_len,
-        policy.d_model,
-    ):
-        raise ValueError("validation tokens are incompatible with the benchmark architecture")
-    if aux.dim() != 4 or aux.size(0) != batch_size or aux.size(1) != 2:
-        raise ValueError("validation aux has an incompatible shape")
-    if numerical.shape != (batch_size, SEQUENCE_LENGTH, NUMERICAL_WIDTH):
-        raise ValueError("validation numerical features have an incompatible shape")
-    if action_mask.shape != (batch_size, 2, ACT_SIZE):
-        raise ValueError("validation action_mask has an incompatible shape")
-    if actions.shape != (batch_size, 2):
-        raise ValueError("validation actions have an incompatible shape")
-    if state.shape != (batch_size, policy.config.history_tokens, policy.d_model):
-        raise ValueError("validation recurrent state has an incompatible shape")
-    return EncodedObs(tokens=tokens, aux=aux, numerical=numerical), state, action_mask, actions
-
-
-def _checkpoint_policy(
-    benchmark: BenchmarkConfig,
-    device: torch.device,
-    dtype: torch.dtype,
-    configs: tuple[ModelConfig, ...],
-) -> PolicyNet | None:
-    if benchmark.checkpoint is None:
-        return None
-    policy = CheckpointStore().load_policy(benchmark.checkpoint, device)
-    if policy.config not in configs:
-        raise ValueError(
-            "checkpoint architecture is incompatible with the requested benchmark variants"
-        )
-    return policy.to(device=device, dtype=dtype)
 
 
 def _validation_metric(
@@ -340,153 +252,129 @@ def _validation_metric(
 ) -> Metric:
     if artifact is None:
         return Metric.unavailable("compatible BC validation inputs were not supplied")
-    enc, state, action_mask, actions = _validate_validation_artifact(
-        artifact, policy, device, dtype
+    encoded = EncodedObs(
+        tokens=artifact["tokens"].to(device=device, dtype=dtype),
+        aux=artifact["aux"].to(device=device, dtype=dtype),
+        numerical=artifact["numerical"].to(device=device, dtype=dtype),
+    )
+    action_mask = artifact["action_mask"].to(device=device, dtype=torch.bool)
+    actions = artifact["actions"].to(device=device, dtype=torch.long)
+    memory = tuple(
+        artifact[name].to(
+            device=device,
+            dtype=(
+                torch.long
+                if name == "history_age_ids"
+                else torch.bool
+                if name in {"series_mask", "history_mask"}
+                else dtype
+            ),
+        )
+        for name in (
+            "series_tokens",
+            "series_mask",
+            "history_tokens",
+            "history_mask",
+            "history_age_ids",
+        )
     )
     with torch.inference_mode():
-        output = policy.evaluate(enc, action_mask, actions, state)
+        output = policy.evaluate(encoded, action_mask, actions, *memory)
     return Metric.available(float((-output.log_probs).mean().item()))
-
-
-def _snapshot_state(policy: PolicyNet) -> dict[str, Tensor]:
-    return {name: value.detach().clone() for name, value in policy.state_dict().items()}
-
-
-def _assert_state_unchanged(policy: PolicyNet, snapshot: Mapping[str, Tensor]) -> None:
-    current = policy.state_dict()
-    if set(current) != set(snapshot) or any(
-        not torch.equal(current[name], snapshot[name]) for name in snapshot
-    ):
-        raise RuntimeError("benchmark mutated model state")
 
 
 def _run_variant(
     benchmark: BenchmarkConfig,
     *,
     mode: str,
-    core_repeats: int,
-    core_weights_tied: bool,
-    pass_embedding_enabled: bool,
+    reducer_layers: int,
     device: torch.device,
     dtype: torch.dtype,
     validation_artifact: Mapping[str, Tensor] | None,
     checkpoint_policy: PolicyNet | None,
 ) -> VariantResult:
-    config = _make_config(
-        benchmark,
-        core_repeats=core_repeats,
-        core_weights_tied=core_weights_tied,
-        pass_embedding_enabled=pass_embedding_enabled,
-    )
+    config = _make_config(benchmark, reducer_layers)
     policy = (
         checkpoint_policy
         if checkpoint_policy is not None and checkpoint_policy.config == config
         else build_policy(config, default_runtime_resources())
-    )
-    policy = policy.to(device=device, dtype=dtype).eval()
-    tokens, initial_state = _build_tokens(policy, benchmark, device, dtype)
-    snapshot = _snapshot_state(policy)
-    reducer = policy.actor.reducer
-
+    ).to(device=device, dtype=dtype).eval()
+    encoded, _, memory = _build_inputs(policy, benchmark, device)
     with torch.inference_mode():
         for _ in range(benchmark.warmup):
-            _run_reducer_sequence(reducer, tokens, initial_state)
-    synchronize(device)
+            policy.actor.reducer(encoded.tokens, *memory)
     samples = [
-        _sample(
-            reducer,
-            tokens,
-            initial_state,
-            device,
-            benchmark.iterations,
-        )
+        _sample(policy, encoded, memory, device, benchmark.iterations)
         for _ in range(benchmark.repeats)
     ]
     median, iqr = _summary(samples)
-    token_count = benchmark.batch_size * benchmark.time_steps * reducer.seq_len
-    peak_memory = _peak_bptt_memory(reducer, tokens, initial_state, device)
-    _assert_state_unchanged(policy, snapshot)
-
+    token_count = encoded.tokens.size(0) * CURRENT_REDUCER_TOKEN_COUNT
     return VariantResult(
-        mode=f"{mode}_{'pass' if pass_embedding_enabled else 'no_pass'}",
+        mode=mode,
         architecture=config.to_dict(),
         parameter_count=sum(parameter.numel() for parameter in policy.parameters()),
         samples_seconds_per_batch=tuple(samples),
         median_seconds_per_batch=median,
         iqr_seconds_per_batch=iqr,
         tokens_per_second=token_count / median,
-        peak_bptt_memory_bytes=peak_memory,
-        validation_bc_nll=_validation_metric(
-            policy, validation_artifact, device, dtype
-        ),
-        self_play_strength=Metric.unavailable(
-            "self-play smoke configuration was not supplied"
-        ),
+        peak_bptt_memory_bytes=_peak_memory(policy, encoded, memory, device),
+        validation_bc_nll=_validation_metric(policy, validation_artifact, device, dtype),
+        self_play_strength=Metric.unavailable("self-play smoke configuration was not supplied"),
     )
 
 
 def run_benchmark(benchmark: BenchmarkConfig) -> dict[str, Any]:
-    """Run all configured variants and return a serializable result."""
+    """Run baseline and deeper fixed reducer variants."""
     device = _resolve_device(benchmark.device)
     dtype = DTYPE_NAMES[benchmark.dtype]
     cpu_rng_state = torch.random.get_rng_state()
-    cuda_rng_state = (
-        torch.cuda.get_rng_state(device) if device.type == "cuda" else None
-    )
     try:
         configs = tuple(
-            _make_config(
-                benchmark,
-                core_repeats=benchmark.deep_core_repeats if repeats is None else repeats,
-                core_weights_tied=tied,
-                pass_embedding_enabled=pass_enabled,
-            )
-            for _, repeats, tied in MODE_SETTINGS
-            for pass_enabled in PASS_EMBEDDING_SETTINGS
+            _make_config(benchmark, benchmark.deep_reducer_layers if layers is None else layers)
+            for _, layers in MODE_SETTINGS
         )
-        checkpoint_policy = _checkpoint_policy(benchmark, device, dtype, configs)
+        checkpoint_policy = None
+        if benchmark.checkpoint is not None:
+            checkpoint_policy = CheckpointStore().load_policy(benchmark.checkpoint, device)
+            if checkpoint_policy.config not in configs:
+                raise ValueError(
+                    "checkpoint architecture is incompatible with the requested benchmark variants"
+                )
         validation_artifact = (
             _load_validation_artifact(benchmark.validation_artifact)
             if benchmark.validation_artifact is not None
             else None
         )
-        results: list[VariantResult] = []
-        for mode, repeats, tied in MODE_SETTINGS:
-            for pass_enabled in PASS_EMBEDDING_SETTINGS:
-                torch.manual_seed(benchmark.seed)
-                results.append(
-                    _run_variant(
-                        benchmark,
-                        mode=mode,
-                        core_repeats=benchmark.deep_core_repeats if repeats is None else repeats,
-                        core_weights_tied=tied,
-                        pass_embedding_enabled=pass_enabled,
-                        device=device,
-                        dtype=dtype,
-                        validation_artifact=validation_artifact,
-                        checkpoint_policy=checkpoint_policy,
-                    )
-                )
+        variants = []
+        for mode, layers in MODE_SETTINGS:
+            torch.manual_seed(benchmark.seed)
+            variants.append(
+                _run_variant(
+                    benchmark,
+                    mode=mode,
+                    reducer_layers=benchmark.deep_reducer_layers if layers is None else layers,
+                    device=device,
+                    dtype=dtype,
+                    validation_artifact=validation_artifact,
+                    checkpoint_policy=checkpoint_policy,
+                ).to_dict()
+            )
         return {
             "benchmark_schema": BENCHMARK_SCHEMA,
             "inputs": {
                 **asdict(benchmark),
                 "device": str(device),
-                "checkpoint": (
-                    None if benchmark.checkpoint is None else str(benchmark.checkpoint)
-                ),
+                "checkpoint": None if benchmark.checkpoint is None else str(benchmark.checkpoint),
                 "validation_artifact": (
                     None
                     if benchmark.validation_artifact is None
                     else str(benchmark.validation_artifact)
                 ),
             },
-            "variants": [result.to_dict() for result in results],
+            "variants": variants,
         }
     finally:
         torch.random.set_rng_state(cpu_rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state, device)
 
 
 def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
@@ -502,8 +390,7 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         d_model=args.d_model,
         nhead=args.nhead,
         dim_feedforward=args.dim_feedforward,
-        history_tokens=args.history_tokens,
-        deep_core_repeats=args.deep_core_repeats,
+        deep_reducer_layers=args.deep_reducer_layers,
         checkpoint=args.checkpoint,
         validation_artifact=args.validation_artifact,
     )
@@ -521,17 +408,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-steps", type=int, default=1)
     parser.add_argument("--d-model", type=int, default=DEFAULT_MODEL_CONFIG.d_model)
     parser.add_argument("--nhead", type=int, default=DEFAULT_MODEL_CONFIG.nhead)
-    parser.add_argument(
-        "--dim-feedforward",
-        type=int,
-        default=DEFAULT_MODEL_CONFIG.dim_feedforward,
-    )
-    parser.add_argument(
-        "--history-tokens",
-        type=int,
-        default=DEFAULT_MODEL_CONFIG.history_tokens,
-    )
-    parser.add_argument("--deep-core-repeats", type=int, default=3)
+    parser.add_argument("--dim-feedforward", type=int, default=DEFAULT_MODEL_CONFIG.dim_feedforward)
+    parser.add_argument("--deep-reducer-layers", type=int, default=3)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--validation-artifact", type=Path)
     args = parser.parse_args()
@@ -544,8 +422,7 @@ def parse_args() -> argparse.Namespace:
         "d_model",
         "nhead",
         "dim_feedforward",
-        "history_tokens",
-        "deep_core_repeats",
+        "deep_reducer_layers",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -568,14 +445,11 @@ def benchmark(args: argparse.Namespace) -> None:
     result = run_benchmark(_config_from_args(args))
     inputs = result["inputs"]
     print(
-        f"device={inputs['device']} dtype={inputs['dtype']} "
-        f"batch={inputs['batch_size']} time_steps={inputs['time_steps']} "
-        f"d_model={inputs['d_model']} nhead={inputs['nhead']} "
-        f"dim_feedforward={inputs['dim_feedforward']} "
-        f"history_tokens={inputs['history_tokens']} "
-        f"deep_core_repeats={inputs['deep_core_repeats']} "
-        f"warmup={inputs['warmup']} iterations={inputs['iterations']} "
-        f"repeats={inputs['repeats']}"
+        f"device={inputs['device']} dtype={inputs['dtype']} batch={inputs['batch_size']} "
+        f"time_steps={inputs['time_steps']} d_model={inputs['d_model']} "
+        f"nhead={inputs['nhead']} dim_feedforward={inputs['dim_feedforward']} "
+        f"deep_reducer_layers={inputs['deep_reducer_layers']} warmup={inputs['warmup']} "
+        f"iterations={inputs['iterations']} repeats={inputs['repeats']}"
     )
     for variant in result["variants"]:
         print(f"variant={variant['mode']}")
@@ -591,7 +465,6 @@ def benchmark(args: argparse.Namespace) -> None:
         print(f"peak_bptt_memory_bytes={variant['peak_bptt_memory_bytes']}")
         _print_metric("validation_bc_nll", variant["validation_bc_nll"])
         _print_metric("self_play_strength", variant["self_play_strength"])
-
 
 
 if __name__ == "__main__":

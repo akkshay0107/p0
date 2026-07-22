@@ -37,4 +37,4 @@ def test_completed_batch_prepares_returns_advantages_and_chunks():
     prepared = prepare_trajectory_batches([batch], torch.device("cpu"), gamma=0.99, gae_lambda=0.95)
     assert prepared[0].returns is not None
     assert prepared[0].advantages is not None
-    assert list(prepared[0].recurrent_chunks(2)) == [slice(0, 2), slice(2, 3)]
+    assert prepared[0].target_slices(2) == [slice(0, 2), slice(2, 3)]

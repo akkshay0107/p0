@@ -6,7 +6,7 @@ training:
   n_pool_opponents: 4
   rollout_steps: 320
   batch_size: 128
-  chunk_size: 32
+  minibatch_size: 32
   gamma: 0.99
   gae_lambda: 0.97
   clip_low: 0.2
@@ -60,7 +60,6 @@ bot:
   allow_random_init: false
   log_level: INFO
 bc:
-  chunk_length: 16
   batch_decisions: 256
   learning_rate: 0.0003
   epochs: 1

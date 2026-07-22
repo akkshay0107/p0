@@ -1,4 +1,4 @@
-"""Pure PPO objective and stateful optimizer lifecycle."""
+"""Pure PPO objective and stateless memory-window optimizer lifecycle."""
 
 from __future__ import annotations
 
@@ -12,12 +12,11 @@ import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
-from p0.model.policy import EncodedObs, PolicyNet
-from p0.model.structured_observation import (
-    TOKEN_IDX_GLOBAL_FIELD,
-    StructuredObservation,
-    is_teampreview,
-)
+from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
+from p0.model.cls_reducer import pack_history_tokens
+from p0.model.policy import PolicyNet
+from p0.model.series_context import SeriesFeatures
+from p0.model.structured_observation import StructuredObservation, is_teampreview
 from p0.training.config import TrainingConfig
 from p0.training.trajectory import TrajectoryBatch
 
@@ -57,7 +56,7 @@ def compute_ppo_objective(
 
 
 class PPOUpdater:
-    """Own optimizer/scaler state while delegating recurrent evaluation."""
+    """Own optimizer/scaler state while delegating memory-window evaluation."""
 
     def __init__(
         self,
@@ -105,9 +104,7 @@ def _run_batched_ppo(
     episode: int,
     entropy_coef: float,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
-    """
-    Run PPO BPTT over a minibatch of variable-length episodes.
-    """
+    """Evaluate one PPO minibatch with one reducer pass per decision."""
     if not episodes:
         return (
             torch.tensor(0.0, device=device),
@@ -120,9 +117,6 @@ def _run_batched_ppo(
             0,
         )
 
-    batch_size = len(episodes)
-    lengths = [ep.length for ep in episodes]
-    max_steps = lengths[0]
     is_warmup = episode < config.warmup_episodes
 
     all_obs = StructuredObservation.cat([ep.observations for ep in episodes], dim=0)
@@ -130,34 +124,107 @@ def _run_batched_ppo(
     with autocast(device_type=device.type, enabled=config.enable_optim):
         all_enc = policy.encode(all_obs, all_action_masks)
     if is_warmup:
-        all_enc = EncodedObs(
-            all_enc.tokens.detach(),
-            all_enc.aux.detach(),
-            all_enc.numerical,
+        all_enc = all_enc._replace(tokens=all_enc.tokens.detach(), aux=all_enc.aux.detach())
+
+    local_lists = []
+    offset = 0
+    for episode_item in episodes:
+        local_lists.append(
+            policy.local_history_tokens(
+                all_enc._replace(
+                    tokens=all_enc.tokens[offset : offset + episode_item.length],
+                    aux=all_enc.aux[offset : offset + episode_item.length],
+                    numerical=all_enc.numerical[offset : offset + episode_item.length],
+                )
+            )
         )
-    split_sizes = [ep.length for ep in episodes]
-    tokens_list = torch.split(all_enc.tokens, split_sizes)
-    aux_list = torch.split(all_enc.aux, split_sizes)
-    numerical_list = torch.split(all_enc.numerical, split_sizes)
+        offset += episode_item.length
 
-    # time major padding
-    enc_p = EncodedObs(
-        tokens=torch.nn.utils.rnn.pad_sequence(list(tokens_list)),
-        aux=torch.nn.utils.rnn.pad_sequence(list(aux_list)),
-        numerical=torch.nn.utils.rnn.pad_sequence(list(numerical_list)),
+    history_parts = []
+    history_mask_parts = []
+    history_age_parts = []
+    for local_tokens in local_lists:
+        for target in range(local_tokens.size(0)):
+            left = max(0, target - HISTORY_WINDOW)
+            packed, mask, ages = pack_history_tokens(local_tokens[left:target].unsqueeze(0))
+            history_parts.append(packed[0])
+            history_mask_parts.append(mask[0])
+            history_age_parts.append(ages[0])
+    history_tokens = torch.stack(history_parts)
+    history_mask = torch.stack(history_mask_parts)
+    history_age_ids = torch.stack(history_age_parts)
+    encoded_series: list[torch.Tensor | None] = [None] * len(episodes)
+    raw_series_indices = [
+        index
+        for index, episode_item in enumerate(episodes)
+        if episode_item.series_features is not None
+    ]
+    if raw_series_indices:
+        raw_feature_values: list[SeriesFeatures] = []
+        for index in raw_series_indices:
+            features = episodes[index].series_features
+            if features is None:
+                raise RuntimeError("series feature index construction drifted")
+            raw_feature_values.append(features)
+        raw_features = SeriesFeatures.stack(raw_feature_values)
+        raw_encoded = policy.encode_series(raw_features)
+        for batch_index, episode_index in enumerate(raw_series_indices):
+            encoded_series[episode_index] = raw_encoded[batch_index]
+
+    series_token_parts = []
+    series_mask_parts = []
+    for episode_index, episode_item in enumerate(episodes):
+        if encoded_series[episode_index] is not None:
+            features = episode_item.series_features
+            if features is None:
+                raise RuntimeError("encoded series context is missing its source features")
+            encoded = encoded_series[episode_index]
+            if encoded is None:
+                raise RuntimeError("encoded series context was unexpectedly cleared")
+            series_token_parts.append(
+                encoded.to(device=device, dtype=all_enc.tokens.dtype)
+                .unsqueeze(0)
+                .expand(episode_item.length, -1, -1)
+            )
+            series_mask_parts.append(
+                features.game_mask.to(device=device).unsqueeze(0).expand(episode_item.length, -1)
+            )
+        elif episode_item.series_tokens is None:
+            series_token_parts.append(
+                torch.zeros(
+                    (episode_item.length, SERIES_SLOTS, policy.d_model),
+                    device=device,
+                    dtype=all_enc.tokens.dtype,
+                )
+            )
+            series_mask_parts.append(
+                torch.zeros((episode_item.length, SERIES_SLOTS), device=device, dtype=torch.bool)
+            )
+        else:
+            if episode_item.series_tokens.shape != (SERIES_SLOTS, policy.d_model):
+                raise ValueError("Trajectory series_tokens do not match the policy contract")
+            if episode_item.series_mask is None or episode_item.series_mask.shape != (
+                SERIES_SLOTS,
+            ):
+                raise ValueError("Trajectory series_mask does not match the policy contract")
+            series_token_parts.append(
+                episode_item.series_tokens.to(device=device, dtype=all_enc.tokens.dtype)
+                .unsqueeze(0)
+                .expand(episode_item.length, -1, -1)
+            )
+            series_mask_parts.append(
+                episode_item.series_mask.to(device=device)
+                .unsqueeze(0)
+                .expand(episode_item.length, -1)
+            )
+    series_tokens = torch.cat(series_token_parts, dim=0)
+    series_mask = torch.cat(series_mask_parts, dim=0)
+    actions = torch.cat([ep.actions for ep in episodes]).to(device)
+    old_log_probs = torch.cat([ep.log_probs for ep in episodes]).to(device)
+    advantages = torch.cat([ep.advantages for ep in episodes if ep.advantages is not None]).to(
+        device
     )
-
-    # pre-pack non-observation tensors for fast slicing [Batch, Time, ...]
-    def pack(fields):
-        return torch.nn.utils.rnn.pad_sequence(fields).to(device)
-
-    actions_p = pack([ep.actions for ep in episodes])
-    old_log_probs_p = pack([ep.log_probs for ep in episodes])
-    advantages_p = pack([ep.advantages for ep in episodes])
-    returns_p = pack([ep.returns for ep in episodes])
-    action_masks_p = pack([ep.action_masks for ep in episodes])
-
-    state = policy.initial_state(batch_size)
+    returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None]).to(device)
     total_loss = torch.tensor(0.0, device=device)
     # convert them to python floats once at the end
     metrics = {
@@ -168,94 +235,50 @@ def _run_batched_ppo(
         "clip_frac": torch.tensor(0.0, device=device),
         "entropy_coef": 0.0,
     }
-    total_steps = 0
     curr_ent_coef = entropy_coef
+    with autocast(device_type=device.type, enabled=config.enable_optim):
+        out = policy.evaluate(
+            all_enc,
+            all_action_masks,
+            actions,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+            critic_only=is_warmup,
+        )
+        step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = compute_ppo_objective(
+            out.log_probs,
+            out.value,
+            out.norm_entropy,
+            old_log_probs,
+            advantages,
+            returns,
+            is_teampreview(all_enc.numerical),
+            config,
+            entropy_coefficient=curr_ent_coef,
+            critic_only=is_warmup,
+        )
 
-    for t in range(max_steps):
-        active_n = sum(1 for length in lengths if length > t)
-        if active_n == 0:
-            break
+    total_loss = step_loss.sum()
+    total_steps = int(step_loss.numel())
 
-        enc_t = enc_p.step(active_n, t)
-        actions_t = actions_p[t, :active_n]
-        old_log_probs_t = old_log_probs_p[t, :active_n]
-        advantages_t = advantages_p[t, :active_n]
-        returns_t = returns_p[t, :active_n]
-        action_masks_t = action_masks_p[t, :active_n]
-        is_tp_t = is_teampreview(enc_t.numerical)
-
-        curr_state = state[:active_n]
-        with autocast(device_type=device.type, enabled=config.enable_optim):
-            out = policy.evaluate(
-                enc_t,
-                action_masks_t,
-                actions_t,
-                curr_state,
-                critic_only=is_warmup,
-            )
-            curr_log_prob = out.log_probs
-            curr_normalized_entropy = out.norm_entropy
-            curr_val = out.value
-            next_state = out.state.to(torch.float32)
-
-            if not torch.isfinite(curr_log_prob).all():
-                non_finite_idx = (~torch.isfinite(curr_log_prob)).nonzero(as_tuple=True)[0]
-                for idx in non_finite_idx:
-                    logging.error(
-                        f"DEBUG: Non-finite log_prob at step {t}, episode element {idx}.\n"
-                        f"  actions_t: {actions_t[idx].tolist()}\n"
-                        f"  action_masks_t (p1): {action_masks_t[idx, 0].nonzero().squeeze(-1).tolist()}\n"
-                        f"  action_masks_t (p2): {action_masks_t[idx, 1].nonzero().squeeze(-1).tolist()}\n"
-                        f"  is_tp_t: {is_tp_t[idx].item()}\n"
-                        "  numerical_t[:, TOKEN_IDX_GLOBAL_FIELD, :4]: "
-                        f"{enc_t.numerical[idx, TOKEN_IDX_GLOBAL_FIELD, :4].tolist()}\n"
-                        f"  old_log_prob: {old_log_probs_t[idx].item()}\n"
-                        f"  curr_log_prob: {curr_log_prob[idx].item()}\n"
-                    )
-
-            step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = compute_ppo_objective(
-                curr_log_prob,
-                curr_val,
-                curr_normalized_entropy,
-                old_log_probs_t,
-                advantages_t,
-                returns_t,
-                is_tp_t,
-                config,
-                entropy_coefficient=curr_ent_coef,
-                critic_only=is_warmup,
-            )
-
-        total_loss = total_loss + step_loss.sum()
-        total_steps += active_n
-
-        if is_warmup:
-            next_state = next_state.detach()
-
-        if active_n < batch_size:
-            state = torch.cat([next_state, state[active_n:]], dim=0)
-        else:
-            state = next_state
-
-        with torch.no_grad():
-            metrics["policy_loss"] += (
-                step_policy_loss.sum() if not is_warmup else torch.tensor(0.0, device=device)
-            )
-            metrics["value_loss"] += step_value_loss.sum()
-
-            metrics["normalized_entropy"] += curr_normalized_entropy.sum()
-
-            metrics["kl_div"] += (
-                ((ratio - 1) - log_ratio).sum()
-                if not is_warmup
-                else torch.tensor(0.0, device=device)
-            )
-            metrics["clip_frac"] += (
-                ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high)).float().sum()
-                if not is_warmup
-                else torch.tensor(0.0, device=device)
-            )
-            metrics["entropy_coef"] = curr_ent_coef
+    with torch.no_grad():
+        metrics["policy_loss"] = (
+            step_policy_loss.sum() if not is_warmup else torch.tensor(0.0, device=device)
+        )
+        metrics["value_loss"] = step_value_loss.sum()
+        metrics["normalized_entropy"] = out.norm_entropy.sum()
+        metrics["kl_div"] = (
+            ((ratio - 1) - log_ratio).sum() if not is_warmup else torch.tensor(0.0, device=device)
+        )
+        metrics["clip_frac"] = (
+            ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high)).float().sum()
+            if not is_warmup
+            else torch.tensor(0.0, device=device)
+        )
+        metrics["entropy_coef"] = curr_ent_coef
 
     for k in ["policy_loss", "value_loss", "normalized_entropy", "kl_div", "clip_frac"]:
         metrics[k] = metrics[k].item()
@@ -297,9 +320,9 @@ def ppo_update(
     num_skipped = 0
     epochs_done = 0
 
-    effective_batch_size = config.chunk_size * (
-        (config.batch_size + config.chunk_size - 1) // config.chunk_size
-    )  # round up to nearest chunk
+    effective_batch_size = config.minibatch_size * (
+        (config.batch_size + config.minibatch_size - 1) // config.minibatch_size
+    )
 
     last_entropy_coef = entropy_coef
     for epoch_idx in range(config.ppo_epochs):
@@ -327,11 +350,11 @@ def ppo_update(
             cancelled = False
             minibatch_mean_kl = 0.0
 
-            for chunk_idx in range(0, len(minibatch), config.chunk_size):
+            for chunk_idx in range(0, len(minibatch), config.minibatch_size):
                 if cancel_requested():
                     cancelled = True
                     break
-                chunk = minibatch[chunk_idx : chunk_idx + config.chunk_size]
+                chunk = minibatch[chunk_idx : chunk_idx + config.minibatch_size]
                 chunk.sort(key=lambda ep: ep.length, reverse=True)
 
                 batch_loss, batch_metrics, batch_steps = _run_batched_ppo(

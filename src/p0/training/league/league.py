@@ -25,8 +25,8 @@ from p0.training.league.state import LeagueState
 INIT_WR = 0.5
 SHADOW_ID = "shadow"
 alpha_shadow = 0.99  # ema decay rate of the shadow model
-REFERENCE_BATCH_SCHEMA = 1
-SIGNATURE_SCHEMA = 1
+REFERENCE_BATCH_SCHEMA = 2
+SIGNATURE_SCHEMA = 2
 
 
 def _normalize(
@@ -256,25 +256,16 @@ class OpponentPool:
             return None
         device = policy.device
         obs_tensors = {
-            k: v.to(device)
-            for k, v in self.reference_batch.items()
-            if k not in ("action_masks", "states")
+            k: v.to(device) for k, v in self.reference_batch.items() if k != "action_masks"
         }
-
-        # the hidden state does matter when it comes to decision
-        # making, and there is the slight chance that when you do
-        # end up replacing the actual hidden state, it might have
-        # wildly different responses, but calculating the actual history
-        # for each of these policies would be time consuming, so this is
-        # a cheap approximation
         obs = StructuredObservation(**obs_tensors)
         mask = self.reference_batch["action_masks"].to(device)
         B = mask.size(0)
-        state = policy.initial_state(B)
+        memory = policy.empty_memory(B)
         dummy_actions = torch.zeros((B, 2), dtype=torch.long, device=device)
 
         with torch.inference_mode():
-            out = policy.evaluate_obs(obs, mask, dummy_actions, state)
+            out = policy.evaluate_obs(obs, mask, dummy_actions, *memory)
 
         sig = out.logits.softmax(dim=-1).cpu()
         return sig  # (B, 2, ACT_SIZE)
