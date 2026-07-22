@@ -20,7 +20,7 @@ from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.config import ModelConfig
-from p0.model.factory import build_policy
+from p0.model.factory import build_policy, compile_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
@@ -287,6 +287,7 @@ def _load_policy(
         episode,
     )
     LOGGER.info("Running inference on device: %s", device)
+    policy = compile_policy(policy, enable=device.type == "cuda")
     policy.eval()
     return policy
 

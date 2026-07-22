@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
-from p0.model.factory import build_policy
+from p0.model.factory import build_policy, compile_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.runtime.composition import build_sim_env
@@ -113,6 +113,7 @@ def run_training(
         if paths.checkpoint_path.exists()
         else build_policy(ModelConfig.baseline(), resources).to(device)
     )
+    policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
     optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
     scaler = GradScaler(
         "cuda", enabled=training.enable_optim and device.type == "cuda", init_scale=512.0

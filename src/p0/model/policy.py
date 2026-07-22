@@ -610,7 +610,7 @@ class PolicyNet(nn.Module):
             config.d_model,
             config.nhead,
             config.dim_feedforward,
-            num_layers=config.reducer_layers,
+            num_layers=2,
         )
 
     @property
