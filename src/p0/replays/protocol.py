@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
+from p0.replays.identity import canonical_format_id, normalize_showdown_id
 from p0.replays.schema import (
     GameEndReason,
     OTSData,
@@ -106,7 +107,7 @@ def _players(value: Mapping[str, Any]) -> tuple[str, str]:
     if (
         isinstance(players, list)
         and len(players) == 2
-        and all(isinstance(item, str) for item in players)
+        and all(isinstance(item, str) and item.strip() for item in players)
     ):
         return players[0], players[1]
     raise ReplayParseError("Replay metadata must contain p1 and p2 players")
@@ -118,24 +119,30 @@ def _metadata(
     replay_id = value.get("id", requested_id)
     if not isinstance(replay_id, str) or not replay_id:
         raise ReplayParseError("Replay metadata has no replay id")
-    actual_format = value.get("format", format_id)
-    if not isinstance(actual_format, str) or not actual_format:
+    actual_format = canonical_format_id(value, expected=format_id)
+    if actual_format is None:
         raise ReplayParseError("Replay metadata has no format id")
-    room_id = str(value.get("roomid", value.get("room_id", replay_id)))
-    parent = value.get("parent", value.get("parentid", value.get("parent_room", "")))
+    room_value = value.get("roomid", value.get("room_id"))
+    room_id = room_value if isinstance(room_value, str) and room_value else replay_id
+    parent_value = value.get("parent", value.get("parentid", value.get("parent_room")))
+    if parent_value is not None and not isinstance(parent_value, str):
+        raise ReplayParseError("Replay parent room must be a string when present")
+    parent_room = "" if parent_value is None else parent_value
     winner = value.get("winner", "")
     if winner is None:
         winner = ""
+    if not isinstance(winner, str):
+        raise ReplayParseError("Replay winner must be a string when present")
     rating = value.get("rating")
     views = value.get("views")
     return ReplayMetadata(
         replay_id=replay_id,
         format_id=actual_format,
         player_names=_players(value),
-        winner=str(winner),
+        winner=winner,
         upload_time=_timestamp(value.get("uploadtime", value.get("upload_time"))),
         room_id=room_id,
-        parent_room=str(parent),
+        parent_room=parent_room,
         game_number=(None if value.get("game_number") is None else int(value["game_number"])),
         rating=(None if rating is None else int(rating)),
         views=(None if views is None else int(views)),
@@ -159,8 +166,6 @@ def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
         if not line.startswith("|"):
             raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
         parts = tuple(line.split("|"))
-        if len(parts) < 2 or not parts[1]:
-            raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
         if parts[1] == "turn":
             if len(parts) < 3 or not parts[2].isdigit():
                 raise ReplayParseError(f"Invalid turn line {index}: {line!r}")
@@ -248,14 +253,14 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
     winner = -1
     end_reason = GameEndReason.NORMAL
     terminal: int | None = None
-    players = tuple(name.casefold() for name in metadata.player_names)
+    players = tuple(normalize_showdown_id(name) for name in metadata.player_names)
     for line in lines:
         if len(line.parts) < 3:
             continue
         tag = line.parts[1]
         if tag == "win":
             terminal = line.index
-            winner_name = line.parts[2].strip().casefold()
+            winner_name = normalize_showdown_id(line.parts[2])
             if winner_name in players:
                 winner = players.index(winner_name)
         elif tag == "tie":

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
 
+from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.schema import (
     GroupingMethod,
@@ -39,14 +40,14 @@ class GroupingResult:
 
 
 def _canonical_players(document: ReplayDocument) -> tuple[str, str]:
-    players = tuple(name.strip().casefold() for name in document.metadata.player_names)
+    players = tuple(normalize_showdown_id(name) for name in document.metadata.player_names)
     if len(set(players)) != 2 or not all(players):
         raise ValueError(f"Replay {document.metadata.replay_id} does not have two distinct players")
     return tuple(sorted(players))  # type: ignore[return-value]
 
 
 def _roles(document: ReplayDocument, players: tuple[str, str]) -> tuple[int, int]:
-    source = tuple(name.strip().casefold() for name in document.metadata.player_names)
+    source = tuple(normalize_showdown_id(name) for name in document.metadata.player_names)
     if set(source) != set(players):
         raise ValueError("Replay players do not match their grouping key")
     return source.index(players[0]), source.index(players[1])
@@ -88,25 +89,13 @@ def _team_hash(document: ReplayDocument, side: int) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _series_id(format_id: str, key: str, games: tuple[ReplayDocument, ...]) -> str:
-    value = "\n".join((format_id, key, *(game.metadata.replay_id for game in games)))
+def _series_id(format_id: str, key: str, players: tuple[str, str]) -> str:
+    value = "\n".join((format_id, key, *players))
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
-def _make_group(
-    documents: tuple[ReplayDocument, ...],
-    *,
-    key: str,
-    method: GroupingMethod,
-    diagnostic: GroupingDiagnostic | None = None,
-) -> GroupedSeries:
-    if not documents:
-        raise ValueError("Cannot group an empty replay collection")
-    format_id = documents[0].metadata.format_id
-    players = _canonical_players(documents[0])
-    if any(_canonical_players(document) != players for document in documents):
-        raise ValueError("A series cannot contain games from different player pairs")
-    ordered = tuple(
+def _ordered_games(documents: tuple[ReplayDocument, ...]) -> tuple[ReplayDocument, ...]:
+    return tuple(
         sorted(
             documents,
             key=lambda document: (
@@ -117,26 +106,106 @@ def _make_group(
             ),
         )
     )
+
+
+def _membership_numbers(games: tuple[ReplayDocument, ...]) -> tuple[int, ...]:
+    return tuple(
+        game.metadata.game_number if game.metadata.game_number is not None else index
+        for index, game in enumerate(games, 1)
+    )
+
+
+def _numbering_diagnostics(
+    games: tuple[ReplayDocument, ...],
+    numbers: tuple[int, ...],
+) -> tuple[GroupingDiagnostic, ...]:
+    replay_ids = tuple(game.metadata.replay_id for game in games)
+    explicit = tuple(game.metadata.game_number for game in games)
+    diagnostics: list[GroupingDiagnostic] = []
+    if any(number is None for number in explicit) and any(
+        number is not None for number in explicit
+    ):
+        diagnostics.append(
+            GroupingDiagnostic(
+                "missing_game_number",
+                replay_ids,
+                "some games have authoritative numbers while others do not",
+            )
+        )
+    if len(set(numbers)) != len(numbers):
+        diagnostics.append(
+            GroupingDiagnostic(
+                "duplicate_game_number",
+                replay_ids,
+                f"series has duplicate game numbers: {numbers}",
+            )
+        )
+    if tuple(sorted(set(numbers))) != tuple(range(1, len(games) + 1)):
+        diagnostics.append(
+            GroupingDiagnostic(
+                "non_contiguous_game_numbers",
+                replay_ids,
+                f"series game numbers are not contiguous from one: {numbers}",
+            )
+        )
+    return tuple(diagnostics)
+
+
+def _series_score(
+    games: tuple[ReplayDocument, ...],
+    players: tuple[str, str],
+) -> tuple[tuple[int, int], tuple[GroupingDiagnostic, ...]]:
     score = [0, 0]
-    for game in ordered:
+    games_after_clinch: list[str] = []
+    games_without_winner: list[str] = []
+    clinched = False
+    for game in games:
+        if clinched:
+            games_after_clinch.append(game.metadata.replay_id)
+            continue
         winner = game.outcome.winner
         if winner in (0, 1):
-            source_role = winner
-            score[_roles(game, players)[source_role]] += 1
-    complete = max(score) == 2
-    series_id = _series_id(format_id, key, ordered)
-    memberships = tuple(
-        SeriesMembership(
-            series_id=series_id,
-            replay_id=game.metadata.replay_id,
-            game_number=index,
-            canonical_player_roles=_roles(game, players),
-            grouping_method=method,
-            confidence=1.0 if method is GroupingMethod.PARENT_ROOM else 0.5,
-            diagnostics=() if diagnostic is None else (diagnostic.code,),
+            score[_roles(game, players)[winner]] += 1
+            clinched = max(score) == 2
+        else:
+            games_without_winner.append(game.metadata.replay_id)
+    diagnostics: list[GroupingDiagnostic] = []
+    if games_without_winner:
+        diagnostics.append(
+            GroupingDiagnostic(
+                "missing_outcome",
+                tuple(game.metadata.replay_id for game in games),
+                f"games have no public winner: {tuple(games_without_winner)}",
+            )
         )
-        for index, game in enumerate(ordered, 1)
-    )
+    if games_after_clinch:
+        diagnostics.append(
+            GroupingDiagnostic(
+                "game_after_series_clinch",
+                tuple(game.metadata.replay_id for game in games),
+                f"games occur after the series was won: {tuple(games_after_clinch)}",
+            )
+        )
+    return (score[0], score[1]), tuple(diagnostics)
+
+
+def _make_group(
+    documents: tuple[ReplayDocument, ...],
+    *,
+    key: str,
+    method: GroupingMethod,
+    diagnostics: tuple[GroupingDiagnostic, ...] = (),
+) -> GroupedSeries:
+    if not documents:
+        raise ValueError("Cannot group an empty replay collection")
+    format_id = documents[0].metadata.format_id
+    players = _canonical_players(documents[0])
+    if any(_canonical_players(document) != players for document in documents):
+        raise ValueError("A series cannot contain games from different player pairs")
+    ordered = _ordered_games(documents)
+    numbers = _membership_numbers(ordered)
+    numbering_diagnostics = _numbering_diagnostics(ordered, numbers)
+    score, outcome_diagnostics = _series_score(ordered, players)
     first_roles = _roles(ordered[0], players)
     team_hashes = (_team_hash(ordered[0], first_roles[0]), _team_hash(ordered[0], first_roles[1]))
     conflicts = []
@@ -154,6 +223,35 @@ def _make_group(
                 )
             )
             break
+    complete = (
+        max(score) == 2
+        and not numbering_diagnostics
+        and not outcome_diagnostics
+        and not conflicts
+        and not any(diagnostic.code == "too_many_games" for diagnostic in diagnostics)
+    )
+    series_id = _series_id(format_id, key, players)
+    membership_diagnostics = tuple(
+        diagnostic.code
+        for diagnostic in (
+            *diagnostics,
+            *numbering_diagnostics,
+            *outcome_diagnostics,
+            *conflicts,
+        )
+    )
+    memberships = tuple(
+        SeriesMembership(
+            series_id=series_id,
+            replay_id=game.metadata.replay_id,
+            game_number=game_number,
+            canonical_player_roles=_roles(game, players),
+            grouping_method=method,
+            confidence=1.0 if method is GroupingMethod.PARENT_ROOM else 0.5,
+            diagnostics=membership_diagnostics,
+        )
+        for game, game_number in zip(ordered, numbers, strict=True)
+    )
     record = SeriesRecord(
         series_id=series_id,
         format_id=format_id,
@@ -162,12 +260,17 @@ def _make_group(
         game_player_roles=tuple(membership.canonical_player_roles for membership in memberships),
         team_hashes=team_hashes,
         is_complete=complete,
-        score=(score[0], score[1]),
+        score=score,
         grouping_method=method,
         grouping_confidence=1.0 if method is GroupingMethod.PARENT_ROOM else 0.5,
     )
-    diagnostics = tuple(conflicts) + (() if diagnostic is None else (diagnostic,))
-    return GroupedSeries(record, ordered, memberships, diagnostics)
+    group_diagnostics = (
+        *diagnostics,
+        *numbering_diagnostics,
+        *outcome_diagnostics,
+        *conflicts,
+    )
+    return GroupedSeries(record, ordered, memberships, group_diagnostics)
 
 
 def group_replays(
@@ -176,7 +279,16 @@ def group_replays(
     format_id: str | None = None,
     max_games: int = 3,
 ) -> GroupingResult:
-    """Group compatible documents without merging conflicting player pairs."""
+    """Group compatible documents without merging conflicting player pairs.
+
+    Arguments:
+        documents: Parsed, model-agnostic replay documents.
+        format_id: Optional exact format filter.
+        max_games: Maximum number of games retained in one series.
+
+    Returns:
+        Deterministically ordered groups and quarantine diagnostics.
+    """
     if max_games < 1 or max_games > 3:
         raise ValueError("max_games must be between one and three")
     candidates = tuple(
@@ -190,9 +302,9 @@ def group_replays(
         )
     )
     diagnostics: list[GroupingDiagnostic] = []
-    buckets: dict[tuple[str, tuple[str, str]], list[ReplayDocument]] = {}
-    methods: dict[tuple[str, tuple[str, str]], GroupingMethod] = {}
-    fallback_state: dict[tuple[str, str], tuple[datetime, int]] = {}
+    buckets: dict[tuple[str, str, tuple[str, str]], list[ReplayDocument]] = {}
+    methods: dict[tuple[str, str, tuple[str, str]], GroupingMethod] = {}
+    fallback_state: dict[tuple[str, tuple[str, str]], tuple[datetime, int]] = {}
     for document in candidates:
         try:
             players = _canonical_players(document)
@@ -203,19 +315,20 @@ def group_replays(
             )
             continue
         if not key:
-            previous = fallback_state.get(players)
+            fallback_key = (document.metadata.format_id, players)
+            previous = fallback_state.get(fallback_key)
             if previous is None or (_time(document) - previous[0]).total_seconds() > 24 * 60 * 60:
                 cluster = 0 if previous is None else previous[1] + 1
             else:
                 cluster = previous[1]
             key = f"fallback:{players[0]}:{players[1]}:{cluster}"
-            fallback_state[players] = (_time(document), cluster)
-        bucket = (key, players)
+            fallback_state[fallback_key] = (_time(document), cluster)
+        bucket = (document.metadata.format_id, key, players)
         buckets.setdefault(bucket, []).append(document)
         methods[bucket] = method
 
     result: list[GroupedSeries] = []
-    for bucket in sorted(buckets, key=lambda item: (item[0], item[1])):
+    for bucket in sorted(buckets):
         games = tuple(
             sorted(buckets[bucket], key=lambda item: (_time(item), item.metadata.replay_id))
         )
@@ -224,7 +337,7 @@ def group_replays(
             chunks: list[list[ReplayDocument]] = [[]]
             previous_hashes: tuple[str, str] | None = None
             for game in games:
-                roles = _roles(game, bucket[1])
+                roles = _roles(game, bucket[2])
                 hashes = (_team_hash(game, roles[0]), _team_hash(game, roles[1]))
                 if previous_hashes is not None and hashes != previous_hashes:
                     diagnostics.append(
@@ -239,14 +352,23 @@ def group_replays(
                 previous_hashes = hashes
             if len(chunks) > 1:
                 for chunk_index, chunk in enumerate(chunks):
-                    result.append(
-                        _make_group(
-                            tuple(chunk),
-                            key=f"{bucket[0]}:{chunk_index}",
-                            method=method,
-                        )
+                    group = _make_group(
+                        tuple(chunk),
+                        key=f"{bucket[1]}:{chunk_index}",
+                        method=method,
                     )
+                    result.append(group)
+                    diagnostics.extend(group.diagnostics)
+                    if not group.record.is_complete:
+                        diagnostics.append(
+                            GroupingDiagnostic(
+                                "incomplete_series",
+                                group.record.game_replay_ids,
+                                "series does not contain a validated two-win result",
+                            )
+                        )
                 continue
+        group_diagnostics: list[GroupingDiagnostic] = []
         if len(games) > max_games:
             diagnostic = GroupingDiagnostic(
                 "too_many_games",
@@ -254,25 +376,78 @@ def group_replays(
                 f"group contains {len(games)} games; retained first {max_games}",
             )
             diagnostics.append(diagnostic)
+            group_diagnostics.append(diagnostic)
             games = games[:max_games]
-        if len(games) < 2:
-            diagnostic = GroupingDiagnostic(
-                "incomplete_series",
-                tuple(game.metadata.replay_id for game in games),
-                "fewer than two games were available",
-            )
-            diagnostics.append(diagnostic)
-        if not any(game.outcome.winner in (0, 1) for game in games):
+        group = _make_group(
+            games,
+            key=bucket[1],
+            method=method,
+            diagnostics=tuple(group_diagnostics),
+        )
+        result.append(group)
+        diagnostics.extend(
+            diagnostic for diagnostic in group.diagnostics if diagnostic not in group_diagnostics
+        )
+        if not group.record.is_complete:
             diagnostics.append(
                 GroupingDiagnostic(
-                    "missing_outcome",
-                    tuple(game.metadata.replay_id for game in games),
-                    "no game has a public winner",
+                    "incomplete_series",
+                    group.record.game_replay_ids,
+                    "series does not contain a validated two-win result",
                 )
             )
-        group = _make_group(games, key=bucket[0], method=method, diagnostic=None)
-        result.append(group)
     return GroupingResult(tuple(result), tuple(diagnostics))
+
+
+def individual_games(
+    documents: Iterable[ReplayDocument],
+    *,
+    format_id: str | None = None,
+) -> tuple[ReplayDocument, ...]:
+    """Return deterministic, deduplicated games for model-agnostic Bo1 use."""
+    selected: dict[str, ReplayDocument] = {}
+    for document in documents:
+        if format_id is not None and document.metadata.format_id != format_id:
+            continue
+        previous = selected.get(document.metadata.replay_id)
+        if previous is not None and previous.raw_payload != document.raw_payload:
+            raise ValueError(
+                f"Conflicting payloads share replay id {document.metadata.replay_id!r}"
+            )
+        selected[document.metadata.replay_id] = document
+    return tuple(
+        sorted(
+            selected.values(),
+            key=lambda document: (_time(document), document.metadata.replay_id),
+        )
+    )
+
+
+def validated_bo3_series(
+    documents: Iterable[ReplayDocument],
+    *,
+    format_id: str | None = None,
+) -> tuple[GroupedSeries, ...]:
+    """Return only explicit-parent series with complete, unambiguous metadata."""
+    grouping = group_replays(documents, format_id=format_id)
+    blocking = {
+        "duplicate_game_number",
+        "fallback_team_conflict",
+        "game_after_series_clinch",
+        "missing_game_number",
+        "missing_outcome",
+        "non_contiguous_game_numbers",
+        "team_identity_conflict",
+        "too_many_games",
+    }
+    return tuple(
+        group
+        for group in grouping.series
+        if group.record.is_complete
+        and group.record.grouping_method is GroupingMethod.PARENT_ROOM
+        and all(game.metadata.game_number is not None for game in group.games)
+        and not any(diagnostic.code in blocking for diagnostic in group.diagnostics)
+    )
 
 
 __all__ = [
@@ -280,4 +455,6 @@ __all__ = [
     "GroupingDiagnostic",
     "GroupingResult",
     "group_replays",
+    "individual_games",
+    "validated_bo3_series",
 ]

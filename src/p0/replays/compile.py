@@ -256,7 +256,19 @@ def write_tensor_shards(
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
 ) -> ShardBuildResult:
-    """Persist a compiled result as immutable, runtime-bound tensor shards."""
+    """Persist a compiled result as immutable, runtime-bound tensor shards.
+
+    Arguments:
+        result: Model-agnostic compilation result to tensorize.
+        output_dir: Root directory for runtime-keyed shard output.
+        max_decisions_per_shard: Soft decision budget for each shard.
+        manifest_path: Runtime contract manifest used to bind the artifacts.
+        resources: Optional preloaded runtime resources.
+        created_at: Optional deterministic manifest timestamp.
+
+    Returns:
+        The generated shard manifest and its path.
+    """
     if max_decisions_per_shard <= 0:
         raise ValueError("max_decisions_per_shard must be positive")
     runtime_hash = _runtime_hash(manifest_path)
@@ -330,17 +342,25 @@ def write_tensor_shards(
         )
     for group in result.series:
         group_games = games_by_series.get(group.record.series_id, {})
+        roles_by_replay = dict(
+            zip(
+                group.record.game_replay_ids,
+                group.record.game_player_roles,
+                strict=True,
+            )
+        )
         score = [0, 0]
         group_items: list[tuple[CompiledGame, ReconstructedPerspective, GameSummary | None]] = []
         for game in group.games:
             compiled = group_games[game.metadata.replay_id]
+            canonical_roles = roles_by_replay[compiled.replay_id]
             winner = compiled.document.outcome.winner
             if winner in (0, 1):
-                score[group.record.game_player_roles[compiled.game_number - 1][winner]] += 1
+                score[canonical_roles[winner]] += 1
             summary = _game_summary(
                 compiled,
                 series_score=(score[0], score[1]),
-                canonical_roles=group.record.game_player_roles[compiled.game_number - 1],
+                canonical_roles=canonical_roles,
             )
             for perspective in compiled.perspectives:
                 group_items.append((compiled, perspective, summary))
@@ -505,13 +525,15 @@ def compile_documents(
     counters["series_count"] = counters["series"]
     counters["complete_series"] = sum(group.record.is_complete for group in grouping.series)
     counters["incomplete_series"] = counters["series"] - counters["complete_series"]
-    counters["grouping_diagnostics"] = len(grouping.diagnostics) + sum(
-        len(group.diagnostics) for group in grouping.series
-    )
+    counters["grouping_diagnostics"] = len(grouping.diagnostics)
     games: list[CompiledGame] = []
     imputation_confidence_sum = 0.0
     for group in grouping.series:
-        for game_number, document in enumerate(group.games, 1):
+        membership_by_replay = {
+            membership.replay_id: membership for membership in group.memberships
+        }
+        for document in group.games:
+            game_number = membership_by_replay[document.metadata.replay_id].game_number
             if dex is not None:
                 estimates = impute_stat_points(document, dex=dex, seed=imputation_seed)
                 counters["imputations"] += sum(item.provenance == "IMPUTED" for item in estimates)

@@ -23,6 +23,7 @@ def test_load_config_applies_partial_yaml_to_source_defaults(tmp_path):
     config = load_config(write_config(tmp_path, "training:\n  n_envs: 8\n  magnet_alpha: 0.05\n"))
 
     assert isinstance(config, GlobalConfig)
+    assert config.bo3 is False
     assert config.training.n_envs == 8
     assert config.training.magnet_alpha == 0.05
     assert config.training.num_episodes == TrainingConfig().num_episodes
@@ -56,6 +57,11 @@ def test_load_config_rejects_invalid_contracts_with_specific_errors(tmp_path):
             "corpus:\n  sampling_policy: made_up\n",
             "sampling_policy",
         ),
+        (
+            "non-boolean bo3 placeholder",
+            "bo3: 1\n",
+            "bo3 must be a boolean",
+        ),
     )
     for label, contents, message in cases:
         try:
@@ -64,6 +70,13 @@ def test_load_config_rejects_invalid_contracts_with_specific_errors(tmp_path):
             assert re.search(message, str(exc)), f"{label}: unexpected error: {exc}"
         else:
             pytest.fail(f"{label}: expected ValueError")
+
+
+def test_bo3_placeholder_is_loaded_without_changing_bo1_configuration(tmp_path):
+    config = load_config(write_config(tmp_path, "bo3: true\n"))
+
+    assert config.bo3 is True
+    assert config.bot.battle_format == "gen9championsvgc2026regmb"
 
 
 def test_config_is_immutable(tmp_path):

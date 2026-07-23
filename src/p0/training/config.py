@@ -217,6 +217,7 @@ class EvalConfig:
 
 @dataclass(frozen=True, slots=True)
 class GlobalConfig:
+    bo3: bool = False
     training: TrainingConfig = TrainingConfig()
     paths: ProjectPaths = DEFAULT_PATHS
     environment: EnvironmentConfig = EnvironmentConfig()
@@ -224,6 +225,10 @@ class GlobalConfig:
     bc: BCConfig = BCConfig()
     corpus: CorpusConfig = CorpusConfig()
     evaluation: EvalConfig = EvalConfig()
+
+    def __post_init__(self) -> None:
+        if type(self.bo3) is not bool:
+            raise ValueError("bo3 must be a boolean")
 
 
 def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root) -> Path:
@@ -321,6 +326,7 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
             names = ", ".join(sorted(str(name) for name in unknown))
             raise ValueError(f"unknown root configuration section(s): {names}")
         config = GlobalConfig(
+            bo3=values["bo3"],
             training=_build_section(TrainingConfig, values["training"]),
             paths=_build_section(ProjectPaths, values["paths"]),
             environment=_build_environment(values["environment"]),

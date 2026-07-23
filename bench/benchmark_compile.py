@@ -11,8 +11,6 @@ from collections.abc import Callable
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import HISTORY_WINDOW
-from p0.model.cls_reducer import pack_history_tokens
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
 from p0.model.policy import PolicyNet

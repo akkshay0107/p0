@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 from torch.amp import GradScaler, autocast
 
-from p0.model.architecture_contract import HISTORY_WINDOW
+from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import PolicyNet
 from p0.replays.dataset import ReplayGameChunk
@@ -143,10 +143,25 @@ class BCTrainer:
             scaler=self.scaler,
         )
 
-    def _series_inputs(self, game: ReplayGameChunk) -> tuple[Tensor, Tensor]:
-        histories = getattr(game, "prior_game_histories", None)
-        series, mask = self.policy.encode_series(histories)
-        return series.to(self.device), mask.to(self.device)
+    def _empty_series_inputs(
+        self,
+        batch_size: int,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        dtype = next(self.policy.parameters()).dtype if dtype is None else dtype
+        return (
+            torch.zeros(
+                (batch_size, SERIES_SLOTS, self.policy.d_model),
+                device=self.device,
+                dtype=dtype,
+            ),
+            torch.zeros(
+                (batch_size, SERIES_SLOTS),
+                device=self.device,
+                dtype=torch.bool,
+            ),
+        )
 
     def _history_inputs(
         self,
@@ -181,6 +196,16 @@ class BCTrainer:
         target_slice: slice,
         totals: _RunTotals,
     ) -> None:
+        """Train one bounded decision window from a replay game.
+
+        Arguments:
+            game: Source game containing observations and supervision.
+            target_slice: Non-empty in-game decision range to optimize.
+            totals: Mutable epoch-level metrics accumulator.
+
+        Returns:
+            None.
+        """
         start = target_slice.start
         stop = target_slice.stop
         if start is None or stop is None or not 0 <= start < stop <= game.length:
@@ -212,13 +237,16 @@ class BCTrainer:
             history_tokens, history_mask, history_age_ids = self._history_inputs(
                 local_tokens, slice(relative_start, relative_stop)
             )
-            series_tokens, series_mask = self._series_inputs(game)
             target_count = stop - start
+            series_tokens, series_mask = self._empty_series_inputs(
+                target_count,
+                dtype=target_encoded.tokens.dtype,
+            )
             log_probs = self.policy.actor.score_joint_candidates(
                 target_encoded,
                 target_mask,
-                series_tokens.expand(target_count, -1, -1),
-                series_mask.expand(target_count, -1),
+                series_tokens,
+                series_mask,
                 history_tokens,
                 history_mask,
                 history_age_ids,

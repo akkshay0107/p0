@@ -1,4 +1,6 @@
 # Copy this file to config.yaml for a machine-local configuration.
+# Reserved for future series orchestration. Bo3 is not operational yet.
+bo3: false
 training:
   num_episodes: 2000
   n_envs: 8

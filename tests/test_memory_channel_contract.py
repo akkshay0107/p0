@@ -163,9 +163,8 @@ def test_policy_exposes_24_current_tokens_and_immutable_history_token() -> None:
     assert not hasattr(output, "state")
 
 
-def test_ppo_reencodes_raw_series_features_inside_the_current_graph() -> None:
+def test_ppo_keeps_series_encoder_out_of_the_bo1_graph() -> None:
     policy = _policy()
-    game1_history = torch.randn(1, 10, policy.d_model)
     observation = StructuredObservation.empty_batch(1)
     action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
     episode = TrajectoryBatch(
@@ -179,7 +178,6 @@ def test_ppo_reencodes_raw_series_features_inside_the_current_graph() -> None:
         length=1,
         returns=torch.zeros(1),
         advantages=torch.ones(1),
-        series_features=[game1_history],
     )
     loss, _, _ = _run_batched_ppo(
         [episode],
@@ -191,4 +189,4 @@ def test_ppo_reencodes_raw_series_features_inside_the_current_graph() -> None:
         alpha=0.0,
     )
     loss.backward()
-    assert policy.series.summary_queries.grad is not None
+    assert all(parameter.grad is None for parameter in policy.series.parameters())

@@ -330,6 +330,7 @@ def test_model_config_has_only_scaling_fields() -> None:
 
 def test_reserved_config_sections(tmp_path) -> None:
     config = load_config("config.yaml.example")
+    assert config.bo3 is False
     assert config.bc.batch_decisions == 256
     assert config.corpus.agent_split == "train"
     assert config.evaluation.episodes_per_matchup == 20

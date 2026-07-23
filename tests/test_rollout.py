@@ -5,7 +5,6 @@ import numpy as np
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import SERIES_SLOTS
 from p0.model.policy import ActOutput
 from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
@@ -37,7 +36,9 @@ class FakePolicy:
         history_mask: torch.Tensor,
         history_age_ids: torch.Tensor,
     ) -> ActOutput:
-        del series_tokens, series_mask, history_tokens, history_mask, history_age_ids
+        assert torch.count_nonzero(series_tokens) == 0
+        assert torch.count_nonzero(series_mask) == 0
+        del history_tokens, history_mask, history_age_ids
         batch_size = action_mask.size(0)
         self.batch_sizes.append(batch_size)
         actions = torch.full((batch_size, 2), self.action, dtype=torch.long)
@@ -46,13 +47,6 @@ class FakePolicy:
             log_probs=torch.full((batch_size,), -0.5),
             value=torch.full((batch_size,), 0.25),
             history_token=torch.ones((batch_size, 1)),
-        )
-
-    def encode_series(self, histories):
-        batch_size = len(histories) if isinstance(histories, list) and histories else 1
-        return (
-            torch.zeros((batch_size, SERIES_SLOTS, self.d_model)),
-            torch.zeros((batch_size, SERIES_SLOTS), dtype=torch.bool),
         )
 
 
@@ -105,29 +99,6 @@ class BufferBindingEnv:
         obs2: StructuredObservation,
     ) -> None:
         self.targets = (obs1, obs2)
-
-
-class FakeSeriesProvider:
-    def __init__(self, n_envs: int):
-        self.game_numbers = [1 for _ in range(n_envs)]
-        self.completed: list[int] = []
-        self.features = torch.randn(1, 5, 1)
-
-    def current(self, env_id: int, player: int):
-        from p0.training.rollout import RolloutSeriesContext
-
-        del player
-        game_number = self.game_numbers[env_id]
-        return RolloutSeriesContext(
-            series_id=f"series-{env_id}",
-            game_number=game_number,
-            features=self.features if game_number > 1 else None,
-        )
-
-    def on_game_end(self, env_id: int, info):
-        del info
-        self.completed.append(env_id)
-        self.game_numbers[env_id] += 1
 
 
 def test_thread_vec_env_binds_each_env_to_its_preallocated_rows():
@@ -207,8 +178,8 @@ def test_collect_rollouts_records_both_self_play_streams():
     vec_env = FakeVecEnv(config.n_envs)
     policy = FakePolicy(action=7)
     buffer = RolloutBuffer()
-    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1, player_index=0)
-    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1, player_index=1)
+    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
+    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
     memory1 = BattleMemoryBuffer(config.n_envs, 1)
     memory2 = BattleMemoryBuffer(config.n_envs, 1)
 
@@ -234,41 +205,3 @@ def test_collect_rollouts_records_both_self_play_streams():
     ]
     assert all(action.tolist() == [7, 7] for action in side_two_actions)
     assert policy.batch_sizes == [2 * config.n_envs]
-
-
-def test_rollout_provider_preserves_series_context_without_cross_game_history():
-    config = TrainingConfig(n_envs=3, rollout_steps=2)
-    vec_env = FakeVecEnv(config.n_envs)
-    provider = FakeSeriesProvider(config.n_envs)
-    trajectories1 = TrajectoryStorage.allocate(
-        config.n_envs, max_steps=4, d_model=1, player_index=0
-    )
-    trajectories2 = TrajectoryStorage.allocate(
-        config.n_envs, max_steps=4, d_model=1, player_index=1
-    )
-    memory1 = BattleMemoryBuffer(config.n_envs, 1)
-    memory2 = BattleMemoryBuffer(config.n_envs, 1)
-    buffer = RolloutBuffer()
-
-    collect_rollouts(
-        cast(Any, vec_env),
-        cast(Any, FakePolicy(action=7)),
-        buffer,
-        config,
-        trajectories1,
-        trajectories2,
-        memory1,
-        memory2,
-        provider,
-    )
-
-    assert provider.completed == [0, 1, 2, 0, 1, 2]
-    second_game = buffer.trajectories[6]
-    assert second_game.series_id == "series-0"
-    assert second_game.game_number == 2
-    assert second_game.player == 0
-    assert second_game.series_features is not None
-    assert second_game.series_tokens is None
-    assert second_game.series_mask is None
-    assert all(not entries for entries in memory1.tokens)
-

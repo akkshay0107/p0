@@ -100,6 +100,27 @@ def test_lazy_dataset_yields_complete_game_perspectives_and_causal_history(
     assert chunks[2].candidate_offsets.tolist() == [0, 0, 1]
 
 
+def test_downstream_shards_preserve_noncontiguous_source_game_numbers(
+    tmp_path: Path,
+) -> None:
+    second = _payload("game-2")
+    second["game_number"] = 2
+    third = _payload("game-3")
+    third["game_number"] = 3
+
+    built = _write_dataset(tmp_path, (third, second))
+    chunks = list(LazyReplayDataset(built.manifest_path))
+
+    assert [(chunk.game_number, chunk.player) for chunk in chunks] == [
+        (2, 0),
+        (2, 1),
+        (3, 0),
+        (3, 1),
+    ]
+    assert chunks[0].summary_inputs == ()
+    assert [summary.game_number for summary in chunks[2].summary_inputs] == [2]
+
+
 def test_split_dataset_keeps_series_together(tmp_path: Path) -> None:
     built = _write_dataset(
         tmp_path,

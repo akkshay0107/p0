@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from p0.replays.identity import linked_replay_ids, replay_matches_format
 from p0.replays.schema import FetchIndexEntry, FetchMetadata
 
 
@@ -137,13 +138,6 @@ def _replay_id(item: object) -> str | None:
     return None
 
 
-def _format_id(item: object) -> str | None:
-    if not isinstance(item, Mapping):
-        return None
-    value = item.get("format", item.get("format_id"))
-    return value if isinstance(value, str) else None
-
-
 def _cutoff_value(cutoff: str | None) -> datetime | None:
     return None if cutoff is None else datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
 
@@ -199,8 +193,7 @@ class ReplayFetcher:
                 replay_id = _replay_id(item)
                 if replay_id is None:
                     raise ReplayFetchError("Search endpoint returned a replay without an id")
-                listed_format = _format_id(item)
-                if listed_format is not None and listed_format != self.config.format_id:
+                if not replay_matches_format(item, self.config.format_id):
                     continue
                 if cutoff is not None:
                     timestamp = _upload_time(item)
@@ -264,6 +257,9 @@ class ReplayFetcher:
             transport=self.transport,
             limiter=self._limiter,
         )
+        value = _json_object(response.body, url)
+        if not isinstance(value, Mapping):
+            raise ReplayFetchError(f"Replay endpoint returned a non-object JSON value: {url}")
         digest, size = self._write_immutable(replay_id, response.body)
         metadata = FetchMetadata(
             source_url=url,
@@ -297,22 +293,45 @@ class ReplayFetcher:
         temporary.write_text(encoded, encoding="utf-8")
         os.replace(temporary, path)
 
-    def acquire(self, replay_ids: Iterable[str] | None = None) -> tuple[FetchIndexEntry, ...]:
-        ids = tuple(sorted(set(replay_ids if replay_ids is not None else self.discover_ids())))
-        existing = read_fetch_index(self.index_path)
-        known = {entry.replay_id: entry for entry in existing}
-        pending = tuple(replay_id for replay_id in ids if replay_id not in known)
-        with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
-            fetched = tuple(executor.map(self._fetch_one, pending))
-        merged = tuple(sorted((*existing, *fetched), key=lambda entry: entry.replay_id))
+    def _write_index(self, entries: Iterable[FetchIndexEntry]) -> None:
+        ordered = tuple(sorted(entries, key=lambda entry: entry.replay_id))
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.index_path.with_suffix(".tmp")
         temporary.write_text(
-            "".join(json.dumps(entry.to_dict(), sort_keys=True) + "\n" for entry in merged),
+            "".join(json.dumps(entry.to_dict(), sort_keys=True) + "\n" for entry in ordered),
             encoding="utf-8",
         )
         os.replace(temporary, self.index_path)
-        return merged
+
+    def _raw_path(self, replay_id: str) -> Path:
+        return self.config.cache_dir / self.config.format_id / "raw" / f"{replay_id}.json.gz"
+
+    def acquire(self, replay_ids: Iterable[str] | None = None) -> tuple[FetchIndexEntry, ...]:
+        seeds = set(replay_ids if replay_ids is not None else self.discover_ids())
+        existing = read_fetch_index(self.index_path)
+        known = {entry.replay_id: entry for entry in existing}
+        frontier = seeds
+        scanned: set[str] = set()
+        while frontier:
+            pending = tuple(sorted(frontier - known.keys()))
+            if pending:
+                with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
+                    fetched = tuple(executor.map(self._fetch_one, pending))
+                known.update((entry.replay_id, entry) for entry in fetched)
+                self._write_index(known.values())
+            scan_ids = tuple(sorted((frontier & known.keys()) - scanned))
+            discovered: set[str] = set()
+            for replay_id in scan_ids:
+                discovered.update(
+                    linked_replay_ids(
+                        load_raw_replay(self._raw_path(replay_id)),
+                        format_id=self.config.format_id,
+                    )
+                )
+            scanned.update(scan_ids)
+            frontier = discovered - scanned
+        self._write_index(known.values())
+        return tuple(sorted(known.values(), key=lambda entry: entry.replay_id))
 
 
 def read_fetch_index(path: str | Path) -> tuple[FetchIndexEntry, ...]:

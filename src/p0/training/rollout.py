@@ -1,9 +1,5 @@
 """Typed all-self-play rollout collection over the fixed memory channel."""
 
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, Protocol
-
 import numpy as np
 import torch
 
@@ -27,38 +23,9 @@ MAX_TRAJECTORY_STEPS = 200
 __all__ = [
     "RolloutBuffer",
     "BattleMemoryBuffer",
-    "RolloutSeriesContext",
-    "SeriesContextProvider",
     "RolloutCollector",
     "collect_rollouts",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class RolloutSeriesContext:
-    """Training-side series state for one environment and player perspective."""
-
-    series_id: str | None = None
-    game_number: int = 1
-    features: Any | None = None
-
-    def __post_init__(self) -> None:
-        if self.series_id is not None and not self.series_id:
-            raise ValueError("RolloutSeriesContext.series_id must be non-empty when provided")
-        if self.game_number < 1:
-            raise ValueError("RolloutSeriesContext.game_number must be positive")
-
-
-class SeriesContextProvider(Protocol):
-    """Inject simulator-produced causal summaries into training rollouts."""
-
-    def current(self, env_id: int, player: int) -> RolloutSeriesContext:
-        """Return the context used by the next decision for one player."""
-        ...
-
-    def on_game_end(self, env_id: int, info: Mapping[str, object]) -> None:
-        """Advance the provider after the simulator reports a completed game."""
-        ...
 
 
 class RolloutBuffer:
@@ -85,8 +52,6 @@ class BattleMemoryBuffer:
 
     def __init__(self, n_envs: int, d_model: int):
         self.tokens: list[list[torch.Tensor]] = [[] for _ in range(n_envs)]
-        self.series_tokens: list[torch.Tensor | None] = [None for _ in range(n_envs)]
-        self.series_masks: list[torch.Tensor | None] = [None for _ in range(n_envs)]
         self.d_model = d_model
 
     def append(self, env_ids: torch.Tensor, history_tokens: torch.Tensor) -> None:
@@ -99,28 +64,8 @@ class BattleMemoryBuffer:
                 del entries[0]
 
     def reset(self, env_id: int) -> None:
-        """Reset one game's history while preserving any active series context."""
+        """Reset one game's history."""
         self.tokens[env_id].clear()
-
-    def set_series(
-        self,
-        env_ids: torch.Tensor,
-        series_tokens: torch.Tensor,
-        series_mask: torch.Tensor,
-    ) -> None:
-        if series_tokens.shape != (env_ids.numel(), SERIES_SLOTS, self.d_model):
-            raise ValueError("series token batch does not match the series slot contract")
-        if series_mask.shape != (env_ids.numel(), SERIES_SLOTS):
-            raise ValueError("series mask batch does not match the series slot contract")
-        for env_id, tokens, mask in zip(env_ids.tolist(), series_tokens, series_mask, strict=True):
-            self.series_tokens[env_id] = (
-                tokens.detach().to(device="cpu", dtype=torch.float32).clone()
-            )
-            self.series_masks[env_id] = mask.detach().to(device="cpu", dtype=torch.bool).clone()
-
-    def clear_series(self, env_id: int) -> None:
-        self.series_tokens[env_id] = None
-        self.series_masks[env_id] = None
 
     def inputs(
         self,
@@ -142,41 +87,22 @@ class BattleMemoryBuffer:
             history.append(packed[0])
             masks.append(mask[0])
             ages.append(age[0])
-        series = []
-        series_masks = []
-        for env_id in env_ids.tolist():
-            stored_tokens = self.series_tokens[env_id]
-            stored_mask = self.series_masks[env_id]
-            if stored_tokens is None or stored_mask is None:
-                series.append(torch.zeros((SERIES_SLOTS, self.d_model), device=device, dtype=dtype))
-                series_masks.append(torch.zeros((SERIES_SLOTS,), device=device, dtype=torch.bool))
-            else:
-                series.append(stored_tokens.to(device=device, dtype=dtype))
-                series_masks.append(stored_mask.to(device=device))
+        batch_size = env_ids.numel()
         return (
-            torch.stack(series),
-            torch.stack(series_masks),
+            torch.zeros(
+                (batch_size, SERIES_SLOTS, self.d_model),
+                device=device,
+                dtype=dtype,
+            ),
+            torch.zeros(
+                (batch_size, SERIES_SLOTS),
+                device=device,
+                dtype=torch.bool,
+            ),
             torch.stack(history),
             torch.stack(masks),
             torch.stack(ages),
         )
-
-
-def _sync_series_context(
-    policy: PolicyNet,
-    memory: BattleMemoryBuffer,
-    env_ids: torch.Tensor,
-    contexts: list[RolloutSeriesContext],
-) -> None:
-    """Encode and install the raw context for selected environments."""
-    if env_ids.numel() == 0:
-        return
-    if len(contexts) != env_ids.numel():
-        raise ValueError("series contexts must match selected environments")
-    histories = [getattr(context, "features", None) for context in contexts]
-    with torch.inference_mode():
-        encoded, masks = policy.encode_series(histories)
-    memory.set_series(env_ids, encoded, masks)
 
 
 @torch.inference_mode()
@@ -189,38 +115,27 @@ def collect_rollouts(
     trajectories2: TrajectoryStorage,
     memory1: BattleMemoryBuffer,
     memory2: BattleMemoryBuffer,
-    series_context: SeriesContextProvider | None = None,
 ) -> None:
-    """Collect one all-self-play rollout using explicit fixed-window memory."""
+    """Collect one all-self-play rollout using explicit fixed-window memory.
+
+    Arguments:
+        vec_env: Batched self-play environments.
+        policy: Policy used for both player seats.
+        buffer: Destination for completed trajectories.
+        config: Rollout length and device optimization settings.
+        trajectories1: Active trajectory storage for the first seat.
+        trajectories2: Active trajectory storage for the second seat.
+        memory1: Per-battle history for the first seat.
+        memory2: Per-battle history for the second seat.
+
+    Returns:
+        None.
+    """
     n_envs = vec_env.n_envs
     device = policy.device
     idx_all = torch.arange(n_envs)
     masks1 = vec_env.last_masks1
     masks2 = vec_env.last_masks2
-
-    contexts1 = (
-        [series_context.current(env_id, 0) for env_id in range(n_envs)]
-        if series_context is not None
-        else [RolloutSeriesContext() for _ in range(n_envs)]
-    )
-    contexts2 = (
-        [series_context.current(env_id, 1) for env_id in range(n_envs)]
-        if series_context is not None
-        else [RolloutSeriesContext() for _ in range(n_envs)]
-    )
-    if series_context is not None:
-        _sync_series_context(policy, memory1, idx_all, contexts1)
-        _sync_series_context(policy, memory2, idx_all, contexts2)
-    trajectories1.set_context(
-        idx_all,
-        [context.series_id for context in contexts1],
-        torch.tensor([context.game_number for context in contexts1], dtype=torch.long),
-    )
-    trajectories2.set_context(
-        idx_all,
-        [context.series_id for context in contexts2],
-        torch.tensor([context.game_number for context in contexts2], dtype=torch.long),
-    )
 
     for _ in range(config.rollout_steps):
         obs1_gpu = vec_env.get_batched_obs1(device)
@@ -264,11 +179,6 @@ def collect_rollouts(
             log_probs1_cpu,
             values1_cpu,
             torch.from_numpy(masks1).to(torch.bool),
-            memory1_inputs[0].to(device="cpu"),
-            memory1_inputs[1].to(device="cpu"),
-            series_features=(
-                [context.features for context in contexts1] if series_context is not None else None
-            ),
         )
         s2 = trajectories2.record(
             idx_all,
@@ -277,11 +187,6 @@ def collect_rollouts(
             log_probs2_cpu,
             values2_cpu,
             torch.from_numpy(masks2).to(torch.bool),
-            memory2_inputs[0].to(device="cpu"),
-            memory2_inputs[1].to(device="cpu"),
-            series_features=(
-                [context.features for context in contexts2] if series_context is not None else None
-            ),
         )
 
         env_actions = [
@@ -292,7 +197,7 @@ def collect_rollouts(
             for i in range(n_envs)
         ]
 
-        next_masks1, next_masks2, rewards1, rewards2, dones, infos = vec_env.step(env_actions)
+        next_masks1, next_masks2, rewards1, rewards2, dones, _ = vec_env.step(env_actions)
         trajectories1.rewards[idx_all, s1] = torch.from_numpy(rewards1)
         trajectories1.dones[idx_all, s1] = torch.from_numpy(dones.astype(np.float32))
         trajectories2.rewards[idx_all, s2] = torch.from_numpy(rewards2)
@@ -305,23 +210,6 @@ def collect_rollouts(
             buffer.add_episode(trajectories2.complete(i))
             memory1.reset(i)
             memory2.reset(i)
-            if series_context is not None:
-                series_context.on_game_end(i, infos[i])
-                contexts1[i] = series_context.current(i, 0)
-                contexts2[i] = series_context.current(i, 1)
-                single_env = torch.tensor([i], dtype=torch.long)
-                _sync_series_context(policy, memory1, single_env, [contexts1[i]])
-                _sync_series_context(policy, memory2, single_env, [contexts2[i]])
-                trajectories1.set_context(
-                    single_env,
-                    [contexts1[i].series_id],
-                    torch.tensor([contexts1[i].game_number], dtype=torch.long),
-                )
-                trajectories2.set_context(
-                    single_env,
-                    [contexts2[i].series_id],
-                    torch.tensor([contexts2[i].game_number], dtype=torch.long),
-                )
 
         masks1 = next_masks1
         masks2 = next_masks2
@@ -337,19 +225,13 @@ class RolloutCollector:
         config: TrainingConfig,
         *,
         max_trajectory_steps: int = MAX_TRAJECTORY_STEPS,
-        series_context: SeriesContextProvider | None = None,
     ) -> None:
         self.vector_env = vector_env
         self.policy = policy
         self.config = config
-        self.series_context = series_context
         self.buffer = RolloutBuffer()
-        self.first = TrajectoryStorage.allocate(
-            config.n_envs, max_trajectory_steps, d_model=policy.d_model, player_index=0
-        )
-        self.second = TrajectoryStorage.allocate(
-            config.n_envs, max_trajectory_steps, d_model=policy.d_model, player_index=1
-        )
+        self.first = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
+        self.second = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
         self.memory1 = BattleMemoryBuffer(config.n_envs, policy.d_model)
         self.memory2 = BattleMemoryBuffer(config.n_envs, policy.d_model)
 
@@ -363,7 +245,6 @@ class RolloutCollector:
             self.second,
             self.memory1,
             self.memory2,
-            self.series_context,
         )
 
     def reset_completed(self) -> None:

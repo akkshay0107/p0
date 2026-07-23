@@ -119,7 +119,7 @@ def _build_memory_inputs(
     episodes: list[TrajectoryBatch],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build fixed-window and series inputs from one encoded trajectory batch."""
+    """Build Bo1 memory inputs from one encoded trajectory batch."""
     dtype = encoded.tokens.dtype
     local_lists = []
     offset = 0
@@ -148,64 +148,20 @@ def _build_memory_inputs(
     history_tokens = torch.stack(history_parts)
     history_mask = torch.stack(history_mask_parts)
     history_age_ids = torch.stack(history_age_parts)
-    encoded_series: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(episodes)
-    raw_series_indices = [
-        index for index, episode_item in enumerate(episodes) if episode_item.series_features is not None
-    ]
-    if raw_series_indices:
-        raw_feature_values = []
-        for index in raw_series_indices:
-            features = episodes[index].series_features
-            if features is None:
-                raise RuntimeError("series feature index construction drifted")
-            raw_feature_values.append(features)
-        raw_encoded, raw_masks = policy.encode_series(raw_feature_values)
-        for batch_index, episode_index in enumerate(raw_series_indices):
-            encoded_series[episode_index] = (raw_encoded[batch_index], raw_masks[batch_index])
-
-    series_token_parts = []
-    series_mask_parts = []
-    for episode_index, episode_item in enumerate(episodes):
-        encoded_tuple = encoded_series[episode_index]
-        if encoded_tuple is not None:
-            encoded_tok, encoded_msk = encoded_tuple
-            series_token_parts.append(
-                encoded_tok.to(device=device, dtype=dtype)
-                .unsqueeze(0)
-                .expand(episode_item.length, -1, -1)
-            )
-            series_mask_parts.append(
-                encoded_msk.to(device=device).unsqueeze(0).expand(episode_item.length, -1)
-            )
-        elif episode_item.series_tokens is None:
-            series_token_parts.append(
-                torch.zeros(
-                    (episode_item.length, SERIES_SLOTS, policy.d_model),
-                    device=device,
-                    dtype=dtype,
-                )
-            )
-            series_mask_parts.append(
-                torch.zeros((episode_item.length, SERIES_SLOTS), device=device, dtype=torch.bool)
-            )
-        else:
-            if episode_item.series_tokens.shape != (SERIES_SLOTS, policy.d_model):
-                raise ValueError("Trajectory series_tokens do not match the policy contract")
-            if episode_item.series_mask is None or episode_item.series_mask.shape != (SERIES_SLOTS,):
-                raise ValueError("Trajectory series_mask does not match the policy contract")
-            series_token_parts.append(
-                episode_item.series_tokens.to(device=device, dtype=dtype)
-                .unsqueeze(0)
-                .expand(episode_item.length, -1, -1)
-            )
-            series_mask_parts.append(
-                episode_item.series_mask.to(device=device)
-                .unsqueeze(0)
-                .expand(episode_item.length, -1)
-            )
+    decision_count = encoded.tokens.size(0)
+    series_tokens = torch.zeros(
+        (decision_count, SERIES_SLOTS, policy.d_model),
+        device=device,
+        dtype=dtype,
+    )
+    series_mask = torch.zeros(
+        (decision_count, SERIES_SLOTS),
+        device=device,
+        dtype=torch.bool,
+    )
     return (
-        torch.cat(series_token_parts, dim=0),
-        torch.cat(series_mask_parts, dim=0),
+        series_tokens,
+        series_mask,
         history_tokens,
         history_mask,
         history_age_ids,
@@ -221,7 +177,20 @@ def _run_batched_ppo(
     episode: int,
     alpha: float,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
-    """Evaluate one PPO minibatch with one reducer pass per decision."""
+    """Evaluate one PPO minibatch with one reducer pass per decision.
+
+    Arguments:
+        episodes: Trajectories included in the minibatch.
+        policy: Live policy receiving gradients.
+        magnet: Frozen reference policy used for reverse-KL regularization.
+        config: PPO optimization settings.
+        device: Device hosting the minibatch computation.
+        episode: Current training episode index.
+        alpha: Active magnet regularization coefficient.
+
+    Returns:
+        Summed loss tensor, summed scalar metrics, and decision count.
+    """
     if not episodes:
         return (
             torch.tensor(0.0, device=device),
@@ -254,9 +223,7 @@ def _run_batched_ppo(
     magnet_enc: EncodedObs | None = None
     magnet_memory: tuple[torch.Tensor, ...] | None = None
     if not is_warmup:
-        with torch.inference_mode(), autocast(
-            device_type=device.type, enabled=use_amp
-        ):
+        with torch.inference_mode(), autocast(device_type=device.type, enabled=use_amp):
             magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
             magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
     total_loss = torch.tensor(0.0, device=device)
@@ -346,7 +313,23 @@ def ppo_update(
     episode: int,
     alpha: float,
     cancel_requested: Callable[[], bool],
-) -> dict:
+) -> dict[str, float | int]:
+    """Apply PPO epochs to a collection of completed trajectories.
+
+    Arguments:
+        episodes: Prepared trajectories with returns and advantages.
+        policy: Live policy to update.
+        magnet: Frozen policy used for regularization.
+        optimizer: Optimizer for the live policy.
+        scaler: Automatic mixed-precision gradient scaler.
+        config: PPO optimization settings.
+        episode: Current training episode index.
+        alpha: Active magnet regularization coefficient.
+        cancel_requested: Callback polled for cooperative cancellation.
+
+    Returns:
+        Scalar optimization, stability, and timing metrics.
+    """
     policy.train()
     t0 = time.time()
 

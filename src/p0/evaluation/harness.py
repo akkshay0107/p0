@@ -152,13 +152,6 @@ class EvalPlayerMixin:
         battle_history = getattr(self, "_battle_history", None)
         if isinstance(battle_history, dict):
             battle_history.pop(str(getattr(battle, "battle_tag", "")), None)
-        if battle.finished and getattr(battle, "_p0_series_complete", True):
-            series_key = getattr(battle, "_p0_series_id", None)
-            if series_key is not None:
-                for attribute in ("_series_tokens", "_series_summaries"):
-                    series_state = getattr(self, attribute, None)
-                    if isinstance(series_state, dict):
-                        series_state.pop(str(series_key), None)
         if self.team_source is not None:
             self.update_team(self.team_source.sample(self.team_rng).packed)
 
@@ -297,7 +290,20 @@ class EvaluationHarness:
         team_source: TeamSource,
         server_configuration: Any,
     ) -> MatchupResult:
-        """Run a single matchup between two policies on a specific team source."""
+        """Run a single matchup between two policies on a specific team source.
+
+        Arguments:
+            name_a: Display name for the first policy.
+            policy_a: First policy, or ``None`` for a random player.
+            name_b: Display name for the second policy.
+            policy_b: Second policy, or ``None`` for a random player.
+            team_category: Label used to aggregate the matchup results.
+            team_source: Team sampler shared by both players.
+            server_configuration: Showdown server connection settings.
+
+        Returns:
+            Aggregated win rates and per-team results for the matchup.
+        """
         logger.info(
             "Starting matchup: %s vs %s on team category '%s' (%d episodes)",
             name_a,

@@ -110,6 +110,17 @@ def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
         torch.testing.assert_close(original_part, changed_part)
 
 
+def test_bc_uses_only_empty_series_inputs() -> None:
+    chunk = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1])
+    trainer = _trainer(chunk)
+
+    tokens, mask = trainer._empty_series_inputs(3)
+
+    assert tokens.shape[0] == 3
+    assert torch.count_nonzero(tokens) == 0
+    assert torch.count_nonzero(mask) == 0
+
+
 def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
     chunk = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1])
     trainer = _trainer(chunk)
