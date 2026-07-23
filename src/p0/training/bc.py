@@ -469,27 +469,8 @@ class BCTrainer:
         self,
         model_inputs: tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor]:
-        batch_size = model_inputs[0].tokens.shape[0]
-        action_count = model_inputs[1].shape[-1]
-        actions = torch.arange(action_count, device=self.device)
-        pairs = torch.cartesian_prod(actions, actions)
-        candidates = pairs.repeat(batch_size, 1)
-        pair_count = pairs.shape[0]
-        offsets = torch.arange(
-            0,
-            (batch_size + 1) * pair_count,
-            pair_count,
-            device=self.device,
-            dtype=torch.long,
-        )
-        scores = self.policy.actor.score_joint_candidates(
-            *model_inputs,
-            candidates,
-            offsets,
-        ).reshape(batch_size, pair_count)
-        best_indices = torch.argmax(scores, dim=1)
-        best_scores = scores.gather(1, best_indices.unsqueeze(1)).squeeze(1)
-        return pairs[best_indices], best_scores
+        actions, log_probs, _, _ = self.policy.actor.greedy(*model_inputs)
+        return actions, log_probs
 
     def _train_batch(self, batch: BCDecisionBatch, totals: _RunTotals) -> None:
         labels = batch.label_kind.to(self.device)

@@ -393,7 +393,7 @@ class _ReplayState:
             if endpoint is None:
                 return
             side, slot = endpoint
-            species = parts[2].split(":", 1)[1].strip() if ":" in parts[2] else "unknown"
+            species = _switch_species(parts) or "unknown"
             pokemon = self.pokemon_for(side, species)
             if pokemon.fainted:
                 pokemon = self._replace_active(side, pokemon, fainted=False)
@@ -456,6 +456,18 @@ def _move_slot(state: _ReplayState, side: int, slot: int, move: str) -> int | No
         return None
 
 
+def _switch_species(parts: Sequence[str]) -> str:
+    """Return the species field from a Showdown switch command.
+
+    Showdown encodes the display nickname in the endpoint field and the actual
+    species (including forms) in the following field. Reconstruction needs the
+    latter to map the event back to the OTS roster.
+    """
+    if len(parts) < 4:
+        return ""
+    return parts[3].split(",", 1)[0].strip()
+
+
 def _observed_actions(
     state: _ReplayState,
     lines: Sequence[Any],
@@ -512,7 +524,7 @@ def _observed_actions(
             endpoint = _ReplayState._endpoint(parts[2])
             if endpoint is None or endpoint[0] != perspective:
                 continue
-            species = parts[2].split(":", 1)[1].strip() if ":" in parts[2] else ""
+            species = _switch_species(parts)
             try:
                 action = 1 + next(
                     index
@@ -541,7 +553,7 @@ def _preview_actions(
         endpoint = _ReplayState._endpoint(line.parts[2])
         if endpoint is None or endpoint[0] != perspective:
             continue
-        species = line.parts[2].split(":", 1)[1].strip() if ":" in line.parts[2] else ""
+        species = _switch_species(line.parts)
         if species and species not in leads:
             leads.append(species)
     if len(leads) != 2:

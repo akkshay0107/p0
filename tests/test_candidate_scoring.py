@@ -101,6 +101,25 @@ def test_candidate_scoring_applies_second_action_mask(policy) -> None:
     assert torch.isneginf(scores[1])
 
 
+def test_greedy_inference_selects_actions_autoregressively(policy) -> None:
+    encoded, _, memory = _inputs(policy, batch_size=2)
+    action_mask = torch.zeros((2, 2, FORMAT.action_size), dtype=torch.bool)
+    action_mask[:, 0, 7] = True
+    action_mask[:, 0, 9] = True
+    action_mask[:, 1, 8] = True
+    action_mask[:, 1, 10] = True
+
+    with torch.inference_mode():
+        first = policy.actor.greedy(encoded, action_mask, *memory)
+        second = policy.actor.greedy(encoded, action_mask, *memory)
+
+    torch.testing.assert_close(first[0], second[0])
+    torch.testing.assert_close(first[1], second[1])
+    assert first[0].shape == (2, 2)
+    assert torch.all((first[0][:, 0] == 7) | (first[0][:, 0] == 9))
+    assert torch.all((first[0][:, 1] == 8) | (first[0][:, 1] == 10))
+
+
 def test_candidate_scoring_rejects_malformed_ragged_inputs(policy) -> None:
     encoded, action_mask, memory = _inputs(policy, batch_size=1)
     candidates = torch.tensor([[7, 8]], dtype=torch.long)

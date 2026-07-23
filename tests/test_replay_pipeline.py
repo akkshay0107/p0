@@ -11,7 +11,7 @@ from p0.replays.group import group_replays, individual_games, validated_bo3_seri
 from p0.replays.identity import linked_replay_ids
 from p0.replays.oracle import OracleCase, OracleExpectation, validate_oracle
 from p0.replays.protocol import ReplayParseError, parse_replay_payload
-from p0.replays.reconstruct import impute_stat_points
+from p0.replays.reconstruct import impute_stat_points, reconstruct_both
 from p0.replays.schema import (
     FetchMetadata,
     GameEndReason,
@@ -332,6 +332,26 @@ def test_reconstruction_is_causal_symmetric_and_compilable() -> None:
     assert right.decisions[1].evidence.exact_action == (9, 10)
     assert left.snapshots[1].pre_line_index < left.snapshots[1].post_line_index
     assert result.metrics.counters["illegal_candidates"] == 0
+
+
+def test_reconstruction_resolves_switch_species_not_nicknames() -> None:
+    payload = _payload("nickname-form")
+    rewritten: list[str] = []
+    for line in str(payload["log"]).splitlines():
+        if line.startswith("|showteam|p1|"):
+            roster = json.loads(line.split("|", 3)[3])
+            roster[0]["species"] = "Ninetales-Alola"
+            line = f"|showteam|p1|{json.dumps(roster, separators=(',', ':'))}"
+        line = line.replace("p1a: Pikachu", "p1a: Snow")
+        line = line.replace("p1b: Eevee", "p1b: Mint")
+        line = line.replace("|Pikachu, L50", "|Ninetales-Alola, L50")
+        rewritten.append(line)
+    payload["log"] = "\n".join(rewritten)
+
+    document = parse_replay_payload(payload)
+    perspectives = reconstruct_both(document)
+
+    assert all(perspective.decisions for perspective in perspectives)
 
 
 def test_controlled_oracle_requires_candidate_containment() -> None:
