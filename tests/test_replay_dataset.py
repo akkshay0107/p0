@@ -67,6 +67,7 @@ def test_split_assignment_is_order_independent_and_round_trips(tmp_path: Path) -
         validation_fraction=0.2,
         test_fraction=0.2,
         runtime_contract_sha256=runtime_hash,
+        dataset_hash="a" * 64,
     )
     second = assign_series_splits(
         ("series-a", "series-b"),
@@ -74,6 +75,7 @@ def test_split_assignment_is_order_independent_and_round_trips(tmp_path: Path) -
         validation_fraction=0.2,
         test_fraction=0.2,
         runtime_contract_sha256=runtime_hash,
+        dataset_hash="a" * 64,
     )
     assert first.to_dict() == second.to_dict()
     path = tmp_path / "splits.json"
@@ -81,7 +83,7 @@ def test_split_assignment_is_order_independent_and_round_trips(tmp_path: Path) -
     assert load_split_manifest(path).to_dict() == first.to_dict()
 
 
-def test_lazy_dataset_yields_complete_game_perspectives_and_causal_history(
+def test_lazy_dataset_yields_complete_game_perspectives_with_empty_bo1_history(
     tmp_path: Path,
 ) -> None:
     built = _write_dataset(tmp_path, (_payload("game-1"), _payload("game-2")))
@@ -94,9 +96,7 @@ def test_lazy_dataset_yields_complete_game_perspectives_and_causal_history(
         (2, 1),
     ]
     assert all(chunk.length == 2 for chunk in chunks)
-    assert chunks[0].summary_inputs == () and chunks[1].summary_inputs == ()
-    assert len(chunks[2].summary_inputs) == 1
-    assert len(chunks[3].summary_inputs) == 1
+    assert all(chunk.summary_inputs == () for chunk in chunks)
     assert chunks[2].candidate_offsets.tolist() == [0, 0, 1]
 
 
@@ -117,8 +117,7 @@ def test_downstream_shards_preserve_noncontiguous_source_game_numbers(
         (3, 0),
         (3, 1),
     ]
-    assert chunks[0].summary_inputs == ()
-    assert [summary.game_number for summary in chunks[2].summary_inputs] == [2]
+    assert all(chunk.summary_inputs == () for chunk in chunks)
 
 
 def test_split_dataset_keeps_series_together(tmp_path: Path) -> None:
@@ -132,6 +131,7 @@ def test_split_dataset_keeps_series_together(tmp_path: Path) -> None:
         runtime_hash,
         0,
         {series_ids[0]: "train", series_ids[1]: "test"},
+        dataset_hash=built.manifest.dataset_hash,
     )
     split_path = tmp_path / "splits.json"
     write_split_manifest(split, split_path)

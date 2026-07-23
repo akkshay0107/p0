@@ -29,7 +29,7 @@ from p0.replays.shards import (
     validate_shard_tensors,
 )
 
-SPLIT_ARTIFACT_SCHEMA = "p0.replay_split.v1"
+SPLIT_ARTIFACT_SCHEMA = "p0.replay_split.v2"
 SPLITS = frozenset({"train", "validation", "test"})
 
 
@@ -40,9 +40,12 @@ class SeriesSplitManifest:
     runtime_contract_sha256: str
     seed: int
     assignments: Mapping[str, str]
+    dataset_hash: str
     artifact_schema: str = SPLIT_ARTIFACT_SCHEMA
 
-    _FIELDS = frozenset({"artifact_schema", "runtime_contract_sha256", "seed", "assignments"})
+    _FIELDS = frozenset(
+        {"artifact_schema", "runtime_contract_sha256", "dataset_hash", "seed", "assignments"}
+    )
 
     def __post_init__(self) -> None:
         if self.artifact_schema != SPLIT_ARTIFACT_SCHEMA:
@@ -52,6 +55,8 @@ class SeriesSplitManifest:
             )
         if not _is_sha256(self.runtime_contract_sha256):
             raise ValueError("SeriesSplitManifest.runtime_contract_sha256 must be a SHA-256 digest")
+        if not _is_sha256(self.dataset_hash):
+            raise ValueError("SeriesSplitManifest.dataset_hash must be a SHA-256 digest")
         if type(self.seed) is not int:
             raise ValueError("SeriesSplitManifest.seed must be an integer")
         for series_id, split in self.assignments.items():
@@ -64,6 +69,7 @@ class SeriesSplitManifest:
         return {
             "artifact_schema": self.artifact_schema,
             "runtime_contract_sha256": self.runtime_contract_sha256,
+            "dataset_hash": self.dataset_hash,
             "seed": self.seed,
             "assignments": {
                 series_id: self.assignments[series_id] for series_id in sorted(self.assignments)
@@ -81,6 +87,7 @@ class SeriesSplitManifest:
             runtime_contract_sha256=str(value["runtime_contract_sha256"]),
             seed=int(value["seed"]),
             assignments={str(series_id): str(split) for series_id, split in assignments.items()},
+            dataset_hash=str(value["dataset_hash"]),
         )
 
 
@@ -91,8 +98,9 @@ def assign_series_splits(
     validation_fraction: float = 0.1,
     test_fraction: float = 0.1,
     runtime_contract_sha256: str,
+    dataset_hash: str,
 ) -> SeriesSplitManifest:
-    """Assign complete series by stable hashing, independent of input order."""
+    """Assign complete series deterministically while keeping requested splits populated."""
     if type(seed) is not int:
         raise ValueError("seed must be an integer")
     if not 0.0 <= validation_fraction < 1.0 or not 0.0 <= test_fraction < 1.0:
@@ -102,18 +110,44 @@ def assign_series_splits(
     unique_ids = sorted(set(series_ids))
     if any(not series_id for series_id in unique_ids):
         raise ValueError("series_ids must contain only non-empty strings")
-    assignments = {}
-    for series_id in unique_ids:
-        digest = hashlib.sha256(f"{seed}:{series_id}".encode("utf-8")).digest()
-        bucket = int.from_bytes(digest[:8], "big") / float(2**64)
-        if bucket < test_fraction:
-            split = "test"
-        elif bucket < test_fraction + validation_fraction:
-            split = "validation"
+    ranked = sorted(
+        unique_ids,
+        key=lambda series_id: (
+            hashlib.sha256(f"{seed}:{series_id}".encode("utf-8")).digest(),
+            series_id,
+        ),
+    )
+    requested = int(validation_fraction > 0) + int(test_fraction > 0)
+    enough_for_all = len(ranked) >= requested + 1
+    test_count = round(len(ranked) * test_fraction)
+    validation_count = round(len(ranked) * validation_fraction)
+    if enough_for_all and test_fraction > 0:
+        test_count = max(1, test_count)
+    if enough_for_all and validation_fraction > 0:
+        validation_count = max(1, validation_count)
+    while test_count + validation_count >= len(ranked) and test_count + validation_count:
+        if validation_count > int(enough_for_all and validation_fraction > 0):
+            validation_count -= 1
+        elif test_count > int(enough_for_all and test_fraction > 0):
+            test_count -= 1
         else:
-            split = "train"
-        assignments[series_id] = split
-    return SeriesSplitManifest(runtime_contract_sha256, seed, assignments)
+            break
+    assignments = {
+        series_id: (
+            "test"
+            if index < test_count
+            else "validation"
+            if index < test_count + validation_count
+            else "train"
+        )
+        for index, series_id in enumerate(ranked)
+    }
+    return SeriesSplitManifest(
+        runtime_contract_sha256,
+        seed,
+        assignments,
+        dataset_hash=dataset_hash,
+    )
 
 
 def write_split_manifest(manifest: SeriesSplitManifest, path: str | Path) -> None:
@@ -231,6 +265,8 @@ class LazyReplayDataset:
             loaded_split.runtime_contract_sha256 != self.manifest.runtime_contract_sha256
         ):
             raise ValueError("Split and shard manifests reference different runtime contracts")
+        if loaded_split is not None and loaded_split.dataset_hash != self.manifest.dataset_hash:
+            raise ValueError("Split and shard manifests reference different datasets")
         self.split = split
         self.split_manifest = loaded_split
         self.runtime_manifest_path = Path(runtime_manifest_path)
@@ -249,34 +285,19 @@ class LazyReplayDataset:
 
     def __iter__(self) -> Iterator[ReplayGameChunk]:
         selected = self._selected_series
-        # Keyed by game number because both perspectives of a game repeat its summary.
-        summaries_by_game: dict[str, dict[int, GameSummary]] = {}
         for entry in self.manifest.shards:
             tensors, summaries = self._load_shard(entry)
-            for item in summaries:
-                summary_value = item["summary"]
-                if summary_value is not None:
-                    series = summaries_by_game.setdefault(str(item["series_id"]), {})
-                    series[int(item["game_number"])] = GameSummary.from_dict(summary_value)
             game_offsets = tensors["game_offsets"].tolist()
             for game_index, item in enumerate(summaries):
                 series_id = str(item["series_id"])
                 if selected is not None and series_id not in selected:
                     continue
-                game_number = int(item["game_number"])
-                history = tuple(
-                    summary
-                    for prior_number, summary in sorted(
-                        summaries_by_game.get(series_id, {}).items()
-                    )
-                    if prior_number < game_number
-                )
                 yield self._chunk(
                     tensors,
                     item,
                     game_offsets[game_index],
                     game_offsets[game_index + 1],
-                    history,
+                    (),
                 )
 
     def _load_shard(
@@ -305,6 +326,8 @@ class LazyReplayDataset:
         if payload.get("artifact_schema") != SHARD_ARTIFACT_SCHEMA:
             raise ValueError(f"Unsupported shard schema in {path}")
         validate_artifact_runtime_contract(payload, self.runtime_manifest_path)
+        if payload.get("dataset_hash") != self.manifest.dataset_hash:
+            raise ValueError(f"Shard and manifest reference different datasets: {path}")
         tensors = payload.get("tensors")
         summaries = payload.get(SHARD_SUMMARY_KEY)
         if not isinstance(tensors, Mapping) or not isinstance(summaries, list):

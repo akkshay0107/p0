@@ -117,19 +117,40 @@ def run_training(
     training, paths = config.training, config.paths
     resources = default_runtime_resources()
     device = default_device()
-    policy = (
-        policy_store.load_policy(paths.checkpoint_path, device)
-        if paths.checkpoint_path.exists()
-        else build_policy(ModelConfig.baseline(), resources).to(device)
-    )
+    if paths.resume_checkpoint is not None:
+        if not paths.resume_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"PPO resume checkpoint does not exist: {paths.resume_checkpoint}"
+            )
+        policy = policy_store.load_policy(paths.resume_checkpoint, device)
+    elif paths.initial_policy_checkpoint is not None:
+        if not paths.initial_policy_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"Initial policy checkpoint does not exist: {paths.initial_policy_checkpoint}"
+            )
+        policy = policy_store.load_policy(paths.initial_policy_checkpoint, device)
+    else:
+        policy = build_policy(ModelConfig.baseline(), resources).to(device)
     policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
     optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
     scaler = GradScaler(
         "cuda", enabled=training.enable_optim and device.type == "cuda", init_scale=512.0
     )
     magnet = Magnet(policy)
-    start = policy_store.load_training_state(
-        paths.checkpoint_path, policy, optimizer=optimizer, scaler=scaler, magnet=magnet
+    scheduler = PPOScheduler(training)
+    start = (
+        policy_store.load_training_state(
+            paths.resume_checkpoint,
+            policy,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            magnet=magnet,
+            expected_trainer_kind="ppo",
+            require_training_state=True,
+        )
+        if paths.resume_checkpoint is not None
+        else 0
     )
     agent_source = _team_source(
         config.environment.agent_team_source,
@@ -187,7 +208,7 @@ def run_training(
                 collector=collector,
                 updater=updater,
                 magnet=magnet,
-                scheduler=PPOScheduler(training),
+                scheduler=scheduler,
                 training_config=training,
                 metric_sink=_tensorboard_sink(writer),
                 cancel_requested=cancel_requested,

@@ -23,7 +23,6 @@ from p0.replays.schema import (
 from p0.replays.scrape import (
     HttpResponse,
     ReplayFetcher,
-    ReplayFetchError,
     ScrapeConfig,
     load_raw_replay,
 )
@@ -435,7 +434,7 @@ def test_fetcher_accepts_display_formats_and_follows_sibling_links(tmp_path) -> 
     )
 
 
-def test_fetcher_rejects_malformed_replay_json_before_caching(tmp_path) -> None:
+def test_fetcher_preserves_malformed_replay_json_for_compilation_audit(tmp_path) -> None:
     config = ScrapeConfig(
         format_id="f",
         cache_dir=tmp_path,
@@ -447,7 +446,7 @@ def test_fetcher_rejects_malformed_replay_json_before_caching(tmp_path) -> None:
         del url, timeout
         return HttpResponse(200, b"not-json")
 
-    with pytest.raises(ReplayFetchError, match="malformed JSON"):
-        ReplayFetcher(config, transport=transport).acquire(("f-1",))
+    entries = ReplayFetcher(config, transport=transport).acquire(("f-1",))
 
-    assert not (tmp_path / "f" / "raw" / "f-1.json.gz").exists()
+    assert [entry.replay_id for entry in entries] == ["f-1"]
+    assert load_raw_replay(tmp_path / "f" / "raw" / "f-1.json.gz") == b"not-json"

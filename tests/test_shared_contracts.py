@@ -136,6 +136,20 @@ def _shard_manifest() -> ShardManifest:
         shards=(entry,),
         diagnostics={"oov_ids": 0},
         created_at="2026-07-17T00:00:00Z",
+        dataset_hash="d" * 64,
+        source_format_id="gen9championsvgc2026regmbbo3",
+        build_config={"max_candidates": 256},
+        raw_replays={"game-1": "f" * 64},
+        source_series={"series-1": ("game-1",)},
+        source_games=1,
+        accepted_games=1,
+        rejected_games=0,
+        quality_manifest="replay-quality-manifest.json",
+        quality_manifest_sha256="e" * 64,
+        artifact_hashes={
+            "shard-000.pt": "c" * 64,
+            "replay-quality-manifest.json": "e" * 64,
+        },
     )
 
 

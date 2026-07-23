@@ -34,6 +34,20 @@ class PPOScheduler:
         del t
         return self.alpha_value
 
+    def state_dict(self) -> dict[str, float | int]:
+        return {
+            "alpha_value": self.alpha_value,
+            "lr_max": self.lr_max,
+            "lr_min": self.lr_min,
+            "warmup_episodes": self.warmup_episodes,
+            "ramp_up_end": self.ramp_up_end,
+            "decay_len": self.decay_len,
+        }
+
+    def load_state_dict(self, value: dict[str, float | int]) -> None:
+        if value != self.state_dict():
+            raise ValueError("PPO scheduler configuration does not match the checkpoint")
+
     def lr(self, t: int):
         """
         Learning rate scheduling. Constant high LR for value warmup,

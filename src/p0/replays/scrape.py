@@ -44,7 +44,8 @@ class ScrapeConfig:
     search_url: str = "https://replay.pokemonshowdown.com/search.json"
     replay_url_template: str = "https://replay.pokemonshowdown.com/{replay_id}.json"
     page_size: int = 50
-    max_pages: int = 1
+    max_pages: int = 100
+    limit_games: int = 50
     cutoff: str | None = None
     concurrency: int = 4
     retries: int = 3
@@ -58,6 +59,7 @@ class ScrapeConfig:
         for name, value in (
             ("page_size", self.page_size),
             ("max_pages", self.max_pages),
+            ("limit_games", self.limit_games),
             ("concurrency", self.concurrency),
             ("retries", self.retries),
         ):
@@ -172,37 +174,45 @@ class ReplayFetcher:
         query = urlencode({"format": self.config.format_id, "page": page})
         return f"{self.config.search_url}?{query}"
 
-    def discover_ids(self) -> tuple[str, ...]:
+    def _discover_page(self, page: int) -> tuple[tuple[str, ...], bool]:
         cutoff = _cutoff_value(self.config.cutoff)
-        discovered: set[str] = set()
-        for page in range(1, self.config.max_pages + 1):
-            response, _ = _request_with_retry(
-                self._page_url(page),
-                config=self.config,
-                transport=self.transport,
-                limiter=self._limiter,
-            )
-            value = _json_object(response.body, self._page_url(page))
-            items = (
-                value if isinstance(value, list) else value.get("replays", value.get("results", []))
-            )
-            if not isinstance(items, list):
-                raise ReplayFetchError("Search endpoint did not return a replay list")
-            ids = []
-            for item in items:
-                replay_id = _replay_id(item)
-                if replay_id is None:
-                    raise ReplayFetchError("Search endpoint returned a replay without an id")
-                if not replay_matches_format(item, self.config.format_id):
+        response, _ = _request_with_retry(
+            self._page_url(page),
+            config=self.config,
+            transport=self.transport,
+            limiter=self._limiter,
+        )
+        value = _json_object(response.body, self._page_url(page))
+        items = value if isinstance(value, list) else value.get("replays", value.get("results", []))
+        if not isinstance(items, list):
+            raise ReplayFetchError("Search endpoint did not return a replay list")
+        ids = []
+        for item in items:
+            replay_id = _replay_id(item)
+            if replay_id is None:
+                raise ReplayFetchError("Search endpoint returned a replay without an id")
+            if not replay_matches_format(item, self.config.format_id):
+                continue
+            if cutoff is not None:
+                timestamp = _upload_time(item)
+                if timestamp is not None and timestamp < cutoff:
                     continue
-                if cutoff is not None:
-                    timestamp = _upload_time(item)
-                    if timestamp is not None and timestamp < cutoff:
-                        continue
-                ids.append(replay_id)
-            discovered.update(ids)
-            if len(items) < self.config.page_size:
+            ids.append(replay_id)
+        return tuple(sorted(set(ids))), len(items) < self.config.page_size
+
+    def _iter_discovered_ids(self) -> Iterable[str]:
+        seen: set[str] = set()
+        for page in range(1, self.config.max_pages + 1):
+            ids, terminal = self._discover_page(page)
+            for replay_id in ids:
+                if replay_id not in seen:
+                    seen.add(replay_id)
+                    yield replay_id
+            if terminal:
                 break
+
+    def discover_ids(self) -> tuple[str, ...]:
+        discovered = set(self._iter_discovered_ids())
         return tuple(sorted(discovered))
 
     def _write_immutable(self, replay_id: str, body: bytes) -> tuple[str, int]:
@@ -257,9 +267,6 @@ class ReplayFetcher:
             transport=self.transport,
             limiter=self._limiter,
         )
-        value = _json_object(response.body, url)
-        if not isinstance(value, Mapping):
-            raise ReplayFetchError(f"Replay endpoint returned a non-object JSON value: {url}")
         digest, size = self._write_immutable(replay_id, response.body)
         metadata = FetchMetadata(
             source_url=url,
@@ -307,29 +314,36 @@ class ReplayFetcher:
         return self.config.cache_dir / self.config.format_id / "raw" / f"{replay_id}.json.gz"
 
     def acquire(self, replay_ids: Iterable[str] | None = None) -> tuple[FetchIndexEntry, ...]:
-        seeds = set(replay_ids if replay_ids is not None else self.discover_ids())
         existing = read_fetch_index(self.index_path)
         known = {entry.replay_id: entry for entry in existing}
-        frontier = seeds
-        scanned: set[str] = set()
-        while frontier:
-            pending = tuple(sorted(frontier - known.keys()))
-            if pending:
-                with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
-                    fetched = tuple(executor.map(self._fetch_one, pending))
-                known.update((entry.replay_id, entry) for entry in fetched)
-                self._write_index(known.values())
-            scan_ids = tuple(sorted((frontier & known.keys()) - scanned))
-            discovered: set[str] = set()
-            for replay_id in scan_ids:
-                discovered.update(
-                    linked_replay_ids(
-                        load_raw_replay(self._raw_path(replay_id)),
-                        format_id=self.config.format_id,
+        if replay_ids is None and len(known) >= self.config.limit_games:
+            return tuple(sorted(known.values(), key=lambda entry: entry.replay_id))
+        seeds = replay_ids if replay_ids is not None else self._iter_discovered_ids()
+        selected: set[str] = set()
+        for seed in seeds:
+            if replay_ids is None and len(selected | set(known)) >= self.config.limit_games:
+                break
+            frontier = {seed}
+            scanned: set[str] = set()
+            while frontier:
+                pending = tuple(sorted(frontier - known.keys()))
+                if pending:
+                    with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
+                        fetched = tuple(executor.map(self._fetch_one, pending))
+                    known.update((entry.replay_id, entry) for entry in fetched)
+                    self._write_index(known.values())
+                scan_ids = tuple(sorted((frontier & known.keys()) - scanned))
+                discovered: set[str] = set()
+                for replay_id in scan_ids:
+                    selected.add(replay_id)
+                    discovered.update(
+                        linked_replay_ids(
+                            load_raw_replay(self._raw_path(replay_id)),
+                            format_id=self.config.format_id,
+                        )
                     )
-                )
-            scanned.update(scan_ids)
-            frontier = discovered - scanned
+                scanned.update(scan_ids)
+                frontier = discovered - scanned
         self._write_index(known.values())
         return tuple(sorted(known.values(), key=lambda entry: entry.replay_id))
 

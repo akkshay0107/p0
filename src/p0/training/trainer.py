@@ -95,6 +95,8 @@ class PPOTrainer:
             episode,
             self.policy,
             optimizer=self.updater.optimizer,
+            scheduler=self.scheduler,
             scaler=self.updater.scaler,
             magnet=self.magnet,
+            trainer_kind="ppo",
         )

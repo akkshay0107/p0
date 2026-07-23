@@ -40,6 +40,7 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 - **Inbuilt Team Preview Handling**: The same policy used for battling can also be used for team picking at the team preview stage. The input is differentiated through a team preview flag in the observation.
 - **Magnetic Mirror-Descent Self-Play**: Runs the live policy on both seats of every environment and regularizes PPO toward a slowly refreshed frozen magnet with a reverse-KL penalty. This preserves strategic diversity in one stochastic policy without a checkpoint league or recurrent BPTT loop.
 - **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with masked prior-game slots and full attention over a 75-position layout. The current BC, PPO, and player runtimes are explicitly Bo1, so the prior-game slots remain empty. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
+- **Bo3 Replay Pretraining**: Acquires complete linked Champions Bo3 OTS series, audits every raw replay, compiles each accepted game as an independent Bo1 example, and creates leakage-safe series-level train/validation/test splits.
 - **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
 - **Mixed Precision (FP16) & CUDA Graph Compilation**: Optional but speeds up training by around 1.7x on the few short runs I have done on a T4.
 
@@ -97,7 +98,35 @@ Launch the main reinforcement learning loop. The script automatically manages th
 uv run p0-train
 ```
 
+Set `paths.resume_checkpoint` to restore PPO training state, or set
+`paths.initial_policy_checkpoint` to import policy weights with a fresh optimizer and
+episode zero. The two settings are mutually exclusive. A BC
+`bc_best_policy.pt` is the supported weights-only handoff into PPO.
+
 _Note: Training metrics (magnet KL, PPO KL, explained variance, normalized entropy, and gradient diagnostics) are exported to TensorBoard. You can view them by running `tensorboard --logdir ./artifacts/runs/ppo_training/`._
+
+### Replay BC pilot
+
+The replay collector searches only the configured Champions Bo3 OTS format. The
+50-game limit is soft so the last linked series is always completed.
+
+```bash
+uv run p0-replays scrape --cache-dir artifacts/replays --limit-games 50
+uv run p0-replays build-shards \
+  --cache-dir artifacts/replays \
+  --output-dir artifacts/shards
+uv run p0-replays create-splits \
+  --shard-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/manifest.json
+uv run p0-bc train \
+  --config config.yaml \
+  --shard-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/manifest.json \
+  --split-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/splits.json \
+  --overfit
+```
+
+Raw response bytes remain immutable even when parsing or OTS checks fail. Derived
+shards are published atomically under the runtime and dataset hashes, and
+`replay-quality-manifest.json` records every accepted or rejected source replay.
 
 ### 3. Local Play
 
@@ -150,7 +179,8 @@ Run the memory-channel performance baseline with:
 uv run python bench/benchmark_memory_channel.py --batch-size 8 --iterations 20
 ```
 
-The installed command-line interfaces are `p0-train`, `p0-play`, `p0-build-vocab`, and `p0-export-training`.
+The installed command-line interfaces include `p0-train`, `p0-bc`, `p0-replays`,
+`p0-play`, `p0-build-vocab`, and `p0-export-training`.
 
 ---
 

@@ -46,6 +46,8 @@ class PolicyStore(Protocol):
         scheduler: Any = None,
         scaler: Any = None,
         magnet: Any = None,
+        metadata: Mapping[str, Any] | None = None,
+        trainer_kind: str | None = None,
     ) -> None: ...
 
     def load_training_state(
@@ -57,6 +59,9 @@ class PolicyStore(Protocol):
         scheduler: Any = None,
         scaler: Any = None,
         magnet: Any = None,
+        expected_trainer_kind: str | None = None,
+        expected_metadata: Mapping[str, Any] | None = None,
+        require_training_state: bool = False,
     ) -> int: ...
 
 
@@ -102,8 +107,13 @@ class CheckpointStore:
         scheduler: Any = None,
         scaler: Any = None,
         magnet: Any = None,
+        metadata: Mapping[str, Any] | None = None,
+        trainer_kind: str | None = None,
     ) -> None:
-        artifact = self._policy_artifact(policy, TRAINING_ARTIFACT)
+        provenance = dict(metadata or {})
+        if trainer_kind is not None:
+            provenance["trainer_kind"] = trainer_kind
+        artifact = self._policy_artifact(policy, TRAINING_ARTIFACT, provenance)
         training_state: dict[str, Any] = {"episode": int(episode)}
         for name, service in (
             ("optimizer", optimizer),
@@ -125,6 +135,9 @@ class CheckpointStore:
         scheduler: Any = None,
         scaler: Any = None,
         magnet: Any = None,
+        expected_trainer_kind: str | None = None,
+        expected_metadata: Mapping[str, Any] | None = None,
+        require_training_state: bool = False,
     ) -> int:
         if not path.exists():
             return 0
@@ -134,7 +147,18 @@ class CheckpointStore:
         if actual != expected:
             raise ValueError(f"Checkpoint {path} model configuration does not match the policy")
         if artifact["artifact_type"] == POLICY_ARTIFACT:
+            if require_training_state:
+                raise ValueError(f"Checkpoint {path} is weights-only and cannot resume training")
             return 0
+        trainer_kind = artifact["provenance"].get("trainer_kind")
+        if expected_trainer_kind is not None and trainer_kind != expected_trainer_kind:
+            raise ValueError(
+                f"Checkpoint {path} belongs to trainer {trainer_kind!r}, "
+                f"not {expected_trainer_kind!r}"
+            )
+        for key, expected_value in (expected_metadata or {}).items():
+            if artifact["provenance"].get(key) != expected_value:
+                raise ValueError(f"Checkpoint {path} provenance field {key!r} is incompatible")
         training_state = artifact.get("training_state")
         if not isinstance(training_state, Mapping):
             raise ValueError(f"Training checkpoint {path} has no valid training_state")

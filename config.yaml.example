@@ -1,5 +1,5 @@
 # Copy this file to config.yaml for a machine-local configuration.
-# Reserved for future series orchestration. Bo3 is not operational yet.
+# This flag remains reserved for live series orchestration; replay acquisition has its own Bo3 flow.
 bo3: false
 training:
   num_episodes: 2000
@@ -32,6 +32,8 @@ paths:
   showdown_root: pokemon-showdown
   gauntlet_dir: artifacts/checkpoints/gauntlet
   checkpoint_path: artifacts/checkpoints/ppo_checkpoint.pt
+  resume_checkpoint: null
+  initial_policy_checkpoint: null
   runs_dir: artifacts/runs
   replays_dir: artifacts/replays
   backups_dir: artifacts/backups
@@ -58,8 +60,10 @@ bc:
   max_grad_norm: 1.0
   seed: 0
   amp: true
-  shards_dir: artifacts/shards
-  checkpoint_path: artifacts/bc_checkpoint.pt
+  shard_manifest: artifacts/shards/manifest.json
+  split_manifest: artifacts/shards/splits.json
+  output_dir: artifacts/checkpoints/bc
+  resume_checkpoint: null
 corpus:
   manifest_path: teams/corpus_manifest.json
   agent_split: train

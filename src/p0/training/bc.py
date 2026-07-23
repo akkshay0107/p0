@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,11 +13,16 @@ from torch.amp import GradScaler, autocast
 
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
-from p0.model.policy import PolicyNet
+from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.structured_observation import StructuredObservation
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
 from p0.training.config import BCConfig
+
+
+class BCCancelled(RuntimeError):
+    """Raised between batches so callers keep the last completed epoch checkpoint."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +50,195 @@ class BCTrainMetrics:
     exact_decisions: int
     partial_decisions: int
     updates: int
+    games: int
+    decisions_per_update: float
+    games_per_update: float
     peak_memory_bytes: int
+
+    def to_dict(self) -> dict[str, float | int]:
+        return {
+            field: getattr(self, field)
+            for field in (
+                "loss",
+                "exact_nll",
+                "partial_nll",
+                "decisions",
+                "labeled_decisions",
+                "exact_decisions",
+                "partial_decisions",
+                "updates",
+                "games",
+                "decisions_per_update",
+                "games_per_update",
+                "peak_memory_bytes",
+            )
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BCGameWindow:
+    game: ReplayGameChunk
+    start: int
+    stop: int
+    batch_start: int
+    batch_stop: int
+
+
+@dataclass(frozen=True, slots=True)
+class BCDecisionBatch:
+    """Target decisions plus game-local context descriptions for one update."""
+
+    observations: StructuredObservation
+    action_mask: Tensor
+    label_kind: Tensor
+    label_confidence: Tensor
+    loss_mask: Tensor
+    decision_type: Tensor
+    exact_action: Tensor
+    candidate_values: Tensor
+    candidate_offsets: Tensor
+    history_local_indices: Tensor
+    windows: tuple[BCGameWindow, ...]
+
+    @property
+    def decisions(self) -> int:
+        return int(self.label_kind.numel())
+
+    @property
+    def games(self) -> int:
+        return len({(window.game.series_id, window.game.game_number) for window in self.windows})
+
+
+@dataclass(frozen=True, slots=True)
+class BCEvaluationMetrics:
+    overall_nll: float
+    exact_nll: float
+    partial_nll: float
+    exact_joint_accuracy: float
+    decisions: int
+    labeled_decisions: int
+    unknown_decisions: int
+    exact_decisions: int
+    partial_decisions: int
+    illegal_predictions: int
+    non_finite_values: int
+    by_decision_type: Mapping[str, Mapping[str, float | int]]
+    confidence_buckets: Mapping[str, Mapping[str, float | int]]
+    candidate_set_sizes: Mapping[str, int]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "overall_nll": self.overall_nll,
+            "exact_nll": self.exact_nll,
+            "partial_nll": self.partial_nll,
+            "exact_joint_accuracy": self.exact_joint_accuracy,
+            "decisions": self.decisions,
+            "labeled_decisions": self.labeled_decisions,
+            "unknown_decisions": self.unknown_decisions,
+            "exact_decisions": self.exact_decisions,
+            "partial_decisions": self.partial_decisions,
+            "illegal_predictions": self.illegal_predictions,
+            "non_finite_values": self.non_finite_values,
+            "by_decision_type": dict(self.by_decision_type),
+            "confidence_buckets": dict(self.confidence_buckets),
+            "candidate_set_sizes": dict(self.candidate_set_sizes),
+        }
+
+
+def _concatenate_observations(
+    observations: Iterable[StructuredObservation],
+) -> StructuredObservation:
+    values = tuple(observations)
+    if not values:
+        raise ValueError("A BC decision batch must contain observations")
+    return StructuredObservation._from_values(
+        [
+            torch.cat([observation.tensors()[index] for observation in values], dim=0)
+            for index in range(len(values[0].tensors()))
+        ]
+    )
+
+
+class MultiGameBCCollator:
+    """Fill a decision budget across game perspectives without crossing histories."""
+
+    def __init__(self, batch_decisions: int):
+        if type(batch_decisions) is not int or batch_decisions <= 0:
+            raise ValueError("batch_decisions must be a positive integer")
+        self.batch_decisions = batch_decisions
+
+    def __call__(self, games: Iterable[ReplayGameChunk]) -> Iterator[BCDecisionBatch]:
+        windows: list[tuple[ReplayGameChunk, int, int]] = []
+        decisions = 0
+        for game in games:
+            start = 0
+            while start < game.length:
+                take = min(self.batch_decisions - decisions, game.length - start)
+                windows.append((game, start, start + take))
+                decisions += take
+                start += take
+                if decisions == self.batch_decisions:
+                    yield self._collate(windows)
+                    windows = []
+                    decisions = 0
+        if windows:
+            yield self._collate(windows)
+
+    @staticmethod
+    def _collate(
+        source_windows: list[tuple[ReplayGameChunk, int, int]],
+    ) -> BCDecisionBatch:
+        windows: list[BCGameWindow] = []
+        observations: list[StructuredObservation] = []
+        tensor_values: dict[str, list[Tensor]] = {
+            name: []
+            for name in (
+                "action_mask",
+                "label_kind",
+                "label_confidence",
+                "loss_mask",
+                "decision_type",
+                "exact_action",
+            )
+        }
+        candidate_values: list[Tensor] = []
+        candidate_offsets = [0]
+        history_rows: list[Tensor] = []
+        batch_start = 0
+        candidate_base = 0
+        for game, start, stop in source_windows:
+            batch_stop = batch_start + stop - start
+            windows.append(BCGameWindow(game, start, stop, batch_start, batch_stop))
+            observations.append(game.observations[start:stop])
+            for name in tensor_values:
+                tensor_values[name].append(getattr(game, name)[start:stop])
+            first_candidate = int(game.candidate_offsets[start])
+            last_candidate = int(game.candidate_offsets[stop])
+            candidate_values.append(game.candidate_values[first_candidate:last_candidate])
+            local_offsets = game.candidate_offsets[start + 1 : stop + 1] - first_candidate
+            candidate_offsets.extend(candidate_base + int(offset) for offset in local_offsets)
+            candidate_base += last_candidate - first_candidate
+            for target in range(start, stop):
+                row = torch.full((HISTORY_WINDOW,), -1, dtype=torch.long)
+                left = max(0, target - HISTORY_WINDOW)
+                count = target - left
+                if count:
+                    row[-count:] = torch.arange(left, target, dtype=torch.long)
+                history_rows.append(row)
+            batch_start = batch_stop
+        return BCDecisionBatch(
+            observations=_concatenate_observations(observations),
+            action_mask=torch.cat(tensor_values["action_mask"]),
+            label_kind=torch.cat(tensor_values["label_kind"]),
+            label_confidence=torch.cat(tensor_values["label_confidence"]),
+            loss_mask=torch.cat(tensor_values["loss_mask"]),
+            decision_type=torch.cat(tensor_values["decision_type"]),
+            exact_action=torch.cat(tensor_values["exact_action"]),
+            candidate_values=torch.cat(candidate_values, dim=0),
+            candidate_offsets=torch.tensor(candidate_offsets, dtype=torch.long),
+            history_local_indices=torch.stack(history_rows),
+            windows=tuple(windows),
+        )
 
 
 @dataclass(slots=True)
@@ -59,6 +253,7 @@ class _RunTotals:
     exact_decisions: int = 0
     partial_decisions: int = 0
     updates: int = 0
+    games: int = 0
 
     def add(self, chunk: _RunTotals) -> None:
         self.loss += chunk.loss
@@ -68,7 +263,8 @@ class _RunTotals:
         self.labeled_decisions += chunk.labeled_decisions
         self.exact_decisions += chunk.exact_decisions
         self.partial_decisions += chunk.partial_decisions
-        self.updates += int(chunk.labeled_decisions > 0)
+        self.updates += chunk.updates
+        self.games += chunk.games
 
 
 class BCTrainer:
@@ -83,6 +279,8 @@ class BCTrainer:
         device: torch.device | str = "cpu",
         optimizer: torch.optim.Optimizer | None = None,
         checkpoint_store: CheckpointStore = DEFAULT_POLICY_STORE,
+        provenance: Mapping[str, object] | None = None,
+        cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self.policy = policy.to(device)
         self.dataset = dataset
@@ -96,19 +294,36 @@ class BCTrainer:
         self.amp_enabled = config.amp and self.device.type == "cuda"
         self.scaler = GradScaler(device=self.device.type, enabled=self.amp_enabled)
         self.checkpoint_store = checkpoint_store
+        self.provenance = dict(provenance or {})
+        self.collator = MultiGameBCCollator(config.batch_decisions)
+        self.cancel_requested = cancel_requested
         torch.manual_seed(config.seed)
 
     def train(self) -> BCTrainMetrics:
         """Run configured epochs over the streaming dataset."""
         if self.config.epochs > 1 and iter(self.dataset) is self.dataset:
             raise ValueError("BC datasets must be re-iterable when epochs is greater than one")
+        totals = _RunTotals()
+        for _ in range(self.config.epochs):
+            totals.add(self._train_epoch_totals())
+        return self._metrics(totals)
+
+    def train_epoch(self) -> BCTrainMetrics:
+        """Train exactly one epoch and return its decision-weighted metrics."""
+        return self._metrics(self._train_epoch_totals())
+
+    def _train_epoch_totals(self) -> _RunTotals:
         self.policy.train()
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
         totals = _RunTotals()
-        for _ in range(self.config.epochs):
-            for game in self.dataset:
-                self._train_game(game, totals)
+        for batch in self.collator(self.dataset):
+            if self.cancel_requested():
+                raise BCCancelled("Behaviour-cloning training was cancelled")
+            self._train_batch(batch, totals)
+        return totals
+
+    def _metrics(self, totals: _RunTotals) -> BCTrainMetrics:
         peak_memory = (
             torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
         )
@@ -121,6 +336,9 @@ class BCTrainer:
             exact_decisions=totals.exact_decisions,
             partial_decisions=totals.partial_decisions,
             updates=totals.updates,
+            games=totals.games,
+            decisions_per_update=totals.decisions / max(totals.updates, 1),
+            games_per_update=totals.games / max(totals.updates, 1),
             peak_memory_bytes=peak_memory,
         )
 
@@ -132,6 +350,8 @@ class BCTrainer:
             self.policy,
             optimizer=self.optimizer,
             scaler=self.scaler,
+            metadata=self.provenance,
+            trainer_kind="bc",
         )
 
     def load_checkpoint(self, path: str | Path) -> int:
@@ -141,6 +361,9 @@ class BCTrainer:
             self.policy,
             optimizer=self.optimizer,
             scaler=self.scaler,
+            expected_trainer_kind="bc",
+            expected_metadata=self.provenance,
+            require_training_state=True,
         )
 
     def _empty_series_inputs(
@@ -185,77 +408,98 @@ class BCTrainer:
         ages = torch.cat([window[2] for window in windows], dim=0)
         return packed, masks, ages
 
-    def _train_game(self, game: ReplayGameChunk, totals: _RunTotals) -> None:
-        for start in range(0, game.length, self.config.batch_decisions):
-            target_slice = slice(start, min(start + self.config.batch_decisions, game.length))
-            self._train_window(game, target_slice, totals)
-
-    def _train_window(
+    def _model_inputs(
         self,
-        game: ReplayGameChunk,
-        target_slice: slice,
-        totals: _RunTotals,
-    ) -> None:
-        """Train one bounded decision window from a replay game.
-
-        Arguments:
-            game: Source game containing observations and supervision.
-            target_slice: Non-empty in-game decision range to optimize.
-            totals: Mutable epoch-level metrics accumulator.
-
-        Returns:
-            None.
-        """
-        start = target_slice.start
-        stop = target_slice.stop
-        if start is None or stop is None or not 0 <= start < stop <= game.length:
-            raise ValueError("target_slice must select a non-empty in-game decision window")
-
-        context_start = max(0, start - HISTORY_WINDOW)
-        observations = game.observations[context_start:stop].to(self.device)
-        action_mask = game.action_mask[context_start:stop].to(self.device)
-        candidate_start = int(game.candidate_offsets[start])
-        candidate_end = int(game.candidate_offsets[stop])
-        candidate_values = game.candidate_values[candidate_start:candidate_end].to(self.device)
-        candidate_offsets = (game.candidate_offsets[start : stop + 1] - candidate_start).to(
-            self.device
+        batch: BCDecisionBatch,
+    ) -> tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        encoded_values: list[EncodedObs] = []
+        history_values: list[tuple[Tensor, Tensor, Tensor]] = []
+        for window in batch.windows:
+            context_start = max(0, window.start - HISTORY_WINDOW)
+            observations = window.game.observations[context_start : window.stop].to(self.device)
+            context_mask = window.game.action_mask[context_start : window.stop].to(self.device)
+            encoded = self.policy.encode(observations, context_mask)
+            local_tokens = self.policy.local_history_tokens(encoded)
+            relative_start = window.start - context_start
+            relative_stop = window.stop - context_start
+            encoded_values.append(
+                EncodedObs(
+                    encoded.tokens[relative_start:relative_stop],
+                    encoded.aux[relative_start:relative_stop],
+                    encoded.numerical[relative_start:relative_stop],
+                )
+            )
+            history_values.append(
+                self._history_inputs(
+                    local_tokens,
+                    slice(relative_start, relative_stop),
+                )
+            )
+        target_encoded = EncodedObs(
+            torch.cat([encoded.tokens for encoded in encoded_values]),
+            torch.cat([encoded.aux for encoded in encoded_values]),
+            torch.cat([encoded.numerical for encoded in encoded_values]),
         )
-        labels = game.label_kind[start:stop].to(self.device)
-        loss_mask = game.loss_mask[start:stop].to(self.device)
+        history_tokens = torch.cat([history[0] for history in history_values])
+        history_mask = torch.cat([history[1] for history in history_values])
+        history_age_ids = torch.cat([history[2] for history in history_values])
+        series_tokens, series_mask = self._empty_series_inputs(
+            batch.decisions,
+            dtype=target_encoded.tokens.dtype,
+        )
+        return (
+            target_encoded,
+            batch.action_mask.to(self.device),
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
+
+    def _forward_batch(self, batch: BCDecisionBatch) -> Tensor:
+        model_inputs = self._model_inputs(batch)
+        return self.policy.actor.score_joint_candidates(
+            *model_inputs,
+            batch.candidate_values.to(self.device),
+            batch.candidate_offsets.to(self.device),
+        )
+
+    def _greedy_actions(
+        self,
+        model_inputs: tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        batch_size = model_inputs[0].tokens.shape[0]
+        action_count = model_inputs[1].shape[-1]
+        actions = torch.arange(action_count, device=self.device)
+        pairs = torch.cartesian_prod(actions, actions)
+        candidates = pairs.repeat(batch_size, 1)
+        pair_count = pairs.shape[0]
+        offsets = torch.arange(
+            0,
+            (batch_size + 1) * pair_count,
+            pair_count,
+            device=self.device,
+            dtype=torch.long,
+        )
+        scores = self.policy.actor.score_joint_candidates(
+            *model_inputs,
+            candidates,
+            offsets,
+        ).reshape(batch_size, pair_count)
+        best_indices = torch.argmax(scores, dim=1)
+        best_scores = scores.gather(1, best_indices.unsqueeze(1)).squeeze(1)
+        return pairs[best_indices], best_scores
+
+    def _train_batch(self, batch: BCDecisionBatch, totals: _RunTotals) -> None:
+        labels = batch.label_kind.to(self.device)
+        loss_mask = batch.loss_mask.to(self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            encoded = self.policy.encode(observations, action_mask)
-            local_tokens = self.policy.local_history_tokens(encoded)
-            relative_start = start - context_start
-            relative_stop = stop - context_start
-            target_encoded = encoded._replace(
-                tokens=encoded.tokens[relative_start:relative_stop],
-                aux=encoded.aux[relative_start:relative_stop],
-                numerical=encoded.numerical[relative_start:relative_stop],
-            )
-            target_mask = action_mask[relative_start:relative_stop]
-            history_tokens, history_mask, history_age_ids = self._history_inputs(
-                local_tokens, slice(relative_start, relative_stop)
-            )
-            target_count = stop - start
-            series_tokens, series_mask = self._empty_series_inputs(
-                target_count,
-                dtype=target_encoded.tokens.dtype,
-            )
-            log_probs = self.policy.actor.score_joint_candidates(
-                target_encoded,
-                target_mask,
-                series_tokens,
-                series_mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
-                candidate_values,
-                candidate_offsets,
-            )
+            log_probs = self._forward_batch(batch)
         objective = compute_bc_objective(
             log_probs,
-            candidate_offsets,
+            batch.candidate_offsets.to(self.device),
             labels,
             loss_mask,
         )
@@ -266,9 +510,7 @@ class BCTrainer:
         if labeled_decisions:
             loss = objective.loss
             if not torch.isfinite(loss):
-                raise ValueError(
-                    f"Non-finite BC loss in series {game.series_id}, game {game.game_number}"
-                )
+                raise ValueError("Non-finite BC loss in a collated decision batch")
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
@@ -280,11 +522,147 @@ class BCTrainer:
                 loss=loss_sum,
                 exact_nll=objective.exact_nll.detach().item() * exact_decisions,
                 partial_nll=objective.partial_nll.detach().item() * partial_decisions,
-                decisions=target_count,
+                decisions=batch.decisions,
                 labeled_decisions=labeled_decisions,
                 exact_decisions=exact_decisions,
                 partial_decisions=partial_decisions,
+                updates=int(labeled_decisions > 0),
+                games=batch.games,
             )
+        )
+
+    @torch.inference_mode()
+    def evaluate(
+        self,
+        dataset: Iterable[ReplayGameChunk] | None = None,
+    ) -> BCEvaluationMetrics:
+        """Evaluate exact and partial replay labels without changing parameters."""
+        self.policy.eval()
+        source = self.dataset if dataset is None else dataset
+        nll_sum = 0.0
+        exact_nll_sum = 0.0
+        partial_nll_sum = 0.0
+        decisions = 0
+        labeled = 0
+        unknown_count = 0
+        exact_count = 0
+        partial_count = 0
+        exact_correct = 0
+        illegal_predictions = 0
+        non_finite = 0
+        candidate_sizes: Counter[str] = Counter()
+        type_totals: dict[str, dict[str, float | int]] = {}
+        confidence_totals: dict[str, dict[str, float | int]] = {}
+        bucket_names = ("[0,.25)", "[.25,.5)", "[.5,.75)", "[.75,1]")
+        boundaries = torch.tensor((0.25, 0.5, 0.75))
+        for batch in self.collator(source):
+            model_inputs = self._model_inputs(batch)
+            candidate_log_probs = self.policy.actor.score_joint_candidates(
+                *model_inputs,
+                batch.candidate_values.to(self.device),
+                batch.candidate_offsets.to(self.device),
+            )
+            objective = compute_bc_objective(
+                candidate_log_probs,
+                batch.candidate_offsets.to(self.device),
+                batch.label_kind.to(self.device),
+                batch.loss_mask.to(self.device),
+            )
+            labels = batch.label_kind.to(self.device)
+            exact = labels == int(LabelKind.EXACT)
+            partial = labels == int(LabelKind.PARTIAL)
+            unknown = labels == int(LabelKind.UNKNOWN)
+            labeled_mask = exact | partial
+            marginal_nll = -objective.marginal_log_probs
+            finite_labeled = torch.isfinite(marginal_nll[labeled_mask])
+            non_finite += int((~finite_labeled).sum())
+            safe_nll = torch.where(
+                torch.isfinite(marginal_nll),
+                marginal_nll,
+                torch.zeros_like(marginal_nll),
+            )
+            nll_sum += float(safe_nll[labeled_mask].sum())
+            exact_nll_sum += float(safe_nll[exact].sum())
+            partial_nll_sum += float(safe_nll[partial].sum())
+            predicted, best_scores = self._greedy_actions(model_inputs)
+            illegal_predictions += int((~torch.isfinite(best_scores)).sum())
+            exact_correct += int(
+                torch.all(
+                    predicted[exact] == batch.exact_action.to(self.device)[exact],
+                    dim=1,
+                ).sum()
+            )
+            batch_decisions = batch.decisions
+            decisions += batch_decisions
+            exact_batch = int(exact.sum())
+            partial_batch = int(partial.sum())
+            unknown_batch = int(unknown.sum())
+            exact_count += exact_batch
+            partial_count += partial_batch
+            unknown_count += unknown_batch
+            labeled += exact_batch + partial_batch
+            counts = (batch.candidate_offsets[1:] - batch.candidate_offsets[:-1]).tolist()
+            candidate_sizes.update(str(count) for count in counts)
+            bucket_ids = torch.bucketize(batch.label_confidence, boundaries).tolist()
+            decision_types = batch.decision_type.tolist()
+            labeled_rows = labeled_mask.cpu().tolist()
+            nll_rows = safe_nll.cpu().tolist()
+            for decision_type, bucket_id, is_labeled, decision_nll in zip(
+                decision_types,
+                bucket_ids,
+                labeled_rows,
+                nll_rows,
+                strict=True,
+            ):
+                type_key = str(decision_type)
+                type_item = type_totals.setdefault(
+                    type_key,
+                    {"decisions": 0, "labeled": 0, "nll_sum": 0.0},
+                )
+                type_item["decisions"] = int(type_item["decisions"]) + 1
+                if is_labeled:
+                    type_item["labeled"] = int(type_item["labeled"]) + 1
+                    type_item["nll_sum"] = float(type_item["nll_sum"]) + decision_nll
+                bucket_key = bucket_names[bucket_id]
+                bucket_item = confidence_totals.setdefault(
+                    bucket_key,
+                    {"decisions": 0, "labeled": 0, "nll_sum": 0.0},
+                )
+                bucket_item["decisions"] = int(bucket_item["decisions"]) + 1
+                if is_labeled:
+                    bucket_item["labeled"] = int(bucket_item["labeled"]) + 1
+                    bucket_item["nll_sum"] = float(bucket_item["nll_sum"]) + decision_nll
+
+        def finalized(
+            values: Mapping[str, Mapping[str, float | int]],
+        ) -> dict[str, Mapping[str, float | int]]:
+            result: dict[str, Mapping[str, float | int]] = {}
+            for key, item in sorted(values.items()):
+                labeled_item = int(item["labeled"])
+                result[key] = {
+                    "decisions": int(item["decisions"]),
+                    "labeled": labeled_item,
+                    "nll": float(item["nll_sum"]) / max(labeled_item, 1),
+                }
+            return result
+
+        return BCEvaluationMetrics(
+            overall_nll=nll_sum / max(labeled, 1),
+            exact_nll=exact_nll_sum / max(exact_count, 1),
+            partial_nll=partial_nll_sum / max(partial_count, 1),
+            exact_joint_accuracy=exact_correct / max(exact_count, 1),
+            decisions=decisions,
+            labeled_decisions=labeled,
+            unknown_decisions=unknown_count,
+            exact_decisions=exact_count,
+            partial_decisions=partial_count,
+            illegal_predictions=illegal_predictions,
+            non_finite_values=non_finite,
+            by_decision_type=finalized(type_totals),
+            confidence_buckets=finalized(confidence_totals),
+            candidate_set_sizes=dict(
+                sorted(candidate_sizes.items(), key=lambda item: int(item[0]))
+            ),
         )
 
 
@@ -406,4 +784,13 @@ def compute_bc_objective(
     )
 
 
-__all__ = ["BCObjective", "compute_bc_objective"]
+__all__ = [
+    "BCDecisionBatch",
+    "BCCancelled",
+    "BCEvaluationMetrics",
+    "BCObjective",
+    "BCTrainMetrics",
+    "BCTrainer",
+    "MultiGameBCCollator",
+    "compute_bc_objective",
+]

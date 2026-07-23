@@ -155,8 +155,10 @@ class BCConfig:
     max_grad_norm: float = 1.0
     seed: int = 0
     amp: bool = True
-    shards_dir: str = "artifacts/shards"
-    checkpoint_path: str = "artifacts/bc_checkpoint.pt"
+    shard_manifest: Path = Path("artifacts/shards/manifest.json")
+    split_manifest: Path = Path("artifacts/shards/splits.json")
+    output_dir: Path = Path("artifacts/checkpoints/bc")
+    resume_checkpoint: Path | None = None
 
     def __post_init__(self) -> None:
         _positive_ints(
@@ -169,10 +171,13 @@ class BCConfig:
         _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))
         if type(self.seed) is not int:
             raise ValueError("bc.seed must be an integer")
-        if not self.shards_dir.strip():
-            raise ValueError("bc.shards_dir must not be empty")
-        if not self.checkpoint_path.strip():
-            raise ValueError("bc.checkpoint_path must not be empty")
+        for name, value in (
+            ("shard_manifest", self.shard_manifest),
+            ("split_manifest", self.split_manifest),
+            ("output_dir", self.output_dir),
+        ):
+            if not str(value).strip():
+                raise ValueError(f"bc.{name} must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +256,16 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
         replays_dir=_resolve_path(config.paths.replays_dir, repository_root),
         backups_dir=_resolve_path(config.paths.backups_dir, repository_root),
         log_path=_resolve_path(config.paths.log_path, repository_root),
+        resume_checkpoint=(
+            None
+            if config.paths.resume_checkpoint is None
+            else _resolve_path(config.paths.resume_checkpoint, repository_root)
+        ),
+        initial_policy_checkpoint=(
+            None
+            if config.paths.initial_policy_checkpoint is None
+            else _resolve_path(config.paths.initial_policy_checkpoint, repository_root)
+        ),
     )
     bot = replace(
         config.bot,
@@ -272,7 +287,18 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
             path=_resolve_path(config.environment.opponent_team_source.path, paths.teams_root),
         ),
     )
-    return replace(config, paths=paths, bot=bot, environment=environment)
+    bc = replace(
+        config.bc,
+        shard_manifest=_resolve_path(config.bc.shard_manifest, repository_root),
+        split_manifest=_resolve_path(config.bc.split_manifest, repository_root),
+        output_dir=_resolve_path(config.bc.output_dir, repository_root),
+        resume_checkpoint=(
+            None
+            if config.bc.resume_checkpoint is None
+            else _resolve_path(config.bc.resume_checkpoint, repository_root)
+        ),
+    )
+    return replace(config, paths=paths, bot=bot, environment=environment, bc=bc)
 
 
 def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
