@@ -25,10 +25,10 @@ def _payload(replay_id: str) -> dict[str, object]:
         "|teampreview",
         f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
         f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
-        "|switch|p1a: Pikachu|Pikachu, L50",
-        "|switch|p1b: Eevee|Eevee, L50",
-        "|switch|p2a: Bulbasaur|Bulbasaur, L50",
-        "|switch|p2b: Charmander|Charmander, L50",
+        "|switch|p1a: Pikachu|Pikachu, L50|100/100",
+        "|switch|p1b: Eevee|Eevee, L50|100/100",
+        "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
+        "|switch|p2b: Charmander|Charmander, L50|100/100",
         "|turn|1",
         "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
@@ -72,6 +72,8 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v3_shard(tmp_path: Path
     assert tensors["game_offsets"].tolist() == [0, 2, 4]
     assert tensors["series_offsets"].tolist() == [0, 4]
     assert len(payload["series_summaries"]) == manifest.games
+    assert torch.count_nonzero(tensors["events_cat"]) > 0
+    assert torch.count_nonzero(tensors["events_metadata"]) > 0
 
 
 def test_shard_bytes_are_deterministic_for_fixed_inputs(tmp_path: Path) -> None:

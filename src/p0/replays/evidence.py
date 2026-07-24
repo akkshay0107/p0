@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from p0.battle.actions import ACT_SIZE, ActionKind, SlotAction, encode_action
+from p0.battle.actions import ACT_SIZE, PASS_ACTION, ActionKind, SlotAction, encode_action
 from p0.battle.legality import DecisionView, legal_actions, validate_joint_action
 from p0.replays.schema import ActionEvidence, LabelKind, MaskProvenance
 
@@ -93,18 +93,13 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
     uncertain = False
     for slot in request.slots:
         if slot is None or not slot.candidates:
-            scalar.append(tuple(legal_actions(request.view, len(scalar))))
+            legal = legal_actions(request.view, len(scalar))
+            if slot is None and legal == (PASS_ACTION,):
+                scalar.append(legal)
+                tags.append("implicit_pass")
+                continue
+            scalar.append(legal)
             uncertain = True
-            if (
-                slot is None
-                and not request.view.wait
-                and not request.view.team_preview
-                and request.view.slots[len(scalar) - 1].active
-                and not request.view.slots[len(scalar) - 1].force_switch
-                and scalar[-1] == (0,)
-            ):
-                tags.append("no_visible_legal_move")
-                return _unknown(tags, MaskProvenance.CONSERVATIVE_RECONSTRUCTED)
             continue
         scalar.append(slot.candidates)
         uncertain |= not slot.exact or len(slot.candidates) != 1

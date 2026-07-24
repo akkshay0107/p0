@@ -6,12 +6,19 @@ import json
 
 import pytest
 
+from p0.battle.legality import DecisionView, SlotDecision
 from p0.replays.compile import compile_payloads
+from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.group import group_replays, individual_games, validated_bo3_series
 from p0.replays.identity import linked_replay_ids
 from p0.replays.oracle import OracleCase, OracleExpectation, validate_oracle
 from p0.replays.protocol import ReplayParseError, parse_replay_payload
-from p0.replays.reconstruct import impute_stat_points, reconstruct_both
+from p0.replays.reconstruct import (
+    _segments,
+    impute_stat_points,
+    reconstruct_both,
+    reconstruct_perspective,
+)
 from p0.replays.schema import (
     FetchMetadata,
     GameEndReason,
@@ -332,6 +339,224 @@ def test_reconstruction_is_causal_symmetric_and_compilable() -> None:
     assert right.decisions[1].evidence.exact_action == (9, 10)
     assert left.snapshots[1].pre_line_index < left.snapshots[1].post_line_index
     assert result.metrics.counters["illegal_candidates"] == 0
+
+
+def test_replay_request_chunks_ignore_outcome_and_automatic_switch_lines() -> None:
+    payload = _payload("request-chunks")
+    lines = str(payload["log"]).splitlines()
+    turn_index = lines.index("|turn|1")
+    lines = lines[:turn_index] + [
+        "|turn|1",
+        "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
+        "|cant|p1a: Pikachu|flinch",
+        "|move|p1b: Eevee|Tackle|p2b: Charmander",
+        "|switch|p1b: Pikachu|Pikachu, L50|100/100|[from] Parting Shot",
+        "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
+        "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|switch|p1a: Eevee|Eevee, L50|100/100",
+        "|turn|2",
+        "|move|p1a: Eevee|Tackle|p2a: Bulbasaur",
+        "|win|Alice",
+    ]
+    payload["log"] = "\n".join(lines)
+
+    document = parse_replay_payload(payload)
+    segments = _segments(document)
+    segment_tags = [
+        [line.parts[1] for line in document.protocol_lines[start:end] if len(line.parts) > 1]
+        for start, end, _ in segments
+    ]
+    assert segment_tags[-3:] == [
+        ["turn", "move", "cant", "move", "switch", "move", "move"],
+        ["switch"],
+        ["turn", "move", "win"],
+    ]
+
+    perspective = reconstruct_perspective(document, perspective=0)
+    assert perspective.diagnostics.counters.get("observed_illegal_action", 0) == 0
+    assert perspective.decisions[1].evidence.exact_action == (9, 10)
+    assert "cant" not in perspective.decisions[1].evidence.tags
+
+
+def test_reconstruction_recovers_target_from_still_animation() -> None:
+    ots = {
+        "p1": [
+            {"species": "Archaludon", "moves": ["Electro Shot", "Protect"]},
+            {"species": "Swampert", "moves": ["Protect"]},
+        ],
+        "p2": [
+            {"species": "Whimsicott", "moves": ["Protect"]},
+            {"species": "Grimmsnarl", "moves": ["Protect"]},
+        ],
+    }
+    payload = _payload("still-animation-target")
+    payload["log"] = "\n".join(
+        [
+            "|start",
+            "|teampreview",
+            f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
+            f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+            "|switch|p1a: Archaludon|Archaludon, L50|100/100",
+            "|switch|p1b: Swampert|Swampert, L50|0 fnt",
+            "|faint|p1b: Swampert",
+            "|switch|p2a: Whimsicott|Whimsicott, L50|100/100",
+            "|switch|p2b: Grimmsnarl|Grimmsnarl, L50|100/100",
+            "|turn|1",
+            "|move|p1a: Archaludon|Electro Shot||[still]",
+            "|-prepare|p1a: Archaludon|Electro Shot",
+            "|-boost|p1a: Archaludon|spa|1",
+            "|-anim|p1a: Archaludon|Electro Shot|p2b: Grimmsnarl",
+            "|-damage|p2b: Grimmsnarl|0 fnt",
+            "|faint|p2b: Grimmsnarl",
+            "|win|Alice",
+        ]
+    )
+
+    perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
+
+    evidence = perspective.decisions[1].evidence
+    assert evidence.label_kind.name == "EXACT"
+    assert evidence.exact_action == (10, 0)  # Electro Shot -> p2b, plus implicit pass.
+    assert "move_anim_target" in evidence.tags
+    assert perspective.diagnostics.counters.get("move_slot_or_target_unknown", 0) == 0
+
+
+def test_reconstruction_restores_illusion_alias_on_replace() -> None:
+    ots = {
+        "p1": [
+            {"species": "Toxapex", "moves": ["Protect"]},
+            {"species": "Zoroark-Hisui", "moves": ["Protect"]},
+            {"species": "Incineroar", "moves": ["Protect"]},
+            {"species": "Grimmsnarl", "moves": ["Protect"]},
+        ],
+        "p2": [
+            {"species": "Bulbasaur", "moves": ["Protect"]},
+            {"species": "Charmander", "moves": ["Protect"]},
+        ],
+    }
+    payload = _payload("illusion-replace")
+    payload["log"] = "\n".join(
+        [
+            "|start",
+            "|teampreview",
+            f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
+            f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+            "|switch|p1a: Toxapex|Toxapex, L50|100/100",
+            "|switch|p1b: Grimmsnarl|Grimmsnarl, L50|100/100",
+            "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
+            "|switch|p2b: Charmander|Charmander, L50|100/100",
+            "|turn|1",
+            "|move|p2a: Bulbasaur|Tackle|p1a: Toxapex",
+            "|-damage|p1a: Toxapex|0 fnt",
+            "|replace|p1a: Zoroark|Zoroark-Hisui, L50",
+            "|-end|p1a: Zoroark|Illusion",
+            "|faint|p1a: Zoroark",
+            "|-damage|p1b: Grimmsnarl|0 fnt",
+            "|faint|p1b: Grimmsnarl",
+            "|switch|p1a: Incineroar|Incineroar, L50|100/100",
+            "|switch|p1b: Toxapex|Toxapex, L50|100/100",
+            "|turn|2",
+            "|win|Alice",
+        ]
+    )
+
+    perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
+
+    assert perspective.diagnostics.counters.get("observed_illegal_action", 0) == 0
+    active = perspective.snapshots[-1].view.active_pokemon[1]
+    assert active is not None
+    assert active.species == "Toxapex"
+    toxapex = next(
+        (
+            pokemon
+            for pokemon in perspective.snapshots[-1].view.team.values()
+            if pokemon is not None and pokemon.species == "Toxapex"
+        ),
+        None,
+    )
+    assert toxapex is not None
+    assert not toxapex.fainted
+
+
+def test_reconstruction_does_not_share_active_illusion_alias_state() -> None:
+    ots = {
+        "p1": [
+            {"species": "Blaziken", "moves": ["Protect"]},
+            {"species": "Toxapex", "moves": ["Protect"]},
+            {"species": "Zoroark-Hisui", "moves": ["Protect"]},
+            {"species": "Incineroar", "moves": ["Protect"]},
+        ],
+        "p2": [
+            {"species": "Bulbasaur", "moves": ["Protect"]},
+            {"species": "Charmander", "moves": ["Protect"]},
+        ],
+    }
+    payload = _payload("illusion-duplicate-active")
+    payload["log"] = "\n".join(
+        [
+            "|start",
+            "|teampreview",
+            f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
+            f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+            "|switch|p1a: Blaziken|Blaziken, L50|100/100",
+            "|switch|p1b: Toxapex|Toxapex, L50|100/100",
+            "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
+            "|switch|p2b: Charmander|Charmander, L50|100/100",
+            "|turn|1",
+            "|move|p2a: Bulbasaur|Tackle|p1b: Toxapex",
+            "|-damage|p1b: Toxapex|50/100",
+            "|move|p2b: Charmander|Tackle|p1a: Blaziken",
+            "|-damage|p1a: Blaziken|0 fnt",
+            "|faint|p1a: Blaziken",
+            "|switch|p1a: Toxapex|Toxapex, L50|100/100",
+            "|turn|2",
+            "|move|p2a: Bulbasaur|Tackle|p1a: Toxapex",
+            "|-damage|p1a: Toxapex|0 fnt",
+            "|replace|p1a: Zoroark|Zoroark-Hisui, L50",
+            "|-end|p1a: Zoroark|Illusion",
+            "|faint|p1a: Zoroark",
+            "|turn|3",
+            "|win|Alice",
+        ]
+    )
+
+    perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
+
+    active = perspective.snapshots[-1].view.active_pokemon
+    assert active[0] is None
+    assert active[1] is not None and active[1].species == "Toxapex"
+    assert active[1].current_hp_fraction == 0.5
+    assert perspective.diagnostics.counters.get("observed_illegal_action", 0) == 0
+
+
+def test_forced_switch_makes_other_slot_an_exact_pass() -> None:
+    view = DecisionView(
+        slots=(
+            SlotDecision(switch_slots=(1,), active=False, force_switch=True),
+            SlotDecision(active=True),
+        )
+    )
+    evidence = extract_action_evidence(
+        EvidenceRequest(view, (ObservedAction(2, tag="switch"), None))
+    )
+
+    assert evidence.label_kind.name == "EXACT"
+    assert evidence.candidates == ((2, 0),)
+    assert evidence.tags == ("switch", "implicit_pass")
+
+
+def test_replay_event_window_is_previous_request_and_is_model_grounded() -> None:
+    payload = _payload("event-window")
+    payload["log"] = "\n".join(
+        f"{line}|100/100" if line.startswith("|switch|") else line
+        for line in str(payload["log"]).splitlines()
+    )
+    perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
+
+    assert perspective.snapshots[0].events == ()
+    assert perspective.snapshots[1].events
+    assert all(event.event_type.name == "SWITCH_IN" for event in perspective.snapshots[1].events)
+    assert perspective.snapshots[1].view.events == list(perspective.snapshots[1].events)
 
 
 def test_reconstruction_resolves_switch_species_not_nicknames() -> None:

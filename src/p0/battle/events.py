@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Callable, Sequence
 from enum import IntEnum
@@ -171,12 +172,11 @@ def build_raw_event(
 
 
 def get_hp_fraction(hp_status: str) -> float:
-    hp_status = hp_status.split()[0]
-    if hp_status == "0" or "/" not in hp_status:
+    match = re.match(r"^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)", hp_status.split()[0])
+    if match is None:
         return 0.0
     try:
-        numerator, denominator = hp_status.split("/")
-        return float(numerator) / float(denominator)
+        return float(match.group(1)) / float(match.group(2))
     except (ValueError, ZeroDivisionError):
         return 0.0
 

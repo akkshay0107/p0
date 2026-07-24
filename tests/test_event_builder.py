@@ -8,6 +8,7 @@ from p0.battle.events import (
     EventTypeId,
     RawBattleEvent,
     build_raw_event,
+    get_hp_fraction,
     truncate_events,
 )
 from p0.battle.events import (
@@ -19,6 +20,12 @@ from p0.runtime.live_event_capture import consume_raw_events, set_raw_events
 
 def parse_events(raw_events: list[RawBattleEvent]) -> list[BattleEvent]:
     return parse_protocol_events(raw_events, tokenizer)
+
+
+def test_hp_fraction_accepts_showdown_status_suffixes() -> None:
+    assert get_hp_fraction("50/100g") == 0.5
+    assert get_hp_fraction("20/100y") == 0.2
+    assert get_hp_fraction("0 fnt") == 0.0
 
 
 def test_parse_events_returns_typed_events_in_protocol_order():

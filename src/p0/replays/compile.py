@@ -51,7 +51,7 @@ from p0.replays.shards import (
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 REPLAY_PARSER_VERSION = 1
-REPLAY_COMPILER_VERSION = 3
+REPLAY_COMPILER_VERSION = 5
 IMPUTATION_ALGORITHM = "causal_stat_point_imputation"
 IMPUTATION_VERSION = 1
 QUALITY_GATE_VERSION = 1
@@ -308,6 +308,10 @@ def _perspective_tensors(
                 )
                 if precomputed is not None:
                     overrides[pokemon] = precomputed
+        # ReconstructedSnapshot.events is the request-scoped event window.
+        # Keep the handoff explicit so observations cannot silently fall back
+        # to FixtureBattleView's default empty event list.
+        snapshot.view.events = list(snapshot.events)
         observation = builder.build(snapshot.view, overrides)
         observation.validate(batch_rank=0)
         observation.validate_overflow_contract()
@@ -818,6 +822,7 @@ def _quality_reasons(
             ("parser_errors", "parser_error"),
             ("state_update_errors", "state_update_error"),
             ("grounding_misses", "grounding_miss"),
+            ("observed_illegal_action", "observed_illegal_action"),
         ):
             if perspective.diagnostics.counters.get(name, 0):
                 reasons.add(reason)
