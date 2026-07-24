@@ -160,12 +160,19 @@ def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
         raise ReplayParseError("Replay metadata has no string or array log")
     result: list[ProtocolLine] = []
     turn: int | None = None
+    skipping_chat_response = False
     for index, line in enumerate(lines):
         if line == "":
             continue
         if not line.startswith("|"):
+            if skipping_chat_response:
+                continue
             raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
         parts = tuple(line.split("|"))
+        if len(parts) >= 2 and parts[1] in {"c", "chatmsg"}:
+            skipping_chat_response = True
+            continue
+        skipping_chat_response = False
         if parts[1] == "turn":
             if len(parts) < 3 or not parts[2].isdigit():
                 raise ReplayParseError(f"Invalid turn line {index}: {line!r}")

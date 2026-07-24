@@ -85,6 +85,28 @@ def test_raw_cache_keeps_malformed_bytes_for_later_quality_rejection(
     )
 
 
+def test_fetcher_skips_404_without_writing_cache_entry(tmp_path: Path, capsys) -> None:
+    replay_id = f"{FORMAT.bo3_format}-missing"
+
+    def transport(url: str, timeout: float) -> HttpResponse:
+        del timeout
+        if "search.invalid" in url:
+            return HttpResponse(200, json.dumps([{"id": replay_id}]).encode())
+        return HttpResponse(404, b"not found")
+
+    config = ScrapeConfig(
+        format_id=FORMAT.bo3_format,
+        cache_dir=tmp_path,
+        search_url="https://search.invalid",
+        replay_url_template="https://replay.invalid/{replay_id}.json",
+        rate_limit_per_second=0,
+    )
+    assert ReplayFetcher(config, transport=transport).acquire() == ()
+    assert not (tmp_path / FORMAT.bo3_format / "raw" / f"{replay_id}.json.gz").exists()
+    assert not (tmp_path / FORMAT.bo3_format / "metadata" / f"{replay_id}.json").exists()
+    assert "skipping unavailable replay" in capsys.readouterr().err
+
+
 def test_cache_build_is_dataset_bound_and_enforces_empty_bo1_history(
     tmp_path: Path,
 ) -> None:

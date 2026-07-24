@@ -100,6 +100,24 @@ def test_protocol_records_are_strict_and_ordered() -> None:
         parse_replay_payload({**_payload("bad"), "log": "not a protocol line"})
 
 
+def test_protocol_ignores_chat_and_multiline_chat_responses() -> None:
+    payload = _payload("chat-response")
+    payload["log"] = "\n".join(
+        [
+            str(payload["log"]),
+            "|c|☆Alice|!dt sharp break",
+            "'sharp break' has no exact match. Approximate match:",
+            "|c|☆Alice|/raw <ul>Sharp Beak</ul>",
+            "|turn|2",
+        ]
+    )
+
+    document = parse_replay_payload(payload)
+
+    assert all(line.parts[1] not in {"c", "chatmsg"} for line in document.protocol_lines)
+    assert all("sharp break" not in line.raw for line in document.protocol_lines)
+
+
 def test_public_bo3_metadata_and_empty_protocol_commands_are_preserved() -> None:
     payload = _payload("gen9championsvgc2026regmbbo3-100")
     payload.pop("p1")
@@ -421,6 +439,26 @@ def test_reconstruction_recovers_target_from_still_animation() -> None:
     assert perspective.diagnostics.counters.get("move_slot_or_target_unknown", 0) == 0
 
 
+def test_reconstruction_marks_struggle_as_forced_move() -> None:
+    payload = _payload("forced-move")
+    lines = []
+    for line in str(payload["log"]).splitlines():
+        if line.startswith("|showteam|p1|"):
+            roster = json.loads(line.split("|", 3)[3])
+            roster[0]["moves"] = ["Struggle"]
+            line = f"|showteam|p1|{json.dumps(roster, separators=(',', ':'))}"
+        if line.startswith("|move|p1a: Pikachu|Protect|"):
+            line = line.replace("|Protect|", "|Struggle|", 1)
+        lines.append(line)
+    payload["log"] = "\n".join(lines)
+
+    perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
+
+    assert perspective.snapshots[1].view.decision.slots[0].forced_move
+    assert perspective.decisions[1].evidence.exact_action[0] == 48
+    assert perspective.diagnostics.counters.get("observed_illegal_action", 0) == 0
+
+
 def test_reconstruction_restores_illusion_alias_on_replace() -> None:
     ots = {
         "p1": [
@@ -476,6 +514,46 @@ def test_reconstruction_restores_illusion_alias_on_replace() -> None:
     )
     assert toxapex is not None
     assert not toxapex.fainted
+
+
+def test_imputation_uses_base_form_stats_for_missing_form_entry() -> None:
+    payload = _payload("florges-blue")
+    lines = []
+    for line in str(payload["log"]).splitlines():
+        if line.startswith("|showteam|p1|"):
+            roster = json.loads(line.split("|", 3)[3])
+            roster[0]["species"] = "Florges-Blue"
+            line = f"|showteam|p1|{json.dumps(roster, separators=(',', ':'))}"
+        line = line.replace("p1a: Pikachu", "p1a: Florges-Blue")
+        line = line.replace("|Pikachu, L50", "|Florges-Blue, L50")
+        lines.append(line)
+    payload["log"] = "\n".join(lines)
+    document = parse_replay_payload(payload)
+    dex = {
+        "species": [
+            {
+                "id": "florges",
+                "name": "Florges",
+                "baseSpecies": "Florges",
+                "formeOrder": ["Florges", "Florges-Blue"],
+                "baseStats": {
+                    "hp": 78,
+                    "atk": 65,
+                    "def": 68,
+                    "spa": 112,
+                    "spd": 154,
+                    "spe": 75,
+                },
+            }
+        ],
+        "moves": [],
+    }
+
+    estimate = impute_stat_points(document, dex=dex, seed=0)[0]
+
+    assert estimate.species == "Florges-Blue"
+    assert estimate.provenance == "IMPUTED"
+    assert estimate.precomputed is not None
 
 
 def test_reconstruction_does_not_share_active_illusion_alias_state() -> None:

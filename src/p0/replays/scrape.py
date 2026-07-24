@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -15,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -24,6 +26,10 @@ from p0.replays.schema import FetchIndexEntry, FetchMetadata
 
 class ReplayFetchError(RuntimeError):
     """Raised after a replay request exhausts its bounded retry budget."""
+
+
+class ReplayUnavailableError(ReplayFetchError):
+    """Raised when a replay listed by search is no longer publicly available."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,8 +96,15 @@ class _RateLimiter:
 
 def _default_transport(url: str, timeout: float) -> HttpResponse:
     request = Request(url, headers={"User-Agent": "p0-replay-acquirer/1"})
-    with urlopen(request, timeout=timeout) as response:
-        return HttpResponse(int(response.status), response.read())
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return HttpResponse(int(response.status), response.read())
+    except HTTPError as exc:
+        try:
+            body = exc.read()
+        except OSError:
+            body = b""
+        return HttpResponse(int(exc.code), body)
 
 
 def _request_with_retry(
@@ -107,11 +120,15 @@ def _request_with_retry(
         limiter.wait()
         try:
             response = transport(url, config.timeout_seconds)
+            if response.status == 404:
+                raise ReplayUnavailableError(f"HTTP status 404 for {url}")
             if response.status == 429 or response.status >= 500:
                 raise ReplayFetchError(f"retryable HTTP status {response.status} for {url}")
             if not 200 <= response.status < 300:
                 raise ReplayFetchError(f"HTTP status {response.status} for {url}")
             return response, attempt
+        except ReplayUnavailableError:
+            raise
         except (OSError, ReplayFetchError) as exc:
             last_error = exc
             if attempt < config.retries:
@@ -165,6 +182,7 @@ class ReplayFetcher:
         self.config = config
         self.transport = transport or _default_transport
         self._limiter = _RateLimiter(config.rate_limit_per_second)
+        self._unavailable_ids: set[str] = set()
 
     @property
     def index_path(self) -> Path:
@@ -326,10 +344,24 @@ class ReplayFetcher:
             frontier = {seed}
             scanned: set[str] = set()
             while frontier:
-                pending = tuple(sorted(frontier - known.keys()))
+                pending = tuple(sorted(frontier - known.keys() - self._unavailable_ids))
                 if pending:
                     with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
-                        fetched = tuple(executor.map(self._fetch_one, pending))
+                        futures = {
+                            replay_id: executor.submit(self._fetch_one, replay_id)
+                            for replay_id in pending
+                        }
+                        fetched = []
+                        for replay_id in pending:
+                            try:
+                                fetched.append(futures[replay_id].result())
+                            except ReplayUnavailableError as exc:
+                                self._unavailable_ids.add(replay_id)
+                                print(
+                                    f"warning: skipping unavailable replay {replay_id}: {exc}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                     known.update((entry.replay_id, entry) for entry in fetched)
                     self._write_index(known.values())
                 scan_ids = tuple(sorted((frontier & known.keys()) - scanned))

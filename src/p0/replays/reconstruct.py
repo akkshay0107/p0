@@ -49,14 +49,50 @@ def normalize_id(value: str) -> str:
 
 
 def _species_base_stats(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
-    """Index the dex by normalized species id."""
-    return {
-        normalize_id(str(entry.get("id", entry.get("name", "")))): {
-            str(key): int(value) for key, value in entry.get("baseStats", {}).items()
-        }
-        for entry in dex.get("species", ())
-        if isinstance(entry, Mapping) and isinstance(entry.get("baseStats"), Mapping)
-    }
+    """Index exact species and documented form aliases by normalized id."""
+    index: dict[str, dict[str, int]] = {}
+    entries = tuple(entry for entry in dex.get("species", ()) if isinstance(entry, Mapping))
+    for entry in entries:
+        base_stats = entry.get("baseStats")
+        if not isinstance(base_stats, Mapping):
+            continue
+        stats = {str(key): int(value) for key, value in base_stats.items()}
+        for value in (entry.get("id"), entry.get("name")):
+            if isinstance(value, str) and value:
+                index[normalize_id(value)] = stats
+    for entry in entries:
+        base_stats = entry.get("baseStats")
+        if not isinstance(base_stats, Mapping):
+            continue
+        stats = {str(key): int(value) for key, value in base_stats.items()}
+        aliases = (*entry.get("formeOrder", ()), *entry.get("otherFormes", ()))
+        for value in aliases:
+            if isinstance(value, str) and value:
+                index.setdefault(normalize_id(value), stats)
+    return index
+
+
+def _species_identity_index(dex: Mapping[str, Any]) -> dict[str, str]:
+    """Map battle forms to their species-clause/base-species identity."""
+    aliases: dict[str, str] = {}
+    for entry in dex.get("species", ()):
+        if not isinstance(entry, Mapping):
+            continue
+        base = entry.get("baseSpecies", entry.get("name", entry.get("id", "")))
+        if not isinstance(base, str) or not base:
+            continue
+        identity = normalize_id(base)
+        values = (
+            entry.get("id"),
+            entry.get("name"),
+            entry.get("baseSpecies"),
+            *entry.get("formeOrder", ()),
+            *entry.get("otherFormes", ()),
+        )
+        for value in values:
+            if isinstance(value, str) and value:
+                aliases.setdefault(normalize_id(value), identity)
+    return aliases
 
 
 _BASE_STATS_CACHE: dict[int, dict[str, dict[str, int]]] = {}
@@ -239,10 +275,19 @@ def impute_stat_points(
     """Seed a legal public-spread estimate, or return explicit UNKNOWN values."""
     species_entries = dex.get("species", ())
     by_id = {
-        str(entry.get("id", entry.get("name", ""))).casefold(): entry
+        normalize_id(str(entry.get("id", entry.get("name", "")))): entry
         for entry in species_entries
         if isinstance(entry, Mapping)
     }
+    for entry in species_entries:
+        if not isinstance(entry, Mapping):
+            continue
+        base = entry.get("baseSpecies", entry.get("name", entry.get("id", "")))
+        base_entry = by_id.get(normalize_id(str(base))) if base else None
+        fallback = base_entry if isinstance(base_entry, Mapping) else entry
+        for value in (*entry.get("formeOrder", ()), *entry.get("otherFormes", ())):
+            if isinstance(value, str) and value:
+                by_id.setdefault(normalize_id(value), fallback)
     move_entries = dex.get("moves", ())
     move_categories = {
         str(entry.get("id", entry.get("name", ""))).casefold(): str(entry.get("category", ""))
@@ -313,6 +358,7 @@ class _ReplayState:
         self.used_mega = [False, False]
         self.active: list[list[ReplayPokemon | None]] = [[None, None], [None, None]]
         self.base_stats_index = _get_base_stats_index(dex)
+        self.species_identity_index = _species_identity_index(dex)
         self.teams: list[list[ReplayPokemon]] = []
         for side in (0, 1):
             side_teams = []
@@ -349,11 +395,24 @@ class _ReplayState:
     def clone_active(self) -> list[list[ReplayPokemon | None]]:
         return deepcopy(self.active)
 
-    def pokemon_for(self, side: int, species: str) -> ReplayPokemon:
+    def team_pokemon(self, side: int, species: str) -> ReplayPokemon | None:
         normalized = normalize_id(species)
         for pokemon in self.teams[side]:
             if normalize_id(pokemon.species) == normalized:
                 return pokemon
+        identity = self.species_identity_index.get(normalized, normalized)
+        for pokemon in self.teams[side]:
+            pokemon_identity = self.species_identity_index.get(
+                normalize_id(pokemon.species), normalize_id(pokemon.species)
+            )
+            if pokemon_identity == identity:
+                return pokemon
+        return None
+
+    def pokemon_for(self, side: int, species: str) -> ReplayPokemon:
+        existing = self.team_pokemon(side, species)
+        if existing is not None:
+            return existing
         pokemon = _make_replay_pokemon(species, self.base_stats_index)
         if len(self.teams[side]) < 6:
             self.teams[side].append(pokemon)
@@ -372,6 +431,57 @@ class _ReplayState:
         for identifier, pokemon in tuple(self.identifiers.items()):
             if pokemon is old:
                 self.identifiers[identifier] = updated
+
+    def _canonicalize_active_aliases(self, side: int) -> None:
+        """Attach duplicate display aliases to their revealed roster members."""
+        for slot, current in enumerate(self.active[side]):
+            if current is None or any(pokemon is current for pokemon in self.teams[side]):
+                continue
+            canonical = self.team_pokemon(side, current.species)
+            if canonical is None or any(pokemon is canonical for pokemon in self.active[side]):
+                continue
+            updated = replace(
+                canonical,
+                current_hp_fraction=current.current_hp_fraction,
+                fainted=current.fainted,
+                selected_in_teampreview=True,
+                status=current.status,
+                boosts=current.boosts,
+            )
+            self._replace_references(side, canonical, updated)
+            self.active[side][slot] = updated
+            for identifier, pokemon in tuple(self.identifiers.items()):
+                if pokemon is current:
+                    self.identifiers[identifier] = updated
+            self._illusion_baselines.pop((side, slot), None)
+
+    def _promote_active_illusion_if_duplicate(
+        self, side: int, slot: int, displayed_species: str
+    ) -> None:
+        """Separate a hidden Illusion before a same-species switch enters."""
+        current = self.active[side][slot]
+        canonical = self.team_pokemon(side, displayed_species)
+        if current is None or canonical is None or current is not canonical:
+            return
+        candidates = [
+            pokemon
+            for pokemon in self.teams[side]
+            if normalize_id(pokemon.ability or "") == "illusion"
+            and not pokemon.fainted
+            and all(active is not pokemon for active in self.active[side])
+        ]
+        if len(candidates) != 1:
+            return
+        alias = replace(
+            current,
+            fainted=False,
+            selected_in_teampreview=True,
+        )
+        self.active[side][slot] = alias
+        self._illusion_baselines[(side, slot)] = alias
+        for identifier, pokemon in tuple(self.identifiers.items()):
+            if pokemon is current:
+                self.identifiers[identifier] = alias
 
     @staticmethod
     def _endpoint(identifier: str) -> tuple[int, int] | None:
@@ -397,6 +507,9 @@ class _ReplayState:
             side, slot = endpoint
             species = _switch_species(parts) or "unknown"
             pokemon = self.pokemon_for(side, species)
+            for active_slot, active in enumerate(self.active[side]):
+                if active is pokemon:
+                    self._promote_active_illusion_if_duplicate(side, active_slot, species)
             hp_fraction = get_hp_fraction(parts[4]) if len(parts) >= 5 else 1.0
             if any(active is pokemon for active in self.active[side]):
                 # A duplicate displayed species is the characteristic replay
@@ -466,6 +579,7 @@ class _ReplayState:
             self.hp[endpoint_id] = hp_fraction
             self.identifiers[parts[2]] = actual
             self.identifiers[endpoint_id] = actual
+            self._canonicalize_active_aliases(side)
             return
         if tag == "faint" and len(parts) >= 3:
             endpoint = self._endpoint(parts[2])
@@ -589,14 +703,7 @@ def _move_slot(
 ) -> int | None:
     active = state.active[side][slot]
     if species is not None:
-        active = next(
-            (
-                pokemon
-                for pokemon in state.teams[side]
-                if normalize_id(pokemon.species) == normalize_id(species)
-            ),
-            None,
-        )
+        active = state.team_pokemon(side, species)
     if active is None:
         return None
     normalized = normalize_id(move)
@@ -691,6 +798,53 @@ def _illusion_species_by_line(lines: Sequence[Any]) -> dict[tuple[int, int, int]
             for index in range(start, line.index):
                 resolved[(index, endpoint[0], endpoint[1])] = species
     return resolved
+
+
+def _infer_illusion_active_species(
+    state: _ReplayState,
+    lines: Sequence[Any],
+    perspective: int,
+    illusion_species_by_line: Mapping[tuple[int, int, int], str],
+) -> dict[tuple[int, int], str]:
+    """Recover an earlier undisclosed Illusion before a displayed switch.
+
+    A same-species switch can mean either that an earlier Illusion is leaving
+    and the real roster member is entering, or that a new Illusion is entering
+    now. The latter has a future ``replace`` entry for the current switch and
+    must not change this segment's pre-decision view.
+    """
+    inferred: dict[tuple[int, int], str] = {}
+    for line in lines:
+        parts = line.parts
+        if not _is_choice_switch(parts):
+            continue
+        endpoint = _ReplayState._endpoint(parts[2])
+        if endpoint is None or endpoint[0] != perspective:
+            continue
+        if (line.index, endpoint[0], endpoint[1]) in illusion_species_by_line:
+            continue
+        current = state.active[endpoint[0]][endpoint[1]]
+        displayed_species = _switch_species(parts)
+        if current is None or not displayed_species:
+            continue
+        current_identity = state.species_identity_index.get(
+            normalize_id(current.species), normalize_id(current.species)
+        )
+        displayed_identity = state.species_identity_index.get(
+            normalize_id(displayed_species), normalize_id(displayed_species)
+        )
+        if current_identity != displayed_identity:
+            continue
+        candidates = [
+            pokemon
+            for pokemon in state.teams[perspective]
+            if normalize_id(pokemon.ability or "") == "illusion"
+            and not pokemon.fainted
+            and all(active is not pokemon for active in state.active[perspective])
+        ]
+        if len(candidates) == 1:
+            inferred[endpoint] = candidates[0].species
+    return inferred
 
 
 def _observed_actions(
@@ -867,15 +1021,40 @@ def _segments(document: ReplayDocument) -> tuple[tuple[int, int, DecisionType], 
     return tuple(segments)
 
 
-def _view(state: _ReplayState, perspective: int, *, preview: bool) -> FixtureBattleView:
+def _view(
+    state: _ReplayState,
+    perspective: int,
+    *,
+    preview: bool,
+    effective_species: Mapping[tuple[int, int], str] | None = None,
+    forced_move_slots: Sequence[int] = (),
+) -> FixtureBattleView:
     opponent = 1 - perspective
-    own_active = tuple(state.active[perspective])
-    opponent_active = tuple(state.active[opponent])
+    teams = [list(state.teams[side]) for side in (0, 1)]
+    active = [list(state.active[side]) for side in (0, 1)]
+    for (side, slot), species in (effective_species or {}).items():
+        current = active[side][slot]
+        actual = state.team_pokemon(side, species)
+        if current is None or actual is None or actual is current:
+            continue
+        effective = replace(
+            actual,
+            current_hp_fraction=current.current_hp_fraction,
+            fainted=current.fainted,
+            selected_in_teampreview=True,
+            status=current.status,
+            boosts=current.boosts,
+        )
+        actual_index = next(index for index, pokemon in enumerate(teams[side]) if pokemon is actual)
+        teams[side][actual_index] = effective
+        active[side][slot] = effective
+    own_active = tuple(active[perspective])
+    opponent_active = tuple(active[opponent])
     slots = []
     known_switches = tuple(
         tuple(
             candidate
-            for candidate in state.teams[perspective]
+            for candidate in teams[perspective]
             if candidate.selected_in_teampreview
             and not candidate.fainted
             and candidate not in own_active
@@ -886,7 +1065,7 @@ def _view(state: _ReplayState, perspective: int, *, preview: bool) -> FixtureBat
         moves = () if pokemon is None else tuple((tuple((-2, -1, 0, 1)),) for _ in pokemon.moves)
         switch_slots = tuple(
             index
-            for index, candidate in enumerate(state.teams[perspective])
+            for index, candidate in enumerate(teams[perspective])
             if not candidate.fainted and candidate not in own_active
         )
         slots.append(
@@ -900,16 +1079,17 @@ def _view(state: _ReplayState, perspective: int, *, preview: bool) -> FixtureBat
                 # forced-switch phase when a known selected reserve exists.
                 force_switch=pokemon is None and bool(known_switches[slot_index]),
                 can_mega=not state.used_mega[perspective],
+                forced_move=slot_index in forced_move_slots,
             )
         )
     decision = DecisionView(
         slots=(slots[0], slots[1]),
         team_preview=preview,
-        team_size=max(1, len(state.teams[perspective])),
+        team_size=max(1, len(teams[perspective])),
     )
     return FixtureBattleView(
-        team=_team_mapping(state.teams[perspective]),
-        opponent_team=_team_mapping(state.teams[opponent]),
+        team=_team_mapping(teams[perspective]),
+        opponent_team=_team_mapping(teams[opponent]),
         active_pokemon=own_active,
         opponent_active_pokemon=opponent_active,
         available_moves=tuple(
@@ -985,7 +1165,35 @@ def reconstruct_perspective(
     illusion_species_by_line = _illusion_species_by_line(document.protocol_lines)
     for decision_index, (start, end, decision_type) in enumerate(_segments(document)):
         lines = document.protocol_lines[start:end]
-        view = _view(state, perspective, preview=decision_type is DecisionType.TEAM_PREVIEW)
+        effective_species = {
+            (side, slot): species
+            for (line_index, side, slot), species in illusion_species_by_line.items()
+            if line_index == start - 1 and side == perspective
+        }
+        effective_species.update(
+            _infer_illusion_active_species(
+                state,
+                lines,
+                perspective,
+                illusion_species_by_line,
+            )
+        )
+        forced_move_slots = {
+            endpoint[1]
+            for line in lines
+            if _is_choice_move(line.parts)
+            and len(line.parts) >= 4
+            and (endpoint := _ReplayState._endpoint(line.parts[2])) is not None
+            and endpoint[0] == perspective
+            and normalize_id(line.parts[3]) in {"struggle", "recharge"}
+        }
+        view = _view(
+            state,
+            perspective,
+            preview=decision_type is DecisionType.TEAM_PREVIEW,
+            effective_species=effective_species,
+            forced_move_slots=forced_move_slots,
+        )
         # The live environment presents the state after the preceding
         # request's protocol messages and exposes exactly those messages as
         # this request's event window. Do not attach the current action's
