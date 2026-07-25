@@ -13,12 +13,11 @@ from typing import Any
 from poke_env import AccountConfiguration
 from poke_env.battle import AbstractBattle
 from poke_env.player import RandomPlayer
-from poke_env.teambuilder import Teambuilder
 
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
-from p0.rl_player import RLPlayer
+from p0.rl_player import RLPlayer, TeamPlayerMixin
 from p0.runtime import poke_env_patches
 from p0.teams.corpus import CorpusSourceSpec, CorpusSplit, SamplingPolicy
 from p0.teams.corpus_source import CorpusTeamSource
@@ -110,84 +109,30 @@ def wilson_score_interval(wins: int, total: int) -> tuple[float, float]:
 
 
 class EvalPlayerMixin:
-    """Mixin to track history and teams used during evaluation."""
+    """Mixin to track win/loss history during evaluation."""
 
-    team_source: TeamSource | None
-    team_rng: random.Random
-    current_team_packed: str | None
     history: list[tuple[str | None, bool]]
 
-    def _init_eval(
-        self,
-        team_rng: random.Random,
-        team_source: TeamSource | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        self.team_source = team_source
-        self.team_rng = team_rng
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
         self.history = []
-
-        if team_source is not None:
-            if "team" in kwargs:
-                raise ValueError("Pass either team or team_source, not both")
-            initial_team = team_source.sample(team_rng).packed
-            kwargs["team"] = initial_team
-            self.current_team_packed = initial_team
-        else:
-            self.current_team_packed = kwargs.get("team")
-
-        if self.current_team_packed is None:
+        if getattr(self, "current_team_packed", None) is None:
             raise ValueError("EvalPlayer requires either team_source or a team in kwargs")
-
-        return kwargs
-
-    def update_team(self, team: str | Teambuilder) -> None:
-        super().update_team(team)  # type: ignore
-        if isinstance(team, str):
-            self.current_team_packed = team
 
     def _battle_finished_callback(self, battle: AbstractBattle) -> None:
         won = battle.won if battle.won is not None else False
-        self.history.append((self.current_team_packed, won))
-        battle_history = getattr(self, "_battle_history", None)
-        if isinstance(battle_history, dict):
-            battle_history.pop(str(getattr(battle, "battle_tag", "")), None)
-        if self.team_source is not None:
-            self.update_team(self.team_source.sample(self.team_rng).packed)
+        self.history.append((getattr(self, "current_team_packed", None), won))
+        super()._battle_finished_callback(battle)  # type: ignore
 
 
 class EvalPlayer(EvalPlayerMixin, RLPlayer):
-    """An RLPlayer subclass that tracks the history and teams used during evaluation."""
-
-    def __init__(
-        self,
-        policy: PolicyNet,
-        *args: Any,
-        team_rng: random.Random,
-        team_source: TeamSource | None = None,
-        **kwargs: Any,
-    ) -> None:
-        kwargs = self._init_eval(team_rng, team_source, **kwargs)
-        super().__init__(
-            policy,
-            *args,
-            team_rng=team_rng,
-            team_source=team_source,
-            **kwargs,
-        )
+    """An RLPlayer subclass that tracks history during evaluation."""
 
 
-class EvalRandomPlayer(EvalPlayerMixin, RandomPlayer):
+class EvalRandomPlayer(EvalPlayerMixin, TeamPlayerMixin, RandomPlayer):
     """A RandomPlayer subclass that tracks history and teams used during evaluation."""
 
-    def __init__(
-        self,
-        *args: Any,
-        team_rng: random.Random,
-        team_source: TeamSource | None = None,
-        **kwargs: Any,
-    ) -> None:
-        kwargs = self._init_eval(team_rng, team_source, **kwargs)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         poke_env_patches.install(self.logger)
 

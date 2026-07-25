@@ -32,7 +32,48 @@ from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import load_config
 
 
-class RLPlayer(Player):
+class TeamPlayerMixin:
+    """Mixin adding team sampling and resampling from a TeamSource to any Player."""
+
+    team_source: TeamSource | None
+    team_rng: random.Random
+    current_team_packed: str | None
+
+    def __init__(
+        self,
+        *args,
+        team_rng: random.Random,
+        team_source: TeamSource | None = None,
+        **kwargs,
+    ):
+        self.team_source = team_source
+        self.team_rng = team_rng
+        if team_source is not None:
+            if "team" in kwargs:
+                raise ValueError("Pass either team or team_source, not both")
+            self.current_team_packed = team_source.sample(team_rng).packed
+            kwargs["team"] = self.current_team_packed
+        else:
+            self.current_team_packed = kwargs.get("team")
+        super().__init__(*args, **kwargs)
+
+    def update_team(self, team):
+        super().update_team(team)
+        if isinstance(team, str):
+            self.current_team_packed = team
+        elif hasattr(team, "yield_team"):
+            self.current_team_packed = team.yield_team()
+
+    def _battle_finished_callback(self, battle: AbstractBattle):
+        super()._battle_finished_callback(battle)
+        if self.team_source is not None:
+            self.update_team(self.team_source.sample(self.team_rng).packed)
+        battle_id = getattr(battle, "battle_tag", None) or getattr(battle, "tag", None)
+        if battle_id and getattr(self, "_battles", None) is not None:
+            self._battles.pop(battle_id, None)
+
+
+class RLPlayer(TeamPlayerMixin, Player):
     """
     Class that plays moves as per the trained policy net.
     """
@@ -47,13 +88,7 @@ class RLPlayer(Player):
         team_source: TeamSource | None = None,
         **kwargs,
     ):
-        self.team_source = team_source
-        self.team_rng = team_rng
-        if team_source is not None:
-            if "team" in kwargs:
-                raise ValueError("Pass either team or team_source, not both")
-            kwargs["team"] = team_source.sample(self.team_rng).packed
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, team_rng=team_rng, team_source=team_source, **kwargs)
         poke_env_patches.install(self.logger)
         self.policy = policy
         self.observation_builder = observation_builder
@@ -128,12 +163,10 @@ class RLPlayer(Player):
         return order.message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
-        if not isinstance(battle, DoubleBattle):
-            return
-        key = self._battle_key(battle)
-        self._battle_history.pop(key, None)
-        if self.team_source is not None:
-            self.update_team(self.team_source.sample(self.team_rng).packed)
+        if isinstance(battle, DoubleBattle):
+            key = self._battle_key(battle)
+            self._battle_history.pop(key, None)
+        super()._battle_finished_callback(battle)
 
 
 LOGGER = logging.getLogger(__name__)

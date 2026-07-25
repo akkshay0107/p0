@@ -27,8 +27,13 @@ def magnet_kl_per_step(live_logits: torch.Tensor, magnet_logits: torch.Tensor) -
     live_log_probs = F.log_softmax(live_logits.float(), dim=-1)
     magnet_log_probs = F.log_softmax(magnet_logits.float(), dim=-1)
     live_probs = live_log_probs.exp()
-    terms = live_probs * (live_log_probs - magnet_log_probs)
-    terms = torch.where(live_probs > 0, terms, torch.zeros_like(terms))
+    safe_live_log_probs = torch.where(
+        live_probs > 0, live_log_probs, torch.zeros_like(live_log_probs)
+    )
+    safe_magnet_log_probs = torch.where(
+        live_probs > 0, magnet_log_probs, torch.zeros_like(magnet_log_probs)
+    )
+    terms = live_probs * (safe_live_log_probs - safe_magnet_log_probs)
     return terms.sum(dim=-1).sum(dim=-1)
 
 
@@ -409,6 +414,10 @@ def ppo_update(
                     scaled_loss = batch_loss / expected_minibatch_steps
                     if torch.isfinite(scaled_loss):
                         scaler.scale(scaled_loss).backward()
+                        # DEBUG: find NaN gradients
+                        for name, param in policy.named_parameters():
+                            if param.grad is not None and not torch.isfinite(param.grad).all():
+                                print(f"DEBUG: NaN/Inf grad in {name}")
                     else:
                         logging.warning(
                             f"Non-finite chunk loss at episode {episode}; "

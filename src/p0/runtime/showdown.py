@@ -67,6 +67,7 @@ class ShowdownServer:
             raise RuntimeError(f"Showdown server on port {self.port} is already started")
         command = [
             "node",
+            "--max-old-space-size=1536",
             "pokemon-showdown",
             "start",
             "--no-security",
