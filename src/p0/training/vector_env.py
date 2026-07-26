@@ -32,12 +32,14 @@ class ThreadVecEnv:
 
         self.last_masks1 = None
         self.last_masks2 = None
+        self.last_infos = None
 
     def _create_buffers(self):
         return StructuredObservation.empty_batch(self.n_envs, pin_memory=self.use_pinned)
 
     def _reset_env(self, env_id: int, env: SimEnv):
         obs, info = env.reset()
+        info["series_id"] = env.series_id
 
         agent1 = env.agent1.username
         agent2 = env.agent2.username
@@ -59,6 +61,7 @@ class ThreadVecEnv:
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
+        self.last_infos = infos
         return masks1, masks2, infos
 
     def _step_env(self, env_id: int, env: SimEnv, action: dict):
@@ -77,9 +80,15 @@ class ThreadVecEnv:
         reward2 = rewards[agent2] if agent2 in rewards else 0.0
 
         if done:
+            series_id = env.series_id
+            series_complete = max(env._series_scores) >= 2
             _, mask1, mask2, _ = self._reset_env(env_id, env)
+            info["series_id"] = series_id
+            info["series_complete"] = series_complete
             return env_id, mask1, mask2, reward1, reward2, done, info
 
+        info["series_id"] = env.series_id
+        info["series_complete"] = False
         return env_id, mask1, mask2, reward1, reward2, done, info
 
     def step(self, actions: list[dict]):
@@ -100,6 +109,7 @@ class ThreadVecEnv:
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
+        self.last_infos = infos
         return masks1, masks2, rewards1, rewards2, dones, infos
 
     def get_batched_obs1(self, device: torch.device):

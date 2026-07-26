@@ -17,13 +17,14 @@ from poke_env.player import DefaultBattleOrder, Player
 
 from p0.battle.legality import action_mask
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
+from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
+from p0.model.token_store import SeriesTokenStore
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
@@ -98,6 +99,8 @@ class RLPlayer(TeamPlayerMixin, Player):
         self.top_p = top_p
         self._memory_model_id = id(policy)
         self._battle_history: dict[str, list[torch.Tensor]] = {}
+        self._series_store = SeriesTokenStore(policy.d_model)
+        self._series_scores: dict[str, list[int]] = {}
 
     @staticmethod
     def _battle_key(battle: DoubleBattle) -> str:
@@ -105,6 +108,15 @@ class RLPlayer(TeamPlayerMixin, Player):
         if not key:
             raise ValueError("Live battle has no stable battle identifier")
         return str(key)
+
+    @staticmethod
+    def _base_series_id(battle_tag: str) -> str:
+        import re
+
+        match = re.match(r"^(.*?)(?:-game(?:-\d+)?)$", battle_tag)
+        if match:
+            return match.group(1)
+        return battle_tag
 
     def invalidate_memory_for_model_reload(self) -> None:
         """Drop per-battle memory when a policy artifact is replaced."""
@@ -121,10 +133,11 @@ class RLPlayer(TeamPlayerMixin, Player):
         else:
             values = torch.zeros((1, 0, self.policy.d_model), device=self.policy.device)
         history_tokens, history_mask, history_age_ids = pack_history_tokens(values)
-        series_tokens = torch.zeros(
-            (1, SERIES_SLOTS, self.policy.d_model), device=self.policy.device
+
+        base_id = self._base_series_id(key)
+        series_tokens, series_mask = self._series_store.get_tokens(
+            [base_id], device=self.policy.device
         )
-        series_mask = torch.zeros((1, SERIES_SLOTS), dtype=torch.bool, device=self.policy.device)
         return series_tokens, series_mask, history_tokens, history_mask, history_age_ids
 
     def _append_history(self, battle: DoubleBattle, token: torch.Tensor) -> None:
@@ -165,7 +178,26 @@ class RLPlayer(TeamPlayerMixin, Player):
     def _battle_finished_callback(self, battle: AbstractBattle):
         if isinstance(battle, DoubleBattle):
             key = self._battle_key(battle)
-            self._battle_history.pop(key, None)
+            base_id = self._base_series_id(key)
+            history = self._battle_history.pop(key, None)
+
+            if history is not None:
+                values = torch.stack(history).unsqueeze(0).to(self.policy.device)
+                with torch.no_grad():
+                    new_tokens = self.policy.series.resample_single_game(values)[0]
+                self._series_store.append(base_id, new_tokens)
+
+            if battle.finished:
+                score = self._series_scores.setdefault(base_id, [0, 0])
+                if battle.won:
+                    score[0] += 1
+                elif battle.lost:
+                    score[1] += 1
+
+                if max(score) >= 2:
+                    self._series_store.drop(base_id)
+                    self._series_scores.pop(base_id, None)
+
         super()._battle_finished_callback(battle)
 
 

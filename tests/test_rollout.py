@@ -25,6 +25,9 @@ class FakePolicy:
         self.device = torch.device("cpu")
         self.d_model = 1
         self.batch_sizes: list[int] = []
+        self.series = SimpleNamespace(
+            resample_single_game=lambda x: torch.zeros((x.size(0), 4, self.d_model))
+        )
 
     def act_obs(
         self,
@@ -57,6 +60,7 @@ class FakeVecEnv:
         self.last_masks2 = np.ones((n_envs, 2, ACT_SIZE), dtype=np.bool_)
         self.obs1_buffers = StructuredObservation.empty_batch(n_envs)
         self.obs2_buffers = StructuredObservation.empty_batch(n_envs)
+        self.last_infos = [{"series_id": f"series-{i}"} for i in range(n_envs)]
         self.envs = [
             SimpleNamespace(
                 agent1=SimpleNamespace(username=f"agent1-{i}"),
@@ -85,7 +89,7 @@ class FakeVecEnv:
             rewards1,
             rewards2,
             dones,
-            [{} for _ in range(self.n_envs)],
+            [{"series_id": f"series-{i}"} for i in range(self.n_envs)],
         )
 
 
@@ -183,6 +187,10 @@ def test_collect_rollouts_records_both_self_play_streams():
     memory1 = BattleMemoryBuffer(config.n_envs, 1)
     memory2 = BattleMemoryBuffer(config.n_envs, 1)
 
+    from p0.model.token_store import SeriesTokenStore
+    series_store1 = SeriesTokenStore(1)
+    series_store2 = SeriesTokenStore(1)
+
     collect_rollouts(
         cast(Any, vec_env),
         cast(Any, policy),
@@ -192,6 +200,8 @@ def test_collect_rollouts_records_both_self_play_streams():
         trajectories2,
         memory1,
         memory2,
+        series_store1,
+        series_store2,
     )
 
     assert len(buffer.trajectories) == 2 * config.n_envs

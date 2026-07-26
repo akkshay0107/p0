@@ -8,6 +8,7 @@ from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import PolicyNet
 from p0.model.structured_observation import StructuredObservation
+from p0.model.token_store import SeriesTokenStore
 from p0.training.config import TrainingConfig
 from p0.training.trajectory import (
     TrajectoryBatch,
@@ -72,7 +73,7 @@ class BattleMemoryBuffer:
         env_ids: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         history = []
         masks = []
         ages = []
@@ -87,18 +88,7 @@ class BattleMemoryBuffer:
             history.append(packed[0])
             masks.append(mask[0])
             ages.append(age[0])
-        batch_size = env_ids.numel()
         return (
-            torch.zeros(
-                (batch_size, SERIES_SLOTS, self.d_model),
-                device=device,
-                dtype=dtype,
-            ),
-            torch.zeros(
-                (batch_size, SERIES_SLOTS),
-                device=device,
-                dtype=torch.bool,
-            ),
             torch.stack(history),
             torch.stack(masks),
             torch.stack(ages),
@@ -115,6 +105,8 @@ def collect_rollouts(
     trajectories2: TrajectoryStorage,
     memory1: BattleMemoryBuffer,
     memory2: BattleMemoryBuffer,
+    series_store1: SeriesTokenStore,
+    series_store2: SeriesTokenStore,
 ) -> None:
     """Collect one all-self-play rollout using explicit fixed-window memory.
 
@@ -145,6 +137,14 @@ def collect_rollouts(
 
         current_obs = StructuredObservation.cat([obs1_gpu, obs2_gpu])
         current_mask = torch.cat([mask1_gpu, mask2_gpu])
+
+        infos = vec_env.last_infos
+        series_ids = [info["series_id"] for info in infos]
+        series_tokens1, series_mask1 = series_store1.get_tokens(series_ids, device)
+        series_tokens2, series_mask2 = series_store2.get_tokens(series_ids, device)
+        current_series_tokens = torch.cat([series_tokens1, series_tokens2], dim=0)
+        current_series_mask = torch.cat([series_mask1, series_mask2], dim=0)
+
         memory1_inputs = memory1.inputs(idx_all, device, torch.float32)
         memory2_inputs = memory2.inputs(idx_all, device, torch.float32)
         current_memory = tuple(
@@ -152,7 +152,13 @@ def collect_rollouts(
             for first, second in zip(memory1_inputs, memory2_inputs, strict=True)
         )
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled(config, device)):
-            current_out = policy.act_obs(current_obs, current_mask, *current_memory)
+            current_out = policy.act_obs(
+                current_obs,
+                current_mask,
+                current_series_tokens,
+                current_series_mask,
+                *current_memory,
+            )
 
         actions1 = current_out.actions[:n_envs]
         actions2 = current_out.actions[n_envs:]
@@ -206,6 +212,25 @@ def collect_rollouts(
         for i in range(n_envs):
             if not dones[i]:
                 continue
+
+            hist1 = memory1.tokens[i]
+            if hist1:
+                val1 = torch.stack(hist1).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    new_tok1 = policy.series.resample_single_game(val1)[0]
+                series_store1.append(series_ids[i], new_tok1)
+
+            hist2 = memory2.tokens[i]
+            if hist2:
+                val2 = torch.stack(hist2).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    new_tok2 = policy.series.resample_single_game(val2)[0]
+                series_store2.append(series_ids[i], new_tok2)
+
+            if infos[i].get("series_complete"):
+                series_store1.drop(series_ids[i])
+                series_store2.drop(series_ids[i])
+
             buffer.add_episode(trajectories1.complete(i))
             buffer.add_episode(trajectories2.complete(i))
             memory1.reset(i)
@@ -234,6 +259,8 @@ class RolloutCollector:
         self.second = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
         self.memory1 = BattleMemoryBuffer(config.n_envs, policy.d_model)
         self.memory2 = BattleMemoryBuffer(config.n_envs, policy.d_model)
+        self.series_store1 = SeriesTokenStore(policy.d_model)
+        self.series_store2 = SeriesTokenStore(policy.d_model)
 
     def collect(self) -> None:
         collect_rollouts(
@@ -245,6 +272,8 @@ class RolloutCollector:
             self.second,
             self.memory1,
             self.memory2,
+            self.series_store1,
+            self.series_store2,
         )
 
     def reset_completed(self) -> None:

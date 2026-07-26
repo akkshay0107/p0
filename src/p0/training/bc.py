@@ -11,10 +11,11 @@ import torch
 from torch import Tensor
 from torch.amp import GradScaler, autocast
 
-from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
+from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
+from p0.model.token_store import SeriesTokenStore
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
@@ -296,6 +297,7 @@ class BCTrainer:
         self.checkpoint_store = checkpoint_store
         self.provenance = dict(provenance or {})
         self.collator = MultiGameBCCollator(config.batch_decisions)
+        self.series_store = SeriesTokenStore(policy.d_model)
         self.cancel_requested = cancel_requested
         torch.manual_seed(config.seed)
 
@@ -321,6 +323,23 @@ class BCTrainer:
             if self.cancel_requested():
                 raise BCCancelled("Behaviour-cloning training was cancelled")
             self._train_batch(batch, totals)
+
+            for window in batch.windows:
+                if window.stop == window.game.length:
+                    with (
+                        torch.no_grad(),
+                        autocast(device_type=self.device.type, enabled=self.amp_enabled),
+                    ):
+                        observations = window.game.observations.to(self.device)
+                        context_mask = window.game.action_mask.to(self.device)
+                        encoded = self.policy.encode(observations, context_mask)
+                        local_tokens = self.policy.local_history_tokens(encoded)
+                        new_tokens = self.policy.series.resample_single_game(
+                            local_tokens.unsqueeze(0)
+                        )[0]
+                    self.series_store.append(window.game.series_id, new_tokens)
+
+        self.series_store.clear()
         return totals
 
     def _metrics(self, totals: _RunTotals) -> BCTrainMetrics:
@@ -372,19 +391,8 @@ class BCTrainer:
         *,
         dtype: torch.dtype | None = None,
     ) -> tuple[Tensor, Tensor]:
-        dtype = next(self.policy.parameters()).dtype if dtype is None else dtype
-        return (
-            torch.zeros(
-                (batch_size, SERIES_SLOTS, self.policy.d_model),
-                device=self.device,
-                dtype=dtype,
-            ),
-            torch.zeros(
-                (batch_size, SERIES_SLOTS),
-                device=self.device,
-                dtype=torch.bool,
-            ),
-        )
+        # Deprecated: _model_inputs now uses self.series_store.get_tokens
+        pass
 
     def _history_inputs(
         self,
@@ -443,10 +451,16 @@ class BCTrainer:
         history_tokens = torch.cat([history[0] for history in history_values])
         history_mask = torch.cat([history[1] for history in history_values])
         history_age_ids = torch.cat([history[2] for history in history_values])
-        series_tokens, series_mask = self._empty_series_inputs(
-            batch.decisions,
-            dtype=target_encoded.tokens.dtype,
+
+        series_ids = []
+        for window in batch.windows:
+            series_ids.extend([window.game.series_id] * (window.stop - window.start))
+
+        series_tokens, series_mask = self.series_store.get_tokens(
+            series_ids,
+            device=self.device,
         )
+
         return (
             target_encoded,
             batch.action_mask.to(self.device),
@@ -543,6 +557,22 @@ class BCTrainer:
                 batch.candidate_values.to(self.device),
                 batch.candidate_offsets.to(self.device),
             )
+
+            for window in batch.windows:
+                if window.stop == window.game.length:
+                    with (
+                        torch.no_grad(),
+                        autocast(device_type=self.device.type, enabled=self.amp_enabled),
+                    ):
+                        observations = window.game.observations.to(self.device)
+                        context_mask = window.game.action_mask.to(self.device)
+                        encoded = self.policy.encode(observations, context_mask)
+                        local_tokens = self.policy.local_history_tokens(encoded)
+                        new_tokens = self.policy.series.resample_single_game(
+                            local_tokens.unsqueeze(0)
+                        )[0]
+                    self.series_store.append(window.game.series_id, new_tokens)
+
             objective = compute_bc_objective(
                 candidate_log_probs,
                 batch.candidate_offsets.to(self.device),
@@ -613,6 +643,8 @@ class BCTrainer:
                 if is_labeled:
                     bucket_item["labeled"] = int(bucket_item["labeled"]) + 1
                     bucket_item["nll_sum"] = float(bucket_item["nll_sum"]) + decision_nll
+
+        self.series_store.clear()
 
         def finalized(
             values: Mapping[str, Mapping[str, float | int]],

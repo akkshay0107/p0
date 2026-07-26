@@ -124,6 +124,9 @@ class SimEnv(MegaEnv):
         self._opponent_team_source = opponent_team_source
         self._agent_rng = agent_rng
         self._opponent_rng = opponent_rng
+        self._series_scores = [0, 0]
+        import uuid
+        self.series_id = str(uuid.uuid4())
 
     def set_observation_targets(
         self,
@@ -141,13 +144,25 @@ class SimEnv(MegaEnv):
         if seed is not None:
             self._agent_rng.seed(seed)
             self._opponent_rng.seed(seed + 1)
-        self.agent1.update_team(self._agent_team_source.sample(self._agent_rng).packed)
-        self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng).packed)
+            
+        if max(self._series_scores) >= 2 or sum(self._series_scores) == 0:
+            self._series_scores = [0, 0]
+            import uuid
+            self.series_id = str(uuid.uuid4())
+            self.agent1.update_team(self._agent_team_source.sample(self._agent_rng).packed)
+            self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng).packed)
+            
         return super().reset(seed=seed, options=options)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         if not battle.finished:
             return 0
+            
+        if battle.won:
+            self._series_scores[0] += 1
+        elif battle.lost:
+            self._series_scores[1] += 1
+            
         return 1 if battle.won else (-1 if battle.lost else 0)
 
     def embed_battle(self, battle: AbstractBattle):
