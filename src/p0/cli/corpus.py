@@ -32,6 +32,7 @@ from p0.teams.validation import validate_many
 def _variants_from_showdown(
     text: str, dex: Mapping[str, Any] | None = None
 ) -> tuple[TeamVariant, ...]:
+    """Parse a showdown text export into team variants."""
     from p0.teams.source import _PACKER
 
     members = _PACKER.parse_showdown_team(text)
@@ -39,6 +40,7 @@ def _variants_from_showdown(
         raise ValueError(
             f"Showdown text contains {len(members)} members (expected a positive multiple of 6)"
         )
+        
     species_by_id = (
         {
             normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): entry
@@ -48,6 +50,7 @@ def _variants_from_showdown(
         if isinstance(dex, Mapping)
         else {}
     )
+    
     move_categories = (
         {
             normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): str(
@@ -131,6 +134,7 @@ def _variants_from_showdown(
 
 
 def _load_variants(path: Path, dex: Mapping[str, Any] | None = None) -> tuple[TeamVariant, ...]:
+    """Load variants from a file or directory of showdown exports or JSON."""
     if not path.exists():
         raise FileNotFoundError(f"Input path does not exist: {path}")
     files: list[Path] = []
@@ -164,6 +168,7 @@ def _load_variants(path: Path, dex: Mapping[str, Any] | None = None) -> tuple[Te
 
 
 def _parser() -> argparse.ArgumentParser:
+    """Build the argument parser for corpus operations."""
     parser = argparse.ArgumentParser(prog="p0-corpus")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -227,17 +232,21 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Corpus CLI entrypoint."""
     args = _parser().parse_args(argv)
+    
     if args.command == "build":
         dex_path = DEFAULT_PATHS.data_root / "champions_dex.json"
         dex = json.loads(dex_path.read_text(encoding="utf-8")) if dex_path.is_file() else None
         variants = _load_variants(args.input, dex=dex)
         tokenizer = PokemonTokenizer.from_file()
+        
         split_policy = SplitPolicy(
             ratio_train=args.train_ratio,
             ratio_val=args.val_ratio,
             ratio_test=args.test_ratio,
         )
+        
         builder = CorpusBuilder(
             tokenizer=tokenizer,
             validator=validate_many,
@@ -245,6 +254,7 @@ def main(argv: list[str] | None = None) -> None:
             format_id=args.format_id,
             split_policy=split_policy,
         )
+        
         manifest, audit = builder.build(variants)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
@@ -259,6 +269,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "audit":
         raw = json.loads(args.manifest.read_text(encoding="utf-8"))
         manifest = TeamCorpusManifest.from_dict(raw)
+        
         audit = audit_corpus(manifest)
         print(json.dumps(audit.to_dict(), sort_keys=True))
         return

@@ -12,6 +12,7 @@ from p0.training.config import BCConfig, load_config
 
 
 def _parser() -> argparse.ArgumentParser:
+    """Build the argument parser for BC training and evaluation."""
     parser = argparse.ArgumentParser(prog="p0-bc")
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name in ("train", "evaluate"):
@@ -21,9 +22,11 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--split-manifest", type=Path, required=True)
         command.add_argument("--output-dir", type=Path, default=None)
         command.add_argument("--device", default=None)
+        
     train = subparsers.choices["train"]
     train.add_argument("--resume-checkpoint", type=Path, default=None)
     train.add_argument("--overfit", action="store_true")
+    
     evaluate = subparsers.choices["evaluate"]
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument(
@@ -35,9 +38,11 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _resolved_config(args: argparse.Namespace) -> BCConfig:
+    """Resolve the BC configuration with CLI overrides."""
     config = load_config(args.config).bc
     output_dir = config.output_dir if args.output_dir is None else args.output_dir.resolve()
     resume = getattr(args, "resume_checkpoint", None)
+    
     return replace(
         config,
         shard_manifest=args.shard_manifest.resolve(),
@@ -48,8 +53,10 @@ def _resolved_config(args: argparse.Namespace) -> BCConfig:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """BC CLI entrypoint."""
     args = _parser().parse_args(argv)
     config = _resolved_config(args)
+    
     if args.command == "train":
         result = train_bc(config, overfit=args.overfit, device=args.device)
     else:
