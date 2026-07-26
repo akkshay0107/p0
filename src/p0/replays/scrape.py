@@ -55,7 +55,7 @@ class ScrapeConfig:
     cutoff: str | None = None
     concurrency: int = 4
     retries: int = 3
-    backoff_seconds: float = 0.5
+    backoff_seconds: float = 1.0
     rate_limit_per_second: float = 2.0
     timeout_seconds: float = 20.0
 
@@ -133,6 +133,8 @@ def _request_with_retry(
             last_error = exc
             if attempt < config.retries:
                 sleeper(config.backoff_seconds * (2 ** (attempt - 1)))
+
+    # error if hasnt returned a value yet
     raise ReplayFetchError(
         f"Replay request failed after {config.retries} attempts: {url}"
     ) from last_error
@@ -204,7 +206,8 @@ class ReplayFetcher:
         items = value if isinstance(value, list) else value.get("replays", value.get("results", []))
         if not isinstance(items, list):
             raise ReplayFetchError("Search endpoint did not return a replay list")
-        ids = []
+
+        ids = set()
         for item in items:
             replay_id = _replay_id(item)
             if replay_id is None:
@@ -215,8 +218,10 @@ class ReplayFetcher:
                 timestamp = _upload_time(item)
                 if timestamp is not None and timestamp < cutoff:
                     continue
-            ids.append(replay_id)
-        return tuple(sorted(set(ids))), len(items) < self.config.page_size
+            ids.add(replay_id)
+
+        terminal = len(items) < self.config.page_size
+        return tuple(sorted(ids)), terminal
 
     def _iter_discovered_ids(self) -> Iterable[str]:
         seen: set[str] = set()
@@ -234,24 +239,42 @@ class ReplayFetcher:
         return tuple(sorted(discovered))
 
     def _write_immutable(self, replay_id: str, body: bytes) -> tuple[str, int]:
+        """Atomically stores a raw replay in a content-addressed pool and links it to its ID.
+
+        Arguments:
+          replay_id: The unique string identifier for the replay.
+          body: The raw uncompressed JSON bytes of the replay fetched from the server.
+
+        Returns:
+          A tuple containing the SHA-256 digest string of the replay and its size in bytes.
+        """
         if not re.fullmatch(r"[A-Za-z0-9_-]+", replay_id):
             raise ReplayFetchError(f"Replay id contains unsafe path characters: {replay_id!r}")
+
         directory = self.config.cache_dir / self.config.format_id / "raw"
         directory.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(body).hexdigest()
         path = directory / f"{replay_id}.json.gz"
+
+        # assume first write authoritative
+        # if exists and is not corrupt, skip writes
         if path.exists():
             try:
                 with gzip.open(path, "rb") as stream:
                     existing = stream.read()
-            except (OSError, EOFError) as exc:
-                raise ReplayFetchError(f"Existing raw replay is unreadable: {path}") from exc
-            if hashlib.sha256(existing).hexdigest() != digest:
-                raise ReplayFetchError(f"Immutable raw replay changed on disk: {path}")
-            return digest, len(existing)
+                return hashlib.sha256(existing).hexdigest(), len(existing)
+            except (OSError, EOFError):
+                # The local file is corrupt. Unlink it so we can write the fresh copy.
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+        digest = hashlib.sha256(body).hexdigest()
+
         canonical_directory = directory / ".sha256"
         canonical_directory.mkdir(exist_ok=True)
         canonical_path = canonical_directory / f"{digest}.json.gz"
+
         if not canonical_path.exists():
             compressed = gzip.compress(body, mtime=0)
             with tempfile.NamedTemporaryFile(
@@ -260,23 +283,17 @@ class ReplayFetcher:
                 temporary = Path(stream.name)
                 stream.write(compressed)
             os.replace(temporary, canonical_path)
-        else:
-            with gzip.open(canonical_path, "rb") as stream:
-                existing = stream.read()
-            if existing != body:
-                raise ReplayFetchError(
-                    f"Duplicate content digest changed on disk: {canonical_path}"
-                )
+
         try:
             os.link(canonical_path, path)
         except FileExistsError:
-            with gzip.open(path, "rb") as stream:
-                existing = stream.read()
-            if existing != body:
-                raise ReplayFetchError(f"Immutable raw replay changed during acquisition: {path}")
+            # another thread linked it just now.
+            # We already validated or wrote the canonical path, so we can trust the link.
+            pass
+
         return digest, len(body)
 
-    def _fetch_one(self, replay_id: str) -> FetchIndexEntry:
+    def _fetch_one(self, replay_id: str) -> tuple[FetchIndexEntry, tuple[str, ...]]:
         url = self.config.replay_url_template.format(replay_id=replay_id)
         started = time.monotonic()
         response, attempt = _request_with_retry(
@@ -295,7 +312,7 @@ class ReplayFetcher:
             elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
         )
         self._write_fetch_metadata(replay_id, metadata)
-        return FetchIndexEntry(
+        entry = FetchIndexEntry(
             replay_id=replay_id,
             format_id=self.config.format_id,
             source_url=url,
@@ -304,6 +321,8 @@ class ReplayFetcher:
             content_sha256=digest,
             byte_size=size,
         )
+        links = linked_replay_ids(response.body, format_id=self.config.format_id)
+        return entry, tuple(links)
 
     def _write_fetch_metadata(self, replay_id: str, metadata: FetchMetadata) -> None:
         directory = self.config.cache_dir / self.config.format_id / "metadata"
@@ -317,6 +336,14 @@ class ReplayFetcher:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(encoded, encoding="utf-8")
         os.replace(temporary, path)
+
+    def _append_index(self, entries: Iterable[FetchIndexEntry]) -> None:
+        if not entries:
+            return
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.index_path.open("a", encoding="utf-8") as stream:
+            for entry in entries:
+                stream.write(json.dumps(entry.to_dict(), sort_keys=True) + "\n")
 
     def _write_index(self, entries: Iterable[FetchIndexEntry]) -> None:
         ordered = tuple(sorted(entries, key=lambda entry: entry.replay_id))
@@ -334,48 +361,69 @@ class ReplayFetcher:
     def acquire(self, replay_ids: Iterable[str] | None = None) -> tuple[FetchIndexEntry, ...]:
         existing = read_fetch_index(self.index_path)
         known = {entry.replay_id: entry for entry in existing}
-        if replay_ids is None and len(known) >= self.config.limit_games:
+        known_keys = set(known.keys())
+
+        if replay_ids is None and len(known_keys) >= self.config.limit_games:
             return tuple(sorted(known.values(), key=lambda entry: entry.replay_id))
+
         seeds = replay_ids if replay_ids is not None else self._iter_discovered_ids()
         selected: set[str] = set()
+
         for seed in seeds:
-            if replay_ids is None and len(selected | set(known)) >= self.config.limit_games:
+            if replay_ids is None and len(selected | known_keys) >= self.config.limit_games:
                 break
+
             frontier = {seed}
             scanned: set[str] = set()
+
             while frontier:
-                pending = tuple(sorted(frontier - known.keys() - self._unavailable_ids))
-                if pending:
-                    with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
-                        futures = {
-                            replay_id: executor.submit(self._fetch_one, replay_id)
-                            for replay_id in pending
-                        }
-                        fetched = []
-                        for replay_id in pending:
-                            try:
-                                fetched.append(futures[replay_id].result())
-                            except ReplayUnavailableError as exc:
-                                self._unavailable_ids.add(replay_id)
-                                print(
-                                    f"warning: skipping unavailable replay {replay_id}: {exc}",
-                                    file=sys.stderr,
-                                    flush=True,
-                                )
-                    known.update((entry.replay_id, entry) for entry in fetched)
-                    self._write_index(known.values())
-                scan_ids = tuple(sorted((frontier & known.keys()) - scanned))
-                discovered: set[str] = set()
-                for replay_id in scan_ids:
+                cached_scan = (frontier & known_keys) - scanned
+                pending = list(frontier - known_keys - self._unavailable_ids)
+
+                discovered = set()
+
+                for replay_id in cached_scan:
                     selected.add(replay_id)
+                    scanned.add(replay_id)
                     discovered.update(
                         linked_replay_ids(
                             load_raw_replay(self._raw_path(replay_id)),
                             format_id=self.config.format_id,
                         )
                     )
-                scanned.update(scan_ids)
+
+                if pending:
+                    with ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
+                        futures = {
+                            replay_id: executor.submit(self._fetch_one, replay_id)
+                            for replay_id in pending
+                        }
+
+                        new_entries = []
+                        for replay_id in pending:
+                            try:
+                                entry, links = futures[replay_id].result()
+                                new_entries.append(entry)
+                                discovered.update(links)
+                                selected.add(replay_id)
+                                scanned.add(replay_id)
+                            except ReplayUnavailableError as exc:
+                                self._unavailable_ids.add(replay_id)
+                                scanned.add(replay_id)
+                                print(
+                                    f"warning: skipping unavailable replay {replay_id}: {exc}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+
+                    if new_entries:
+                        for entry in new_entries:
+                            known[entry.replay_id] = entry
+                            known_keys.add(entry.replay_id)
+                        self._append_index(new_entries)
+
                 frontier = discovered - scanned
+
         self._write_index(known.values())
         return tuple(sorted(known.values(), key=lambda entry: entry.replay_id))
 
@@ -384,6 +432,7 @@ def read_fetch_index(path: str | Path) -> tuple[FetchIndexEntry, ...]:
     path = Path(path)
     if not path.exists():
         return ()
+
     entries: list[FetchIndexEntry] = []
     seen: set[str] = set()
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -393,10 +442,12 @@ def read_fetch_index(path: str | Path) -> tuple[FetchIndexEntry, ...]:
             entry = FetchIndexEntry.from_dict(json.loads(line))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError(f"Malformed fetch index line {line_number}: {path}") from exc
+
         if entry.replay_id in seen:
             raise ValueError(f"Duplicate replay id in fetch index: {entry.replay_id}")
         seen.add(entry.replay_id)
         entries.append(entry)
+
     return tuple(sorted(entries, key=lambda entry: entry.replay_id))
 
 

@@ -33,6 +33,7 @@ class ObservedAction:
     @property
     def candidates(self) -> tuple[int, ...]:
         if self.alternatives:
+            # remove duplicates as a safety net
             return tuple(dict.fromkeys(self.alternatives))
         return () if self.action is None else (self.action,)
 
@@ -58,16 +59,19 @@ def enumerate_joint_candidates(
     """Apply scalar legality and sequential joint constraints in stable order."""
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
+
     candidates: list[tuple[int, int]] = []
     for first_action in dict.fromkeys(first):
         if first_action not in legal_actions(view, 0):
             continue
+
         for second_action in dict.fromkeys(second):
             pair = (first_action, second_action)
             if validate_joint_action(view, *pair):
                 candidates.append(pair)
                 if len(candidates) > max_candidates:
                     return ()
+
     return tuple(candidates)
 
 
@@ -85,10 +89,12 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
     """Return exact, partial, or unknown evidence without inventing hidden orders."""
     if request.max_candidates < 1:
         raise ValueError("EvidenceRequest.max_candidates must be positive")
+
     tags = list(request.tags)
     if request.unknown:
         tags.append("unsupported")
         return _unknown(tags, MaskProvenance.CONSERVATIVE_RECONSTRUCTED)
+
     scalar: list[tuple[int, ...]] = []
     uncertain = False
     for slot in request.slots:
@@ -98,13 +104,16 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
                 scalar.append(legal)
                 tags.append("implicit_pass")
                 continue
+
             scalar.append(legal)
             uncertain = True
             continue
+
         scalar.append(slot.candidates)
         uncertain |= not slot.exact or len(slot.candidates) != 1
         if slot.tag:
             tags.append(slot.tag)
+
     candidates = enumerate_joint_candidates(
         request.view, scalar[0], scalar[1], max_candidates=request.max_candidates
     )
@@ -112,6 +121,7 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
         if any(len(values) > 0 for values in scalar):
             tags.append("candidate_cap_or_illegal")
         return _unknown(tags, MaskProvenance.CONSERVATIVE_RECONSTRUCTED)
+
     if len(candidates) == 1:
         return ActionEvidence(
             LabelKind.EXACT,
@@ -120,6 +130,7 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
             MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
             tuple(dict.fromkeys(tags)),
         )
+
     confidence = 0.75 if not uncertain else 0.5
     return ActionEvidence(
         LabelKind.PARTIAL,
@@ -143,6 +154,7 @@ def observed_move_action(
         return ObservedAction(47 if mega else 48, exact=True, tag=tag)
     if move_slot is None or target is None:
         return ObservedAction(None, exact=False, tag=tag or "move_slot_or_target_unknown")
+
     return ObservedAction(
         encode_action(SlotAction(ActionKind.MOVE, move_slot=move_slot, target=target, mega=mega)),
         exact=True,

@@ -101,7 +101,7 @@ def _ordered_games(documents: tuple[ReplayDocument, ...]) -> tuple[ReplayDocumen
             key=lambda document: (
                 document.metadata.game_number is None,
                 document.metadata.game_number or 0,
-                _time(document),
+                document.metadata.upload_time,
                 document.metadata.replay_id,
             ),
         )
@@ -196,23 +196,39 @@ def _make_group(
     method: GroupingMethod,
     diagnostics: tuple[GroupingDiagnostic, ...] = (),
 ) -> GroupedSeries:
+    """Forms a strict deterministic Series out of a collection of grouped games.
+
+    Arguments:
+        documents: A tuple of replay documents belonging to the same grouping bucket.
+        key: The grouping identifier key (e.g. parent room).
+        method: The method by which these games were grouped.
+        diagnostics: Any existing diagnostics to carry over.
+
+    Returns:
+        A strictly verified and deterministic GroupedSeries.
+    """
     if not documents:
         raise ValueError("Cannot group an empty replay collection")
+
     format_id = documents[0].metadata.format_id
     players = _canonical_players(documents[0])
     if any(_canonical_players(document) != players for document in documents):
         raise ValueError("A series cannot contain games from different player pairs")
+
     ordered = _ordered_games(documents)
     numbers = _membership_numbers(ordered)
     numbering_diagnostics = _numbering_diagnostics(ordered, numbers)
     score, outcome_diagnostics = _series_score(ordered, players)
+
     first_roles = _roles(ordered[0], players)
     team_hashes = (_team_hash(ordered[0], first_roles[0]), _team_hash(ordered[0], first_roles[1]))
     conflicts = []
+
     for game in ordered[1:]:
+        roles = _roles(game, players)
         game_hashes = (
-            _team_hash(game, _roles(game, players)[0]),
-            _team_hash(game, _roles(game, players)[1]),
+            _team_hash(game, roles[0]),
+            _team_hash(game, roles[1]),
         )
         if game_hashes != team_hashes:
             conflicts.append(
@@ -240,6 +256,7 @@ def _make_group(
             *conflicts,
         )
     )
+
     memberships = tuple(
         SeriesMembership(
             series_id=series_id,
@@ -252,6 +269,7 @@ def _make_group(
         )
         for game, game_number in zip(ordered, numbers, strict=True)
     )
+
     record = SeriesRecord(
         series_id=series_id,
         format_id=format_id,
@@ -264,12 +282,14 @@ def _make_group(
         grouping_method=method,
         grouping_confidence=1.0 if method is GroupingMethod.PARENT_ROOM else 0.5,
     )
+
     group_diagnostics = (
         *diagnostics,
         *numbering_diagnostics,
         *outcome_diagnostics,
         *conflicts,
     )
+
     return GroupedSeries(record, ordered, memberships, group_diagnostics)
 
 
@@ -298,7 +318,7 @@ def group_replays(
                 for document in documents
                 if format_id is None or document.metadata.format_id == format_id
             ),
-            key=lambda document: (_time(document), document.metadata.replay_id),
+            key=lambda document: (document.metadata.upload_time, document.metadata.replay_id),
         )
     )
     diagnostics: list[GroupingDiagnostic] = []
@@ -329,10 +349,9 @@ def group_replays(
 
     result: list[GroupedSeries] = []
     for bucket in sorted(buckets):
-        games = tuple(
-            sorted(buckets[bucket], key=lambda item: (_time(item), item.metadata.replay_id))
-        )
+        games = tuple(buckets[bucket])
         method = methods[bucket]
+
         if method is GroupingMethod.FALLBACK_SAME_PLAYERS and len(games) > 1:
             chunks: list[list[ReplayDocument]] = [[]]
             previous_hashes: tuple[str, str] | None = None
@@ -418,7 +437,7 @@ def individual_games(
     return tuple(
         sorted(
             selected.values(),
-            key=lambda document: (_time(document), document.metadata.replay_id),
+            key=lambda document: (document.metadata.upload_time, document.metadata.replay_id),
         )
     )
 

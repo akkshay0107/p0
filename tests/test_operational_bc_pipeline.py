@@ -13,7 +13,7 @@ from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.replays.compile import build_shards_from_cache
+from p0.replays.compile import compile_to_shards
 from p0.replays.dataset import LazyReplayDataset, assign_series_splits
 from p0.replays.schema import LabelKind
 from p0.replays.scrape import HttpResponse, ReplayFetcher, ScrapeConfig, load_raw_replay
@@ -132,8 +132,15 @@ def test_cache_build_is_dataset_bound_and_enforces_empty_bo1_history(
         rate_limit_per_second=0,
     )
     ReplayFetcher(config, transport=transport).acquire((good_id, bad_id))
-    first = build_shards_from_cache(cache, tmp_path / "shards")
-    second = build_shards_from_cache(cache, tmp_path / "shards")
+    from p0.replays.protocol import parse_replay_payload
+    from p0.replays.scrape import load_raw_replay
+
+    docs = [
+        parse_replay_payload(load_raw_replay(p))
+        for p in (cache / FORMAT.bo3_format / "raw").glob("*.json.gz")
+    ]
+    first = compile_to_shards(docs, tmp_path / "shards", format_id=FORMAT.bo3_format)
+    second = compile_to_shards(docs, tmp_path / "shards", format_id=FORMAT.bo3_format)
 
     assert first.manifest_path == second.manifest_path
     assert first.manifest.dataset_hash == second.manifest.dataset_hash

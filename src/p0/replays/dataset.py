@@ -53,15 +53,20 @@ class SeriesSplitManifest:
                 f"Unsupported split artifact schema {self.artifact_schema!r}; "
                 f"expected {SPLIT_ARTIFACT_SCHEMA}"
             )
+
         if not _is_sha256(self.runtime_contract_sha256):
             raise ValueError("SeriesSplitManifest.runtime_contract_sha256 must be a SHA-256 digest")
+
         if not _is_sha256(self.dataset_hash):
             raise ValueError("SeriesSplitManifest.dataset_hash must be a SHA-256 digest")
+
         if type(self.seed) is not int:
             raise ValueError("SeriesSplitManifest.seed must be an integer")
+
         for series_id, split in self.assignments.items():
             if not isinstance(series_id, str) or not series_id:
                 raise ValueError("Series split ids must be non-empty strings")
+
             if split not in SPLITS:
                 raise ValueError(f"Unsupported series split {split!r}")
 
@@ -82,6 +87,7 @@ class SeriesSplitManifest:
         assignments = value["assignments"]
         if not isinstance(assignments, Mapping):
             raise ValueError("SeriesSplitManifest.assignments must be an object")
+
         return cls(
             artifact_schema=str(value["artifact_schema"]),
             runtime_contract_sha256=str(value["runtime_contract_sha256"]),
@@ -103,13 +109,17 @@ def assign_series_splits(
     """Assign complete series deterministically while keeping requested splits populated."""
     if type(seed) is not int:
         raise ValueError("seed must be an integer")
+
     if not 0.0 <= validation_fraction < 1.0 or not 0.0 <= test_fraction < 1.0:
         raise ValueError("split fractions must be in [0, 1)")
+
     if validation_fraction + test_fraction >= 1.0:
         raise ValueError("validation_fraction plus test_fraction must be less than one")
+
     unique_ids = sorted(set(series_ids))
     if any(not series_id for series_id in unique_ids):
         raise ValueError("series_ids must contain only non-empty strings")
+
     ranked = sorted(
         unique_ids,
         key=lambda series_id: (
@@ -123,8 +133,10 @@ def assign_series_splits(
     validation_count = round(len(ranked) * validation_fraction)
     if enough_for_all and test_fraction > 0:
         test_count = max(1, test_count)
+
     if enough_for_all and validation_fraction > 0:
         validation_count = max(1, validation_count)
+
     while test_count + validation_count >= len(ranked) and test_count + validation_count:
         if validation_count > int(enough_for_all and validation_fraction > 0):
             validation_count -= 1
@@ -132,6 +144,7 @@ def assign_series_splits(
             test_count -= 1
         else:
             break
+
     assignments = {
         series_id: (
             "test"
@@ -142,6 +155,7 @@ def assign_series_splits(
         )
         for index, series_id in enumerate(ranked)
     }
+
     return SeriesSplitManifest(
         runtime_contract_sha256,
         seed,
@@ -165,8 +179,10 @@ def load_split_manifest(
             value = json.loads(Path(value).read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"Unable to read split manifest {value}") from exc
+
     if not isinstance(value, Mapping):
         raise ValueError("Split manifest must be a JSON object")
+
     validate_artifact_runtime_contract(value, manifest_path)
     return SeriesSplitManifest.from_dict(value)
 
@@ -208,8 +224,10 @@ class ReplayGameChunk:
         ):
             if tensor.shape[0] != length:
                 raise ValueError(f"ReplayGameChunk.{name} length does not match observations")
+
         if self.candidate_offsets.shape != (length + 1,):
             raise ValueError("ReplayGameChunk.candidate_offsets must have one row per decision")
+
         if self.candidate_offsets[0].item() != 0 or self.candidate_offsets[-1].item() != len(
             self.candidate_values
         ):
@@ -253,25 +271,31 @@ class LazyReplayDataset:
         self.manifest = load_shard_manifest(value, runtime_manifest_path)
         if split is not None and split not in SPLITS:
             raise ValueError(f"Unsupported dataset split {split!r}")
+
         if split is not None and split_manifest is None:
             raise ValueError("A split_manifest is required when split is selected")
+
         if split_manifest is None:
             loaded_split = None
         elif isinstance(split_manifest, SeriesSplitManifest):
             loaded_split = split_manifest
         else:
             loaded_split = load_split_manifest(split_manifest, runtime_manifest_path)
+
         if loaded_split is not None and (
             loaded_split.runtime_contract_sha256 != self.manifest.runtime_contract_sha256
         ):
             raise ValueError("Split and shard manifests reference different runtime contracts")
+
         if loaded_split is not None and loaded_split.dataset_hash != self.manifest.dataset_hash:
             raise ValueError("Split and shard manifests reference different datasets")
+
         self.split = split
         self.split_manifest = loaded_split
         self.runtime_manifest_path = Path(runtime_manifest_path)
         self.verify_hashes = verify_hashes
         self._root = self.manifest_path.parent
+
         # Resolving the selection here keeps the streaming loop free of split branching.
         self._selected_series: frozenset[str] | None = (
             None
@@ -292,6 +316,7 @@ class LazyReplayDataset:
                 series_id = str(item["series_id"])
                 if selected is not None and series_id not in selected:
                     continue
+
                 yield self._chunk(
                     tensors,
                     item,
@@ -308,44 +333,56 @@ class LazyReplayDataset:
         resolved_path = path.resolve()
         if root not in resolved_path.parents:
             raise ValueError(f"Shard filename escapes the manifest directory: {entry.filename!r}")
+
         path = resolved_path
         if not path.is_file():
             raise ValueError(f"Shard file is missing: {path}")
+
         if self.verify_hashes:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             if digest != entry.sha256:
                 raise ValueError(f"Shard hash mismatch for {path}")
+
         if path.stat().st_size != entry.byte_size:
             raise ValueError(f"Shard byte-size mismatch for {path}")
+
         try:
             payload = torch.load(path, weights_only=True, map_location="cpu")
         except (OSError, RuntimeError, EOFError, UnpicklingError) as exc:
             raise ValueError(f"Unable to load shard {path}") from exc
+
         if not isinstance(payload, Mapping):
             raise ValueError(f"Malformed shard {path}: expected a mapping")
+
         if payload.get("artifact_schema") != SHARD_ARTIFACT_SCHEMA:
             raise ValueError(f"Unsupported shard schema in {path}")
+
         validate_artifact_runtime_contract(payload, self.runtime_manifest_path)
         if payload.get("dataset_hash") != self.manifest.dataset_hash:
             raise ValueError(f"Shard and manifest reference different datasets: {path}")
+
         tensors = payload.get("tensors")
         summaries = payload.get(SHARD_SUMMARY_KEY)
         if not isinstance(tensors, Mapping) or not isinstance(summaries, list):
             raise ValueError(f"Malformed shard payload {path}")
+
         validate_shard_tensors(tensors)
         if len(summaries) != tensors["game_offsets"].numel() - 1:
             raise ValueError(f"Shard summary count does not match game offsets in {path}")
+
         if (
             len(summaries) != entry.games
             or tensors["loss_mask"].shape[0] != entry.decisions
             or tensors["series_offsets"].numel() - 1 != entry.series
         ):
             raise ValueError(f"Shard index metadata does not match payload {path}")
+
         required_summary_fields = {"series_id", "game_number", "player", "summary"}
         if not all(
             isinstance(item, Mapping) and required_summary_fields <= set(item) for item in summaries
         ):
             raise ValueError(f"Shard summaries must be objects in {path}")
+
         return tensors, summaries
 
     @staticmethod

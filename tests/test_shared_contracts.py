@@ -144,11 +144,8 @@ def _shard_manifest() -> ShardManifest:
         source_games=1,
         accepted_games=1,
         rejected_games=0,
-        quality_manifest="replay-quality-manifest.json",
-        quality_manifest_sha256="e" * 64,
         artifact_hashes={
             "shard-000.pt": "c" * 64,
-            "replay-quality-manifest.json": "e" * 64,
         },
     )
 

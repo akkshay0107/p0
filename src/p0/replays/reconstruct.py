@@ -49,26 +49,35 @@ def normalize_id(value: str) -> str:
 
 
 def _species_base_stats(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
-    """Index exact species and documented form aliases by normalized id."""
+    """Index exact species and documented form aliases by normalized id.
+
+    Args:
+        dex: The pokedex data mapping containing species and baseStats information.
+
+    Returns:
+        A dictionary mapping normalized species and alias IDs to their base stats.
+    """
     index: dict[str, dict[str, int]] = {}
     entries = tuple(entry for entry in dex.get("species", ()) if isinstance(entry, Mapping))
+
     for entry in entries:
         base_stats = entry.get("baseStats")
+
         if not isinstance(base_stats, Mapping):
             continue
+
         stats = {str(key): int(value) for key, value in base_stats.items()}
+
         for value in (entry.get("id"), entry.get("name")):
             if isinstance(value, str) and value:
                 index[normalize_id(value)] = stats
-    for entry in entries:
-        base_stats = entry.get("baseStats")
-        if not isinstance(base_stats, Mapping):
-            continue
-        stats = {str(key): int(value) for key, value in base_stats.items()}
+
         aliases = (*entry.get("formeOrder", ()), *entry.get("otherFormes", ()))
+
         for value in aliases:
             if isinstance(value, str) and value:
                 index.setdefault(normalize_id(value), stats)
+
     return index
 
 
@@ -561,9 +570,7 @@ class _ReplayState:
                 self._replace_references(side, current, baseline)
 
             hp_fraction = (
-                get_hp_fraction(parts[4])
-                if len(parts) >= 5
-                else current.current_hp_fraction
+                get_hp_fraction(parts[4]) if len(parts) >= 5 else current.current_hp_fraction
             )
             actual = self._replace_active(
                 side,
@@ -889,14 +896,14 @@ def _observed_actions(
             target = parts[4] if len(parts) >= 5 else None
             target_tag = "move"
             if not target:
-                target = animation_targets.get(
-                    (endpoint[0], endpoint[1], normalize_id(move))
-                )
+                target = animation_targets.get((endpoint[0], endpoint[1], normalize_id(move)))
                 if target:
                     target_tag = "move_anim_target"
-            effective_species = illusion_species_by_line.get(
-                (line.index, endpoint[0], endpoint[1])
-            ) if illusion_species_by_line is not None else None
+            effective_species = (
+                illusion_species_by_line.get((line.index, endpoint[0], endpoint[1]))
+                if illusion_species_by_line is not None
+                else None
+            )
             move_slot = _move_slot(
                 state,
                 perspective,
@@ -919,9 +926,13 @@ def _observed_actions(
             endpoint = _ReplayState._endpoint(parts[2])
             if endpoint is None or endpoint[0] != perspective:
                 continue
-            species = illusion_species_by_line.get(
-                (line.index, endpoint[0], endpoint[1]), _switch_species(parts)
-            ) if illusion_species_by_line is not None else _switch_species(parts)
+            species = (
+                illusion_species_by_line.get(
+                    (line.index, endpoint[0], endpoint[1]), _switch_species(parts)
+                )
+                if illusion_species_by_line is not None
+                else _switch_species(parts)
+            )
             try:
                 action = 1 + next(
                     index
@@ -959,7 +970,7 @@ def _preview_actions(
             )
             for species in leads
         )
-    except StopIteration:
+    except (StopIteration, RuntimeError):
         return None, None, ("preview_roster_unknown",)
     if len(set(lead_indices)) != 2:
         return None, None, ("preview_duplicate_lead",)
@@ -978,28 +989,40 @@ def _preview_actions(
 
 
 def _segments(document: ReplayDocument) -> tuple[tuple[int, int, DecisionType], ...]:
-    turns = [
-        line.index
-        for line in document.protocol_lines
-        if len(line.parts) > 1 and line.parts[1] == "turn"
-    ]
-    preview = [
-        line.index
-        for line in document.protocol_lines
-        if len(line.parts) > 1 and line.parts[1] == "teampreview"
-    ]
+    """Partition the protocol lines into contiguous decision segments.
+
+    Args:
+        document: The complete parsed replay document.
+
+    Returns:
+        A tuple of (start_index, end_index, decision_type) representing the protocol line
+        boundaries for each decision request.
+    """
+    turns: list[int] = []
+    preview: list[int] = []
+
+    for line in document.protocol_lines:
+        if len(line.parts) > 1:
+            if line.parts[1] == "turn":
+                turns.append(line.index)
+            elif line.parts[1] == "teampreview":
+                preview.append(line.index)
+
     segments: list[tuple[int, int, DecisionType]] = []
+
     if preview and turns and turns[0] > 0:
         segments.append((0, turns[0], DecisionType.TEAM_PREVIEW))
     elif preview and not turns:
         segments.append((0, len(document.protocol_lines), DecisionType.TEAM_PREVIEW))
+
     for index, start in enumerate(turns):
         end = turns[index + 1] if index + 1 < len(turns) else len(document.protocol_lines)
         boundaries = [start]
         saw_action = False
+
         for line in document.protocol_lines[start:end]:
-            # ``cant`` is an outcome of a submitted move (flinch, paralysis,
-            # sleep, Armor Tail, ...), and ``drag`` is an automatic battle
+            # cant is an outcome of a submitted move (flinch, paralysis,
+            # sleep, Armor Tail, ...), and drag is an automatic battle
             # effect. Neither creates a new request in poke-env. A switch
             # after an action is a forced replacement request; switches
             # before the first action belong to the current request (for
@@ -1010,14 +1033,18 @@ def _segments(document: ReplayDocument) -> tuple[tuple[int, int, DecisionType], 
                     saw_action = False
                 else:
                     saw_action = True
+
         boundaries.append(end)
+
         segments.extend(
             (left, right, DecisionType.TURN)
             for left, right in zip(boundaries, boundaries[1:])
             if left < right
         )
+
     if not segments and not preview:
         segments.append((0, len(document.protocol_lines), DecisionType.TURN))
+
     return tuple(segments)
 
 
@@ -1150,26 +1177,42 @@ def reconstruct_perspective(
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
 ) -> ReconstructedPerspective:
-    """Build pre-decision player-relative views while enforcing causal cutoffs."""
+    """Build pre-decision player-relative views while enforcing causal cutoffs.
+
+    Args:
+        document: The complete parsed replay document.
+        perspective: The index of the player to reconstruct the view for (0 or 1).
+        max_candidates: The maximum number of joint action candidates to evaluate.
+        dex: Optional pokedex data mapping. If omitted, uses the default runtime resources.
+
+    Returns:
+        A ReconstructedPerspective containing the sequential snapshots, decisions,
+        and diagnostics built from the observed replay.
+    """
     if perspective not in (0, 1):
         raise ValueError("perspective must be 0 or 1")
+
     if dex is None:
         from p0.model.resources import default_runtime_resources
 
         dex = default_runtime_resources().dex
+
     state = _ReplayState(document, dex)
     counters: Counter[str] = Counter()
     snapshots: list[ReconstructedSnapshot] = []
     decisions: list[DecisionRecord] = []
     pending_events: tuple[BattleEvent, ...] = ()
     illusion_species_by_line = _illusion_species_by_line(document.protocol_lines)
+
     for decision_index, (start, end, decision_type) in enumerate(_segments(document)):
         lines = document.protocol_lines[start:end]
-        effective_species = {
-            (side, slot): species
-            for (line_index, side, slot), species in illusion_species_by_line.items()
-            if line_index == start - 1 and side == perspective
-        }
+
+        effective_species = {}
+        for slot in (0, 1):
+            species = illusion_species_by_line.get((start - 1, perspective, slot))
+            if species is not None:
+                effective_species[(perspective, slot)] = species
+
         effective_species.update(
             _infer_illusion_active_species(
                 state,
