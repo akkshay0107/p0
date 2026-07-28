@@ -13,6 +13,7 @@ from p0.paths import DEFAULT_PATHS
 
 
 def build_showdown(showdown_root: Path = DEFAULT_PATHS.showdown_root) -> None:
+    """Build the local Showdown Node server assets in the target directory."""
     try:
         subprocess.run(
             ["node", "build"],
@@ -27,14 +28,17 @@ def build_showdown(showdown_root: Path = DEFAULT_PATHS.showdown_root) -> None:
 
 
 def allocate_loopback_ports(count: int) -> tuple[int, ...]:
+    """Allocate loopback socket ports dynamically."""
     if count < 1:
         raise ValueError("At least one Showdown port is required")
+
     listeners: list[socket.socket] = []
     try:
         for _ in range(count):
             listener = socket.socket()
             listener.bind(("127.0.0.1", 0))
             listeners.append(listener)
+
         return tuple(int(listener.getsockname()[1]) for listener in listeners)
     finally:
         for listener in listeners:
@@ -65,6 +69,7 @@ class ShowdownServer:
     def start(self) -> None:
         if self.process is not None:
             raise RuntimeError(f"Showdown server on port {self.port} is already started")
+
         command = [
             "node",
             "--max-old-space-size=1536",
@@ -82,14 +87,17 @@ class ShowdownServer:
             text=True,
         )
         deadline = time.monotonic() + self.startup_timeout
+
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 self._raise_startup_failure(command)
+
             try:
                 with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
                     return
             except OSError:
                 time.sleep(0.05)
+
         self.stop()
         raise RuntimeError(
             f"Showdown command {command!r} did not listen on port {self.port} "
@@ -101,6 +109,7 @@ class ShowdownServer:
         stderr = self.process.communicate(timeout=1)[1][-4000:]
         code = self.process.returncode
         self.process = None
+
         raise RuntimeError(
             f"Showdown command {command!r} exited with {code} on port {self.port}: {stderr}"
         )
@@ -109,6 +118,7 @@ class ShowdownServer:
         process, self.process = self.process, None
         if process is None or process.poll() is not None:
             return
+
         process.terminate()
         try:
             process.wait(timeout=self.stop_timeout)
@@ -134,6 +144,7 @@ def start_showdown_servers(
     selected_ports = allocate_loopback_ports(count) if ports is None else tuple(ports)
     if len(selected_ports) != count or len(set(selected_ports)) != count:
         raise ValueError("Showdown ports must be unique and match the requested server count")
+
     build_showdown(showdown_root)
     with contextlib.ExitStack() as stack:
         servers = tuple(

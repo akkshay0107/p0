@@ -46,10 +46,13 @@ class SlotAction:
 def decode_action(action: int) -> SlotAction:
     """Translate one policy action ID into its semantic boundary value."""
     action = int(action)
+
     if action == PASS_ACTION:
         return SlotAction(ActionKind.PASS)
+
     if SWITCH_START <= action < SWITCH_END:
         return SlotAction(ActionKind.SWITCH, switch_slot=action - SWITCH_START)
+
     if MOVE_START <= action < MEGA_MOVE_END:
         offset = action - MOVE_START
         mega = offset >= MOVE_END - MOVE_START
@@ -61,20 +64,26 @@ def decode_action(action: int) -> SlotAction:
             target=offset % TARGET_COUNT - 2,
             mega=mega,
         )
+
     if action in (MEGA_FORCED_ACTION, FORCED_ACTION):
         return SlotAction(ActionKind.FORCED_MOVE, mega=action == MEGA_FORCED_ACTION)
+
     raise ValueError(f"Action must be in [0, {ACT_SIZE}), got {action}")
 
 
 def encode_action(action: SlotAction) -> int:
+    """Encode a semantic boundary action into a policy action ID."""
     if action.kind is ActionKind.PASS:
         return PASS_ACTION
+
     if action.kind is ActionKind.SWITCH:
         if not 0 <= action.switch_slot < TEAM_SIZE:
             raise ValueError(f"Invalid switch slot {action.switch_slot}")
         return SWITCH_START + action.switch_slot
+
     if action.kind is ActionKind.FORCED_MOVE:
         return MEGA_FORCED_ACTION if action.mega else FORCED_ACTION
+
     if action.kind is ActionKind.MOVE:
         if not 0 <= action.move_slot < MOVE_SLOT_COUNT:
             raise ValueError(f"Invalid move slot {action.move_slot}")
@@ -87,20 +96,23 @@ def encode_action(action: SlotAction) -> int:
             + 2
             + (MOVE_END - MOVE_START if action.mega else 0)
         )
+
     raise ValueError(f"Unsupported action kind {action.kind!r}")
 
 
 def encode_team_pair(first: int, second: int, team_size: int = TEAM_SIZE) -> int:
+    """Encode a pair of team preview indices into a single action ID."""
     if not 0 <= first < team_size or not 0 <= second < team_size:
         raise ValueError("Team-preview indices are outside the roster")
     if first >= second:
         raise ValueError("Team-preview pairs must be strictly increasing")
-    return first * TEAM_SIZE + second
+    return first * team_size + second
 
 
 def decode_team_pair(action: int, team_size: int = TEAM_SIZE) -> tuple[int, int]:
+    """Decode an action ID into a pair of team preview indices."""
     action = int(action)
-    first, second = divmod(action, TEAM_SIZE)
+    first, second = divmod(action, team_size)
     if action < 0 or first >= team_size or second >= team_size or first >= second:
         raise ValueError(f"Invalid canonical team-preview action {action}")
     return first, second
@@ -109,13 +121,11 @@ def decode_team_pair(action: int, team_size: int = TEAM_SIZE) -> tuple[int, int]
 def team_selection(
     lead_action: int, back_action: int, team_size: int = TEAM_SIZE
 ) -> tuple[int, ...]:
-    selected: list[int] = []
-    for index in (
-        *decode_team_pair(lead_action, team_size),
-        *decode_team_pair(back_action, team_size),
-    ):
-        if index not in selected:
-            selected.append(index)
+    """Construct full team ordering from lead and back pair preview actions."""
+    leads = decode_team_pair(lead_action, team_size)
+    backs = decode_team_pair(back_action, team_size)
+
+    selected: list[int] = list(dict.fromkeys((*leads, *backs)))
     selected.extend(index for index in range(team_size) if index not in selected)
     return tuple(selected)
 
@@ -123,13 +133,17 @@ def team_selection(
 def canonical_team_actions(
     selection: tuple[int, ...], team_size: int = TEAM_SIZE
 ) -> tuple[int, int]:
+    """Derive canonical lead and back pair preview actions from a team order."""
     defaults = tuple(range(team_size))
     values = tuple(index for index in selection if 0 <= index < team_size)
     values += tuple(index for index in defaults if index not in values)
+
     lead = tuple(sorted(values[:2]))
     back = tuple(sorted(values[2:4]))
+
     if lead[0] == lead[1] or back[0] == back[1]:
         raise ValueError("Team preview must select four distinct members")
+
     return (
         encode_team_pair(lead[0], lead[1], team_size),
         encode_team_pair(back[0], back[1], team_size),

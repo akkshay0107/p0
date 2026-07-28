@@ -119,10 +119,6 @@ class PokeEnvBattleView:
         return self._battle.get_pokemon(identifier)
 
     def consume_events(self):
-        # The raw buffer drains once per decision; repeated observation builds
-        # for the same decision (value/policy passes, candidate scoring) see the
-        # identical event window. Consecutive requests are distinct objects, so
-        # object identity is a safe per-decision key.
         key = id(self._battle.last_request)
         if key != self._events_key:
             self._events = parse_events(consume_raw_events(self._battle), tokenizer)
@@ -137,6 +133,7 @@ _VIEWS: WeakKeyDictionary[DoubleBattle, PokeEnvBattleView] = WeakKeyDictionary()
 
 
 def battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
+    """Return refreshed PokeEnvBattleView for the specified battle instance."""
     view = current_battle_view(battle)
     return view.refresh()
 
@@ -151,6 +148,7 @@ def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
 
 
 def decision_view(battle: DoubleBattle) -> DecisionView:
+    """Extract a lightweight DecisionView from live battle state."""
     active_pokemon = battle.active_pokemon
     available_moves = battle.available_moves
     available_switches = battle.available_switches
@@ -160,10 +158,12 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
     force_switch = battle.force_switch
     can_mega_evolve = battle.can_mega_evolve
     slots: list[SlotDecision] = []
+
     for position in (0, 1):
         active = active_pokemon[position]
         position_moves = available_moves[position]
         available_ids = {move.id for move in position_moves}
+
         move_targets = (
             ()
             if active is None
@@ -174,15 +174,18 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
                 for move in active.moves.values()
             )
         )
+
         switches = {pokemon.base_species for pokemon in available_switches[position]}
         switch_slots = tuple(
             index for index, pokemon in enumerate(team) if pokemon.base_species in switches
         )
+
         forced_move = (
             not any(move_targets)
             and len(position_moves) == 1
             and position_moves[0].id in {"struggle", "recharge"}
         )
+
         slots.append(
             SlotDecision(
                 switch_slots=switch_slots,
@@ -194,6 +197,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
                 forced_move=forced_move,
             )
         )
+
     return DecisionView(
         slots=(slots[0], slots[1]),
         wait=battle._wait,

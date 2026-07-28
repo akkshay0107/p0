@@ -1,6 +1,10 @@
+"""Gymnasium environment wrappers for poke-env simulations."""
+
+from __future__ import annotations
+
 import random
+import uuid
 from collections.abc import Callable
-from typing import Optional, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -28,6 +32,7 @@ ACT_SIZE = FORMAT.action_size
 
 
 def get_action_mask(battle: AbstractBattle) -> list[int]:
+    """Compute flat integer action mask list for a double battle."""
     if not isinstance(battle, DoubleBattle):
         raise TypeError(f"Expected DoubleBattle, got {type(battle).__name__}")
     return action_mask(battle_view(battle).decision).reshape(-1).astype(np.int64).tolist()
@@ -40,29 +45,29 @@ def _get_current_action_mask(battle: AbstractBattle) -> list[int]:
     return action_mask(current_battle_view(battle).decision).reshape(-1).astype(np.int64).tolist()
 
 
-# modified from poke-env
-# to remove all other gimmicks but mega evolution
 class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
+    """Custom PokeEnv subclass supporting doubles action spaces and mega evolution."""
+
     action_to_order = staticmethod(action_to_order)
     get_action_mask = staticmethod(get_action_mask)
 
     def __init__(
         self,
-        account_configuration1: Optional[AccountConfiguration] = None,
-        account_configuration2: Optional[AccountConfiguration] = None,
-        avatar: Optional[int] = None,
+        account_configuration1: AccountConfiguration | None = None,
+        account_configuration2: AccountConfiguration | None = None,
+        avatar: int | None = None,
         battle_format: str = FORMAT.battle_format,
-        log_level: Optional[int] = None,
-        save_replays: Union[bool, str] = False,
-        server_configuration: Optional[ServerConfiguration] = LocalhostServerConfiguration,
-        accept_open_team_sheet: Optional[bool] = True,
+        log_level: int | None = None,
+        save_replays: bool | str = False,
+        server_configuration: ServerConfiguration | None = LocalhostServerConfiguration,
+        accept_open_team_sheet: bool | None = True,
         start_timer_on_battle_start: bool = False,
         start_listening: bool = True,
-        open_timeout: Optional[float] = 10.0,
-        ping_interval: Optional[float] = 20.0,
-        ping_timeout: Optional[float] = 20.0,
-        challenge_timeout: Optional[float] = 60.0,
-        team: Optional[Union[str, Teambuilder]] = None,
+        open_timeout: float | None = 10.0,
+        ping_interval: float | None = 20.0,
+        ping_timeout: float | None = 20.0,
+        challenge_timeout: float | None = 60.0,
+        team: str | Teambuilder | None = None,
         fake: bool = False,
         strict: bool = True,
     ):
@@ -86,6 +91,7 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             fake=fake,
             strict=strict,
         )
+
         poke_env_patches.install(self.agent1.logger)
         poke_env_patches.install(self.agent2.logger)
         poke_env_patches.enable_environment_team_preview(self.agent1)
@@ -103,6 +109,8 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
 
 
 class SimEnv(MegaEnv):
+    """High-performance simulation environment supporting observation target pre-allocation."""
+
     get_action_mask = staticmethod(_get_current_action_mask)
 
     def __init__(
@@ -125,7 +133,6 @@ class SimEnv(MegaEnv):
         self._agent_rng = agent_rng
         self._opponent_rng = opponent_rng
         self._series_scores = [0, 0]
-        import uuid
         self.series_id = str(uuid.uuid4())
 
     def set_observation_targets(
@@ -144,32 +151,33 @@ class SimEnv(MegaEnv):
         if seed is not None:
             self._agent_rng.seed(seed)
             self._opponent_rng.seed(seed + 1)
-            
+
         if max(self._series_scores) >= 2 or sum(self._series_scores) == 0:
             self._series_scores = [0, 0]
-            import uuid
             self.series_id = str(uuid.uuid4())
             self.agent1.update_team(self._agent_team_source.sample(self._agent_rng).packed)
             self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng).packed)
-            
+
         return super().reset(seed=seed, options=options)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         if not battle.finished:
-            return 0
-            
+            return 0.0
+
         if battle.won:
             self._series_scores[0] += 1
         elif battle.lost:
             self._series_scores[1] += 1
-            
-        return 1 if battle.won else (-1 if battle.lost else 0)
+
+        return 1.0 if battle.won else (-1.0 if battle.lost else 0.0)
 
     def embed_battle(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
         view = self._battle_view_factory(battle)
         out = self._observation_targets.get(battle.player_username)
+
         if out is None:
             return self._observation_builder.build(view)
+
         self._observation_builder.build_into_prevalidated(view, out)
         return out

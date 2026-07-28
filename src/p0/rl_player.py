@@ -1,10 +1,16 @@
-"""Bo1 policy player, command-line configuration, and Showdown listener lifecycle."""
+"""Bo1 policy player, command-line configuration, and Showdown listener lifecycle.
+
+This module provides the core RLPlayer agent integrating neural network policy inference,
+history token management, series token persistence, team sampling, and CLI configuration
+for live Pokemon Showdown battles.
+"""
 
 import argparse
 import asyncio
 import logging
 import os
 import random
+import re
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +55,7 @@ class TeamPlayerMixin:
     ):
         self.team_source = team_source
         self.team_rng = team_rng
+
         if team_source is not None:
             if "team" in kwargs:
                 raise ValueError("Pass either team or team_source, not both")
@@ -56,28 +63,31 @@ class TeamPlayerMixin:
             kwargs["team"] = self.current_team_packed
         else:
             self.current_team_packed = kwargs.get("team")
+
         super().__init__(*args, **kwargs)
 
     def update_team(self, team):
-        super().update_team(team)
+        super().update_team(team)  # pyright: ignore[reportAttributeAccessIssue]
+
         if isinstance(team, str):
             self.current_team_packed = team
         elif hasattr(team, "yield_team"):
             self.current_team_packed = team.yield_team()
 
     def _battle_finished_callback(self, battle: AbstractBattle):
-        super()._battle_finished_callback(battle)
+        super()._battle_finished_callback(battle)  # pyright: ignore[reportAttributeAccessIssue]
+
         if self.team_source is not None:
             self.update_team(self.team_source.sample(self.team_rng).packed)
+
         battle_id = getattr(battle, "battle_tag", None) or getattr(battle, "tag", None)
-        if battle_id and getattr(self, "_battles", None) is not None:
-            self._battles.pop(battle_id, None)
+        battles = getattr(self, "_battles", None)
+        if battle_id and battles is not None:
+            battles.pop(battle_id, None)
 
 
 class RLPlayer(TeamPlayerMixin, Player):
-    """
-    Class that plays moves as per the trained policy net.
-    """
+    """Class that plays moves as per the trained policy net."""
 
     def __init__(
         self,
@@ -96,6 +106,7 @@ class RLPlayer(TeamPlayerMixin, Player):
 
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+
         self.top_p = top_p
         self._memory_model_id = id(policy)
         self._battle_history: dict[str, list[torch.Tensor]] = {}
@@ -111,8 +122,6 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     @staticmethod
     def _base_series_id(battle_tag: str) -> str:
-        import re
-
         match = re.match(r"^(.*?)(?:-game(?:-\d+)?)$", battle_tag)
         if match:
             return match.group(1)
@@ -126,12 +135,15 @@ class RLPlayer(TeamPlayerMixin, Player):
     def _memory_inputs(self, battle: DoubleBattle):
         if id(self.policy) != self._memory_model_id:
             self.invalidate_memory_for_model_reload()
+
         key = self._battle_key(battle)
         history = self._battle_history.get(key, [])
+
         if history:
             values = torch.stack(history[-HISTORY_WINDOW:]).unsqueeze(0).to(self.policy.device)
         else:
             values = torch.zeros((1, 0, self.policy.d_model), device=self.policy.device)
+
         history_tokens, history_mask, history_age_ids = pack_history_tokens(values)
 
         base_id = self._base_series_id(key)
@@ -153,8 +165,10 @@ class RLPlayer(TeamPlayerMixin, Player):
 
         obs = obs.unsqueeze(0).to(self.policy.device)
         mask = mask.unsqueeze(0).to(self.policy.device)
+
         with torch.no_grad():
             out = self.policy.act_obs(obs, mask, *self._memory_inputs(battle), top_p=self.top_p)
+
         self._append_history(battle, out.history_token[0])
         return out.actions[0].cpu().numpy()
 
@@ -285,6 +299,7 @@ def _load_policy(
     if checkpoint_path is None:
         if not allow_random_init:
             raise ValueError("A checkpoint is required unless random init is explicitly allowed.")
+
         LOGGER.warning("Starting bot with randomly initialized policy weights.")
         resources = default_runtime_resources()
         policy = build_policy(ModelConfig.baseline(), resources).to(device)
@@ -327,11 +342,21 @@ class RLBotConfig:
 
 
 def parse_args(argv: list[str] | None = None) -> RLBotConfig:
+    """Parse command line arguments and return structured bot configuration.
+
+    Arguments:
+      argv: list of command line argument strings or None to parse sys.argv
+
+    Returns:
+      RLBotConfig dataclass holding parsed runtime configuration values
+    """
     app_defaults = load_config()
     root_dir = app_defaults.paths.repository_root
     bot_defaults = app_defaults.bot
+
     env_team_files = os.getenv("SHOWDOWN_TEAM_FILES", "")
     configured_team_files = [str(path) for path in bot_defaults.team_files]
+
     parser = argparse.ArgumentParser(description="Run the VGC RL Showdown bot.")
     parser.add_argument(
         "--server",
@@ -430,6 +455,7 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         default=os.getenv("SHOWDOWN_LOG_LEVEL", bot_defaults.log_level),
         help="Python logging level.",
     )
+
     args = parser.parse_args(argv)
 
     server_configuration = _build_server_configuration(
@@ -439,12 +465,16 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     )
     team_files = _resolve_path_list(root_dir, args.team_file)
     checkpoint_path = _resolve_path(root_dir, args.checkpoint)
+
     if checkpoint_path is None and not args.allow_random_init:
         checkpoint_path = _resolve_checkpoint_path(root_dir, checkpoint_path)
+
     if not 0.0 < args.top_p <= 1.0:
         raise ValueError("--top-p must be in (0.0, 1.0].")
+
     if args.max_concurrent_battles < 1:
         raise ValueError("--max-concurrent-battles must be at least 1.")
+
     if args.challenge_limit < 1:
         raise ValueError("--challenge-limit must be at least 1.")
 
@@ -478,14 +508,25 @@ async def run_bot(
     config: RLBotConfig,
     policy_store: PolicyStore = DEFAULT_POLICY_STORE,
 ) -> None:
+    """Boot and run the RL bot Showdown listener process.
+
+    Arguments:
+      config: RLBotConfig containing connection, policy, and team options
+      policy_store: PolicyStore implementation for checkpoint loading
+
+    Returns:
+      None
+    """
     poke_env_patches.install()
     root_dir = load_config().paths.repository_root
+
     team_source = (
         FileTeamSource.from_files(config.team_files)
         if config.team_files
         else FileTeamSource(root_dir / "teams" / config.team_pool)
     )
     checkpoint_path = config.checkpoint_path
+
     policy = _load_policy(
         checkpoint_path,
         allow_random_init=config.allow_random_init,
@@ -496,6 +537,7 @@ async def run_bot(
         config.authentication_url,
     )
     account_configuration = AccountConfiguration(config.username, config.password)
+
     bot_player = RLPlayer(
         policy=policy,
         top_p=config.top_p,
@@ -515,6 +557,7 @@ async def run_bot(
         config.websocket_url,
         checkpoint_path if checkpoint_path is not None else "random-init policy",
     )
+
     if config.opponent:
         LOGGER.info("Accepting challenges only from '%s'", config.opponent)
     else:
@@ -522,6 +565,7 @@ async def run_bot(
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop_event.set)
@@ -552,6 +596,7 @@ async def run_bot(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for running the RL bot process."""
     try:
         config = parse_args(argv)
         _configure_logging(config.log_level)
@@ -559,6 +604,7 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as exc:
         LOGGER.error("%s", exc)
         return 1
+
     return 0
 
 

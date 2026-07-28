@@ -31,8 +31,10 @@ class ProjectPaths:
 
     @classmethod
     def from_root(cls, repository_root: str | Path) -> ProjectPaths:
+        """Construct ProjectPaths structure anchored at repository_root."""
         root = Path(repository_root).expanduser().resolve()
         artifacts = root / "artifacts"
+
         return cls(
             repository_root=root,
             data_root=root / "data",
@@ -60,6 +62,7 @@ def _default_paths() -> ProjectPaths:
         Path(__file__).resolve().parents[1] / "share" / "p0",
         Path(sys.prefix) / "share" / "p0",
     )
+
     for data_root in candidates:
         if (data_root / "vocab.json").is_file():
             return ProjectPaths(
@@ -77,6 +80,7 @@ def _default_paths() -> ProjectPaths:
                 resume_checkpoint=paths.resume_checkpoint,
                 initial_policy_checkpoint=paths.initial_policy_checkpoint,
             )
+
     return paths
 
 

@@ -35,6 +35,7 @@ class _TeamPreviewEnvPlayer(_EnvPlayer):
             order = await self.order_queue.async_get()
             await self.ps_client.send_message(order.message, battle.battle_tag)
             return
+
         await super()._handle_battle_request(battle, maybe_default_order)
 
 
@@ -53,6 +54,7 @@ async def _wait_for_login(self: PSClient, checking_interval: float = 0.1, wait_f
         await asyncio.sleep(checking_interval)
         if self.logged_in.is_set():
             return
+
     assert self.logged_in.is_set(), f"Expected {self.username} to be logged in."
 
 
@@ -62,22 +64,28 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
 
 
 def install(logger: logging.Logger | None = None) -> None:
+    """Install monkey patches for login waiting and message event capture."""
     global _installed
     target = logger or logging.getLogger("poke_env")
+
     if target not in _filtered_loggers:
         target.addFilter(_INACTIVE_POKEMON_FILTER)
         _filtered_loggers.append(target)
+
     if _installed:
         return
+
     PSClient.wait_for_login = _wait_for_login
     DoubleBattle.parse_message = _parse_message
     _installed = True
 
 
 def uninstall_for_tests() -> None:
+    """Uninstall monkey patches for unit test isolation."""
     global _installed
     for logger in _filtered_loggers:
         logger.removeFilter(_INACTIVE_POKEMON_FILTER)
+
     _filtered_loggers.clear()
     if _installed:
         PSClient.wait_for_login = _ORIGINAL_WAIT_FOR_LOGIN
@@ -86,4 +94,5 @@ def uninstall_for_tests() -> None:
 
 
 def is_installed() -> bool:
+    """Return whether poke-env monkey patches are active."""
     return _installed
