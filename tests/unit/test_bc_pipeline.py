@@ -1,5 +1,5 @@
 import torch
-from test_replay_dataset import _payload
+from tests.unit.test_replay_dataset import _payload
 
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy

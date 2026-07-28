@@ -17,7 +17,7 @@ from p0.model.fused_token_encoder import (
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.tokenizer import PokemonTokenizer
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_active_contract_is_reg_m_b_and_manifest_matches_sources():

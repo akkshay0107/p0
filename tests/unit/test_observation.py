@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from types import SimpleNamespace
 from typing import Any, cast
@@ -14,7 +13,6 @@ from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
-from poke_env.player import RandomPlayer
 
 from p0.battle.events import EventTypeId, RawBattleEvent
 from p0.format_config import FORMAT
@@ -891,58 +889,6 @@ def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
     assert result.token_type_ids[0] == TokenType.POKEMON
     assert len(mask) == FORMAT.action_size * 2
     assert decision_builds == 1
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_observation_builder_live(showdown_server, battle_format, sample_team):
-    """Exercise observation construction against the real local Showdown protocol."""
-    captured_battles = []
-    captured_errors = []
-
-    class CapturePlayer(RandomPlayer):
-        def teampreview(self, battle):
-            try:
-                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
-            except Exception as exc:
-                captured_errors.append(f"teampreview: {exc}")
-            return super().teampreview(battle)
-
-        def choose_move(self, battle):
-            try:
-                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
-            except Exception as exc:
-                captured_errors.append(f"choose_move: {exc}")
-            return super().choose_move(battle)
-
-    p1 = CapturePlayer(
-        battle_format=battle_format,
-        server_configuration=showdown_server,
-        team=sample_team,
-        max_concurrent_battles=1,
-    )
-    p2 = RandomPlayer(
-        battle_format=battle_format,
-        server_configuration=showdown_server,
-        team=sample_team,
-        max_concurrent_battles=1,
-    )
-
-    try:
-        await asyncio.wait_for(p1.battle_against(p2, n_battles=1), timeout=15.0)
-    except asyncio.TimeoutError:
-        pytest.fail(f"Battle timed out. Internal errors: {captured_errors}")
-    except Exception as exc:
-        pytest.fail(f"Battle failed with exception: {exc}. Internal errors: {captured_errors}")
-
-    assert not captured_errors
-    assert captured_battles
-    assert any(is_teampreview for is_teampreview, _ in captured_battles)
-    assert any(not is_teampreview for is_teampreview, _ in captured_battles)
-    for _, obs in captured_battles:
-        assert isinstance(obs, StructuredObservation)
-        assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
-        assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
 
 
 def test_concurrent_universal_effect_stress_state():

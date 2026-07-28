@@ -1,5 +1,4 @@
 import torch
-import pytest
 
 from p0.model.architecture_contract import SERIES_SLOTS, SERIES_TOKENS_PER_GAME
 from p0.model.token_store import SeriesTokenStore
@@ -67,7 +66,7 @@ def test_token_store_batching_and_missing():
     assert out_tokens.shape == (2, SERIES_SLOTS, 8)
 
     assert torch.allclose(out_tokens[0, :SERIES_TOKENS_PER_GAME], t1)
-    assert out_mask[0, 0] == True
+    assert out_mask[0, 0]
 
     assert torch.all(out_tokens[1] == 0)
     assert not torch.any(out_mask[1])

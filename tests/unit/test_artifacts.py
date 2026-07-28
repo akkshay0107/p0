@@ -11,7 +11,7 @@ from p0.model.resources import default_runtime_resources
 from p0.training.checkpoint import CHECKPOINT_SCHEMA, DEFAULT_POLICY_STORE
 
 _EXPORT_SPEC = importlib.util.spec_from_file_location(
-    "export_training", Path(__file__).parents[1] / "scripts" / "export_training.py"
+    "export_training", Path(__file__).parents[2] / "scripts" / "export_training.py"
 )
 assert _EXPORT_SPEC is not None and _EXPORT_SPEC.loader is not None
 _EXPORT_MODULE = importlib.util.module_from_spec(_EXPORT_SPEC)

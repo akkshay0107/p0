@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pytest
 import torch
-from test_bc_trainer import _chunk
-from test_replay_dataset import _payload
 
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
@@ -20,6 +18,8 @@ from p0.replays.scrape import HttpResponse, ReplayFetcher, ScrapeConfig, load_ra
 from p0.training.bc import BCTrainer, MultiGameBCCollator
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
+from tests.unit.test_bc_trainer import _chunk
+from tests.unit.test_replay_dataset import _payload
 
 
 def test_scrape_soft_limit_completes_the_final_linked_series(tmp_path: Path) -> None:

@@ -103,10 +103,10 @@ environment:
     )
 
     assert config.paths.repository_root.is_absolute()
-    assert config.paths.data_root == (Path(__file__).parents[1] / "relative-data").resolve()
+    assert config.paths.data_root == (Path(__file__).parents[2] / "relative-data").resolve()
     assert (
         config.environment.agent_team_source.path
-        == (Path(__file__).parents[1] / "teams" / "team-pool").resolve()
+        == (Path(__file__).parents[2] / "teams" / "team-pool").resolve()
     )
 
 

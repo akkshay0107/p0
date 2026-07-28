@@ -14,7 +14,7 @@ from p0.training.checkpoint import DEFAULT_POLICY_STORE
 
 _SPEC = importlib.util.spec_from_file_location(
     "benchmark_reducer_depth",
-    Path(__file__).parents[1] / "bench" / "benchmark_reducer_depth.py",
+    Path(__file__).parents[2] / "bench" / "benchmark_reducer_depth.py",
 )
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)

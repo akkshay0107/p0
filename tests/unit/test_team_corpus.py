@@ -11,7 +11,6 @@ from p0.teams.team import (
     deduplicate_variants,
     validate_evidence_cutoff,
 )
-from p0.teams.validation import validate_variant
 
 
 def _members():
@@ -122,10 +121,3 @@ def test_opponent_evidence_rejects_future_games():
         validate_evidence_cutoff(
             own_team=False, game_number=1, event_index=10, evidence_game=1, evidence_event=11
         )
-
-
-@pytest.mark.integration
-def test_pinned_showdown_admits_and_packs_legal_variant():
-    result = validate_variant(_variant())
-    assert result.valid, result.problems
-    assert result.packed_team

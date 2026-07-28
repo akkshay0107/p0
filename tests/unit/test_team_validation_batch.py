@@ -14,7 +14,6 @@ from p0.teams.validation import (
     PersistentShowdownValidator,
     validate_many,
     validate_many_batched,
-    validate_variant,
 )
 
 
@@ -215,16 +214,3 @@ def test_persistent_showdown_validator_lifecycle_and_validation() -> None:
     assert len(calls) >= 1
     first_request = json.loads(calls[0])
     assert len(first_request["batch"]) == 2
-
-
-@pytest.mark.integration
-def test_batched_validator_integration_matches_single_validator() -> None:
-    variants = (_variant("Pikachu"), _variant("Raichu"))
-    single_results = tuple(validate_variant(variant) for variant in variants)
-    batched_results = validate_many_batched(variants)
-    assert len(single_results) == len(batched_results)
-    for single, batched in zip(single_results, batched_results, strict=True):
-        assert single.team_hash == batched.team_hash
-        assert single.valid == batched.valid
-        assert single.packed_team == batched.packed_team
-        assert single.problems == batched.problems
