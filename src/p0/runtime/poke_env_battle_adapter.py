@@ -10,7 +10,6 @@ from p0.battle.events import BattleEvent, parse_events
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.model.tokenizer import tokenizer
 from p0.runtime.live_event_capture import consume_raw_events, last_move
-from p0.teams.stat_points import PrecomputedStats
 
 
 class PokeEnvBattleView:
@@ -23,7 +22,7 @@ class PokeEnvBattleView:
         self._decision: DecisionView | None = None
         self._events: list[BattleEvent] = []
         self._events_key: tuple[int, int] = (-1, -1)
-        self.stat_cache: dict[object, PrecomputedStats] = {}
+        self.stat_cache: dict[object, tuple[int, int, int, int, int, int]] = {}
 
     def refresh(self) -> PokeEnvBattleView:
         self._decision = None

@@ -178,17 +178,17 @@ def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
                 continue
             raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
 
-        parts = tuple(line.split("|"))
-        if len(parts) >= 2 and parts[1] in {"c", "chatmsg"}:
+        parts_list = line.split("|")
+        if len(parts_list) >= 2 and parts_list[1] in {"c", "chatmsg"}:
             skipping_chat_response = True
             continue
 
         skipping_chat_response = False
-        if parts[1] == "turn":
-            if len(parts) < 3 or not parts[2].isdigit():
+        if len(parts_list) >= 2 and parts_list[1] == "turn":
+            if len(parts_list) < 3 or not parts_list[2].isdigit():
                 raise ReplayParseError(f"Invalid turn line {index}: {line!r}")
-            turn = int(parts[2])
-        result.append(ProtocolLine(len(result), line, parts, turn))
+            turn = int(parts_list[2])
+        result.append(ProtocolLine(len(result), line, tuple(parts_list), turn))
 
     if not result:
         raise ReplayParseError("Replay log contains no protocol lines")

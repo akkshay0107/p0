@@ -12,11 +12,11 @@ from p0.cli.corpus import _variants_from_showdown
 from p0.cli.corpus import main as corpus_main
 from p0.format_config import FORMAT, current_manifest
 from p0.model.tokenizer import PokemonTokenizer
-from p0.teams.corpus_build import CorpusBuilder
+from p0.teams.corpus_build import build_corpus
 from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FileTeamSource
 from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamVariant
+from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 from p0.teams.validation import AdmissionResult
 from p0.training.composition import _team_source
 from p0.training.config import CorpusConfig, TeamSourceConfig
@@ -48,7 +48,7 @@ def _mock_vocab() -> dict[str, dict[str, int]]:
     }
 
 
-def _mock_variant(species: str = "Pikachu") -> TeamVariant:
+def _mock_variant(species: str = "Pikachu") -> TeamRecord:
     if species == "Pikachu":
         members = tuple(
             TeamMember(
@@ -71,7 +71,7 @@ def _mock_variant(species: str = "Pikachu") -> TeamVariant:
             )
             for _ in range(6)
         )
-    return TeamVariant(
+    return TeamRecord(
         team=CanonicalTeam(members),
         spreads=tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
         metadata=TeamMetadata(
@@ -86,7 +86,7 @@ def _mock_variant(species: str = "Pikachu") -> TeamVariant:
 
 
 def _mock_validator(
-    variants: Sequence[TeamVariant], **kwargs: object
+    variants: Sequence[TeamRecord], **kwargs: object
 ) -> tuple[AdmissionResult, ...]:
     return tuple(
         AdmissionResult(
@@ -105,14 +105,14 @@ def _mock_validator(
 def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
     contract_hash = current_manifest().runtime_contract_sha256
-    builder = CorpusBuilder(
+    v1 = _mock_variant("Pikachu")
+    manifest, _ = build_corpus(
+        (v1,),
         tokenizer=tokenizer,
         validator=_mock_validator,
         runtime_contract_sha256=contract_hash,
         format_id=FORMAT.battle_format,
     )
-    v1 = _mock_variant("Pikachu")
-    manifest, _ = builder.build((v1,))
     manifest_path = tmp_path / "corpus_manifest.json"
     manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
 
@@ -159,10 +159,16 @@ def test_corpus_cli_build_and_audit(
 
     input_dir = tmp_path / "inputs"
     input_dir.mkdir()
-    v1 = _mock_variant("Pikachu")
-    v2 = _mock_variant("Charizard")
-    (input_dir / "v1.json").write_text(json.dumps(v1.to_dict()), encoding="utf-8")
-    (input_dir / "v2.json").write_text(json.dumps(v2.to_dict()), encoding="utf-8")
+    team_text_1 = "\n\n".join(
+        "Pikachu @ Light Ball\nAbility: Static\nJolly Nature\n- Fake Out\n- Protect\n- Thunderbolt\n- Electroweb"
+        for i in range(1, 7)
+    )
+    team_text_2 = "\n\n".join(
+        "Charizard @ Charizardite Y\nAbility: Blaze\nModest Nature\n- Heat Wave\n- Solar Beam\n- Protect\n- Weather Ball"
+        for i in range(1, 7)
+    )
+    (input_dir / "v1.txt").write_text(team_text_1, encoding="utf-8")
+    (input_dir / "v2.txt").write_text(team_text_2, encoding="utf-8")
 
     output_manifest = tmp_path / "output" / "corpus_manifest.json"
     pool_dir = tmp_path / "pools"
@@ -185,27 +191,29 @@ def test_corpus_cli_build_and_audit(
     assert (pool_dir / "all" / "corpus_manifest.json").is_file()
 
     captured = capsys.readouterr()
-    audit_data = json.loads(captured.out)
+    audit_data = json.loads(captured.out.split("\n")[-2]) if captured.out.strip() else {}
     assert audit_data["admitted_count"] == 2
     assert audit_data["rejected_count"] == 0
 
     corpus_main(["audit", "--manifest", str(output_manifest)])
     audit_captured = capsys.readouterr()
-    re_audit_data = json.loads(audit_captured.out)
+    re_audit_data = (
+        json.loads(audit_captured.out.split("\n")[-2]) if audit_captured.out.strip() else {}
+    )
     assert re_audit_data["admitted_count"] == 2
 
 
 def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
     contract_hash = current_manifest().runtime_contract_sha256
-    builder = CorpusBuilder(
+    v1 = _mock_variant("Pikachu")
+    manifest, _ = build_corpus(
+        (v1,),
         tokenizer=tokenizer,
         validator=_mock_validator,
         runtime_contract_sha256=contract_hash,
         format_id=FORMAT.battle_format,
     )
-    v1 = _mock_variant("Pikachu")
-    manifest, _ = builder.build((v1,))
     pool_dir = tmp_path / "pool_all"
     pool_dir.mkdir(parents=True, exist_ok=True)
     (pool_dir / "corpus_manifest.json").write_text(json.dumps(manifest.to_dict()), encoding="utf-8")

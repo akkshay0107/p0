@@ -121,7 +121,9 @@ class ShowdownServer:
             self._log_file.close()
             self._log_file = None
 
-        stderr = self.log_path.read_text(encoding="utf-8")[-4000:] if self.log_path.is_file() else ""
+        stderr = (
+            self.log_path.read_text(encoding="utf-8")[-4000:] if self.log_path.is_file() else ""
+        )
         raise RuntimeError(
             f"Showdown command {command!r} exited with {code} on port {self.port}: {stderr}"
         )

@@ -5,17 +5,15 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS
-from p0.teams.team import TeamVariant
+from p0.teams.team import TeamRecord
 
 
-@dataclass(frozen=True, slots=True)
-class AdmissionResult:
+class AdmissionResult(NamedTuple):
     team_hash: str
     valid: bool
     packed_team: str | None
@@ -25,37 +23,43 @@ class AdmissionResult:
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
-def _variant_dict(variant: TeamVariant) -> dict[str, Any]:
-    pairs = sorted(
-        zip(variant.team.members, variant.spreads, strict=True),
-        key=lambda pair: pair[0].canonical().species,
-    )
+def _variant_dict(variant: TeamRecord) -> dict[str, Any]:
+    canonical_members = variant.team.canonical().members
+    if variant.team.members == canonical_members:
+        pairs = list(zip(variant.team.members, variant.spreads, strict=True))
+    else:
+        pairs = sorted(
+            zip(variant.team.members, variant.spreads, strict=True),
+            key=lambda pair: pair[0].canonical().species,
+        )
+
     team = []
     for member, spread in pairs:
-        member = member.canonical()
+        canon_member = member.canonical()
         team.append(
             {
-                "name": member.species,
-                "species": member.species,
-                "item": member.item,
-                "ability": member.ability,
-                "moves": list(member.moves),
-                "nature": member.nature,
+                "name": canon_member.species,
+                "species": canon_member.species,
+                "item": canon_member.item,
+                "ability": canon_member.ability,
+                "moves": list(canon_member.moves),
+                "nature": canon_member.nature,
                 "evs": spread.as_dict(),
                 "ivs": {name: 31 for name in ("hp", "atk", "def", "spa", "spd", "spe")},
-                "gender": member.gender,
-                "level": member.level,
+                "gender": canon_member.gender,
+                "level": canon_member.level,
             }
         )
+
     return {"format": FORMAT.battle_format, "team": team}
 
 
-def showdown_payload(variant: TeamVariant) -> str:
+def showdown_payload(variant: TeamRecord) -> str:
     return json.dumps(_variant_dict(variant))
 
 
 def validate_variant(
-    variant: TeamVariant,
+    variant: TeamRecord,
     *,
     runner: Runner = subprocess.run,
     timeout: float = 30.0,
@@ -89,7 +93,7 @@ def validate_variant(
 
 
 def validate_many_batched(
-    variants: Sequence[TeamVariant],
+    variants: Sequence[TeamRecord],
     *,
     batch_size: int = 256,
     runner: Runner = subprocess.run,
@@ -156,7 +160,7 @@ def validate_many_batched(
 
 
 def validate_many(
-    variants: Sequence[TeamVariant],
+    variants: Sequence[TeamRecord],
     *,
     runner: Runner = subprocess.run,
     timeout: float = 30.0,
@@ -243,7 +247,7 @@ class PersistentShowdownValidator:
 
     def validate_many(
         self,
-        variants: Sequence[TeamVariant],
+        variants: Sequence[TeamRecord],
         *,
         batch_size: int = 256,
     ) -> tuple[AdmissionResult, ...]:

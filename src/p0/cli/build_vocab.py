@@ -119,7 +119,7 @@ def build(
         if table is None:
             raise ValueError(f"Unknown legal protocol-effect namespace: {family}")
         append_keys(vocab[table], {normalize(value) for value in identifiers})
-        
+
     for table, values in vocab.items():
         if any(not isinstance(index, int) or index <= 0 for index in values.values()):
             raise ValueError(f"Vocabulary table {table!r} contains a non-positive embedding ID")
@@ -153,7 +153,7 @@ def build(
     known_protocol_ids.update(
         normalize(identifier) for table in effect_tables.values() for identifier in vocab[table]
     )
-    
+
     protocol_ids = {normalize(value) for value in dex.get("protocolEffects", [])}
     coverage = {
         "schemaVersion": 1,
@@ -169,10 +169,10 @@ def build(
         coverage_path.write_text(
             json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        
+
     if missing_content:
         raise ValueError(f"Champions coverage audit failed: missing={missing_content}")
-        
+
     manifest = current_manifest(
         vocab_path=vocab_path,
         dex_path=dex_path,
@@ -196,9 +196,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional path for the reproducible coverage audit report",
     )
     args = parser.parse_args(argv)
-    
+
     build(args.dex, args.vocab, args.manifest, args.coverage)
-    
+
     print(json.dumps({"vocab": str(args.vocab), "manifest": str(args.manifest)}, indent=2))
     return 0
 

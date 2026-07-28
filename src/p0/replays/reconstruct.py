@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import typing
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -34,8 +35,6 @@ from p0.replays.schema import (
 )
 from p0.teams.stat_points import (
     BaseStats,
-    ImputationInput,
-    PrecomputedStats,
     StatPoints,
     calculate_stats,
     impute_candidates,
@@ -271,7 +270,7 @@ class StatPointEstimate:
     species: str
     provenance: str
     points: StatPoints
-    precomputed: PrecomputedStats | None
+    precomputed: tuple[int, int, int, int, int, int] | None
     confidence: float
 
 
@@ -328,20 +327,18 @@ def impute_stat_points(
                     StatPointEstimate(side, species, "UNKNOWN", StatPoints(), None, 0.0)
                 )
                 continue
-            value = ImputationInput(
-                species=species,
+            value: dict[str, typing.Any] = dict(
                 nature=str(details.get("nature", "serious")),
                 item=str(details.get("item", "")),
                 ability=str(details.get("ability", "")),
                 moves=moves,
                 move_categories=categories,
                 base_stats=BaseStats.from_mapping(base_mapping),
-                level=level,
             )
-            candidates = impute_candidates(value)
-            candidate = select_candidate(value, seed + side * 1009 + index)
-            stats = PrecomputedStats(
-                calculate_stats(value.base_stats, candidate.points, value.nature, value.level)
+            candidates = impute_candidates(**value)
+            candidate = select_candidate(seed=seed + side * 1009 + index, **value)
+            stats = tuple[int, int, int, int, int, int](
+                calculate_stats(value["base_stats"], candidate.points, value["nature"], level)
             )
             total_weight = sum(item.weight for item in candidates)
             estimates.append(
@@ -1221,7 +1218,7 @@ def reconstruct_perspective(
                 illusion_species_by_line,
             )
         )
-        forced_move_slots = {
+        forced_move_slots = tuple(
             endpoint[1]
             for line in lines
             if _is_choice_move(line.parts)
@@ -1229,7 +1226,7 @@ def reconstruct_perspective(
             and (endpoint := _ReplayState._endpoint(line.parts[2])) is not None
             and endpoint[0] == perspective
             and normalize_id(line.parts[3]) in {"struggle", "recharge"}
-        }
+        )
         view = _view(
             state,
             perspective,

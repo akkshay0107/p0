@@ -49,7 +49,7 @@ def main() -> int:
     """Export CLI entrypoint."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
-    
+
     project_root = DEFAULT_PATHS.repository_root
     output_path = project_root / "ppo_training_export.tar.gz"
 
@@ -79,7 +79,7 @@ def main() -> int:
 
     print(f"Creating archive: {output_path}")
     t0 = time.time()
-    
+
     try:
         with tarfile.open(output_path, "w:gz") as tar:
             for filepath, arcname, size in files_to_archive:
@@ -92,7 +92,7 @@ def main() -> int:
 
     duration = time.time() - t0
     archive_size = output_path.stat().st_size
-    
+
     print(f"Export completed in {duration:.1f}s.")
     print(f"Archive file: {output_path} ({format_size(archive_size)})")
 

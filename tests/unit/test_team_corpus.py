@@ -7,7 +7,7 @@ from p0.teams.team import (
     CanonicalTeam,
     TeamMember,
     TeamMetadata,
-    TeamVariant,
+    TeamRecord,
     deduplicate_variants,
     validate_evidence_cutoff,
 )
@@ -73,7 +73,7 @@ def _metadata(source="series-1", usage=1):
 
 def _variant(members=None, metadata=None, spreads=None):
     members = members or _members()
-    return TeamVariant(
+    return TeamRecord(
         CanonicalTeam(tuple(members)),
         spreads or tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
         metadata or _metadata(),
@@ -101,13 +101,13 @@ def test_deduplication_merges_metadata_but_preserves_spread_variants():
     assert merged.metadata.source_series == ("series-1", "series-2")
 
 
-def test_team_variant_serialization_round_trip_is_strict():
+def test_team_record_serialization_round_trip_is_strict():
     variant = _variant()
-    assert TeamVariant.from_dict(variant.to_dict()) == replace(
+    assert TeamRecord.from_dict(variant.to_dict()) == replace(
         variant, team=variant.team.canonical()
     )
     with pytest.raises(ValueError, match="fields"):
-        TeamVariant.from_dict({**variant.to_dict(), "unexpected": True})
+        TeamRecord.from_dict({**variant.to_dict(), "unexpected": True})
 
 
 def test_opponent_evidence_rejects_future_games():

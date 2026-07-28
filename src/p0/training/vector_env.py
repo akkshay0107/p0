@@ -39,7 +39,7 @@ class ThreadVecEnv:
 
     def _reset_env(self, env_id: int, env: SimEnv):
         obs, info = env.reset()
-        info["series_id"] = env.series_id
+        info["series_id"] = env.series_id  # type: ignore
 
         agent1 = env.agent1.username
         agent2 = env.agent2.username
@@ -83,12 +83,12 @@ class ThreadVecEnv:
             series_id = env.series_id
             series_complete = max(env._series_scores) >= 2
             _, mask1, mask2, _ = self._reset_env(env_id, env)
-            info["series_id"] = series_id
-            info["series_complete"] = series_complete
+            info["series_id"] = series_id  # type: ignore
+            info["series_complete"] = series_complete  # type: ignore
             return env_id, mask1, mask2, reward1, reward2, done, info
 
-        info["series_id"] = env.series_id
-        info["series_complete"] = False
+        info["series_id"] = env.series_id  # type: ignore
+        info["series_complete"] = False  # type: ignore
         return env_id, mask1, mask2, reward1, reward2, done, info
 
     def step(self, actions: list[dict]):

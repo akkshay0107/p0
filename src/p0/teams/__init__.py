@@ -7,12 +7,12 @@ Importing the package must not eagerly import poke-env just to access them.
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from p0.teams.corpus_build import CorpusBuilder
+    from p0.teams.corpus_build import build_corpus
     from p0.teams.corpus_source import CorpusTeamSource
     from p0.teams.source import FileTeamSource, FixedTeamSource, TeamSource, ValidatedTeam
 
 __all__ = [
-    "CorpusBuilder",
+    "build_corpus",
     "CorpusTeamSource",
     "FileTeamSource",
     "FixedTeamSource",
@@ -21,22 +21,20 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
-    if name in __all__:
-        if name == "CorpusBuilder":
-            from p0.teams.corpus_build import CorpusBuilder
+def __getattr__(name: str) -> object:
+    if name == "build_corpus":
+        from p0.teams.corpus_build import build_corpus
 
-            return CorpusBuilder
-        if name == "CorpusTeamSource":
-            from p0.teams.corpus_source import CorpusTeamSource
+        return build_corpus
 
-            return CorpusTeamSource
-        from p0.teams.source import FileTeamSource, FixedTeamSource, TeamSource, ValidatedTeam
+    if name == "CorpusTeamSource":
+        from p0.teams.corpus_source import CorpusTeamSource
 
-        return {
-            "FileTeamSource": FileTeamSource,
-            "FixedTeamSource": FixedTeamSource,
-            "TeamSource": TeamSource,
-            "ValidatedTeam": ValidatedTeam,
-        }[name]
+        return CorpusTeamSource
+
+    if name in ("FileTeamSource", "FixedTeamSource", "TeamSource", "ValidatedTeam"):
+        import p0.teams.source as source_module
+
+        return getattr(source_module, name)
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

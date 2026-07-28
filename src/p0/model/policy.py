@@ -450,11 +450,9 @@ class ActorPolicy(nn.Module):
         )
         a2 = torch.argmax(logits[:, 1], dim=-1)
         actions = torch.stack([a1, a2], dim=-1)
-        log_probs = F.log_softmax(logits[:, 0], dim=-1).gather(
-            1, a1.unsqueeze(1)
-        ).squeeze(1) + F.log_softmax(logits[:, 1], dim=-1).gather(
-            1, a2.unsqueeze(1)
-        ).squeeze(1)
+        log_probs = F.log_softmax(logits[:, 0], dim=-1).gather(1, a1.unsqueeze(1)).squeeze(
+            1
+        ) + F.log_softmax(logits[:, 1], dim=-1).gather(1, a2.unsqueeze(1)).squeeze(1)
         return actions, log_probs, z, reduced.local_history_token
 
     def score(

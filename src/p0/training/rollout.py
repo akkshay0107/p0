@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
+from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import PolicyNet
 from p0.model.structured_observation import StructuredObservation
@@ -139,7 +139,8 @@ def collect_rollouts(
         current_mask = torch.cat([mask1_gpu, mask2_gpu])
 
         infos = vec_env.last_infos
-        series_ids = [info["series_id"] for info in infos]
+        assert infos is not None
+        series_ids = [str(info["series_id"]) for info in infos if info]
         series_tokens1, series_mask1 = series_store1.get_tokens(series_ids, device)
         series_tokens2, series_mask2 = series_store2.get_tokens(series_ids, device)
         current_series_tokens = torch.cat([series_tokens1, series_tokens2], dim=0)
@@ -218,18 +219,18 @@ def collect_rollouts(
                 val1 = torch.stack(hist1).unsqueeze(0).to(device)
                 with torch.no_grad():
                     new_tok1 = policy.series.resample_single_game(val1)[0]
-                series_store1.append(series_ids[i], new_tok1)
+                series_store1.append(str(series_ids[i]), new_tok1)
 
             hist2 = memory2.tokens[i]
             if hist2:
                 val2 = torch.stack(hist2).unsqueeze(0).to(device)
                 with torch.no_grad():
                     new_tok2 = policy.series.resample_single_game(val2)[0]
-                series_store2.append(series_ids[i], new_tok2)
+                series_store2.append(str(series_ids[i]), new_tok2)
 
-            if infos[i].get("series_complete"):
-                series_store1.drop(series_ids[i])
-                series_store2.drop(series_ids[i])
+            if infos[i] and infos[i].get("series_complete"):
+                series_store1.drop(str(series_ids[i]))
+                series_store2.drop(str(series_ids[i]))
 
             buffer.add_episode(trajectories1.complete(i))
             buffer.add_episode(trajectories2.complete(i))

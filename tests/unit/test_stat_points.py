@@ -2,7 +2,6 @@ import pytest
 
 from p0.teams.stat_points import (
     BaseStats,
-    ImputationInput,
     Role,
     StatPoints,
     calculate_stats,
@@ -47,32 +46,34 @@ def test_stat_point_validation(points, error):
         StatPoints(**points)
 
 
+import typing
+
+
 def _input(*, moves=("Heat Wave", "Protect"), categories=("special", "status"), nature="modest"):
-    return ImputationInput(
-        species="charizard",
+    return typing.cast(dict[str, typing.Any], dict(
         nature=nature,
         item="charizarditey",
         ability="blaze",
         moves=moves,
         move_categories=categories,
         base_stats=CHARIZARD,
-    )
+    ))
 
 
 def test_imputer_is_legal_deterministic_and_role_sensitive():
     value = _input()
-    assert classify_role(value) == Role.SPECIAL
-    assert impute_candidates(value) == impute_candidates(value)
-    assert impute_candidates(value)[0].points == StatPoints(hp=2, spa=32, spe=32)
-    assert all(sum(candidate.points.as_tuple()) <= 66 for candidate in impute_candidates(value))
-    assert select_candidate(value, seed=7) == select_candidate(value, seed=7)
+    assert classify_role(value["nature"], value["moves"], value["move_categories"]) == Role.SPECIAL
+    assert impute_candidates(**value) == impute_candidates(**value)
+    assert impute_candidates(**value)[0].points == StatPoints(hp=2, spa=32, spe=32)
+    assert all(sum(candidate.points.as_tuple()) <= 66 for candidate in impute_candidates(**value))
+    assert select_candidate(seed=7, **value) == select_candidate(seed=7, **value)
 
 
 def test_imputed_level_stats_are_cached_by_static_team_facts():
     value = _input()
     imputed_stats.cache_clear()
-    first = imputed_stats(value)
-    second = imputed_stats(value)
+    first = imputed_stats(**value)
+    second = imputed_stats(**value)
     assert first == second
     assert imputed_stats.cache_info().hits == 1
 
@@ -84,7 +85,13 @@ def test_trick_room_and_support_shapes_do_not_assume_fast_offense():
         nature="quiet",
     )
     support = _input(moves=("Protect", "Follow Me"), categories=("status", "status"), nature="calm")
-    assert classify_role(trick_room) == Role.TRICK_ROOM
-    assert impute_candidates(trick_room)[0].points.spe == 0
-    assert classify_role(support) == Role.SUPPORT
-    assert impute_candidates(support)[0].points == StatPoints(hp=32, defense=17, spd=17)
+    assert (
+        classify_role(trick_room["nature"], trick_room["moves"], trick_room["move_categories"])
+        == Role.TRICK_ROOM
+    )
+    assert impute_candidates(**trick_room)[0].points.spe == 0
+    assert (
+        classify_role(support["nature"], support["moves"], support["move_categories"])
+        == Role.SUPPORT
+    )
+    assert impute_candidates(**support)[0].points == StatPoints(hp=32, defense=17, spd=17)

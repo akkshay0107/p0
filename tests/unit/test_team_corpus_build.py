@@ -13,13 +13,12 @@ from p0.teams.corpus import (
     TeamCorpusManifest,
 )
 from p0.teams.corpus_build import (
-    CorpusBuilder,
-    SplitPolicy,
     audit_corpus,
+    build_corpus,
     populate_pool_directories,
 )
 from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamVariant
+from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 from p0.teams.validation import AdmissionResult
 
 
@@ -79,7 +78,7 @@ def _variant(
     usage_count: int = 1,
     archetypes: tuple[str, ...] = ("balance",),
     move: str = "Fake Out",
-) -> TeamVariant:
+) -> TeamRecord:
     members = (
         TeamMember(
             species=species,
@@ -124,7 +123,7 @@ def _variant(
             nature="Modest",
         ),
     )
-    return TeamVariant(
+    return TeamRecord(
         team=CanonicalTeam(members),
         spreads=tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
         metadata=TeamMetadata(
@@ -138,7 +137,7 @@ def _variant(
     )
 
 
-def _mock_validator(variants: Sequence[TeamVariant], **kwargs: Any) -> tuple[AdmissionResult, ...]:
+def _mock_validator(variants: Sequence[TeamRecord], **kwargs: Any) -> tuple[AdmissionResult, ...]:
     return tuple(
         AdmissionResult(
             team_hash=variant.team.team_hash,
@@ -155,44 +154,44 @@ def _mock_validator(variants: Sequence[TeamVariant], **kwargs: Any) -> tuple[Adm
 
 def test_corpus_builder_admits_valid_variants() -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
-    builder = CorpusBuilder(
+    v1 = _variant("Pikachu", usage_count=5)
+    v2 = _variant("Charizard", source_series=("series-2",), usage_count=3)
+    manifest, audit = build_corpus(
+        (v1, v2),
         tokenizer=tokenizer,
         validator=_mock_validator,
         runtime_contract_sha256="a" * 64,
         format_id=FORMAT.battle_format,
     )
-    v1 = _variant("Pikachu", usage_count=5)
-    v2 = _variant("Charizard", source_series=("series-2",), usage_count=3)
-    manifest, audit = builder.build((v1, v2))
     assert len(manifest.entries) == 2
     assert manifest.format_id == FORMAT.battle_format
     assert manifest.runtime_contract_sha256 == "a" * 64
-    assert audit.admitted_count == 2
-    assert audit.rejected_count == 0
-    assert set(audit.species_coverage) >= {"pikachu", "charizard"}
+    assert audit["admitted_count"] == 2
+    assert audit["rejected_count"] == 0
+    assert set(audit["species_coverage"]) >= {"pikachu", "charizard"}
 
 
 def test_corpus_builder_rejects_oov_species() -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
-    builder = CorpusBuilder(
+    v_valid = _variant("Pikachu")
+    v_oov = _variant("Missingno")
+    manifest, audit = build_corpus(
+        (v_valid, v_oov),
         tokenizer=tokenizer,
         validator=_mock_validator,
         runtime_contract_sha256="a" * 64,
     )
-    v_valid = _variant("Pikachu")
-    v_oov = _variant("Missingno")
-    manifest, audit = builder.build((v_valid, v_oov))
     assert len(manifest.entries) == 1
-    assert audit.admitted_count == 1
-    assert audit.rejected_count == 1
-    assert any("oov" in reason for reason in audit.rejections_by_reason)
+    assert audit["admitted_count"] == 1
+    assert audit["rejected_count"] == 1
+    assert any("oov" in reason for reason in audit["rejections_by_reason"])
 
 
 def test_corpus_builder_rejects_showdown_invalid() -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
 
     def failing_validator(
-        variants: Sequence[TeamVariant], **kwargs: Any
+        variants: Sequence[TeamRecord], **kwargs: Any
     ) -> tuple[AdmissionResult, ...]:
         results = []
         for index, variant in enumerate(variants):
@@ -217,31 +216,31 @@ def test_corpus_builder_rejects_showdown_invalid() -> None:
                 )
         return tuple(results)
 
-    builder = CorpusBuilder(
-        tokenizer=tokenizer, validator=failing_validator, runtime_contract_sha256="a" * 64
-    )
     v1 = _variant("Pikachu", source_series=("s1",))
     v2 = _variant("Charizard", source_series=("s2",))
-    manifest, audit = builder.build((v1, v2))
+    manifest, audit = build_corpus(
+        (v1, v2), tokenizer=tokenizer, validator=failing_validator, runtime_contract_sha256="a" * 64
+    )
     assert len(manifest.entries) == 1
-    assert audit.rejected_count == 1
-    assert any("showdown_invalid" in reason for reason in audit.rejections_by_reason)
+    assert audit["rejected_count"] == 1
+    assert any("showdown_invalid" in reason for reason in audit["rejections_by_reason"])
 
 
 def test_split_assignment_prevents_series_leakage() -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
-    builder = CorpusBuilder(
-        tokenizer=tokenizer,
-        validator=_mock_validator,
-        runtime_contract_sha256="a" * 64,
-        split_policy=SplitPolicy(
-            ratio_train=0.5, ratio_val=0.5, ratio_test=0.0, held_out_tags=("held_out",)
-        ),
-    )
     v1 = _variant("Pikachu", source_series=("shared-series",))
     v2 = _variant("Charizard", source_series=("shared-series",))
     v3 = _variant("Whimsicott", source_series=("other-series",), archetypes=("held_out",))
-    manifest, _ = builder.build((v1, v2, v3))
+    manifest, _ = build_corpus(
+        (v1, v2, v3),
+        tokenizer=tokenizer,
+        validator=_mock_validator,
+        runtime_contract_sha256="a" * 64,
+        ratio_train=0.5,
+        ratio_val=0.5,
+        ratio_test=0.0,
+        held_out_tags=("held_out",),
+    )
     assert len(manifest.entries) == 3
     by_species = {entry.canonical_hash: entry.split for entry in manifest.entries}
     assert by_species[v1.team.team_hash] == by_species[v2.team.team_hash]
@@ -250,28 +249,20 @@ def test_split_assignment_prevents_series_leakage() -> None:
 
 def test_audit_corpus_and_coverage() -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
-    builder = CorpusBuilder(
-        tokenizer=tokenizer,
-        validator=_mock_validator,
-        runtime_contract_sha256="b" * 64,
-    )
     v1 = _variant("Pikachu", usage_count=10, archetypes=("hyperoffense",))
     v2 = _variant("Charizard", source_series=("s2",), usage_count=5, archetypes=("balance",))
-    manifest, audit = builder.build((v1, v2))
+    manifest, audit = build_corpus(
+        (v1, v2), tokenizer=tokenizer, validator=_mock_validator, runtime_contract_sha256="b" * 64
+    )
     re_audit = audit_corpus(manifest)
-    assert re_audit.admitted_count == 2
-    assert "pikachu" in re_audit.species_coverage
-    assert "hyperoffense" in re_audit.archetype_counts
-    assert re_audit.archetype_counts["hyperoffense"] == 1
+    assert re_audit["admitted_count"] == 2
+    assert "pikachu" in re_audit["species_coverage"]
+    assert "hyperoffense" in re_audit["archetype_counts"]
+    assert re_audit["archetype_counts"]["hyperoffense"] == 1
 
 
 def test_populate_pool_directories(tmp_path: Path) -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
-    builder = CorpusBuilder(
-        tokenizer=tokenizer,
-        validator=_mock_validator,
-        runtime_contract_sha256="c" * 64,
-    )
     # Each variant needs a unique species or move so canonical_hash is distinct
     unique_variants = tuple(
         _variant(
@@ -282,7 +273,12 @@ def test_populate_pool_directories(tmp_path: Path) -> None:
         )
         for i in range(1, 5)
     )
-    manifest, _ = builder.build(unique_variants)
+    manifest, _ = build_corpus(
+        unique_variants,
+        tokenizer=tokenizer,
+        validator=_mock_validator,
+        runtime_contract_sha256="c" * 64,
+    )
     populate_pool_directories(manifest, output_root=tmp_path, reduced_limit=2)
 
     all_path = tmp_path / "all" / "corpus_manifest.json"

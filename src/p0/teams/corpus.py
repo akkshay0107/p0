@@ -46,9 +46,13 @@ class SamplingPolicy(IntEnum):
     MATCHUP_BALANCED = 5
 
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
 def _require_fields(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
     missing = sorted(expected - value.keys())
     unknown = sorted(value.keys() - expected)
+
     if missing or unknown:
         raise ValueError(f"Invalid {owner} fields; missing={missing}, unknown={unknown}")
 
@@ -57,7 +61,7 @@ def _is_sha256(value: Any) -> bool:
     return (
         isinstance(value, str)
         and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
+        and all(character in _HEX_DIGITS for character in value)
     )
 
 
@@ -88,18 +92,23 @@ class CorpusEntry:
     def __post_init__(self) -> None:
         if not _is_sha256(self.canonical_hash):
             raise ValueError("CorpusEntry.canonical_hash must be a lowercase SHA-256 digest")
+
         if not self.packed:
             raise ValueError("CorpusEntry.packed must be a non-empty packed team")
-        actual = hashlib.sha256(self.packed.encode("utf-8")).hexdigest()
+
+        actual = hashlib.sha256(self.packed.encode()).hexdigest()
         if self.packed_sha256 != actual:
             raise ValueError(
                 "CorpusEntry.packed_sha256 does not match the packed team: "
                 f"declared={self.packed_sha256}, actual={actual}"
             )
+
         if self.split is CorpusSplit.UNSPECIFIED:
             raise ValueError("CorpusEntry.split must be assigned before admission")
+
         if type(self.usage_count) is not int or self.usage_count < 1:
             raise ValueError("CorpusEntry.usage_count must be a positive integer")
+
         if self.spread_provenance not in ("imputed", "exact"):
             raise ValueError("CorpusEntry.spread_provenance must be 'imputed' or 'exact'")
 
@@ -164,28 +173,34 @@ class TeamCorpusManifest:
                 f"Unsupported corpus manifest schema {self.artifact_schema!r}; "
                 f"expected {CORPUS_MANIFEST_SCHEMA}"
             )
+
         if not _is_sha256(self.runtime_contract_sha256):
             raise ValueError(
                 "TeamCorpusManifest.runtime_contract_sha256 must be a lowercase SHA-256 digest"
             )
+
         if not self.format_id:
             raise ValueError("TeamCorpusManifest.format_id must be non-empty")
+
         seen: set[tuple[str, str]] = set()
         for entry in self.entries:
             key = (entry.canonical_hash, entry.packed_sha256)
             if key in seen:
                 raise ValueError(f"Duplicate corpus entry {entry.canonical_hash}")
             seen.add(key)
+
         actual = corpus_content_hash(self.entries)
         if self.corpus_hash != actual:
             raise ValueError(
                 "TeamCorpusManifest.corpus_hash does not match the entries: "
                 f"declared={self.corpus_hash}, actual={actual}"
             )
+
         try:
             datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
         except ValueError as exc:
             raise ValueError("TeamCorpusManifest.created_at must be ISO-8601") from exc
+
         for key in self.sampling_metadata:
             if not isinstance(key, str):
                 raise ValueError("Sampling metadata keys must be strings")
@@ -248,11 +263,15 @@ class CorpusSourceSpec:
     def __post_init__(self) -> None:
         if not self.corpus_path or not self.format_id:
             raise ValueError("CorpusSourceSpec requires corpus_path and format_id")
+
         if not _is_sha256(self.corpus_hash):
             raise ValueError("CorpusSourceSpec.corpus_hash must be a lowercase SHA-256 digest")
+
         if self.split is CorpusSplit.UNSPECIFIED:
             raise ValueError("CorpusSourceSpec.split must be specified")
+
         if self.sampling_policy is SamplingPolicy.UNSPECIFIED:
             raise ValueError("CorpusSourceSpec.sampling_policy must be specified")
+
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("CorpusSourceSpec.seed must be a nonnegative integer")

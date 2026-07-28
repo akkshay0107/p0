@@ -188,6 +188,7 @@ def test_collect_rollouts_records_both_self_play_streams():
     memory2 = BattleMemoryBuffer(config.n_envs, 1)
 
     from p0.model.token_store import SeriesTokenStore
+
     series_store1 = SeriesTokenStore(1)
     series_store2 = SeriesTokenStore(1)
 

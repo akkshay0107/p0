@@ -120,6 +120,16 @@ class CorpusTeamSource:
         policy = self._spec.sampling_policy
 
         if exclude_canonical_hash is not None:
+            by_canonical, canonical_keys = self._get_canonical_index()
+            eligible_keys = tuple(k for k in canonical_keys if k != exclude_canonical_hash)
+
+            if not eligible_keys:
+                raise ValueError("No eligible corpus entries remain after exclusion")
+
+            if policy in (SamplingPolicy.UNIFORM_CANONICAL, SamplingPolicy.MATCHUP_BALANCED):
+                chosen_canonical = rng.choice(eligible_keys)
+                return rng.choice(by_canonical[chosen_canonical])
+
             entries = tuple(
                 entry for entry in self._entries if entry.canonical_hash != exclude_canonical_hash
             )
@@ -129,18 +139,7 @@ class CorpusTeamSource:
             if policy == SamplingPolicy.USAGE_WEIGHTED:
                 weights = [entry.usage_count for entry in entries]
                 return rng.choices(entries, weights=weights, k=1)[0]
-            if policy in (SamplingPolicy.UNIFORM_CANONICAL, SamplingPolicy.MATCHUP_BALANCED):
-                by_canonical, _ = self._get_canonical_index()
-                keys = tuple(sorted(k for k in by_canonical.keys() if k != exclude_canonical_hash))
-                if not keys:
-                    raise ValueError("No eligible corpus entries remain after exclusion")
-                chosen_canonical = rng.choice(keys)
-                candidates = [
-                    entry
-                    for entry in by_canonical[chosen_canonical]
-                    if entry.canonical_hash != exclude_canonical_hash
-                ]
-                return rng.choice(candidates) if candidates else rng.choice(entries)
+
             if policy == SamplingPolicy.UNIFORM_ARCHETYPE:
                 by_arch: dict[str, list[CorpusEntry]] = {}
                 for entry in entries:
@@ -149,24 +148,30 @@ class CorpusTeamSource:
                         by_arch.setdefault(tag, []).append(entry)
                 chosen_arch = rng.choice(tuple(sorted(by_arch.keys())))
                 return rng.choice(by_arch[chosen_arch])
+
             if policy == SamplingPolicy.RARE_COVERAGE:
                 tot = sum(entry.usage_count for entry in entries)
                 rare_w = [max(1, tot // entry.usage_count) for entry in entries]
                 return rng.choices(entries, weights=rare_w, k=1)[0]
+
             return rng.choice(entries)
 
         if policy == SamplingPolicy.USAGE_WEIGHTED:
             return rng.choices(entries, weights=self._get_usage_weights(), k=1)[0]
+
         if policy in (SamplingPolicy.UNIFORM_CANONICAL, SamplingPolicy.MATCHUP_BALANCED):
             by_canonical, canonical_keys = self._get_canonical_index()
             chosen_canonical = rng.choice(canonical_keys)
             return rng.choice(by_canonical[chosen_canonical])
+
         if policy == SamplingPolicy.UNIFORM_ARCHETYPE:
             by_archetype, archetype_keys = self._get_archetype_index()
             chosen_arch = rng.choice(archetype_keys)
             return rng.choice(by_archetype[chosen_arch])
+
         if policy == SamplingPolicy.RARE_COVERAGE:
             return rng.choices(entries, weights=self._get_rare_weights(), k=1)[0]
+
         return rng.choice(entries)
 
     def sample(self, rng: random.Random) -> ValidatedTeam:

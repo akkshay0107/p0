@@ -35,6 +35,7 @@ def last_move(pokemon: Pokemon) -> str | None:
 
 def capture_message(battle: DoubleBattle, split_message: list[str]) -> None:
     """Capture a raw protocol line from Showdown onto the battle's live event buffer."""
+
     def pre_hp_for(identifier: str) -> float | None:
         try:
             return battle.get_pokemon(identifier).current_hp_fraction

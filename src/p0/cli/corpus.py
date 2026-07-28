@@ -13,34 +13,48 @@ from p0.model.tokenizer import PokemonTokenizer
 from p0.paths import DEFAULT_PATHS
 from p0.teams.corpus import TeamCorpusManifest
 from p0.teams.corpus_build import (
-    CorpusBuilder,
-    SplitPolicy,
     audit_corpus,
+    build_corpus,
     populate_pool_directories,
 )
 from p0.teams.stat_points import (
     BaseStats,
-    ImputationInput,
     Role,
     StatPoints,
     select_candidate,
 )
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamVariant, normalize_id
+from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord, normalize_id
 from p0.teams.validation import validate_many
 
 
 def _variants_from_showdown(
     text: str, dex: Mapping[str, Any] | None = None
-) -> tuple[TeamVariant, ...]:
-    """Parse a showdown text export into team variants."""
+) -> tuple[TeamRecord, ...]:
+    """Parse a showdown text export into team records."""
     from p0.teams.source import _PACKER
 
-    members = _PACKER.parse_showdown_team(text)
-    if not members or len(members) % 6 != 0:
+    lines = text.replace("\r\n", "\n").split("\n")
+    lines = [line for line in lines if not line.strip().startswith("===")]
+    clean_text = "\n".join(lines)
+
+    blocks = [b.strip() for b in clean_text.split("\n\n") if b.strip()]
+    if len(blocks) % 6 != 0:
+        raise ValueError(f"Showdown text contains {len(blocks)} blocks, not a multiple of 6")
+
+    team_strings = ["\n\n".join(blocks[i : i + 6]) for i in range(0, len(blocks), 6)]
+    team_counts: dict[str, int] = {}
+    for t in team_strings:
+        team_counts[t] = team_counts.get(t, 0) + 1
+
+    unique_teams = list(team_counts.keys())
+    unique_text = "\n\n\n".join(unique_teams)
+    members = _PACKER.parse_showdown_team(unique_text)
+
+    if not members or len(members) != len(unique_teams) * 6:
         raise ValueError(
-            f"Showdown text contains {len(members)} members (expected a positive multiple of 6)"
+            f"Showdown text parsed into {len(members)} members, expected {len(unique_teams) * 6}"
         )
-        
+
     species_by_id = (
         {
             normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): entry
@@ -50,7 +64,7 @@ def _variants_from_showdown(
         if isinstance(dex, Mapping)
         else {}
     )
-    
+
     move_categories = (
         {
             normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): str(
@@ -63,7 +77,7 @@ def _variants_from_showdown(
         else {}
     )
 
-    variants: list[TeamVariant] = []
+    canonical_dict: dict[str, tuple[CanonicalTeam, int]] = {}
     for i in range(0, len(members), 6):
         team_members = tuple(
             TeamMember(
@@ -71,16 +85,25 @@ def _variants_from_showdown(
                 item=m.item or "",
                 ability=m.ability or "",
                 moves=tuple(m.moves),
-                nature=m.nature or "",
+                nature=m.nature or "serious",
                 gender=m.gender or "",
                 level=m.level if m.level is not None else 100,
             )
             for m in members[i : i + 6]
         )
         team = CanonicalTeam(team_members)
+        usage = team_counts[unique_teams[i // 6]]
+
+        if team.team_hash in canonical_dict:
+            canonical_dict[team.team_hash] = (team, canonical_dict[team.team_hash][1] + usage)
+        else:
+            canonical_dict[team.team_hash] = (team, usage)
+
+    variants: list[TeamRecord] = []
+    for team, usage in canonical_dict.values():
         spreads_list: list[StatPoints] = []
         roles_list: list[Role] = []
-        for m in team_members:
+        for m in team.members:
             species_entry = species_by_id.get(normalize_id(m.species).casefold())
             base_mapping = (
                 species_entry.get("baseStats") if isinstance(species_entry, Mapping) else None
@@ -91,23 +114,24 @@ def _variants_from_showdown(
                     categories = tuple(
                         move_categories.get(normalize_id(move).casefold(), "") for move in moves
                     )
-                    imp_input = ImputationInput(
-                        species=m.species,
+                    base_stats = BaseStats.from_mapping(base_mapping)
+                    candidate = select_candidate(
                         nature=m.nature or "serious",
-                        item=m.item,
-                        ability=m.ability,
                         moves=moves,
                         move_categories=categories,
-                        base_stats=BaseStats.from_mapping(base_mapping),
-                        level=m.level,
+                        item=m.item,
+                        ability=m.ability,
+                        base_stats=base_stats,
+                        seed=0,
                     )
-                    candidate = select_candidate(imp_input, seed=0)
                     spreads_list.append(candidate.points)
                     roles_list.append(candidate.role)
                     continue
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    import logging
+                    logging.warning(f"Failed to impute stats for {m.species}: {exc}")
             spreads_list.append(StatPoints(hp=2, spa=32, spe=32))
+
         spreads = tuple(spreads_list)
         if roles_list:
             if any(role == Role.TRICK_ROOM for role in roles_list):
@@ -126,15 +150,16 @@ def _variants_from_showdown(
             source_replays=(),
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-01T00:00:00Z",
-            usage_count=1,
+            usage_count=usage,
             archetype_tags=archetype_tags,
         )
-        variants.append(TeamVariant(team=team, spreads=spreads, metadata=metadata))
+        variants.append(TeamRecord(team=team, spreads=spreads, metadata=metadata))
+
     return tuple(variants)
 
 
-def _load_variants(path: Path, dex: Mapping[str, Any] | None = None) -> tuple[TeamVariant, ...]:
-    """Load variants from a file or directory of showdown exports or JSON."""
+def _load_variants(path: Path, dex: Mapping[str, Any] | None = None) -> tuple[TeamRecord, ...]:
+    """Load variants from a file or directory of showdown exports."""
     if not path.exists():
         raise FileNotFoundError(f"Input path does not exist: {path}")
     files: list[Path] = []
@@ -145,26 +170,18 @@ def _load_variants(path: Path, dex: Mapping[str, Any] | None = None) -> tuple[Te
     else:
         files.append(path)
 
-    variants: list[TeamVariant] = []
+    texts: list[str] = []
     for file_path in files:
-        if file_path.suffix == ".jsonl":
-            for line in file_path.read_text(encoding="utf-8").splitlines():
-                line_str = line.strip()
-                if line_str:
-                    variants.append(TeamVariant.from_dict(json.loads(line_str)))
-        elif file_path.suffix == ".json":
-            data = json.loads(file_path.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict) and "team" in item and "spreads" in item:
-                        variants.append(TeamVariant.from_dict(item))
-            elif isinstance(data, dict) and "team" in data and "spreads" in data:
-                variants.append(TeamVariant.from_dict(data))
-        else:
+        if file_path.suffix == ".txt" or not file_path.suffix:
             text = file_path.read_text(encoding="utf-8").strip()
             if text:
-                variants.extend(_variants_from_showdown(text, dex=dex))
-    return tuple(variants)
+                texts.append(text)
+
+    if not texts:
+        return ()
+
+    combined_text = "\n\n".join(texts)
+    return _variants_from_showdown(combined_text, dex=dex)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -234,28 +251,23 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     """Corpus CLI entrypoint."""
     args = _parser().parse_args(argv)
-    
+
     if args.command == "build":
         dex_path = DEFAULT_PATHS.data_root / "champions_dex.json"
         dex = json.loads(dex_path.read_text(encoding="utf-8")) if dex_path.is_file() else None
         variants = _load_variants(args.input, dex=dex)
         tokenizer = PokemonTokenizer.from_file()
-        
-        split_policy = SplitPolicy(
-            ratio_train=args.train_ratio,
-            ratio_val=args.val_ratio,
-            ratio_test=args.test_ratio,
-        )
-        
-        builder = CorpusBuilder(
+
+        manifest, audit = build_corpus(
+            variants,
             tokenizer=tokenizer,
             validator=validate_many,
             runtime_contract_sha256=current_manifest().runtime_contract_sha256,
             format_id=args.format_id,
-            split_policy=split_policy,
+            ratio_train=args.train_ratio,
+            ratio_val=args.val_ratio,
+            ratio_test=args.test_ratio,
         )
-        
-        manifest, audit = builder.build(variants)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
@@ -263,15 +275,15 @@ def main(argv: list[str] | None = None) -> None:
         )
         if args.pool_dir is not None:
             populate_pool_directories(manifest, args.pool_dir, reduced_limit=args.reduced_limit)
-        print(json.dumps(audit.to_dict(), sort_keys=True))
+        print(json.dumps(audit, sort_keys=True))
         return
 
     if args.command == "audit":
         raw = json.loads(args.manifest.read_text(encoding="utf-8"))
         manifest = TeamCorpusManifest.from_dict(raw)
-        
+
         audit = audit_corpus(manifest)
-        print(json.dumps(audit.to_dict(), sort_keys=True))
+        print(json.dumps(audit, sort_keys=True))
         return
 
 

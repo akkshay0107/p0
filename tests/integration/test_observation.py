@@ -10,7 +10,7 @@ from p0.model.structured_observation import (
     StructuredObservation,
 )
 from p0.model.tokenizer import tokenizer
-from tests.unit.test_observation import battle_format, from_battle, sample_team
+from tests.unit.test_observation import from_battle
 
 
 @pytest.mark.integration

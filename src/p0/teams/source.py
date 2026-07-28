@@ -30,6 +30,7 @@ class ValidatedTeam:
     def __post_init__(self) -> None:
         if not self.packed.strip():
             raise ValueError("A validated team must have a packed representation")
+
         if len(self.team_hash) != 64:
             raise ValueError("A validated team hash must be SHA-256")
 
@@ -100,7 +101,7 @@ class FileTeamSource:
             raise ValueError(f"Malformed team file: {path}") from exc
 
     def sample(self, rng: random.Random) -> ValidatedTeam:
-        return self._teams[rng.randrange(len(self._teams))]
+        return rng.choice(self._teams)
 
     def describe(self) -> Mapping[str, JsonScalar | tuple[str, ...]]:
         return {

@@ -165,9 +165,7 @@ def _build_inputs(
     device: torch.device,
 ) -> tuple[EncodedObs, Tensor, tuple[Tensor, ...]]:
     observations = StructuredObservation.empty_batch(benchmark.batch_size).to(device)
-    action_mask = torch.ones(
-        (benchmark.batch_size, 2, ACT_SIZE), dtype=torch.bool, device=device
-    )
+    action_mask = torch.ones((benchmark.batch_size, 2, ACT_SIZE), dtype=torch.bool, device=device)
     encoded = policy.encode(observations, action_mask)
     if benchmark.time_steps == 1:
         return encoded, action_mask, policy.empty_memory(benchmark.batch_size)
@@ -295,10 +293,14 @@ def _run_variant(
 ) -> VariantResult:
     config = _make_config(benchmark, reducer_layers)
     policy = (
-        checkpoint_policy
-        if checkpoint_policy is not None and checkpoint_policy.config == config
-        else build_policy(config, default_runtime_resources())
-    ).to(device=device, dtype=dtype).eval()
+        (
+            checkpoint_policy
+            if checkpoint_policy is not None and checkpoint_policy.config == config
+            else build_policy(config, default_runtime_resources())
+        )
+        .to(device=device, dtype=dtype)
+        .eval()
+    )
     encoded, _, memory = _build_inputs(policy, benchmark, device)
     with torch.inference_mode():
         for _ in range(benchmark.warmup):

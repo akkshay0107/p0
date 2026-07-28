@@ -25,7 +25,9 @@ def _batch(policy, batch_size=3):
 
 
 def _live_and_magnet_logits(policy, magnet, obs, masks, actions):
-    live = policy.evaluate_obs(obs, masks, actions, *policy.empty_memory(obs.numerical.size(0))).logits
+    live = policy.evaluate_obs(
+        obs, masks, actions, *policy.empty_memory(obs.numerical.size(0))
+    ).logits
     mag = magnet.policy.evaluate_obs(
         obs, masks, actions, *magnet.policy.empty_memory(obs.numerical.size(0))
     )
@@ -76,7 +78,9 @@ def test_refresh_does_not_perturb_optimizer_state():
     optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-3)
 
     obs, masks, actions = _batch(policy)
-    loss = policy.evaluate_obs(obs, masks, actions, *policy.empty_memory(obs.numerical.size(0))).value.sum()
+    loss = policy.evaluate_obs(
+        obs, masks, actions, *policy.empty_memory(obs.numerical.size(0))
+    ).value.sum()
     loss.backward()
     optimizer.step()
 
@@ -97,7 +101,9 @@ def test_magnet_frozen_under_live_optimizer_step():
     optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-2)
 
     obs, masks, actions = _batch(policy)
-    loss = policy.evaluate_obs(obs, masks, actions, *policy.empty_memory(obs.numerical.size(0))).value.sum()
+    loss = policy.evaluate_obs(
+        obs, masks, actions, *policy.empty_memory(obs.numerical.size(0))
+    ).value.sum()
     loss.backward()
     optimizer.step()
 

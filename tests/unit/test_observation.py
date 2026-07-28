@@ -42,7 +42,6 @@ from p0.model.structured_observation import (
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
     NUMERICAL_WIDTH,
-    SEQUENCE_LENGTH,
     CounterKind,
     EffectNamespace,
     Provenance,
@@ -55,7 +54,6 @@ from p0.runtime.env import SimEnv
 from p0.runtime.live_event_capture import set_raw_events
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import ValidatedTeam
-from p0.teams.stat_points import PrecomputedStats
 
 _OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
 
@@ -844,9 +842,10 @@ def test_stat_resolution_provenance_and_cache_behavior():
     assert values == (0.0,) * 6
     assert provenance == Provenance.UNKNOWN
 
-    expected = PrecomputedStats((155, 93, 98, 177, 105, 152))
+    import typing
+    expected = typing.cast(tuple[int, int, int, int, int, int], tuple((155, 93, 98, 177, 105, 152)))
     values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
-    assert values == tuple(float(value) for value in expected.values)
+    assert values == tuple(float(value) for value in expected)
     assert provenance == Provenance.IMPUTED
     pokemon = make_real_pokemon(
         species="charizard",

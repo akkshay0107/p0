@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamVariant
+from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 from p0.teams.validation import (
     PersistentShowdownValidator,
     validate_many,
@@ -17,7 +17,7 @@ from p0.teams.validation import (
 )
 
 
-def _variant(species: str = "Pikachu", item: str = "Light Ball") -> TeamVariant:
+def _variant(species: str = "Pikachu", item: str = "Light Ball") -> TeamRecord:
     members = (
         TeamMember(
             species=species,
@@ -62,7 +62,7 @@ def _variant(species: str = "Pikachu", item: str = "Light Ball") -> TeamVariant:
             nature="Modest",
         ),
     )
-    return TeamVariant(
+    return TeamRecord(
         team=CanonicalTeam(members),
         spreads=tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
         metadata=TeamMetadata(

@@ -5,7 +5,7 @@ import pytest
 
 from p0.teams.source import FileTeamSource, FixedTeamSource, ValidatedTeam
 from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamVariant
+from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 from p0.teams.validation import validate_many
 
 TEAM = """
@@ -46,7 +46,7 @@ def _variant():
         TeamMember(species, "item", "ability", ("Protect",), "Serious")
         for species in ("Pikachu", "Charizard", "Whimsicott", "Garchomp", "Kingambit", "Glimmora")
     )
-    return TeamVariant(
+    return TeamRecord(
         CanonicalTeam(members),
         tuple(StatPoints() for _ in members),
         TeamMetadata((), (), "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),

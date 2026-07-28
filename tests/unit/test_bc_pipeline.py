@@ -1,5 +1,4 @@
 import torch
-from tests.unit.test_replay_dataset import _payload
 
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
@@ -8,6 +7,7 @@ from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.dataset import LazyReplayDataset
 from p0.training.bc import BCTrainer
 from p0.training.config import BCConfig
+from tests.unit.test_replay_dataset import _payload
 
 
 def test_replay_to_series_bc_checkpoint_smoke(tmp_path) -> None:
