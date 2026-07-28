@@ -39,6 +39,15 @@ def capture_message(battle: DoubleBattle, split_message: list[str]) -> None:
         try:
             return battle.get_pokemon(identifier).current_hp_fraction
         except (AssertionError, IndexError, KeyError, ValueError):
-            return None
+            pass
+
+        if ":" in identifier:
+            clean_id = identifier.split(":", 1)[-1].strip()
+            try:
+                return battle.get_pokemon(clean_id).current_hp_fraction
+            except (AssertionError, IndexError, KeyError, ValueError):
+                pass
+
+        return None
 
     _events_for(battle).append(build_raw_event(split_message, pre_hp_for))

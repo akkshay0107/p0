@@ -8,6 +8,7 @@ import subprocess
 import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import TextIO
 
 from p0.paths import DEFAULT_PATHS
 
@@ -46,21 +47,24 @@ def allocate_loopback_ports(count: int) -> tuple[int, ...]:
 
 
 class ShowdownServer:
-    """Own exactly one local Showdown subprocess."""
+    """Own exactly one local Showdown subprocess with non-blocking file log output."""
 
     def __init__(
         self,
         port: int,
         *,
         showdown_root: Path = DEFAULT_PATHS.showdown_root,
+        log_path: Path | None = None,
         startup_timeout: float = 30.0,
         stop_timeout: float = 5.0,
     ) -> None:
         self.port = port
         self.showdown_root = showdown_root
+        self.log_path = log_path or (DEFAULT_PATHS.artifacts_root / "logs" / f"showdown_{port}.log")
         self.startup_timeout = startup_timeout
         self.stop_timeout = stop_timeout
         self.process: subprocess.Popen[str] | None = None
+        self._log_file: TextIO | None = None
 
     @property
     def websocket_url(self) -> str:
@@ -79,11 +83,15 @@ class ShowdownServer:
             "--skip-build",
             str(self.port),
         ]
+
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_file = self.log_path.open("a", encoding="utf-8")
+
         self.process = subprocess.Popen(
             command,
             cwd=self.showdown_root,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=self._log_file,
             text=True,
         )
         deadline = time.monotonic() + self.startup_timeout
@@ -106,25 +114,31 @@ class ShowdownServer:
 
     def _raise_startup_failure(self, command: list[str]) -> None:
         assert self.process is not None
-        stderr = self.process.communicate(timeout=1)[1][-4000:]
         code = self.process.returncode
         self.process = None
 
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+
+        stderr = self.log_path.read_text(encoding="utf-8")[-4000:] if self.log_path.is_file() else ""
         raise RuntimeError(
             f"Showdown command {command!r} exited with {code} on port {self.port}: {stderr}"
         )
 
     def stop(self) -> None:
         process, self.process = self.process, None
-        if process is None or process.poll() is not None:
-            return
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=self.stop_timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=self.stop_timeout)
 
-        process.terminate()
-        try:
-            process.wait(timeout=self.stop_timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=self.stop_timeout)
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
 
     def __enter__(self) -> ShowdownServer:
         self.start()

@@ -22,7 +22,7 @@ class PokeEnvBattleView:
         self._battle = battle
         self._decision: DecisionView | None = None
         self._events: list[BattleEvent] = []
-        self._events_key: int = -1  # id() is never negative, so -1 forces the first drain
+        self._events_key: tuple[int, int] = (-1, -1)
         self.stat_cache: dict[object, PrecomputedStats] = {}
 
     def refresh(self) -> PokeEnvBattleView:
@@ -119,7 +119,7 @@ class PokeEnvBattleView:
         return self._battle.get_pokemon(identifier)
 
     def consume_events(self):
-        key = id(self._battle.last_request)
+        key = (self._battle.turn, id(self._battle.last_request))
         if key != self._events_key:
             self._events = parse_events(consume_raw_events(self._battle), tokenizer)
             self._events_key = key
