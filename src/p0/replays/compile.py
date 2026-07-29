@@ -395,9 +395,13 @@ def write_tensor_shards(
         manifest_path: Runtime contract manifest used to bind the artifacts.
         resources: Optional preloaded runtime resources.
         created_at: Optional deterministic manifest timestamp.
+        max_candidates: Maximum number of action candidates per decision.
+        imputation_seed: Random seed for stat imputation.
+        raw_replays: Optional precomputed identities for raw replay payload.
+        source_series: Optional precomputed mappings of source series.
 
     Returns:
-        The generated shard manifest and its path.
+        The generated shard manifest and its path as a ShardBuildResult.
     """
     if max_decisions_per_shard <= 0:
         raise ValueError("max_decisions_per_shard must be positive")
@@ -710,6 +714,16 @@ def compile_documents(
 
     This function processes every document twice (once from each player's perspective),
     imputes missing stats, groups games by series, and tracks all diagnostic counters.
+
+    Arguments:
+        documents: Iterable stream of replay documents to compile.
+        format_id: Optional exact format filter.
+        max_candidates: Maximum number of action candidates per decision.
+        dex: Optional stat dex for imputation.
+        imputation_seed: Random seed for stat imputation.
+
+    Returns:
+        A CompilationResult containing the series, games, and metrics.
     """
     grouping: GroupingResult = group_replays(documents, format_id=format_id)
     counters: Counter[str] = Counter()

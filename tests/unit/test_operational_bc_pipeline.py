@@ -15,7 +15,7 @@ from p0.replays.compile import compile_to_shards
 from p0.replays.dataset import LazyReplayDataset, assign_series_splits
 from p0.replays.schema import LabelKind
 from p0.replays.scrape import HttpResponse, ReplayFetcher, ScrapeConfig, load_raw_replay
-from p0.training.bc import BCTrainer, MultiGameBCCollator
+from p0.training.bc import BCTrainer, collate_bc_batches
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
 from tests.unit.test_bc_trainer import _chunk
@@ -165,7 +165,7 @@ def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:
     )
     second = replace(second, series_id="series-2")
 
-    batches = list(MultiGameBCCollator(4)((first, second)))
+    batches = list(collate_bc_batches((first, second), 4))
 
     assert [batch.decisions for batch in batches] == [4, 1]
     assert batches[0].games == 2
