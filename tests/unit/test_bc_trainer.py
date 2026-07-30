@@ -70,10 +70,10 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
 
     metrics = trainer.train()
 
-    assert metrics.decisions == 2
-    assert metrics.labeled_decisions == 2
-    assert metrics.updates == 2
-    assert torch.isfinite(torch.tensor(metrics.loss))
+    assert metrics["decisions"] == 2
+    assert metrics["labeled_decisions"] == 2
+    assert metrics["updates"] == 2
+    assert torch.isfinite(torch.tensor(metrics["loss"]))
     assert any(
         not torch.equal(before[name], parameter)
         for name, parameter in trainer.policy.named_parameters()
@@ -87,9 +87,9 @@ def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
         [0, 0, 1],
     )
     metrics = _trainer(chunk).train()
-    assert metrics.decisions == 2
-    assert metrics.labeled_decisions == 1
-    assert metrics.exact_decisions == 1
+    assert metrics["decisions"] == 2
+    assert metrics["labeled_decisions"] == 1
+    assert metrics["exact_decisions"] == 1
 
 
 def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:

@@ -42,9 +42,9 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path) -> None:
 
     metrics = trainer.train()
 
-    assert metrics.decisions == 8
-    assert metrics.labeled_decisions > 0
-    assert torch.isfinite(torch.tensor(metrics.loss))
+    assert metrics["decisions"] == 8
+    assert metrics["labeled_decisions"] > 0
+    assert torch.isfinite(torch.tensor(metrics["loss"]))
     checkpoint = tmp_path / "bc.pt"
     trainer.save_checkpoint(checkpoint, epoch=1)
 

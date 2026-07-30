@@ -170,7 +170,6 @@ def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:
     assert batches[0].games == 2
     assert batches[0].candidate_offsets.tolist() == [0, 0, 1, 2, 3]
     assert batches[1].candidate_offsets.tolist() == [0, 2]
-    assert torch.all(batches[0].history_local_indices[3] == -1)
 
 
 def test_split_assignment_populates_all_requested_splits_when_possible() -> None:
