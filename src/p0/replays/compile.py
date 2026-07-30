@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -702,6 +703,31 @@ def _quality_reasons(
     return tuple(sorted(reasons))
 
 
+def _compile_worker(
+    args: tuple[ReplayDocument, str, int, int, Mapping[str, Any] | None, int],
+) -> tuple[CompiledGame | None, str | None]:
+    document, series_id, game_number, max_candidates, dex, imputation_seed = args
+    estimates = ()
+
+    if dex is not None:
+        estimates = impute_stat_points(document, dex=dex, seed=imputation_seed)
+
+    try:
+        perspectives = reconstruct_both(document, max_candidates=max_candidates, dex=dex)
+    except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+        return None, type(exc).__name__
+
+    compiled = CompiledGame(
+        series_id,
+        game_number,
+        document.metadata.replay_id,
+        document,
+        perspectives,
+        estimates,
+    )
+    return compiled, None
+
+
 def compile_documents(
     documents: Iterable[ReplayDocument],
     *,
@@ -759,6 +785,7 @@ def compile_documents(
     games: list[CompiledGame] = []
     imputation_confidence_sum = 0.0
 
+    jobs = []
     for group in grouping.series:
         membership_by_replay = {
             membership.replay_id: membership for membership in group.memberships
@@ -766,42 +793,49 @@ def compile_documents(
 
         for document in group.games:
             game_number = membership_by_replay[document.metadata.replay_id].game_number
-            estimates = ()
-
-            if dex is not None:
-                estimates = impute_stat_points(document, dex=dex, seed=imputation_seed)
-                counters["imputations"] += sum(item.provenance == "IMPUTED" for item in estimates)
-                counters["imputation_unknown"] += sum(
-                    item.provenance == "UNKNOWN" for item in estimates
+            jobs.append(
+                (
+                    document,
+                    group.record.series_id,
+                    game_number,
+                    max_candidates,
+                    dex,
+                    imputation_seed,
                 )
-                imputation_confidence_sum += sum(item.confidence for item in estimates)
-
-            try:
-                perspectives = reconstruct_both(document, max_candidates=max_candidates, dex=dex)
-            except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-                counters[f"rejected_reconstruction_{type(exc).__name__}"] += 1
-                counters["rejected_games"] += 1
-                continue
-
-            compiled = CompiledGame(
-                group.record.series_id,
-                game_number,
-                document.metadata.replay_id,
-                document,
-                perspectives,
-                estimates,
             )
 
-            reasons = _quality_reasons(compiled)
-            if reasons:
-                for reason in reasons:
-                    counters[f"rejected_{reason}"] += 1
-                counters["rejected_games"] += 1
-                continue
+    if jobs:
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            for compiled, exc_name in executor.map(_compile_worker, jobs, chunksize=100):
+                if exc_name is not None:
+                    counters[f"rejected_reconstruction_{exc_name}"] += 1
+                    counters["rejected_games"] += 1
+                    continue
 
-            counters["accepted_games"] += 1
-            games.append(compiled)
-            _measure_game(counters, compiled)
+                if compiled is None:
+                    continue
+
+                if dex is not None:
+                    counters["imputations"] += sum(
+                        item.provenance == "IMPUTED" for item in compiled.stat_estimates
+                    )
+                    counters["imputation_unknown"] += sum(
+                        item.provenance == "UNKNOWN" for item in compiled.stat_estimates
+                    )
+                    imputation_confidence_sum += sum(
+                        item.confidence for item in compiled.stat_estimates
+                    )
+
+                reasons = _quality_reasons(compiled)
+                if reasons:
+                    for reason in reasons:
+                        counters[f"rejected_{reason}"] += 1
+                    counters["rejected_games"] += 1
+                    continue
+
+                counters["accepted_games"] += 1
+                games.append(compiled)
+                _measure_game(counters, compiled)
 
     metric_values: dict[str, int | float] = dict(counters)
     metric_values["imputation_confidence_sum"] = imputation_confidence_sum

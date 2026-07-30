@@ -8,11 +8,12 @@ explicit error instead of silently dropping lines.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping
+
+import orjson
 
 from p0.replays.identity import canonical_format_id, normalize_showdown_id
 from p0.replays.schema import (
@@ -72,13 +73,13 @@ class ReplayDocument:
 
 def _as_object(payload: bytes | str | Mapping[str, Any]) -> tuple[Mapping[str, Any], bytes]:
     if isinstance(payload, Mapping):
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
         return payload, encoded
 
     raw = payload.encode("utf-8") if isinstance(payload, str) else payload
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = orjson.loads(raw)
+    except (UnicodeDecodeError, orjson.JSONDecodeError) as exc:
         raise ReplayParseError("Replay response is not valid UTF-8 JSON") from exc
     if not isinstance(value, Mapping):
         raise ReplayParseError("Replay response root must be a JSON object")
@@ -201,8 +202,8 @@ def _details_from_payload(payload: str) -> dict[str, dict[str, Any]]:
         return {}
 
     try:
-        value = json.loads(payload)
-    except json.JSONDecodeError:
+        value = orjson.loads(payload)
+    except orjson.JSONDecodeError:
         value = None
 
     details: dict[str, dict[str, Any]] = {}
