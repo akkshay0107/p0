@@ -31,6 +31,26 @@ def test_resample_single_game_shape() -> None:
     assert torch.isfinite(output).all()
 
 
+def test_padded_resampling_matches_independent_game_histories() -> None:
+    resampler = _resampler()
+    short = torch.randn(5, D_MODEL)
+    long = torch.randn(9, D_MODEL)
+    padded = torch.zeros((2, 9, D_MODEL))
+    padded[0, :5] = short
+    padded[1] = long
+    mask = torch.arange(9).unsqueeze(0) < torch.tensor((5, 9)).unsqueeze(1)
+
+    actual = resampler.resample_single_game(padded, mask)
+    expected = torch.cat(
+        (
+            resampler.resample_single_game(short.unsqueeze(0)),
+            resampler.resample_single_game(long.unsqueeze(0)),
+        )
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_resample_empty_game() -> None:
     resampler = _resampler()
     batch_size = 2
@@ -46,13 +66,11 @@ def test_series_context_encoding_shapes() -> None:
     game1 = torch.randn(batch_size, 10, D_MODEL)
     game2 = torch.randn(batch_size, 20, D_MODEL)
 
-    # 2 completed prior games
     series_tokens, series_mask = resampler([game1, game2])
     assert series_tokens.shape == (batch_size, SERIES_SLOTS, D_MODEL)
     assert series_mask.shape == (batch_size, SERIES_SLOTS)
     assert series_mask.all()
 
-    # 1 completed prior game
     series_tokens_1, series_mask_1 = resampler([game1])
     assert series_tokens_1.shape == (batch_size, SERIES_SLOTS, D_MODEL)
     assert series_mask_1[:, :4].all()

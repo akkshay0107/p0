@@ -96,6 +96,7 @@ def test_lazy_dataset_yields_canonical_bo3_game_perspectives(
         (2, 1),
     ]
     assert [chunk.canonical_player for chunk in chunks] == [0, 1, 0, 1]
+    assert [chunk.is_series_end for chunk in chunks] == [False, False, True, True]
     assert all(chunk.length == 2 for chunk in chunks)
     assert chunks[2].candidate_offsets.tolist() == [0, 0, 1]
 

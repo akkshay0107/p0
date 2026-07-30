@@ -91,7 +91,22 @@ class DynamicSeriesResampler(nn.Module):
         if seq_len == 0:
             return self.empty_game_context.expand(batch_size, -1, -1).to(device)
 
-        positions = torch.linspace(0.0, 1.0, steps=seq_len, device=device).view(1, seq_len, 1)
+        if history_mask is None:
+            positions = torch.linspace(0.0, 1.0, steps=seq_len, device=device).view(1, seq_len, 1)
+        else:
+            if (
+                history_mask.shape != (batch_size, seq_len)
+                or history_mask.dtype != torch.bool
+                or history_mask.device != device
+            ):
+                raise ValueError("history_mask must be a boolean (B, T) tensor on history.device")
+            history_lengths = history_mask.sum(dim=1, keepdim=True)
+            if torch.any(history_lengths == 0):
+                raise ValueError("Each resampled game must contain at least one history token")
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+            denominators = (history_lengths - 1).clamp_min(1)
+            positions = (position_ids / denominators).unsqueeze(-1)
+            positions = positions * history_mask.unsqueeze(-1)
         pos_vectors = self.pos_emb(positions)
         keys_values = self.norm_k(history + pos_vectors)
 

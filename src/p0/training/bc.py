@@ -16,13 +16,18 @@ from pathlib import Path
 import torch
 from torch import Tensor
 from torch.amp import GradScaler, autocast
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, IterableDataset
 
 from p0.battle.series import SeriesPerspectiveKey
-from p0.model.architecture_contract import HISTORY_WINDOW
+from p0.model.architecture_contract import (
+    HISTORY_WINDOW,
+    MAX_PRIOR_GAMES,
+    SERIES_SLOTS,
+    SERIES_TOKENS_PER_GAME,
+)
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
-from p0.model.token_store import SeriesTokenStore
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
@@ -55,16 +60,7 @@ class BCGameWindow:
     batch_start: int
     batch_stop: int
     is_game_end: bool
-
-
-@dataclass(frozen=True, slots=True)
-class BCCompletedGame:
-    """Full observation payload sent once when a perspective-game completes."""
-
-    series_key: SeriesPerspectiveKey
-    game_number: int
-    observations: StructuredObservation
-    action_mask: Tensor
+    is_series_end: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,9 +81,7 @@ class BCDecisionBatch:
     history_indices: Tensor
     history_mask: Tensor
     history_age_ids: Tensor
-    series_keys: tuple[SeriesPerspectiveKey, ...]
     windows: tuple[BCGameWindow, ...]
-    completed_games: tuple[BCCompletedGame, ...]
 
     @property
     def decisions(self) -> int:
@@ -96,6 +90,89 @@ class BCDecisionBatch:
     @property
     def games(self) -> int:
         return len({(window.series_key, window.game_number) for window in self.windows})
+
+
+@dataclass(frozen=True, slots=True)
+class _BCGameKey:
+    series_key: SeriesPerspectiveKey
+    game_number: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BCGameHistoryUpdate:
+    game_key: _BCGameKey
+    tokens: Tensor
+    is_game_end: bool
+    is_series_end: bool
+
+
+BCModelInputs = tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedBCBatch:
+    model_inputs: BCModelInputs
+    history_updates: tuple[_BCGameHistoryUpdate, ...]
+
+
+class _BCSeriesHistoryStore:
+    """Retain detached raw game tokens between truncated BC backward passes."""
+
+    def __init__(self, d_model: int) -> None:
+        self.d_model = d_model
+        self._partial: dict[_BCGameKey, list[Tensor]] = {}
+        self._completed: dict[SeriesPerspectiveKey, dict[int, Tensor]] = {}
+        self._ended: set[SeriesPerspectiveKey] = set()
+
+    def is_ended(self, series_key: SeriesPerspectiveKey) -> bool:
+        return series_key in self._ended
+
+    def partial_fragments(self, game_key: _BCGameKey) -> tuple[Tensor, ...]:
+        return tuple(self._partial.get(game_key, ()))
+
+    def completed_before(
+        self,
+        series_key: SeriesPerspectiveKey,
+        game_number: int,
+    ) -> dict[_BCGameKey, Tensor]:
+        games = self._completed.get(series_key, {})
+        return {
+            _BCGameKey(series_key, prior_number): tokens
+            for prior_number, tokens in games.items()
+            if prior_number < game_number
+        }
+
+    def apply(self, updates: tuple[_BCGameHistoryUpdate, ...]) -> None:
+        for update in updates:
+            tokens = update.tokens.detach().to(device="cpu", dtype=torch.float32)
+            if tokens.dim() != 2 or tokens.shape[1] != self.d_model:
+                raise ValueError("BC game history tokens do not match the policy width")
+
+            fragments = self._partial.setdefault(update.game_key, [])
+            fragments.append(tokens)
+            if update.is_game_end:
+                game_tokens = torch.cat(self._partial.pop(update.game_key), dim=0)
+                completed = self._completed.setdefault(update.game_key.series_key, {})
+                if update.game_key.game_number in completed:
+                    raise ValueError("A BC perspective-game completed more than once")
+                completed[update.game_key.game_number] = game_tokens
+
+            if update.is_series_end:
+                if not update.is_game_end:
+                    raise ValueError("A BC series can end only at a game boundary")
+                self.drop(update.game_key.series_key)
+                self._ended.add(update.game_key.series_key)
+
+    def drop(self, series_key: SeriesPerspectiveKey) -> None:
+        self._completed.pop(series_key, None)
+        stale = [key for key in self._partial if key.series_key == series_key]
+        for game_key in stale:
+            self._partial.pop(game_key)
+
+    def clear(self) -> None:
+        self._partial.clear()
+        self._completed.clear()
+        self._ended.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +229,6 @@ def _collate_bc_window(
     source_windows: list[tuple[ReplayGameChunk, int, int]],
 ) -> BCDecisionBatch:
     windows: list[BCGameWindow] = []
-    completed_games: list[BCCompletedGame] = []
     observations: list[StructuredObservation] = []
     context_action_masks: list[Tensor] = []
     action_masks: list[Tensor] = []
@@ -168,7 +244,6 @@ def _collate_bc_window(
     history_indices: list[Tensor] = []
     history_masks: list[Tensor] = []
     history_age_ids: list[Tensor] = []
-    series_keys: list[SeriesPerspectiveKey] = []
     candidate_base = 0
     context_base = 0
     batch_start = 0
@@ -188,17 +263,9 @@ def _collate_bc_window(
                 batch_start=batch_start,
                 batch_stop=batch_stop,
                 is_game_end=stop == game.length,
+                is_series_end=stop == game.length and game.is_series_end,
             )
         )
-        if stop == game.length:
-            completed_games.append(
-                BCCompletedGame(
-                    series_key=game.series_key,
-                    game_number=game.game_number,
-                    observations=game.observations,
-                    action_mask=game.action_mask,
-                )
-            )
 
         action_masks.append(game.action_mask[start:stop])
         label_kinds.append(game.label_kind[start:stop])
@@ -232,7 +299,6 @@ def _collate_bc_window(
         history_masks.append(local_mask)
         ages = torch.arange(HISTORY_WINDOW - 1, -1, -1, dtype=torch.long).unsqueeze(0)
         history_age_ids.append(torch.where(local_mask, ages, 0))
-        series_keys.extend([game.series_key] * (stop - start))
 
         context_base += context_length
         batch_start = batch_stop
@@ -252,9 +318,7 @@ def _collate_bc_window(
         history_indices=_compact_tensors(history_indices),
         history_mask=_compact_tensors(history_masks),
         history_age_ids=_compact_tensors(history_age_ids),
-        series_keys=tuple(series_keys),
         windows=tuple(windows),
-        completed_games=tuple(completed_games),
     )
 
 
@@ -322,7 +386,7 @@ class BCTrainer:
         self.checkpoint_store = checkpoint_store
         self.provenance = dict(provenance or {})
         self.batch_decisions = config.batch_decisions
-        self.series_store = SeriesTokenStore(policy.d_model)
+        self._series_history = _BCSeriesHistoryStore(policy.d_model)
         self.cancel_requested = cancel_requested
         torch.manual_seed(config.seed)
 
@@ -356,6 +420,7 @@ class BCTrainer:
 
     def _train_epoch_totals(self) -> dict[str, float | int]:
         self.policy.train()
+        self._series_history.clear()
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
@@ -389,7 +454,6 @@ class BCTrainer:
                 raise BCCancelled("Behaviour-cloning training was cancelled")
             self._backward_chunk(batch, totals)
             accumulated_decisions += batch.decisions
-            self._record_completed_games(batch)
 
             if accumulated_decisions >= self.batch_decisions:
                 self._step_optimizer()
@@ -398,7 +462,7 @@ class BCTrainer:
         if accumulated_decisions > 0:
             self._step_optimizer()
 
-        self.series_store.clear()
+        self._series_history.clear()
         return totals
 
     def _metrics(self, totals: dict[str, float | int]) -> dict[str, float | int]:
@@ -479,12 +543,19 @@ class BCTrainer:
     def _model_inputs(
         self,
         batch: BCDecisionBatch,
-    ) -> tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> BCModelInputs:
+        """Prepare and immediately commit inputs for isolated diagnostics."""
+        prepared = self._prepare_model_inputs(batch)
+        self._series_history.apply(prepared.history_updates)
+        return prepared.model_inputs
+
+    def _prepare_model_inputs(self, batch: BCDecisionBatch) -> _PreparedBCBatch:
         observations = batch.observations.to(self.device)
         context_action_mask = batch.context_action_mask.to(self.device)
         encoded = self.policy.encode(observations, context_action_mask)
         local_tokens = self.policy.local_history_tokens(encoded)
         target_indices = batch.target_indices.to(self.device)
+        target_local_tokens = local_tokens[target_indices]
         target_encoded = EncodedObs(
             encoded.tokens[target_indices],
             encoded.aux[target_indices],
@@ -495,58 +566,165 @@ class BCTrainer:
         history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
         history_age_ids = batch.history_age_ids.to(self.device)
 
-        series_tokens, series_mask = self.series_store.get_tokens(
-            batch.series_keys,
+        prior_keys, history_by_key, history_updates = self._plan_series_history(
+            batch,
+            target_local_tokens,
+        )
+        summaries = self._resample_game_histories(history_by_key)
+        series_tokens, series_mask = self._pack_series_context(
+            batch.windows,
+            prior_keys,
+            summaries,
+            target_local_tokens,
+        )
+
+        return _PreparedBCBatch(
+            model_inputs=(
+                target_encoded,
+                batch.action_mask.to(self.device),
+                series_tokens,
+                series_mask,
+                history_tokens,
+                history_mask,
+                history_age_ids,
+            ),
+            history_updates=history_updates,
+        )
+
+    def _plan_series_history(
+        self,
+        batch: BCDecisionBatch,
+        target_local_tokens: Tensor,
+    ) -> tuple[
+        tuple[tuple[_BCGameKey, ...], ...],
+        dict[_BCGameKey, Tensor],
+        tuple[_BCGameHistoryUpdate, ...],
+    ]:
+        completed_in_batch: dict[_BCGameKey, Tensor] = {}
+        fragments_in_batch: dict[_BCGameKey, list[Tensor]] = {}
+        history_by_key: dict[_BCGameKey, Tensor] = {}
+        prior_keys: list[tuple[_BCGameKey, ...]] = []
+        updates: list[_BCGameHistoryUpdate] = []
+        ended_in_batch: set[SeriesPerspectiveKey] = set()
+
+        for window in batch.windows:
+            if (
+                self._series_history.is_ended(window.series_key)
+                or window.series_key in ended_in_batch
+            ):
+                raise ValueError("A BC batch contains data after a perspective-series ended")
+            game_key = _BCGameKey(window.series_key, window.game_number)
+            persistent_prior = self._series_history.completed_before(
+                window.series_key,
+                window.game_number,
+            )
+            available_prior = {**persistent_prior, **completed_in_batch}
+            window_prior = tuple(
+                sorted(
+                    (
+                        key
+                        for key in available_prior
+                        if key.series_key == window.series_key
+                        and key.game_number < window.game_number
+                    ),
+                    key=lambda key: key.game_number,
+                )[-MAX_PRIOR_GAMES:]
+            )
+            prior_keys.append(window_prior)
+            for prior_key in window_prior:
+                if prior_key not in history_by_key:
+                    history_by_key[prior_key] = available_prior[prior_key].to(
+                        device=self.device,
+                        dtype=target_local_tokens.dtype,
+                    )
+
+            token_chunk = target_local_tokens[window.batch_start : window.batch_stop]
+            current_parts = [
+                fragment.to(device=self.device, dtype=target_local_tokens.dtype)
+                for fragment in self._series_history.partial_fragments(game_key)
+            ]
+            current_parts.extend(fragments_in_batch.get(game_key, ()))
+            current_parts.append(token_chunk)
+
+            if window.is_game_end:
+                completed_in_batch[game_key] = torch.cat(current_parts, dim=0)
+                fragments_in_batch.pop(game_key, None)
+            else:
+                fragments_in_batch.setdefault(game_key, []).append(token_chunk)
+
+            updates.append(
+                _BCGameHistoryUpdate(
+                    game_key=game_key,
+                    tokens=token_chunk,
+                    is_game_end=window.is_game_end,
+                    is_series_end=window.is_series_end,
+                )
+            )
+            if window.is_series_end:
+                ended_in_batch.add(window.series_key)
+
+        return tuple(prior_keys), history_by_key, tuple(updates)
+
+    def _resample_game_histories(
+        self,
+        history_by_key: Mapping[_BCGameKey, Tensor],
+    ) -> dict[_BCGameKey, Tensor]:
+        if not history_by_key:
+            return {}
+
+        game_keys = tuple(history_by_key)
+        histories = list(history_by_key.values())
+        lengths = torch.tensor(
+            [history.size(0) for history in histories],
             device=self.device,
         )
+        padded = pad_sequence(histories, batch_first=True)
+        positions = torch.arange(padded.size(1), device=self.device)
+        history_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        resampled = self.policy.series.resample_single_game(padded, history_mask)
+        return dict(zip(game_keys, resampled.unbind(0), strict=True))
 
+    @staticmethod
+    def _pack_series_context(
+        windows: tuple[BCGameWindow, ...],
+        prior_keys: tuple[tuple[_BCGameKey, ...], ...],
+        summaries: Mapping[_BCGameKey, Tensor],
+        reference: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        window_tokens: list[Tensor] = []
+        window_masks: list[Tensor] = []
+        window_lengths: list[int] = []
+        for window, keys in zip(windows, prior_keys, strict=True):
+            game_summaries = [summaries[key] for key in keys]
+            used_slots = len(game_summaries) * SERIES_TOKENS_PER_GAME
+            padding = reference.new_zeros((SERIES_SLOTS - used_slots, reference.size(-1)))
+            row = torch.cat((*game_summaries, padding), dim=0)
+            mask = torch.arange(SERIES_SLOTS, device=reference.device) < used_slots
+            window_tokens.append(row)
+            window_masks.append(mask)
+            window_lengths.append(window.batch_stop - window.batch_start)
+
+        repeats = torch.tensor(window_lengths, device=reference.device)
         return (
-            target_encoded,
-            batch.action_mask.to(self.device),
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
+            torch.repeat_interleave(torch.stack(window_tokens), repeats, dim=0),
+            torch.repeat_interleave(torch.stack(window_masks), repeats, dim=0),
         )
 
-    def _record_completed_games(self, batch: BCDecisionBatch) -> None:
-        if not batch.completed_games:
-            return
-
-        with (
-            torch.no_grad(),
-            autocast(device_type=self.device.type, enabled=self.amp_enabled),
-        ):
-            observations = StructuredObservation.cat(
-                [game.observations for game in batch.completed_games]
-            ).to(self.device)
-            action_mask = torch.cat([game.action_mask for game in batch.completed_games]).to(
-                self.device
-            )
-            encoded = self.policy.encode(observations, action_mask)
-            local_tokens = self.policy.local_history_tokens(encoded)
-
-            offset = 0
-            for game in batch.completed_games:
-                game_stop = offset + game.action_mask.size(0)
-                new_tokens = self.policy.series.resample_single_game(
-                    local_tokens[offset:game_stop].unsqueeze(0)
-                )[0]
-                self.series_store.append(game.series_key, new_tokens)
-                offset = game_stop
-
-    def _forward_batch(self, batch: BCDecisionBatch) -> Tensor:
-        model_inputs = self._model_inputs(batch)
-        return self.policy.actor.score_joint_candidates(
-            *model_inputs,
+    def _forward_batch(
+        self,
+        batch: BCDecisionBatch,
+    ) -> tuple[Tensor, tuple[_BCGameHistoryUpdate, ...]]:
+        prepared = self._prepare_model_inputs(batch)
+        log_probs = self.policy.actor.score_joint_candidates(
+            *prepared.model_inputs,
             batch.candidate_values.to(self.device),
             batch.candidate_offsets.to(self.device),
         )
+        return log_probs, prepared.history_updates
 
     def _greedy_actions(
         self,
-        model_inputs: tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+        model_inputs: BCModelInputs,
     ) -> tuple[Tensor, Tensor]:
         actions, log_probs, _, _ = self.policy.actor.greedy(*model_inputs)
         return actions, log_probs
@@ -562,7 +740,7 @@ class BCTrainer:
         labels = batch.label_kind.to(self.device)
         loss_mask = batch.loss_mask.to(self.device)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            log_probs = self._forward_batch(batch)
+            log_probs, history_updates = self._forward_batch(batch)
 
         objective = compute_bc_objective(
             log_probs,
@@ -582,6 +760,7 @@ class BCTrainer:
             self.scaler.scale(loss).backward()
             loss_sum = objective.loss.detach().item() * labeled_decisions
 
+        self._series_history.apply(history_updates)
         totals["loss"] += loss_sum
         totals["exact_nll"] += objective.exact_nll.detach().item() * exact_decisions
         totals["partial_nll"] += objective.partial_nll.detach().item() * partial_decisions
@@ -599,6 +778,7 @@ class BCTrainer:
     ) -> BCEvaluationMetrics:
         """Evaluate exact and partial replay labels without changing parameters."""
         self.policy.eval()
+        self._series_history.clear()
         source = self.dataset if dataset is None else dataset
 
         nll_sum = 0.0
@@ -622,13 +802,13 @@ class BCTrainer:
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
 
         for batch in collate_bc_batches(source, chunk_size):
-            model_inputs = self._model_inputs(batch)
+            prepared = self._prepare_model_inputs(batch)
+            model_inputs = prepared.model_inputs
             candidate_log_probs = self.policy.actor.score_joint_candidates(
                 *model_inputs,
                 batch.candidate_values.to(self.device),
                 batch.candidate_offsets.to(self.device),
             )
-            self._record_completed_games(batch)
 
             objective = compute_bc_objective(
                 candidate_log_probs,
@@ -666,6 +846,7 @@ class BCTrainer:
                     dim=1,
                 ).sum()
             )
+            self._series_history.apply(prepared.history_updates)
 
             batch_decisions = batch.decisions
             decisions += batch_decisions
@@ -714,7 +895,7 @@ class BCTrainer:
                     bucket_item["labeled"] = int(bucket_item["labeled"]) + 1
                     bucket_item["nll_sum"] = float(bucket_item["nll_sum"]) + decision_nll
 
-        self.series_store.clear()
+        self._series_history.clear()
 
         def finalized(
             values: Mapping[str, Mapping[str, float | int]],
@@ -894,7 +1075,6 @@ def compute_bc_objective(
 
 __all__ = [
     "BCCancelled",
-    "BCCompletedGame",
     "BCDecisionBatch",
     "BCEvaluationMetrics",
     "BCGameWindow",

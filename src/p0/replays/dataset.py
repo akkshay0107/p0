@@ -131,22 +131,19 @@ def assign_series_splits(
     ranked = [series_id for _, series_id in hashed_pairs]
     requested = int(validation_fraction > 0) + int(test_fraction > 0)
 
-    # + 1 for train
     enough_for_all = len(ranked) >= requested + 1
 
-    # initial counts
     test_count = round(len(ranked) * test_fraction)
     validation_count = round(len(ranked) * validation_fraction)
 
-    # force 1 element min for each valid split
+    # Preserve every requested split when the dataset can also retain training data.
     if enough_for_all and test_fraction > 0:
         test_count = max(1, test_count)
 
     if enough_for_all and validation_fraction > 0:
         validation_count = max(1, validation_count)
 
-    # adjust if rounding takes you above the maximum number of series
-    # in the dataset. Runs atmost twice
+    # Fraction rounding must not consume the training split.
     while test_count + validation_count >= len(ranked) and test_count + validation_count:
         if validation_count > int(enough_for_all and validation_fraction > 0):
             validation_count -= 1
@@ -216,9 +213,15 @@ class ReplayGameChunk:
     candidate_values: torch.Tensor
     candidate_offsets: torch.Tensor
     outcome: torch.Tensor
+    is_series_end: bool = False
 
     def __post_init__(self) -> None:
-        if self.player not in (0, 1) or self.canonical_player not in (0, 1) or self.game_number < 1:
+        if (
+            self.player not in (0, 1)
+            or self.canonical_player not in (0, 1)
+            or self.game_number not in (1, 2, 3)
+            or type(self.is_series_end) is not bool
+        ):
             raise ValueError("ReplayGameChunk has invalid player or game number")
 
     @property
@@ -310,16 +313,28 @@ class LazyReplayDataset(IterableDataset):
         for entry in shards:
             tensors, summaries = self._load_shard(entry)
             game_offsets = tensors["game_offsets"].tolist()
+            final_game_numbers: dict[SeriesPerspectiveKey, int] = {}
+            for item in summaries:
+                key = SeriesPerspectiveKey(
+                    str(item["series_id"]),
+                    int(item["canonical_player"]),
+                )
+                final_game_numbers[key] = max(
+                    int(item["game_number"]),
+                    final_game_numbers.get(key, 0),
+                )
             for game_index, item in enumerate(summaries):
                 series_id = str(item["series_id"])
                 if selected is not None and series_id not in selected:
                     continue
 
+                series_key = SeriesPerspectiveKey(series_id, int(item["canonical_player"]))
                 yield self._chunk(
                     tensors,
                     item,
                     game_offsets[game_index],
                     game_offsets[game_index + 1],
+                    is_series_end=int(item["game_number"]) == final_game_numbers[series_key],
                 )
 
     def _load_shard(
@@ -393,6 +408,8 @@ class LazyReplayDataset(IterableDataset):
         item: Mapping[str, Any],
         start: int,
         end: int,
+        *,
+        is_series_end: bool,
     ) -> ReplayGameChunk:
         candidate_bounds = tensors["candidate_offsets"][start : end + 1]
         candidate_start = int(candidate_bounds[0])
@@ -417,6 +434,7 @@ class LazyReplayDataset(IterableDataset):
             candidate_values=tensors["candidate_values"][candidate_start:candidate_end].clone(),
             candidate_offsets=candidate_offsets,
             outcome=tensors["outcome"][start:end].clone(),
+            is_series_end=is_series_end,
         )
 
 
