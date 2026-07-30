@@ -149,6 +149,7 @@ class BotConfig:
 @dataclass(frozen=True, slots=True)
 class BCConfig:
     batch_decisions: int = 256
+    max_chunk_size: int = 1024
     learning_rate: float = 3e-4
     epochs: int = 1
     weight_decay: float = 0.0
@@ -164,6 +165,7 @@ class BCConfig:
         _positive_ints(
             type(self).__name__,
             ("batch_decisions", self.batch_decisions),
+            ("max_chunk_size", self.max_chunk_size),
             ("epochs", self.epochs),
         )
         _positive(type(self).__name__, ("learning_rate", self.learning_rate))

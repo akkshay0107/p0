@@ -316,10 +316,15 @@ class BCTrainer:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
         totals = _RunTotals()
-        for batch in collate_bc_batches(self.dataset, self.batch_decisions):
+        accumulated_decisions = 0
+        chunk_size = min(self.batch_decisions, getattr(self.config, "max_chunk_size", self.batch_decisions))
+        self.optimizer.zero_grad(set_to_none=True)
+
+        for batch in collate_bc_batches(self.dataset, chunk_size):
             if self.cancel_requested():
                 raise BCCancelled("Behaviour-cloning training was cancelled")
-            self._train_batch(batch, totals)
+            self._backward_chunk(batch, totals)
+            accumulated_decisions += batch.decisions
 
             for window in batch.windows:
                 if window.stop == window.game.length:
@@ -335,6 +340,13 @@ class BCTrainer:
                             local_tokens.unsqueeze(0)
                         )[0]
                     self.series_store.append(window.game.series_id, new_tokens)
+
+            if accumulated_decisions >= self.batch_decisions:
+                self._step_optimizer()
+                accumulated_decisions = 0
+
+        if accumulated_decisions > 0:
+            self._step_optimizer()
 
         self.series_store.clear()
         return totals
@@ -474,10 +486,16 @@ class BCTrainer:
         actions, log_probs, _, _ = self.policy.actor.greedy(*model_inputs)
         return actions, log_probs
 
-    def _train_batch(self, batch: BCDecisionBatch, totals: _RunTotals) -> None:
+    def _step_optimizer(self) -> None:
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _backward_chunk(self, batch: BCDecisionBatch, totals: _RunTotals) -> None:
         labels = batch.label_kind.to(self.device)
         loss_mask = batch.loss_mask.to(self.device)
-        self.optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
             log_probs = self._forward_batch(batch)
         objective = compute_bc_objective(
@@ -491,15 +509,11 @@ class BCTrainer:
         partial_decisions = objective.partial_count
         loss_sum = 0.0
         if labeled_decisions:
-            loss = objective.loss
+            loss = objective.loss * (batch.decisions / self.batch_decisions)
             if not torch.isfinite(loss):
                 raise ValueError("Non-finite BC loss in a collated decision batch")
             self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            loss_sum = loss.detach().item() * labeled_decisions
+            loss_sum = objective.loss.detach().item() * labeled_decisions
         totals.add(
             _RunTotals(
                 loss=loss_sum,
@@ -538,7 +552,8 @@ class BCTrainer:
         confidence_totals: dict[str, dict[str, float | int]] = {}
         bucket_names = ("[0,.25)", "[.25,.5)", "[.5,.75)", "[.75,1]")
         boundaries = torch.tensor((0.25, 0.5, 0.75))
-        for batch in collate_bc_batches(source, self.batch_decisions):
+        chunk_size = min(self.batch_decisions, getattr(self.config, "max_chunk_size", self.batch_decisions))
+        for batch in collate_bc_batches(source, chunk_size):
             model_inputs = self._model_inputs(batch)
             candidate_log_probs = self.policy.actor.score_joint_candidates(
                 *model_inputs,

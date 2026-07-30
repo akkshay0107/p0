@@ -14,7 +14,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from p0.model.config import ModelConfig
-from p0.model.factory import build_policy
+from p0.model.factory import build_policy, compile_policy
 from p0.model.resources import default_runtime_resources
 from p0.persistence import atomic_json_save
 from p0.replays.dataset import LazyReplayDataset, load_split_manifest
@@ -28,6 +28,7 @@ from p0.training.utils import default_device
 def _trainer_config(config: BCConfig, *, overfit: bool) -> dict[str, Any]:
     return {
         "batch_decisions": config.batch_decisions,
+        "max_chunk_size": config.max_chunk_size,
         "learning_rate": config.learning_rate,
         "epochs": 200 if overfit else config.epochs,
         "weight_decay": config.weight_decay,
@@ -128,6 +129,8 @@ def train_bc(
         policy = build_policy(ModelConfig.baseline(), default_runtime_resources())
     else:
         policy = store.load_policy(config.resume_checkpoint, selected_device)
+        
+    policy = compile_policy(policy, enable=selected_device.type == "cuda")
     dataset_output = config.output_dir / shard_manifest.dataset_hash
     dataset_output.mkdir(parents=True, exist_ok=True)
     latest_path = dataset_output / "bc_latest_training.pt"
