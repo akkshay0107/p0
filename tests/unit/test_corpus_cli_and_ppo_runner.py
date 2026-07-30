@@ -18,8 +18,8 @@ from p0.teams.source import FileTeamSource
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 from p0.teams.validation import AdmissionResult
-from p0.training.composition import _team_source
 from p0.training.config import CorpusConfig, TeamSourceConfig
+from p0.training.ppo_runner import _team_source
 
 
 def _mock_vocab() -> dict[str, dict[str, int]]:

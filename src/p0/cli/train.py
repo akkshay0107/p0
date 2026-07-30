@@ -6,8 +6,8 @@ import argparse
 import signal
 import threading
 
-from p0.training.composition import run_training
 from p0.training.config import load_config
+from p0.training.ppo_runner import run_training
 
 
 def main(argv: list[str] | None = None) -> int:

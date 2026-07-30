@@ -7,7 +7,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-from p0.training.bc_composition import evaluate_bc, train_bc
+from p0.training.bc_runner import evaluate_bc, train_bc
 from p0.training.config import BCConfig, load_config
 
 
