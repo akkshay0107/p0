@@ -24,6 +24,7 @@ def _chunk(label_kind: list[int], candidate_values: list[tuple[int, int]], offse
         series_id="series-1",
         game_number=1,
         player=0,
+        canonical_player=0,
         observations=observations,
         action_mask=action_mask,
         mask_provenance=torch.ones(length, dtype=torch.long),

@@ -39,8 +39,8 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 - **Autoregressive Policy Pointer Head**: Uses a pointer-attention network to select actions. The first head predicts action `a1` for the first active Pokemon. This selection is embedded and passed as context to the second head to predict action `a2` for the second active Pokemon. Sequential masking prevents invalid choices (such as duplicate switch targets or multiple mega evolutions in a single turn).
 - **Inbuilt Team Preview Handling**: The same policy used for battling can also be used for team picking at the team preview stage. The input is differentiated through a team preview flag in the observation.
 - **Magnetic Mirror-Descent Self-Play**: Runs the live policy on both seats of every environment and regularizes PPO toward a slowly refreshed frozen magnet with a reverse-KL penalty. This preserves strategic diversity in one stochastic policy without a checkpoint league or recurrent BPTT loop.
-- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with masked prior-game slots and full attention over a 75-position layout. The current BC, PPO, and player runtimes are explicitly Bo1, so the prior-game slots remain empty. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
-- **Bo3 Replay Pretraining**: Acquires complete linked Champions Bo3 OTS series, audits every raw replay, compiles each accepted game as an independent Bo1 example, and creates leakage-safe series-level train/validation/test splits.
+- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with perspective-safe prior-game slots and full attention over a 75-position layout. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
+- **Bo3 Replay Pretraining**: Acquires complete linked Champions Bo3 OTS series, audits every raw replay, preserves canonical player identity across games, and creates leakage-safe series-level train/validation/test splits.
 - **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
 - **Mixed Precision (FP16) & CUDA Graph Compilation**: Optional but speeds up training by around 1.7x on the few short runs I have done on a T4.
 
@@ -169,9 +169,8 @@ uv build
 
 The BC `batch_decisions` setting is an explicit target-window budget. Each window
 recomputes its local context under current weights before updating, while retaining
-past-only context and the fixed 48-decision cap. The root `bo3` configuration field is
-reserved for future series orchestration and defaults to `false`; changing it currently
-does not alter execution, which remains Bo1 throughout BC, PPO, evaluation, and play.
+past-only context and the fixed 48-decision cap. BC, PPO, evaluation, and play use
+Bo3 series orchestration and keep each canonical player's prior-game state isolated.
 
 Run the memory-channel performance baseline with:
 

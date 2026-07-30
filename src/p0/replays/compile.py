@@ -38,7 +38,7 @@ from p0.replays.reconstruct import (
 )
 from p0.replays.schema import LabelKind
 from p0.replays.shards import (
-    BO1_COMPILATION_SEMANTICS,
+    BO3_COMPILATION_SEMANTICS,
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
     ShardIndexEntry,
@@ -49,7 +49,7 @@ from p0.replays.shards import (
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 REPLAY_PARSER_VERSION = 1
-REPLAY_COMPILER_VERSION = 5
+REPLAY_COMPILER_VERSION = 6
 IMPUTATION_ALGORITHM = "causal_stat_point_imputation"
 IMPUTATION_VERSION = 1
 
@@ -194,7 +194,7 @@ def _dataset_hash(
             series_id: list(sorted(source_series[series_id])) for series_id in sorted(source_series)
         },
         "source_format_id": source_format_id,
-        "compilation_semantics": BO1_COMPILATION_SEMANTICS,
+        "compilation_semantics": BO3_COMPILATION_SEMANTICS,
         "build_config": dict(build_config),
         "runtime_contract_sha256": runtime_hash,
     }
@@ -492,6 +492,7 @@ def write_tensor_shards(
                     "series_id": game.series_id,
                     "game_number": game.game_number,
                     "player": perspective.player,
+                    "canonical_player": game.canonical_player(perspective.player),
                     "source_replay_id": game.replay_id,
                     "summary": None,
                 }
@@ -612,9 +613,21 @@ class CompiledGame:
     series_id: str
     game_number: int
     replay_id: str
+    canonical_player_roles: tuple[int, int]
     document: ReplayDocument
     perspectives: tuple[ReconstructedPerspective, ReconstructedPerspective]
     stat_estimates: tuple[Any, ...]
+
+    def __post_init__(self) -> None:
+        if sorted(self.canonical_player_roles) != [0, 1]:
+            raise ValueError("CompiledGame canonical player roles must be a permutation of (0, 1)")
+
+    def canonical_player(self, source_player: int) -> int:
+        """Map a replay-local player index to its stable series player index."""
+        try:
+            return self.canonical_player_roles.index(source_player)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported replay-local player index {source_player}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,10 +644,12 @@ class CompilationResult:
                     "series_id": game.series_id,
                     "game_number": game.game_number,
                     "replay_id": game.replay_id,
+                    "canonical_player_roles": list(game.canonical_player_roles),
                     "normalized": game.document.to_dict(),
                     "perspectives": [
                         {
                             "player": perspective.player,
+                            "canonical_player": game.canonical_player(perspective.player),
                             "decisions": [decision.to_dict() for decision in perspective.decisions],
                             "diagnostics": perspective.diagnostics.to_dict(),
                         }
@@ -714,9 +729,25 @@ def _quality_reasons(
 
 
 def _compile_worker(
-    args: tuple[ReplayDocument, str, int, int, Mapping[str, Any] | None, int],
+    args: tuple[
+        ReplayDocument,
+        str,
+        int,
+        tuple[int, int],
+        int,
+        Mapping[str, Any] | None,
+        int,
+    ],
 ) -> tuple[CompiledGame | None, str | None]:
-    document, series_id, game_number, max_candidates, dex, imputation_seed = args
+    (
+        document,
+        series_id,
+        game_number,
+        canonical_player_roles,
+        max_candidates,
+        dex,
+        imputation_seed,
+    ) = args
     estimates = ()
 
     if dex is not None:
@@ -731,6 +762,7 @@ def _compile_worker(
         series_id,
         game_number,
         document.metadata.replay_id,
+        canonical_player_roles,
         document,
         perspectives,
         estimates,
@@ -802,12 +834,13 @@ def compile_documents(
         }
 
         for document in group.games:
-            game_number = membership_by_replay[document.metadata.replay_id].game_number
+            membership = membership_by_replay[document.metadata.replay_id]
             jobs.append(
                 (
                     document,
                     group.record.series_id,
-                    game_number,
+                    membership.game_number,
+                    membership.canonical_player_roles,
                     max_candidates,
                     dex,
                     imputation_seed,

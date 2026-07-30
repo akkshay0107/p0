@@ -13,6 +13,7 @@ import orjson
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
+from p0.battle.series import SeriesPerspectiveKey
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     validate_artifact_runtime_contract,
@@ -203,6 +204,7 @@ class ReplayGameChunk:
     series_id: str
     game_number: int
     player: int
+    canonical_player: int
     observations: StructuredObservation
     action_mask: torch.Tensor
     mask_provenance: torch.Tensor
@@ -216,12 +218,16 @@ class ReplayGameChunk:
     outcome: torch.Tensor
 
     def __post_init__(self) -> None:
-        if self.player not in (0, 1) or self.game_number < 1:
+        if self.player not in (0, 1) or self.canonical_player not in (0, 1) or self.game_number < 1:
             raise ValueError("ReplayGameChunk has invalid player or game number")
 
     @property
     def length(self) -> int:
         return self.observations.token_type_ids.shape[0]
+
+    @property
+    def series_key(self) -> SeriesPerspectiveKey:
+        return SeriesPerspectiveKey(self.series_id, self.canonical_player)
 
     def to(self, device: torch.device | str) -> ReplayGameChunk:
         return replace(
@@ -367,7 +373,13 @@ class LazyReplayDataset(IterableDataset):
         ):
             raise ValueError(f"Shard index metadata does not match payload {path}")
 
-        required_summary_fields = {"series_id", "game_number", "player", "summary"}
+        required_summary_fields = {
+            "series_id",
+            "game_number",
+            "player",
+            "canonical_player",
+            "summary",
+        }
         if not all(
             isinstance(item, Mapping) and required_summary_fields <= set(item) for item in summaries
         ):
@@ -393,6 +405,7 @@ class LazyReplayDataset(IterableDataset):
             series_id=str(item["series_id"]),
             game_number=int(item["game_number"]),
             player=int(item["player"]),
+            canonical_player=int(item["canonical_player"]),
             observations=observation,
             action_mask=tensors["action_mask"][start:end].clone(),
             mask_provenance=tensors["mask_provenance"][start:end].clone(),

@@ -64,7 +64,7 @@ class BCDecisionBatch:
 
     @property
     def games(self) -> int:
-        return len(set((window[0].series_id, window[0].game_number) for window in self.windows))
+        return len({(game.series_key, game.game_number) for game, _, _ in self.windows})
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +293,7 @@ class BCTrainer:
                         new_tokens = self.policy.series.resample_single_game(
                             local_tokens.unsqueeze(0)
                         )[0]
-                    self.series_store.append(game.series_id, new_tokens)
+                    self.series_store.append(game.series_key, new_tokens)
 
             if accumulated_decisions >= self.batch_decisions:
                 self._step_optimizer()
@@ -419,12 +419,12 @@ class BCTrainer:
         history_mask = torch.cat([history[1] for history in history_values])
         history_age_ids = torch.cat([history[2] for history in history_values])
 
-        series_ids = []
+        series_keys = []
         for game, start, stop in batch.windows:
-            series_ids.extend([game.series_id] * (stop - start))
+            series_keys.extend([game.series_key] * (stop - start))
 
         series_tokens, series_mask = self.series_store.get_tokens(
-            series_ids,
+            series_keys,
             device=self.device,
         )
 
@@ -544,7 +544,7 @@ class BCTrainer:
                         new_tokens = self.policy.series.resample_single_game(
                             local_tokens.unsqueeze(0)
                         )[0]
-                    self.series_store.append(game.series_id, new_tokens)
+                    self.series_store.append(game.series_key, new_tokens)
 
             objective = compute_bc_objective(
                 candidate_log_probs,

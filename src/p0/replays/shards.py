@@ -29,8 +29,8 @@ from p0.replays.schema import (
     _require_iso_timestamp,
 )
 
-SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v3"
-BO1_COMPILATION_SEMANTICS = "independent_bo1_empty_history.v1"
+SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v4"
+BO3_COMPILATION_SEMANTICS = "canonical_player_bo3_history.v1"
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
 # T is the shard's decision count and C its total candidate count. Candidates
@@ -142,7 +142,7 @@ class ShardManifest:
     accepted_games: int
     rejected_games: int
     artifact_hashes: Mapping[str, str]
-    compilation_semantics: str = BO1_COMPILATION_SEMANTICS
+    compilation_semantics: str = BO3_COMPILATION_SEMANTICS
     artifact_schema: str = SHARD_ARTIFACT_SCHEMA
     observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
     replay_ir_schema_version: int = REPLAY_IR_SCHEMA_VERSION
@@ -207,7 +207,7 @@ class ShardManifest:
         if not self.source_format_id:
             raise ValueError("ShardManifest.source_format_id must be non-empty")
 
-        if self.compilation_semantics != BO1_COMPILATION_SEMANTICS:
+        if self.compilation_semantics != BO3_COMPILATION_SEMANTICS:
             raise ValueError(f"Unsupported compilation semantics {self.compilation_semantics!r}")
 
         if not isinstance(self.build_config, Mapping):

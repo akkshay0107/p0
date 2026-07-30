@@ -23,6 +23,20 @@ SERIES_SUMMARY_SCHEMA_VERSION = 1
 MAX_PRIOR_GAMES = 2
 
 
+@dataclass(frozen=True, slots=True)
+class SeriesPerspectiveKey:
+    """Stable identity for one player's state within a series."""
+
+    series_id: str
+    canonical_player: int
+
+    def __post_init__(self) -> None:
+        if not self.series_id:
+            raise ValueError("SeriesPerspectiveKey.series_id must be non-empty")
+        if type(self.canonical_player) is not int or self.canonical_player not in (0, 1):
+            raise ValueError("SeriesPerspectiveKey.canonical_player must be 0 or 1")
+
+
 def _require_fields(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
     missing = sorted(expected - value.keys())
     unknown = sorted(value.keys() - expected)

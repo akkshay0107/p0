@@ -48,7 +48,7 @@ def _payload(replay_id: str) -> dict[str, object]:
     }
 
 
-def test_replay_fixture_compiles_to_runtime_bound_schema_v3_shard(tmp_path: Path) -> None:
+def test_replay_fixture_compiles_to_runtime_bound_schema_v4_shard(tmp_path: Path) -> None:
     result = compile_payloads((_payload("shard-fixture"),))
     built = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
 
@@ -72,6 +72,7 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v3_shard(tmp_path: Path
     assert tensors["game_offsets"].tolist() == [0, 2, 4]
     assert tensors["series_offsets"].tolist() == [0, 4]
     assert len(payload["series_summaries"]) == manifest.games
+    assert [item["canonical_player"] for item in payload["series_summaries"]] == [0, 1]
     assert torch.count_nonzero(tensors["events_cat"]) > 0
     assert torch.count_nonzero(tensors["events_metadata"]) > 0
 

@@ -107,7 +107,7 @@ def test_fetcher_skips_404_without_writing_cache_entry(tmp_path: Path, capsys) -
     assert "skipping unavailable replay" in capsys.readouterr().err
 
 
-def test_cache_build_is_dataset_bound_and_enforces_empty_bo1_history(
+def test_cache_build_is_dataset_bound_and_preserves_bo3_series(
     tmp_path: Path,
 ) -> None:
     good_id = f"{FORMAT.bo3_format}-good"

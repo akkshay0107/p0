@@ -83,7 +83,7 @@ def test_split_assignment_is_order_independent_and_round_trips(tmp_path: Path) -
     assert load_split_manifest(path).to_dict() == first.to_dict()
 
 
-def test_lazy_dataset_yields_complete_game_perspectives_with_empty_bo1_history(
+def test_lazy_dataset_yields_canonical_bo3_game_perspectives(
     tmp_path: Path,
 ) -> None:
     built = _write_dataset(tmp_path, (_payload("game-1"), _payload("game-2")))
@@ -95,8 +95,28 @@ def test_lazy_dataset_yields_complete_game_perspectives_with_empty_bo1_history(
         (2, 0),
         (2, 1),
     ]
+    assert [chunk.canonical_player for chunk in chunks] == [0, 1, 0, 1]
     assert all(chunk.length == 2 for chunk in chunks)
     assert chunks[2].candidate_offsets.tolist() == [0, 0, 1]
+
+
+def test_canonical_player_identity_survives_replay_side_swap(tmp_path: Path) -> None:
+    first = _payload("game-1")
+    first["game_number"] = 1
+    second = _payload("game-2")
+    second["game_number"] = 2
+    second["p1"] = "Bob"
+    second["p2"] = "Alice"
+
+    built = _write_dataset(tmp_path, (first, second))
+    chunks = list(LazyReplayDataset(built.manifest_path))
+
+    assert [(chunk.game_number, chunk.player, chunk.canonical_player) for chunk in chunks] == [
+        (1, 0, 0),
+        (1, 1, 1),
+        (2, 0, 1),
+        (2, 1, 0),
+    ]
 
 
 def test_downstream_shards_preserve_noncontiguous_source_game_numbers(

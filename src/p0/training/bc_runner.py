@@ -185,15 +185,16 @@ def train_bc(
                     raise RuntimeError(f"BC training evaluation failed at epoch {epoch}")
             else:
                 final_training = BCEvaluationMetrics(
-                    overall_nll=training.loss,
-                    exact_nll=training.exact_nll,
-                    partial_nll=training.partial_nll,
+                    overall_nll=float(training["loss"]),
+                    exact_nll=float(training["exact_nll"]),
+                    partial_nll=float(training["partial_nll"]),
                     exact_joint_accuracy=0.0,
-                    decisions=training.decisions,
-                    labeled_decisions=training.labeled_decisions,
-                    unknown_decisions=training.decisions - training.labeled_decisions,
-                    exact_decisions=training.exact_decisions,
-                    partial_decisions=training.partial_decisions,
+                    decisions=int(training["decisions"]),
+                    labeled_decisions=int(training["labeled_decisions"]),
+                    unknown_decisions=int(training["decisions"])
+                    - int(training["labeled_decisions"]),
+                    exact_decisions=int(training["exact_decisions"]),
+                    partial_decisions=int(training["partial_decisions"]),
                     illegal_predictions=0,
                     non_finite_values=0,
                     by_decision_type={},
@@ -213,12 +214,12 @@ def train_bc(
                 "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "epoch": epoch,
                 "dataset_hash": shard_manifest.dataset_hash,
-                "train_update": training.to_dict(),
+                "train_update": training,
                 "training": final_training.to_dict(),
                 "validation": validation.to_dict(),
             }
             _append_metrics(metrics_path, record)
-            for name, value in _flatten_metrics("train", training.to_dict()).items():
+            for name, value in _flatten_metrics("train", training).items():
                 writer.add_scalar(name, value, epoch)
             for name, value in _flatten_metrics("validation", validation.to_dict()).items():
                 writer.add_scalar(name, value, epoch)

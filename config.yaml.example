@@ -1,6 +1,4 @@
 # Copy this file to config.yaml for a machine-local configuration.
-# This flag remains reserved for live series orchestration; replay acquisition has its own Bo3 flow.
-bo3: false
 training:
   num_episodes: 2000
   n_envs: 8

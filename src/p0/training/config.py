@@ -72,12 +72,14 @@ class TrainingConfig:
             ("ppo_epochs", self.ppo_epochs),
             ("magnet_refresh_interval", self.magnet_refresh_interval),
         )
+
         _unit_interval(
             type(self).__name__,
             ("gamma", self.gamma),
             ("gae_lambda", self.gae_lambda),
             ("ramp_up_phase", self.ramp_up_phase),
         )
+
         _non_negative(
             type(self).__name__,
             ("clip_low", self.clip_low),
@@ -87,6 +89,7 @@ class TrainingConfig:
             ("residual_entropy_coef", self.residual_entropy_coef),
             ("target_kl", self.target_kl),
         )
+
         _positive(
             type(self).__name__,
             ("lr", self.lr),
@@ -94,8 +97,10 @@ class TrainingConfig:
             ("teampreview_loss_mult", self.teampreview_loss_mult),
             ("teampreview_alpha_mult", self.teampreview_alpha_mult),
         )
+
         if not 0 <= self.warmup_episodes <= self.num_episodes:
             raise ValueError("training.warmup_episodes must be between 0 and training.num_episodes")
+
         if self.magnet_refresh_interval > self.num_episodes:
             raise ValueError(
                 "training.magnet_refresh_interval must not exceed training.num_episodes"
@@ -139,6 +144,7 @@ class BotConfig:
             raise ValueError(
                 f"bot.battle_format must match configured format {FORMAT.battle_format!r}"
             )
+
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError("bot.top_p must be in (0, 1]")
 
@@ -170,15 +176,20 @@ class BCConfig:
             ("max_chunk_size", self.max_chunk_size),
             ("epochs", self.epochs),
         )
+
         if self.num_workers < 0:
             raise ValueError("bc.num_workers must be non-negative")
+
         if self.prefetch_factor <= 0:
             raise ValueError("bc.prefetch_factor must be positive")
+
         _positive(type(self).__name__, ("learning_rate", self.learning_rate))
         _non_negative(type(self).__name__, ("weight_decay", self.weight_decay))
         _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))
+
         if type(self.seed) is not int:
             raise ValueError("bc.seed must be an integer")
+
         for name, value in (
             ("shard_manifest", self.shard_manifest),
             ("split_manifest", self.split_manifest),
@@ -230,7 +241,6 @@ class EvalConfig:
 
 @dataclass(frozen=True, slots=True)
 class GlobalConfig:
-    bo3: bool = False
     training: TrainingConfig = TrainingConfig()
     paths: ProjectPaths = DEFAULT_PATHS
     environment: EnvironmentConfig = EnvironmentConfig()
@@ -238,10 +248,6 @@ class GlobalConfig:
     bc: BCConfig = BCConfig()
     corpus: CorpusConfig = CorpusConfig()
     evaluation: EvalConfig = EvalConfig()
-
-    def __post_init__(self) -> None:
-        if type(self.bo3) is not bool:
-            raise ValueError("bo3 must be a boolean")
 
 
 def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root) -> Path:
@@ -360,7 +366,6 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
             names = ", ".join(sorted(str(name) for name in unknown))
             raise ValueError(f"unknown root configuration section(s): {names}")
         config = GlobalConfig(
-            bo3=values["bo3"],
             training=_build_section(TrainingConfig, values["training"]),
             paths=_build_section(ProjectPaths, values["paths"]),
             environment=_build_environment(values["environment"]),
