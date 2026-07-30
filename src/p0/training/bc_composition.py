@@ -129,7 +129,7 @@ def train_bc(
         policy = build_policy(ModelConfig.baseline(), default_runtime_resources())
     else:
         policy = store.load_policy(config.resume_checkpoint, selected_device)
-        
+
     policy = compile_policy(policy, enable=selected_device.type == "cuda")
     dataset_output = config.output_dir / shard_manifest.dataset_hash
     dataset_output.mkdir(parents=True, exist_ok=True)

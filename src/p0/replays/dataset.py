@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from pickle import UnpicklingError
 from typing import Any
 
+import orjson
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -177,8 +177,8 @@ def load_split_manifest(
     """Load and validate a split manifest before selecting any shard rows."""
     if isinstance(value, (str, Path)):
         try:
-            value = json.loads(Path(value).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            value = orjson.loads(Path(value).read_bytes())
+        except (OSError, UnicodeDecodeError, orjson.JSONDecodeError) as exc:
             raise ValueError(f"Unable to read split manifest {value}") from exc
 
     if not isinstance(value, Mapping):
@@ -268,7 +268,7 @@ class LazyReplayDataset(IterableDataset):
         verify_hashes: bool = True,
     ) -> None:
         self.manifest_path = Path(manifest_path)
-        value = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        value = orjson.loads(self.manifest_path.read_bytes())
         self.manifest = load_shard_manifest(value, runtime_manifest_path)
         if split is not None and split not in SPLITS:
             raise ValueError(f"Unsupported dataset split {split!r}")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import json
 import os
 import re
 import sys
@@ -19,6 +18,8 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+import orjson
 
 from p0.replays.identity import linked_replay_ids, replay_matches_format
 from p0.replays.schema import FetchIndexEntry, FetchMetadata
@@ -142,8 +143,8 @@ def _request_with_retry(
 
 def _json_object(body: bytes, url: str) -> Mapping[str, object] | list[object]:
     try:
-        value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = orjson.loads(body)
+    except (UnicodeDecodeError, orjson.JSONDecodeError) as exc:
         raise ReplayFetchError(f"Endpoint returned malformed JSON: {url}") from exc
     if not isinstance(value, (Mapping, list)):
         raise ReplayFetchError(f"Endpoint returned a non-container JSON value: {url}")
@@ -328,30 +329,32 @@ class ReplayFetcher:
         directory = self.config.cache_dir / self.config.format_id / "metadata"
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{replay_id}.json"
-        encoded = json.dumps(metadata.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        encoded = orjson.dumps(metadata.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n"
         if path.exists():
-            if path.read_text(encoding="utf-8") != encoded:
+            if path.read_bytes() != encoded:
                 raise ReplayFetchError(f"Fetch metadata changed on disk: {path}")
             return
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(encoded, encoding="utf-8")
+        temporary.write_bytes(encoded)
         os.replace(temporary, path)
 
     def _append_index(self, entries: Iterable[FetchIndexEntry]) -> None:
         if not entries:
             return
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.index_path.open("a", encoding="utf-8") as stream:
+        with self.index_path.open("ab") as stream:
             for entry in entries:
-                stream.write(json.dumps(entry.to_dict(), sort_keys=True) + "\n")
+                stream.write(orjson.dumps(entry.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n")
 
     def _write_index(self, entries: Iterable[FetchIndexEntry]) -> None:
         ordered = tuple(sorted(entries, key=lambda entry: entry.replay_id))
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.index_path.with_suffix(".tmp")
-        temporary.write_text(
-            "".join(json.dumps(entry.to_dict(), sort_keys=True) + "\n" for entry in ordered),
-            encoding="utf-8",
+        temporary.write_bytes(
+            b"".join(
+                orjson.dumps(entry.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n"
+                for entry in ordered
+            )
         )
         os.replace(temporary, self.index_path)
 
@@ -435,12 +438,12 @@ def read_fetch_index(path: str | Path) -> tuple[FetchIndexEntry, ...]:
 
     entries: list[FetchIndexEntry] = []
     seen: set[str] = set()
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(path.read_bytes().splitlines(), 1):
         if not line:
             continue
         try:
-            entry = FetchIndexEntry.from_dict(json.loads(line))
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            entry = FetchIndexEntry.from_dict(orjson.loads(line))
+        except (TypeError, ValueError, orjson.JSONDecodeError) as exc:
             raise ValueError(f"Malformed fetch index line {line_number}: {path}") from exc
 
         if entry.replay_id in seen:

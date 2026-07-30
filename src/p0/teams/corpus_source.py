@@ -8,10 +8,11 @@ and diverse sampling policies.
 
 from __future__ import annotations
 
-import json
 import random
 from collections.abc import Mapping
 from pathlib import Path
+
+import orjson
 
 from p0.teams.corpus import (
     CorpusEntry,
@@ -31,8 +32,8 @@ class CorpusTeamSource:
             raise FileNotFoundError(f"Corpus manifest file not found: {path}")
 
         try:
-            raw_data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raw_data = orjson.loads(path.read_bytes())
+        except (OSError, UnicodeError, orjson.JSONDecodeError) as exc:
             raise ValueError(f"Malformed corpus manifest file: {path}") from exc
 
         manifest = load_corpus_manifest(raw_data)

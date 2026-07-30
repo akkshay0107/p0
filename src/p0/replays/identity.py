@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
+
+import orjson
 
 _HREF_PATTERN = re.compile(r"""href=["']([^"']+)["']""", flags=re.IGNORECASE)
 
@@ -50,8 +51,8 @@ def replay_matches_format(item: object, expected: str) -> bool:
 def linked_replay_ids(payload: bytes, *, format_id: str) -> tuple[str, ...]:
     """Extract same-format sibling battle links without interpreting battle state."""
     try:
-        value = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = orjson.loads(payload)
+    except (UnicodeDecodeError, orjson.JSONDecodeError):
         return ()
     if not isinstance(value, Mapping):
         return ()

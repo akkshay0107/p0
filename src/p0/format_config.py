@@ -8,11 +8,12 @@ fail-fast contract checking when loading model checkpoints or dataset shards.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+import orjson
 
 from p0.paths import DEFAULT_PATHS
 
@@ -105,13 +106,7 @@ def _validate_json_value(value: Any, location: str = "contract") -> None:
 def canonical_json_sha256(value: Any) -> str:
     """Hash JSON semantics independently of whitespace and object-key order."""
     _validate_json_value(value)
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+    encoded = orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -125,8 +120,8 @@ def sha256_json_file(path: str | Path) -> str:
     """Hash parsed JSON so formatting-only edits do not break compatibility."""
     path = Path(path)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        value = orjson.loads(path.read_bytes())
+    except (OSError, UnicodeError, orjson.JSONDecodeError) as exc:
         raise ValueError(f"Malformed JSON resource: {path}") from exc
 
     return canonical_json_sha256(value)
@@ -273,10 +268,10 @@ def load_runtime_manifest(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> Runtim
     """Load and parse a RuntimeManifest from disk."""
     path = Path(path)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = orjson.loads(path.read_bytes())
     except FileNotFoundError:
         raise FileNotFoundError(f"Global runtime manifest not found: {path}") from None
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, orjson.JSONDecodeError) as exc:
         raise ValueError(f"Malformed global runtime manifest: {path}") from exc
 
     if not isinstance(value, Mapping):

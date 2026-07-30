@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Mapping, cast
+
+import orjson
 
 from p0.format_config import FORMAT
 from p0.teams.stat_points import STAT_POINT_IMPUTER_VERSION, StatPoints
@@ -96,7 +97,7 @@ class CanonicalTeam:
 
     @property
     def team_hash(self) -> str:
-        encoded = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode()
+        encoded = orjson.dumps(self.to_dict(), option=orjson.OPT_SORT_KEYS)
         return hashlib.sha256(encoded).hexdigest()
 
     def to_dict(self) -> dict[str, object]:

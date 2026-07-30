@@ -50,14 +50,17 @@ import typing
 
 
 def _input(*, moves=("Heat Wave", "Protect"), categories=("special", "status"), nature="modest"):
-    return typing.cast(dict[str, typing.Any], dict(
-        nature=nature,
-        item="charizarditey",
-        ability="blaze",
-        moves=moves,
-        move_categories=categories,
-        base_stats=CHARIZARD,
-    ))
+    return typing.cast(
+        dict[str, typing.Any],
+        dict(
+            nature=nature,
+            item="charizarditey",
+            ability="blaze",
+            moves=moves,
+            move_categories=categories,
+            base_stats=CHARIZARD,
+        ),
+    )
 
 
 def test_imputer_is_legal_deterministic_and_role_sensitive():

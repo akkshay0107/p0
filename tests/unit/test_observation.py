@@ -843,6 +843,7 @@ def test_stat_resolution_provenance_and_cache_behavior():
     assert provenance == Provenance.UNKNOWN
 
     import typing
+
     expected = typing.cast(tuple[int, int, int, int, int, int], tuple((155, 93, 98, 177, 105, 152)))
     values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
     assert values == tuple(float(value) for value in expected)

@@ -129,6 +129,7 @@ def _variants_from_showdown(
                     continue
                 except (TypeError, ValueError) as exc:
                     import logging
+
                     logging.warning(f"Failed to impute stats for {m.species}: {exc}")
             spreads_list.append(StatPoints(hp=2, spa=32, spe=32))
 

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
+
+import orjson
 
 from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
@@ -85,7 +86,7 @@ def _team_hash(document: ReplayDocument, side: int) -> str:
                 ),
             }
         )
-    payload = json.dumps(members, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload = orjson.dumps(members, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(payload).hexdigest()
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
-import json
 import os
 import shutil
 import tempfile
@@ -14,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import orjson
 import torch
 
 from p0.battle.legality import action_mask, validate_joint_action
@@ -208,10 +208,10 @@ def _validate_existing_build(
     manifest_path: str | Path,
 ) -> ShardBuildResult:
     try:
-        manifest_value = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        manifest_value = orjson.loads((root / "manifest.json").read_bytes())
         manifest = ShardManifest.from_dict(manifest_value)
         validate_artifact_runtime_contract(manifest_value, manifest_path)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (OSError, UnicodeDecodeError, orjson.JSONDecodeError, TypeError, ValueError) as exc:
         raise ValueError(f"Existing dataset build is invalid: {root}") from exc
 
     if manifest.dataset_hash != dataset_hash:
@@ -876,10 +876,7 @@ def write_compilation(result: CompilationResult, path: str | Path) -> None:
     """Write a canonical JSON report suitable for deterministic regression checks."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
+    destination.write_bytes(orjson.dumps(result.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n")
 
 
 compile_replays = compile_documents
