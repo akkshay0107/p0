@@ -152,6 +152,8 @@ class BCConfig:
     max_chunk_size: int = 1024
     learning_rate: float = 3e-4
     epochs: int = 1
+    num_workers: int = 2
+    prefetch_factor: int = 2
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     seed: int = 0
@@ -168,6 +170,10 @@ class BCConfig:
             ("max_chunk_size", self.max_chunk_size),
             ("epochs", self.epochs),
         )
+        if self.num_workers < 0:
+            raise ValueError("bc.num_workers must be non-negative")
+        if self.prefetch_factor <= 0:
+            raise ValueError("bc.prefetch_factor must be positive")
         _positive(type(self).__name__, ("learning_rate", self.learning_rate))
         _non_negative(type(self).__name__, ("weight_decay", self.weight_decay))
         _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))

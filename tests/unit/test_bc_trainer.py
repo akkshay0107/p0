@@ -51,6 +51,7 @@ def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
             batch_decisions=minibatch_size,
             learning_rate=1e-3,
             epochs=1,
+            num_workers=0,
             amp=False,
         ),
         device="cpu",

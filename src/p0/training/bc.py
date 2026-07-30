@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, IterableDataset
 
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
@@ -193,14 +194,15 @@ def _collate_bc_window(
         local_offsets = game.candidate_offsets[start + 1 : stop + 1] - first_candidate
         candidate_offsets.extend(candidate_base + int(offset) for offset in local_offsets)
         candidate_base += last_candidate - first_candidate
-        
+
         targets = torch.arange(start, stop, dtype=torch.long).unsqueeze(1)
         offsets_tensor = torch.arange(-HISTORY_WINDOW, 0, dtype=torch.long).unsqueeze(0)
         matrix = targets + offsets_tensor
         row = torch.where(matrix >= 0, matrix, -1)
         history_rows.append(row)
-        
+
         batch_start = batch_stop
+
     return BCDecisionBatch(
         observations=_concatenate_observations(observations),
         action_mask=torch.cat(tensor_values["action_mask"]),
@@ -237,6 +239,17 @@ def collate_bc_batches(
                 decisions = 0
     if windows:
         yield _collate_bc_window(windows)
+
+
+class BCBatchDataset(IterableDataset):
+    """Wrap dataset collation so DataLoader workers can yield pre-assembled batches."""
+
+    def __init__(self, dataset: Iterable[ReplayGameChunk], chunk_size: int):
+        self.dataset = dataset
+        self.chunk_size = chunk_size
+
+    def __iter__(self) -> Iterator[BCDecisionBatch]:
+        yield from collate_bc_batches(self.dataset, self.chunk_size)
 
 
 @dataclass(slots=True)
@@ -317,10 +330,22 @@ class BCTrainer:
             torch.cuda.reset_peak_memory_stats(self.device)
         totals = _RunTotals()
         accumulated_decisions = 0
-        chunk_size = min(self.batch_decisions, getattr(self.config, "max_chunk_size", self.batch_decisions))
+        chunk_size = min(
+            self.batch_decisions, getattr(self.config, "max_chunk_size", self.batch_decisions)
+        )
         self.optimizer.zero_grad(set_to_none=True)
 
-        for batch in collate_bc_batches(self.dataset, chunk_size):
+        num_workers = getattr(self.config, "num_workers", 2)
+        prefetch_factor = getattr(self.config, "prefetch_factor", 2) if num_workers > 0 else None
+
+        dataloader = DataLoader(
+            BCBatchDataset(self.dataset, chunk_size),
+            num_workers=num_workers,
+            batch_size=None,
+            prefetch_factor=prefetch_factor,
+        )
+
+        for batch in dataloader:
             if self.cancel_requested():
                 raise BCCancelled("Behaviour-cloning training was cancelled")
             self._backward_chunk(batch, totals)
@@ -552,7 +577,9 @@ class BCTrainer:
         confidence_totals: dict[str, dict[str, float | int]] = {}
         bucket_names = ("[0,.25)", "[.25,.5)", "[.5,.75)", "[.75,1]")
         boundaries = torch.tensor((0.25, 0.5, 0.75))
-        chunk_size = min(self.batch_decisions, getattr(self.config, "max_chunk_size", self.batch_decisions))
+        chunk_size = min(
+            self.batch_decisions, getattr(self.config, "max_chunk_size", self.batch_decisions)
+        )
         for batch in collate_bc_batches(source, chunk_size):
             model_inputs = self._model_inputs(batch)
             candidate_log_probs = self.policy.actor.score_joint_candidates(
@@ -719,23 +746,23 @@ def _validate_objective_inputs(
 
 def _ragged_logsumexp(candidate_log_probs: Tensor, offsets: Tensor) -> Tensor:
     counts = offsets[1:] - offsets[:-1]
-    
+
     row_max = torch.segment_reduce(candidate_log_probs, reduce="max", lengths=counts, unsafe=True)
     row_max = torch.where(counts > 0, row_max, float("-inf"))
-    
+
     row_ids = torch.repeat_interleave(
         torch.arange(counts.numel(), device=candidate_log_probs.device), counts
     )
     gathered_max = row_max[row_ids]
-    
+
     shifted = torch.where(
         torch.isfinite(gathered_max),
         candidate_log_probs - gathered_max,
         torch.zeros_like(candidate_log_probs),
     )
-    
+
     row_sum = torch.segment_reduce(torch.exp(shifted), reduce="sum", lengths=counts, unsafe=True)
-    
+
     return torch.where(
         torch.isfinite(row_max),
         row_max + torch.log(row_sum),

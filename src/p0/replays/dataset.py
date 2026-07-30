@@ -11,6 +11,7 @@ from pickle import UnpicklingError
 from typing import Any
 
 import torch
+from torch.utils.data import IterableDataset, get_worker_info
 
 from p0.battle.series import GameSummary
 from p0.format_config import (
@@ -254,7 +255,7 @@ class ReplayGameChunk:
         )
 
 
-class LazyReplayDataset:
+class LazyReplayDataset(IterableDataset):
     """Stream complete game perspectives while keeping one shard resident."""
 
     def __init__(
@@ -309,7 +310,13 @@ class LazyReplayDataset:
 
     def __iter__(self) -> Iterator[ReplayGameChunk]:
         selected = self._selected_series
-        for entry in self.manifest.shards:
+        shards = self.manifest.shards
+
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            shards = shards[worker_info.id :: worker_info.num_workers]
+
+        for entry in shards:
             tensors, summaries = self._load_shard(entry)
             game_offsets = tensors["game_offsets"].tolist()
             for game_index, item in enumerate(summaries):

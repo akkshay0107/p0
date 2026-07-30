@@ -515,16 +515,26 @@ def write_tensor_shards(
         current_decisions = 0
 
     try:
+        current_series_id = None
         for game in sorted(
             result.games,
             key=lambda item: (item.series_id, item.game_number, item.replay_id),
         ):
             game_items = [(game, perspective) for perspective in game.perspectives]
             game_decisions = sum(len(perspective.decisions) for _, perspective in game_items)
-            if current_games and current_decisions + game_decisions > max_decisions_per_shard:
+
+            # Flush only at series boundaries to prevent temporal logic corruption
+            if (
+                current_games
+                and (game.series_id != current_series_id)
+                and (current_decisions + game_decisions > max_decisions_per_shard)
+            ):
                 flush()
+
             current_games.extend(game_items)
             current_decisions += game_decisions
+            current_series_id = game.series_id
+
         flush()
         artifact_hashes = {entry.filename: entry.sha256 for entry in entries}
         source_games = diagnostics.get("replays", len(result.games))
