@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import HISTORY_WINDOW
+from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_TOKENS_PER_GAME
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
@@ -150,21 +150,24 @@ def test_game_boundary_accumulation_uses_total_loss_weight() -> None:
 
 
 def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
-    chunk = _chunk([int(LabelKind.EXACT)] * 4, [(7, 8)] * 4, [0, 1, 2, 3, 4])
-    trainer = _trainer(chunk, minibatch_size=2)
-    local_tokens = torch.randn(52, trainer.policy.d_model)
+    length = 52
+    chunk = _chunk(
+        [int(LabelKind.EXACT)] * length,
+        [(7, 8)] * length,
+        list(range(length + 1)),
+    )
+    _, batch = collate_bc_batches((chunk,), 48)
 
-    whole = trainer._history_inputs(local_tokens)
-    window = trainer._history_inputs(local_tokens, slice(48, 52))
-    for whole_part, window_part in zip(whole, window, strict=True):
-        torch.testing.assert_close(whole_part[48:], window_part)
-
-    changed_ancient = local_tokens.clone()
-    changed_ancient[0] += 1000.0
-    original_last = trainer._history_inputs(local_tokens, slice(51, 52))
-    changed_last = trainer._history_inputs(changed_ancient, slice(51, 52))
-    for original_part, changed_part in zip(original_last, changed_last, strict=True):
-        torch.testing.assert_close(original_part, changed_part)
+    assert batch.target_indices.tolist() == [48, 49, 50, 51]
+    for target, indices, mask in zip(
+        batch.target_indices,
+        batch.history_indices,
+        batch.history_mask,
+        strict=True,
+    ):
+        expected = torch.arange(max(0, int(target) - HISTORY_WINDOW), int(target))
+        torch.testing.assert_close(indices[mask], expected)
+    assert 0 not in batch.history_indices[-1, batch.history_mask[-1]]
 
 
 def test_collated_context_is_compact_and_never_crosses_game_boundaries() -> None:
@@ -210,7 +213,7 @@ def test_model_inputs_encode_all_game_windows_once() -> None:
         torch.inference_mode(),
         patch.object(trainer.policy, "encode", wraps=trainer.policy.encode) as encode,
     ):
-        model_inputs = trainer._model_inputs(batch)
+        model_inputs = trainer._prepare_model_inputs(batch).model_inputs
 
     assert encode.call_count == 1
     assert model_inputs[0].tokens.size(0) == batch.decisions
@@ -229,23 +232,23 @@ def test_continued_chunk_matches_per_window_reference_inputs() -> None:
     batch = list(collate_bc_batches((game,), 64))[1]
 
     with torch.inference_mode():
-        actual = trainer._model_inputs(batch)
+        actual = trainer._prepare_model_inputs(batch).model_inputs
         context_start = 64 - HISTORY_WINDOW
         encoded = trainer.policy.encode(
             game.observations[context_start:],
             game.action_mask[context_start:],
         )
         local_tokens = trainer.policy.local_history_tokens(encoded)
-        expected_history = trainer._history_inputs(
-            local_tokens,
-            slice(HISTORY_WINDOW, game.length - context_start),
-        )
+        expected_history_tokens = local_tokens[
+            batch.history_indices
+        ] * batch.history_mask.unsqueeze(-1)
 
-    torch.testing.assert_close(actual[0].tokens, encoded.tokens[HISTORY_WINDOW:])
-    torch.testing.assert_close(actual[0].aux, encoded.aux[HISTORY_WINDOW:])
-    torch.testing.assert_close(actual[0].numerical, encoded.numerical[HISTORY_WINDOW:])
-    for actual_part, expected_part in zip(actual[4:], expected_history, strict=True):
-        torch.testing.assert_close(actual_part, expected_part)
+    torch.testing.assert_close(actual[0].tokens, encoded.tokens[batch.target_indices])
+    torch.testing.assert_close(actual[0].aux, encoded.aux[batch.target_indices])
+    torch.testing.assert_close(actual[0].numerical, encoded.numerical[batch.target_indices])
+    torch.testing.assert_close(actual[4], expected_history_tokens)
+    torch.testing.assert_close(actual[5], batch.history_mask)
+    torch.testing.assert_close(actual[6], batch.history_age_ids)
 
 
 def test_completed_game_does_not_emit_a_second_observation_payload() -> None:
@@ -266,21 +269,149 @@ def test_completed_game_does_not_emit_a_second_observation_payload() -> None:
 
 def test_raw_game_history_caches_each_target_token_once() -> None:
     length = 100
+    first = _chunk(
+        [int(LabelKind.EXACT)] * length,
+        [(7, 8)] * length,
+        list(range(length + 1)),
+    )
+    second = _chunk(
+        [int(LabelKind.EXACT)] * 2,
+        [(7, 8)] * 2,
+        [0, 1, 2],
+        game_number=2,
+        is_series_end=True,
+    )
+    trainer = _trainer(first, minibatch_size=64)
+
+    with patch.object(
+        trainer.policy.series,
+        "resample_single_game",
+        wraps=trainer.policy.series.resample_single_game,
+    ) as resample:
+        trainer.evaluate((first, second))
+
+    assert resample.call_count == 1
+    history, history_mask = resample.call_args.args
+    assert history.shape == (1, length, trainer.policy.d_model)
+    assert history_mask.shape == (1, length)
+    assert history_mask.all()
+
+
+def test_ordered_history_allows_skipped_game_numbers() -> None:
+    first = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=1,
+    )
+    third = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=3,
+        is_series_end=True,
+    )
+    trainer = _trainer(first, minibatch_size=2)
+    batch = next(collate_bc_batches((first, third), 2))
+
+    prepared = trainer._prepare_model_inputs(batch)
+
+    assert not prepared.model_inputs[3][0].any()
+    assert prepared.model_inputs[3][1, :SERIES_TOKENS_PER_GAME].all()
+
+
+def test_ordered_history_keeps_interleaved_series_independent() -> None:
+    first_a = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1], game_number=1)
+    first_b = replace(
+        first_a,
+        series_id="series-2",
+    )
+    third_a = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=3,
+        is_series_end=True,
+    )
+    second_b = replace(
+        _chunk(
+            [int(LabelKind.EXACT)],
+            [(7, 8)],
+            [0, 1],
+            game_number=2,
+            is_series_end=True,
+        ),
+        series_id="series-2",
+    )
+    trainer = _trainer(first_a, minibatch_size=4)
+    batch = next(collate_bc_batches((first_a, first_b, third_a, second_b), 4))
+
+    series_mask = trainer._prepare_model_inputs(batch).model_inputs[3]
+
+    assert not series_mask[:2].any()
+    assert series_mask[2:, :SERIES_TOKENS_PER_GAME].all()
+    assert not series_mask[2:, SERIES_TOKENS_PER_GAME:].any()
+
+
+@pytest.mark.parametrize("game_numbers", [(2, 2), (2, 1)])
+def test_ordered_history_rejects_repeated_or_decreasing_games(
+    game_numbers: tuple[int, int],
+) -> None:
+    first = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=game_numbers[0],
+    )
+    invalid = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=game_numbers[1],
+        is_series_end=True,
+    )
+    trainer = _trainer(first, minibatch_size=2)
+    batch = next(collate_bc_batches((first, invalid), 2))
+
+    with pytest.raises(ValueError, match="must increase"):
+        trainer._prepare_model_inputs(batch)
+
+
+def test_ordered_history_rejects_data_after_series_end() -> None:
+    ended = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=1,
+        is_series_end=True,
+    )
+    extra = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=2,
+    )
+    trainer = _trainer(ended, minibatch_size=2)
+    batch = next(collate_bc_batches((ended, extra), 2))
+
+    with pytest.raises(ValueError, match="after a perspective-series ended"):
+        trainer._prepare_model_inputs(batch)
+
+
+def test_ordered_history_tracks_an_incomplete_final_game() -> None:
+    length = 100
     game = _chunk(
         [int(LabelKind.EXACT)] * length,
         [(7, 8)] * length,
         list(range(length + 1)),
     )
     trainer = _trainer(game, minibatch_size=64)
-    first, second = collate_bc_batches((game,), 64)
+    first = next(collate_bc_batches((game,), 64))
 
-    with torch.inference_mode():
-        trainer._model_inputs(first)
-        trainer._model_inputs(second)
+    prepared = trainer._prepare_model_inputs(first)
+    trainer._series_history.apply(prepared.history_updates)
 
-    cached = trainer._series_history.completed_before(game.series_key, 2)
-    assert len(cached) == 1
-    assert next(iter(cached.values())).shape == (length, trainer.policy.d_model)
+    assert trainer._series_history.has_partial_games
 
 
 def test_same_batch_next_game_receives_differentiable_series_context() -> None:
@@ -307,6 +438,38 @@ def test_same_batch_next_game_receives_differentiable_series_context() -> None:
     assert series_mask[2:, :4].all()
     assert not series_mask[2:, 4:].any()
     assert prepared.model_inputs[2].requires_grad
+
+
+def test_cross_batch_series_history_truncates_encoder_gradients() -> None:
+    first = _chunk(
+        [int(LabelKind.EXACT)] * 2,
+        [(7, 8)] * 2,
+        [0, 1, 2],
+        game_number=1,
+    )
+    second = _chunk(
+        [int(LabelKind.EXACT)] * 2,
+        [(7, 8)] * 2,
+        [0, 1, 2],
+        game_number=2,
+        is_series_end=True,
+    )
+    trainer = _trainer(first, minibatch_size=2)
+    first_batch, second_batch = collate_bc_batches((first, second), 2)
+    first_tokens = torch.randn(2, trainer.policy.d_model, requires_grad=True)
+
+    with patch.object(
+        trainer.policy,
+        "local_history_tokens",
+        return_value=first_tokens,
+    ):
+        first_prepared = trainer._prepare_model_inputs(first_batch)
+    trainer._series_history.apply(first_prepared.history_updates)
+
+    second_prepared = trainer._prepare_model_inputs(second_batch)
+    second_prepared.model_inputs[2].sum().backward()
+
+    assert first_tokens.grad is None
 
 
 def test_bc_loss_trains_series_resampler() -> None:
