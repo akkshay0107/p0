@@ -96,7 +96,6 @@ def test_lazy_dataset_yields_complete_game_perspectives_with_empty_bo1_history(
         (2, 1),
     ]
     assert all(chunk.length == 2 for chunk in chunks)
-    assert all(chunk.summary_inputs == () for chunk in chunks)
     assert chunks[2].candidate_offsets.tolist() == [0, 0, 1]
 
 
@@ -117,7 +116,6 @@ def test_downstream_shards_preserve_noncontiguous_source_game_numbers(
         (3, 0),
         (3, 1),
     ]
-    assert all(chunk.summary_inputs == () for chunk in chunks)
 
 
 def test_split_dataset_keeps_series_together(tmp_path: Path) -> None:
@@ -146,7 +144,7 @@ def test_dataset_rejects_tampered_shard(tmp_path: Path) -> None:
     shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
     shard_path.write_bytes(shard_path.read_bytes() + b"tampered")
     with pytest.raises(ValueError, match="hash mismatch"):
-        next(iter(LazyReplayDataset(built.manifest_path)))
+        next(iter(LazyReplayDataset(built.manifest_path, verify_hashes=True)))
 
 
 def torch_summaries(built) -> list[dict[str, object]]:

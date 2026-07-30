@@ -149,7 +149,6 @@ def test_cache_build_is_dataset_bound_and_enforces_empty_bo1_history(
     assert first.manifest.rejected_games == 1
     chunks = list(LazyReplayDataset(first.manifest_path))
     assert len(chunks) == 2
-    assert all(chunk.summary_inputs == () for chunk in chunks)
 
 
 def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:

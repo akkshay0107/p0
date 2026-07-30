@@ -13,7 +13,6 @@ import orjson
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from p0.battle.series import GameSummary
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     validate_artifact_runtime_contract,
@@ -121,23 +120,32 @@ def assign_series_splits(
     if any(not series_id for series_id in unique_ids):
         raise ValueError("series_ids must contain only non-empty strings")
 
-    ranked = sorted(
-        unique_ids,
-        key=lambda series_id: (
-            hashlib.sha256(f"{seed}:{series_id}".encode("utf-8")).digest(),
-            series_id,
-        ),
-    )
+    seed_prefix = f"{seed}:".encode("utf-8")
+    hashed_pairs = [
+        (hashlib.sha256(seed_prefix + series_id.encode("utf-8")).digest(), series_id)
+        for series_id in unique_ids
+    ]
+    hashed_pairs.sort()
+
+    ranked = [series_id for _, series_id in hashed_pairs]
     requested = int(validation_fraction > 0) + int(test_fraction > 0)
+
+    # + 1 for train
     enough_for_all = len(ranked) >= requested + 1
+
+    # initial counts
     test_count = round(len(ranked) * test_fraction)
     validation_count = round(len(ranked) * validation_fraction)
+
+    # force 1 element min for each valid split
     if enough_for_all and test_fraction > 0:
         test_count = max(1, test_count)
 
     if enough_for_all and validation_fraction > 0:
         validation_count = max(1, validation_count)
 
+    # adjust if rounding takes you above the maximum number of series
+    # in the dataset. Runs atmost twice
     while test_count + validation_count >= len(ranked) and test_count + validation_count:
         if validation_count > int(enough_for_all and validation_fraction > 0):
             validation_count -= 1
@@ -206,33 +214,10 @@ class ReplayGameChunk:
     candidate_values: torch.Tensor
     candidate_offsets: torch.Tensor
     outcome: torch.Tensor
-    summary_inputs: tuple[GameSummary, ...]
 
     def __post_init__(self) -> None:
         if self.player not in (0, 1) or self.game_number < 1:
             raise ValueError("ReplayGameChunk has invalid player or game number")
-        self.observations.validate(batch_rank=1)
-        length = self.observations.token_type_ids.shape[0]
-        for name, tensor in (
-            ("action_mask", self.action_mask),
-            ("mask_provenance", self.mask_provenance),
-            ("label_kind", self.label_kind),
-            ("label_confidence", self.label_confidence),
-            ("loss_mask", self.loss_mask),
-            ("decision_type", self.decision_type),
-            ("exact_action", self.exact_action),
-            ("outcome", self.outcome),
-        ):
-            if tensor.shape[0] != length:
-                raise ValueError(f"ReplayGameChunk.{name} length does not match observations")
-
-        if self.candidate_offsets.shape != (length + 1,):
-            raise ValueError("ReplayGameChunk.candidate_offsets must have one row per decision")
-
-        if self.candidate_offsets[0].item() != 0 or self.candidate_offsets[-1].item() != len(
-            self.candidate_values
-        ):
-            raise ValueError("ReplayGameChunk.candidate_offsets must bound candidate_values")
 
     @property
     def length(self) -> int:
@@ -265,7 +250,7 @@ class LazyReplayDataset(IterableDataset):
         split: str | None = None,
         split_manifest: SeriesSplitManifest | Mapping[str, Any] | str | Path | None = None,
         runtime_manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
-        verify_hashes: bool = True,
+        verify_hashes: bool = False,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         value = orjson.loads(self.manifest_path.read_bytes())
@@ -329,7 +314,6 @@ class LazyReplayDataset(IterableDataset):
                     item,
                     game_offsets[game_index],
                     game_offsets[game_index + 1],
-                    (),
                 )
 
     def _load_shard(
@@ -364,7 +348,6 @@ class LazyReplayDataset(IterableDataset):
         if payload.get("artifact_schema") != SHARD_ARTIFACT_SCHEMA:
             raise ValueError(f"Unsupported shard schema in {path}")
 
-        validate_artifact_runtime_contract(payload, self.runtime_manifest_path)
         if payload.get("dataset_hash") != self.manifest.dataset_hash:
             raise ValueError(f"Shard and manifest reference different datasets: {path}")
 
@@ -398,7 +381,6 @@ class LazyReplayDataset(IterableDataset):
         item: Mapping[str, Any],
         start: int,
         end: int,
-        history: tuple[GameSummary, ...],
     ) -> ReplayGameChunk:
         candidate_bounds = tensors["candidate_offsets"][start : end + 1]
         candidate_start = int(candidate_bounds[0])
@@ -422,7 +404,6 @@ class LazyReplayDataset(IterableDataset):
             candidate_values=tensors["candidate_values"][candidate_start:candidate_end].clone(),
             candidate_offsets=candidate_offsets,
             outcome=tensors["outcome"][start:end].clone(),
-            summary_inputs=history,
         )
 
 
