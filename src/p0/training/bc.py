@@ -8,7 +8,6 @@ objectives to support both exact and partial candidate scoring.
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +28,7 @@ from p0.model.architecture_contract import (
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.replays.dataset import ReplayGameChunk
-from p0.replays.schema import LabelKind
+from p0.replays.schema import DecisionType, LabelKind
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
 from p0.training.config import BCConfig
 
@@ -49,6 +48,7 @@ class BCObjective:
     exact_count: int
     partial_count: int
     labeled_count: int
+    loss_weight: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +91,10 @@ class BCDecisionBatch:
     def games(self) -> int:
         return len({(window.series_key, window.game_number) for window in self.windows})
 
+    @property
+    def completed_game_count(self) -> int:
+        return sum(window.is_game_end for window in self.windows)
+
 
 @dataclass(frozen=True, slots=True)
 class _BCGameKey:
@@ -126,6 +130,10 @@ class _BCSeriesHistoryStore:
 
     def is_ended(self, series_key: SeriesPerspectiveKey) -> bool:
         return series_key in self._ended
+
+    @property
+    def has_partial_games(self) -> bool:
+        return bool(self._partial)
 
     def partial_fragments(self, game_key: _BCGameKey) -> tuple[Tensor, ...]:
         return tuple(self._partial.get(game_key, ()))
@@ -209,6 +217,244 @@ class BCEvaluationMetrics:
             "confidence_buckets": dict(self.confidence_buckets),
             "candidate_set_sizes": dict(self.candidate_set_sizes),
         }
+
+
+_CONFIDENCE_BUCKET_NAMES = ("[0,.25)", "[.25,.5)", "[.5,.75)", "[.75,1]")
+_DECISION_TYPE_BIN_COUNT = max(int(decision_type) for decision_type in DecisionType) + 1
+
+
+def _binned_evaluation_totals(
+    bin_ids: Tensor,
+    labeled_mask: Tensor,
+    safe_nll: Tensor,
+    *,
+    minlength: int = 0,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if bin_ids.dim() != 1 or labeled_mask.shape != bin_ids.shape or safe_nll.shape != bin_ids.shape:
+        raise ValueError("Evaluation bin inputs must be aligned one-dimensional tensors")
+    if bin_ids.dtype != torch.long or labeled_mask.dtype != torch.bool:
+        raise ValueError("Evaluation bin ids and labeled mask have invalid dtypes")
+    if bin_ids.device != labeled_mask.device or bin_ids.device != safe_nll.device:
+        raise ValueError("Evaluation bin inputs must share a device")
+
+    decisions = torch.bincount(bin_ids, minlength=minlength)
+    labeled = torch.bincount(bin_ids[labeled_mask], minlength=decisions.numel())
+    labeled_nll = torch.where(
+        labeled_mask,
+        safe_nll.to(dtype=torch.float64),
+        torch.zeros((), dtype=torch.float64, device=safe_nll.device),
+    )
+    nll_sums = torch.bincount(
+        bin_ids,
+        weights=labeled_nll,
+        minlength=decisions.numel(),
+    )
+    return decisions, labeled, nll_sums
+
+
+def _merge_bin_totals(
+    current: tuple[Tensor, Tensor, Tensor],
+    update: tuple[Tensor, Tensor, Tensor],
+) -> tuple[Tensor, Tensor, Tensor]:
+    if current[0].numel() == update[0].numel():
+        for current_values, update_values in zip(current, update, strict=True):
+            current_values.add_(update_values)
+        return current
+
+    width = max(current[0].numel(), update[0].numel())
+    merged: list[Tensor] = []
+    for current_values, update_values in zip(current, update, strict=True):
+        if current_values.numel() < width:
+            current_values = torch.cat(
+                (
+                    current_values,
+                    current_values.new_zeros(width - current_values.numel()),
+                )
+            )
+        if update_values.numel() < width:
+            update_values = torch.cat(
+                (
+                    update_values,
+                    update_values.new_zeros(width - update_values.numel()),
+                )
+            )
+        merged.append(current_values + update_values)
+    return merged[0], merged[1], merged[2]
+
+
+def _finalize_evaluation_bins(
+    totals: tuple[Tensor, Tensor, Tensor],
+    *,
+    names: tuple[str, ...] | None = None,
+) -> dict[str, Mapping[str, float | int]]:
+    decision_values = totals[0].cpu().tolist()
+    labeled_values = totals[1].cpu().tolist()
+    nll_values = totals[2].cpu().tolist()
+    result: dict[str, Mapping[str, float | int]] = {}
+    for index, decision_count in enumerate(decision_values):
+        if not decision_count:
+            continue
+        key = names[index] if names is not None else str(index)
+        labeled_count = int(labeled_values[index])
+        result[key] = {
+            "decisions": int(decision_count),
+            "labeled": labeled_count,
+            "nll": float(nll_values[index]) / max(labeled_count, 1),
+        }
+    return result
+
+
+@dataclass(slots=True)
+class _BCEvaluationAccumulator:
+    counts: Tensor
+    nll_sums: Tensor
+    decision_type_totals: tuple[Tensor, Tensor, Tensor]
+    confidence_totals: tuple[Tensor, Tensor, Tensor]
+    confidence_boundaries: Tensor
+    candidate_counts: Tensor
+
+    @classmethod
+    def create(cls, device: torch.device) -> _BCEvaluationAccumulator:
+        empty_long = torch.zeros(0, dtype=torch.long, device=device)
+        return cls(
+            counts=torch.zeros(8, dtype=torch.long, device=device),
+            nll_sums=torch.zeros(3, dtype=torch.float64, device=device),
+            decision_type_totals=(
+                torch.zeros(_DECISION_TYPE_BIN_COUNT, dtype=torch.long, device=device),
+                torch.zeros(_DECISION_TYPE_BIN_COUNT, dtype=torch.long, device=device),
+                torch.zeros(_DECISION_TYPE_BIN_COUNT, dtype=torch.float64, device=device),
+            ),
+            confidence_totals=(
+                torch.zeros(4, dtype=torch.long, device=device),
+                torch.zeros(4, dtype=torch.long, device=device),
+                torch.zeros(4, dtype=torch.float64, device=device),
+            ),
+            confidence_boundaries=torch.tensor((0.25, 0.5, 0.75), device=device),
+            candidate_counts=empty_long.clone(),
+        )
+
+    def add(
+        self,
+        batch: BCDecisionBatch,
+        *,
+        candidate_offsets: Tensor,
+        exact: Tensor,
+        partial: Tensor,
+        unknown: Tensor,
+        labeled_mask: Tensor,
+        marginal_nll: Tensor,
+        safe_nll: Tensor,
+        predicted: Tensor,
+        best_scores: Tensor,
+    ) -> None:
+        exact_correct = torch.all(
+            predicted[exact] == batch.exact_action.to(predicted.device)[exact],
+            dim=1,
+        ).sum()
+        self.counts += torch.stack(
+            (
+                exact.sum() + partial.sum() + unknown.sum(),
+                labeled_mask.sum(),
+                unknown.sum(),
+                exact.sum(),
+                partial.sum(),
+                exact_correct,
+                (~torch.isfinite(best_scores)).sum(),
+                ((~torch.isfinite(marginal_nll)) & labeled_mask).sum(),
+            )
+        )
+        safe_nll_64 = safe_nll.to(dtype=torch.float64)
+        self.nll_sums += torch.stack(
+            (
+                safe_nll_64[labeled_mask].sum(),
+                safe_nll_64[exact].sum(),
+                safe_nll_64[partial].sum(),
+            )
+        )
+
+        decision_types = batch.decision_type.to(exact.device)
+        self.decision_type_totals = _merge_bin_totals(
+            self.decision_type_totals,
+            _binned_evaluation_totals(
+                decision_types,
+                labeled_mask,
+                safe_nll,
+                minlength=_DECISION_TYPE_BIN_COUNT,
+            ),
+        )
+
+        confidence = batch.label_confidence.to(exact.device)
+        bucket_ids = torch.bucketize(confidence, self.confidence_boundaries)
+        self.confidence_totals = _merge_bin_totals(
+            self.confidence_totals,
+            _binned_evaluation_totals(
+                bucket_ids,
+                labeled_mask,
+                safe_nll,
+                minlength=len(_CONFIDENCE_BUCKET_NAMES),
+            ),
+        )
+
+        candidate_sizes = candidate_offsets[1:] - candidate_offsets[:-1]
+        batch_candidate_counts = torch.bincount(candidate_sizes)
+        width = max(self.candidate_counts.numel(), batch_candidate_counts.numel())
+        if self.candidate_counts.numel() < width:
+            self.candidate_counts = torch.cat(
+                (
+                    self.candidate_counts,
+                    self.candidate_counts.new_zeros(width - self.candidate_counts.numel()),
+                )
+            )
+        if batch_candidate_counts.numel() < width:
+            batch_candidate_counts = torch.cat(
+                (
+                    batch_candidate_counts,
+                    batch_candidate_counts.new_zeros(width - batch_candidate_counts.numel()),
+                )
+            )
+        self.candidate_counts.add_(batch_candidate_counts)
+
+    def finalize(self) -> BCEvaluationMetrics:
+        counts = self.counts.cpu().tolist()
+        nll_sums = self.nll_sums.cpu().tolist()
+        candidate_counts = self.candidate_counts.cpu().tolist()
+        decisions, labeled, unknown, exact, partial = (int(value) for value in counts[:5])
+        return BCEvaluationMetrics(
+            overall_nll=float(nll_sums[0]) / max(labeled, 1),
+            exact_nll=float(nll_sums[1]) / max(exact, 1),
+            partial_nll=float(nll_sums[2]) / max(partial, 1),
+            exact_joint_accuracy=int(counts[5]) / max(exact, 1),
+            decisions=decisions,
+            labeled_decisions=labeled,
+            unknown_decisions=unknown,
+            exact_decisions=exact,
+            partial_decisions=partial,
+            illegal_predictions=int(counts[6]),
+            non_finite_values=int(counts[7]),
+            by_decision_type=_finalize_evaluation_bins(self.decision_type_totals),
+            confidence_buckets=_finalize_evaluation_bins(
+                self.confidence_totals,
+                names=_CONFIDENCE_BUCKET_NAMES,
+            ),
+            candidate_set_sizes={
+                str(size): int(count) for size, count in enumerate(candidate_counts) if count
+            },
+        )
+
+
+def _empty_training_totals() -> dict[str, float | int]:
+    return {
+        "loss": 0.0,
+        "loss_weight": 0.0,
+        "exact_nll": 0.0,
+        "partial_nll": 0.0,
+        "decisions": 0,
+        "labeled_decisions": 0,
+        "exact_decisions": 0,
+        "partial_decisions": 0,
+        "updates": 0,
+        "games": 0,
+    }
 
 
 def _compact_observations(
@@ -395,17 +641,7 @@ class BCTrainer:
         if self.config.epochs > 1 and iter(self.dataset) is self.dataset:
             raise ValueError("BC datasets must be re-iterable when epochs is greater than one")
 
-        totals: dict[str, float | int] = {
-            "loss": 0.0,
-            "exact_nll": 0.0,
-            "partial_nll": 0.0,
-            "decisions": 0,
-            "labeled_decisions": 0,
-            "exact_decisions": 0,
-            "partial_decisions": 0,
-            "updates": 0,
-            "games": 0,
-        }
+        totals = _empty_training_totals()
 
         for _ in range(self.config.epochs):
             epoch_totals = self._train_epoch_totals()
@@ -424,18 +660,9 @@ class BCTrainer:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
-        totals: dict[str, float | int] = {
-            "loss": 0.0,
-            "exact_nll": 0.0,
-            "partial_nll": 0.0,
-            "decisions": 0,
-            "labeled_decisions": 0,
-            "exact_decisions": 0,
-            "partial_decisions": 0,
-            "updates": 0,
-            "games": 0,
-        }
+        totals = _empty_training_totals()
         accumulated_decisions = 0
+        accumulated_loss_weight = 0.0
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -452,15 +679,22 @@ class BCTrainer:
         for batch in dataloader:
             if self.cancel_requested():
                 raise BCCancelled("Behaviour-cloning training was cancelled")
-            self._backward_chunk(batch, totals)
+            accumulated_loss_weight += self._backward_chunk(batch, totals)
             accumulated_decisions += batch.decisions
 
-            if accumulated_decisions >= self.batch_decisions:
-                self._step_optimizer()
+            if (
+                accumulated_decisions >= self.batch_decisions
+                and not self._series_history.has_partial_games
+            ):
+                if accumulated_loss_weight > 0:
+                    totals["updates"] += int(self._step_optimizer(accumulated_loss_weight))
                 accumulated_decisions = 0
+                accumulated_loss_weight = 0.0
 
-        if accumulated_decisions > 0:
-            self._step_optimizer()
+        if self._series_history.has_partial_games:
+            raise ValueError("BC dataset ended with an incomplete perspective-game")
+        if accumulated_loss_weight > 0:
+            totals["updates"] += int(self._step_optimizer(accumulated_loss_weight))
 
         self._series_history.clear()
         return totals
@@ -470,7 +704,7 @@ class BCTrainer:
             torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
         )
         return {
-            "loss": float(totals["loss"]) / max(int(totals["labeled_decisions"]), 1),
+            "loss": float(totals["loss"]) / max(float(totals["loss_weight"]), 1.0),
             "exact_nll": float(totals["exact_nll"]) / max(int(totals["exact_decisions"]), 1),
             "partial_nll": float(totals["partial_nll"]) / max(int(totals["partial_decisions"]), 1),
             "decisions": int(totals["decisions"]),
@@ -479,8 +713,14 @@ class BCTrainer:
             "partial_decisions": int(totals["partial_decisions"]),
             "updates": int(totals["updates"]),
             "games": int(totals["games"]),
-            "decisions_per_update": float(totals["decisions"]) / max(int(totals["updates"]), 1),
-            "games_per_update": float(totals["games"]) / max(int(totals["updates"]), 1),
+            "decisions_per_update": (
+                float(totals["decisions"]) / int(totals["updates"])
+                if int(totals["updates"])
+                else 0.0
+            ),
+            "games_per_update": (
+                float(totals["games"]) / int(totals["updates"]) if int(totals["updates"]) else 0.0
+            ),
             "peak_memory_bytes": peak_memory,
         }
 
@@ -729,14 +969,26 @@ class BCTrainer:
         actions, log_probs, _, _ = self.policy.actor.greedy(*model_inputs)
         return actions, log_probs
 
-    def _step_optimizer(self) -> None:
+    def _step_optimizer(self, loss_weight: float) -> bool:
+        if loss_weight <= 0:
+            raise ValueError("loss_weight must be positive before an optimizer step")
         self.scaler.unscale_(self.optimizer)
+        inverse_weight = 1.0 / loss_weight
+        for parameter in self.policy.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(inverse_weight)
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        previous_scale = self.scaler.get_scale()
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
+        return self.scaler.get_scale() >= previous_scale
 
-    def _backward_chunk(self, batch: BCDecisionBatch, totals: dict[str, float | int]) -> None:
+    def _backward_chunk(
+        self,
+        batch: BCDecisionBatch,
+        totals: dict[str, float | int],
+    ) -> float:
         labels = batch.label_kind.to(self.device)
         loss_mask = batch.loss_mask.to(self.device)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
@@ -754,22 +1006,23 @@ class BCTrainer:
         loss_sum = 0.0
 
         if labeled_decisions:
-            loss = objective.loss * (batch.decisions / self.batch_decisions)
+            loss = objective.loss * objective.loss_weight
             if not torch.isfinite(loss):
                 raise ValueError("Non-finite BC loss in a collated decision batch")
             self.scaler.scale(loss).backward()
-            loss_sum = objective.loss.detach().item() * labeled_decisions
+            loss_sum = objective.loss.detach().item() * objective.loss_weight
 
         self._series_history.apply(history_updates)
         totals["loss"] += loss_sum
+        totals["loss_weight"] += objective.loss_weight
         totals["exact_nll"] += objective.exact_nll.detach().item() * exact_decisions
         totals["partial_nll"] += objective.partial_nll.detach().item() * partial_decisions
         totals["decisions"] += batch.decisions
         totals["labeled_decisions"] += labeled_decisions
         totals["exact_decisions"] += exact_decisions
         totals["partial_decisions"] += partial_decisions
-        totals["updates"] += int(labeled_decisions > 0)
-        totals["games"] += batch.games
+        totals["games"] += batch.completed_game_count
+        return objective.loss_weight
 
     @torch.inference_mode()
     def evaluate(
@@ -781,164 +1034,63 @@ class BCTrainer:
         self._series_history.clear()
         source = self.dataset if dataset is None else dataset
 
-        nll_sum = 0.0
-        exact_nll_sum = 0.0
-        partial_nll_sum = 0.0
-        decisions = 0
-        labeled = 0
-        unknown_count = 0
-        exact_count = 0
-        partial_count = 0
-        exact_correct = 0
-        illegal_predictions = 0
-        non_finite = 0
-
-        candidate_sizes: Counter[str] = Counter()
-        type_totals: dict[str, dict[str, float | int]] = {}
-        confidence_totals: dict[str, dict[str, float | int]] = {}
-        bucket_names = ("[0,.25)", "[.25,.5)", "[.5,.75)", "[.75,1]")
-        boundaries = torch.tensor((0.25, 0.5, 0.75))
-
+        accumulator = _BCEvaluationAccumulator.create(self.device)
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
 
         for batch in collate_bc_batches(source, chunk_size):
             prepared = self._prepare_model_inputs(batch)
             model_inputs = prepared.model_inputs
+            candidate_offsets = batch.candidate_offsets.to(self.device)
             candidate_log_probs = self.policy.actor.score_joint_candidates(
                 *model_inputs,
                 batch.candidate_values.to(self.device),
-                batch.candidate_offsets.to(self.device),
+                candidate_offsets,
             )
 
-            objective = compute_bc_objective(
-                candidate_log_probs,
-                batch.candidate_offsets.to(self.device),
-                batch.label_kind.to(self.device),
-                batch.loss_mask.to(self.device),
+            _validate_objective_inputs(
+                candidate_log_probs.numel(),
+                batch.candidate_offsets,
+                batch.label_kind,
+                batch.loss_mask,
             )
-
             labels = batch.label_kind.to(self.device)
             exact = labels == int(LabelKind.EXACT)
             partial = labels == int(LabelKind.PARTIAL)
             unknown = labels == int(LabelKind.UNKNOWN)
             labeled_mask = exact | partial
 
-            marginal_nll = -objective.marginal_log_probs
-            finite_labeled = torch.isfinite(marginal_nll[labeled_mask])
-            non_finite += int((~finite_labeled).sum())
-
+            marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
             safe_nll = torch.where(
                 torch.isfinite(marginal_nll),
                 marginal_nll,
                 torch.zeros_like(marginal_nll),
             )
 
-            nll_sum += float(safe_nll[labeled_mask].sum())
-            exact_nll_sum += float(safe_nll[exact].sum())
-            partial_nll_sum += float(safe_nll[partial].sum())
-
             predicted, best_scores = self._greedy_actions(model_inputs)
-            illegal_predictions += int((~torch.isfinite(best_scores)).sum())
-
-            exact_correct += int(
-                torch.all(
-                    predicted[exact] == batch.exact_action.to(self.device)[exact],
-                    dim=1,
-                ).sum()
+            accumulator.add(
+                batch,
+                candidate_offsets=candidate_offsets,
+                exact=exact,
+                partial=partial,
+                unknown=unknown,
+                labeled_mask=labeled_mask,
+                marginal_nll=marginal_nll,
+                safe_nll=safe_nll,
+                predicted=predicted,
+                best_scores=best_scores,
             )
             self._series_history.apply(prepared.history_updates)
 
-            batch_decisions = batch.decisions
-            decisions += batch_decisions
-
-            exact_batch = int(exact.sum())
-            partial_batch = int(partial.sum())
-            unknown_batch = int(unknown.sum())
-
-            exact_count += exact_batch
-            partial_count += partial_batch
-            unknown_count += unknown_batch
-            labeled += exact_batch + partial_batch
-
-            counts = (batch.candidate_offsets[1:] - batch.candidate_offsets[:-1]).tolist()
-            candidate_sizes.update(str(count) for count in counts)
-
-            bucket_ids = torch.bucketize(batch.label_confidence, boundaries).tolist()
-            decision_types = batch.decision_type.tolist()
-            labeled_rows = labeled_mask.cpu().tolist()
-            nll_rows = safe_nll.cpu().tolist()
-
-            for decision_type, bucket_id, is_labeled, decision_nll in zip(
-                decision_types,
-                bucket_ids,
-                labeled_rows,
-                nll_rows,
-                strict=True,
-            ):
-                type_key = str(decision_type)
-                type_item = type_totals.setdefault(
-                    type_key,
-                    {"decisions": 0, "labeled": 0, "nll_sum": 0.0},
-                )
-                type_item["decisions"] = int(type_item["decisions"]) + 1
-                if is_labeled:
-                    type_item["labeled"] = int(type_item["labeled"]) + 1
-                    type_item["nll_sum"] = float(type_item["nll_sum"]) + decision_nll
-
-                bucket_key = bucket_names[bucket_id]
-                bucket_item = confidence_totals.setdefault(
-                    bucket_key,
-                    {"decisions": 0, "labeled": 0, "nll_sum": 0.0},
-                )
-                bucket_item["decisions"] = int(bucket_item["decisions"]) + 1
-                if is_labeled:
-                    bucket_item["labeled"] = int(bucket_item["labeled"]) + 1
-                    bucket_item["nll_sum"] = float(bucket_item["nll_sum"]) + decision_nll
-
         self._series_history.clear()
-
-        def finalized(
-            values: Mapping[str, Mapping[str, float | int]],
-        ) -> dict[str, Mapping[str, float | int]]:
-            result: dict[str, Mapping[str, float | int]] = {}
-            for key, item in sorted(values.items()):
-                labeled_item = int(item["labeled"])
-                result[key] = {
-                    "decisions": int(item["decisions"]),
-                    "labeled": labeled_item,
-                    "nll": float(item["nll_sum"]) / max(labeled_item, 1),
-                }
-            return result
-
-        return BCEvaluationMetrics(
-            overall_nll=nll_sum / max(labeled, 1),
-            exact_nll=exact_nll_sum / max(exact_count, 1),
-            partial_nll=partial_nll_sum / max(partial_count, 1),
-            exact_joint_accuracy=exact_correct / max(exact_count, 1),
-            decisions=decisions,
-            labeled_decisions=labeled,
-            unknown_decisions=unknown_count,
-            exact_decisions=exact_count,
-            partial_decisions=partial_count,
-            illegal_predictions=illegal_predictions,
-            non_finite_values=non_finite,
-            by_decision_type=finalized(type_totals),
-            confidence_buckets=finalized(confidence_totals),
-            candidate_set_sizes=dict(
-                sorted(candidate_sizes.items(), key=lambda item: int(item[0]))
-            ),
-        )
+        return accumulator.finalize()
 
 
 def _validate_objective_inputs(
-    candidate_log_probs: Tensor,
+    candidate_count: int,
     candidate_offsets: Tensor,
     label_kind: Tensor,
     loss_mask: Tensor,
-) -> Tensor:
-    if candidate_log_probs.dim() != 1:
-        raise ValueError("candidate_log_probs must be one-dimensional")
-
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     if candidate_offsets.dim() != 1 or candidate_offsets.dtype != torch.long:
         raise ValueError("candidate_offsets must be a one-dimensional torch.long tensor")
 
@@ -951,19 +1103,13 @@ def _validate_objective_inputs(
     if label_kind.numel() != loss_mask.numel():
         raise ValueError("label_kind and loss_mask must have matching lengths")
 
-    if candidate_offsets.device != candidate_log_probs.device:
-        candidate_offsets = candidate_offsets.to(candidate_log_probs.device)
-
     if (
-        label_kind.device != candidate_log_probs.device
-        or loss_mask.device != candidate_log_probs.device
+        candidate_offsets.device != label_kind.device
+        or candidate_offsets.device != loss_mask.device
     ):
-        raise ValueError("objective tensors must share a device")
+        raise ValueError("candidate label-contract tensors must share a device")
 
-    if (
-        candidate_offsets[0].item() != 0
-        or candidate_offsets[-1].item() != candidate_log_probs.numel()
-    ):
+    if candidate_offsets[0].item() != 0 or candidate_offsets[-1].item() != candidate_count:
         raise ValueError("candidate_offsets must start at zero and end at candidate count")
 
     if torch.any(candidate_offsets[1:] < candidate_offsets[:-1]):
@@ -972,7 +1118,26 @@ def _validate_objective_inputs(
     if torch.any((loss_mask < 0) | (loss_mask > 1)):
         raise ValueError("loss_mask values must be in [0, 1]")
 
-    return candidate_offsets
+    exact = label_kind == int(LabelKind.EXACT)
+    partial = label_kind == int(LabelKind.PARTIAL)
+    unknown = label_kind == int(LabelKind.UNKNOWN)
+
+    if torch.any(~(exact | partial | unknown)):
+        raise ValueError("label_kind contains an unsupported label")
+
+    counts = candidate_offsets[1:] - candidate_offsets[:-1]
+    if torch.any(exact & (counts != 1)):
+        raise ValueError("EXACT labels must have exactly one candidate")
+    if torch.any(partial & (counts < 2)):
+        raise ValueError("PARTIAL labels must have at least two candidates")
+    if torch.any(unknown & (counts != 0)):
+        raise ValueError("UNKNOWN labels must not have candidates")
+    if torch.any(unknown & (loss_mask != 0)):
+        raise ValueError("UNKNOWN labels must have a zero loss mask")
+    if torch.any((exact | partial) & (loss_mask == 0)):
+        raise ValueError("Labeled decisions must have a nonzero loss mask")
+
+    return candidate_offsets, exact, partial, unknown
 
 
 def _ragged_logsumexp(candidate_log_probs: Tensor, offsets: Tensor) -> Tensor:
@@ -1018,29 +1183,21 @@ def compute_bc_objective(
     Returns:
       A BCObjective dataclass containing the computed loss, metrics, and marginal log probabilities.
     """
-    offsets = _validate_objective_inputs(
-        candidate_log_probs, candidate_offsets, label_kind, loss_mask
+    if candidate_log_probs.dim() != 1:
+        raise ValueError("candidate_log_probs must be one-dimensional")
+    if (
+        candidate_offsets.device != candidate_log_probs.device
+        or label_kind.device != candidate_log_probs.device
+        or loss_mask.device != candidate_log_probs.device
+    ):
+        raise ValueError("objective tensors must share a device")
+
+    offsets, exact, partial, _ = _validate_objective_inputs(
+        candidate_log_probs.numel(),
+        candidate_offsets,
+        label_kind,
+        loss_mask,
     )
-
-    exact = label_kind == int(LabelKind.EXACT)
-    partial = label_kind == int(LabelKind.PARTIAL)
-    unknown = label_kind == int(LabelKind.UNKNOWN)
-
-    if torch.any(~(exact | partial | unknown)):
-        raise ValueError("label_kind contains an unsupported label")
-
-    counts = offsets[1:] - offsets[:-1]
-
-    if torch.any(exact & (counts != 1)):
-        raise ValueError("EXACT labels must have exactly one candidate")
-    if torch.any(partial & (counts < 2)):
-        raise ValueError("PARTIAL labels must have at least two candidates")
-    if torch.any(unknown & (counts != 0)):
-        raise ValueError("UNKNOWN labels must not have candidates")
-    if torch.any(unknown & (loss_mask != 0)):
-        raise ValueError("UNKNOWN labels must have a zero loss mask")
-    if torch.any((exact | partial) & (loss_mask == 0)):
-        raise ValueError("Labeled decisions must have a nonzero loss mask")
 
     # EXACT decisions carry exactly one candidate, so their marginal is that candidate's
     # log-probability and the exact and marginal objectives coincide.
@@ -1055,7 +1212,8 @@ def compute_bc_objective(
     )
 
     mask_total = loss_mask.sum()
-    labeled_count = int(mask_total.item())
+    labeled_count = int((exact | partial).sum().item())
+    loss_weight = float(mask_total.item())
     exact_count = int(exact.sum().item())
     partial_count = int(partial.sum().item())
 
@@ -1070,6 +1228,7 @@ def compute_bc_objective(
         exact_count=exact_count,
         partial_count=partial_count,
         labeled_count=labeled_count,
+        loss_weight=loss_weight,
     )
 
 

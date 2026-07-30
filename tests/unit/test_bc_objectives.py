@@ -19,10 +19,24 @@ def test_exact_and_partial_losses_match_probability_definitions() -> None:
     expected_partial = -math.log(0.75)
     assert result.exact_count == 1 and result.partial_count == 1
     assert result.labeled_count == 2
+    assert result.loss_weight == 2.0
     assert result.exact_nll.item() == pytest.approx(expected_exact)
     assert result.partial_nll.item() == pytest.approx(expected_partial)
     assert result.loss.item() == pytest.approx((expected_exact + expected_partial) / 2)
     assert result.marginal_log_probs[2].isneginf()
+
+
+def test_fractional_loss_weights_do_not_change_labeled_counts() -> None:
+    result = compute_bc_objective(
+        torch.log(torch.tensor([0.25, 0.75])),
+        torch.tensor([0, 1, 2], dtype=torch.long),
+        torch.tensor([int(LabelKind.EXACT), int(LabelKind.EXACT)]),
+        torch.tensor([0.25, 0.75]),
+    )
+
+    assert result.labeled_count == 2
+    assert result.loss_weight == 1.0
+    assert result.loss.item() == pytest.approx(-0.25 * math.log(0.25) - 0.75 * math.log(0.75))
 
 
 def test_unknown_steps_have_zero_loss_and_preserve_boundaries() -> None:

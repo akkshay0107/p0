@@ -85,7 +85,10 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
 
     assert metrics["decisions"] == 2
     assert metrics["labeled_decisions"] == 2
-    assert metrics["updates"] == 2
+    assert metrics["updates"] == 1
+    assert metrics["games"] == 1
+    assert metrics["decisions_per_update"] == 2
+    assert metrics["games_per_update"] == 1
     assert torch.isfinite(torch.tensor(metrics["loss"]))
     assert any(
         not torch.equal(before[name], parameter)
@@ -103,6 +106,47 @@ def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
     assert metrics["decisions"] == 2
     assert metrics["labeled_decisions"] == 1
     assert metrics["exact_decisions"] == 1
+
+
+def test_unknown_only_game_does_not_report_an_optimizer_update() -> None:
+    chunk = _chunk(
+        [int(LabelKind.UNKNOWN), int(LabelKind.UNKNOWN)],
+        [],
+        [0, 0, 0],
+    )
+
+    metrics = _trainer(chunk, minibatch_size=1).train()
+
+    assert metrics["updates"] == 0
+    assert metrics["games"] == 1
+    assert metrics["decisions_per_update"] == 0.0
+    assert metrics["games_per_update"] == 0.0
+
+
+def test_game_boundary_accumulation_uses_total_loss_weight() -> None:
+    chunk = _chunk(
+        [int(LabelKind.EXACT)] * 4,
+        [(7, 8)] * 4,
+        [0, 1, 2, 3, 4],
+    )
+    whole_game = _trainer(chunk, minibatch_size=4)
+    decision_chunks = _trainer(chunk, minibatch_size=1)
+
+    with patch.object(
+        whole_game,
+        "_step_optimizer",
+        wraps=whole_game._step_optimizer,
+    ) as whole_step:
+        whole_metrics = whole_game.train()
+    with patch.object(
+        decision_chunks,
+        "_step_optimizer",
+        wraps=decision_chunks._step_optimizer,
+    ) as chunk_step:
+        chunk_metrics = decision_chunks.train()
+
+    assert whole_metrics["updates"] == chunk_metrics["updates"] == 1
+    assert whole_step.call_args.args == chunk_step.call_args.args == (4.0,)
 
 
 def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
@@ -283,6 +327,7 @@ def test_bc_loss_trains_series_resampler() -> None:
     batch = next(collate_bc_batches((first, second), 4))
     totals: dict[str, float | int] = {
         "loss": 0.0,
+        "loss_weight": 0.0,
         "exact_nll": 0.0,
         "partial_nll": 0.0,
         "decisions": 0,

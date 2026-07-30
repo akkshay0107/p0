@@ -188,6 +188,11 @@ def test_validation_is_deterministic_inference_only_and_reports_all_counts() -> 
         [(7, 8), (7, 8), (9, 10)],
         [0, 0, 1, 3],
     )
+    game = replace(
+        game,
+        decision_type=torch.tensor((1, 2, 2)),
+        label_confidence=torch.tensor((0.1, 0.3, 0.8)),
+    )
     policy = build_policy(
         ModelConfig(d_model=64, nhead=4, reducer_layers=1, dim_feedforward=128),
         default_runtime_resources(),
@@ -211,6 +216,17 @@ def test_validation_is_deterministic_inference_only_and_reports_all_counts() -> 
     assert first.partial_decisions == 1
     assert first.non_finite_values == 0
     assert first.illegal_predictions == 0
+    assert first.by_decision_type["1"] == {
+        "decisions": 1,
+        "labeled": 0,
+        "nll": 0.0,
+    }
+    assert first.by_decision_type["2"]["decisions"] == 2
+    assert first.by_decision_type["2"]["labeled"] == 2
+    assert first.confidence_buckets["[0,.25)"]["decisions"] == 1
+    assert first.confidence_buckets["[.25,.5)"]["labeled"] == 1
+    assert first.confidence_buckets["[.75,1]"]["labeled"] == 1
+    assert first.candidate_set_sizes == {"0": 1, "1": 1, "2": 1}
     assert all(
         torch.equal(before[name], parameter) for name, parameter in policy.named_parameters()
     )
