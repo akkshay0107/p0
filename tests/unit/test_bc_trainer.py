@@ -1,14 +1,18 @@
+from dataclasses import replace
+from unittest.mock import patch
+
 import pytest
 import torch
 
 from p0.format_config import FORMAT
+from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
-from p0.training.bc import BCTrainer
+from p0.training.bc import BCGameWindow, BCTrainer, collate_bc_batches
 from p0.training.config import BCConfig
 
 
@@ -109,6 +113,101 @@ def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
     changed_last = trainer._history_inputs(changed_ancient, slice(51, 52))
     for original_part, changed_part in zip(original_last, changed_last, strict=True):
         torch.testing.assert_close(original_part, changed_part)
+
+
+def test_collated_context_is_compact_and_never_crosses_game_boundaries() -> None:
+    first = _chunk(
+        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
+        [(7, 8), (7, 8)],
+        [0, 1, 2],
+    )
+    second = _chunk(
+        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
+        [(7, 8), (7, 8)],
+        [0, 1, 2],
+    )
+    second = replace(second, series_id="series-2")
+
+    batch = next(collate_bc_batches((first, second), 4))
+
+    assert all(isinstance(window, BCGameWindow) for window in batch.windows)
+    assert batch.target_indices.tolist() == [0, 1, 2, 3]
+    assert not torch.any(batch.history_mask[2])
+    assert batch.history_indices[3, -1] == 2
+    assert batch.history_mask[3, -1]
+    for tensor in batch.observations.tensors():
+        assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+
+
+def test_model_inputs_encode_all_game_windows_once() -> None:
+    first = _chunk(
+        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
+        [(7, 8), (7, 8)],
+        [0, 1, 2],
+    )
+    second = _chunk(
+        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
+        [(7, 8), (7, 8)],
+        [0, 1, 2],
+    )
+    trainer = _trainer(first, minibatch_size=4)
+    batch = next(collate_bc_batches((first, second), 4))
+
+    with (
+        torch.inference_mode(),
+        patch.object(trainer.policy, "encode", wraps=trainer.policy.encode) as encode,
+    ):
+        model_inputs = trainer._model_inputs(batch)
+
+    assert encode.call_count == 1
+    assert model_inputs[0].tokens.size(0) == batch.decisions
+    assert model_inputs[4].shape[:2] == (batch.decisions, HISTORY_WINDOW)
+
+
+def test_continued_chunk_matches_per_window_reference_inputs() -> None:
+    length = 100
+    game = _chunk(
+        [int(LabelKind.EXACT)] * length,
+        [(7, 8)] * length,
+        list(range(length + 1)),
+    )
+    trainer = _trainer(game, minibatch_size=64)
+    trainer.policy.eval()
+    batch = list(collate_bc_batches((game,), 64))[1]
+
+    with torch.inference_mode():
+        actual = trainer._model_inputs(batch)
+        context_start = 64 - HISTORY_WINDOW
+        encoded = trainer.policy.encode(
+            game.observations[context_start:],
+            game.action_mask[context_start:],
+        )
+        local_tokens = trainer.policy.local_history_tokens(encoded)
+        expected_history = trainer._history_inputs(
+            local_tokens,
+            slice(HISTORY_WINDOW, game.length - context_start),
+        )
+
+    torch.testing.assert_close(actual[0].tokens, encoded.tokens[HISTORY_WINDOW:])
+    torch.testing.assert_close(actual[0].aux, encoded.aux[HISTORY_WINDOW:])
+    torch.testing.assert_close(actual[0].numerical, encoded.numerical[HISTORY_WINDOW:])
+    for actual_part, expected_part in zip(actual[4:], expected_history, strict=True):
+        torch.testing.assert_close(actual_part, expected_part)
+
+
+def test_completed_game_payload_is_emitted_only_once() -> None:
+    length = 100
+    game = _chunk(
+        [int(LabelKind.EXACT)] * length,
+        [(7, 8)] * length,
+        list(range(length + 1)),
+    )
+
+    first, second = collate_bc_batches((game,), 64)
+
+    assert not first.completed_games
+    assert len(second.completed_games) == 1
+    assert second.completed_games[0].action_mask.size(0) == length
 
 
 def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
