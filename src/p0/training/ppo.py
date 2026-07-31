@@ -27,12 +27,10 @@ def magnet_kl_per_step(live_logits: torch.Tensor, magnet_logits: torch.Tensor) -
     live_log_probs = F.log_softmax(live_logits.float(), dim=-1)
     magnet_log_probs = F.log_softmax(magnet_logits.float(), dim=-1)
     live_probs = live_log_probs.exp()
-    safe_live_log_probs = torch.where(
-        live_probs > 0, live_log_probs, torch.zeros_like(live_log_probs)
-    )
-    safe_magnet_log_probs = torch.where(
-        live_probs > 0, magnet_log_probs, torch.zeros_like(magnet_log_probs)
-    )
+
+    safe_live_log_probs = torch.where(live_probs > 0, live_log_probs, 0.0)
+    safe_magnet_log_probs = torch.where(live_probs > 0, magnet_log_probs, 0.0)
+
     terms = live_probs * (safe_live_log_probs - safe_magnet_log_probs)
     return terms.sum(dim=-1).sum(dim=-1)
 
@@ -54,23 +52,29 @@ def compute_ppo_objective(
     """Return per-step total/policy/value losses, ratios, and log-ratios."""
     log_ratio = current_log_probs - old_log_probs
     ratio = torch.exp(log_ratio)
+
     unclipped = ratio * advantages
     clipped = torch.clamp(ratio, 1.0 - config.clip_low, 1.0 + config.clip_high) * advantages
     policy_loss = -torch.min(unclipped, clipped)
+
     value_loss = F.mse_loss(current_values, returns, reduction="none")
     total = config.value_coef * value_loss
+
     if not critic_only:
         alpha_scale = alpha * torch.where(
             team_preview.reshape(-1), config.teampreview_alpha_mult, 1.0
         )
         total = total + policy_loss + alpha_scale * magnet_kl
+
         if config.residual_entropy_coef > 0.0:
             total = total - config.residual_entropy_coef * normalized_entropy
+
     total = torch.where(
         team_preview.reshape(-1),
         total * config.teampreview_loss_mult,
         total,
     )
+
     return total, policy_loss, value_loss, ratio, log_ratio
 
 
@@ -114,6 +118,7 @@ class PPOUpdater:
 
 
 def _kl_exceeds_target(kl_sum: float, steps: int, target_kl: float) -> tuple[bool, float]:
+    """Check if the mean KL divergence exceeds the target early-stopping threshold."""
     mean_kl = kl_sum / steps if steps > 0 else 0.0
     return mean_kl > target_kl, mean_kl
 
@@ -154,16 +159,20 @@ def _build_memory_inputs(
     history_mask = torch.stack(history_mask_parts)
     history_age_ids = torch.stack(history_age_parts)
     decision_count = encoded.tokens.size(0)
-    series_tokens = torch.zeros(
-        (decision_count, SERIES_SLOTS, policy.d_model),
-        device=device,
-        dtype=dtype,
-    )
-    series_mask = torch.zeros(
-        (decision_count, SERIES_SLOTS),
-        device=device,
-        dtype=torch.bool,
-    )
+    if episodes and episodes[0].series_tokens is not None:
+        series_tokens = torch.cat([ep.series_tokens for ep in episodes if ep.series_tokens is not None], dim=0).to(device)
+        series_mask = torch.cat([ep.series_mask for ep in episodes if ep.series_mask is not None], dim=0).to(device)
+    else:
+        series_tokens = torch.zeros(
+            (decision_count, SERIES_SLOTS, policy.d_model),
+            device=device,
+            dtype=dtype,
+        )
+        series_mask = torch.zeros(
+            (decision_count, SERIES_SLOTS),
+            device=device,
+            dtype=torch.bool,
+        )
     return (
         series_tokens,
         series_mask,
@@ -211,26 +220,29 @@ def _run_batched_ppo(
     is_warmup = episode < config.warmup_episodes
 
     all_obs = StructuredObservation.cat([ep.observations for ep in episodes], dim=0)
-    all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0).to(device)
+    all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0)
     use_amp = amp_enabled(config, device)
+
     with autocast(device_type=device.type, enabled=use_amp):
         all_enc = policy.encode(all_obs, all_action_masks)
+
     if is_warmup:
         all_enc = all_enc._replace(tokens=all_enc.tokens.detach(), aux=all_enc.aux.detach())
 
-    actions = torch.cat([ep.actions for ep in episodes]).to(device)
-    old_log_probs = torch.cat([ep.log_probs for ep in episodes]).to(device)
-    advantages = torch.cat([ep.advantages for ep in episodes if ep.advantages is not None]).to(
-        device
-    )
-    returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None]).to(device)
+    actions = torch.cat([ep.actions for ep in episodes])
+    old_log_probs = torch.cat([ep.log_probs for ep in episodes])
+    advantages = torch.cat([ep.advantages for ep in episodes if ep.advantages is not None])
+    returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None])
+
     live_memory = _build_memory_inputs(policy, all_enc, episodes, device)
     magnet_enc: EncodedObs | None = None
     magnet_memory: tuple[torch.Tensor, ...] | None = None
+
     if not is_warmup:
         with torch.inference_mode(), autocast(device_type=device.type, enabled=use_amp):
             magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
             magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
+
     total_loss = torch.tensor(0.0, device=device)
     # convert them to python floats once at the end
     metrics: dict[str, Any] = {

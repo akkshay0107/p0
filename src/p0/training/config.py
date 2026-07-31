@@ -214,8 +214,10 @@ class CorpusConfig:
         ):
             if not value.strip():
                 raise ValueError(f"corpus.{name} must not be empty")
+
         if self.agent_split.upper() not in {"TRAIN", "VALIDATION", "TEST"}:
             raise ValueError("corpus.agent_split must be train, validation, or test")
+
         if self.sampling_policy.upper() not in {
             "USAGE_WEIGHTED",
             "UNIFORM_CANONICAL",
@@ -235,6 +237,7 @@ class EvalConfig:
     def __post_init__(self) -> None:
         _positive_ints(type(self).__name__, ("episodes_per_matchup", self.episodes_per_matchup))
         _non_negative(type(self).__name__, ("seed", self.seed))
+
         if not self.report_dir.strip():
             raise ValueError("evaluation.report_dir must not be empty")
 
@@ -312,30 +315,36 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
             else _resolve_path(config.bc.resume_checkpoint, repository_root)
         ),
     )
+
     return replace(config, paths=paths, bot=bot, environment=environment, bc=bc)
 
 
 def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} must be a mapping")
+
     names = {field.name for field in fields(cls)}
     unknown = set(values) - names
     if unknown:
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unknown {cls.__name__} field(s): {names}")
+
     values = dict(values)
     if bot:
         values["team_files"] = tuple(values["team_files"])
+
     return cls(**values)
 
 
 def _build_environment(values: Any) -> EnvironmentConfig:
     if not isinstance(values, Mapping):
         raise ValueError("EnvironmentConfig must be a mapping")
+
     names = {field.name for field in fields(EnvironmentConfig)}
     unknown = set(values) - names
     if unknown:
         raise ValueError(f"unknown EnvironmentConfig field(s): {', '.join(sorted(unknown))}")
+
     return EnvironmentConfig(
         agent_team_source=_build_section(TeamSourceConfig, values["agent_team_source"]),
         opponent_team_source=_build_section(TeamSourceConfig, values["opponent_team_source"]),
@@ -349,8 +358,10 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
     )
     if not path.is_absolute():
         path = DEFAULT_PATHS.repository_root / path
+
     if path.name in {".ppoconfig", ".ppoconfig.example"}:
         raise ValueError(".ppoconfig is no longer supported; migrate settings to config.yaml")
+
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {path}")
 
@@ -360,11 +371,13 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
         values = OmegaConf.to_container(merged, resolve=True)
         if not isinstance(values, Mapping):
             raise ValueError("configuration root must be a mapping")
+
         sections = {field.name for field in fields(GlobalConfig)}
         unknown = set(values) - sections
         if unknown:
             names = ", ".join(sorted(str(name) for name in unknown))
             raise ValueError(f"unknown root configuration section(s): {names}")
+
         config = GlobalConfig(
             training=_build_section(TrainingConfig, values["training"]),
             paths=_build_section(ProjectPaths, values["paths"]),

@@ -38,6 +38,7 @@ def _team_source(
     seed: int = 0,
     is_agent: bool = True,
 ) -> TeamSource:
+    """Build a team provider from the configuration, automatically parsing corpus manifests."""
     path = config.path
     if path.is_dir() and (path / "corpus_manifest.json").exists():
         path = path / "corpus_manifest.json"
@@ -74,6 +75,8 @@ def _team_source(
 
 
 def _tensorboard_sink(writer: SummaryWriter):
+    """Create a metric sink callback for Tensorboard logging."""
+
     def emit(metrics: Mapping[str, float], step: int, phase: str) -> None:
         for name, value in metrics.items():
             writer.add_scalar(f"{phase}/{name}", value, step)
@@ -82,6 +85,7 @@ def _tensorboard_sink(writer: SummaryWriter):
 
 
 def _close_environments(envs: list[SimEnv]) -> None:
+    """Cleanly close a list of Pokemon Showdown simulation environments."""
     for env in envs:
         try:
             env.close()
@@ -94,6 +98,7 @@ def _close_environments(envs: list[SimEnv]) -> None:
 
 
 def _close_vector_env(vector_env: ThreadVecEnv) -> None:
+    """Cleanly shutdown the vector environment pool and its underlying simulations."""
     vector_env.shutdown()
     _close_environments(vector_env.envs)
 
@@ -117,6 +122,7 @@ def run_training(
     training, paths = config.training, config.paths
     resources = default_runtime_resources()
     device = default_device()
+
     if paths.resume_checkpoint is not None:
         if not paths.resume_checkpoint.is_file():
             raise FileNotFoundError(
@@ -131,6 +137,7 @@ def run_training(
         policy = policy_store.load_policy(paths.initial_policy_checkpoint, device)
     else:
         policy = build_policy(ModelConfig.baseline(), resources).to(device)
+
     policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
     optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
     scaler = GradScaler(
@@ -138,6 +145,7 @@ def run_training(
     )
     magnet = Magnet(policy)
     scheduler = PPOScheduler(training)
+
     start = (
         policy_store.load_training_state(
             paths.resume_checkpoint,
@@ -152,6 +160,7 @@ def run_training(
         if paths.resume_checkpoint is not None
         else 0
     )
+
     agent_source = _team_source(
         config.environment.agent_team_source,
         corpus_config=config.corpus,
@@ -172,6 +181,7 @@ def run_training(
         envs = []
         vector_env = None
         writer = None
+
         try:
             for index, server in enumerate(servers):
                 envs.append(

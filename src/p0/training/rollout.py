@@ -22,30 +22,10 @@ ACT_SIZE = FORMAT.action_size
 MAX_TRAJECTORY_STEPS = 200
 
 __all__ = [
-    "RolloutBuffer",
     "BattleMemoryBuffer",
     "RolloutCollector",
     "collect_rollouts",
 ]
-
-
-class RolloutBuffer:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.trajectories: list[TrajectoryBatch] = []
-
-    def add_episode(self, episode: TrajectoryBatch):
-        self.trajectories.append(episode)
-
-    def get_batches(self, device: torch.device, config: TrainingConfig):
-        return prepare_trajectory_batches(
-            self.trajectories,
-            device,
-            gamma=config.gamma,
-            gae_lambda=config.gae_lambda,
-        )
 
 
 class BattleMemoryBuffer:
@@ -99,7 +79,7 @@ class BattleMemoryBuffer:
 def collect_rollouts(
     vec_env: ThreadVecEnv,
     policy: PolicyNet,
-    buffer: RolloutBuffer,
+    completed_trajectories: list[TrajectoryBatch],
     config: TrainingConfig,
     trajectories1: TrajectoryStorage,
     trajectories2: TrajectoryStorage,
@@ -113,12 +93,14 @@ def collect_rollouts(
     Arguments:
         vec_env: Batched self-play environments.
         policy: Policy used for both player seats.
-        buffer: Destination for completed trajectories.
+        completed_trajectories: Destination for completed trajectories.
         config: Rollout length and device optimization settings.
         trajectories1: Active trajectory storage for the first seat.
         trajectories2: Active trajectory storage for the second seat.
         memory1: Per-battle history for the first seat.
         memory2: Per-battle history for the second seat.
+        series_store1: Persistent cross-episode tokens for the first seat.
+        series_store2: Persistent cross-episode tokens for the second seat.
 
     Returns:
         None.
@@ -140,6 +122,7 @@ def collect_rollouts(
 
         infos = vec_env.last_infos
         assert infos is not None
+
         series_ids = [str(info["series_id"]) for info in infos if info]
         series_tokens1, series_mask1 = series_store1.get_tokens(series_ids, device)
         series_tokens2, series_mask2 = series_store2.get_tokens(series_ids, device)
@@ -152,6 +135,7 @@ def collect_rollouts(
             torch.cat([first, second], dim=0)
             for first, second in zip(memory1_inputs, memory2_inputs, strict=True)
         )
+
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled(config, device)):
             current_out = policy.act_obs(
                 current_obs,
@@ -161,21 +145,20 @@ def collect_rollouts(
                 *current_memory,
             )
 
-        actions1 = current_out.actions[:n_envs]
-        actions2 = current_out.actions[n_envs:]
-        log_probs1 = current_out.log_probs[:n_envs]
-        log_probs2 = current_out.log_probs[n_envs:]
-        values1 = current_out.value[:n_envs]
-        values2 = current_out.value[n_envs:]
         memory1.append(idx_all, current_out.history_token[:n_envs])
         memory2.append(idx_all, current_out.history_token[n_envs:])
 
-        actions1_cpu = actions1.to(device="cpu", dtype=torch.long)
-        actions2_cpu = actions2.to(device="cpu", dtype=torch.long)
-        log_probs1_cpu = log_probs1.to(device="cpu", dtype=torch.float32)
-        log_probs2_cpu = log_probs2.to(device="cpu", dtype=torch.float32)
-        values1_cpu = values1.to(device="cpu", dtype=torch.float32)
-        values2_cpu = values2.to(device="cpu", dtype=torch.float32)
+        actions_cpu = current_out.actions.to(device="cpu", dtype=torch.long)
+        log_probs_cpu = current_out.log_probs.to(device="cpu", dtype=torch.float32)
+        values_cpu = current_out.value.to(device="cpu", dtype=torch.float32)
+
+        actions1_cpu = actions_cpu[:n_envs]
+        actions2_cpu = actions_cpu[n_envs:]
+        log_probs1_cpu = log_probs_cpu[:n_envs]
+        log_probs2_cpu = log_probs_cpu[n_envs:]
+        values1_cpu = values_cpu[:n_envs]
+        values2_cpu = values_cpu[n_envs:]
+
         obs1_cpu = vec_env.obs1_buffers
         obs2_cpu = vec_env.obs2_buffers
 
@@ -186,6 +169,8 @@ def collect_rollouts(
             log_probs1_cpu,
             values1_cpu,
             torch.from_numpy(masks1).to(torch.bool),
+            series_tokens1.cpu(),
+            series_mask1.cpu(),
         )
         s2 = trajectories2.record(
             idx_all,
@@ -194,6 +179,8 @@ def collect_rollouts(
             log_probs2_cpu,
             values2_cpu,
             torch.from_numpy(masks2).to(torch.bool),
+            series_tokens2.cpu(),
+            series_mask2.cpu(),
         )
 
         env_actions = [
@@ -232,8 +219,9 @@ def collect_rollouts(
                 series_store1.drop(str(series_ids[i]))
                 series_store2.drop(str(series_ids[i]))
 
-            buffer.add_episode(trajectories1.complete(i))
-            buffer.add_episode(trajectories2.complete(i))
+            completed_trajectories.append(trajectories1.complete(i))
+            completed_trajectories.append(trajectories2.complete(i))
+
             memory1.reset(i)
             memory2.reset(i)
 
@@ -255,9 +243,9 @@ class RolloutCollector:
         self.vector_env = vector_env
         self.policy = policy
         self.config = config
-        self.buffer = RolloutBuffer()
-        self.first = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
-        self.second = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
+        self.completed_trajectories: list[TrajectoryBatch] = []
+        self.first = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps, policy.d_model)
+        self.second = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps, policy.d_model)
         self.memory1 = BattleMemoryBuffer(config.n_envs, policy.d_model)
         self.memory2 = BattleMemoryBuffer(config.n_envs, policy.d_model)
         self.series_store1 = SeriesTokenStore(policy.d_model)
@@ -267,7 +255,7 @@ class RolloutCollector:
         collect_rollouts(
             self.vector_env,
             self.policy,
-            self.buffer,
+            self.completed_trajectories,
             self.config,
             self.first,
             self.second,
@@ -278,4 +266,12 @@ class RolloutCollector:
         )
 
     def reset_completed(self) -> None:
-        self.buffer.reset()
+        self.completed_trajectories.clear()
+
+    def get_batches(self, device: torch.device) -> list[TrajectoryBatch]:
+        return prepare_trajectory_batches(
+            self.completed_trajectories,
+            device,
+            gamma=self.config.gamma,
+            gae_lambda=self.config.gae_lambda,
+        )

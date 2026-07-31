@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from p0.format_config import FORMAT
+from p0.model.architecture_contract import SERIES_SLOTS
 from p0.model.structured_observation import StructuredObservation
 
 
@@ -22,10 +23,13 @@ class TrajectoryBatch:
     length: int
     returns: torch.Tensor | None = None
     advantages: torch.Tensor | None = None
+    series_tokens: torch.Tensor | None = None
+    series_mask: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.length <= 0:
             raise ValueError("Completed trajectories must contain at least one step")
+
         if any(
             tensor.size(0) != self.length
             for tensor in (
@@ -38,9 +42,16 @@ class TrajectoryBatch:
             )
         ):
             raise ValueError("Trajectory tensor lengths do not match")
-        for name, tensor in (("returns", self.returns), ("advantages", self.advantages)):
+
+        for name, tensor in (
+            ("returns", self.returns),
+            ("advantages", self.advantages),
+            ("series_tokens", self.series_tokens),
+            ("series_mask", self.series_mask),
+        ):
             if tensor is not None and tensor.size(0) != self.length:
                 raise ValueError(f"Trajectory {name} length does not match")
+
         self.observations.validate(batch_rank=1)
 
     def to(self, device: torch.device | str) -> TrajectoryBatch:
@@ -55,16 +66,9 @@ class TrajectoryBatch:
             dones=self.dones.to(device),
             returns=None if self.returns is None else self.returns.to(device),
             advantages=None if self.advantages is None else self.advantages.to(device),
+            series_tokens=None if self.series_tokens is None else self.series_tokens.to(device),
+            series_mask=None if self.series_mask is None else self.series_mask.to(device),
         )
-
-    def target_slices(self, target_size: int) -> list[slice]:
-        """Return independent target windows for bounded PPO recomputation."""
-        if target_size <= 0:
-            raise ValueError("target_size must be positive")
-        return [
-            slice(start, min(start + target_size, self.length))
-            for start in range(0, self.length, target_size)
-        ]
 
 
 @dataclass(slots=True)
@@ -77,6 +81,8 @@ class TrajectoryStorage:
     rewards: torch.Tensor
     dones: torch.Tensor
     action_masks: torch.Tensor
+    series_tokens: torch.Tensor
+    series_mask: torch.Tensor
     max_steps: int
 
     @classmethod
@@ -84,10 +90,12 @@ class TrajectoryStorage:
         cls,
         n_envs: int,
         max_steps: int,
+        d_model: int,
         device: torch.device | str = "cpu",
     ) -> TrajectoryStorage:
         if n_envs <= 0 or max_steps <= 0:
             raise ValueError("n_envs and max_steps must be positive")
+
         flat = StructuredObservation.empty_batch(n_envs * max_steps).to(device)
         observations = StructuredObservation._from_values(
             [value.reshape(n_envs, max_steps, *value.shape[1:]) for value in flat.tensors()]
@@ -103,6 +111,8 @@ class TrajectoryStorage:
             action_masks=torch.zeros(
                 (n_envs, max_steps, 2, FORMAT.action_size), dtype=torch.bool, device=device
             ),
+            series_tokens=torch.zeros((n_envs, max_steps, SERIES_SLOTS, d_model), dtype=torch.float32, device=device),
+            series_mask=torch.zeros((n_envs, max_steps, SERIES_SLOTS), dtype=torch.bool, device=device),
             max_steps=max_steps,
         )
 
@@ -122,6 +132,8 @@ class TrajectoryStorage:
         log_probs: torch.Tensor,
         values: torch.Tensor,
         action_masks: torch.Tensor,
+        series_tokens: torch.Tensor,
+        series_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Store one decision for each selected environment and return its step indices."""
         self.ensure_capacity(env_ids)
@@ -134,6 +146,8 @@ class TrajectoryStorage:
         self.log_probs[env_ids, steps] = log_probs
         self.values[env_ids, steps] = values
         self.action_masks[env_ids, steps] = action_masks
+        self.series_tokens[env_ids, steps] = series_tokens
+        self.series_mask[env_ids, steps] = series_mask
         self.step_counts[env_ids] += 1
         return steps
 
@@ -149,6 +163,8 @@ class TrajectoryStorage:
             rewards=self.rewards[env_id, :length].clone(),
             dones=self.dones[env_id, :length].clone(),
             action_masks=self.action_masks[env_id, :length].clone(),
+            series_tokens=self.series_tokens[env_id, :length].clone(),
+            series_mask=self.series_mask[env_id, :length].clone(),
             length=length,
         )
         self.step_counts[env_id] = 0
@@ -163,14 +179,18 @@ def compute_gae_batch(
     gamma: float,
     gae_lambda: float,
 ) -> torch.Tensor:
+    """Compute Generalized Advantage Estimation (GAE) over a batch of trajectories."""
     if rewards.shape != values.shape or rewards.shape != dones.shape:
         raise ValueError("rewards, values, and dones must have matching padded shapes.")
+
     if rewards.dim() != 2 or lengths.shape != (rewards.size(0),):
         raise ValueError("Expected (batch, time) tensors and one length per batch row.")
+
     batch_size, max_steps = rewards.shape
     lengths = lengths.to(rewards.device)
     advantages = torch.zeros_like(rewards)
     gae = torch.zeros(batch_size, dtype=rewards.dtype, device=rewards.device)
+
     for step in reversed(range(max_steps)):
         active = step < lengths
         next_value = (
@@ -179,9 +199,11 @@ def compute_gae_batch(
             else torch.zeros_like(gae)
         )
         nonterminal = 1.0 - dones[:, step]
+
         delta = rewards[:, step] + gamma * next_value * nonterminal - values[:, step]
         gae = torch.where(active, delta + gamma * gae_lambda * nonterminal * gae, 0.0)
         advantages[:, step] = gae
+
     return advantages
 
 
@@ -192,8 +214,10 @@ def prepare_trajectory_batches(
     gamma: float,
     gae_lambda: float,
 ) -> list[TrajectoryBatch]:
+    """Pad and compute normalized GAE advantages for a list of trajectory batches."""
     if not trajectories:
         return []
+
     rewards = torch.nn.utils.rnn.pad_sequence(
         [trajectory.rewards for trajectory in trajectories], batch_first=True
     )
@@ -204,8 +228,10 @@ def prepare_trajectory_batches(
         [trajectory.dones for trajectory in trajectories], batch_first=True
     )
     lengths = torch.tensor([trajectory.length for trajectory in trajectories])
+
     advantages = compute_gae_batch(rewards, values, dones, lengths, gamma, gae_lambda)
     completed = []
+
     for index, trajectory in enumerate(trajectories):
         advantage = advantages[index, : trajectory.length]
         completed.append(
@@ -215,8 +241,10 @@ def prepare_trajectory_batches(
                 advantages=advantage,
             ).to(device)
         )
+
     flat = torch.cat([batch.advantages for batch in completed if batch.advantages is not None])
     mean, std = flat.mean(), flat.std(unbiased=False).clamp_min(1e-8)
+
     return [
         replace(batch, advantages=(batch.advantages - mean) / std)
         for batch in completed

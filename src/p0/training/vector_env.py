@@ -53,7 +53,7 @@ class ThreadVecEnv:
         futures = [self.executor.submit(self._reset_env, i, env) for i, env in enumerate(self.envs)]
 
         results = [f.result() for f in futures]
-        results.sort(key=lambda x: x[0])
+        results.sort(key=lambda x: x[0])  # r[0] is env_id
 
         masks1 = np.stack([r[1] for r in results])
         masks2 = np.stack([r[2] for r in results]) if results[0][2] is not None else None  # type: ignore
@@ -98,7 +98,7 @@ class ThreadVecEnv:
         ]
 
         results = [f.result() for f in futures]
-        results.sort(key=lambda x: x[0])  # guarantee order
+        results.sort(key=lambda x: x[0])  # r[0] is env_id (guarantees order)
 
         masks1 = np.stack([r[1] for r in results])
         masks2 = np.stack([r[2] for r in results]) if results[0][2] is not None else None  # type: ignore
