@@ -73,23 +73,31 @@ class ThreadVecEnv:
         mask1 = np.reshape(next_obs[agent1]["action_mask"], (2, ACT_SIZE))
         mask2 = np.reshape(next_obs[agent2]["action_mask"], (2, ACT_SIZE))
 
-        done = bool(
-            terminated[agent1] or truncated[agent1] or terminated[agent2] or truncated[agent2]
-        )
+        is_truncated = truncated[agent1] or truncated[agent2]
+        is_terminated = terminated[agent1] or terminated[agent2]
+        done_status = 2 if is_truncated else (1 if is_terminated else 0)
+
         reward1 = rewards[agent1]
         reward2 = rewards[agent2] if agent2 in rewards else 0.0
 
-        if done:
-            series_id = env.series_id
-            series_complete = max(env._series_scores) >= 2
+        if done_status > 0:
+            series_complete = max(env._series_scores) >= 2 or env._series_games_played >= 3
+            terminal_obs1 = None
+            terminal_obs2 = None
+            if is_truncated:
+                terminal_obs1 = self.obs1_buffers[env_id].clone()
+                terminal_obs2 = self.obs2_buffers[env_id].clone()
+
             _, mask1, mask2, _ = self._reset_env(env_id, env)
-            info["series_id"] = series_id  # type: ignore
+            info["series_id"] = env.series_id  # type: ignore
             info["series_complete"] = series_complete  # type: ignore
-            return env_id, mask1, mask2, reward1, reward2, done, info
+            info["terminal_observation1"] = terminal_obs1  # type: ignore
+            info["terminal_observation2"] = terminal_obs2  # type: ignore
+            return env_id, mask1, mask2, reward1, reward2, done_status, info
 
         info["series_id"] = env.series_id  # type: ignore
         info["series_complete"] = False  # type: ignore
-        return env_id, mask1, mask2, reward1, reward2, done, info
+        return env_id, mask1, mask2, reward1, reward2, done_status, info
 
     def step(self, actions: list[dict]):
         futures = [

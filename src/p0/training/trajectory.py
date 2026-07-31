@@ -25,6 +25,7 @@ class TrajectoryBatch:
     advantages: torch.Tensor | None = None
     series_tokens: torch.Tensor | None = None
     series_mask: torch.Tensor | None = None
+    bootstrap_value: float = 0.0
 
     def __post_init__(self) -> None:
         if self.length <= 0:
@@ -68,6 +69,7 @@ class TrajectoryBatch:
             advantages=None if self.advantages is None else self.advantages.to(device),
             series_tokens=None if self.series_tokens is None else self.series_tokens.to(device),
             series_mask=None if self.series_mask is None else self.series_mask.to(device),
+            bootstrap_value=self.bootstrap_value,
         )
 
 
@@ -111,8 +113,12 @@ class TrajectoryStorage:
             action_masks=torch.zeros(
                 (n_envs, max_steps, 2, FORMAT.action_size), dtype=torch.bool, device=device
             ),
-            series_tokens=torch.zeros((n_envs, max_steps, SERIES_SLOTS, d_model), dtype=torch.float32, device=device),
-            series_mask=torch.zeros((n_envs, max_steps, SERIES_SLOTS), dtype=torch.bool, device=device),
+            series_tokens=torch.zeros(
+                (n_envs, max_steps, SERIES_SLOTS, d_model), dtype=torch.float32, device=device
+            ),
+            series_mask=torch.zeros(
+                (n_envs, max_steps, SERIES_SLOTS), dtype=torch.bool, device=device
+            ),
             max_steps=max_steps,
         )
 
@@ -151,11 +157,13 @@ class TrajectoryStorage:
         self.step_counts[env_ids] += 1
         return steps
 
-    def complete(self, env_id: int) -> TrajectoryBatch:
+    def complete(self, env_id: int, bootstrap_value: float = 0.0) -> TrajectoryBatch:
         length = int(self.step_counts[env_id].item())
         if length == 0:
             raise ValueError(f"Environment {env_id} has no trajectory steps to complete")
-        batch = TrajectoryBatch(
+
+        self.step_counts[env_id] = 0
+        return TrajectoryBatch(
             observations=self.observations[env_id, :length].clone(),
             actions=self.actions[env_id, :length].clone(),
             log_probs=self.log_probs[env_id, :length].clone(),
@@ -166,9 +174,8 @@ class TrajectoryStorage:
             series_tokens=self.series_tokens[env_id, :length].clone(),
             series_mask=self.series_mask[env_id, :length].clone(),
             length=length,
+            bootstrap_value=bootstrap_value,
         )
-        self.step_counts[env_id] = 0
-        return batch
 
 
 def compute_gae_batch(
@@ -178,6 +185,7 @@ def compute_gae_batch(
     lengths: torch.Tensor,
     gamma: float,
     gae_lambda: float,
+    bootstrap_values: torch.Tensor,
 ) -> torch.Tensor:
     """Compute Generalized Advantage Estimation (GAE) over a batch of trajectories."""
     if rewards.shape != values.shape or rewards.shape != dones.shape:
@@ -190,15 +198,24 @@ def compute_gae_batch(
     lengths = lengths.to(rewards.device)
     advantages = torch.zeros_like(rewards)
     gae = torch.zeros(batch_size, dtype=rewards.dtype, device=rewards.device)
+    bootstrap_values = bootstrap_values.to(rewards.device)
+
+    # pad with extra slot and copy over values. extra slot holds the bootstrap values for
+    # games that do not end within the alloted turns. For the other batches they get
+    # zeroed out so doesnt matter.
+    extended_values = torch.zeros(
+        (batch_size, max_steps + 1), dtype=values.dtype, device=values.device
+    )
+    extended_values[:, :max_steps] = values
+
+    # step < lengths is our active mask, step + 1 == lengths evaluates to the exact boundary.
+    batch_indices = torch.arange(batch_size, device=values.device)
+    extended_values[batch_indices, lengths] = bootstrap_values
 
     for step in reversed(range(max_steps)):
         active = step < lengths
-        next_value = (
-            torch.where(step + 1 < lengths, values[:, step + 1], 0.0)
-            if step + 1 < max_steps
-            else torch.zeros_like(gae)
-        )
         nonterminal = 1.0 - dones[:, step]
+        next_value = extended_values[:, step + 1]
 
         delta = rewards[:, step] + gamma * next_value * nonterminal - values[:, step]
         gae = torch.where(active, delta + gamma * gae_lambda * nonterminal * gae, 0.0)
@@ -228,8 +245,13 @@ def prepare_trajectory_batches(
         [trajectory.dones for trajectory in trajectories], batch_first=True
     )
     lengths = torch.tensor([trajectory.length for trajectory in trajectories])
+    bootstrap_values = torch.tensor(
+        [trajectory.bootstrap_value for trajectory in trajectories], dtype=torch.float32
+    )
 
-    advantages = compute_gae_batch(rewards, values, dones, lengths, gamma, gae_lambda)
+    advantages = compute_gae_batch(
+        rewards, values, dones, lengths, gamma, gae_lambda, bootstrap_values
+    )
     completed = []
 
     for index, trajectory in enumerate(trajectories):

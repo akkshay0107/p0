@@ -191,14 +191,19 @@ def collect_rollouts(
             for i in range(n_envs)
         ]
 
-        next_masks1, next_masks2, rewards1, rewards2, dones, _ = vec_env.step(env_actions)
+        next_masks1, next_masks2, rewards1, rewards2, done_status, infos = vec_env.step(env_actions)
+
+        # RL non-terminal masking only cares if the episode naturally terminated.
+        # Status 1 is Terminated, Status 2 is Truncated.
+        game_done = (done_status == 1).astype(np.float32)
+
         trajectories1.rewards[idx_all, s1] = torch.from_numpy(rewards1)
-        trajectories1.dones[idx_all, s1] = torch.from_numpy(dones.astype(np.float32))
+        trajectories1.dones[idx_all, s1] = torch.from_numpy(game_done)
         trajectories2.rewards[idx_all, s2] = torch.from_numpy(rewards2)
-        trajectories2.dones[idx_all, s2] = torch.from_numpy(dones.astype(np.float32))
+        trajectories2.dones[idx_all, s2] = torch.from_numpy(game_done)
 
         for i in range(n_envs):
-            if not dones[i]:
+            if not done_status[i]:
                 continue
 
             hist1 = memory1.tokens[i]
@@ -215,12 +220,46 @@ def collect_rollouts(
                     new_tok2 = policy.series.resample_single_game(val2)[0]
                 series_store2.append(str(series_ids[i]), new_tok2)
 
-            if infos[i] and infos[i].get("series_complete"):
-                series_store1.drop(str(series_ids[i]))
-                series_store2.drop(str(series_ids[i]))
+            info = infos[i] or {}
+            bootstrap_value1 = 0.0
+            bootstrap_value2 = 0.0
 
-            completed_trajectories.append(trajectories1.complete(i))
-            completed_trajectories.append(trajectories2.complete(i))
+            if done_status[i] == 2:
+                # truncated case
+                term1: StructuredObservation = info.get("terminal_observation1")  # type: ignore
+                term2: StructuredObservation = info.get("terminal_observation2")  # type: ignore
+
+                term1 = term1.unsqueeze(0).to(device)
+                term2 = term2.unsqueeze(0).to(device)
+                t_obs = StructuredObservation.cat([term1, term2])
+                dummy_mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool, device=device)
+
+                idx_tensor = torch.tensor([i], dtype=torch.long, device=device)
+                mem1 = memory1.inputs(idx_tensor, device, torch.float32)
+                mem2 = memory2.inputs(idx_tensor, device, torch.float32)
+                t_mem = tuple(torch.cat([m1, m2], dim=0) for m1, m2 in zip(mem1, mem2, strict=True))
+
+                s_tok1, s_mask1 = series_store1.get_tokens([str(series_ids[i])], device)
+                s_tok2, s_mask2 = series_store2.get_tokens([str(series_ids[i])], device)
+                t_s_tok = torch.cat([s_tok1, s_tok2], dim=0)
+                t_s_mask = torch.cat([s_mask1, s_mask2], dim=0)
+
+                with (
+                    torch.no_grad(),
+                    torch.amp.autocast(
+                        device_type=device.type, enabled=amp_enabled(config, device)
+                    ),
+                ):
+                    t_out = policy.act_obs(t_obs, dummy_mask, t_s_tok, t_s_mask, *t_mem)
+                    bootstrap_value1 = t_out.value[0].item()
+                    bootstrap_value2 = t_out.value[1].item()
+
+            if info.get("series_complete"):
+                series_store1.drop(series_ids[i])
+                series_store2.drop(series_ids[i])
+
+            completed_trajectories.append(trajectories1.complete(i, bootstrap_value1))
+            completed_trajectories.append(trajectories2.complete(i, bootstrap_value2))
 
             memory1.reset(i)
             memory2.reset(i)
@@ -245,7 +284,9 @@ class RolloutCollector:
         self.config = config
         self.completed_trajectories: list[TrajectoryBatch] = []
         self.first = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps, policy.d_model)
-        self.second = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps, policy.d_model)
+        self.second = TrajectoryStorage.allocate(
+            config.n_envs, max_trajectory_steps, policy.d_model
+        )
         self.memory1 = BattleMemoryBuffer(config.n_envs, policy.d_model)
         self.memory2 = BattleMemoryBuffer(config.n_envs, policy.d_model)
         self.series_store1 = SeriesTokenStore(policy.d_model)

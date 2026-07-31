@@ -35,6 +35,7 @@ def get_action_mask(battle: AbstractBattle) -> list[int]:
     """Compute flat integer action mask list for a double battle."""
     if not isinstance(battle, DoubleBattle):
         raise TypeError(f"Expected DoubleBattle, got {type(battle).__name__}")
+
     return action_mask(battle_view(battle).decision).reshape(-1).astype(np.int64).tolist()
 
 
@@ -42,6 +43,7 @@ def _get_current_action_mask(battle: AbstractBattle) -> list[int]:
     """Build the mask from the view refreshed by ``SimEnv.embed_battle``."""
     if not isinstance(battle, DoubleBattle):
         raise TypeError(f"Expected DoubleBattle, got {type(battle).__name__}")
+
     return action_mask(current_battle_view(battle).decision).reshape(-1).astype(np.int64).tolist()
 
 
@@ -133,6 +135,8 @@ class SimEnv(MegaEnv):
         self._agent_rng = agent_rng
         self._opponent_rng = opponent_rng
         self._series_scores = [0, 0]
+        self._series_games_played = 0
+        self._decision_steps = 0
         self.series_id = str(uuid.uuid4())
 
     def set_observation_targets(
@@ -152,24 +156,50 @@ class SimEnv(MegaEnv):
             self._agent_rng.seed(seed)
             self._opponent_rng.seed(seed + 1)
 
-        if max(self._series_scores) >= 2 or sum(self._series_scores) == 0:
+        is_new_series = sum(self._series_scores) == 0 and self._series_games_played == 0
+        is_completed_series = max(self._series_scores) >= 2 or self._series_games_played >= 3
+
+        if is_completed_series or is_new_series:
             self._series_scores = [0, 0]
+            self._series_games_played = 0
             self.series_id = str(uuid.uuid4())
             self.agent1.update_team(self._agent_team_source.sample(self._agent_rng).packed)
             self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng).packed)
 
+        self._decision_steps = 0
+        # preemptively add the game that will be played
+        self._series_games_played += 1
         return super().reset(seed=seed, options=options)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
         if not battle.finished:
             return 0.0
 
+        rew = 0.0
         if battle.won:
             self._series_scores[0] += 1
+            rew = 1.0
         elif battle.lost:
             self._series_scores[1] += 1
+            rew = -1.0
 
-        return 1.0 if battle.won else (-1.0 if battle.lost else 0.0)
+        return rew
+
+    def step(self, actions):
+        self._decision_steps += 1
+        obs, rewards, terminated, truncated, info = super().step(actions)
+
+        if (
+            self._decision_steps >= 198
+            and not any(terminated.values())
+            and not any(truncated.values())
+        ):
+            for k in truncated:
+                truncated[k] = True
+            for k in rewards:
+                rewards[k] = 0.0
+
+        return obs, rewards, terminated, truncated, info
 
     def embed_battle(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
