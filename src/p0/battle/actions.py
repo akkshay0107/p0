@@ -56,8 +56,10 @@ def decode_action(action: int) -> SlotAction:
     if MOVE_START <= action < MEGA_MOVE_END:
         offset = action - MOVE_START
         mega = offset >= MOVE_END - MOVE_START
+
         if mega:
             offset -= MOVE_END - MOVE_START
+
         return SlotAction(
             ActionKind.MOVE,
             move_slot=offset // TARGET_COUNT,
@@ -79,6 +81,7 @@ def encode_action(action: SlotAction) -> int:
     if action.kind is ActionKind.SWITCH:
         if not 0 <= action.switch_slot < TEAM_SIZE:
             raise ValueError(f"Invalid switch slot {action.switch_slot}")
+
         return SWITCH_START + action.switch_slot
 
     if action.kind is ActionKind.FORCED_MOVE:
@@ -87,8 +90,10 @@ def encode_action(action: SlotAction) -> int:
     if action.kind is ActionKind.MOVE:
         if not 0 <= action.move_slot < MOVE_SLOT_COUNT:
             raise ValueError(f"Invalid move slot {action.move_slot}")
+
         if not -2 <= action.target <= 2:
             raise ValueError(f"Invalid move target {action.target}")
+
         return (
             MOVE_START
             + action.move_slot * TARGET_COUNT

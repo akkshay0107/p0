@@ -41,14 +41,24 @@ class DecisionView:
     team_size: int = 6
 
 
+_TEAM_PREVIEW_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _get_team_preview(team_size: int) -> tuple[int, ...]:
+    if team_size not in _TEAM_PREVIEW_CACHE:
+        _TEAM_PREVIEW_CACHE[team_size] = tuple(
+            first * 6 + second
+            for first in range(team_size)
+            for second in range(first + 1, team_size)
+        )
+
+    return _TEAM_PREVIEW_CACHE[team_size]
+
+
 def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:
     """Compute the legal action IDs for a single slot position given decision view."""
     if view.team_preview:
-        return tuple(
-            first * 6 + second
-            for first in range(view.team_size)
-            for second in range(first + 1, view.team_size)
-        )
+        return _get_team_preview(view.team_size)
 
     slot = view.slots[position]
     any_force = view.slots[0].force_switch or view.slots[1].force_switch
@@ -107,20 +117,23 @@ def second_action_mask(view: DecisionView, first: int) -> npt.NDArray[np.bool_]:
             mask.fill(False)
             return mask
 
-        for action in np.flatnonzero(mask[:36]):
-            try:
-                second_pair = decode_team_pair(int(action), view.team_size)
-            except ValueError:
-                mask[action] = False
-                continue
+        actions = np.arange(36)
+        second_first, second_second = np.divmod(actions, view.team_size)
 
-            if (
-                first_pair[0] == second_pair[0]
-                or first_pair[0] == second_pair[1]
-                or first_pair[1] == second_pair[0]
-                or first_pair[1] == second_pair[1]
-            ):
-                mask[action] = False
+        valid = (
+            (second_first < view.team_size)
+            & (second_second < view.team_size)
+            & (second_first < second_second)
+        )
+
+        conflict = (
+            (second_first == first_pair[0])
+            | (second_first == first_pair[1])
+            | (second_second == first_pair[0])
+            | (second_second == first_pair[1])
+        )
+
+        mask[:36] &= valid & ~conflict
     else:
         if SWITCH_START <= first < SWITCH_END:
             mask[first] = False

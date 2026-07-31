@@ -7,7 +7,6 @@ BattleEvent objects for model consumption.
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from collections.abc import Callable, Sequence
 from enum import IntEnum
@@ -152,11 +151,19 @@ PROTECT_EFFECTS = (
 
 
 class EventResolver(Protocol):
-    def id_for(self, table: str, name: str | None) -> int: ...
+    """Vocabulary resolution protocol mapping identifiers to integer IDs."""
 
-    def effect_id_for(self, table: str, name: str | None) -> int: ...
+    def id_for(self, table: str, name: str | None) -> int:
+        """Fetch the exact ID for a name within a vocabulary table."""
+        ...
 
-    def resolve(self, table: str, name: str | None) -> tuple[int, str]: ...
+    def effect_id_for(self, table: str, name: str | None) -> int:
+        """Fetch the effect ID for a name within a vocabulary table."""
+        ...
+
+    def resolve(self, table: str, name: str | None) -> tuple[int, str]:
+        """Resolve a name, returning both the ID and the resolution type."""
+        ...
 
 
 _PRE_HP_TAGS = frozenset({"-damage", "-heal"})
@@ -179,28 +186,33 @@ def build_raw_event(
     return RawBattleEvent(tuple(split_message), pre_hp)
 
 
-_RE_HP_FRACTION = re.compile(r"^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)")
-
-
 def get_hp_fraction(hp_status: str) -> float:
     """Extract float HP fraction from a Showdown HP status string."""
-    hp_part = hp_status.split()[0]
-    match = _RE_HP_FRACTION.match(hp_part)
-    if match is None:
-        return 0.0
+    hp_part = hp_status.split(" ", 1)[0]
 
     try:
-        return float(match.group(1)) / float(match.group(2))
+        num, den = hp_part.split("/")
+        return float(num) / float(den)
     except (ValueError, ZeroDivisionError):
         return 0.0
 
 
-def _event_priority(event: BattleEvent) -> int:
-    if event.event_type in HIGH_PRIORITY_EVENTS:
-        return 2
-    if event.event_type in MEDIUM_PRIORITY_EVENTS:
-        return 1
-    return 0
+_priority_list = [0] * EVENT_TYPE_COUNT
+for _ev in HIGH_PRIORITY_EVENTS:
+    _priority_list[_ev] = 2
+for _ev in MEDIUM_PRIORITY_EVENTS:
+    _priority_list[_ev] = 1
+_PRIORITY_MAP = tuple(_priority_list)
+
+
+def _sort_priority_key(event: BattleEvent) -> tuple[int, int]:
+    """Provide a sort key to rank high-priority events earlier for truncation."""
+    return (-_PRIORITY_MAP[event.event_type], event.order)
+
+
+def _sort_order_key(event: BattleEvent) -> int:
+    """Provide a sort key to restore original event order after truncation."""
+    return event.order
 
 
 def truncate_events(events: list[BattleEvent], limit: int = 24) -> list[BattleEvent]:
@@ -208,11 +220,12 @@ def truncate_events(events: list[BattleEvent], limit: int = 24) -> list[BattleEv
     if len(events) <= limit:
         return events
 
-    selected = sorted(events, key=lambda event: (-_event_priority(event), event.order))[:limit]
-    return sorted(selected, key=lambda event: event.order)
+    selected = sorted(events, key=_sort_priority_key)[:limit]
+    return sorted(selected, key=_sort_order_key)
 
 
 def _resolve_id(resolver: EventResolver, table: str, name: str | None) -> int:
+    """Resolve an identifier, updating diagnostics upon Out-Of-Vocabulary matches."""
     resolved_id, resolution = resolver.resolve(table, name)
     if resolution == _RESOLUTION_OOV:
         EVENT_DIAGNOSTICS["oov_ids"] += 1
@@ -220,6 +233,7 @@ def _resolve_id(resolver: EventResolver, table: str, name: str | None) -> int:
 
 
 def _resolve_effect(resolver: EventResolver, table: str, name: str) -> int:
+    """Strip prefixes from effect names and resolve their identifiers."""
     _, separator, remainder = name.partition(":")
     return _resolve_id(resolver, table, remainder if separator else name)
 
