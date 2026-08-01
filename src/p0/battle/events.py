@@ -190,9 +190,13 @@ def get_hp_fraction(hp_status: str) -> float:
     """Extract float HP fraction from a Showdown HP status string."""
     hp_part = hp_status.split(" ", 1)[0]
 
+    if "/" not in hp_part:
+        return 0.0
+
     try:
-        num, den = hp_part.split("/")
-        return float(num) / float(den)
+        num, den_str = hp_part.split("/")
+        den_clean = "".join(c for c in den_str if c.isdigit() or c == ".")
+        return float(num) / float(den_clean)
     except (ValueError, ZeroDivisionError):
         return 0.0
 

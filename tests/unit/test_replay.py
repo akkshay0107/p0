@@ -1,13 +1,21 @@
-"""Deterministic replay pipeline fixtures; network coverage lives in tests/integration."""
-
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
+import torch
 
 from p0.battle.legality import DecisionView, SlotDecision
-from p0.replays.compile import compile_payloads
+from p0.format_config import DEFAULT_RUNTIME_MANIFEST, load_active_runtime_manifest
+from p0.replays.compile import compile_payloads, write_tensor_shards
+from p0.replays.dataset import (
+    LazyReplayDataset,
+    SeriesSplitManifest,
+    assign_series_splits,
+    load_split_manifest,
+    write_split_manifest,
+)
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.group import group_replays, individual_games, validated_bo3_series
 from p0.replays.identity import linked_replay_ids
@@ -33,9 +41,174 @@ from p0.replays.scrape import (
     ScrapeConfig,
     load_raw_replay,
 )
+from p0.replays.shards import load_shard_manifest
 
 
-def _payload(
+def _payload_replay_dataset(replay_id: str, parent: str = "series-1") -> dict[str, object]:
+    ots = {
+        "p1": [
+            {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
+            {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
+        ],
+        "p2": [
+            {"species": "Bulbasaur", "moves": ["Protect", "Tackle"]},
+            {"species": "Charmander", "moves": ["Tackle", "Helping Hand"]},
+        ],
+    }
+    lines = [
+        "|start",
+        "|teampreview",
+        f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
+        f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+        "|switch|p1a: Pikachu|Pikachu, L50",
+        "|switch|p1b: Eevee|Eevee, L50",
+        "|switch|p2a: Bulbasaur|Bulbasaur, L50",
+        "|switch|p2b: Charmander|Charmander, L50",
+        "|turn|1",
+        "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
+        "|move|p1b: Eevee|Tackle|p2b: Charmander",
+        "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
+        "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|win|Alice",
+    ]
+    return {
+        "id": replay_id,
+        "format": "gen9championsvgc2026regmbbo3",
+        "p1": "Alice",
+        "p2": "Bob",
+        "uploadtime": 1_750_000_000,
+        "roomid": replay_id,
+        "parent": parent,
+        "log": "\n".join(lines),
+    }
+
+
+def _write_dataset_replay_dataset(tmp_path: Path, payloads: tuple[dict[str, object], ...]):
+    result = compile_payloads(payloads)
+    return write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
+
+
+def test_split_assignment_is_order_independent_and_round_trips(tmp_path: Path) -> None:
+    runtime_hash = load_active_runtime_manifest(DEFAULT_RUNTIME_MANIFEST).runtime_contract_sha256
+    first = assign_series_splits(
+        ("series-b", "series-a"),
+        seed=17,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        runtime_contract_sha256=runtime_hash,
+        dataset_hash="a" * 64,
+    )
+    second = assign_series_splits(
+        ("series-a", "series-b"),
+        seed=17,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        runtime_contract_sha256=runtime_hash,
+        dataset_hash="a" * 64,
+    )
+    assert first.to_dict() == second.to_dict()
+    path = tmp_path / "splits.json"
+    write_split_manifest(first, path)
+    assert load_split_manifest(path).to_dict() == first.to_dict()
+
+
+def test_lazy_dataset_yields_canonical_bo3_game_perspectives(
+    tmp_path: Path,
+) -> None:
+    built = _write_dataset_replay_dataset(
+        tmp_path, (_payload_replay_dataset("game-1"), _payload_replay_dataset("game-2"))
+    )
+    chunks = list(LazyReplayDataset(built.manifest_path))
+
+    assert [(chunk.game_number, chunk.player) for chunk in chunks] == [
+        (1, 0),
+        (1, 1),
+        (2, 0),
+        (2, 1),
+    ]
+    assert [chunk.canonical_player for chunk in chunks] == [0, 1, 0, 1]
+    assert [chunk.is_series_end for chunk in chunks] == [False, False, True, True]
+    assert all(chunk.length == 2 for chunk in chunks)
+    assert chunks[2].candidate_offsets.tolist() == [0, 0, 1]
+
+
+def test_canonical_player_identity_survives_replay_side_swap(tmp_path: Path) -> None:
+    first = _payload_replay_dataset("game-1")
+    first["game_number"] = 1
+    second = _payload_replay_dataset("game-2")
+    second["game_number"] = 2
+    second["p1"] = "Bob"
+    second["p2"] = "Alice"
+
+    built = _write_dataset_replay_dataset(tmp_path, (first, second))
+    chunks = list(LazyReplayDataset(built.manifest_path))
+
+    assert [(chunk.game_number, chunk.player, chunk.canonical_player) for chunk in chunks] == [
+        (1, 0, 0),
+        (1, 1, 1),
+        (2, 0, 1),
+        (2, 1, 0),
+    ]
+
+
+def test_downstream_shards_preserve_noncontiguous_source_game_numbers(
+    tmp_path: Path,
+) -> None:
+    second = _payload_replay_dataset("game-2")
+    second["game_number"] = 2
+    third = _payload_replay_dataset("game-3")
+    third["game_number"] = 3
+
+    built = _write_dataset_replay_dataset(tmp_path, (third, second))
+    chunks = list(LazyReplayDataset(built.manifest_path))
+
+    assert [(chunk.game_number, chunk.player) for chunk in chunks] == [
+        (2, 0),
+        (2, 1),
+        (3, 0),
+        (3, 1),
+    ]
+
+
+def test_split_dataset_keeps_series_together(tmp_path: Path) -> None:
+    built = _write_dataset_replay_dataset(
+        tmp_path,
+        (
+            _payload_replay_dataset("game-1", "series-1"),
+            _payload_replay_dataset("game-2", "series-2"),
+        ),
+    )
+    series_ids = sorted({str(summary["series_id"]) for summary in torch_summaries(built)})
+    runtime_hash = built.manifest.runtime_contract_sha256
+    split = SeriesSplitManifest(
+        runtime_hash,
+        0,
+        {series_ids[0]: "train", series_ids[1]: "test"},
+        dataset_hash=built.manifest.dataset_hash,
+    )
+    split_path = tmp_path / "splits.json"
+    write_split_manifest(split, split_path)
+    train = list(LazyReplayDataset(built.manifest_path, split="train", split_manifest=split_path))
+    test = list(LazyReplayDataset(built.manifest_path, split="test", split_manifest=split_path))
+    assert {chunk.series_id for chunk in train} == {series_ids[0]}
+    assert {chunk.series_id for chunk in test} == {series_ids[1]}
+
+
+def test_dataset_rejects_tampered_shard(tmp_path: Path) -> None:
+    built = _write_dataset_replay_dataset(tmp_path, (_payload_replay_dataset("game-1"),))
+    shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
+    shard_path.write_bytes(shard_path.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        next(iter(LazyReplayDataset(built.manifest_path, verify_hashes=True)))
+
+
+def torch_summaries(built) -> list[dict[str, object]]:
+    payload_path = built.manifest_path.parent / built.manifest.shards[0].filename
+    payload = torch.load(payload_path, weights_only=True, map_location="cpu")
+    return payload["series_summaries"]
+
+
+def _payload_replay_pipeline(
     replay_id: str,
     *,
     parent: str = "series-1",
@@ -83,7 +256,7 @@ def _payload(
 
 
 def test_protocol_records_are_strict_and_ordered() -> None:
-    document = parse_replay_payload(_payload("g1"))
+    document = parse_replay_payload(_payload_replay_pipeline("g1"))
     assert [line.index for line in document.protocol_lines] == list(
         range(len(document.protocol_lines))
     )
@@ -97,11 +270,11 @@ def test_protocol_records_are_strict_and_ordered() -> None:
     with pytest.raises(ValueError, match="unknown"):
         ProtocolLine.from_dict({**document.protocol_lines[0].to_dict(), "unknown": 1})
     with pytest.raises(ReplayParseError, match="Malformed protocol line"):
-        parse_replay_payload({**_payload("bad"), "log": "not a protocol line"})
+        parse_replay_payload({**_payload_replay_pipeline("bad"), "log": "not a protocol line"})
 
 
 def test_protocol_ignores_chat_and_multiline_chat_responses() -> None:
-    payload = _payload("chat-response")
+    payload = _payload_replay_pipeline("chat-response")
     payload["log"] = "\n".join(
         [
             str(payload["log"]),
@@ -119,7 +292,7 @@ def test_protocol_ignores_chat_and_multiline_chat_responses() -> None:
 
 
 def test_public_bo3_metadata_and_empty_protocol_commands_are_preserved() -> None:
-    payload = _payload("gen9championsvgc2026regmbbo3-100")
+    payload = _payload_replay_pipeline("gen9championsvgc2026regmbbo3-100")
     payload.pop("p1")
     payload.pop("p2")
     payload.pop("parent")
@@ -156,7 +329,7 @@ def test_public_bo3_metadata_and_empty_protocol_commands_are_preserved() -> None
 
 
 def test_null_parent_is_an_orphan_instead_of_a_literal_series_id() -> None:
-    payload = _payload("orphan")
+    payload = _payload_replay_pipeline("orphan")
     payload["parent"] = None
 
     document = parse_replay_payload(payload)
@@ -168,7 +341,7 @@ def test_null_parent_is_an_orphan_instead_of_a_literal_series_id() -> None:
 
 
 def test_link_extraction_is_same_format_and_model_agnostic() -> None:
-    payload = _payload("gen9championsvgc2026regmbbo3-100")
+    payload = _payload_replay_pipeline("gen9championsvgc2026regmbbo3-100")
     payload["log"] = "\n".join(
         [
             '|uhtml|bestof|<a href="/game-bestof3-gen9championsvgc2026regmbbo3-99">series</a>',
@@ -185,7 +358,7 @@ def test_link_extraction_is_same_format_and_model_agnostic() -> None:
 
 
 def test_packed_open_team_sheet_and_seeded_imputation() -> None:
-    payload = _payload("packed")
+    payload = _payload_replay_pipeline("packed")
     payload["log"] = "\n".join(
         [
             "|start",
@@ -240,22 +413,22 @@ def test_new_schema_records_round_trip() -> None:
 
 
 def test_grouping_parent_and_fallback_are_deterministic() -> None:
-    first = parse_replay_payload(_payload("g1", parent="series-1"))
-    second = parse_replay_payload(_payload("g2", parent="series-1", winner="Bob"))
+    first = parse_replay_payload(_payload_replay_pipeline("g1", parent="series-1"))
+    second = parse_replay_payload(_payload_replay_pipeline("g2", parent="series-1", winner="Bob"))
     parent_result = group_replays((second, first), format_id=first.metadata.format_id)
     assert len(parent_result.series) == 1
     assert parent_result.series[0].record.game_replay_ids == ("g1", "g2")
     assert parent_result.series[0].record.score == (1, 1)
-    fallback_first = parse_replay_payload(_payload("fallback-game-1", parent=""))
-    fallback_second = parse_replay_payload(_payload("fallback-game-2", parent=""))
+    fallback_first = parse_replay_payload(_payload_replay_pipeline("fallback-game-1", parent=""))
+    fallback_second = parse_replay_payload(_payload_replay_pipeline("fallback-game-2", parent=""))
     fallback = group_replays((fallback_second, fallback_first))
     assert len(fallback.series) == 1
     assert fallback.series[0].record.grouping_method.name == "FALLBACK_SAME_PLAYERS"
 
 
 def test_grouping_preserves_authoritative_numbers_and_stable_series_id() -> None:
-    first = parse_replay_payload(_payload("g1", game_number=1))
-    second = parse_replay_payload(_payload("g2", game_number=2))
+    first = parse_replay_payload(_payload_replay_pipeline("g1", game_number=1))
+    second = parse_replay_payload(_payload_replay_pipeline("g2", game_number=2))
 
     incomplete = group_replays((first,)).series[0]
     complete = group_replays((second, first)).series[0]
@@ -266,12 +439,12 @@ def test_grouping_preserves_authoritative_numbers_and_stable_series_id() -> None
 
 
 def test_grouping_quarantines_missing_and_duplicate_game_numbers() -> None:
-    second = parse_replay_payload(_payload("g2", game_number=2))
-    third = parse_replay_payload(_payload("g3", game_number=3))
+    second = parse_replay_payload(_payload_replay_pipeline("g2", game_number=2))
+    third = parse_replay_payload(_payload_replay_pipeline("g3", game_number=3))
     missing = group_replays((third, second)).series[0]
 
-    duplicate_a = parse_replay_payload(_payload("dup-a", game_number=1))
-    duplicate_b = parse_replay_payload(_payload("dup-b", game_number=1))
+    duplicate_a = parse_replay_payload(_payload_replay_pipeline("dup-a", game_number=1))
+    duplicate_b = parse_replay_payload(_payload_replay_pipeline("dup-b", game_number=1))
     duplicate = group_replays((duplicate_a, duplicate_b)).series[0]
 
     assert [membership.game_number for membership in missing.memberships] == [2, 3]
@@ -284,7 +457,8 @@ def test_grouping_quarantines_missing_and_duplicate_game_numbers() -> None:
 
 def test_grouping_quarantines_games_after_a_series_clinch() -> None:
     games = tuple(
-        parse_replay_payload(_payload(f"g{number}", game_number=number)) for number in (1, 2, 3)
+        parse_replay_payload(_payload_replay_pipeline(f"g{number}", game_number=number))
+        for number in (1, 2, 3)
     )
 
     group = group_replays(games).series[0]
@@ -296,14 +470,18 @@ def test_grouping_quarantines_games_after_a_series_clinch() -> None:
 
 
 def test_grouping_quarantines_missing_outcomes_and_team_conflicts() -> None:
-    unresolved_payload = _payload("unresolved", game_number=1, parent="unresolved-series")
+    unresolved_payload = _payload_replay_pipeline(
+        "unresolved", game_number=1, parent="unresolved-series"
+    )
     unresolved_payload["log"] = "\n".join(
         line for line in str(unresolved_payload["log"]).splitlines() if not line.startswith("|win|")
     )
     unresolved = group_replays((parse_replay_payload(unresolved_payload),)).series[0]
 
-    first = parse_replay_payload(_payload("team-1", game_number=1, parent="team-series"))
-    changed_payload = _payload("team-2", game_number=2, parent="team-series")
+    first = parse_replay_payload(
+        _payload_replay_pipeline("team-1", game_number=1, parent="team-series")
+    )
+    changed_payload = _payload_replay_pipeline("team-2", game_number=2, parent="team-series")
     changed_payload["log"] = str(changed_payload["log"]).replace("Pikachu", "Raichu")
     conflicted = group_replays((first, parse_replay_payload(changed_payload))).series[0]
 
@@ -317,9 +495,9 @@ def test_grouping_quarantines_missing_outcomes_and_team_conflicts() -> None:
 
 
 def test_side_roles_are_canonical_and_bo1_bo3_views_share_games() -> None:
-    first = parse_replay_payload(_payload("g1", game_number=1))
+    first = parse_replay_payload(_payload_replay_pipeline("g1", game_number=1))
     second = parse_replay_payload(
-        _payload(
+        _payload_replay_pipeline(
             "g2",
             game_number=2,
             winner="Alice",
@@ -335,18 +513,18 @@ def test_side_roles_are_canonical_and_bo1_bo3_views_share_games() -> None:
         "g2",
     )
     assert validated_bo3_series((first,)) == ()
-    inferred_first = parse_replay_payload(_payload("inferred-1"))
-    inferred_second = parse_replay_payload(_payload("inferred-2"))
+    inferred_first = parse_replay_payload(_payload_replay_pipeline("inferred-1"))
+    inferred_second = parse_replay_payload(_payload_replay_pipeline("inferred-2"))
     assert validated_bo3_series((inferred_first, inferred_second)) == ()
-    same_side_second = parse_replay_payload(_payload("g2", game_number=2))
+    same_side_second = parse_replay_payload(_payload_replay_pipeline("g2", game_number=2))
     assert tuple(
         game.metadata.replay_id for game in validated_bo3_series((same_side_second, first))[0].games
     ) == ("g1", "g2")
 
 
 def test_reconstruction_is_causal_symmetric_and_compilable() -> None:
-    first = _payload("g1")
-    second = _payload("g2", winner="Bob")
+    first = _payload_replay_pipeline("g1")
+    second = _payload_replay_pipeline("g2", winner="Bob")
     result = compile_payloads((first, second))
     assert result.to_dict() == compile_payloads((second, first)).to_dict()
     game = result.games[0]
@@ -360,7 +538,7 @@ def test_reconstruction_is_causal_symmetric_and_compilable() -> None:
 
 
 def test_replay_request_chunks_ignore_outcome_and_automatic_switch_lines() -> None:
-    payload = _payload("request-chunks")
+    payload = _payload_replay_pipeline("request-chunks")
     lines = str(payload["log"]).splitlines()
     turn_index = lines.index("|turn|1")
     lines = lines[:turn_index] + [
@@ -407,7 +585,7 @@ def test_reconstruction_recovers_target_from_still_animation() -> None:
             {"species": "Grimmsnarl", "moves": ["Protect"]},
         ],
     }
-    payload = _payload("still-animation-target")
+    payload = _payload_replay_pipeline("still-animation-target")
     payload["log"] = "\n".join(
         [
             "|start",
@@ -440,7 +618,7 @@ def test_reconstruction_recovers_target_from_still_animation() -> None:
 
 
 def test_reconstruction_marks_struggle_as_forced_move() -> None:
-    payload = _payload("forced-move")
+    payload = _payload_replay_pipeline("forced-move")
     lines = []
     for line in str(payload["log"]).splitlines():
         if line.startswith("|showteam|p1|"):
@@ -472,7 +650,7 @@ def test_reconstruction_restores_illusion_alias_on_replace() -> None:
             {"species": "Charmander", "moves": ["Protect"]},
         ],
     }
-    payload = _payload("illusion-replace")
+    payload = _payload_replay_pipeline("illusion-replace")
     payload["log"] = "\n".join(
         [
             "|start",
@@ -517,7 +695,7 @@ def test_reconstruction_restores_illusion_alias_on_replace() -> None:
 
 
 def test_imputation_uses_base_form_stats_for_missing_form_entry() -> None:
-    payload = _payload("florges-blue")
+    payload = _payload_replay_pipeline("florges-blue")
     lines = []
     for line in str(payload["log"]).splitlines():
         if line.startswith("|showteam|p1|"):
@@ -569,7 +747,7 @@ def test_reconstruction_does_not_share_active_illusion_alias_state() -> None:
             {"species": "Charmander", "moves": ["Protect"]},
         ],
     }
-    payload = _payload("illusion-duplicate-active")
+    payload = _payload_replay_pipeline("illusion-duplicate-active")
     payload["log"] = "\n".join(
         [
             "|start",
@@ -624,7 +802,7 @@ def test_forced_switch_makes_other_slot_an_exact_pass() -> None:
 
 
 def test_replay_event_window_is_previous_request_and_is_model_grounded() -> None:
-    payload = _payload("event-window")
+    payload = _payload_replay_pipeline("event-window")
     payload["log"] = "\n".join(
         f"{line}|100/100" if line.startswith("|switch|") else line
         for line in str(payload["log"]).splitlines()
@@ -638,7 +816,7 @@ def test_replay_event_window_is_previous_request_and_is_model_grounded() -> None
 
 
 def test_reconstruction_resolves_switch_species_not_nicknames() -> None:
-    payload = _payload("nickname-form")
+    payload = _payload_replay_pipeline("nickname-form")
     rewritten: list[str] = []
     for line in str(payload["log"]).splitlines():
         if line.startswith("|showteam|p1|"):
@@ -660,7 +838,7 @@ def test_reconstruction_resolves_switch_species_not_nicknames() -> None:
 def test_controlled_oracle_requires_candidate_containment() -> None:
     case = OracleCase(
         "normal-move",
-        _payload("oracle"),
+        _payload_replay_pipeline("oracle"),
         (
             OracleExpectation(0, 1, (9, 10)),
             OracleExpectation(1, 1, (9, 10)),
@@ -671,7 +849,7 @@ def test_controlled_oracle_requires_candidate_containment() -> None:
 
 
 def test_fetcher_retries_and_writes_immutable_raw_cache(tmp_path) -> None:
-    payload = _payload("g1")
+    payload = _payload_replay_pipeline("g1")
     body = json.dumps(payload).encode()
     calls: list[str] = []
     failures = {"https://search.invalid?format=f&page=1": 1}
@@ -708,7 +886,7 @@ def test_fetcher_accepts_display_formats_and_follows_sibling_links(tmp_path) -> 
     format_id = "gen9championsvgc2026regmbbo3"
     first_id = f"{format_id}-100"
     second_id = f"{format_id}-101"
-    first = _payload(first_id, game_number=1)
+    first = _payload_replay_pipeline(first_id, game_number=1)
     first["format"] = "[Gen 9 Champions] VGC 2026 Reg M-B (Bo3)"
     first["formatid"] = format_id
     first["log"] = (
@@ -717,7 +895,7 @@ def test_fetcher_accepts_display_formats_and_follows_sibling_links(tmp_path) -> 
         f'|uhtml|next|<a href="/battle-{second_id}">Game 2 of 3</a>\n'
         f"{first['log']}"
     )
-    second = _payload(second_id, game_number=2)
+    second = _payload_replay_pipeline(second_id, game_number=2)
     second["format"] = "[Gen 9 Champions] VGC 2026 Reg M-B (Bo3)"
     second["formatid"] = format_id
     bodies = {
@@ -773,3 +951,90 @@ def test_fetcher_preserves_malformed_replay_json_for_compilation_audit(tmp_path)
 
     assert [entry.replay_id for entry in entries] == ["f-1"]
     assert load_raw_replay(tmp_path / "f" / "raw" / "f-1.json.gz") == b"not-json"
+
+
+def _payload_replay_shards(replay_id: str) -> dict[str, object]:
+    ots = {
+        "p1": [
+            {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
+            {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
+        ],
+        "p2": [
+            {"species": "Bulbasaur", "moves": ["Protect", "Tackle"]},
+            {"species": "Charmander", "moves": ["Tackle", "Helping Hand"]},
+        ],
+    }
+    lines = [
+        "|start",
+        "|teampreview",
+        f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
+        f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+        "|switch|p1a: Pikachu|Pikachu, L50|100/100",
+        "|switch|p1b: Eevee|Eevee, L50|100/100",
+        "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
+        "|switch|p2b: Charmander|Charmander, L50|100/100",
+        "|turn|1",
+        "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
+        "|move|p1b: Eevee|Tackle|p2b: Charmander",
+        "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
+        "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|win|Alice",
+    ]
+    return {
+        "id": replay_id,
+        "format": "gen9championsvgc2026regmbbo3",
+        "p1": "Alice",
+        "p2": "Bob",
+        "uploadtime": 1_750_000_000,
+        "roomid": replay_id,
+        "parent": "series-1",
+        "log": "\n".join(lines),
+    }
+
+
+def test_replay_fixture_compiles_to_runtime_bound_schema_v4_shard(tmp_path: Path) -> None:
+    result = compile_payloads((_payload_replay_shards("shard-fixture"),))
+    built = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
+
+    manifest = load_shard_manifest(
+        json.loads(built.manifest_path.read_text(encoding="utf-8")), DEFAULT_RUNTIME_MANIFEST
+    )
+    assert manifest.decisions == 4
+    assert manifest.games == 2
+    assert manifest.series == 1
+    assert manifest.diagnostics["label_unknown"] == 2
+
+    shard_path = built.manifest_path.parent / manifest.shards[0].filename
+    payload = torch.load(shard_path, weights_only=True, map_location="cpu")
+    tensors = payload["tensors"]
+    assert all(
+        torch.isfinite(tensor).all() for tensor in tensors.values() if tensor.is_floating_point()
+    )
+    assert tensors["categorical"].shape[0] == manifest.decisions
+    assert tensors["action_mask"].shape == (4, 2, 49)
+    assert tensors["candidate_offsets"].tolist() == [0, 0, 1, 1, 2]
+    assert tensors["game_offsets"].tolist() == [0, 2, 4]
+    assert tensors["series_offsets"].tolist() == [0, 4]
+    assert len(payload["series_summaries"]) == manifest.games
+    assert [item["canonical_player"] for item in payload["series_summaries"]] == [0, 1]
+    assert torch.count_nonzero(tensors["events_cat"]) > 0
+    assert torch.count_nonzero(tensors["events_metadata"]) > 0
+
+
+def test_shard_bytes_are_deterministic_for_fixed_inputs(tmp_path: Path) -> None:
+    result = compile_payloads((_payload_replay_shards("shard-fixture"),))
+    first = write_tensor_shards(result, tmp_path / "first", created_at="2026-01-01T00:00:00Z")
+    second = write_tensor_shards(result, tmp_path / "second", created_at="2026-01-01T00:00:00Z")
+    first_path = first.manifest_path.parent / first.manifest.shards[0].filename
+    second_path = second.manifest_path.parent / second.manifest.shards[0].filename
+    assert first_path.read_bytes() == second_path.read_bytes()
+    assert first.manifest.to_dict() == second.manifest.to_dict()
+
+
+def test_shard_manifest_rejects_runtime_contract_mismatch(tmp_path: Path) -> None:
+    result = compile_payloads((_payload_replay_shards("shard-fixture"),))
+    built = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
+    value = json.loads(built.manifest_path.read_text(encoding="utf-8"))
+    value["runtime_contract_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="runtime contract"):
+        load_shard_manifest(value, DEFAULT_RUNTIME_MANIFEST)

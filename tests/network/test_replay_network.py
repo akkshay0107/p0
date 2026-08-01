@@ -1,5 +1,3 @@
-"""Small explicit public-endpoint smoke test for replay acquisition and parsing."""
-
 from __future__ import annotations
 
 import pytest

@@ -1,7 +1,9 @@
 import pytest
 
-from p0.teams.validation import validate_variant
-from tests.unit.test_team_corpus import _variant
+from p0.teams.validation import (
+    validate_variant,
+)
+from tests.unit.test_teams import _variant_team_corpus as _variant
 
 
 @pytest.mark.integration

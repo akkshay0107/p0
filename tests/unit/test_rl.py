@@ -1,22 +1,40 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
+import pytest
 import torch
+from poke_env.battle import DoubleBattle
+from poke_env.player.battle_order import PassBattleOrder
 
-from p0.format_config import FORMAT
+from p0.battle.actions import ACT_SIZE
+from p0.evaluation.harness import (
+    EvaluationHarness,
+)
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
 from p0.model.policy import ActOutput
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
+from p0.runtime.poke_env_action_adapter import action_to_single_order
+from p0.teams.source import FixedTeamSource
 from p0.training.config import TrainingConfig
 from p0.training.rollout import (
     BattleMemoryBuffer,
-    RolloutBuffer,
     collect_rollouts,
 )
-from p0.training.trajectory import TrajectoryStorage, compute_gae_batch
+from p0.training.trajectory import (
+    TrajectoryBatch,
+    TrajectoryStorage,
+    compute_gae_batch,
+    prepare_trajectory_batches,
+)
 from p0.training.vector_env import ThreadVecEnv
-
-ACT_SIZE = FORMAT.action_size
 
 
 class FakePolicy:
@@ -163,6 +181,7 @@ def test_compute_gae_batch_matches_single_episode_reference():
         lengths,
         gamma=0.99,
         gae_lambda=0.95,
+        bootstrap_values=torch.zeros(len(rewards)),
     )
 
     for episode_idx, length in enumerate(lengths.tolist()):
@@ -181,9 +200,9 @@ def test_collect_rollouts_records_both_self_play_streams():
     config = TrainingConfig(n_envs=3, rollout_steps=1)
     vec_env = FakeVecEnv(config.n_envs)
     policy = FakePolicy(action=7)
-    buffer = RolloutBuffer()
-    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
-    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4)
+    buffer = []
+    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
+    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
     memory1 = BattleMemoryBuffer(config.n_envs, 1)
     memory2 = BattleMemoryBuffer(config.n_envs, 1)
 
@@ -205,8 +224,8 @@ def test_collect_rollouts_records_both_self_play_streams():
         series_store2,
     )
 
-    assert len(buffer.trajectories) == 2 * config.n_envs
-    assert all(torch.all(episode.actions == 7) for episode in buffer.trajectories)
+    assert len(buffer) == 2 * config.n_envs
+    assert all(torch.all(episode.actions == 7) for episode in buffer)
     assert trajectories1.step_counts.tolist() == [0, 0, 0]
     assert trajectories2.step_counts.tolist() == [0, 0, 0]
     assert all(not entries for entries in memory1.tokens)
@@ -216,3 +235,120 @@ def test_collect_rollouts_records_both_self_play_streams():
     ]
     assert all(action.tolist() == [7, 7] for action in side_two_actions)
     assert policy.batch_sizes == [2 * config.n_envs]
+
+
+def test_storage_allocates_completes_and_resets_one_environment():
+    storage = TrajectoryStorage.allocate(2, 3, d_model=1)
+    storage.step_counts[1] = 2
+    storage.actions[1, :2] = 7
+    completed = storage.complete(1)
+    assert completed is not None
+    assert completed.length == 2
+    assert torch.all(completed.actions == 7)
+    assert storage.step_counts.tolist() == [0, 0]
+
+
+def test_storage_reports_explicit_overflow():
+    storage = TrajectoryStorage.allocate(1, 1, d_model=1)
+    storage.step_counts[0] = 1
+    with pytest.raises(OverflowError, match="exceeded"):
+        storage.ensure_capacity(torch.tensor([0]))
+
+
+def test_completed_batch_prepares_returns_advantages_and_chunks():
+    batch = TrajectoryBatch(
+        observations=StructuredObservation.empty_batch(3),
+        action_masks=torch.ones((3, 2, 49), dtype=torch.bool),
+        actions=torch.zeros((3, 2), dtype=torch.long),
+        log_probs=torch.zeros(3),
+        values=torch.tensor([0.2, 0.1, 0.0]),
+        rewards=torch.tensor([0.0, 1.0, 0.5]),
+        dones=torch.tensor([0.0, 1.0, 1.0]),
+        length=3,
+    )
+    prepared = prepare_trajectory_batches([batch], torch.device("cpu"), gamma=0.99, gae_lambda=0.95)
+    assert prepared[0].returns is not None
+    assert prepared[0].advantages is not None
+
+
+def test_action_validation_rejects_orders_outside_battle_order_space():
+    valid_order = PassBattleOrder()
+    battle = cast(
+        DoubleBattle,
+        SimpleNamespace(
+            player_username="player",
+            battle_tag="battle",
+            valid_orders=([valid_order], []),
+        ),
+    )
+
+    order = action_to_single_order(
+        0,
+        battle,
+        fake=False,
+        position=0,
+    )
+    assert str(order) == str(valid_order)
+
+    battle.valid_orders[0].clear()
+    with pytest.raises(ValueError, match="not in action space"):
+        action_to_single_order(
+            0,
+            battle,
+            fake=False,
+            position=0,
+        )
+
+
+def test_evaluation_harness_falls_back_without_corpus(tmp_path: Path) -> None:
+    harness = EvaluationHarness(
+        corpus_path=tmp_path / "nonexistent_manifest.json",
+        corpus_hash="nonexistent",
+        episodes_per_matchup=5,
+        seed=123,
+    )
+    sources = harness._build_team_sources()
+    assert len(sources) == 4
+    for key, source in sources.items():
+        assert isinstance(source, FixedTeamSource)
+        # Sampled team should match DEFAULT_TEST_TEAM
+        team = source.sample(harness.rng)
+        assert "Pikachu" in team.packed
+
+
+_SPEC = importlib.util.spec_from_file_location(
+    "benchmark_reducer_depth",
+    Path(__file__).parents[2] / "bench" / "benchmark_reducer_depth.py",
+)
+assert _SPEC is not None and _SPEC.loader is not None
+_MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = _MODULE
+_SPEC.loader.exec_module(_MODULE)
+BenchmarkConfig = _MODULE.BenchmarkConfig
+run_benchmark = _MODULE.run_benchmark
+
+
+def _benchmark_config(**overrides):
+    values = {
+        "device": "cpu",
+        "dtype": "float32",
+        "seed": 7,
+        "warmup": 1,
+        "iterations": 1,
+        "repeats": 2,
+        "batch_size": 1,
+        "time_steps": 1,
+        "d_model": 8,
+        "nhead": 2,
+        "dim_feedforward": 32,
+        "deep_reducer_layers": 2,
+    }
+    values.update(overrides)
+    return BenchmarkConfig(**values)
+
+
+def _small_policy(reducer_layers: int = 1):
+    return build_policy(
+        ModelConfig(8, 2, reducer_layers, 32),
+        default_runtime_resources(),
+    )
