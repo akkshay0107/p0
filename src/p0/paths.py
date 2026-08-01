@@ -20,11 +20,21 @@ class ProjectPaths:
     replays_dir: Path
     backups_dir: Path
     log_path: Path
+    resume_checkpoint: Path | None = None
+    initial_policy_checkpoint: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.resume_checkpoint is not None and self.initial_policy_checkpoint is not None:
+            raise ValueError(
+                "paths.resume_checkpoint and paths.initial_policy_checkpoint are mutually exclusive"
+            )
 
     @classmethod
     def from_root(cls, repository_root: str | Path) -> ProjectPaths:
+        """Construct ProjectPaths structure anchored at repository_root."""
         root = Path(repository_root).expanduser().resolve()
         artifacts = root / "artifacts"
+
         return cls(
             repository_root=root,
             data_root=root / "data",
@@ -37,6 +47,8 @@ class ProjectPaths:
             replays_dir=artifacts / "replays",
             backups_dir=artifacts / "backups",
             log_path=artifacts / "training.log",
+            resume_checkpoint=None,
+            initial_policy_checkpoint=None,
         )
 
 
@@ -50,6 +62,7 @@ def _default_paths() -> ProjectPaths:
         Path(__file__).resolve().parents[1] / "share" / "p0",
         Path(sys.prefix) / "share" / "p0",
     )
+
     for data_root in candidates:
         if (data_root / "vocab.json").is_file():
             return ProjectPaths(
@@ -64,7 +77,10 @@ def _default_paths() -> ProjectPaths:
                 replays_dir=paths.replays_dir,
                 backups_dir=paths.backups_dir,
                 log_path=paths.log_path,
+                resume_checkpoint=paths.resume_checkpoint,
+                initial_policy_checkpoint=paths.initial_policy_checkpoint,
             )
+
     return paths
 
 

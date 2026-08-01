@@ -28,3 +28,5 @@ data/raw/
 data/cache/
 data/*.tmp
 data/champions_coverage.json
+teams/**/*.txt
+teams/*.txt

@@ -32,12 +32,14 @@ class ThreadVecEnv:
 
         self.last_masks1 = None
         self.last_masks2 = None
+        self.last_infos = None
 
     def _create_buffers(self):
         return StructuredObservation.empty_batch(self.n_envs, pin_memory=self.use_pinned)
 
     def _reset_env(self, env_id: int, env: SimEnv):
         obs, info = env.reset()
+        info["series_id"] = env.series_id  # type: ignore
 
         agent1 = env.agent1.username
         agent2 = env.agent2.username
@@ -51,7 +53,7 @@ class ThreadVecEnv:
         futures = [self.executor.submit(self._reset_env, i, env) for i, env in enumerate(self.envs)]
 
         results = [f.result() for f in futures]
-        results.sort(key=lambda x: x[0])
+        results.sort(key=lambda x: x[0])  # r[0] is env_id
 
         masks1 = np.stack([r[1] for r in results])
         masks2 = np.stack([r[2] for r in results]) if results[0][2] is not None else None  # type: ignore
@@ -59,6 +61,7 @@ class ThreadVecEnv:
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
+        self.last_infos = infos
         return masks1, masks2, infos
 
     def _step_env(self, env_id: int, env: SimEnv, action: dict):
@@ -70,17 +73,31 @@ class ThreadVecEnv:
         mask1 = np.reshape(next_obs[agent1]["action_mask"], (2, ACT_SIZE))
         mask2 = np.reshape(next_obs[agent2]["action_mask"], (2, ACT_SIZE))
 
-        done = bool(
-            terminated[agent1] or truncated[agent1] or terminated[agent2] or truncated[agent2]
-        )
+        is_truncated = truncated[agent1] or truncated[agent2]
+        is_terminated = terminated[agent1] or terminated[agent2]
+        done_status = 2 if is_truncated else (1 if is_terminated else 0)
+
         reward1 = rewards[agent1]
         reward2 = rewards[agent2] if agent2 in rewards else 0.0
 
-        if done:
-            _, mask1, mask2, _ = self._reset_env(env_id, env)
-            return env_id, mask1, mask2, reward1, reward2, done, info
+        if done_status > 0:
+            series_complete = max(env._series_scores) >= 2 or env._series_games_played >= 3
+            terminal_obs1 = None
+            terminal_obs2 = None
+            if is_truncated:
+                terminal_obs1 = self.obs1_buffers[env_id].clone()
+                terminal_obs2 = self.obs2_buffers[env_id].clone()
 
-        return env_id, mask1, mask2, reward1, reward2, done, info
+            _, mask1, mask2, _ = self._reset_env(env_id, env)
+            info["series_id"] = env.series_id  # type: ignore
+            info["series_complete"] = series_complete  # type: ignore
+            info["terminal_observation1"] = terminal_obs1  # type: ignore
+            info["terminal_observation2"] = terminal_obs2  # type: ignore
+            return env_id, mask1, mask2, reward1, reward2, done_status, info
+
+        info["series_id"] = env.series_id  # type: ignore
+        info["series_complete"] = False  # type: ignore
+        return env_id, mask1, mask2, reward1, reward2, done_status, info
 
     def step(self, actions: list[dict]):
         futures = [
@@ -89,7 +106,7 @@ class ThreadVecEnv:
         ]
 
         results = [f.result() for f in futures]
-        results.sort(key=lambda x: x[0])  # guarantee order
+        results.sort(key=lambda x: x[0])  # r[0] is env_id (guarantees order)
 
         masks1 = np.stack([r[1] for r in results])
         masks2 = np.stack([r[2] for r in results]) if results[0][2] is not None else None  # type: ignore
@@ -100,6 +117,7 @@ class ThreadVecEnv:
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
+        self.last_infos = infos
         return masks1, masks2, rewards1, rewards2, dones, infos
 
     def get_batched_obs1(self, device: torch.device):

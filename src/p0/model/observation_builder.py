@@ -36,7 +36,7 @@ from p0.model.structured_observation import (
     effect_num_slice,
 )
 from p0.model.tokenizer import PokemonTokenizer
-from p0.teams.stat_points import BaseStats, ImputationInput, PrecomputedStats, imputed_stats
+from p0.teams.stat_points import BaseStats, imputed_stats
 
 _DEFAULT_RESOURCES = default_runtime_resources()
 _MEGA_ITEMS = _DEFAULT_RESOURCES.mega_items
@@ -237,32 +237,30 @@ def _slot_condition(
     return 2 if mon in selected_allies else -1
 
 
-def _imputation_input(pokemon: PokemonView) -> ImputationInput | None:
+def _imputation_input(pokemon: PokemonView) -> dict | None:
     if not pokemon.species or not pokemon.nature or len(pokemon.moves) != MOVE_SLOTS:
         return None
     moves = tuple(pokemon.moves.values())
-    return ImputationInput(
-        species=PokemonTokenizer.normalize_id(pokemon.species),
+    return dict(
         nature=str(pokemon.nature).lower(),
         item=PokemonTokenizer.normalize_id(pokemon.item or ""),
         ability=PokemonTokenizer.normalize_id(pokemon.ability or ""),
         moves=tuple(move.id for move in moves),
         move_categories=tuple(move.category.name.lower() for move in moves),
         base_stats=BaseStats.from_mapping(pokemon.base_stats),
-        level=int(pokemon.level or 50),
     )
 
 
 def _cached_imputed_stats(
-    pokemon: PokemonView, cache: dict[Any, PrecomputedStats]
-) -> PrecomputedStats | None:
+    pokemon: PokemonView, cache: dict[Any, tuple[int, int, int, int, int, int]]
+) -> tuple[int, int, int, int, int, int] | None:
     result = cache.get(pokemon)
     if result is not None:
         return result
     value = _imputation_input(pokemon)
     if value is None:
         return None
-    result = imputed_stats(value)
+    result = imputed_stats(**value)
     cache[pokemon] = result
     return result
 
@@ -277,7 +275,7 @@ def _has_exact_stats(pokemon: PokemonView) -> bool:
 def _get_pokemon_level_stats(
     pokemon: PokemonView,
     is_opponent: bool,
-    precomputed: PrecomputedStats | None,
+    precomputed: tuple[int, int, int, int, int, int] | None,
 ) -> tuple[tuple[float, ...], Provenance]:
     stats = pokemon.stats
     if not is_opponent and stats is not None:
@@ -286,16 +284,16 @@ def _get_pokemon_level_stats(
             return tuple(float(value) for value in values), Provenance.SELF_KNOWN  # type: ignore
 
     if precomputed is not None:
-        return tuple(float(value) for value in precomputed.values), Provenance.IMPUTED
+        return tuple(float(value) for value in precomputed), Provenance.IMPUTED
     return (0.0,) * 6, Provenance.UNKNOWN
 
 
 def _resolve_stats(
     pokemon: PokemonView | None,
     is_opponent: bool,
-    cache: dict[Any, PrecomputedStats],
-    overrides: Mapping[Any, PrecomputedStats] | None,
-) -> PrecomputedStats | None:
+    cache: dict[Any, tuple[int, int, int, int, int, int]],
+    overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None,
+) -> tuple[int, int, int, int, int, int] | None:
     if pokemon is None:
         return None
     supplied = overrides.get(pokemon) if overrides is not None else None
@@ -466,7 +464,7 @@ def _pokemon_numeric_into(
     row: np.ndarray,
     active_idx: int | None = None,
     is_opponent: bool = False,
-    precomputed_stats: PrecomputedStats | None = None,
+    precomputed_stats: tuple[int, int, int, int, int, int] | None = None,
 ) -> None:
     row[cond + 1] = 1.0
 
@@ -732,7 +730,7 @@ def _write_observation(
     battle: BattleView,
     out: StructuredObservation,
     tok: PokemonTokenizer,
-    stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
+    stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
 ) -> None:
     token_types = out.token_type_ids.numpy()
     sides = out.side_ids.numpy()
@@ -888,7 +886,7 @@ class ObservationBuilder:
         self,
         battle: BattleView,
         out: StructuredObservation,
-        stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
     ) -> None:
         self.validate_output(out)
         self.build_into_prevalidated(battle, out, stat_overrides)
@@ -897,7 +895,7 @@ class ObservationBuilder:
         self,
         battle: BattleView,
         out: StructuredObservation,
-        stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
     ) -> None:
         _write_observation(battle, out, self.tokenizer, stat_overrides)
 
@@ -908,7 +906,7 @@ class ObservationBuilder:
     def build(
         self,
         battle: BattleView,
-        stat_overrides: Mapping[Any, PrecomputedStats] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
     ) -> StructuredObservation:
         obs = StructuredObservation.empty_batch(1)[0]
         self.build_into_prevalidated(battle, obs, stat_overrides)

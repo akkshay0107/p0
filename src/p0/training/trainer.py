@@ -60,9 +60,7 @@ class PPOTrainer:
             started = time.monotonic()
             self.collector.collect()
             rollout_seconds = time.monotonic() - started
-            trajectories = self.collector.buffer.get_batches(
-                self.policy.device, self.training_config
-            )
+            trajectories = self.collector.get_batches(self.policy.device)
             if not trajectories:
                 logging.warning("No trajectories collected, skipping update")
                 completed_episode = episode + 1
@@ -95,6 +93,8 @@ class PPOTrainer:
             episode,
             self.policy,
             optimizer=self.updater.optimizer,
+            scheduler=self.scheduler,
             scaler=self.updater.scaler,
             magnet=self.magnet,
+            trainer_kind="ppo",
         )

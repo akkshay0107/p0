@@ -1,4 +1,9 @@
-"""Pure protocol-event values and parser entry point."""
+"""Pure protocol-event values and parser entry point.
+
+This module defines battle event data structures, event priorities for truncation,
+and high-performance line-by-line parsing of raw Showdown protocol logs into structured
+BattleEvent objects for model consumption.
+"""
 
 from __future__ import annotations
 
@@ -56,7 +61,6 @@ class EventTypeId(IntEnum):
 
 
 EVENT_TYPE_COUNT = max(EventTypeId) + 1
-
 
 # Counters for silent event-pipeline degradations: "oov_ids", "missing_pre_hp",
 # "grounding_misses". Reset with .clear().
@@ -116,6 +120,7 @@ HIGH_PRIORITY_EVENTS = frozenset(
         EventTypeId.BOOST_SET,
     }
 )
+
 # Routine numeric deltas: informative but partly recoverable from state tokens.
 MEDIUM_PRIORITY_EVENTS = frozenset(
     {
@@ -131,8 +136,10 @@ MEDIUM_PRIORITY_EVENTS = frozenset(
         EventTypeId.BLOCKED,
     }
 )
+
 # Protocol status codes; the status vocab table is keyed by these raw codes.
 STATUS_CODES = frozenset({"brn", "frz", "par", "psn", "slp", "tox"})
+
 PROTECT_EFFECTS = (
     "move: Protect",
     "move: Detect",
@@ -144,11 +151,19 @@ PROTECT_EFFECTS = (
 
 
 class EventResolver(Protocol):
-    def id_for(self, table: str, name: str | None) -> int: ...
+    """Vocabulary resolution protocol mapping identifiers to integer IDs."""
 
-    def effect_id_for(self, table: str, name: str | None) -> int: ...
+    def id_for(self, table: str, name: str | None) -> int:
+        """Fetch the exact ID for a name within a vocabulary table."""
+        ...
 
-    def resolve(self, table: str, name: str | None) -> tuple[int, str]: ...
+    def effect_id_for(self, table: str, name: str | None) -> int:
+        """Fetch the effect ID for a name within a vocabulary table."""
+        ...
+
+    def resolve(self, table: str, name: str | None) -> tuple[int, str]:
+        """Resolve a name, returning both the ID and the resolution type."""
+        ...
 
 
 _PRE_HP_TAGS = frozenset({"-damage", "-heal"})
@@ -167,143 +182,150 @@ def build_raw_event(
     pre_hp = None
     if len(split_message) > 2 and split_message[1] in _PRE_HP_TAGS:
         pre_hp = pre_hp_for(split_message[2])
+
     return RawBattleEvent(tuple(split_message), pre_hp)
 
 
 def get_hp_fraction(hp_status: str) -> float:
-    hp_status = hp_status.split()[0]
-    if hp_status == "0" or "/" not in hp_status:
-        return 0.0
+    """Extract float HP fraction from a Showdown HP status string."""
+    hp_part = hp_status.split(" ", 1)[0]
+
     try:
-        numerator, denominator = hp_status.split("/")
-        return float(numerator) / float(denominator)
+        num, den = hp_part.split("/")
+        return float(num) / float(den)
     except (ValueError, ZeroDivisionError):
         return 0.0
 
 
-def _event_priority(event: BattleEvent) -> int:
-    if event.event_type in HIGH_PRIORITY_EVENTS:
-        return 2
-    if event.event_type in MEDIUM_PRIORITY_EVENTS:
-        return 1
-    return 0
+_priority_list = [0] * EVENT_TYPE_COUNT
+for _ev in HIGH_PRIORITY_EVENTS:
+    _priority_list[_ev] = 2
+for _ev in MEDIUM_PRIORITY_EVENTS:
+    _priority_list[_ev] = 1
+_PRIORITY_MAP = tuple(_priority_list)
+
+
+def _sort_priority_key(event: BattleEvent) -> tuple[int, int]:
+    """Provide a sort key to rank high-priority events earlier for truncation."""
+    return (-_PRIORITY_MAP[event.event_type], event.order)
+
+
+def _sort_order_key(event: BattleEvent) -> int:
+    """Provide a sort key to restore original event order after truncation."""
+    return event.order
 
 
 def truncate_events(events: list[BattleEvent], limit: int = 24) -> list[BattleEvent]:
+    """Truncate event sequence to limit while preserving high-priority events."""
     if len(events) <= limit:
         return events
-    selected = sorted(events, key=lambda event: (-_event_priority(event), event.order))[:limit]
-    return sorted(selected, key=lambda event: event.order)
+
+    selected = sorted(events, key=_sort_priority_key)[:limit]
+    return sorted(selected, key=_sort_order_key)
+
+
+def _resolve_id(resolver: EventResolver, table: str, name: str | None) -> int:
+    """Resolve an identifier, updating diagnostics upon Out-Of-Vocabulary matches."""
+    resolved_id, resolution = resolver.resolve(table, name)
+    if resolution == _RESOLUTION_OOV:
+        EVENT_DIAGNOSTICS["oov_ids"] += 1
+    return resolved_id
+
+
+def _resolve_effect(resolver: EventResolver, table: str, name: str) -> int:
+    """Strip prefixes from effect names and resolve their identifiers."""
+    _, separator, remainder = name.partition(":")
+    return _resolve_id(resolver, table, remainder if separator else name)
 
 
 def parse_events(
     raw_events: list[RawBattleEvent],
     resolver: EventResolver,
 ) -> list[BattleEvent]:
+    """Parse raw Showdown protocol event lines into structured BattleEvents.
+
+    Arguments:
+      raw_events: sequence of raw battle event line records to parse
+      resolver: vocabulary event resolver mapping string identifiers to integers
+
+    Returns:
+      list of parsed BattleEvent objects in order of occurrence
+    """
     events: list[BattleEvent] = []
     last_attacker: str | None = None
-
-    def event(
-        event_type: EventTypeId,
-        entity_id: str | None,
-        order: int,
-        *,
-        target_id: str | None = None,
-        move_id: int = 0,
-        item_id: int = 0,
-        status_id: int = 0,
-        effect_id: int = 0,
-        ability_id: int = 0,
-        flags: int = 0,
-        value: float = 0.0,
-    ) -> BattleEvent:
-        return BattleEvent(
-            event_type,
-            entity_id,
-            target_id,
-            move_id,
-            item_id,
-            status_id,
-            effect_id,
-            ability_id,
-            flags,
-            value,
-            order,
-        )
-
-    def resolve_id(table: str, name: str | None) -> int:
-        resolved_id, resolution = resolver.resolve(table, name)
-        if resolution == _RESOLUTION_OOV:
-            EVENT_DIAGNOSTICS["oov_ids"] += 1
-        return resolved_id
-
-    def resolve_effect(table: str, name: str) -> int:
-        _, separator, remainder = name.partition(":")
-        return resolve_id(table, remainder if separator else name)
 
     for raw_event in raw_events:
         message = raw_event.message
         if len(message) < 2:
             continue
+
         tag = message[1]
         order = len(events)
+
         if tag == "move" and len(message) >= 4:
             last_attacker = message[2]
             generated = any(part.startswith("[from]") for part in message[5:])
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.MOVE,
                     last_attacker,
-                    order,
                     target_id=message[4] if len(message) >= 5 else None,
-                    move_id=resolve_id("moves", message[3]),
+                    move_id=_resolve_id(resolver, "moves", message[3]),
                     flags=4 if generated else 0,
+                    order=order,
                 )
             )
+
         elif tag in ("switch", "drag") and len(message) >= 5:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.DRAG if tag == "drag" else EventTypeId.SWITCH_IN,
                     message[2],
-                    order,
+                    order=order,
                 )
             )
+
         elif tag == "swap" and len(message) >= 3:
-            events.append(event(EventTypeId.SWAP, message[2], order))
+            events.append(BattleEvent(EventTypeId.SWAP, message[2], order=order))
+
         elif tag == "faint" and len(message) >= 3:
-            events.append(event(EventTypeId.FAINT, message[2], order))
+            events.append(BattleEvent(EventTypeId.FAINT, message[2], order=order))
+
         elif tag in ("-damage", "-heal") and len(message) >= 4:
             new_hp = get_hp_fraction(message[3])
             if raw_event.pre_hp is None:
                 EVENT_DIAGNOSTICS["missing_pre_hp"] += 1
             value = 0.0 if raw_event.pre_hp is None else new_hp - raw_event.pre_hp
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.DAMAGE if tag == "-damage" else EventTypeId.HEAL,
                     message[2],
-                    order,
                     value=value,
+                    order=order,
                 )
             )
+
         elif tag in ("-boost", "-unboost") and len(message) >= 5:
             amount = int(message[4]) / 6.0
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.BOOST if tag == "-boost" else EventTypeId.UNBOOST,
                     message[2],
-                    order,
                     value=amount if tag == "-boost" else -amount,
+                    order=order,
                 )
             )
+
         elif tag in ("-status", "-curestatus") and len(message) >= 4:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.STATUS_SET if tag == "-status" else EventTypeId.STATUS_CURE,
                     message[2],
-                    order,
-                    status_id=resolve_id("status", message[3]),
+                    status_id=_resolve_id(resolver, "status", message[3]),
+                    order=order,
                 )
             )
+
         elif tag in ("-enditem", "-item") and len(message) >= 4:
             transferred = tag == "-item" and any(
                 "move: trick" in part.lower() or "move: switcheroo" in part.lower()
@@ -317,78 +339,82 @@ def parse_events(
                 else EventTypeId.ITEM_REVEAL
             )
             events.append(
-                event(
+                BattleEvent(
                     event_type,
                     message[2],
-                    order,
-                    item_id=resolve_id("items", message[3]),
+                    item_id=_resolve_id(resolver, "items", message[3]),
+                    order=order,
                 )
             )
+
         elif tag == "-ability" and len(message) >= 4:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.ABILITY,
                     message[2],
-                    order,
-                    ability_id=resolve_id("abilities", message[3]),
+                    ability_id=_resolve_id(resolver, "abilities", message[3]),
+                    order=order,
                 )
             )
+
         elif tag == "-weather" and len(message) >= 3:
             if any("[upkeep]" in part for part in message[3:]):
-                # Showdown re-emits the active weather every turn; an upkeep
-                # line is not a state transition and must not burn a slot.
                 continue
             if message[2] == "none":
-                events.append(event(EventTypeId.WEATHER_END, None, order))
+                events.append(BattleEvent(EventTypeId.WEATHER_END, None, order=order))
             else:
                 events.append(
-                    event(
+                    BattleEvent(
                         EventTypeId.WEATHER_START,
                         None,
-                        order,
-                        effect_id=resolve_effect("weathers", message[2]),
+                        effect_id=_resolve_effect(resolver, "weathers", message[2]),
+                        order=order,
                     )
                 )
+
         elif tag in ("-fieldstart", "-fieldend") and len(message) >= 3:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.FIELD_START if tag == "-fieldstart" else EventTypeId.FIELD_END,
                     None,
-                    order,
-                    effect_id=resolve_effect("fields", message[2]),
+                    effect_id=_resolve_effect(resolver, "fields", message[2]),
+                    order=order,
                 )
             )
+
         elif tag in ("-sidestart", "-sideend") and len(message) >= 4:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.SIDE_START if tag == "-sidestart" else EventTypeId.SIDE_END,
                     message[2],
-                    order,
-                    effect_id=resolve_effect("side_conditions", message[3]),
+                    effect_id=_resolve_effect(resolver, "side_conditions", message[3]),
+                    order=order,
                 )
             )
+
         elif tag in ("-start", "-end") and len(message) >= 4:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.EFFECT_START if tag == "-start" else EventTypeId.EFFECT_END,
                     message[2],
-                    order,
-                    effect_id=resolve_effect("volatiles", message[3]),
+                    effect_id=_resolve_effect(resolver, "volatiles", message[3]),
+                    order=order,
                 )
             )
+
         elif tag in ("-formechange", "detailschange") and len(message) >= 4:
-            events.append(event(EventTypeId.FORME_CHANGE, message[2], order))
+            events.append(BattleEvent(EventTypeId.FORME_CHANGE, message[2], order=order))
+
         elif tag == "-fail":
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.FAILED,
                     last_attacker or (message[2] if len(message) >= 3 else None),
-                    order,
+                    order=order,
                 )
             )
+
         elif tag in ("-immune", "-miss"):
-            # -immune names the immune (blocked-on) Pokemon; -miss names the
-            # source and, when present, the missed target. Keep both endpoints.
             named = message[2] if len(message) >= 3 else None
             if tag == "-miss":
                 source = named or last_attacker
@@ -398,109 +424,176 @@ def parse_events(
                 source = last_attacker
                 target = named
                 flags = 1
-            events.append(event(EventTypeId.BLOCKED, source, order, target_id=target, flags=flags))
+            events.append(
+                BattleEvent(
+                    EventTypeId.BLOCKED,
+                    source,
+                    target_id=target,
+                    flags=flags,
+                    order=order,
+                )
+            )
+
         elif tag == "-activate" and len(message) >= 4:
             effect = message[3]
             if effect.startswith(PROTECT_EFFECTS):
                 events.append(
-                    event(EventTypeId.BLOCKED, last_attacker, order, target_id=message[2])
+                    BattleEvent(
+                        EventTypeId.BLOCKED,
+                        last_attacker,
+                        target_id=message[2],
+                        order=order,
+                    )
                 )
             else:
                 kind, separator, name = effect.partition(":")
                 kind = kind.strip().lower() if separator else ""
-                activation = event(EventTypeId.ACTIVATE, message[2], order)
+                ability_id = 0
+                item_id = 0
+                effect_id = 0
                 if kind == "ability":
-                    activation = activation._replace(ability_id=resolve_id("abilities", name))
+                    ability_id = _resolve_id(resolver, "abilities", name)
                 elif kind == "item":
-                    activation = activation._replace(item_id=resolve_id("items", name))
+                    item_id = _resolve_id(resolver, "items", name)
                 else:
-                    activation = activation._replace(effect_id=resolve_effect("volatiles", effect))
-                events.append(activation)
+                    effect_id = _resolve_effect(resolver, "volatiles", effect)
+
+                events.append(
+                    BattleEvent(
+                        EventTypeId.ACTIVATE,
+                        message[2],
+                        ability_id=ability_id,
+                        item_id=item_id,
+                        effect_id=effect_id,
+                        order=order,
+                    )
+                )
+
         elif tag == "-crit" and len(message) >= 3:
-            events.append(event(EventTypeId.CRIT, message[2], order))
+            events.append(BattleEvent(EventTypeId.CRIT, message[2], order=order))
+
         elif tag == "-mega" and len(message) >= 3:
-            events.append(event(EventTypeId.MEGA, message[2], order))
+            events.append(BattleEvent(EventTypeId.MEGA, message[2], order=order))
+
         elif tag == "cant" and len(message) >= 4:
-            # "Fully paralyzed / flinched / asleep / taunted out of the move".
-            # Flinch has no -start/-end line, so this is its only representation.
             reason = message[3]
             is_status = reason in STATUS_CODES
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.CANT,
                     message[2],
-                    order,
-                    status_id=resolve_id("status", reason) if is_status else 0,
-                    effect_id=0 if is_status else resolve_effect("volatiles", reason),
-                    move_id=resolve_id("moves", message[4]) if len(message) >= 5 else 0,
+                    status_id=_resolve_id(resolver, "status", reason) if is_status else 0,
+                    effect_id=0 if is_status else _resolve_effect(resolver, "volatiles", reason),
+                    move_id=_resolve_id(resolver, "moves", message[4]) if len(message) >= 5 else 0,
+                    order=order,
                 )
             )
+
         elif tag == "-prepare" and len(message) >= 4:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.PREPARE,
                     message[2],
-                    order,
                     target_id=message[4] if len(message) >= 5 else None,
-                    move_id=resolve_id("moves", message[3]),
+                    move_id=_resolve_id(resolver, "moves", message[3]),
+                    order=order,
                 )
             )
+
         elif tag == "-singlemove" and len(message) >= 4:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.SINGLEMOVE,
                     message[2],
-                    order,
-                    effect_id=resolve_effect("volatiles", message[3]),
+                    effect_id=_resolve_effect(resolver, "volatiles", message[3]),
+                    order=order,
                 )
             )
+
         elif tag == "-setboost" and len(message) >= 5:
             events.append(
-                event(EventTypeId.BOOST_SET, message[2], order, value=int(message[4]) / 6.0)
+                BattleEvent(
+                    EventTypeId.BOOST_SET,
+                    message[2],
+                    value=int(message[4]) / 6.0,
+                    order=order,
+                )
             )
+
         elif tag in ("-clearboost", "-clearnegativeboost", "-clearallboost"):
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.BOOST_CLEAR,
                     message[2] if len(message) >= 3 else None,
-                    order,
                     flags=1 if tag == "-clearnegativeboost" else 0,
+                    order=order,
                 )
             )
+
         elif tag == "-swapboost" and len(message) >= 4:
-            events.append(event(EventTypeId.BOOST_SWAP, message[2], order, target_id=message[3]))
+            events.append(
+                BattleEvent(
+                    EventTypeId.BOOST_SWAP,
+                    message[2],
+                    target_id=message[3],
+                    order=order,
+                )
+            )
+
         elif tag == "-invertboost" and len(message) >= 3:
-            events.append(event(EventTypeId.BOOST_INVERT, message[2], order))
+            events.append(BattleEvent(EventTypeId.BOOST_INVERT, message[2], order=order))
+
         elif tag == "-copyboost" and len(message) >= 4:
-            events.append(event(EventTypeId.BOOST_COPY, message[2], order, target_id=message[3]))
+            events.append(
+                BattleEvent(
+                    EventTypeId.BOOST_COPY,
+                    message[2],
+                    target_id=message[3],
+                    order=order,
+                )
+            )
+
         elif tag == "-transform" and len(message) >= 4:
-            events.append(event(EventTypeId.TRANSFORM, message[2], order, target_id=message[3]))
+            events.append(
+                BattleEvent(
+                    EventTypeId.TRANSFORM,
+                    message[2],
+                    target_id=message[3],
+                    order=order,
+                )
+            )
+
         elif tag == "-endability" and len(message) >= 3:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.ABILITY_END,
                     message[2],
-                    order,
-                    ability_id=resolve_id("abilities", message[3]) if len(message) >= 4 else 0,
+                    ability_id=_resolve_id(resolver, "abilities", message[3])
+                    if len(message) >= 4
+                    else 0,
+                    order=order,
                 )
             )
+
         elif tag == "-fieldactivate" and len(message) >= 3:
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.FIELD_ACTIVATE,
                     None,
-                    order,
-                    effect_id=resolve_effect("fields", message[2]),
+                    effect_id=_resolve_effect(resolver, "fields", message[2]),
+                    order=order,
                 )
             )
+
         elif tag == "-notarget":
             events.append(
-                event(
+                BattleEvent(
                     EventTypeId.NO_TARGET,
                     message[2] if len(message) >= 3 else last_attacker,
-                    order,
+                    order=order,
                 )
             )
+
     return events
 
 

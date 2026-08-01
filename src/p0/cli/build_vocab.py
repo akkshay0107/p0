@@ -41,10 +41,12 @@ NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
 
 def normalize(value: str) -> str:
+    """Normalize a string by lowercasing and stripping non-alphanumeric characters."""
     return NORMALIZE_RE.sub("", value.lower())
 
 
 def append_keys(table: dict[str, int], keys: set[str]) -> None:
+    """Add new semantic keys to a vocabulary table."""
     next_id = max(table.values(), default=0) + 1
     for key in sorted(keys):
         if key not in table:
@@ -53,6 +55,7 @@ def append_keys(table: dict[str, int], keys: set[str]) -> None:
 
 
 def enum_keys(enum: Any) -> set[str]:
+    """Extract and normalize keys from an enumeration."""
     return {normalize(member.name) for member in enum if member.name != "UNKNOWN"}
 
 
@@ -62,6 +65,7 @@ def build(
     manifest_path: Path,
     coverage_path: Path | None = None,
 ) -> dict[str, Any]:
+    """Build the vocab mapping, checking for schema and dataset coverage."""
     dex = json.loads(dex_path.read_text(encoding="utf-8"))
     vocab: dict[str, dict[str, int]] = {table: {} for table in TABLES}
 
@@ -115,6 +119,7 @@ def build(
         if table is None:
             raise ValueError(f"Unknown legal protocol-effect namespace: {family}")
         append_keys(vocab[table], {normalize(value) for value in identifiers})
+
     for table, values in vocab.items():
         if any(not isinstance(index, int) or index <= 0 for index in values.values()):
             raise ValueError(f"Vocabulary table {table!r} contains a non-positive embedding ID")
@@ -148,6 +153,7 @@ def build(
     known_protocol_ids.update(
         normalize(identifier) for table in effect_tables.values() for identifier in vocab[table]
     )
+
     protocol_ids = {normalize(value) for value in dex.get("protocolEffects", [])}
     coverage = {
         "schemaVersion": 1,
@@ -163,8 +169,10 @@ def build(
         coverage_path.write_text(
             json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+
     if missing_content:
         raise ValueError(f"Champions coverage audit failed: missing={missing_content}")
+
     manifest = current_manifest(
         vocab_path=vocab_path,
         dex_path=dex_path,
@@ -177,6 +185,7 @@ def build(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Build vocab CLI entrypoint."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--dex", type=Path, default=DEFAULT_DEX)
     parser.add_argument("--vocab", type=Path, default=DEFAULT_VOCAB)
@@ -187,7 +196,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional path for the reproducible coverage audit report",
     )
     args = parser.parse_args(argv)
+
     build(args.dex, args.vocab, args.manifest, args.coverage)
+
     print(json.dumps({"vocab": str(args.vocab), "manifest": str(args.manifest)}, indent=2))
     return 0
 

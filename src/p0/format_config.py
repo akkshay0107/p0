@@ -1,18 +1,27 @@
-"""Format configuration and the load-breaking runtime contract."""
+"""Format configuration and the load-breaking runtime contract.
+
+This module specifies format metadata, action space layouts, and runtime manifest contracts.
+It validates tensor ABI versions, vocabulary hashes, and dex compatibility to enforce
+fail-fast contract checking when loading model checkpoints or dataset shards.
+"""
 
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+import orjson
 
 from p0.paths import DEFAULT_PATHS
 
 RUNTIME_MANIFEST_SCHEMA = 2
 TENSOR_ABI = "champions-memory-channel-v1"
 RESOURCE_FEATURE_ABI = "champions-dex-features-v1"
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # This is deliberately data, not a hash of the action-encoding implementation.
 ACTION_CONTRACT: dict[str, Any] = {
@@ -75,50 +84,46 @@ def _validate_json_value(value: Any, location: str = "contract") -> None:
     """Accept the small, unambiguous JSON subset used by compatibility contracts."""
     if value is None or isinstance(value, (str, bool)):
         return
+
     if type(value) is int:
         return
+
     if isinstance(value, list):
         for index, item in enumerate(value):
             _validate_json_value(item, f"{location}[{index}]")
         return
+
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError(f"{location} contains a non-string object key")
             _validate_json_value(item, f"{location}.{key}")
         return
+
     raise ValueError(f"{location} contains unsupported value {value!r}")
 
 
 def canonical_json_sha256(value: Any) -> str:
     """Hash JSON semantics independently of whitespace and object-key order."""
     _validate_json_value(value)
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+    encoded = orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(encoded).hexdigest()
 
 
 def sha256_file(path: str | Path) -> str:
-    """Return the SHA-256 digest of exact file bytes."""
-    digest = hashlib.sha256()
+    """Return the SHA-256 digest of exact file bytes using C-level file_digest."""
     with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def sha256_json_file(path: str | Path) -> str:
     """Hash parsed JSON so formatting-only edits do not break compatibility."""
     path = Path(path)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        value = orjson.loads(path.read_bytes())
+    except (OSError, UnicodeError, orjson.JSONDecodeError) as exc:
         raise ValueError(f"Malformed JSON resource: {path}") from exc
+
     return canonical_json_sha256(value)
 
 
@@ -165,6 +170,7 @@ class RuntimeManifest:
     def from_dict(cls, value: Mapping[str, Any]) -> RuntimeManifest:
         data = dict(value)
         _validate_exact_fields(data, _MANIFEST_FIELDS, "runtime manifest")
+
         if data["manifest_schema"] != RUNTIME_MANIFEST_SCHEMA:
             raise ValueError(
                 f"Unsupported runtime manifest schema {data['manifest_schema']!r}; "
@@ -175,6 +181,7 @@ class RuntimeManifest:
         provenance = data["mechanics_provenance"]
         if not isinstance(contract, Mapping) or not isinstance(provenance, Mapping):
             raise ValueError("Runtime contract and mechanics provenance must be JSON objects")
+
         _validate_exact_fields(contract, _RUNTIME_CONTRACT_FIELDS, "runtime contract")
         _validate_exact_fields(provenance, _MECHANICS_PROVENANCE_FIELDS, "mechanics provenance")
         _validate_json_value(contract, "runtime contract")
@@ -182,21 +189,26 @@ class RuntimeManifest:
         digest = data["runtime_contract_sha256"]
         if not _is_sha256(digest):
             raise ValueError("runtime_contract_sha256 must be a lowercase SHA-256 digest")
+
         actual = canonical_json_sha256(contract)
         if digest != actual:
             raise ValueError(
                 "runtime_contract_sha256 does not match the embedded runtime contract: "
                 f"declared={digest}, actual={actual}"
             )
+
         vocabulary_digest = contract["vocabulary_sha256"]
         dex_digest = provenance["champions_dex_sha256"]
         if not _is_sha256(vocabulary_digest) or not _is_sha256(dex_digest):
             raise ValueError("Vocabulary and dex identities must be lowercase SHA-256 digests")
+
         for field in ("tensor_abi", "resource_feature_abi"):
             if not isinstance(contract[field], str) or not contract[field]:
                 raise ValueError(f"Runtime contract {field} must be a non-empty string")
+
         if not isinstance(contract["action"], Mapping):
             raise ValueError("Runtime action contract must be a JSON object")
+
         for field in _MECHANICS_PROVENANCE_FIELDS - {"champions_dex_sha256"}:
             if not isinstance(provenance[field], str) or not provenance[field]:
                 raise ValueError(f"Mechanics provenance {field} must be a non-empty string")
@@ -223,11 +235,7 @@ def _validate_exact_fields(value: Mapping[str, Any], expected: frozenset[str], o
 
 
 def _is_sha256(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
+    return isinstance(value, str) and bool(_SHA256_RE.match(value))
 
 
 def current_manifest(
@@ -242,14 +250,13 @@ def current_manifest(
         "action": ACTION_CONTRACT,
         "resource_feature_abi": RESOURCE_FEATURE_ABI,
     }
+
     return RuntimeManifest(
         tensor_abi=TENSOR_ABI,
         vocabulary_sha256=contract["vocabulary_sha256"],
         action=ACTION_CONTRACT,
         resource_feature_abi=RESOURCE_FEATURE_ABI,
         runtime_contract_sha256=canonical_json_sha256(contract),
-        # Dex identity is provenance rather than compatibility, so an exact file
-        # digest is sufficient and permits ordinary numeric mechanics values.
         champions_dex_sha256=sha256_file(dex_path),
         showdown_commit=FORMAT.showdown_commit,
         battle_format=FORMAT.battle_format,
@@ -258,15 +265,18 @@ def current_manifest(
 
 
 def load_runtime_manifest(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> RuntimeManifest:
+    """Load and parse a RuntimeManifest from disk."""
     path = Path(path)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = orjson.loads(path.read_bytes())
     except FileNotFoundError:
         raise FileNotFoundError(f"Global runtime manifest not found: {path}") from None
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, orjson.JSONDecodeError) as exc:
         raise ValueError(f"Malformed global runtime manifest: {path}") from exc
+
     if not isinstance(value, Mapping):
         raise ValueError(f"Global runtime manifest must be a JSON object: {path}")
+
     return RuntimeManifest.from_dict(value)
 
 
@@ -277,22 +287,28 @@ def load_active_runtime_manifest(
     path = Path(path)
     manifest = load_runtime_manifest(path)
     mismatches = []
+
     if manifest.tensor_abi != TENSOR_ABI:
         mismatches.append(f"tensor_abi={manifest.tensor_abi!r}, code={TENSOR_ABI!r}")
+
     if manifest.resource_feature_abi != RESOURCE_FEATURE_ABI:
         mismatches.append(
             f"resource_feature_abi={manifest.resource_feature_abi!r}, code={RESOURCE_FEATURE_ABI!r}"
         )
+
     if manifest.action != ACTION_CONTRACT:
         mismatches.append("action contract differs from the compiled action-encoding contract")
+
     vocab_path = path.with_name("vocab.json")
     actual_vocab = sha256_json_file(vocab_path)
     if manifest.vocabulary_sha256 != actual_vocab:
         mismatches.append(f"vocabulary={manifest.vocabulary_sha256}, actual={actual_vocab}")
+
     if mismatches:
         raise ValueError(
             "Runtime manifest does not describe the active runtime: " + "; ".join(mismatches)
         )
+
     return manifest
 
 
@@ -305,13 +321,16 @@ def validate_artifact_runtime_contract(
             "Unsupported legacy checkpoint format containing runtime_manifest_sha256; "
             "create a new checkpoint with the checkpoint-4 artifact schema"
         )
+
     reference = artifact.get("runtime_contract_sha256")
     if not _is_sha256(reference):
         raise ValueError("Artifact has no valid runtime_contract_sha256 reference")
+
     manifest = load_active_runtime_manifest(path)
     if reference != manifest.runtime_contract_sha256:
         raise ValueError(
             "Artifact runtime contract is incompatible with the active runtime: "
             f"artifact={reference}, active={manifest.runtime_contract_sha256}"
         )
+
     return manifest

@@ -1,8 +1,16 @@
+"""Bo1 policy player, command-line configuration, and Showdown listener lifecycle.
+
+This module provides the core RLPlayer agent integrating neural network policy inference,
+history token management, series token persistence, team sampling, and CLI configuration
+for live Pokemon Showdown battles.
+"""
+
 import argparse
 import asyncio
 import logging
 import os
 import random
+import re
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,16 +22,15 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
 
 from p0.battle.legality import action_mask
-from p0.battle.series import MAX_PRIOR_GAMES, GameSummary
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
+from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.config import ModelConfig
-from p0.model.factory import build_policy
+from p0.model.factory import build_policy, compile_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.model.series_context import SeriesFeatures, tensorize_series
+from p0.model.token_store import SeriesTokenStore
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
@@ -32,10 +39,55 @@ from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import load_config
 
 
-class RLPlayer(Player):
-    """
-    Class that plays moves as per the trained policy net.
-    """
+class TeamPlayerMixin:
+    """Mixin adding team sampling and resampling from a TeamSource to any Player."""
+
+    team_source: TeamSource | None
+    team_rng: random.Random
+    current_team_packed: str | None
+
+    def __init__(
+        self,
+        *args,
+        team_rng: random.Random,
+        team_source: TeamSource | None = None,
+        **kwargs,
+    ):
+        self.team_source = team_source
+        self.team_rng = team_rng
+
+        if team_source is not None:
+            if "team" in kwargs:
+                raise ValueError("Pass either team or team_source, not both")
+            self.current_team_packed = team_source.sample(team_rng).packed
+            kwargs["team"] = self.current_team_packed
+        else:
+            self.current_team_packed = kwargs.get("team")
+
+        super().__init__(*args, **kwargs)
+
+    def update_team(self, team):
+        super().update_team(team)  # pyright: ignore[reportAttributeAccessIssue]
+
+        if isinstance(team, str):
+            self.current_team_packed = team
+        elif hasattr(team, "yield_team"):
+            self.current_team_packed = team.yield_team()
+
+    def _battle_finished_callback(self, battle: AbstractBattle):
+        super()._battle_finished_callback(battle)  # pyright: ignore[reportAttributeAccessIssue]
+
+        if self.team_source is not None:
+            self.update_team(self.team_source.sample(self.team_rng).packed)
+
+        battle_id = getattr(battle, "battle_tag", None) or getattr(battle, "tag", None)
+        battles = getattr(self, "_battles", None)
+        if battle_id and battles is not None:
+            battles.pop(battle_id, None)
+
+
+class RLPlayer(TeamPlayerMixin, Player):
+    """Class that plays moves as per the trained policy net."""
 
     def __init__(
         self,
@@ -47,24 +99,19 @@ class RLPlayer(Player):
         team_source: TeamSource | None = None,
         **kwargs,
     ):
-        self.team_source = team_source
-        self.team_rng = team_rng
-        if team_source is not None:
-            if "team" in kwargs:
-                raise ValueError("Pass either team or team_source, not both")
-            kwargs["team"] = team_source.sample(self.team_rng).packed
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, team_rng=team_rng, team_source=team_source, **kwargs)
         poke_env_patches.install(self.logger)
         self.policy = policy
         self.observation_builder = observation_builder
 
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+
         self.top_p = top_p
         self._memory_model_id = id(policy)
         self._battle_history: dict[str, list[torch.Tensor]] = {}
-        self._series_tokens: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._series_summaries: dict[str, tuple[GameSummary, ...]] = {}
+        self._series_store = SeriesTokenStore(policy.d_model)
+        self._series_scores: dict[str, list[int]] = {}
 
     @staticmethod
     def _battle_key(battle: DoubleBattle) -> str:
@@ -74,95 +121,41 @@ class RLPlayer(Player):
         return str(key)
 
     @staticmethod
-    def _series_key(battle: DoubleBattle) -> str:
-        return str(getattr(battle, "_p0_series_id", RLPlayer._battle_key(battle).split("-game")[0]))
-
-    def set_series_summaries(
-        self,
-        series_id: str,
-        summaries: tuple[GameSummary, ...],
-        player_index: int,
-    ) -> None:
-        """Install causally completed-game summaries for the next game."""
-        if len(summaries) > MAX_PRIOR_GAMES:
-            raise ValueError(
-                f"At most {MAX_PRIOR_GAMES} completed game summaries can condition a game"
-            )
-        features = tensorize_series(
-            summaries, player_index=player_index, tokenizer=self.policy.resources.tokenizer
-        )
-        encoded = self.policy.encode_series(SeriesFeatures.stack([features])).detach()
-        mask = features.game_mask.unsqueeze(0)
-        self._series_summaries[series_id] = summaries
-        self._series_tokens[series_id] = (encoded, mask)
-
-    def record_completed_game_summary(
-        self,
-        battle: DoubleBattle,
-        summary: GameSummary,
-        player_index: int,
-    ) -> None:
-        """Validate and install one causal summary before the next series game.
-
-        Replay compilation and live integration both use ``GameSummary`` as the
-        schema boundary. The live adapter supplies the completed-game summary;
-        this method enforces game ordering, canonical perspective, and the same
-        two-game encoder path used by BC.
-        """
-        series_key = self._series_key(battle)
-        prior = self._series_summaries.get(series_key, ())
-        expected_game = len(prior) + 1
-        if summary.game_number != expected_game:
-            raise ValueError(
-                f"Expected completed game {expected_game} for series {series_key!r}, "
-                f"got {summary.game_number}"
-            )
-        completed = (*prior, summary)
-        self._series_summaries[series_key] = completed
-        if len(completed) <= MAX_PRIOR_GAMES:
-            self.set_series_summaries(series_key, completed, player_index)
-        else:
-            # A completed third game has no next game to condition; retain only
-            # the validated audit record until the series cleanup callback.
-            self._series_tokens.pop(series_key, None)
+    def _base_series_id(battle_tag: str) -> str:
+        match = re.match(r"^(.*?)(?:-game(?:-\d+)?)$", battle_tag)
+        if match:
+            return match.group(1)
+        return battle_tag
 
     def invalidate_memory_for_model_reload(self) -> None:
-        """Drop orchestration tensors when a policy artifact is replaced."""
+        """Drop per-battle memory when a policy artifact is replaced."""
         self._battle_history.clear()
-        self._series_tokens.clear()
-        self._series_summaries.clear()
         self._memory_model_id = id(self.policy)
 
     def _memory_inputs(self, battle: DoubleBattle):
         if id(self.policy) != self._memory_model_id:
             self.invalidate_memory_for_model_reload()
+
         key = self._battle_key(battle)
         history = self._battle_history.get(key, [])
+
         if history:
-            values = torch.stack(history).unsqueeze(0).to(self.policy.device)
+            values = torch.stack(history[-HISTORY_WINDOW:]).unsqueeze(0).to(self.policy.device)
         else:
             values = torch.zeros((1, 0, self.policy.d_model), device=self.policy.device)
+
         history_tokens, history_mask, history_age_ids = pack_history_tokens(values)
-        series = self._series_tokens.get(self._series_key(battle))
-        if series is None:
-            series_tokens = torch.zeros(
-                (1, SERIES_SLOTS, self.policy.d_model), device=self.policy.device
-            )
-            series_mask = torch.zeros(
-                (1, SERIES_SLOTS), dtype=torch.bool, device=self.policy.device
-            )
-        else:
-            series_tokens, series_mask = series
-            series_tokens = series_tokens.to(self.policy.device)
-            series_mask = series_mask.to(self.policy.device)
+
+        base_id = self._base_series_id(key)
+        series_tokens, series_mask = self._series_store.get_tokens(
+            [base_id], device=self.policy.device
+        )
         return series_tokens, series_mask, history_tokens, history_mask, history_age_ids
 
     def _append_history(self, battle: DoubleBattle, token: torch.Tensor) -> None:
         key = self._battle_key(battle)
         entries = self._battle_history.setdefault(key, [])
         entries.append(token.detach().to(torch.float32).cpu())
-        if len(entries) > HISTORY_WINDOW:
-            del entries[0]
 
     def _get_action(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
@@ -172,8 +165,10 @@ class RLPlayer(Player):
 
         obs = obs.unsqueeze(0).to(self.policy.device)
         mask = mask.unsqueeze(0).to(self.policy.device)
+
         with torch.no_grad():
             out = self.policy.act_obs(obs, mask, *self._memory_inputs(battle), top_p=self.top_p)
+
         self._append_history(battle, out.history_token[0])
         return out.actions[0].cpu().numpy()
 
@@ -195,15 +190,29 @@ class RLPlayer(Player):
         return order.message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
-        if not isinstance(battle, DoubleBattle):
-            return
-        self._battle_history.pop(self._battle_key(battle), None)
-        if battle.finished and getattr(battle, "_p0_series_complete", True):
-            series_key = self._series_key(battle)
-            self._series_tokens.pop(series_key, None)
-            self._series_summaries.pop(series_key, None)
-        if self.team_source is not None:
-            self.update_team(self.team_source.sample(self.team_rng).packed)
+        if isinstance(battle, DoubleBattle):
+            key = self._battle_key(battle)
+            base_id = self._base_series_id(key)
+            history = self._battle_history.pop(key, None)
+
+            if history is not None:
+                values = torch.stack(history).unsqueeze(0).to(self.policy.device)
+                with torch.no_grad():
+                    new_tokens = self.policy.series.resample_single_game(values)[0]
+                self._series_store.append(base_id, new_tokens)
+
+            if battle.finished:
+                score = self._series_scores.setdefault(base_id, [0, 0])
+                if battle.won:
+                    score[0] += 1
+                elif battle.lost:
+                    score[1] += 1
+
+                if max(score) >= 2:
+                    self._series_store.drop(base_id)
+                    self._series_scores.pop(base_id, None)
+
+        super()._battle_finished_callback(battle)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -290,6 +299,7 @@ def _load_policy(
     if checkpoint_path is None:
         if not allow_random_init:
             raise ValueError("A checkpoint is required unless random init is explicitly allowed.")
+
         LOGGER.warning("Starting bot with randomly initialized policy weights.")
         resources = default_runtime_resources()
         policy = build_policy(ModelConfig.baseline(), resources).to(device)
@@ -307,6 +317,7 @@ def _load_policy(
         episode,
     )
     LOGGER.info("Running inference on device: %s", device)
+    policy = compile_policy(policy, enable=device.type == "cuda")
     policy.eval()
     return policy
 
@@ -331,11 +342,21 @@ class RLBotConfig:
 
 
 def parse_args(argv: list[str] | None = None) -> RLBotConfig:
+    """Parse command line arguments and return structured bot configuration.
+
+    Arguments:
+      argv: list of command line argument strings or None to parse sys.argv
+
+    Returns:
+      RLBotConfig dataclass holding parsed runtime configuration values
+    """
     app_defaults = load_config()
     root_dir = app_defaults.paths.repository_root
     bot_defaults = app_defaults.bot
+
     env_team_files = os.getenv("SHOWDOWN_TEAM_FILES", "")
     configured_team_files = [str(path) for path in bot_defaults.team_files]
+
     parser = argparse.ArgumentParser(description="Run the VGC RL Showdown bot.")
     parser.add_argument(
         "--server",
@@ -434,6 +455,7 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         default=os.getenv("SHOWDOWN_LOG_LEVEL", bot_defaults.log_level),
         help="Python logging level.",
     )
+
     args = parser.parse_args(argv)
 
     server_configuration = _build_server_configuration(
@@ -443,12 +465,16 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     )
     team_files = _resolve_path_list(root_dir, args.team_file)
     checkpoint_path = _resolve_path(root_dir, args.checkpoint)
+
     if checkpoint_path is None and not args.allow_random_init:
         checkpoint_path = _resolve_checkpoint_path(root_dir, checkpoint_path)
+
     if not 0.0 < args.top_p <= 1.0:
         raise ValueError("--top-p must be in (0.0, 1.0].")
+
     if args.max_concurrent_battles < 1:
         raise ValueError("--max-concurrent-battles must be at least 1.")
+
     if args.challenge_limit < 1:
         raise ValueError("--challenge-limit must be at least 1.")
 
@@ -482,14 +508,25 @@ async def run_bot(
     config: RLBotConfig,
     policy_store: PolicyStore = DEFAULT_POLICY_STORE,
 ) -> None:
+    """Boot and run the RL bot Showdown listener process.
+
+    Arguments:
+      config: RLBotConfig containing connection, policy, and team options
+      policy_store: PolicyStore implementation for checkpoint loading
+
+    Returns:
+      None
+    """
     poke_env_patches.install()
     root_dir = load_config().paths.repository_root
+
     team_source = (
         FileTeamSource.from_files(config.team_files)
         if config.team_files
         else FileTeamSource(root_dir / "teams" / config.team_pool)
     )
     checkpoint_path = config.checkpoint_path
+
     policy = _load_policy(
         checkpoint_path,
         allow_random_init=config.allow_random_init,
@@ -500,6 +537,7 @@ async def run_bot(
         config.authentication_url,
     )
     account_configuration = AccountConfiguration(config.username, config.password)
+
     bot_player = RLPlayer(
         policy=policy,
         top_p=config.top_p,
@@ -519,6 +557,7 @@ async def run_bot(
         config.websocket_url,
         checkpoint_path if checkpoint_path is not None else "random-init policy",
     )
+
     if config.opponent:
         LOGGER.info("Accepting challenges only from '%s'", config.opponent)
     else:
@@ -526,6 +565,7 @@ async def run_bot(
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop_event.set)
@@ -556,6 +596,7 @@ async def run_bot(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for running the RL bot process."""
     try:
         config = parse_args(argv)
         _configure_logging(config.log_level)
@@ -563,6 +604,7 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as exc:
         LOGGER.error("%s", exc)
         return 1
+
     return 0
 
 

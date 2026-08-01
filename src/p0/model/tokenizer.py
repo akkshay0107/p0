@@ -26,11 +26,15 @@ class _EnumIdTable(dict["NamedEffectView | str", int]):
 
     def __missing__(self, member: NamedEffectView | str) -> int:
         name = member if isinstance(member, str) else member.name
-        alias = self._aliases.get(name)
-        value = self._table.get(PokemonTokenizer.normalize_id(alias)) if alias else None
+        normalized = PokemonTokenizer.normalize_id(name)
+        alias = self._aliases.get(normalized)
+        value = self._table.get(alias) if alias else None
+
         if value is None:
-            value = self._table.get(PokemonTokenizer.normalize_id(name), 0)
+            value = self._table.get(normalized, 0)
+
         self[member] = value
+
         return value
 
 
@@ -87,30 +91,29 @@ class PokemonTokenizer:
         for nature in ("serious", "bashful", "docile", "hardy", "quirky"):
             self.natures[nature] = 0
 
+        self.aliases = {
+            "weathers": {
+                "rain": "raindance",
+                "sun": "sunnyday",
+                "sand": "sandstorm",
+                "snow": "snowscape",
+            },
+            "status": {
+                "burn": "brn",
+                "freeze": "frz",
+                "paralysis": "par",
+                "poison": "psn",
+                "sleep": "slp",
+                "toxic": "tox",
+            },
+        }
+
         # Enum members resolve lazily from their normalized names.
         self.volatiles = _EnumIdTable(vocab.get("volatiles", {}))
         self.side_conditions = _EnumIdTable(vocab.get("side_conditions", {}))
-        self.weathers = _EnumIdTable(
-            vocab.get("weathers", {}),
-            {
-                "RAINDANCE": "rain",
-                "SUNNYDAY": "sun",
-                "SANDSTORM": "sand",
-                "SNOW": "snow",
-            },
-        )
+        self.weathers = _EnumIdTable(vocab.get("weathers", {}), self.aliases["weathers"])
         self.fields = _EnumIdTable(vocab.get("fields", {}))
-        self.status = _EnumIdTable(
-            vocab.get("status", {}),
-            {
-                "BRN": "burn",
-                "FRZ": "freeze",
-                "PAR": "paralysis",
-                "PSN": "poison",
-                "SLP": "sleep",
-                "TOX": "toxic",
-            },
-        )
+        self.status = _EnumIdTable(vocab.get("status", {}), self.aliases["status"])
         self.types = _EnumIdTable(vocab.get("types", {}))
         self.categories = _EnumIdTable(vocab.get("categories", {}))
 
@@ -154,15 +157,31 @@ class PokemonTokenizer:
         return self.id_for(table, remainder if separator else name)
 
     def resolve(self, table: str, name: str | None) -> tuple[int, str]:
-        """Resolve a value while exposing why ID zero was returned."""
+        """Resolve a value while exposing why ID zero was returned.
+
+        Args:
+            table: The vocabulary table name to query (e.g. 'weathers', 'status').
+            name: The raw protocol string or enum name to resolve.
+
+        Returns:
+            A tuple containing the resolved vocabulary ID (or 0 if unresolved)
+            and a Resolution string indicating the outcome (e.g., 'known', 'oov').
+        """
         if name is None or self.normalize_id(name) == "":
             return 0, Resolution.KNOWN_NONE
+
         vocab_table = self.vocab.get(table)
+
         if vocab_table is None:
             return 0, Resolution.UNKNOWN
+
         key = self.normalize_id(name)
+        table_aliases = self.aliases.get(table, {})
+        key = table_aliases.get(key, key)
+
         if key not in vocab_table:
             return 0, Resolution.OOV
+
         return vocab_table[key], Resolution.KNOWN
 
     def status_id(self, status: NamedEffectView | None) -> int:

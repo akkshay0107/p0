@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
-import json
+import os
+import shutil
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import orjson
 import torch
 
 from p0.battle.legality import action_mask, validate_joint_action
 from p0.battle.series import GameSummary, SideGameSummary
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
+    FORMAT,
+    canonical_json_sha256,
     load_active_runtime_manifest,
     validate_artifact_runtime_contract,
 )
@@ -31,8 +37,8 @@ from p0.replays.reconstruct import (
     reconstruct_both,
 )
 from p0.replays.schema import LabelKind
-from p0.replays.scrape import load_raw_replay, read_fetch_index
 from p0.replays.shards import (
+    BO3_COMPILATION_SEMANTICS,
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
     ShardIndexEntry,
@@ -42,6 +48,10 @@ from p0.replays.shards import (
 )
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
+REPLAY_PARSER_VERSION = 1
+REPLAY_COMPILER_VERSION = 6
+IMPUTATION_ALGORITHM = "causal_stat_point_imputation"
+IMPUTATION_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +132,107 @@ def _runtime_hash(manifest_path: str | Path) -> str:
     return load_active_runtime_manifest(manifest_path).runtime_contract_sha256
 
 
+def _source_series(result: CompilationResult) -> dict[str, tuple[str, ...]]:
+    return {
+        group.record.series_id: tuple(sorted(group.record.game_replay_ids))
+        for group in result.series
+    }
+
+
+def _raw_replay_identities(
+    result: CompilationResult,
+) -> tuple[dict[str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                {
+                    "replay_id": document.metadata.replay_id,
+                    "content_sha256": hashlib.sha256(document.raw_payload).hexdigest(),
+                }
+                for group in result.series
+                for document in group.games
+            ),
+            key=lambda item: item["replay_id"],
+        )
+    )
+
+
+def _build_configuration(
+    *,
+    max_candidates: int,
+    imputation_seed: int,
+    max_decisions_per_shard: int,
+) -> dict[str, Any]:
+    return {
+        "parser_version": REPLAY_PARSER_VERSION,
+        "replay_ir_version": 1,
+        "compiler_version": REPLAY_COMPILER_VERSION,
+        "max_candidates": max_candidates,
+        "imputation": {
+            "algorithm": IMPUTATION_ALGORITHM,
+            "version": IMPUTATION_VERSION,
+            "seed": imputation_seed,
+        },
+        "max_decisions_per_shard": max_decisions_per_shard,
+    }
+
+
+def _dataset_hash(
+    *,
+    raw_replays: Iterable[Mapping[str, str]],
+    source_series: Mapping[str, tuple[str, ...]],
+    source_format_id: str,
+    build_config: Mapping[str, Any],
+    runtime_hash: str,
+) -> str:
+    identity = {
+        "raw_replays": sorted(
+            (dict(replay) for replay in raw_replays),
+            key=lambda replay: replay["replay_id"],
+        ),
+        "source_series": {
+            series_id: list(sorted(source_series[series_id])) for series_id in sorted(source_series)
+        },
+        "source_format_id": source_format_id,
+        "compilation_semantics": BO3_COMPILATION_SEMANTICS,
+        "build_config": dict(build_config),
+        "runtime_contract_sha256": runtime_hash,
+    }
+    return canonical_json_sha256(identity)
+
+
+def _validate_existing_build(
+    root: Path,
+    *,
+    dataset_hash: str,
+    manifest_path: str | Path,
+) -> ShardBuildResult:
+    try:
+        manifest_value = orjson.loads((root / "manifest.json").read_bytes())
+        manifest = ShardManifest.from_dict(manifest_value)
+        validate_artifact_runtime_contract(manifest_value, manifest_path)
+    except (OSError, UnicodeDecodeError, orjson.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Existing dataset build is invalid: {root}") from exc
+
+    if manifest.dataset_hash != dataset_hash:
+        raise ValueError(f"Dataset directory identity mismatch: {root}")
+
+    expected_artifacts = {entry.filename for entry in manifest.shards}
+
+    if set(manifest.artifact_hashes) != expected_artifacts:
+        raise ValueError(f"Existing dataset artifact index is incomplete: {root}")
+
+    if any(manifest.artifact_hashes[entry.filename] != entry.sha256 for entry in manifest.shards):
+        raise ValueError(f"Existing dataset shard identities are inconsistent: {root}")
+
+    for filename, expected in manifest.artifact_hashes.items():
+        path = root / filename
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise ValueError(f"Existing dataset artifact failed validation: {path}")
+
+    return ShardBuildResult(root / "manifest.json", manifest)
+
+
 def _empty_scalar_values() -> dict[str, list[Any]]:
     return {
         "action_mask": [],
@@ -144,15 +255,19 @@ def _perspective_tensors(
     builder: ObservationBuilder,
     stat_estimates: tuple[Any, ...],
 ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
+    """Convert a single perspective's snapshots into raw python observation and scalar lists."""
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
+
     estimates = {
         (estimate.side, _normalized(estimate.species)): estimate.precomputed
         for estimate in stat_estimates
         if estimate.precomputed is not None
     }
+
     winner = game.document.outcome.winner
     outcome = 0.0 if winner < 0 else (1.0 if winner == perspective.player else -1.0)
+
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
         snapshot.view.stat_cache = {}
         overrides = {}
@@ -163,20 +278,28 @@ def _perspective_tensors(
                 )
                 if precomputed is not None:
                     overrides[pokemon] = precomputed
+        # ReconstructedSnapshot.events is the request-scoped event window.
+        # Keep the handoff explicit so observations cannot silently fall back
+        # to FixtureBattleView's default empty event list.
+        snapshot.view.events = list(snapshot.events)
         observation = builder.build(snapshot.view, overrides)
         observation.validate(batch_rank=0)
         observation.validate_overflow_contract()
+
         if any(
             tensor.is_floating_point() and not torch.isfinite(tensor).all()
             for tensor in observation.tensors()
         ):
             raise ValueError("Replay observation contains a non-finite tensor value")
+
         for name, tensor in zip(
             StructuredObservation._FIELD_NAMES, observation.tensors(), strict=True
         ):
             fields[name].append(tensor)
+
         mask = torch.as_tensor(action_mask(snapshot.view.decision), dtype=torch.bool)
         values["action_mask"].append(mask)
+
         evidence = decision.evidence
         values["mask_provenance"].append(int(evidence.mask_provenance))
         values["label_kind"].append(int(evidence.label_kind))
@@ -195,7 +318,9 @@ def _perspective_tensors(
 def _tensorize_values(
     fields: dict[str, list[Any]], values: dict[str, list[Any]]
 ) -> dict[str, torch.Tensor]:
+    """Stack scalar lists and fields into batched PyTorch tensors for a single perspective."""
     tensors = {name: torch.stack(items) for name, items in fields.items()}
+
     tensors.update(
         {
             "action_mask": torch.stack(values["action_mask"]),
@@ -221,6 +346,7 @@ def _save_shard(
     tensors: dict[str, torch.Tensor],
     summaries: list[dict[str, Any]],
     runtime_hash: str,
+    dataset_hash: str,
 ) -> ShardIndexEntry:
     validate_shard_tensors(tensors)
     if len(summaries) != tensors["game_offsets"].numel() - 1:
@@ -232,6 +358,7 @@ def _save_shard(
         {
             "artifact_schema": SHARD_ARTIFACT_SCHEMA,
             "runtime_contract_sha256": runtime_hash,
+            "dataset_hash": dataset_hash,
             "tensors": tensors,
             SHARD_SUMMARY_KEY: summaries,
         },
@@ -255,19 +382,68 @@ def write_tensor_shards(
     manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
+    max_candidates: int = 256,
+    imputation_seed: int = 0,
+    raw_replays: Iterable[Mapping[str, str]] | None = None,
+    source_series: Mapping[str, tuple[str, ...]] | None = None,
 ) -> ShardBuildResult:
-    """Persist a compiled result as immutable, runtime-bound tensor shards."""
+    """Persist a compiled result as immutable, runtime-bound tensor shards.
+
+    Arguments:
+        result: Model-agnostic compilation result to tensorize.
+        output_dir: Root directory for runtime-keyed shard output.
+        max_decisions_per_shard: Soft decision budget for each shard.
+        manifest_path: Runtime contract manifest used to bind the artifacts.
+        resources: Optional preloaded runtime resources.
+        created_at: Optional deterministic manifest timestamp.
+        max_candidates: Maximum number of action candidates per decision.
+        imputation_seed: Random seed for stat imputation.
+        raw_replays: Optional precomputed identities for raw replay payload.
+        source_series: Optional precomputed mappings of source series.
+
+    Returns:
+        The generated shard manifest and its path as a ShardBuildResult.
+    """
     if max_decisions_per_shard <= 0:
         raise ValueError("max_decisions_per_shard must be positive")
+    if not result.games:
+        raise ValueError("No replay games passed the quality gates; nothing was published")
     runtime_hash = _runtime_hash(manifest_path)
-    root = Path(output_dir) / runtime_hash
-    root.mkdir(parents=True, exist_ok=True)
+    build_config = _build_configuration(
+        max_candidates=max_candidates,
+        imputation_seed=imputation_seed,
+        max_decisions_per_shard=max_decisions_per_shard,
+    )
+    identities = tuple(raw_replays or _raw_replay_identities(result))
+    memberships = dict(source_series or _source_series(result))
+    source_format_id = next(
+        (game.document.metadata.format_id for game in result.games),
+        FORMAT.bo3_format,
+    )
+    dataset_hash = _dataset_hash(
+        raw_replays=identities,
+        source_series=memberships,
+        source_format_id=source_format_id,
+        build_config=build_config,
+        runtime_hash=runtime_hash,
+    )
+    runtime_root = Path(output_dir) / runtime_hash
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    destination = runtime_root / dataset_hash
+    if destination.exists():
+        return _validate_existing_build(
+            destination,
+            dataset_hash=dataset_hash,
+            manifest_path=manifest_path,
+        )
+    root = Path(tempfile.mkdtemp(prefix=f".{dataset_hash}.", dir=runtime_root))
     builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
-    current_games: list[tuple[CompiledGame, ReconstructedPerspective, GameSummary | None]] = []
+    current_games: list[tuple[CompiledGame, ReconstructedPerspective]] = []
     current_decisions = 0
     shard_index = 0
+    failed_games: set[str] = set()
 
     def flush() -> None:
         nonlocal current_games, current_decisions, shard_index
@@ -278,22 +454,31 @@ def write_tensor_shards(
         game_offsets = [0]
         series_offsets = [0]
         summaries: list[dict[str, Any]] = []
-        series_ids: list[str] = []
-        estimate_cache: dict[str, tuple[Any, ...]] = {}
-        for game, perspective, summary in current_games:
-            if game.replay_id not in estimate_cache:
-                estimate_cache[game.replay_id] = impute_stat_points(
-                    game.document, dex=builder.resources.dex
+        last_series_id: str | None = None
+        for game, perspective in current_games:
+            if game.replay_id in failed_games:
+                continue
+
+            try:
+                fields, values = _perspective_tensors(
+                    game,
+                    perspective,
+                    builder=builder,
+                    stat_estimates=game.stat_estimates,
                 )
-            fields, values = _perspective_tensors(
-                game,
-                perspective,
-                builder=builder,
-                stat_estimates=estimate_cache[game.replay_id],
-            )
+            except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                diagnostics[f"rejected_tensorization_{type(exc).__name__}"] += 1
+                if game.replay_id not in failed_games:
+                    failed_games.add(game.replay_id)
+                    diagnostics["rejected_games"] += 1
+                    diagnostics["accepted_games"] -= 1
+                continue
+
+            if last_series_id is not None and game.series_id != last_series_id:
+                series_offsets.append(game_offsets[-1])
+            last_series_id = game.series_id
             for name in field_values:
                 field_values[name].extend(fields[name])
-            # Candidate offsets are per perspective, so rebase them onto the shard's flat rows.
             candidate_base = len(scalar_values["candidate_values"])
             for name in scalar_values:
                 if name != "candidate_offsets":
@@ -307,59 +492,79 @@ def write_tensor_shards(
                     "series_id": game.series_id,
                     "game_number": game.game_number,
                     "player": perspective.player,
-                    "summary": None if summary is None else summary.to_dict(),
+                    "canonical_player": game.canonical_player(perspective.player),
+                    "source_replay_id": game.replay_id,
+                    "summary": None,
                 }
             )
-            if game.series_id not in series_ids:
-                series_ids.append(game.series_id)
-                series_offsets.append(game_offsets[-1])
-            else:
-                series_offsets[-1] = game_offsets[-1]
+        series_offsets.append(game_offsets[-1])
         tensors = _tensorize_values(field_values, scalar_values)
         tensors["game_offsets"] = torch.tensor(game_offsets, dtype=torch.long)
         tensors["series_offsets"] = torch.tensor(series_offsets, dtype=torch.long)
-        entries.append(_save_shard(root, shard_index, tensors, summaries, runtime_hash))
+        entries.append(
+            _save_shard(
+                root,
+                shard_index,
+                tensors,
+                summaries,
+                runtime_hash,
+                dataset_hash,
+            )
+        )
         shard_index += 1
         current_games = []
         current_decisions = 0
 
-    games_by_series: dict[str, dict[str, CompiledGame]] = {}
-    for compiled_game in result.games:
-        games_by_series.setdefault(compiled_game.series_id, {})[compiled_game.replay_id] = (
-            compiled_game
+    try:
+        current_series_id = None
+        for game in sorted(
+            result.games,
+            key=lambda item: (item.series_id, item.game_number, item.replay_id),
+        ):
+            game_items = [(game, perspective) for perspective in game.perspectives]
+            game_decisions = sum(len(perspective.decisions) for _, perspective in game_items)
+
+            # Flush only at series boundaries to prevent temporal logic corruption
+            if (
+                current_games
+                and (game.series_id != current_series_id)
+                and (current_decisions + game_decisions > max_decisions_per_shard)
+            ):
+                flush()
+
+            current_games.extend(game_items)
+            current_decisions += game_decisions
+            current_series_id = game.series_id
+
+        flush()
+        artifact_hashes = {entry.filename: entry.sha256 for entry in entries}
+        source_games = diagnostics.get("replays", len(result.games))
+        timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        manifest = ShardManifest(
+            runtime_contract_sha256=runtime_hash,
+            dataset_hash=dataset_hash,
+            source_format_id=source_format_id,
+            build_config=build_config,
+            raw_replays={
+                str(identity["replay_id"]): str(identity["content_sha256"])
+                for identity in identities
+            },
+            source_series=memberships,
+            source_games=source_games,
+            accepted_games=diagnostics.get("accepted_games", source_games),
+            rejected_games=diagnostics.get("rejected_games", 0),
+            artifact_hashes=artifact_hashes,
+            shards=tuple(entries),
+            diagnostics={key: int(value) for key, value in diagnostics.items() if value >= 0},
+            created_at=timestamp,
         )
-    for group in result.series:
-        group_games = games_by_series.get(group.record.series_id, {})
-        score = [0, 0]
-        group_items: list[tuple[CompiledGame, ReconstructedPerspective, GameSummary | None]] = []
-        for game in group.games:
-            compiled = group_games[game.metadata.replay_id]
-            winner = compiled.document.outcome.winner
-            if winner in (0, 1):
-                score[group.record.game_player_roles[compiled.game_number - 1][winner]] += 1
-            summary = _game_summary(
-                compiled,
-                series_score=(score[0], score[1]),
-                canonical_roles=group.record.game_player_roles[compiled.game_number - 1],
-            )
-            for perspective in compiled.perspectives:
-                group_items.append((compiled, perspective, summary))
-        group_decisions = sum(len(item[1].decisions) for item in group_items)
-        if current_games and current_decisions + group_decisions > max_decisions_per_shard:
-            flush()
-        current_games.extend(group_items)
-        current_decisions += group_decisions
-    flush()
-    timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    manifest = ShardManifest(
-        runtime_contract_sha256=runtime_hash,
-        shards=tuple(entries),
-        diagnostics={key: int(value) for key, value in diagnostics.items() if value >= 0},
-        created_at=timestamp,
-    )
-    validate_artifact_runtime_contract(manifest.to_dict(), manifest_path)
-    atomic_json_save(root / "manifest.json", manifest.to_dict())
-    return ShardBuildResult(root / "manifest.json", manifest)
+        validate_artifact_runtime_contract(manifest.to_dict(), manifest_path)
+        atomic_json_save(root / "manifest.json", manifest.to_dict())
+        os.replace(root, destination)
+        return ShardBuildResult(destination / "manifest.json", manifest)
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
 
 
 def compile_to_shards(
@@ -390,6 +595,8 @@ def compile_to_shards(
         manifest_path=manifest_path,
         resources=resources,
         created_at=created_at,
+        max_candidates=max_candidates,
+        imputation_seed=imputation_seed,
     )
 
 
@@ -406,8 +613,21 @@ class CompiledGame:
     series_id: str
     game_number: int
     replay_id: str
+    canonical_player_roles: tuple[int, int]
     document: ReplayDocument
     perspectives: tuple[ReconstructedPerspective, ReconstructedPerspective]
+    stat_estimates: tuple[Any, ...]
+
+    def __post_init__(self) -> None:
+        if sorted(self.canonical_player_roles) != [0, 1]:
+            raise ValueError("CompiledGame canonical player roles must be a permutation of (0, 1)")
+
+    def canonical_player(self, source_player: int) -> int:
+        """Map a replay-local player index to its stable series player index."""
+        try:
+            return self.canonical_player_roles.index(source_player)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported replay-local player index {source_player}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,10 +644,12 @@ class CompilationResult:
                     "series_id": game.series_id,
                     "game_number": game.game_number,
                     "replay_id": game.replay_id,
+                    "canonical_player_roles": list(game.canonical_player_roles),
                     "normalized": game.document.to_dict(),
                     "perspectives": [
                         {
                             "player": perspective.player,
+                            "canonical_player": game.canonical_player(perspective.player),
                             "decisions": [decision.to_dict() for decision in perspective.decisions],
                             "diagnostics": perspective.diagnostics.to_dict(),
                         }
@@ -470,6 +692,84 @@ def _measure_game(counters: Counter[str], game: CompiledGame) -> None:
                 counters[f"tag_{tag}"] += 1
 
 
+def _quality_reasons(
+    game: CompiledGame,
+) -> tuple[str, ...]:
+    reasons: set[str] = set()
+    if any(
+        not ots.raw_payload.strip() or len(ots.revealed_species) < 2 for ots in game.document.ots
+    ):
+        reasons.add("missing_or_unusable_ots")
+
+    for perspective in game.perspectives:
+        for name, reason in (
+            ("parser_errors", "parser_error"),
+            ("state_update_errors", "state_update_error"),
+            ("grounding_misses", "grounding_miss"),
+            ("observed_illegal_action", "observed_illegal_action"),
+        ):
+            if perspective.diagnostics.counters.get(name, 0):
+                reasons.add(reason)
+
+        for snapshot, decision in zip(
+            perspective.snapshots,
+            perspective.decisions,
+            strict=True,
+        ):
+            evidence = decision.evidence
+            candidate_count = len(evidence.candidates)
+            if evidence.label_kind is LabelKind.EXACT and candidate_count != 1:
+                reasons.add("invalid_exact_candidate_count")
+            elif evidence.label_kind is LabelKind.PARTIAL and candidate_count < 2:
+                reasons.add("invalid_partial_candidate_count")
+            elif evidence.label_kind is LabelKind.UNKNOWN and candidate_count:
+                reasons.add("invalid_unknown_candidates")
+
+    return tuple(sorted(reasons))
+
+
+def _compile_worker(
+    args: tuple[
+        ReplayDocument,
+        str,
+        int,
+        tuple[int, int],
+        int,
+        Mapping[str, Any] | None,
+        int,
+    ],
+) -> tuple[CompiledGame | None, str | None]:
+    (
+        document,
+        series_id,
+        game_number,
+        canonical_player_roles,
+        max_candidates,
+        dex,
+        imputation_seed,
+    ) = args
+    estimates = ()
+
+    if dex is not None:
+        estimates = impute_stat_points(document, dex=dex, seed=imputation_seed)
+
+    try:
+        perspectives = reconstruct_both(document, max_candidates=max_candidates, dex=dex)
+    except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+        return None, type(exc).__name__
+
+    compiled = CompiledGame(
+        series_id,
+        game_number,
+        document.metadata.replay_id,
+        canonical_player_roles,
+        document,
+        perspectives,
+        estimates,
+    )
+    return compiled, None
+
+
 def compile_documents(
     documents: Iterable[ReplayDocument],
     *,
@@ -478,9 +778,24 @@ def compile_documents(
     dex: Mapping[str, Any] | None = None,
     imputation_seed: int = 0,
 ) -> CompilationResult:
-    """Compile documents twice, once from each player-relative perspective."""
+    """Compile a stream of raw ReplayDocuments into state-machine verified CompiledGames.
+
+    This function processes every document twice (once from each player's perspective),
+    imputes missing stats, groups games by series, and tracks all diagnostic counters.
+
+    Arguments:
+        documents: Iterable stream of replay documents to compile.
+        format_id: Optional exact format filter.
+        max_candidates: Maximum number of action candidates per decision.
+        dex: Optional stat dex for imputation.
+        imputation_seed: Random seed for stat imputation.
+
+    Returns:
+        A CompilationResult containing the series, games, and metrics.
+    """
     grouping: GroupingResult = group_replays(documents, format_id=format_id)
     counters: Counter[str] = Counter()
+
     counters["illegal_candidates"] = 0
     for key in (
         "replay_count",
@@ -497,6 +812,8 @@ def compile_documents(
         "parser_errors",
         "preview_decisions",
         "imputation_confidence_sum",
+        "accepted_games",
+        "rejected_games",
     ):
         counters[key] = 0
     counters["replays"] = sum(len(group.games) for group in grouping.series)
@@ -505,30 +822,64 @@ def compile_documents(
     counters["series_count"] = counters["series"]
     counters["complete_series"] = sum(group.record.is_complete for group in grouping.series)
     counters["incomplete_series"] = counters["series"] - counters["complete_series"]
-    counters["grouping_diagnostics"] = len(grouping.diagnostics) + sum(
-        len(group.diagnostics) for group in grouping.series
-    )
+    counters["grouping_diagnostics"] = len(grouping.diagnostics)
+
     games: list[CompiledGame] = []
     imputation_confidence_sum = 0.0
+
+    jobs = []
     for group in grouping.series:
-        for game_number, document in enumerate(group.games, 1):
-            if dex is not None:
-                estimates = impute_stat_points(document, dex=dex, seed=imputation_seed)
-                counters["imputations"] += sum(item.provenance == "IMPUTED" for item in estimates)
-                counters["imputation_unknown"] += sum(
-                    item.provenance == "UNKNOWN" for item in estimates
+        membership_by_replay = {
+            membership.replay_id: membership for membership in group.memberships
+        }
+
+        for document in group.games:
+            membership = membership_by_replay[document.metadata.replay_id]
+            jobs.append(
+                (
+                    document,
+                    group.record.series_id,
+                    membership.game_number,
+                    membership.canonical_player_roles,
+                    max_candidates,
+                    dex,
+                    imputation_seed,
                 )
-                imputation_confidence_sum += sum(item.confidence for item in estimates)
-            perspectives = reconstruct_both(document, max_candidates=max_candidates, dex=dex)
-            compiled = CompiledGame(
-                group.record.series_id,
-                game_number,
-                document.metadata.replay_id,
-                document,
-                perspectives,
             )
-            games.append(compiled)
-            _measure_game(counters, compiled)
+
+    if jobs:
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            for compiled, exc_name in executor.map(_compile_worker, jobs, chunksize=100):
+                if exc_name is not None:
+                    counters[f"rejected_reconstruction_{exc_name}"] += 1
+                    counters["rejected_games"] += 1
+                    continue
+
+                if compiled is None:
+                    continue
+
+                if dex is not None:
+                    counters["imputations"] += sum(
+                        item.provenance == "IMPUTED" for item in compiled.stat_estimates
+                    )
+                    counters["imputation_unknown"] += sum(
+                        item.provenance == "UNKNOWN" for item in compiled.stat_estimates
+                    )
+                    imputation_confidence_sum += sum(
+                        item.confidence for item in compiled.stat_estimates
+                    )
+
+                reasons = _quality_reasons(compiled)
+                if reasons:
+                    for reason in reasons:
+                        counters[f"rejected_{reason}"] += 1
+                    counters["rejected_games"] += 1
+                    continue
+
+                counters["accepted_games"] += 1
+                games.append(compiled)
+                _measure_game(counters, compiled)
+
     metric_values: dict[str, int | float] = dict(counters)
     metric_values["imputation_confidence_sum"] = imputation_confidence_sum
     return CompilationResult(grouping.series, tuple(games), CompilationMetrics(metric_values))
@@ -542,7 +893,9 @@ def compile_payloads(
     dex: Mapping[str, Any] | None = None,
     imputation_seed: int = 0,
 ) -> CompilationResult:
+    """Parse raw replay JSON payloads and compile them into verified games."""
     documents = tuple(parse_replay_payload(payload, format_id=format_id) for payload in payloads)
+
     return compile_documents(
         documents,
         format_id=format_id,
@@ -552,33 +905,11 @@ def compile_payloads(
     )
 
 
-def compile_raw_cache(
-    cache_dir: str | Path,
-    *,
-    format_id: str,
-    max_candidates: int = 256,
-) -> CompilationResult:
-    root = Path(cache_dir) / format_id
-    entries = read_fetch_index(root / "index.jsonl")
-    documents = tuple(
-        parse_replay_payload(
-            load_raw_replay(root / "raw" / f"{entry.replay_id}.json.gz"),
-            replay_id=entry.replay_id,
-            format_id=format_id,
-        )
-        for entry in entries
-    )
-    return compile_documents(documents, format_id=format_id, max_candidates=max_candidates)
-
-
 def write_compilation(result: CompilationResult, path: str | Path) -> None:
     """Write a canonical JSON report suitable for deterministic regression checks."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(result.to_dict(), sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
+    destination.write_bytes(orjson.dumps(result.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n")
 
 
 compile_replays = compile_documents
@@ -591,7 +922,6 @@ __all__ = [
     "ShardBuildResult",
     "compile_documents",
     "compile_payloads",
-    "compile_raw_cache",
     "compile_replays",
     "compile_to_shards",
     "write_tensor_shards",

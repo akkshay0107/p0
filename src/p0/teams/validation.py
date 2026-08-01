@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+
+import orjson
 
 from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS
-from p0.teams.team import TeamVariant
+from p0.teams.team import TeamRecord
 
 
-@dataclass(frozen=True, slots=True)
-class AdmissionResult:
+class AdmissionResult(NamedTuple):
     team_hash: str
     valid: bool
     packed_team: str | None
@@ -25,37 +24,43 @@ class AdmissionResult:
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
-def _variant_dict(variant: TeamVariant) -> dict[str, Any]:
-    pairs = sorted(
-        zip(variant.team.members, variant.spreads, strict=True),
-        key=lambda pair: pair[0].canonical().species,
-    )
+def _variant_dict(variant: TeamRecord) -> dict[str, Any]:
+    canonical_members = variant.team.canonical().members
+    if variant.team.members == canonical_members:
+        pairs = list(zip(variant.team.members, variant.spreads, strict=True))
+    else:
+        pairs = sorted(
+            zip(variant.team.members, variant.spreads, strict=True),
+            key=lambda pair: pair[0].canonical().species,
+        )
+
     team = []
     for member, spread in pairs:
-        member = member.canonical()
+        canon_member = member.canonical()
         team.append(
             {
-                "name": member.species,
-                "species": member.species,
-                "item": member.item,
-                "ability": member.ability,
-                "moves": list(member.moves),
-                "nature": member.nature,
+                "name": canon_member.species,
+                "species": canon_member.species,
+                "item": canon_member.item,
+                "ability": canon_member.ability,
+                "moves": list(canon_member.moves),
+                "nature": canon_member.nature,
                 "evs": spread.as_dict(),
                 "ivs": {name: 31 for name in ("hp", "atk", "def", "spa", "spd", "spe")},
-                "gender": member.gender,
-                "level": member.level,
+                "gender": canon_member.gender,
+                "level": canon_member.level,
             }
         )
+
     return {"format": FORMAT.battle_format, "team": team}
 
 
-def showdown_payload(variant: TeamVariant) -> str:
-    return json.dumps(_variant_dict(variant))
+def showdown_payload(variant: TeamRecord) -> str:
+    return orjson.dumps(_variant_dict(variant)).decode("utf-8")
 
 
 def validate_variant(
-    variant: TeamVariant,
+    variant: TeamRecord,
     *,
     runner: Runner = subprocess.run,
     timeout: float = 30.0,
@@ -77,19 +82,19 @@ def validate_variant(
     if process.returncode:
         raise RuntimeError(f"Pinned Showdown validator failed: {process.stderr.strip()}")
     try:
-        result = json.loads(process.stdout)
+        result = orjson.loads(process.stdout)
         return AdmissionResult(
             team_hash=variant.team.team_hash,
             valid=bool(result["valid"]),
             packed_team=result["packedTeam"],
             problems=tuple(result["problems"]),
         )
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, orjson.JSONDecodeError) as exc:
         raise RuntimeError("Pinned Showdown validator returned a malformed response") from exc
 
 
 def validate_many_batched(
-    variants: Sequence[TeamVariant],
+    variants: Sequence[TeamRecord],
     *,
     batch_size: int = 256,
     runner: Runner = subprocess.run,
@@ -116,7 +121,7 @@ def validate_many_batched(
     results: list[AdmissionResult] = []
     for offset in range(0, len(variants), batch_size):
         chunk = variants[offset : offset + batch_size]
-        payload = json.dumps([_variant_dict(variant) for variant in chunk])
+        payload = orjson.dumps([_variant_dict(variant) for variant in chunk]).decode("utf-8")
         try:
             process = runner(
                 ["node", str(validator)],
@@ -136,7 +141,7 @@ def validate_many_batched(
                 f"Pinned Showdown batched validator failed: {process.stderr.strip()}"
             )
         try:
-            parsed = json.loads(process.stdout)
+            parsed = orjson.loads(process.stdout)
             if not isinstance(parsed, list) or len(parsed) != len(chunk):
                 raise ValueError("Response count mismatch")
             for variant, item in zip(chunk, parsed, strict=True):
@@ -148,7 +153,7 @@ def validate_many_batched(
                         problems=tuple(item["problems"]),
                     )
                 )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError, orjson.JSONDecodeError) as exc:
             raise RuntimeError(
                 "Pinned Showdown batched validator returned a malformed response"
             ) from exc
@@ -156,7 +161,7 @@ def validate_many_batched(
 
 
 def validate_many(
-    variants: Sequence[TeamVariant],
+    variants: Sequence[TeamRecord],
     *,
     runner: Runner = subprocess.run,
     timeout: float = 30.0,
@@ -222,7 +227,9 @@ class PersistentShowdownValidator:
         if self._process is not None:
             try:
                 if self._process.stdin is not None:
-                    self._process.stdin.write(json.dumps({"command": "stop"}) + "\n")
+                    self._process.stdin.write(
+                        orjson.dumps({"command": "stop"}).decode("utf-8") + "\n"
+                    )
                     self._process.stdin.flush()
                     self._process.stdin.close()
                 self._process.wait(timeout=2.0)
@@ -243,7 +250,7 @@ class PersistentShowdownValidator:
 
     def validate_many(
         self,
-        variants: Sequence[TeamVariant],
+        variants: Sequence[TeamRecord],
         *,
         batch_size: int = 256,
     ) -> tuple[AdmissionResult, ...]:
@@ -265,14 +272,16 @@ class PersistentShowdownValidator:
         results: list[AdmissionResult] = []
         for offset in range(0, len(variants), batch_size):
             chunk = variants[offset : offset + batch_size]
-            payload = json.dumps({"batch": [_variant_dict(variant) for variant in chunk]})
+            payload = orjson.dumps({"batch": [_variant_dict(variant) for variant in chunk]}).decode(
+                "utf-8"
+            )
             try:
                 self._process.stdin.write(payload + "\n")
                 self._process.stdin.flush()
                 line = self._process.stdout.readline()
                 if not line:
                     raise RuntimeError("Persistent worker closed stdout unexpectedly")
-                parsed = json.loads(line)
+                parsed = orjson.loads(line)
                 if parsed.get("status") != "ok":
                     raise RuntimeError(f"Persistent worker error: {parsed.get('message')}")
                 items = parsed.get("results")

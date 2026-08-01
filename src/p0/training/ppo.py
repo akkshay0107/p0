@@ -15,7 +15,6 @@ from torch.amp import GradScaler, autocast
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
 from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import EncodedObs, PolicyNet
-from p0.model.series_context import SeriesFeatures
 from p0.model.structured_observation import StructuredObservation, is_teampreview
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
@@ -28,8 +27,11 @@ def magnet_kl_per_step(live_logits: torch.Tensor, magnet_logits: torch.Tensor) -
     live_log_probs = F.log_softmax(live_logits.float(), dim=-1)
     magnet_log_probs = F.log_softmax(magnet_logits.float(), dim=-1)
     live_probs = live_log_probs.exp()
-    terms = live_probs * (live_log_probs - magnet_log_probs)
-    terms = torch.where(live_probs > 0, terms, torch.zeros_like(terms))
+
+    safe_live_log_probs = torch.where(live_probs > 0, live_log_probs, 0.0)
+    safe_magnet_log_probs = torch.where(live_probs > 0, magnet_log_probs, 0.0)
+
+    terms = live_probs * (safe_live_log_probs - safe_magnet_log_probs)
     return terms.sum(dim=-1).sum(dim=-1)
 
 
@@ -50,23 +52,29 @@ def compute_ppo_objective(
     """Return per-step total/policy/value losses, ratios, and log-ratios."""
     log_ratio = current_log_probs - old_log_probs
     ratio = torch.exp(log_ratio)
+
     unclipped = ratio * advantages
     clipped = torch.clamp(ratio, 1.0 - config.clip_low, 1.0 + config.clip_high) * advantages
     policy_loss = -torch.min(unclipped, clipped)
+
     value_loss = F.mse_loss(current_values, returns, reduction="none")
     total = config.value_coef * value_loss
+
     if not critic_only:
         alpha_scale = alpha * torch.where(
             team_preview.reshape(-1), config.teampreview_alpha_mult, 1.0
         )
         total = total + policy_loss + alpha_scale * magnet_kl
+
         if config.residual_entropy_coef > 0.0:
             total = total - config.residual_entropy_coef * normalized_entropy
+
     total = torch.where(
         team_preview.reshape(-1),
         total * config.teampreview_loss_mult,
         total,
     )
+
     return total, policy_loss, value_loss, ratio, log_ratio
 
 
@@ -110,6 +118,7 @@ class PPOUpdater:
 
 
 def _kl_exceeds_target(kl_sum: float, steps: int, target_kl: float) -> tuple[bool, float]:
+    """Check if the mean KL divergence exceeds the target early-stopping threshold."""
     mean_kl = kl_sum / steps if steps > 0 else 0.0
     return mean_kl > target_kl, mean_kl
 
@@ -120,7 +129,7 @@ def _build_memory_inputs(
     episodes: list[TrajectoryBatch],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build fixed-window and series inputs from one encoded trajectory batch."""
+    """Build Bo1 memory inputs from one encoded trajectory batch."""
     dtype = encoded.tokens.dtype
     local_lists = []
     offset = 0
@@ -149,68 +158,24 @@ def _build_memory_inputs(
     history_tokens = torch.stack(history_parts)
     history_mask = torch.stack(history_mask_parts)
     history_age_ids = torch.stack(history_age_parts)
-
-    encoded_series: list[torch.Tensor | None] = [None] * len(episodes)
-    raw_series_indices = [
-        index for index, episode_item in enumerate(episodes) if episode_item.series_features is not None
-    ]
-    if raw_series_indices:
-        raw_feature_values: list[SeriesFeatures] = []
-        for index in raw_series_indices:
-            features = episodes[index].series_features
-            if features is None:
-                raise RuntimeError("series feature index construction drifted")
-            raw_feature_values.append(features)
-        raw_features = SeriesFeatures.stack(raw_feature_values)
-        raw_encoded = policy.encode_series(raw_features)
-        for batch_index, episode_index in enumerate(raw_series_indices):
-            encoded_series[episode_index] = raw_encoded[batch_index]
-
-    series_token_parts = []
-    series_mask_parts = []
-    for episode_index, episode_item in enumerate(episodes):
-        encoded_series_item = encoded_series[episode_index]
-        if encoded_series_item is not None:
-            features = episode_item.series_features
-            if features is None:
-                raise RuntimeError("encoded series context is missing its source features")
-            series_token_parts.append(
-                encoded_series_item.to(device=device, dtype=dtype)
-                .unsqueeze(0)
-                .expand(episode_item.length, -1, -1)
-            )
-            series_mask_parts.append(
-                features.game_mask.to(device=device).unsqueeze(0).expand(episode_item.length, -1)
-            )
-        elif episode_item.series_tokens is None:
-            series_token_parts.append(
-                torch.zeros(
-                    (episode_item.length, SERIES_SLOTS, policy.d_model),
-                    device=device,
-                    dtype=dtype,
-                )
-            )
-            series_mask_parts.append(
-                torch.zeros((episode_item.length, SERIES_SLOTS), device=device, dtype=torch.bool)
-            )
-        else:
-            if episode_item.series_tokens.shape != (SERIES_SLOTS, policy.d_model):
-                raise ValueError("Trajectory series_tokens do not match the policy contract")
-            if episode_item.series_mask is None or episode_item.series_mask.shape != (SERIES_SLOTS,):
-                raise ValueError("Trajectory series_mask does not match the policy contract")
-            series_token_parts.append(
-                episode_item.series_tokens.to(device=device, dtype=dtype)
-                .unsqueeze(0)
-                .expand(episode_item.length, -1, -1)
-            )
-            series_mask_parts.append(
-                episode_item.series_mask.to(device=device)
-                .unsqueeze(0)
-                .expand(episode_item.length, -1)
-            )
+    decision_count = encoded.tokens.size(0)
+    if episodes and episodes[0].series_tokens is not None:
+        series_tokens = torch.cat([ep.series_tokens for ep in episodes if ep.series_tokens is not None], dim=0).to(device)
+        series_mask = torch.cat([ep.series_mask for ep in episodes if ep.series_mask is not None], dim=0).to(device)
+    else:
+        series_tokens = torch.zeros(
+            (decision_count, SERIES_SLOTS, policy.d_model),
+            device=device,
+            dtype=dtype,
+        )
+        series_mask = torch.zeros(
+            (decision_count, SERIES_SLOTS),
+            device=device,
+            dtype=torch.bool,
+        )
     return (
-        torch.cat(series_token_parts, dim=0),
-        torch.cat(series_mask_parts, dim=0),
+        series_tokens,
+        series_mask,
         history_tokens,
         history_mask,
         history_age_ids,
@@ -226,7 +191,20 @@ def _run_batched_ppo(
     episode: int,
     alpha: float,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
-    """Evaluate one PPO minibatch with one reducer pass per decision."""
+    """Evaluate one PPO minibatch with one reducer pass per decision.
+
+    Arguments:
+        episodes: Trajectories included in the minibatch.
+        policy: Live policy receiving gradients.
+        magnet: Frozen reference policy used for reverse-KL regularization.
+        config: PPO optimization settings.
+        device: Device hosting the minibatch computation.
+        episode: Current training episode index.
+        alpha: Active magnet regularization coefficient.
+
+    Returns:
+        Summed loss tensor, summed scalar metrics, and decision count.
+    """
     if not episodes:
         return (
             torch.tensor(0.0, device=device),
@@ -242,28 +220,29 @@ def _run_batched_ppo(
     is_warmup = episode < config.warmup_episodes
 
     all_obs = StructuredObservation.cat([ep.observations for ep in episodes], dim=0)
-    all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0).to(device)
+    all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0)
     use_amp = amp_enabled(config, device)
+
     with autocast(device_type=device.type, enabled=use_amp):
         all_enc = policy.encode(all_obs, all_action_masks)
+
     if is_warmup:
         all_enc = all_enc._replace(tokens=all_enc.tokens.detach(), aux=all_enc.aux.detach())
 
-    actions = torch.cat([ep.actions for ep in episodes]).to(device)
-    old_log_probs = torch.cat([ep.log_probs for ep in episodes]).to(device)
-    advantages = torch.cat([ep.advantages for ep in episodes if ep.advantages is not None]).to(
-        device
-    )
-    returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None]).to(device)
+    actions = torch.cat([ep.actions for ep in episodes])
+    old_log_probs = torch.cat([ep.log_probs for ep in episodes])
+    advantages = torch.cat([ep.advantages for ep in episodes if ep.advantages is not None])
+    returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None])
+
     live_memory = _build_memory_inputs(policy, all_enc, episodes, device)
     magnet_enc: EncodedObs | None = None
     magnet_memory: tuple[torch.Tensor, ...] | None = None
+
     if not is_warmup:
-        with torch.inference_mode(), autocast(
-            device_type=device.type, enabled=use_amp
-        ):
+        with torch.inference_mode(), autocast(device_type=device.type, enabled=use_amp):
             magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
             magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
+
     total_loss = torch.tensor(0.0, device=device)
     # convert them to python floats once at the end
     metrics: dict[str, Any] = {
@@ -351,7 +330,23 @@ def ppo_update(
     episode: int,
     alpha: float,
     cancel_requested: Callable[[], bool],
-) -> dict:
+) -> dict[str, float | int]:
+    """Apply PPO epochs to a collection of completed trajectories.
+
+    Arguments:
+        episodes: Prepared trajectories with returns and advantages.
+        policy: Live policy to update.
+        magnet: Frozen policy used for regularization.
+        optimizer: Optimizer for the live policy.
+        scaler: Automatic mixed-precision gradient scaler.
+        config: PPO optimization settings.
+        episode: Current training episode index.
+        alpha: Active magnet regularization coefficient.
+        cancel_requested: Callback polled for cooperative cancellation.
+
+    Returns:
+        Scalar optimization, stability, and timing metrics.
+    """
     policy.train()
     t0 = time.time()
 
@@ -431,6 +426,10 @@ def ppo_update(
                     scaled_loss = batch_loss / expected_minibatch_steps
                     if torch.isfinite(scaled_loss):
                         scaler.scale(scaled_loss).backward()
+                        # DEBUG: find NaN gradients
+                        for name, param in policy.named_parameters():
+                            if param.grad is not None and not torch.isfinite(param.grad).all():
+                                print(f"DEBUG: NaN/Inf grad in {name}")
                     else:
                         logging.warning(
                             f"Non-finite chunk loss at episode {episode}; "

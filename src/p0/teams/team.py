@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Iterable, Mapping, cast
+from typing import Any, Mapping, cast
+
+import orjson
 
 from p0.format_config import FORMAT
 from p0.teams.stat_points import STAT_POINT_IMPUTER_VERSION, StatPoints
@@ -30,8 +32,10 @@ class TeamMember:
     def __post_init__(self) -> None:
         if not self.species or not self.nature:
             raise ValueError("Team members require species and nature")
+
         if not 1 <= len(self.moves) <= 4:
             raise ValueError("Team members require one to four moves")
+
         if not 1 <= self.level <= 100:
             raise ValueError("Team member level must be in [1, 100]")
 
@@ -93,7 +97,7 @@ class CanonicalTeam:
 
     @property
     def team_hash(self) -> str:
-        encoded = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode()
+        encoded = orjson.dumps(self.to_dict(), option=orjson.OPT_SORT_KEYS)
         return hashlib.sha256(encoded).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
@@ -120,6 +124,7 @@ class TeamMetadata:
     def __post_init__(self) -> None:
         if self.usage_count < 1 or self.evidence_game < 0 or self.evidence_event < 0:
             raise ValueError("Usage count must be positive and evidence cutoff nonnegative")
+
         for timestamp in (self.first_seen, self.last_seen):
             datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
 
@@ -171,7 +176,7 @@ class TeamMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class TeamVariant:
+class TeamRecord:
     team: CanonicalTeam
     spreads: tuple[StatPoints, ...]
     metadata: TeamMetadata
@@ -182,6 +187,7 @@ class TeamVariant:
     def __post_init__(self) -> None:
         if len(self.spreads) != len(self.team.members):
             raise ValueError("Each team member requires one Stat Point spread")
+
         if self.spread_provenance != "imputed":
             raise ValueError("Reconstructed public teams must retain imputed provenance")
 
@@ -200,7 +206,7 @@ class TeamVariant:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, object]) -> TeamVariant:
+    def from_dict(cls, value: Mapping[str, object]) -> TeamRecord:
         expected = {
             "team",
             "spreads",
@@ -210,7 +216,7 @@ class TeamVariant:
             "validator_version",
         }
         if set(value) != expected:
-            raise ValueError("Invalid serialized team variant fields")
+            raise ValueError("Invalid serialized team record fields")
         try:
             spreads = tuple(
                 StatPoints(
@@ -232,24 +238,32 @@ class TeamVariant:
                 validator_version=str(value["validator_version"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Invalid serialized team variant") from exc
+            raise ValueError("Invalid serialized team record") from exc
 
 
-def deduplicate_variants(variants: Iterable[TeamVariant]) -> tuple[TeamVariant, ...]:
-    by_hash: dict[tuple[str, tuple[StatPoints, ...]], TeamVariant] = {}
+def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ...]:
+    deduped: dict[Any, TeamRecord] = {}
+
     for variant in variants:
-        canonical_spreads = tuple(
-            spread
-            for _, spread in sorted(
-                zip(variant.team.members, variant.spreads, strict=True),
-                key=lambda pair: pair[0].canonical().species,
+        canonical_members = variant.team.canonical().members
+        if variant.team.members == canonical_members:
+            canonical_spreads = variant.spreads
+        else:
+            canonical_spreads = tuple(
+                spread
+                for _, spread in sorted(
+                    zip(variant.team.members, variant.spreads, strict=True),
+                    key=lambda pair: pair[0].canonical().species,
+                )
             )
-        )
-        key = (variant.team.team_hash, canonical_spreads)
-        previous = by_hash.get(key)
+
+        hash_key = (variant.team.team_hash, canonical_spreads)
+        previous = deduped.get(hash_key)
+
         if previous is None:
-            by_hash[key] = variant
+            deduped[hash_key] = variant
             continue
+
         metadata = TeamMetadata(
             source_series=tuple(
                 sorted(set(previous.metadata.source_series + variant.metadata.source_series))
@@ -266,8 +280,9 @@ def deduplicate_variants(variants: Iterable[TeamVariant]) -> tuple[TeamVariant, 
             evidence_game=min(previous.metadata.evidence_game, variant.metadata.evidence_game),
             evidence_event=min(previous.metadata.evidence_event, variant.metadata.evidence_event),
         )
-        by_hash[key] = replace(previous, metadata=metadata)
-    return tuple(by_hash[key] for key in sorted(by_hash, key=lambda item: (item[0], repr(item[1]))))
+        deduped[hash_key] = replace(previous, metadata=metadata)
+
+    return tuple(deduped[k] for k in sorted(deduped, key=lambda item: (item[0], repr(item[1]))))
 
 
 def validate_evidence_cutoff(
@@ -275,5 +290,6 @@ def validate_evidence_cutoff(
 ) -> None:
     if min(event_index, evidence_game, evidence_event) < 0 or game_number < 1:
         raise ValueError("Game numbers must be positive and evidence cutoffs nonnegative")
+
     if not own_team and (evidence_game, evidence_event) > (game_number, event_index):
         raise ValueError("Opponent Stat Point evidence cannot come from the future")

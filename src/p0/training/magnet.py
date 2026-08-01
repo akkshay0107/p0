@@ -1,10 +1,8 @@
-"""Frozen magnet policy for Magnetic Mirror Descent regularization.
+"""
+Frozen magnet policy for Magnetic Mirror Descent regularization.
 
-MMD (Sokota et al., ICLR 2023) turns self-play into a game with a unique,
-attracting quantal-response equilibrium by adding a reverse-KL penalty toward a
-slowly-refreshed frozen copy of the policy — the magnet. This module owns that
-frozen copy: it never trains, carries no optimizer state, and is refreshed by a
-pure state-dict copy from the live policy on a fixed episode interval.
+This module owns that frozen copy: it never trains, carries no optimizer state,
+and is refreshed by a pure state-dict copy from the live policy on a fixed episode interval.
 """
 
 from __future__ import annotations
@@ -28,10 +26,8 @@ class Magnet:
         return self.policy.device
 
     def refresh(self, policy: PolicyNet) -> None:
-        """Reload the magnet weights from the live policy (state-dict copy only).
-
-        This never touches the live optimizer's moment buffers — a refresh is a
-        pure copy into the frozen net, so no optimizer reset is ever needed.
+        """
+        Reload the magnet weights from the live policy (state-dict copy only).
         """
         self.policy.load_state_dict(policy.state_dict())
         self.policy.eval()

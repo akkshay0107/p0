@@ -28,9 +28,11 @@ def build_sim_env(
     opponent_seed: int = 1,
     env_type: type[EnvT] = SimEnv,
 ) -> EnvT:
+    """Build and initialize a live simulation environment with random team sampling."""
     agent_rng = random.Random(agent_seed)
     opponent_rng = random.Random(opponent_seed)
     initial_agent_team = agent_team_source.sample(random.Random(agent_seed))
+
     env = env_type(
         account_configuration1=account_configuration1,
         account_configuration2=account_configuration2,
@@ -50,5 +52,6 @@ def build_sim_env(
         agent_rng=agent_rng,
         opponent_rng=opponent_rng,
     )
+
     env.agent2.update_team(opponent_team_source.sample(random.Random(opponent_seed)).packed)
     return env

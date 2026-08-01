@@ -39,7 +39,8 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 - **Autoregressive Policy Pointer Head**: Uses a pointer-attention network to select actions. The first head predicts action `a1` for the first active Pokemon. This selection is embedded and passed as context to the second head to predict action `a2` for the second active Pokemon. Sequential masking prevents invalid choices (such as duplicate switch targets or multiple mega evolutions in a single turn).
 - **Inbuilt Team Preview Handling**: The same policy used for battling can also be used for team picking at the team preview stage. The input is differentiated through a team preview flag in the observation.
 - **Magnetic Mirror-Descent Self-Play**: Runs the live policy on both seats of every environment and regularizes PPO toward a slowly refreshed frozen magnet with a reverse-KL penalty. This preserves strategic diversity in one stochastic policy without a checkpoint league or recurrent BPTT loop.
-- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with two fixed prior-game slots and full attention over a 75-position layout. BC and PPO batch complete games or bounded target windows without recurrent state APIs. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
+- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with perspective-safe prior-game slots and full attention over a 75-position layout. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
+- **Bo3 Replay Pretraining**: Acquires complete linked Champions Bo3 OTS series, audits every raw replay, preserves canonical player identity across games, and creates leakage-safe series-level train/validation/test splits.
 - **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
 - **Mixed Precision (FP16) & CUDA Graph Compilation**: Optional but speeds up training by around 1.7x on the few short runs I have done on a T4.
 
@@ -97,7 +98,35 @@ Launch the main reinforcement learning loop. The script automatically manages th
 uv run p0-train
 ```
 
+Set `paths.resume_checkpoint` to restore PPO training state, or set
+`paths.initial_policy_checkpoint` to import policy weights with a fresh optimizer and
+episode zero. The two settings are mutually exclusive. A BC
+`bc_best_policy.pt` is the supported weights-only handoff into PPO.
+
 _Note: Training metrics (magnet KL, PPO KL, explained variance, normalized entropy, and gradient diagnostics) are exported to TensorBoard. You can view them by running `tensorboard --logdir ./artifacts/runs/ppo_training/`._
+
+### Replay BC pilot
+
+The replay collector searches only the configured Champions Bo3 OTS format. The
+50-game limit is soft so the last linked series is always completed.
+
+```bash
+uv run p0-replays scrape --cache-dir artifacts/replays --limit-games 50
+uv run p0-replays build-shards \
+  --cache-dir artifacts/replays \
+  --output-dir artifacts/shards
+uv run p0-replays create-splits \
+  --shard-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/manifest.json
+uv run p0-bc train \
+  --config config.yaml \
+  --shard-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/manifest.json \
+  --split-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/splits.json \
+  --overfit
+```
+
+Raw response bytes remain immutable even when parsing or OTS checks fail. Derived
+shards are published atomically under the runtime and dataset hashes, and
+`replay-quality-manifest.json` records every accepted or rejected source replay.
 
 ### 3. Local Play
 
@@ -140,9 +169,8 @@ uv build
 
 The BC `batch_decisions` setting is an explicit target-window budget. Each window
 recomputes its local context under current weights before updating, while retaining
-past-only context and the fixed 48-decision cap. PPO can receive validated simulator
-series features through its training-side rollout provider; live protocol summary
-production remains a separate deployment concern.
+past-only context and the fixed 48-decision cap. BC, PPO, evaluation, and play use
+Bo3 series orchestration and keep each canonical player's prior-game state isolated.
 
 Run the memory-channel performance baseline with:
 
@@ -150,7 +178,8 @@ Run the memory-channel performance baseline with:
 uv run python bench/benchmark_memory_channel.py --batch-size 8 --iterations 20
 ```
 
-The installed command-line interfaces are `p0-train`, `p0-play`, `p0-build-vocab`, and `p0-export-training`.
+The installed command-line interfaces include `p0-train`, `p0-bc`, `p0-replays`,
+`p0-play`, `p0-build-vocab`, and `p0-export-training`.
 
 ---
 

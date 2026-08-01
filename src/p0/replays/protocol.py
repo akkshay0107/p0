@@ -8,12 +8,14 @@ explicit error instead of silently dropping lines.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
+import orjson
+
+from p0.replays.identity import canonical_format_id, normalize_showdown_id
 from p0.replays.schema import (
     GameEndReason,
     OTSData,
@@ -71,12 +73,13 @@ class ReplayDocument:
 
 def _as_object(payload: bytes | str | Mapping[str, Any]) -> tuple[Mapping[str, Any], bytes]:
     if isinstance(payload, Mapping):
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
         return payload, encoded
+
     raw = payload.encode("utf-8") if isinstance(payload, str) else payload
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = orjson.loads(raw)
+    except (UnicodeDecodeError, orjson.JSONDecodeError) as exc:
         raise ReplayParseError("Replay response is not valid UTF-8 JSON") from exc
     if not isinstance(value, Mapping):
         raise ReplayParseError("Replay response root must be a JSON object")
@@ -86,6 +89,7 @@ def _as_object(payload: bytes | str | Mapping[str, Any]) -> tuple[Mapping[str, A
 def _timestamp(value: Any) -> str:
     if isinstance(value, (int, float)) and value >= 0:
         return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
+
     if isinstance(value, str) and value:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -94,7 +98,8 @@ def _timestamp(value: Any) -> str:
             return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
         except ValueError as exc:
             raise ReplayParseError(f"Invalid upload timestamp {value!r}") from exc
-    return "1970-01-01T00:00:00Z"
+
+    return "1970-01-01T00:00:00Z"  # fallback
 
 
 def _players(value: Mapping[str, Any]) -> tuple[str, str]:
@@ -102,13 +107,15 @@ def _players(value: Mapping[str, Any]) -> tuple[str, str]:
     p2 = value.get("p2")
     if isinstance(p1, str) and isinstance(p2, str) and p1 and p2:
         return p1, p2
+
     players = value.get("players")
     if (
         isinstance(players, list)
         and len(players) == 2
-        and all(isinstance(item, str) for item in players)
+        and all(isinstance(item, str) and item.strip() for item in players)
     ):
         return players[0], players[1]
+
     raise ReplayParseError("Replay metadata must contain p1 and p2 players")
 
 
@@ -118,27 +125,35 @@ def _metadata(
     replay_id = value.get("id", requested_id)
     if not isinstance(replay_id, str) or not replay_id:
         raise ReplayParseError("Replay metadata has no replay id")
-    actual_format = value.get("format", format_id)
-    if not isinstance(actual_format, str) or not actual_format:
+
+    actual_format = canonical_format_id(value, expected=format_id)
+    if actual_format is None:
         raise ReplayParseError("Replay metadata has no format id")
-    room_id = str(value.get("roomid", value.get("room_id", replay_id)))
-    parent = value.get("parent", value.get("parentid", value.get("parent_room", "")))
+
+    room_value = value.get("roomid", value.get("room_id"))
+    room_id = room_value if isinstance(room_value, str) and room_value else replay_id
+    parent_value = value.get("parent", value.get("parentid", value.get("parent_room")))
+    if parent_value is not None and not isinstance(parent_value, str):
+        raise ReplayParseError("Replay parent room must be a string when present")
+
+    parent_room = "" if parent_value is None else parent_value
     winner = value.get("winner", "")
     if winner is None:
         winner = ""
-    rating = value.get("rating")
-    views = value.get("views")
+    if not isinstance(winner, str):
+        raise ReplayParseError("Replay winner must be a string when present")
+
     return ReplayMetadata(
         replay_id=replay_id,
         format_id=actual_format,
         player_names=_players(value),
-        winner=str(winner),
+        winner=winner,
         upload_time=_timestamp(value.get("uploadtime", value.get("upload_time"))),
         room_id=room_id,
-        parent_room=str(parent),
-        game_number=(None if value.get("game_number") is None else int(value["game_number"])),
-        rating=(None if rating is None else int(rating)),
-        views=(None if views is None else int(views)),
+        parent_room=parent_room,
+        game_number=int(v) if (v := value.get("game_number")) else None,
+        rating=int(v) if (v := value.get("rating")) else None,
+        views=int(v) if (v := value.get("views")) else None,
     )
 
 
@@ -151,33 +166,46 @@ def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
         lines = log.splitlines()
     else:
         raise ReplayParseError("Replay metadata has no string or array log")
+
     result: list[ProtocolLine] = []
     turn: int | None = None
+    skipping_chat_response = False
     for index, line in enumerate(lines):
         if line == "":
             continue
+
         if not line.startswith("|"):
+            if skipping_chat_response:
+                continue
             raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
-        parts = tuple(line.split("|"))
-        if len(parts) < 2 or not parts[1]:
-            raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
-        if parts[1] == "turn":
-            if len(parts) < 3 or not parts[2].isdigit():
+
+        parts_list = line.split("|")
+        if len(parts_list) >= 2 and parts_list[1] in {"c", "chatmsg"}:
+            skipping_chat_response = True
+            continue
+
+        skipping_chat_response = False
+        if len(parts_list) >= 2 and parts_list[1] == "turn":
+            if len(parts_list) < 3 or not parts_list[2].isdigit():
                 raise ReplayParseError(f"Invalid turn line {index}: {line!r}")
-            turn = int(parts[2])
-        result.append(ProtocolLine(len(result), line, parts, turn))
+            turn = int(parts_list[2])
+        result.append(ProtocolLine(len(result), line, tuple(parts_list), turn))
+
     if not result:
         raise ReplayParseError("Replay log contains no protocol lines")
+
     return tuple(result)
 
 
 def _details_from_payload(payload: str) -> dict[str, dict[str, Any]]:
     if not payload:
         return {}
+
     try:
-        value = json.loads(payload)
-    except json.JSONDecodeError:
+        value = orjson.loads(payload)
+    except orjson.JSONDecodeError:
         value = None
+
     details: dict[str, dict[str, Any]] = {}
     if isinstance(value, list):
         entries = value
@@ -200,6 +228,7 @@ def _details_from_payload(payload: str) -> dict[str, dict[str, Any]]:
                 "evs": fields[6] if len(fields) > 6 else "",
                 "level": fields[10] if len(fields) > 10 and fields[10] else 100,
             }
+
     if isinstance(entries, list):
         for entry in entries:
             if isinstance(entry, Mapping):
@@ -211,6 +240,7 @@ def _details_from_payload(payload: str) -> dict[str, dict[str, Any]]:
             elif isinstance(entry, str) and entry:
                 species = entry.split(",", 1)[0].strip()
                 details[species] = {"raw": entry}
+
     return details
 
 
@@ -221,6 +251,7 @@ def _ots(lines: tuple[ProtocolLine, ...]) -> tuple[OTSData, OTSData]:
     for line in lines:
         if len(line.parts) < 3:
             continue
+
         tag = line.parts[1]
         if tag == "showteam" and len(line.parts) >= 4 and line.parts[2] in payloads:
             payload = "|".join(line.parts[3:])
@@ -230,6 +261,7 @@ def _ots(lines: tuple[ProtocolLine, ...]) -> tuple[OTSData, OTSData]:
             details[line.parts[2]].update(payload_details)
         elif tag == "poke" and line.parts[2] in species and len(line.parts) >= 4:
             species[line.parts[2]].append(line.parts[3].split(",", 1)[0].strip())
+
     result = []
     for player in ("p1", "p2"):
         raw = "\n".join(payloads[player])
@@ -241,6 +273,7 @@ def _ots(lines: tuple[ProtocolLine, ...]) -> tuple[OTSData, OTSData]:
                 revealed_details=details[player],
             )
         )
+
     return result[0], result[1]
 
 
@@ -248,14 +281,14 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
     winner = -1
     end_reason = GameEndReason.NORMAL
     terminal: int | None = None
-    players = tuple(name.casefold() for name in metadata.player_names)
+    players = tuple(normalize_showdown_id(name) for name in metadata.player_names)
     for line in lines:
         if len(line.parts) < 3:
             continue
         tag = line.parts[1]
         if tag == "win":
             terminal = line.index
-            winner_name = line.parts[2].strip().casefold()
+            winner_name = normalize_showdown_id(line.parts[2])
             if winner_name in players:
                 winner = players.index(winner_name)
         elif tag == "tie":
@@ -282,12 +315,15 @@ def _bestof_metadata(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) 
         game_match = re.search(r"Game\s+(\d+)", html, flags=re.IGNORECASE)
         if game_match:
             game_number = int(game_match.group(1))
+
         href_match = re.search(r'href=["\']?/([^"\'>]+)', html)
         if href_match:
             candidate = href_match.group(1)
             parent = candidate.removeprefix("battle-")
+
     if parent == metadata.parent_room and game_number == metadata.game_number:
         return metadata
+
     return ReplayMetadata(
         replay_id=metadata.replay_id,
         format_id=metadata.format_id,

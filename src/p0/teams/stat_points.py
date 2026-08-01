@@ -6,7 +6,7 @@ import random
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import lru_cache
-from typing import Mapping
+from typing import Mapping, NamedTuple
 
 STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
 STAT_POINT_LIMIT = 32
@@ -50,8 +50,10 @@ class StatPoints:
         values = self.as_tuple()
         if any(type(value) is not int for value in values):
             raise TypeError("Stat Points must be integers")
+
         if any(not 0 <= value <= STAT_POINT_LIMIT for value in values):
             raise ValueError("Each Stat Point value must be in [0, 32]")
+
         if sum(values) > STAT_POINT_TOTAL_LIMIT:
             raise ValueError("A Stat Point spread may use at most 66 points")
 
@@ -62,18 +64,13 @@ class StatPoints:
         return dict(zip(STAT_NAMES, self.as_tuple(), strict=True))
 
 
-@dataclass(frozen=True, slots=True)
-class BaseStats:
+class BaseStats(NamedTuple):
     hp: int
     atk: int
     defense: int
     spa: int
     spd: int
     spe: int
-
-    def __post_init__(self) -> None:
-        if any(type(value) is not int or value <= 0 for value in self.as_tuple()):
-            raise ValueError("Base stats must be positive integers")
 
     def as_tuple(self) -> tuple[int, int, int, int, int, int]:
         return (self.hp, self.atk, self.defense, self.spa, self.spd, self.spe)
@@ -90,10 +87,13 @@ def _modify_nature(stat: int, stat_name: str, nature: str) -> int:
     impact = NATURE_IMPACTS.get(nature.lower())
     if impact is None:
         return stat
+
     if impact[0] == stat_name:
         return stat * 110 // 100
+
     if impact[1] == stat_name:
         return stat * 90 // 100
+
     return stat
 
 
@@ -130,40 +130,10 @@ class Role(StrEnum):
     BULKY_SETUP = "bulky-setup"
 
 
-@dataclass(frozen=True, slots=True)
-class ImputationInput:
-    species: str
-    nature: str
-    item: str
-    ability: str
-    moves: tuple[str, ...]
-    move_categories: tuple[str, ...]
-    base_stats: BaseStats
-    level: int = 50
-
-    def __post_init__(self) -> None:
-        if not self.species:
-            raise ValueError("Species is required for Stat Point imputation")
-        if len(self.moves) != len(self.move_categories):
-            raise ValueError("Moves and move categories must be aligned")
-
-
-@dataclass(frozen=True, slots=True)
-class SpreadCandidate:
+class SpreadCandidate(NamedTuple):
     points: StatPoints
     weight: int
     role: Role
-
-
-@dataclass(frozen=True, slots=True)
-class PrecomputedStats:
-    """Six exact level stats prepared outside observation construction."""
-
-    values: tuple[int, int, int, int, int, int]
-
-    def __post_init__(self) -> None:
-        if len(self.values) != len(STAT_NAMES) or any(value <= 0 for value in self.values):
-            raise ValueError("Precomputed stats must contain six positive values")
 
 
 _SPEED_CONTROL = frozenset({"tailwind", "icywind", "electroweb", "trickroom"})
@@ -196,57 +166,88 @@ def _normalized_id(value: str) -> str:
     return "".join(char for char in value.lower() if char.isalnum())
 
 
-def classify_role(value: ImputationInput) -> Role:
-    moves = {_normalized_id(move) for move in value.moves}
-    physical = sum(category.lower() == "physical" for category in value.move_categories)
-    special = sum(category.lower() == "special" for category in value.move_categories)
-    if "trickroom" in moves or value.nature.lower() in {"brave", "quiet", "relaxed", "sassy"}:
+def classify_role(nature: str, moves: tuple[str, ...], move_categories: tuple[str, ...]) -> Role:
+    nature_lower = nature.lower()
+    moves_set = {_normalized_id(move) for move in moves}
+    physical = sum(category.lower() == "physical" for category in move_categories)
+    special = sum(category.lower() == "special" for category in move_categories)
+
+    if "trickroom" in moves_set or nature_lower in {"brave", "quiet", "relaxed", "sassy"}:
         return Role.TRICK_ROOM
-    if moves & _SPEED_CONTROL:
+
+    if moves_set & _SPEED_CONTROL:
         return Role.SPEED_CONTROL
-    if moves & _SETUP:
+
+    if moves_set & _SETUP:
         return Role.BULKY_SETUP
-    if len(moves & _SUPPORT) >= 2 and physical + special <= 1:
+
+    if len(moves_set & _SUPPORT) >= 2 and physical + special <= 1:
         return Role.SUPPORT
+
     if physical and special:
         return Role.MIXED
+
     if physical:
         return Role.PHYSICAL
+
     if special:
         return Role.SPECIAL
+
     return Role.SUPPORT
 
 
 def _candidate_weight(
-    value: ImputationInput, points: StatPoints, role: Role, base_weight: int
+    nature: str,
+    moves: tuple[str, ...],
+    item: str,
+    ability: str,
+    base_stats: BaseStats,
+    points: StatPoints,
+    role: Role,
+    base_weight: int,
 ) -> int:
     allocation = points.as_dict()
-    moves = {_normalized_id(move) for move in value.moves}
-    item = _normalized_id(value.item)
-    ability = _normalized_id(value.ability)
-    boosted = NATURE_IMPACTS.get(value.nature.lower(), ("", ""))[0]
+    moves_set = {_normalized_id(move) for move in moves}
+    item_norm = _normalized_id(item)
+    ability_norm = _normalized_id(ability)
+    boosted = NATURE_IMPACTS.get(nature.lower(), ("", ""))[0]
     score = base_weight + allocation.get(boosted, 0)
-    if item in _OFFENSE_ITEMS:
+
+    if item_norm in _OFFENSE_ITEMS:
         score += max(allocation["atk"], allocation["spa"])
-    if ability in _SPEED_ABILITIES:
+
+    if ability_norm in _SPEED_ABILITIES:
         score += allocation["spe"]
-    if moves & _PRIORITY:
+
+    if moves_set & _PRIORITY:
         score += allocation["hp"] // 2
-    if moves & _RECOVERY or role in {Role.SUPPORT, Role.BULKY_SETUP}:
+
+    if moves_set & _RECOVERY or role in {Role.SUPPORT, Role.BULKY_SETUP}:
         score += (allocation["hp"] + allocation["def"] + allocation["spd"]) // 3
+
     if role == Role.TRICK_ROOM:
         score += STAT_POINT_LIMIT - allocation["spe"]
-    defense_total = value.base_stats.defense + value.base_stats.spd
-    offense_total = value.base_stats.atk + value.base_stats.spa
+
+    defense_total = base_stats.defense + base_stats.spd
+    offense_total = base_stats.atk + base_stats.spa
+
     if defense_total > offense_total:
         score += allocation["hp"] // 2
+
     return max(1, score)
 
 
-def impute_candidates(value: ImputationInput) -> tuple[SpreadCandidate, ...]:
+def impute_candidates(
+    nature: str,
+    moves: tuple[str, ...],
+    move_categories: tuple[str, ...],
+    item: str,
+    ability: str,
+    base_stats: BaseStats,
+) -> tuple[SpreadCandidate, ...]:
     """Return a small deterministic set of legal, weighted candidate spreads."""
-    role = classify_role(value)
-    attack = "atk" if value.base_stats.atk >= value.base_stats.spa else "spa"
+    role = classify_role(nature, moves, move_categories)
+    attack = "atk" if base_stats.atk >= base_stats.spa else "spa"
     if role == Role.PHYSICAL:
         attack = "atk"
     elif role == Role.SPECIAL:
@@ -277,13 +278,25 @@ def impute_candidates(value: ImputationInput) -> tuple[SpreadCandidate, ...]:
             (spread(hp=32, **{attack: 32}, defense=2), 55),
         )
     return tuple(
-        SpreadCandidate(points, _candidate_weight(value, points, role, weight), role)
+        SpreadCandidate(
+            points,
+            _candidate_weight(nature, moves, item, ability, base_stats, points, role, weight),
+            role,
+        )
         for points, weight in shapes
     )
 
 
-def select_candidate(value: ImputationInput, seed: int | None = None) -> SpreadCandidate:
-    candidates = impute_candidates(value)
+def select_candidate(
+    nature: str,
+    moves: tuple[str, ...],
+    move_categories: tuple[str, ...],
+    item: str,
+    ability: str,
+    base_stats: BaseStats,
+    seed: int | None = None,
+) -> SpreadCandidate:
+    candidates = impute_candidates(nature, moves, move_categories, item, ability, base_stats)
     if seed is None:
         return candidates[0]
     weights = [item.weight for item in candidates]
@@ -291,7 +304,14 @@ def select_candidate(value: ImputationInput, seed: int | None = None) -> SpreadC
 
 
 @lru_cache(maxsize=8192)
-def imputed_stats(value: ImputationInput) -> PrecomputedStats:
-    candidate = select_candidate(value)
-    stats = calculate_stats(value.base_stats, candidate.points, value.nature, value.level)
-    return PrecomputedStats(stats)
+def imputed_stats(
+    nature: str,
+    moves: tuple[str, ...],
+    move_categories: tuple[str, ...],
+    item: str,
+    ability: str,
+    base_stats: BaseStats,
+    level: int = 50,
+) -> tuple[int, int, int, int, int, int]:
+    candidate = select_candidate(nature, moves, move_categories, item, ability, base_stats)
+    return calculate_stats(base_stats, candidate.points, nature, level)

@@ -10,6 +10,7 @@ dependencies = [
     "gymnasium>=0.26.3",
     "tensorboard>=2.20.0",
     "omegaconf>=2.3.0",
+    "orjson>=3.11.9",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,7 @@ p0-export-training = "p0.cli.export_training:main"
 p0-replays = "p0.cli.replays:main"
 p0-corpus = "p0.cli.corpus:main"
 p0-eval = "p0.cli.eval:main"
+p0-bc = "p0.cli.bc:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -69,11 +71,12 @@ line-length = 100
 select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.pytest.ini_options]
-addopts = "-m 'not integration and not network'"
+addopts = "-m 'not integration and not network and not stress'"
 testpaths = ["tests"]
 markers = [
     "integration: requires a built local Showdown server",
     "network: requires access to the public replay endpoint",
+    "stress: runs large random input tests",
 ]
 
 [dependency-groups]

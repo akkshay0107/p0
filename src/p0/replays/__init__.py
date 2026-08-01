@@ -5,6 +5,7 @@ It must never import p0.runtime, and p0.replays.schema must stay torch-free
 so the IR survives observation-schema changes.
 """
 
+from p0.replays.group import individual_games, validated_bo3_series
 from p0.replays.oracle import OracleCase, OracleExpectation, OracleResult, validate_oracle
 from p0.replays.protocol import ReplayDocument, ReplayParseError, parse_replay_payload
 from p0.replays.schema import (
@@ -50,6 +51,8 @@ __all__ = [
     "ReplayDocument",
     "ReplayParseError",
     "parse_replay_payload",
+    "individual_games",
+    "validated_bo3_series",
     "OracleCase",
     "OracleExpectation",
     "OracleResult",

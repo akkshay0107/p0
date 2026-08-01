@@ -26,13 +26,39 @@ class PPOScheduler:
         self.decay_len = config.num_episodes - self.ramp_up_end
 
     def alpha(self, t: int) -> float:
-        """MMD magnet coefficient. Constant for a QRE fixed point.
+        """MMD magnet coefficient.
 
-        Annealing ``alpha`` downward late in training pushes the fixed point
-        toward Nash; kept constant here as the first-cut default.
+        Annealing alpha downward late in training pushes the fixed point
+        toward Nash; Constant for a QRE fixed point.
         """
         del t
         return self.alpha_value
+
+    def state_dict(self) -> dict[str, float | int]:
+        """Expose the PyTorch-standard state_dict interface for checkpointing.
+
+        Since this scheduler computes the learning rate dynamically based on the
+        episode 't' and has no mutable internal state, this just saves the static
+        configuration parameters into the checkpoint.
+        """
+        return {
+            "alpha_value": self.alpha_value,
+            "lr_max": self.lr_max,
+            "lr_min": self.lr_min,
+            "warmup_episodes": self.warmup_episodes,
+            "ramp_up_end": self.ramp_up_end,
+            "decay_len": self.decay_len,
+        }
+
+    def load_state_dict(self, value: dict[str, float | int]) -> None:
+        """Restore the scheduler state from a checkpoint.
+
+        Because there is no mutable state to overwrite, this method acts purely as a
+        safeguard to ensure we don't accidentally resume a training run using a
+        completely different learning rate schedule than what it started with.
+        """
+        if value != self.state_dict():
+            raise ValueError("PPO scheduler configuration does not match the checkpoint")
 
     def lr(self, t: int):
         """

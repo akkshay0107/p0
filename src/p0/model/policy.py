@@ -40,8 +40,7 @@ from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
 from p0.model.resources import RuntimeResources
 from p0.model.series_context import (
-    SeriesContextEncoder,
-    SeriesFeatures,
+    DynamicSeriesResampler,
 )
 from p0.model.structured_observation import (
     ALLY_POKE_TOKENS,
@@ -404,6 +403,58 @@ class ActorPolicy(nn.Module):
         actions = torch.stack([a1, a2], dim=-1)
         return actions, log_probs, z, reduced.local_history_token
 
+    @torch.no_grad()
+    def greedy(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Choose one legal joint action through the autoregressive path."""
+        reduced = self.reducer(
+            enc.tokens,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
+        z = reduced.cls
+        k_entity_extended = self._compute_keys(reduced.pokemon)
+
+        logits1, keys1 = self._compute_pointer_logits(
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
+        )
+        logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
+        a1 = torch.argmax(logits1, dim=-1)
+
+        batch_idx = torch.arange(a1.size(0), device=a1.device)
+        ctx_a1 = keys1[batch_idx, a1]
+        logits2, _ = self._compute_pointer_logits(
+            z,
+            k_entity_extended,
+            enc.aux[:, 1],
+            enc.numerical,
+            head_idx=1,
+            ctx_a1=ctx_a1,
+        )
+        logits = self._apply_sequential_masks(
+            torch.stack([logits1, logits2], dim=1),
+            a1,
+            action_mask,
+            is_teampreview(enc.numerical),
+        )
+        a2 = torch.argmax(logits[:, 1], dim=-1)
+        actions = torch.stack([a1, a2], dim=-1)
+        log_probs = F.log_softmax(logits[:, 0], dim=-1).gather(1, a1.unsqueeze(1)).squeeze(
+            1
+        ) + F.log_softmax(logits[:, 1], dim=-1).gather(1, a2.unsqueeze(1)).squeeze(1)
+        return actions, log_probs, z, reduced.local_history_token
+
     def score(
         self,
         enc: EncodedObs,
@@ -607,23 +658,20 @@ class PolicyNet(nn.Module):
         # value head
         self.critic = ValueHead(config.d_model)
 
-        self.series = SeriesContextEncoder(
+        self.series = DynamicSeriesResampler(
             config.d_model,
             config.nhead,
             config.dim_feedforward,
-            self.encoder.species_emb,
-            self.encoder.move_emb,
-            self.encoder.item_emb,
-            self.encoder.ability_emb,
+            num_layers=2,
         )
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def encode_series(self, features: SeriesFeatures) -> Tensor:
-        """Encode completed-game summaries into the fixed two series slots."""
-        return self.series(features)
+    def encode_series(self, histories) -> tuple[Tensor, Tensor]:
+        """Encode completed game turn histories into series tokens and mask."""
+        return self.series(histories)
 
     def local_history_tokens(self, encoded: EncodedObs) -> Tensor:
         """Generate causal per-decision tokens without memory interaction."""
