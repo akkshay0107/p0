@@ -1062,7 +1062,7 @@ def _payload_ko_scenario(
     ]
     p2_team = [
         {"species": "Bulbasaur", "moves": ["Protect", "Tackle"]},
-        {"species": "Charmander", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Charmander", "moves": ["Protect", "Helping Hand"]},
         {"species": "Venusaur", "moves": ["Protect", "Tackle"]},
     ]
     lines = [
@@ -1075,15 +1075,25 @@ def _payload_ko_scenario(
         "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
         "|switch|p2b: Charmander|Charmander, L50|100/100",
         "|turn|1",
-        "|move|p1a: Pikachu|Thunderbolt|p2a: Bulbasaur",
-        "|-damage|p2a: Bulbasaur|0/100",
-        "|faint|p2a: Bulbasaur",
     ]
     if pivot:
-        # Voluntary pivot: p2 switches without a faint (U-turn / Parting Shot).
-        lines.append("|switch|p2a: Venusaur|Venusaur, L50|100/100")
+        # One-sided pivot request: p2 voluntarily switches one slot and acts
+        # with the other while p1 has no submitted action in this segment.
+        lines.extend(
+            [
+                "|switch|p2a: Venusaur|Venusaur, L50|100/100",
+                "|move|p2b: Charmander|Protect|p1b: Eevee",
+            ]
+        )
     else:
-        lines.append("|switch|p2a: Venusaur|Venusaur, L50|100/100")
+        lines.extend(
+            [
+                "|move|p1a: Pikachu|Thunderbolt|p2a: Bulbasaur",
+                "|-damage|p2a: Bulbasaur|0/100",
+                "|faint|p2a: Bulbasaur",
+                "|switch|p2a: Venusaur|Venusaur, L50|100/100",
+            ]
+        )
 
     if terminal:
         lines.append("|win|Alice")
@@ -1143,12 +1153,15 @@ def test_forced_pass_for_one_sided_ko_replacement() -> None:
 def test_forced_pass_for_one_sided_pivot_request() -> None:
     """A one-sided voluntary pivot also produces a FORCED_PASS for the waiter."""
     document = parse_replay_payload(_payload_ko_scenario("pivot-onesided", pivot=True))
-    alice, _bob = reconstruct_both(document)
+    alice, bob = reconstruct_both(document)
 
     alice_pass = [d for d in alice.decisions if d.decision_type is DecisionType.FORCED_PASS]
     assert len(alice_pass) == 1
     assert alice_pass[0].evidence.label_kind is LabelKind.EXACT
     assert alice_pass[0].evidence.exact_action == (0, 0)
+
+    bob_pivot = [d for d in bob.decisions if d.decision_type is DecisionType.PIVOT_SWITCH]
+    assert len(bob_pivot) == 1
 
 
 def test_forced_pass_skipped_for_simultaneous_replacements() -> None:

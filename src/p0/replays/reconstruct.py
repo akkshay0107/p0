@@ -524,6 +524,9 @@ class _ReplayState:
 
         Arguments:
             parts: The split protocol line (``|tag|...``).
+
+        Returns:
+            None; mutates the replay state in place.
         """
         if len(parts) < 2:
             return
@@ -1268,7 +1271,7 @@ def reconstruct_perspective(
 ) -> ReconstructedPerspective:
     """Build pre-decision player-relative views while enforcing causal cutoffs.
 
-    Args:
+    Arguments:
         document: The complete parsed replay document.
         perspective: The index of the player to reconstruct the view for (0 or 1).
         max_candidates: The maximum number of joint action candidates to evaluate.
