@@ -1,13 +1,34 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
+from poke_env import LocalhostServerConfiguration, ServerConfiguration
 
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
+
+
+@pytest.fixture(scope="function")
+def showdown_server():
+    """Start live stress tests only when the checked-out server is runnable."""
+    from p0.paths import DEFAULT_PATHS
+    from p0.runtime.showdown import start_showdown_servers
+
+    root = Path(DEFAULT_PATHS.showdown_root)
+    if not (root / "build").is_file():
+        pytest.skip("built pokemon-showdown runtime not available")
+
+    port = 8120
+    server_configuration = ServerConfiguration(
+        websocket_url=f"ws://localhost:{port}/showdown/websocket",
+        authentication_url=LocalhostServerConfiguration.authentication_url,
+    )
+    with start_showdown_servers(1, ports=(port,)):
+        yield server_configuration
 
 
 def _stress_devices() -> tuple[torch.device, ...]:
