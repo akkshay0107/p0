@@ -8,6 +8,7 @@ explicit error instead of silently dropping lines.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -99,6 +100,7 @@ def _timestamp(value: Any) -> str:
         except ValueError as exc:
             raise ReplayParseError(f"Invalid upload timestamp {value!r}") from exc
 
+    logging.getLogger(__name__).warning("replay has no upload timestamp; using epoch fallback")
     return "1970-01-01T00:00:00Z"  # fallback
 
 

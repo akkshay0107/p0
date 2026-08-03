@@ -763,7 +763,7 @@ def test_raw_cache_keeps_malformed_bytes_for_later_quality_rejection(
     )
 
 
-def test_fetcher_skips_404_without_writing_cache_entry(tmp_path: Path, capsys) -> None:
+def test_fetcher_skips_404_without_writing_cache_entry(tmp_path: Path, caplog) -> None:
     replay_id = f"{FORMAT.bo3_format}-missing"
 
     def transport(url: str, timeout: float) -> HttpResponse:
@@ -779,10 +779,11 @@ def test_fetcher_skips_404_without_writing_cache_entry(tmp_path: Path, capsys) -
         replay_url_template="https://replay.invalid/{replay_id}.json",
         rate_limit_per_second=0,
     )
-    assert ReplayFetcher(config, transport=transport).acquire() == ()
+    with caplog.at_level("WARNING", logger="p0.replays.scrape"):
+        assert ReplayFetcher(config, transport=transport).acquire() == ()
     assert not (tmp_path / FORMAT.bo3_format / "raw" / f"{replay_id}.json.gz").exists()
     assert not (tmp_path / FORMAT.bo3_format / "metadata" / f"{replay_id}.json").exists()
-    assert "skipping unavailable replay" in capsys.readouterr().err
+    assert "skipping unavailable replay" in caplog.text
 
 
 def test_cache_build_is_dataset_bound_and_preserves_bo3_series(

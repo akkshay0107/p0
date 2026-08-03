@@ -16,7 +16,12 @@ from typing import Any, Iterable, Mapping
 import orjson
 import torch
 
-from p0.battle.legality import action_mask, validate_joint_action
+from p0.battle.legality import (
+    action_mask,
+    apply_joint_constraints,
+    legal_actions,
+    slot1_base_mask,
+)
 from p0.battle.series import GameSummary, SideGameSummary
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
@@ -36,7 +41,7 @@ from p0.replays.reconstruct import (
     impute_stat_points,
     reconstruct_both,
 )
-from p0.replays.schema import LabelKind
+from p0.replays.schema import DecisionType, LabelKind
 from p0.replays.shards import (
     BO3_COMPILATION_SEMANTICS,
     SHARD_ARTIFACT_SCHEMA,
@@ -579,14 +584,33 @@ def compile_to_shards(
     manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
+    chunksize: int | None = None,
 ) -> ShardBuildResult:
-    """Compile normalized replay documents and persist their tensor shards."""
+    """Compile normalized replay documents and persist their tensor shards.
+
+    Arguments:
+        documents: Iterable stream of replay documents to compile.
+        output_dir: Directory where shard artifacts are written.
+        format_id: Optional exact format filter.
+        max_candidates: Maximum number of action candidates per decision.
+        dex: Optional stat dex for imputation.
+        imputation_seed: Random seed for stat imputation.
+        max_decisions_per_shard: Maximum decisions packed into a single shard.
+        manifest_path: Path to the runtime manifest for contract validation.
+        resources: Optional pre-loaded runtime resources.
+        created_at: Optional ISO timestamp stamped into the manifest.
+        chunksize: Optional ProcessPoolExecutor chunk size (see ``compile_documents``).
+
+    Returns:
+        A ShardBuildResult containing the manifest path and manifest object.
+    """
     result = compile_documents(
         documents,
         format_id=format_id,
         max_candidates=max_candidates,
         dex=dex,
         imputation_seed=imputation_seed,
+        chunksize=chunksize,
     )
     return write_tensor_shards(
         result,
@@ -680,13 +704,24 @@ def _measure_game(counters: Counter[str], game: CompiledGame) -> None:
         for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
             _count_label(counters, int(decision.evidence.label_kind))
             counters[f"decision_type_{int(decision.decision_type)}"] += 1
-            if int(decision.decision_type) == 1:
+            if decision.decision_type is DecisionType.TEAM_PREVIEW:
                 counters["preview_decisions"] += 1
             counters[f"candidate_size_{len(decision.evidence.candidates)}"] += 1
             counters[f"mask_provenance_{int(decision.evidence.mask_provenance)}"] += 1
-            if decision.evidence.label_kind != 3:
-                for candidate in decision.evidence.candidates:
-                    if not validate_joint_action(snapshot.view.decision, *candidate):
+            if decision.evidence.label_kind is not LabelKind.UNKNOWN:
+                # Precompute the slot-0 legal set and the slot-1 base mask
+                # once per decision, then apply per-first-action constraints as
+                # cheap boolean array ops instead of calling validate_joint_action
+                # per candidate (81x faster — see scratch/bench_legality.py).
+                legal0 = set(legal_actions(snapshot.view.decision, 0))
+                base_slot1 = slot1_base_mask(snapshot.view.decision)
+                for first, second in decision.evidence.candidates:
+                    if first not in legal0:
+                        counters["illegal_candidates"] += 1
+                        continue
+                    slot1 = base_slot1.copy()
+                    apply_joint_constraints(slot1, snapshot.view.decision, first)
+                    if not slot1[second]:
                         counters["illegal_candidates"] += 1
             for tag in decision.evidence.tags:
                 counters[f"tag_{tag}"] += 1
@@ -777,6 +812,7 @@ def compile_documents(
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
     imputation_seed: int = 0,
+    chunksize: int | None = None,
 ) -> CompilationResult:
     """Compile a stream of raw ReplayDocuments into state-machine verified CompiledGames.
 
@@ -789,6 +825,10 @@ def compile_documents(
         max_candidates: Maximum number of action candidates per decision.
         dex: Optional stat dex for imputation.
         imputation_seed: Random seed for stat imputation.
+        chunksize: Optional ProcessPoolExecutor chunk size. When ``None`` (the
+            default) a value is derived from the job count and CPU count. For
+            small corpora (fewer jobs than workers) compilation runs inline to
+            avoid the overhead of spawning a process pool.
 
     Returns:
         A CompilationResult containing the series, games, and metrics.
@@ -848,37 +888,52 @@ def compile_documents(
             )
 
     if jobs:
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            for compiled, exc_name in executor.map(_compile_worker, jobs, chunksize=100):
-                if exc_name is not None:
-                    counters[f"rejected_reconstruction_{exc_name}"] += 1
-                    counters["rejected_games"] += 1
-                    continue
+        worker_count = os.cpu_count() or 1
+        if chunksize is None:
+            # Derive a chunk size that balances pickling overhead against
+            # worker utilisation. Each job carries a ReplayDocument with
+            # raw_payload bytes, so large chunks can pressure memory.
+            chunksize = max(1, len(jobs) // (worker_count * 4))
 
-                if compiled is None:
-                    continue
+        if len(jobs) <= worker_count or chunksize <= 0:
+            # For small corpora the process-pool spawn cost exceeds the
+            # benefit; run inline so callers get deterministic single-process
+            # behaviour without the multiprocessing fork() deprecation.
+            results = (_compile_worker(job) for job in jobs)
+        else:
+            with concurrent.futures.ProcessPoolExecutor() as executor:
+                results = executor.map(_compile_worker, jobs, chunksize=chunksize)
 
-                if dex is not None:
-                    counters["imputations"] += sum(
-                        item.provenance == "IMPUTED" for item in compiled.stat_estimates
-                    )
-                    counters["imputation_unknown"] += sum(
-                        item.provenance == "UNKNOWN" for item in compiled.stat_estimates
-                    )
-                    imputation_confidence_sum += sum(
-                        item.confidence for item in compiled.stat_estimates
-                    )
+        for compiled, exc_name in results:
+            if exc_name is not None:
+                counters[f"rejected_reconstruction_{exc_name}"] += 1
+                counters["rejected_games"] += 1
+                continue
 
-                reasons = _quality_reasons(compiled)
-                if reasons:
-                    for reason in reasons:
-                        counters[f"rejected_{reason}"] += 1
-                    counters["rejected_games"] += 1
-                    continue
+            if compiled is None:
+                continue
 
-                counters["accepted_games"] += 1
-                games.append(compiled)
-                _measure_game(counters, compiled)
+            if dex is not None:
+                counters["imputations"] += sum(
+                    item.provenance == "IMPUTED" for item in compiled.stat_estimates
+                )
+                counters["imputation_unknown"] += sum(
+                    item.provenance == "UNKNOWN" for item in compiled.stat_estimates
+                )
+                imputation_confidence_sum += sum(
+                    item.confidence for item in compiled.stat_estimates
+                )
+
+            reasons = _quality_reasons(compiled)
+            if reasons:
+                for reason in reasons:
+                    counters[f"rejected_{reason}"] += 1
+                counters["rejected_games"] += 1
+                continue
+
+            counters["accepted_games"] += 1
+            games.append(compiled)
+            _measure_game(counters, compiled)
 
     metric_values: dict[str, int | float] = dict(counters)
     metric_values["imputation_confidence_sum"] = imputation_confidence_sum
@@ -892,6 +947,7 @@ def compile_payloads(
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
     imputation_seed: int = 0,
+    chunksize: int | None = None,
 ) -> CompilationResult:
     """Parse raw replay JSON payloads and compile them into verified games."""
     documents = tuple(parse_replay_payload(payload, format_id=format_id) for payload in payloads)
@@ -902,6 +958,7 @@ def compile_payloads(
         max_candidates=max_candidates,
         dex=dex,
         imputation_seed=imputation_seed,
+        chunksize=chunksize,
     )
 
 

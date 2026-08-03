@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import logging
 import os
 import re
-import sys
 import tempfile
 import threading
 import time
@@ -413,10 +413,10 @@ class ReplayFetcher:
                             except ReplayUnavailableError as exc:
                                 self._unavailable_ids.add(replay_id)
                                 scanned.add(replay_id)
-                                print(
-                                    f"warning: skipping unavailable replay {replay_id}: {exc}",
-                                    file=sys.stderr,
-                                    flush=True,
+                                logging.getLogger(__name__).warning(
+                                    "skipping unavailable replay %s: %s",
+                                    replay_id,
+                                    exc,
                                 )
 
                     if new_entries:

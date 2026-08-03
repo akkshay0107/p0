@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import typing
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from p0.battle.actions import encode_team_pair
+import orjson
+
+from p0.battle.actions import (
+    FORCED_ACTION,
+    MEGA_FORCED_ACTION,
+    MOVE_END,
+    MOVE_START,
+    SWITCH_START,
+    TARGET_COUNT,
+    encode_team_pair,
+)
 from p0.battle.events import (
     EVENT_DIAGNOSTICS,
     BattleEvent,
@@ -103,14 +113,21 @@ def _species_identity_index(dex: Mapping[str, Any]) -> dict[str, str]:
     return aliases
 
 
-_BASE_STATS_CACHE: dict[int, dict[str, dict[str, int]]] = {}
+_BASE_STATS_CACHE: dict[str, dict[str, dict[str, int]]] = {}
 
 
 def _get_base_stats_index(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
-    dex_id = id(dex)
-    if dex_id not in _BASE_STATS_CACHE:
-        _BASE_STATS_CACHE[dex_id] = _species_base_stats(dex)
-    return _BASE_STATS_CACHE[dex_id]
+    """Compute the species base-stats index, caching by a content fingerprint.
+
+    The cache is keyed by a SHA-256 of the canonical JSON of the dex's
+    ``species`` list, avoiding the stale-hit and memory-leak problems of an
+    ``id(dex)``-keyed cache when callers pass freshly-loaded mappings.
+    """
+    species = dex.get("species", ())
+    fingerprint = hashlib.sha256(orjson.dumps(species, option=orjson.OPT_SORT_KEYS)).hexdigest()
+    if fingerprint not in _BASE_STATS_CACHE:
+        _BASE_STATS_CACHE[fingerprint] = _species_base_stats(dex)
+    return _BASE_STATS_CACHE[fingerprint]
 
 
 def _make_replay_pokemon(
@@ -398,9 +415,6 @@ class _ReplayState:
         # boundaries so replay event grounding matches the live adapter.
         self.identifiers: dict[str, ReplayPokemon] = {}
 
-    def clone_active(self) -> list[list[ReplayPokemon | None]]:
-        return deepcopy(self.active)
-
     def team_pokemon(self, side: int, species: str) -> ReplayPokemon | None:
         normalized = normalize_id(species)
         for pokemon in self.teams[side]:
@@ -500,6 +514,17 @@ class _ReplayState:
         return self.hp.get(identifier.split(":", 1)[0])
 
     def apply(self, parts: Sequence[str]) -> None:
+        """Advance the state machine by applying one parsed protocol line.
+
+        Dispatches on ``parts[1]`` (the Showdown tag) to update active
+        pokemon, HP, boosts, status, weather, fields, and Illusion aliases.
+        Each handler mutates ``self.teams``, ``self.active``, ``self.hp``,
+        and ``self.identifiers`` in place so the next ``_view`` call observes
+        the post-line state.
+
+        Arguments:
+            parts: The split protocol line (``|tag|...``).
+        """
         if len(parts) < 2:
             return
         tag = parts[1]
@@ -752,6 +777,27 @@ def _is_choice_move(parts: Sequence[str]) -> bool:
     )
 
 
+def _perspective_has_choice(lines: Sequence[Any], perspective: int) -> bool:
+    """Whether *perspective* submitted a move or switch in *lines*."""
+    for line in lines:
+        parts = line.parts
+        if not (_is_choice_move(parts) or _is_choice_switch(parts)):
+            continue
+        endpoint = _ReplayState._endpoint(parts[2])
+        if endpoint is not None and endpoint[0] == perspective:
+            return True
+    return False
+
+
+def _is_terminal_segment(lines: Sequence[Any]) -> bool:
+    """Whether *lines* contain a game-ending ``win`` or ``tie`` marker."""
+    for line in lines:
+        parts = line.parts
+        if len(parts) >= 2 and parts[1] in ("win", "tie"):
+            return True
+    return False
+
+
 def _animation_targets(lines: Sequence[Any]) -> dict[tuple[int, int, str], str]:
     """Collect targets from animation lines paired with targetless move lines.
 
@@ -858,6 +904,25 @@ def _observed_actions(
     diagnostics: Counter[str],
     illusion_species_by_line: Mapping[tuple[int, int, int], str] | None = None,
 ) -> tuple[ObservedAction | None, ObservedAction | None, tuple[str, ...]]:
+    """Extract the observed slot-0 and slot-1 actions for one decision segment.
+
+    Walks the segment's protocol lines and maps each submitted ``move`` or
+    ``switch`` order belonging to *perspective* into an ``ObservedAction``
+    using the 49-action codec. Target ambiguity, forced-move (Struggle /
+    Recharge), and Illusion-disguised switches are resolved conservatively.
+
+    Arguments:
+        state: The replay state machine (pre-segment view).
+        lines: The protocol lines that compose this decision segment.
+        perspective: The player index (0 or 1) to extract actions for.
+        diagnostics: A counter to record extraction diagnostics.
+        illusion_species_by_line: Optional Illusion species map for
+            resolving displayed aliases to actual roster members.
+
+    Returns:
+        A ``(slot0, slot1, tags)`` triple where each slot is an
+        ``ObservedAction`` or ``None`` when no action was observed.
+    """
     observed: list[ObservedAction | None] = [None, None]
     tags: list[str] = []
     mega_slots: set[tuple[int, int]] = set()
@@ -887,7 +952,8 @@ def _observed_actions(
             forced = normalize_id(move) in {"struggle", "recharge"}
             if forced:
                 observed[slot] = ObservedAction(
-                    47 if (endpoint in mega_slots) else 48, tag="forced_move"
+                    MEGA_FORCED_ACTION if (endpoint in mega_slots) else FORCED_ACTION,
+                    tag="forced_move",
                 )
                 continue
             target = parts[4] if len(parts) >= 5 else None
@@ -915,9 +981,9 @@ def _observed_actions(
                     None, exact=False, tag="move_slot_or_target_unknown"
                 )
             else:
-                action = 7 + move_slot * 5 + target_code + 2
+                action = MOVE_START + move_slot * TARGET_COUNT + target_code + 2
                 if endpoint in mega_slots:
-                    action += 20
+                    action += MOVE_END - MOVE_START
                 observed[slot] = ObservedAction(action, tag=target_tag)
         elif _is_choice_switch(parts):
             endpoint = _ReplayState._endpoint(parts[2])
@@ -931,7 +997,7 @@ def _observed_actions(
                 else _switch_species(parts)
             )
             try:
-                action = 1 + next(
+                action = SWITCH_START + next(
                     index
                     for index, pokemon in enumerate(state.teams[perspective])
                     if normalize_id(pokemon.species) == normalize_id(species)
@@ -1055,7 +1121,29 @@ def _view(
     preview: bool,
     effective_species: Mapping[tuple[int, int], str] | None = None,
     forced_move_slots: Sequence[int] = (),
+    wait: bool = False,
 ) -> FixtureBattleView:
+    """Build a player-relative pre-decision view from the current state.
+
+    Constructs the ``FixtureBattleView`` and ``DecisionView`` that the live
+    environment would present at this request boundary. The view reflects
+    the state *before* the segment's protocol lines are applied, with
+    Illusion aliases and forced-move slots overlaid where applicable.
+
+    Arguments:
+        state: The replay state machine (pre-segment view).
+        perspective: The player index (0 or 1) to build the view for.
+        preview: Whether this is a team-preview decision.
+        effective_species: Optional mapping of ``(side, slot)`` to the actual
+            Illusion species to display instead of the disguised alias.
+        forced_move_slots: Slot indices that are locked into a forced move
+            (Struggle / Recharge) during this segment.
+        wait: When ``True``, both slots are forced to ``PASS_ACTION`` — used
+            for ``FORCED_PASS`` decisions where only the opponent acts.
+
+    Returns:
+        A ``FixtureBattleView`` ready for evidence extraction.
+    """
     opponent = 1 - perspective
     teams = [list(state.teams[side]) for side in (0, 1)]
     active = [list(state.active[side]) for side in (0, 1)]
@@ -1113,6 +1201,7 @@ def _view(
         slots=(slots[0], slots[1]),
         team_preview=preview,
         team_size=max(1, len(teams[perspective])),
+        wait=wait,
     )
     return FixtureBattleView(
         team=_team_mapping(teams[perspective]),
@@ -1230,12 +1319,26 @@ def reconstruct_perspective(
             and endpoint[0] == perspective
             and normalize_id(line.parts[3]) in {"struggle", "recharge"}
         )
+        # Detect a one-sided waiting segment: only the opponent has an
+        # asynchronous replacement or pivot choice, so this perspective is
+        # forced to pass. Boundary rule 1: a terminal KO that ends the game
+        # has no later request, so it must not produce a FORCED_PASS record.
+        # Boundary rule 2: a simultaneous replacement where this perspective
+        # must also choose is handled by the ``not _perspective_has_choice``
+        # guard below — it keeps the normal FORCED_SWITCH / TURN path.
+        is_waiting = (
+            decision_type is not DecisionType.TEAM_PREVIEW
+            and not _perspective_has_choice(lines, perspective)
+            and _perspective_has_choice(lines, 1 - perspective)
+            and not _is_terminal_segment(lines)
+        )
         view = _view(
             state,
             perspective,
             preview=decision_type is DecisionType.TEAM_PREVIEW,
             effective_species=effective_species,
             forced_move_slots=forced_move_slots,
+            wait=is_waiting,
         )
         # The live environment presents the state after the preceding
         # request's protocol messages and exposes exactly those messages as
@@ -1265,6 +1368,9 @@ def reconstruct_perspective(
                 if observed[index] is not None
             ):
                 decision_type = DecisionType.FORCED_SWITCH
+        elif is_waiting:
+            decision_type = DecisionType.FORCED_PASS
+            tags.append("forced_pass")
         for slot, action in enumerate(observed[:2]):
             if action is not None and action.action is not None:
                 if action.action not in legal_actions(view.decision, slot):

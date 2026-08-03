@@ -5,7 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from p0.battle.actions import ACT_SIZE, PASS_ACTION, ActionKind, SlotAction, encode_action
+from p0.battle.actions import (
+    ACT_SIZE,
+    FORCED_ACTION,
+    MEGA_FORCED_ACTION,
+    PASS_ACTION,
+    SWITCH_START,
+    ActionKind,
+    SlotAction,
+    encode_action,
+)
 from p0.battle.legality import (
     DecisionView,
     apply_joint_constraints,
@@ -166,7 +175,7 @@ def observed_move_action(
 ) -> ObservedAction:
     """Encode a protocol move, retaining target ambiguity as alternatives."""
     if forced:
-        return ObservedAction(47 if mega else 48, exact=True, tag=tag)
+        return ObservedAction(MEGA_FORCED_ACTION if mega else FORCED_ACTION, exact=True, tag=tag)
     if move_slot is None or target is None:
         return ObservedAction(None, exact=False, tag=tag or "move_slot_or_target_unknown")
 
@@ -180,7 +189,7 @@ def observed_move_action(
 def observed_switch_action(slot: int | None, *, tag: str = "") -> ObservedAction:
     if slot is None:
         return ObservedAction(None, exact=False, tag=tag or "switch_slot_unknown")
-    return ObservedAction(1 + slot, exact=True, tag=tag)
+    return ObservedAction(SWITCH_START + slot, exact=True, tag=tag)
 
 
 __all__ = [

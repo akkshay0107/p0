@@ -28,8 +28,10 @@ from p0.replays.reconstruct import (
     reconstruct_perspective,
 )
 from p0.replays.schema import (
+    DecisionType,
     FetchMetadata,
     GameEndReason,
+    LabelKind,
     OTSData,
     ProtocolLine,
     ReplayMetadata,
@@ -1038,3 +1040,143 @@ def test_shard_manifest_rejects_runtime_contract_mismatch(tmp_path: Path) -> Non
     value["runtime_contract_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="runtime contract"):
         load_shard_manifest(value, DEFAULT_RUNTIME_MANIFEST)
+
+
+def _payload_ko_scenario(
+    replay_id: str,
+    *,
+    terminal: bool = False,
+    simultaneous: bool = False,
+    pivot: bool = False,
+) -> dict[str, object]:
+    """Build a replay where one player KOs the other and a replacement follows.
+
+    *terminal* -- the KO ends the game immediately (no later request).
+    *simultaneous* -- both players need a replacement (boundary rule 2).
+    *pivot* -- the opponent's switch is a voluntary pivot, not a forced replacement.
+    """
+    p1_team = [
+        {"species": "Pikachu", "moves": ["Thunderbolt", "Tackle"]},
+        {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Squirtle", "moves": ["Protect", "Tackle"]},
+    ]
+    p2_team = [
+        {"species": "Bulbasaur", "moves": ["Protect", "Tackle"]},
+        {"species": "Charmander", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Venusaur", "moves": ["Protect", "Tackle"]},
+    ]
+    lines = [
+        "|start",
+        "|teampreview",
+        f"|showteam|p1|{json.dumps(p1_team, separators=(',', ':'))}",
+        f"|showteam|p2|{json.dumps(p2_team, separators=(',', ':'))}",
+        "|switch|p1a: Pikachu|Pikachu, L50|100/100",
+        "|switch|p1b: Eevee|Eevee, L50|100/100",
+        "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
+        "|switch|p2b: Charmander|Charmander, L50|100/100",
+        "|turn|1",
+        "|move|p1a: Pikachu|Thunderbolt|p2a: Bulbasaur",
+        "|-damage|p2a: Bulbasaur|0/100",
+        "|faint|p2a: Bulbasaur",
+    ]
+    if pivot:
+        # Voluntary pivot: p2 switches without a faint (U-turn / Parting Shot).
+        lines.append("|switch|p2a: Venusaur|Venusaur, L50|100/100")
+    else:
+        lines.append("|switch|p2a: Venusaur|Venusaur, L50|100/100")
+
+    if terminal:
+        lines.append("|win|Alice")
+    elif simultaneous:
+        lines.extend(
+            [
+                "|-damage|p1a: Pikachu|0/100",
+                "|faint|p1a: Pikachu",
+                "|switch|p1a: Squirtle|Squirtle, L50|100/100",
+                "|turn|2",
+                "|move|p1a: Squirtle|Protect|p2a: Venusaur",
+                "|move|p2a: Venusaur|Protect|p1a: Squirtle",
+                "|win|Alice",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "|turn|2",
+                "|move|p1a: Pikachu|Tackle|p2a: Venusaur",
+                "|move|p2a: Venusaur|Protect|p1a: Pikachu",
+                "|win|Alice",
+            ]
+        )
+    return {
+        "id": replay_id,
+        "format": "gen9championsvgc2026regmbbo3",
+        "p1": "Alice",
+        "p2": "Bob",
+        "uploadtime": 1_750_000_000,
+        "roomid": replay_id,
+        "parent": "series-1",
+        "log": "\n".join(lines),
+    }
+
+
+def test_forced_pass_for_one_sided_ko_replacement() -> None:
+    """The waiting perspective gets an exact (PASS, PASS) FORCED_PASS."""
+    document = parse_replay_payload(_payload_ko_scenario("ko-onesided"))
+    alice, bob = reconstruct_both(document)
+
+    # Alice (p0) waits during Bob's replacement after the KO.
+    alice_pass = [d for d in alice.decisions if d.decision_type is DecisionType.FORCED_PASS]
+    assert len(alice_pass) == 1
+    assert alice_pass[0].evidence.label_kind is LabelKind.EXACT
+    assert alice_pass[0].evidence.exact_action == (0, 0)
+    assert alice_pass[0].evidence.candidates == ((0, 0),)
+    assert "forced_pass" in alice_pass[0].evidence.tags
+
+    # Bob (p1) waits during Alice's attack that caused the KO.
+    bob_pass = [d for d in bob.decisions if d.decision_type is DecisionType.FORCED_PASS]
+    assert len(bob_pass) == 1
+    assert bob_pass[0].evidence.label_kind is LabelKind.EXACT
+    assert bob_pass[0].evidence.exact_action == (0, 0)
+
+
+def test_forced_pass_for_one_sided_pivot_request() -> None:
+    """A one-sided voluntary pivot also produces a FORCED_PASS for the waiter."""
+    document = parse_replay_payload(_payload_ko_scenario("pivot-onesided", pivot=True))
+    alice, _bob = reconstruct_both(document)
+
+    alice_pass = [d for d in alice.decisions if d.decision_type is DecisionType.FORCED_PASS]
+    assert len(alice_pass) == 1
+    assert alice_pass[0].evidence.label_kind is LabelKind.EXACT
+    assert alice_pass[0].evidence.exact_action == (0, 0)
+
+
+def test_forced_pass_skipped_for_simultaneous_replacements() -> None:
+    """Boundary rule 2: both players choosing is not a FORCED_PASS."""
+    document = parse_replay_payload(_payload_ko_scenario("simul", simultaneous=True))
+    alice, bob = reconstruct_both(document)
+
+    # Neither perspective should have a FORCED_PASS during the simultaneous
+    # replacement segment (both have choice actions there).
+    for perspective in (alice, bob):
+        pass_decisions = [
+            d for d in perspective.decisions if d.decision_type is DecisionType.FORCED_PASS
+        ]
+        # Alice has a pass during the initial attack segment (Bob has no action
+        # there), but NOT during the simultaneous replacement segment.
+        if perspective is bob:
+            assert len(pass_decisions) == 1
+        else:
+            assert all(d.evidence.exact_action == (0, 0) for d in pass_decisions)
+
+
+def test_forced_pass_skipped_for_terminal_ko() -> None:
+    """Boundary rule 1: a KO that ends the game produces no FORCED_PASS."""
+    document = parse_replay_payload(_payload_ko_scenario("terminal", terminal=True))
+    alice, _bob = reconstruct_both(document)
+
+    # The terminal segment (replacement + win) must not be a FORCED_PASS.
+    terminal_decisions = [
+        d for d in alice.decisions if d.post_line_index == len(document.protocol_lines)
+    ]
+    assert all(d.decision_type is not DecisionType.FORCED_PASS for d in terminal_decisions)
