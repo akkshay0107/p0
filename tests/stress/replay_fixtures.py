@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 from p0.battle.events import EventTypeId, RawBattleEvent
 from p0.format_config import FORMAT
+
+
+def golden_series_id(parent: str) -> str:
+    """Return the independently calculated series identity for this fixture family."""
+    value = "\n".join((FORMAT.bo3_format, parent, "alice", "bob"))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
 def golden_replay_payload(
@@ -16,6 +23,7 @@ def golden_replay_payload(
     game_number: int = 1,
     winner: str = "Alice",
     players: tuple[str, str] = ("Alice", "Bob"),
+    first_move_target: str | None = "p2a: Bulbasaur",
 ) -> dict[str, Any]:
     """Return a replay payload whose log is copied from the pinned protocol shape."""
     p1_team = [
@@ -36,7 +44,8 @@ def golden_replay_payload(
         "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
         "|switch|p2b: Charmander|Charmander, L50|100/100",
         "|turn|1",
-        "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
+        "|move|p1a: Pikachu|Protect"
+        + (f"|{first_move_target}" if first_move_target is not None else ""),
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
         "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
         "|move|p2b: Charmander|Tackle|p1b: Eevee",

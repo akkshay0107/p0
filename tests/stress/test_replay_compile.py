@@ -8,7 +8,7 @@ import torch
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.shards import validate_shard_tensors
 from tests.stress._helpers import stress_count
-from tests.stress.replay_fixtures import golden_replay_payload
+from tests.stress.replay_fixtures import golden_replay_payload, golden_series_id
 
 
 def _compile_payloads(count: int) -> tuple[dict[str, Any], ...]:
@@ -78,6 +78,62 @@ def test_compiler_is_deterministic_for_golden_replays(tmp_path) -> None:
     )
 
     assert first_build.manifest.to_dict() == second_build.manifest.to_dict()
+
+
+@pytest.mark.stress
+def test_compiler_retains_exact_partial_unknown_and_rejected_labels() -> None:
+    exact = golden_replay_payload("exact", series_id="label-series")
+    partial = golden_replay_payload(
+        "partial",
+        series_id="label-series-2",
+        first_move_target=None,
+    )
+    result = compile_payloads((exact, partial), format_id=exact["formatid"])
+
+    counters = result.metrics.counters
+    assert counters["accepted_games"] == 2
+    assert counters["label_exact"] == 3
+    assert counters["label_partial"] == 1
+    assert counters["label_unknown"] == 4
+
+    capped = compile_payloads((partial,), format_id=partial["formatid"], max_candidates=1)
+    assert capped.metrics.counters["label_partial"] == 0
+    assert capped.metrics.counters["label_exact"] == 1
+    assert capped.metrics.counters["label_unknown"] == 3
+
+    rejected = golden_replay_payload("rejected", series_id="rejected-series")
+    rejected["log"] = "\n".join(
+        line for line in str(rejected["log"]).splitlines() if "|showteam|" not in line
+    )
+    rejected_result = compile_payloads((rejected,), format_id=rejected["formatid"])
+    assert not rejected_result.games
+    assert rejected_result.metrics.counters["rejected_games"] == 1
+
+
+@pytest.mark.stress
+def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> None:
+    payloads = (
+        golden_replay_payload("series-a-1", series_id="series-a", game_number=1),
+        golden_replay_payload("series-a-2", series_id="series-a", game_number=2, winner="Bob"),
+        golden_replay_payload("series-b-1", series_id="series-b", game_number=1),
+    )
+    result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
+    assert len(result.games) == len(payloads)
+
+    built = write_tensor_shards(
+        result,
+        tmp_path / "series-boundaries",
+        max_decisions_per_shard=1,
+        created_at="2026-01-01T00:00:00Z",
+    )
+    shard_series = [
+        {str(summary["series_id"]) for summary in _summaries(built, shard.filename)}
+        for shard in built.manifest.shards
+    ]
+    assert shard_series == [
+        {golden_series_id("series-a")},
+        {golden_series_id("series-b")},
+    ]
 
 
 def _summaries(build, filename: str) -> list[dict[str, Any]]:
