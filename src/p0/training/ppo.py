@@ -160,8 +160,12 @@ def _build_memory_inputs(
     history_age_ids = torch.stack(history_age_parts)
     decision_count = encoded.tokens.size(0)
     if episodes and episodes[0].series_tokens is not None:
-        series_tokens = torch.cat([ep.series_tokens for ep in episodes if ep.series_tokens is not None], dim=0).to(device)
-        series_mask = torch.cat([ep.series_mask for ep in episodes if ep.series_mask is not None], dim=0).to(device)
+        series_tokens = torch.cat(
+            [ep.series_tokens for ep in episodes if ep.series_tokens is not None], dim=0
+        ).to(device)
+        series_mask = torch.cat(
+            [ep.series_mask for ep in episodes if ep.series_mask is not None], dim=0
+        ).to(device)
     else:
         series_tokens = torch.zeros(
             (decision_count, SERIES_SLOTS, policy.d_model),
@@ -426,10 +430,6 @@ def ppo_update(
                     scaled_loss = batch_loss / expected_minibatch_steps
                     if torch.isfinite(scaled_loss):
                         scaler.scale(scaled_loss).backward()
-                        # DEBUG: find NaN gradients
-                        for name, param in policy.named_parameters():
-                            if param.grad is not None and not torch.isfinite(param.grad).all():
-                                print(f"DEBUG: NaN/Inf grad in {name}")
                     else:
                         logging.warning(
                             f"Non-finite chunk loss at episode {episode}; "

@@ -81,7 +81,7 @@ class ThreadVecEnv:
         reward2 = rewards[agent2] if agent2 in rewards else 0.0
 
         if done_status > 0:
-            series_complete = max(env._series_scores) >= 2 or env._series_games_played >= 3
+            series_complete = max(env.series_scores) >= 2 or env.series_games_played >= 3
             terminal_obs1 = None
             terminal_obs2 = None
             if is_truncated:

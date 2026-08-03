@@ -124,10 +124,13 @@ def test_action_contract_round_trips_ids_and_describes_canonical_ranges() -> Non
         "forced_move",
     ]
     actions = {
-        encode_team_pair(first, second) for first in range(6) for second in range(first + 1, 6)
+        encode_team_pair(first, second)
+        for first in range(6)
+        for second in range(6)
+        if first != second
     }
-    assert len(actions) == 15
-    assert all(decode_team_pair(action)[0] < decode_team_pair(action)[1] for action in actions)
+    assert len(actions) == 30
+    assert all(decode_team_pair(action)[0] != decode_team_pair(action)[1] for action in actions)
     assert team_selection(1, 8)[:4] == (0, 1, 2, 3)
 
 

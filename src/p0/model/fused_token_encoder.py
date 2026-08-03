@@ -1,3 +1,9 @@
+"""Fused token encoder that turns categorical/numerical battle features into mixed context tokens.
+
+Produces the casual observation sequence consumed by the memory reducer, including side-owned
+scalars (turn, team-preview flag, fainted counts), entity rows, and pooled battle events.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -598,6 +604,15 @@ class FusedTokenEncoder(nn.Module):
         obs: StructuredObservation,
         action_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode a batched observation into token and auxiliary-context tensors.
+
+        Arguments:
+          obs: the batched structured observation to encode
+          action_mask: per-slot action mask (batch, 2, action_size) guiding masking
+
+        Returns:
+          a (tokens, aux) pair of encoded observation tensors for the reducer/policy
+        """
         categorical = obs.categorical.long()
         numerical = obs.numerical.float()
         token_type_ids = obs.token_type_ids.long()

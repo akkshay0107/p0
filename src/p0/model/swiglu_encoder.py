@@ -1,3 +1,9 @@
+"""SwiGLU encoder layer used inside the fused token encoder.
+
+Provides the lean batch-first, norm-first transformer encoder layer (self-attention plus
+SwiGLU feedforward) with the exact dropout/attention configuration the model relies on.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

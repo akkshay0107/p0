@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import random
@@ -184,7 +185,7 @@ class EvaluationHarness:
         self.port = port
         self.rng = random.Random(seed)
 
-    def _build_team_sources(self) -> dict[str, TeamSource]:
+    def build_team_sources(self) -> dict[str, TeamSource]:
         """Build team sources for different categories based on the corpus manifest."""
         sources: dict[str, TeamSource] = {}
         if self.corpus_path is not None and self.corpus_path.exists() and self.corpus_hash:
@@ -359,6 +360,4 @@ class EvaluationHarness:
 
 def hashlib_team(team_packed: str) -> str:
     """Generate a stable short identifier for a team string."""
-    import hashlib
-
     return hashlib.sha256(team_packed.encode("utf-8")).hexdigest()[:8]

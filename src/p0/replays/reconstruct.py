@@ -971,12 +971,15 @@ def _preview_actions(
         return None, None, ("preview_roster_unknown",)
     if len(set(lead_indices)) != 2:
         return None, None, ("preview_duplicate_lead",)
-    first = encode_team_pair(*sorted(lead_indices), team_size=len(state.teams[perspective]))
+    team_size = len(state.teams[perspective])
+    first = encode_team_pair(lead_indices[0], lead_indices[1], team_size=team_size)
     alternatives = tuple(
-        encode_team_pair(first_index, second_index, team_size=len(state.teams[perspective]))
-        for first_index in range(len(state.teams[perspective]))
-        for second_index in range(first_index + 1, len(state.teams[perspective]))
-        if first_index not in lead_indices and second_index not in lead_indices
+        encode_team_pair(first_index, second_index, team_size=team_size)
+        for first_index in range(team_size)
+        for second_index in range(team_size)
+        if first_index != second_index
+        and first_index not in lead_indices
+        and second_index not in lead_indices
     )
     return (
         ObservedAction(first, tag="preview_leads"),

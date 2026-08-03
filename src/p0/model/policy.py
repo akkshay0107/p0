@@ -1,3 +1,10 @@
+"""Policy network: fixed memory reducer, fused token encoder, and the 49-action joint heads.
+
+Defines ``ActorPolicy`` (stateless action sampling/scoring with sequential joint-action masks)
+and ``PolicyNet`` (full actor+critic model). Shared by live play, rollouts, and behaviour-cloning
+candidate marginalization.
+"""
+
 from __future__ import annotations
 
 import math
@@ -602,17 +609,17 @@ class ActorPolicy(nn.Module):
         # Ensure all 4 selected Pokemon are unique (no overlap between Lead and Back).
         # compute overlap for all B rows simultaneously, gate with is_tp.
         # eliminates the is_tp.any() GPU->CPU sync
-        p1_1 = action1 // 6 + 1  # (B,) — meaningful only for tp rows
-        p2_1 = action1 % 6 + 1  # (B,)
-        p1_2 = self.all_a // 6 + 1  # (36,)
-        p2_2 = self.all_a % 6 + 1  # (36,)
+        p1_1 = action1 // TEAM_SIZE  # (B,) — meaningful only for tp rows
+        p2_1 = action1 % TEAM_SIZE  # (B,)
+        p1_2 = self.all_a // TEAM_SIZE  # (TP_END,)
+        p2_2 = self.all_a % TEAM_SIZE  # (TP_END,)
         tp_overlap = (
             (p1_2[None] == p1_1[:, None])
             | (p1_2[None] == p2_1[:, None])
             | (p2_2[None] == p1_1[:, None])
             | (p2_2[None] == p2_1[:, None])
-        )  # (B, 36)
-        mask2[:, :36] = mask2[:, :36] & ~(is_tp[:, None] & tp_overlap)
+        )  # (B, TP_END)
+        mask2[:, :TP_END] = mask2[:, :TP_END] & ~(is_tp[:, None] & tp_overlap)
 
         # If no valid action remains, force pass action to be valid for Pokemon 2
         no_valid = mask2.sum(-1) == 0

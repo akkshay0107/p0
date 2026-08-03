@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
     )
 
-    sources = harness._build_team_sources()
+    sources = harness.build_team_sources()
     matchup_results = []
 
     # Run evaluations in an asyncio event loop

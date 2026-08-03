@@ -307,7 +307,7 @@ def test_evaluation_harness_falls_back_without_corpus(tmp_path: Path) -> None:
         episodes_per_matchup=5,
         seed=123,
     )
-    sources = harness._build_team_sources()
+    sources = harness.build_team_sources()
     assert len(sources) == 4
     for key, source in sources.items():
         assert isinstance(source, FixedTeamSource)

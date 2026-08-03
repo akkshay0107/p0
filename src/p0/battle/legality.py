@@ -45,11 +45,13 @@ _TEAM_PREVIEW_CACHE: dict[int, tuple[int, ...]] = {}
 
 
 def _get_team_preview(team_size: int) -> tuple[int, ...]:
+    """Ordered distinct team-preview pair action IDs, in ascending roster order."""
     if team_size not in _TEAM_PREVIEW_CACHE:
         _TEAM_PREVIEW_CACHE[team_size] = tuple(
-            first * 6 + second
+            first * team_size + second
             for first in range(team_size)
-            for second in range(first + 1, team_size)
+            for second in range(team_size)
+            if first != second
         )
 
     return _TEAM_PREVIEW_CACHE[team_size]
@@ -98,32 +100,29 @@ def action_mask(view: DecisionView) -> npt.NDArray[np.bool_]:
     return mask
 
 
-def validate_joint_action(view: DecisionView, first: int, second: int) -> bool:
-    """Validate whether the pair (first, second) is a legal joint action."""
-    if first not in legal_actions(view, 0):
-        return False
-    return bool(second_action_mask(view, first)[second])
-
-
-def second_action_mask(view: DecisionView, first: int) -> npt.NDArray[np.bool_]:
-    """Compute the legal action mask for slot 1 conditioned on slot 0's chosen action."""
+def slot1_base_mask(view: DecisionView) -> npt.NDArray[np.bool_]:
+    """Mask of slot-1 unconstrained legal action IDs."""
     mask = np.zeros(ACT_SIZE, dtype=np.bool_)
     mask[list(legal_actions(view, 1))] = True
+    return mask
 
+
+def apply_joint_constraints(mask: npt.NDArray[np.bool_], view: DecisionView, first: int) -> None:
+    """Apply the sequential slot-1 joint-action constraints in place to ``mask``."""
     if view.team_preview:
         try:
             first_pair = decode_team_pair(first, view.team_size)
         except ValueError:
             mask.fill(False)
-            return mask
+            return
 
-        actions = np.arange(36)
+        actions = np.arange(view.team_size**2)
         second_first, second_second = np.divmod(actions, view.team_size)
 
         valid = (
             (second_first < view.team_size)
             & (second_second < view.team_size)
-            & (second_first < second_second)
+            & (second_first != second_second)
         )
 
         conflict = (
@@ -133,7 +132,7 @@ def second_action_mask(view: DecisionView, first: int) -> npt.NDArray[np.bool_]:
             | (second_second == first_pair[1])
         )
 
-        mask[:36] &= valid & ~conflict
+        mask[: view.team_size**2] &= valid & ~conflict
     else:
         if SWITCH_START <= first < SWITCH_END:
             mask[first] = False
@@ -147,4 +146,16 @@ def second_action_mask(view: DecisionView, first: int) -> npt.NDArray[np.bool_]:
     if not mask.any():
         mask[PASS_ACTION] = True
 
+
+def second_action_mask(view: DecisionView, first: int) -> npt.NDArray[np.bool_]:
+    """Compute the legal action mask for slot 1 conditioned on slot 0's chosen action."""
+    mask = slot1_base_mask(view)
+    apply_joint_constraints(mask, view, first)
     return mask
+
+
+def validate_joint_action(view: DecisionView, first: int, second: int) -> bool:
+    """Validate whether the pair (first, second) is a legal joint action."""
+    if first not in legal_actions(view, 0):
+        return False
+    return bool(second_action_mask(view, first)[second])

@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from p0.battle.actions import ACT_SIZE, PASS_ACTION, ActionKind, SlotAction, encode_action
-from p0.battle.legality import DecisionView, legal_actions, validate_joint_action
+from p0.battle.legality import (
+    DecisionView,
+    apply_joint_constraints,
+    legal_actions,
+    slot1_base_mask,
+)
 from p0.replays.schema import ActionEvidence, LabelKind, MaskProvenance
 
 
@@ -61,14 +66,24 @@ def enumerate_joint_candidates(
         raise ValueError("max_candidates must be positive")
 
     candidates: list[tuple[int, int]] = []
-    for first_action in dict.fromkeys(first):
-        if first_action not in legal_actions(view, 0):
+    first_actions = tuple(dict.fromkeys(first))
+    second_actions = tuple(dict.fromkeys(second))
+    if not first_actions or not second_actions:
+        return ()
+
+    legal0 = legal_actions(view, 0)
+    base_slot1 = slot1_base_mask(view)
+
+    for first_action in first_actions:
+        if first_action not in legal0:
             continue
 
-        for second_action in dict.fromkeys(second):
-            pair = (first_action, second_action)
-            if validate_joint_action(view, *pair):
-                candidates.append(pair)
+        slot1 = base_slot1.copy()
+        apply_joint_constraints(slot1, view, first_action)
+
+        for second_action in second_actions:
+            if slot1[second_action]:
+                candidates.append((first_action, second_action))
                 if len(candidates) > max_candidates:
                     return ()
 

@@ -1,3 +1,10 @@
+"""Builds structured battle observations and per-slot action masks from poke-env battles.
+
+Implements the observation builder that serializes a ``DoubleBattle`` into the
+``StructuredObservation`` contract (entities, categoricals, numericals, action mask and
+team-preview state) consumed by the policy and the runtime.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -732,6 +739,17 @@ def _write_observation(
     tok: PokemonTokenizer,
     stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
 ) -> None:
+    """Serialize a battle view into a pre-allocated StructuredObservation in place.
+
+    Arguments:
+      battle: battle view providing the entity, categorical, and numerical features
+      out: pre-allocated observation buffer to populate in place
+      tok: tokenizer mapping string identifiers to categorical vocabulary indices
+      stat_overrides: optional per-species base stat overrides keyed by species identifier
+
+    Returns:
+      None; writes directly into the ``out`` buffers
+    """
     token_types = out.token_type_ids.numpy()
     sides = out.side_ids.numpy()
     slots = out.slot_ids.numpy()

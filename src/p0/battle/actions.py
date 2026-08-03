@@ -106,19 +106,19 @@ def encode_action(action: SlotAction) -> int:
 
 
 def encode_team_pair(first: int, second: int, team_size: int = TEAM_SIZE) -> int:
-    """Encode a pair of team preview indices into a single action ID."""
+    """Encode an ordered pair of distinct team preview indices into an action ID."""
     if not 0 <= first < team_size or not 0 <= second < team_size:
         raise ValueError("Team-preview indices are outside the roster")
-    if first >= second:
-        raise ValueError("Team-preview pairs must be strictly increasing")
+    if first == second:
+        raise ValueError("Team-preview pairs must be distinct")
     return first * team_size + second
 
 
 def decode_team_pair(action: int, team_size: int = TEAM_SIZE) -> tuple[int, int]:
-    """Decode an action ID into a pair of team preview indices."""
+    """Decode an action ID into an ordered pair of team preview indices."""
     action = int(action)
     first, second = divmod(action, team_size)
-    if action < 0 or first >= team_size or second >= team_size or first >= second:
+    if action < 0 or first >= team_size or second >= team_size or first == second:
         raise ValueError(f"Invalid canonical team-preview action {action}")
     return first, second
 
@@ -138,15 +138,15 @@ def team_selection(
 def canonical_team_actions(
     selection: tuple[int, ...], team_size: int = TEAM_SIZE
 ) -> tuple[int, int]:
-    """Derive canonical lead and back pair preview actions from a team order."""
+    """Derive ordered lead and back pair preview actions from a team order."""
     defaults = tuple(range(team_size))
     values = tuple(index for index in selection if 0 <= index < team_size)
     values += tuple(index for index in defaults if index not in values)
 
-    lead = tuple(sorted(values[:2]))
-    back = tuple(sorted(values[2:4]))
+    lead = values[:2]
+    back = values[2:4]
 
-    if lead[0] == lead[1] or back[0] == back[1]:
+    if len(set((*lead, *back))) != 4:
         raise ValueError("Team preview must select four distinct members")
 
     return (

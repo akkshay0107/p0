@@ -139,6 +139,16 @@ class SimEnv(MegaEnv):
         self._decision_steps = 0
         self.series_id = str(uuid.uuid4())
 
+    @property
+    def series_scores(self) -> list[int]:
+        """Best-of-three win counts for (agent, opponent) in the current series."""
+        return self._series_scores
+
+    @property
+    def series_games_played(self) -> int:
+        """Number of games played so far in the current best-of-three series."""
+        return self._series_games_played
+
     def set_observation_targets(
         self,
         agent1_out: StructuredObservation,

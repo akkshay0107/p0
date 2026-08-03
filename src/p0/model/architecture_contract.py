@@ -22,6 +22,5 @@ REDUCER_MAX_LENGTH = SERIES_SLOTS + HISTORY_WINDOW + CURRENT_REDUCER_TOKEN_COUNT
 # sequence position and therefore cannot drift when observation rows change.
 SELF_TARGET_SENTINEL = -1
 
-TENSOR_ABI = "champions-memory-channel-v2"
 OBSERVATION_SCHEMA_VERSION = 4
 CHECKPOINT_ARTIFACT_SCHEMA = "p0.policy_checkpoint.v3"
