@@ -14,7 +14,7 @@ from p0.model.token_store import SeriesTokenStore
 from p0.training.config import TrainingConfig
 from p0.training.rollout import BattleMemoryBuffer, collect_rollouts
 from p0.training.trajectory import TrajectoryStorage
-from tests.stress._helpers import capture_showdown_decisions, stress_count, stress_repetitions
+from tests.stress._helpers import stress_repetitions
 
 
 class _SelfPlayPolicy:
@@ -134,17 +134,3 @@ def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
     assert not empty_history.any()
     assert not empty_ages.any()
     assert mask[1].any()
-
-
-@pytest.mark.integration
-@pytest.mark.stress
-@pytest.mark.asyncio
-async def test_live_self_play_captures_decisions_across_repeated_games(showdown_server) -> None:
-    decisions = await capture_showdown_decisions(
-        showdown_server,
-        game_count=stress_count("P0_STRESS_SELF_PLAY_GAMES", 2),
-        max_concurrent_battles=2,
-    )
-    assert decisions
-    assert all(decision.legal_joint_actions for decision in decisions)
-    assert all(decision.observation.numerical.isfinite().all() for decision in decisions)

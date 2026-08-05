@@ -8,14 +8,17 @@ import torch
 from poke_env.battle import DoubleBattle
 from poke_env.player import RandomPlayer
 
+from p0.battle.actions import ACT_SIZE
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
+from p0.model.structured_observation import StructuredObservation
 from p0.rl_player import RLPlayer
 from p0.runtime import poke_env_patches
 from p0.teams.source import FixedTeamSource
+from tests.stress._helpers import capture_showdown_decisions, stress_count
 
 TEAM = """
 Pikachu @ Light Ball
@@ -150,3 +153,96 @@ async def test_checkpoint_free_policy_completes_live_battle(
         assert second.history_tokens
         assert not second._battle_history
         assert first.history_tokens[0] is not second.history_tokens[0]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_observed_showdown_orders_round_trip_to_recorded_actions(showdown_server) -> None:
+    decisions = await capture_showdown_decisions(
+        showdown_server,
+        game_count=stress_count("P0_STRESS_ACTION_GAMES", 2),
+    )
+    assert decisions
+
+    for decision in decisions:
+        assert decision.chosen_action in decision.legal_joint_actions
+        assert decision.chosen_order
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_showdown_order_sets_remain_nonempty_across_many_requests(showdown_server) -> None:
+    decisions = await capture_showdown_decisions(
+        showdown_server,
+        game_count=stress_count("P0_STRESS_ACTION_GAMES", 2),
+    )
+    assert decisions
+    assert all(decision.legal_joint_actions for decision in decisions)
+    for decision in decisions:
+        projected = tuple(
+            sorted({action for pair in decision.legal_joint_actions for action in pair})
+        )
+        observed = tuple(sorted(set(decision.legal_actions[0] + decision.legal_actions[1])))
+        assert set(projected) <= set(observed)
+        assert all(0 <= action < 49 for action in observed)
+        assert any(action in observed for action in (7, 8, 9, 10, 11)) or any(
+            action in observed for action in (1, 2, 3, 4, 5, 6, 48)
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_size", (1, 8))
+async def test_policy_handles_showdown_captured_batches(
+    showdown_server,
+    model_policy,
+    model_device: torch.device,
+    batch_size: int,
+) -> None:
+    decisions = await capture_showdown_decisions(showdown_server, game_count=1)
+    assert decisions
+    selected = tuple(decisions[index % len(decisions)] for index in range(batch_size))
+    observation = StructuredObservation.stack([decision.observation for decision in selected]).to(
+        model_device
+    )
+    action_mask = torch.zeros((batch_size, 2, ACT_SIZE), dtype=torch.bool, device=model_device)
+    for index, decision in enumerate(selected):
+        for position, actions in enumerate(decision.legal_actions):
+            action_mask[index, position, list(actions)] = True
+    memory = model_policy.empty_memory(batch_size)
+
+    with torch.inference_mode():
+        acted = model_policy.act_obs(observation, action_mask, *memory)
+        evaluated = model_policy.evaluate_obs(
+            observation,
+            action_mask,
+            acted.actions,
+            *memory,
+        )
+
+    assert acted.actions.shape == (batch_size, 2)
+    assert torch.all((acted.actions >= 0) & (acted.actions < FORMAT.action_size))
+    assert torch.all(action_mask.gather(2, acted.actions.unsqueeze(-1)).squeeze(-1))
+    assert torch.isfinite(acted.log_probs).all()
+    assert torch.isfinite(acted.value).all()
+    assert torch.isfinite(evaluated.log_probs).all()
+    assert torch.isfinite(evaluated.entropy).all()
+    assert torch.isfinite(evaluated.value).all()
+    for index, decision in enumerate(selected):
+        actions = tuple(int(value) for value in acted.actions[index].tolist())
+        assert actions in decision.legal_joint_actions
+
+    assert torch.isfinite(evaluated.logits.masked_select(action_mask)).all()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_live_self_play_captures_decisions_across_repeated_games(showdown_server) -> None:
+    decisions = await capture_showdown_decisions(
+        showdown_server,
+        game_count=stress_count("P0_STRESS_SELF_PLAY_GAMES", 2),
+        max_concurrent_battles=2,
+    )
+    assert decisions
+    assert all(decision.legal_joint_actions for decision in decisions)
+    assert all(decision.observation.numerical.isfinite().all() for decision in decisions)

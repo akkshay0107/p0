@@ -20,6 +20,9 @@ from poke_env.battle.weather import Weather
 
 from p0.battle.actions import (
     ACT_SIZE,
+    ActionKind,
+    SlotAction,
+    canonical_team_actions,
     decode_action,
     decode_team_pair,
     encode_action,
@@ -44,6 +47,7 @@ from p0.battle.legality import (
     action_mask,
     legal_actions,
     second_action_mask,
+    validate_joint_action,
 )
 from p0.battle.views import FixtureBattleView
 from p0.format_config import ACTION_CONTRACT, FORMAT
@@ -75,6 +79,7 @@ from p0.model.structured_observation import (
     MAX_EFFECTS,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
     CounterKind,
     EffectNamespace,
@@ -84,11 +89,20 @@ from p0.model.structured_observation import (
     TokenType,
 )
 from p0.model.tokenizer import tokenizer
+from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
+from p0.replays.protocol import parse_replay_payload
+from p0.replays.reconstruct import reconstruct_both
+from p0.replays.schema import LabelKind
 from p0.runtime import poke_env_patches
 from p0.runtime.env import MegaEnv, SimEnv
 from p0.runtime.live_event_capture import consume_raw_events, set_raw_events
-from p0.runtime.poke_env_action_adapter import action_to_single_order, single_order_to_action
-from p0.runtime.poke_env_battle_adapter import battle_view, decision_view
+from p0.runtime.poke_env_action_adapter import (
+    action_to_order,
+    action_to_single_order,
+    order_to_action,
+    single_order_to_action,
+)
+from p0.runtime.poke_env_battle_adapter import battle_view, current_battle_view, decision_view
 from p0.teams.source import ValidatedTeam
 from p0.teams.stat_points import (
     BaseStats,
@@ -1630,3 +1644,283 @@ def test_struggle_policy_logits():
         out.logits, torch.tensor([47, 47]), action_mask, torch.tensor([False, False])
     )
     assert (logits2[:, 1, 47] == float("-inf")).all()
+
+
+def test_action_ids_cover_all_boundary_categories() -> None:
+    expected = {
+        0: SlotAction(ActionKind.PASS),
+        1: SlotAction(ActionKind.SWITCH, switch_slot=0),
+        6: SlotAction(ActionKind.SWITCH, switch_slot=5),
+        7: SlotAction(ActionKind.MOVE, move_slot=0, target=-2),
+        11: SlotAction(ActionKind.MOVE, move_slot=0, target=2),
+        26: SlotAction(ActionKind.MOVE, move_slot=3, target=2),
+        27: SlotAction(ActionKind.MOVE, move_slot=0, target=-2, mega=True),
+        46: SlotAction(ActionKind.MOVE, move_slot=3, target=2, mega=True),
+        47: SlotAction(ActionKind.FORCED_MOVE, mega=True),
+        48: SlotAction(ActionKind.FORCED_MOVE),
+    }
+    for action_id, semantic in expected.items():
+        assert decode_action(action_id) == semantic
+        assert encode_action(semantic) == action_id
+
+
+def test_team_preview_pairs_and_joint_constraints_preserve_uniqueness() -> None:
+    pairs = tuple((first, second) for first in range(6) for second in range(6) if first != second)
+    assert tuple(decode_team_pair(encode_team_pair(*pair)) for pair in pairs) == pairs
+    selection = (5, 4, 3, 2, 0, 1)
+    lead, back = canonical_team_actions(selection)
+    assert team_selection(lead, back) == selection
+
+    preview = DecisionView(slots=(SlotDecision(), SlotDecision()), team_preview=True)
+    assert legal_actions(preview, 0) == tuple(encode_team_pair(*pair) for pair in pairs)
+    assert validate_joint_action(preview, 1, 15)
+    assert not validate_joint_action(preview, 1, 14)
+
+    regular = DecisionView(
+        slots=(
+            SlotDecision(switch_slots=(0, 1), move_targets=((-2, 2),), can_mega=True),
+            SlotDecision(switch_slots=(0, 1), move_targets=((-2, 2),), can_mega=True),
+        )
+    )
+    assert validate_joint_action(regular, 7, 11)
+    assert not validate_joint_action(regular, 1, 1)
+    assert not validate_joint_action(regular, 27, 31)
+
+    forced = DecisionView(
+        slots=(
+            SlotDecision(forced_move=True, can_mega=True),
+            SlotDecision(forced_move=True, can_mega=True),
+        )
+    )
+    assert legal_actions(forced, 0) == (48, 47)
+
+
+def test_candidate_cap_degrades_to_explicit_unknown_evidence() -> None:
+    view = DecisionView(
+        slots=(
+            SlotDecision(move_targets=((-2, -1),)),
+            SlotDecision(move_targets=((-2,),)),
+        )
+    )
+    evidence = extract_action_evidence(
+        EvidenceRequest(
+            view=view,
+            slots=(
+                ObservedAction(alternatives=(7, 8), exact=False),
+                ObservedAction(action=7),
+            ),
+            max_candidates=1,
+        )
+    )
+    assert evidence.label_kind is LabelKind.UNKNOWN
+    assert evidence.candidates == ()
+    assert "candidate_cap_or_illegal" in evidence.tags
+
+
+def test_protocol_event_stream_matches_showdown_golden_types() -> None:
+    from tests.stress.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
+
+    EVENT_DIAGNOSTICS.clear()
+    events = parse_protocol_events(list(golden_raw_events()), tokenizer)
+    assert tuple(event.event_type for event in events) == GOLDEN_EVENT_TYPES
+    assert events[0].entity_id == "p1a: Pikachu"
+    damage = next(event for event in events if event.event_type is EventTypeId.DAMAGE)
+    heal = next(event for event in events if event.event_type is EventTypeId.HEAL)
+    unboost = next(event for event in events if event.event_type is EventTypeId.UNBOOST)
+    assert damage.value == pytest.approx(-0.25)
+    assert heal.value == pytest.approx(0.15)
+    assert unboost.value == pytest.approx(-1 / 6)
+    assert any(event.event_type is EventTypeId.MEGA for event in events)
+    assert EVENT_DIAGNOSTICS["oov_ids"] >= 1
+
+
+def test_event_truncation_keeps_priority_events_and_protocol_order() -> None:
+    from tests.stress.replay_fixtures import golden_raw_events
+
+    EVENT_DIAGNOSTICS.clear()
+    events = parse_protocol_events(list(golden_raw_events()), tokenizer)
+    truncated = truncate_events(events, limit=12)
+    assert len(truncated) == 12
+    assert [event.order for event in truncated] == sorted(event.order for event in truncated)
+    assert any(event.event_type is EventTypeId.MOVE for event in truncated)
+    assert any(event.event_type is EventTypeId.SWITCH_IN for event in truncated)
+    assert any(event.event_type is EventTypeId.FAINT for event in truncated)
+
+
+def test_malformed_and_incomplete_protocol_lines_are_diagnosed_without_fabrication() -> None:
+    from tests.stress.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
+
+    EVENT_DIAGNOSTICS.clear()
+    raw_events = list(golden_raw_events())
+    raw_events.extend(
+        (
+            RawBattleEvent(("",)),
+            RawBattleEvent(("", "chat", "ignored")),
+            RawBattleEvent(("", "switch", "p1a: Pikachu")),
+            RawBattleEvent(("", "-damage", "p2a: Charizard", "50/100")),
+            RawBattleEvent(("", "-status", "p2a: Charizard")),
+            RawBattleEvent(("", "move", "p1a: Pikachu")),
+        )
+    )
+    events = parse_protocol_events(raw_events, tokenizer)
+    assert len(events) == len(GOLDEN_EVENT_TYPES) + 1
+    assert EVENT_DIAGNOSTICS["oov_ids"] >= 1
+    assert EVENT_DIAGNOSTICS["missing_pre_hp"] == 1
+    damage = events[-1]
+    assert damage.event_type is EventTypeId.DAMAGE
+    assert damage.value == 0.0
+
+
+def test_event_truncation_handles_below_equal_and_above_capacity_limits() -> None:
+    from tests.stress.replay_fixtures import golden_raw_events
+
+    events = parse_protocol_events(list(golden_raw_events()) * 2, tokenizer)
+    assert len(events) > EVENT_COUNT
+    for limit in (EVENT_COUNT - 1, EVENT_COUNT, EVENT_COUNT + 1):
+        truncated = truncate_events(events, limit=limit)
+        assert len(truncated) == limit
+        assert [event.order for event in truncated] == sorted(event.order for event in truncated)
+
+
+def test_observation_overflow_contract_holds_at_capacity_boundaries() -> None:
+    observation = StructuredObservation.empty_batch(3)
+    observation.numerical[0, 0, NUM_IDX_EFFECT_COUNT] = MAX_EFFECTS - 1
+    observation.numerical[1, 0, NUM_IDX_EFFECT_COUNT] = MAX_EFFECTS
+    observation.numerical[2, 0, NUM_IDX_EFFECT_COUNT] = MAX_EFFECTS + 2
+    observation.numerical[2, 0, NUM_IDX_EFFECT_OVERFLOW] = 2
+    observation.events_cat[0, : EVENT_COUNT - 1, 0] = 1
+    observation.events_cat[1, :, 0] = 1
+    observation.events_cat[2, :, 0] = 1
+    observation.events_metadata[:] = torch.tensor(
+        ((EVENT_COUNT - 1, 0), (EVENT_COUNT, 0), (EVENT_COUNT + 3, 3)),
+        dtype=torch.float32,
+    )
+    observation.validate_overflow_contract()
+    assert observation.overflow_totals() == (2, 3)
+
+
+def test_reconstructed_observations_clear_reused_buffer_state() -> None:
+    from tests.stress.replay_fixtures import golden_replay_payload
+
+    document = parse_replay_payload(golden_replay_payload("buffer-reuse"))
+    perspective = reconstruct_both(document)[0]
+    assert len(perspective.snapshots) >= 2
+    builder = ObservationBuilder(default_runtime_resources())
+    output = StructuredObservation.empty_batch(1)[0]
+    for snapshot in perspective.snapshots:
+        snapshot.view.events = list(snapshot.events)
+        output.token_type_ids.fill_(99)
+        output.categorical.fill_(99)
+        output.numerical.fill_(99.0)
+        output.events_cat.fill_(99)
+        output.events_num.fill_(99.0)
+        output.events_side_ids.fill_(99)
+        output.events_slot_ids.fill_(99)
+        output.events_metadata.fill_(99.0)
+        builder.build_into(snapshot.view, output)
+        output.validate(batch_rank=0)
+        output.validate_overflow_contract()
+        assert all(torch.isfinite(tensor).all() for tensor in output.tensors())
+        assert output.events_metadata[0].item() == len(snapshot.events)
+        assert not torch.any(output.events_cat[len(snapshot.events) :, :])
+        assert not torch.any(output.events_num[len(snapshot.events) :, :])
+        assert output.token_type_ids[0].item() == int(TokenType.POKEMON)
+        assert output.side_ids[0].item() == int(SideId.ALLY)
+        assert tuple(output.slot_ids[:6].tolist()) == (1, 2, 3, 4, 5, 6)
+        assert tuple(output.slot_ids[6:12].tolist()) == (1, 2, 3, 4, 5, 6)
+        assert output.numerical[12, NUM_IDX_TEAM_PREVIEW].item() == float(snapshot.view.teampreview)
+        assert output.numerical[12, 3].item() == pytest.approx(snapshot.view.turn / 24.0)
+
+
+class _AdapterBattleState:
+    pass
+
+
+def _adapter_battle(*, teampreview: bool = False, forced: bool = False) -> DoubleBattle:
+    active = SimpleNamespace(
+        moves={"tackle": SimpleNamespace(id="tackle")},
+        fainted=False,
+        base_species="Pikachu",
+    )
+    team = {
+        f"p1: Species-{index}": SimpleNamespace(base_species=f"Species-{index}")
+        for index in range(6)
+    }
+    battle = _AdapterBattleState()
+    for name, value in {
+        "player_username": "player",
+        "battle_tag": "stress-battle",
+        "teampreview": teampreview,
+        "team": team,
+        "active_pokemon": [active, None],
+        "opponent_active_pokemon": [None, None],
+        "available_moves": [[SimpleNamespace(id="struggle" if forced else "tackle")], []],
+        "available_switches": [[], []],
+        "valid_orders": [[], []],
+        "can_mega_evolve": [False, False],
+        "force_switch": [False, False],
+        "trapped": [False, False],
+        "maybe_trapped": [False, False],
+        "_wait": False,
+        "player_role": "p1",
+        "opponent_team": {},
+        "weather": {},
+        "fields": {},
+        "side_conditions": {},
+        "opponent_side_conditions": {},
+        "turn": 1,
+        "used_mega_evolve": False,
+        "opponent_used_mega_evolve": False,
+        "get_possible_showdown_targets": lambda move, pokemon: [0],
+    }.items():
+        setattr(battle, name, value)
+    return cast(DoubleBattle, battle)
+
+
+def test_runtime_action_adapters_round_trip_control_move_and_preview_orders() -> None:
+    battle = _adapter_battle()
+    for action in (0, 7):
+        order = action_to_single_order(action, battle, fake=True, position=0)
+        assert int(single_order_to_action(order, battle, fake=True, position=0)) == action
+    forced_battle = _adapter_battle(forced=True)
+    forced_order = action_to_single_order(48, forced_battle, fake=True, position=0)
+    assert int(single_order_to_action(forced_order, forced_battle, fake=True, position=0)) == 48
+    assert np.array_equal(
+        order_to_action(action_to_order(np.array([-2, -2]), battle), battle), [-2, -2]
+    )
+    assert np.array_equal(
+        order_to_action(action_to_order(np.array([-1, -1]), battle), battle), [-1, -1]
+    )
+    preview = _adapter_battle(teampreview=True)
+    selected = np.array([1, 15], dtype=np.int64)
+    preview_order = action_to_order(selected, preview)
+    assert np.array_equal(order_to_action(preview_order, preview), selected)
+
+
+def test_battle_view_cache_refreshes_decisions_without_replacing_facade() -> None:
+    battle = _adapter_battle()
+    first = current_battle_view(battle)
+    first_decision = first.decision
+    assert first is current_battle_view(battle)
+    assert first_decision is first.decision
+    battle._wait = True
+    refreshed = battle_view(battle)
+    assert refreshed is first
+    assert refreshed.decision is not first_decision
+    assert refreshed.decision.wait is True
+    assert decision_view(battle) == refreshed.decision
+
+
+def test_runtime_action_adapters_reject_invalid_orders_in_strict_mode() -> None:
+    battle = _adapter_battle()
+    with pytest.raises(ValueError):
+        action_to_single_order(26, battle, fake=False, position=0)
+    with pytest.raises((TypeError, ValueError)):
+        order_to_action(cast(Any, SimpleNamespace()), battle, strict=True)
+
+
+def test_recharge_is_encoded_as_forced_move() -> None:
+    battle = _adapter_battle()
+    cast(Any, battle).available_moves = [[SimpleNamespace(id="recharge")], []]
+    order = action_to_single_order(48, battle, fake=True, position=0)
+    assert int(single_order_to_action(order, battle, fake=True, position=0)) == 48

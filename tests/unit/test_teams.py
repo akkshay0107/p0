@@ -42,6 +42,7 @@ from p0.teams.validation import (
     PersistentShowdownValidator,
     validate_many,
     validate_many_batched,
+    validate_variant,
 )
 
 
@@ -992,3 +993,32 @@ def test_persistent_showdown_validator_lifecycle_and_validation() -> None:
     assert len(calls) >= 1
     first_request = json.loads(calls[0])
     assert len(first_request["batch"]) == 2
+
+
+def test_single_team_validation_reports_pinned_runner_failures() -> None:
+    variant = _variant_team_validation_batch()
+
+    def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        return subprocess.CompletedProcess("node", 1, stdout="", stderr="invalid team")
+
+    with pytest.raises(RuntimeError, match="validator failed: invalid team"):
+        validate_variant(variant, runner=runner)
+
+
+def test_batched_team_validation_rejects_timeout_crash_and_malformed_output() -> None:
+    variant = _variant_team_validation_batch()
+
+    def timeout_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        raise subprocess.TimeoutExpired("node", 0.1)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        validate_many_batched((variant,), runner=timeout_runner)
+
+    def malformed_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        return subprocess.CompletedProcess("node", 0, stdout="{}", stderr="")
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        validate_many_batched((variant,), runner=malformed_runner)

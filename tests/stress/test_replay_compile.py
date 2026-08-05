@@ -5,7 +5,6 @@ from typing import Any
 import pytest
 import torch
 
-from p0.replays import compile as compile_module
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.shards import validate_shard_tensors
 from tests.stress._helpers import stress_count
@@ -82,36 +81,6 @@ def test_compiler_is_deterministic_for_golden_replays(tmp_path) -> None:
 
 
 @pytest.mark.stress
-def test_compiler_retains_exact_partial_unknown_and_rejected_labels() -> None:
-    exact = golden_replay_payload("exact", series_id="label-series")
-    partial = golden_replay_payload(
-        "partial",
-        series_id="label-series-2",
-        first_move_target=None,
-    )
-    result = compile_payloads((exact, partial), format_id=exact["formatid"])
-
-    counters = result.metrics.counters
-    assert counters["accepted_games"] == 2
-    assert counters["label_exact"] == 3
-    assert counters["label_partial"] == 1
-    assert counters["label_unknown"] == 4
-
-    capped = compile_payloads((partial,), format_id=partial["formatid"], max_candidates=1)
-    assert capped.metrics.counters["label_partial"] == 0
-    assert capped.metrics.counters["label_exact"] == 1
-    assert capped.metrics.counters["label_unknown"] == 3
-
-    rejected = golden_replay_payload("rejected", series_id="rejected-series")
-    rejected["log"] = "\n".join(
-        line for line in str(rejected["log"]).splitlines() if "|showteam|" not in line
-    )
-    rejected_result = compile_payloads((rejected,), format_id=rejected["formatid"])
-    assert not rejected_result.games
-    assert rejected_result.metrics.counters["rejected_games"] == 1
-
-
-@pytest.mark.stress
 def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> None:
     payloads = (
         golden_replay_payload("series-a-1", series_id="series-a", game_number=1),
@@ -135,31 +104,6 @@ def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> Non
         {golden_series_id("series-a")},
         {golden_series_id("series-b")},
     ]
-
-
-@pytest.mark.stress
-def test_compiler_closes_process_pool_after_worker_failure(monkeypatch) -> None:
-    events: list[str] = []
-
-    class FailingPool:
-        def __enter__(self):
-            events.append("enter")
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            del exc_type, exc, traceback
-            events.append("exit")
-
-        def map(self, *args, **kwargs):
-            del args, kwargs
-            events.append("map")
-            raise RuntimeError("injected worker failure")
-
-    monkeypatch.setattr(compile_module.concurrent.futures, "ProcessPoolExecutor", FailingPool)
-    payload = golden_replay_payload("worker-failure", series_id="worker-failure-series")
-    with pytest.raises(RuntimeError, match="injected worker failure"):
-        compile_payloads((payload,), format_id=payload["formatid"])
-    assert events == ["enter", "map", "exit"]
 
 
 def _summaries(build, filename: str) -> list[dict[str, Any]]:
