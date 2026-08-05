@@ -14,8 +14,17 @@ from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
-from p0.format_config import current_manifest
+from p0.format_config import (
+    ACTION_CONTRACT,
+    FORMAT,
+    RESOURCE_FEATURE_ABI,
+    TENSOR_ABI,
+    RuntimeManifest,
+    canonical_json_sha256,
+    sha256_file,
+)
 from p0.paths import DEFAULT_PATHS
+from p0.persistence import atomic_json_save
 
 ROOT = DEFAULT_PATHS.repository_root
 DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
@@ -65,7 +74,17 @@ def build(
     manifest_path: Path,
     coverage_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Build the vocab mapping, checking for schema and dataset coverage."""
+    """Build the vocab mapping, checking for schema and dataset coverage.
+
+    Arguments:
+        dex_path: Champions data file containing legal content and protocol IDs.
+        vocab_path: Destination for the atomically written vocabulary.
+        manifest_path: Destination for the atomically written runtime manifest.
+        coverage_path: Optional destination for the coverage audit JSON.
+
+    Returns:
+        The generated coverage audit.
+    """
     dex = json.loads(dex_path.read_text(encoding="utf-8"))
     vocab: dict[str, dict[str, int]] = {table: {} for table in TABLES}
 
@@ -131,10 +150,6 @@ def build(
                 f"Vocabulary table {table!r} collides with reserved semantics: {reserved_collisions}"
             )
 
-    # Keep the JSON shape consumed by the current runtime. The semantic IDs are
-    # recorded in the sidecar manifest until the observation tensor schema grows
-    # explicit knownness/provenance fields in Workstream C.
-    vocab_path.write_text(json.dumps(vocab, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     missing_content: dict[str, list[str]] = {}
     for table in ("species", "items", "abilities", "moves", "natures"):
         dumped = {normalize(entry.get("id", entry.get("name", ""))) for entry in dex[table]}
@@ -165,22 +180,30 @@ def build(
         ),
         "vocabularyTables": {name: len(values) for name, values in sorted(vocab.items())},
     }
-    if coverage_path is not None:
-        coverage_path.write_text(
-            json.dumps(coverage, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-
     if missing_content:
         raise ValueError(f"Champions coverage audit failed: missing={missing_content}")
 
-    manifest = current_manifest(
-        vocab_path=vocab_path,
-        dex_path=dex_path,
+    contract = {
+        "tensor_abi": TENSOR_ABI,
+        "vocabulary_sha256": canonical_json_sha256(vocab),
+        "action": ACTION_CONTRACT,
+        "resource_feature_abi": RESOURCE_FEATURE_ABI,
+    }
+    manifest = RuntimeManifest(
+        tensor_abi=TENSOR_ABI,
+        vocabulary_sha256=contract["vocabulary_sha256"],
+        action=ACTION_CONTRACT,
+        resource_feature_abi=RESOURCE_FEATURE_ABI,
+        runtime_contract_sha256=canonical_json_sha256(contract),
+        champions_dex_sha256=sha256_file(dex_path),
+        showdown_commit=FORMAT.showdown_commit,
+        battle_format=FORMAT.battle_format,
+        bo3_format=FORMAT.bo3_format,
     )
-    manifest_path.write_text(
-        json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_json_save(vocab_path, vocab)
+    if coverage_path is not None:
+        atomic_json_save(coverage_path, coverage)
+    atomic_json_save(manifest_path, manifest.to_dict())
     return coverage
 
 

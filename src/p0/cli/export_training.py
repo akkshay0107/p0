@@ -1,11 +1,14 @@
 """Export training artifacts and their runtime contracts."""
 
 import argparse
-import shutil
+import io
+import json
 import sys
 import tarfile
 import time
 from pathlib import Path
+
+from omegaconf import OmegaConf
 
 from p0.paths import DEFAULT_PATHS
 
@@ -27,7 +30,10 @@ def gather_directory_files(
         return
     for p in sorted(directory.rglob("*")):
         if p.is_file():
-            targets.append((p, str(p.relative_to(project_root)), p.stat().st_size))
+            relative = p.relative_to(project_root)
+            if relative == Path("artifacts/config.yaml"):
+                continue
+            targets.append((p, str(relative), p.stat().st_size))
 
 
 def collect_export_files(project_root: Path, artifacts: Path) -> list[tuple[Path, str, int]]:
@@ -45,6 +51,34 @@ def collect_export_files(project_root: Path, artifacts: Path) -> list[tuple[Path
     return targets
 
 
+def redacted_config_snapshot(config_path: Path) -> bytes | None:
+    """Serialize a schema-shaped configuration snapshot with credentials removed."""
+    if not config_path.is_file():
+        return None
+    raw = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+    secret_names = {
+        "password",
+        "token",
+        "secret",
+        "api_key",
+        "apikey",
+        "access_token",
+        "credentials",
+    }
+
+    def redact(value: object, key: str = "") -> object:
+        if key.casefold() in secret_names:
+            return "<redacted>"
+        if isinstance(value, dict):
+            return {str(name): redact(item, str(name)) for name, item in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    snapshot = redact(raw)
+    return (json.dumps(snapshot, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def main() -> int:
     """Export CLI entrypoint."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -58,11 +92,8 @@ def main() -> int:
         print("No artifacts directory found.", file=sys.stderr)
         return 1
 
-    config = project_root / "config.yaml"
-    if config.exists():
-        shutil.copy(config, artifacts / "config.yaml")
-
     targets = collect_export_files(project_root, artifacts)
+    config_snapshot = redacted_config_snapshot(project_root / "config.yaml")
 
     files_to_archive = [
         (p, arc, size) for p, arc, size in targets if p.resolve() != output_path.resolve()
@@ -72,7 +103,9 @@ def main() -> int:
         print("No training files found to export.", file=sys.stderr)
         return 1
 
-    total_bytes = sum(size for _, _, size in files_to_archive)
+    total_bytes = sum(size for _, _, size in files_to_archive) + (
+        len(config_snapshot) if config_snapshot is not None else 0
+    )
     print(
         f"Discovered {len(files_to_archive)} files to export (Total size: {format_size(total_bytes)})."
     )
@@ -86,7 +119,12 @@ def main() -> int:
                 if size > 10 * 1024 * 1024:
                     print(f"Adding: {arcname} ({format_size(size)})")
                 tar.add(filepath, arcname=arcname)
-    except Exception as e:
+            if config_snapshot is not None:
+                info = tarfile.TarInfo("artifacts/config.redacted.json")
+                info.size = len(config_snapshot)
+                info.mtime = time.time()
+                tar.addfile(info, io.BytesIO(config_snapshot))
+    except (OSError, tarfile.TarError, TypeError, ValueError) as e:
         print(f"Error creating archive: {e}", file=sys.stderr)
         return 1
 

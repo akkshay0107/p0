@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,8 @@ from p0.replays.group import group_replays
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.scrape import ReplayFetcher, ScrapeConfig, load_raw_replay
 from p0.replays.shards import load_shard_manifest
+
+logger = logging.getLogger(__name__)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -36,6 +39,12 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--imputation-seed", type=int, default=0)
     build.add_argument("--max-decisions-per-shard", type=int, default=4096)
     build.add_argument("--runtime-manifest", type=Path, default=DEFAULT_RUNTIME_MANIFEST)
+    build.add_argument(
+        "--max-parse-errors",
+        type=int,
+        default=0,
+        help="Maximum malformed cached replay files allowed before failing.",
+    )
 
     splits = subparsers.add_parser("create-splits")
     splits.add_argument("--shard-manifest", type=Path, required=True)
@@ -90,29 +99,45 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _yield_documents(
+    cache_dir: Path,
+    parse_errors: list[str],
+) -> Iterator[ReplayDocument]:
+    """Yield cached documents while retaining identities of malformed inputs."""
+    for path in sorted((cache_dir / FORMAT.bo3_format / "raw").glob("*.json.gz")):
+        try:
+            yield parse_replay_payload(
+                load_raw_replay(path),
+                replay_id=path.name.removesuffix(".json.gz"),
+                format_id=FORMAT.bo3_format,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            identity = path.name.removesuffix(".json.gz")
+            parse_errors.append(identity)
+            logger.warning("Rejected malformed cached replay %s: %s", identity, exc)
+
+
 def _build(args: argparse.Namespace) -> dict[str, Any]:
     """Compile a folder of scraped raw replays into PyTorch tensor shards."""
-
-    def _yield_documents() -> Iterator[ReplayDocument]:
-        """Safely parse payload files from cache and yield ReplayDocuments."""
-        for p in (args.cache_dir / FORMAT.bo3_format / "raw").glob("*.json.gz"):
-            try:
-                yield parse_replay_payload(
-                    load_raw_replay(p),
-                    replay_id=p.name.removesuffix(".json.gz"),
-                    format_id=FORMAT.bo3_format,
-                )
-            except (TypeError, ValueError):
-                continue
+    if args.max_parse_errors < 0:
+        raise ValueError("--max-parse-errors must be non-negative")
+    parse_errors: list[str] = []
+    documents = tuple(_yield_documents(args.cache_dir, parse_errors))
+    if len(parse_errors) > args.max_parse_errors:
+        raise ValueError(
+            f"Cached replay parse errors ({len(parse_errors)}) exceed the allowed threshold "
+            f"({args.max_parse_errors}): {tuple(parse_errors)}"
+        )
 
     built = compile_to_shards(
-        documents=_yield_documents(),
+        documents=documents,
         output_dir=args.output_dir,
         format_id=FORMAT.bo3_format,
         max_candidates=args.max_candidates,
         imputation_seed=args.imputation_seed,
         max_decisions_per_shard=args.max_decisions_per_shard,
         manifest_path=args.runtime_manifest,
+        external_rejections=tuple(parse_errors),
     )
 
     manifest = built.manifest
@@ -125,6 +150,7 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
         "accepted_games": manifest.accepted_games,
         "rejected_games": manifest.rejected_games,
         "source_series": len(manifest.source_series),
+        "parse_errors": parse_errors,
     }
 
 

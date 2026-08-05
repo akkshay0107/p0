@@ -323,7 +323,7 @@ def _can_mega(pokemon: PokemonView | None, battle: Any, active_idx: int | None =
         return False
     if active_idx is not None:
         return battle.can_mega_evolve[active_idx]
-    # fallback if the above doesnt work
+    # Fallback if the attribute above is unavailable.
     item = pokemon.item
     if not item:
         return False
