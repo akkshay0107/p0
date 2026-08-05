@@ -10,7 +10,10 @@ from p0.model.structured_observation import (
     MAX_EFFECTS,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_TEAM_PREVIEW,
+    SideId,
     StructuredObservation,
+    TokenType,
 )
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruct import reconstruct_both
@@ -95,3 +98,11 @@ def test_reconstructed_observations_clear_reused_buffer_state() -> None:
         assert output.events_metadata[0].item() == len(snapshot.events)
         assert not torch.any(output.events_cat[len(snapshot.events) :, :])
         assert not torch.any(output.events_num[len(snapshot.events) :, :])
+
+        # Independent replay-derived checks for identity/layout and battle state.
+        assert output.token_type_ids[0].item() == int(TokenType.POKEMON)
+        assert output.side_ids[0].item() == int(SideId.ALLY)
+        assert tuple(output.slot_ids[:6].tolist()) == (1, 2, 3, 4, 5, 6)
+        assert tuple(output.slot_ids[6:12].tolist()) == (1, 2, 3, 4, 5, 6)
+        assert output.numerical[12, NUM_IDX_TEAM_PREVIEW].item() == float(snapshot.view.teampreview)
+        assert output.numerical[12, 3].item() == pytest.approx(snapshot.view.turn / 24.0)

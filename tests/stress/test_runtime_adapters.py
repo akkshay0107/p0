@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -97,3 +97,20 @@ def test_battle_view_cache_refreshes_decisions_without_replacing_facade() -> Non
     assert refreshed.decision is not first_decision
     assert refreshed.decision.wait is True
     assert decision_view(battle) == refreshed.decision
+
+
+@pytest.mark.stress
+def test_runtime_action_adapters_reject_invalid_orders_in_strict_mode() -> None:
+    battle = _battle()
+    with pytest.raises(ValueError):
+        action_to_single_order(26, battle, fake=False, position=0)
+    with pytest.raises((TypeError, ValueError)):
+        order_to_action(cast(Any, SimpleNamespace()), battle, strict=True)
+
+
+@pytest.mark.stress
+def test_recharge_is_encoded_as_forced_move() -> None:
+    battle = _battle()
+    cast(Any, battle).available_moves = [[SimpleNamespace(id="recharge")], []]
+    order = action_to_single_order(48, battle, fake=True, position=0)
+    assert int(single_order_to_action(order, battle, fake=True, position=0)) == 48

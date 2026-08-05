@@ -58,6 +58,25 @@ def test_single_team_validation_reports_pinned_runner_failures() -> None:
 
 
 @pytest.mark.stress
+def test_batched_team_validation_rejects_timeout_crash_and_malformed_output() -> None:
+    variant = _variant_team_validation_batch()
+
+    def timeout_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        raise subprocess.TimeoutExpired("node", 0.1)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        validate_many_batched((variant,), runner=timeout_runner)
+
+    def malformed_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del args, kwargs
+        return subprocess.CompletedProcess("node", 0, stdout="{}", stderr="")
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        validate_many_batched((variant,), runner=malformed_runner)
+
+
+@pytest.mark.stress
 def test_persistent_validator_handles_repeated_batches_and_closes_worker() -> None:
     variants = tuple(
         _variant_team_validation_batch(species) for species in ("Pikachu", "Raichu", "Zapdos")

@@ -64,7 +64,7 @@ async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_ser
     from p0.evaluation.harness import DEFAULT_TEST_TEAM
     from p0.teams.source import FixedTeamSource
 
-    harness = EvaluationHarness(episodes_per_matchup=1, seed=17)
+    harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
     result = await harness.run_matchup(
         "random-a",
         None,
@@ -74,8 +74,8 @@ async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_ser
         FixedTeamSource(DEFAULT_TEST_TEAM),
         showdown_server,
     )
-    assert result.total_games == 1
-    assert result.wins_a + result.wins_b <= result.total_games
+    assert result.total_games == 2
+    assert result.wins_a + result.wins_b == result.total_games
     assert all(
         set(stats) == {"wins", "games", "win_rate"} for stats in result.per_team_results.values()
     )

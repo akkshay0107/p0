@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from torch.utils.data import DataLoader
 
@@ -135,3 +137,23 @@ def test_dataset_rejects_missing_golden_shard(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="Shard file is missing"):
         next(iter(LazyReplayDataset(built.manifest_path)))
+
+
+@pytest.mark.stress
+def test_dataset_rejects_missing_and_duplicate_source_records(tmp_path) -> None:
+    missing = _build_dataset_from_payloads(
+        tmp_path / "missing", (golden_replay_payload("only", series_id="series"),)
+    )
+    missing_manifest = missing.manifest.to_dict()
+    missing_manifest["raw_replays"] = {}
+    altered = missing.manifest_path.parent / "missing.json"
+    altered.write_text(json.dumps(missing_manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="raw_replays|source_games|partition"):
+        LazyReplayDataset(altered)
+
+    duplicate_payloads = (
+        golden_replay_payload("duplicate", series_id="duplicate-series"),
+        golden_replay_payload("duplicate", series_id="duplicate-series"),
+    )
+    with pytest.raises((ValueError, KeyError), match="duplicate|already|unique|invalid"):
+        _build_dataset_from_payloads(tmp_path / "duplicate", duplicate_payloads)

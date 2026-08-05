@@ -86,7 +86,9 @@ class _GroundTruthPlayer(RandomPlayer):
         return order
 
 
-async def capture_showdown_decisions(server_configuration, *, game_count: int = 1):
+async def capture_showdown_decisions(
+    server_configuration, *, game_count: int = 1, max_concurrent_battles: int = 1
+):
     """Capture live requests, observations, valid orders, and chosen orders."""
     builder = ObservationBuilder(default_runtime_resources())
     player_a = _GroundTruthPlayer(
@@ -95,7 +97,7 @@ async def capture_showdown_decisions(server_configuration, *, game_count: int = 
         server_configuration=server_configuration,
         team=DEFAULT_TEST_TEAM,
         accept_open_team_sheet=True,
-        max_concurrent_battles=1,
+        max_concurrent_battles=max_concurrent_battles,
         observation_builder=builder,
     )
     player_b = RandomPlayer(
@@ -104,7 +106,7 @@ async def capture_showdown_decisions(server_configuration, *, game_count: int = 
         server_configuration=server_configuration,
         team=DEFAULT_TEST_TEAM,
         accept_open_team_sheet=True,
-        max_concurrent_battles=1,
+        max_concurrent_battles=max_concurrent_battles,
     )
     poke_env_patches.install()
     try:

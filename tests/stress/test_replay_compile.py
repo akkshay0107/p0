@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 import torch
 
+from p0.replays import compile as compile_module
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.shards import validate_shard_tensors
 from tests.stress._helpers import stress_count
@@ -134,6 +135,31 @@ def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> Non
         {golden_series_id("series-a")},
         {golden_series_id("series-b")},
     ]
+
+
+@pytest.mark.stress
+def test_compiler_closes_process_pool_after_worker_failure(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FailingPool:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            events.append("exit")
+
+        def map(self, *args, **kwargs):
+            del args, kwargs
+            events.append("map")
+            raise RuntimeError("injected worker failure")
+
+    monkeypatch.setattr(compile_module.concurrent.futures, "ProcessPoolExecutor", FailingPool)
+    payload = golden_replay_payload("worker-failure", series_id="worker-failure-series")
+    with pytest.raises(RuntimeError, match="injected worker failure"):
+        compile_payloads((payload,), format_id=payload["formatid"])
+    assert events == ["enter", "map", "exit"]
 
 
 def _summaries(build, filename: str) -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import subprocess
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -42,7 +43,7 @@ def test_showdown_server_start_stop_owns_process_log_and_command(
         def terminate(self):
             pass
 
-        def wait(self, timeout=None):
+        def wait(self, timeout: float | None = None):
             del timeout
             return 0
 
@@ -102,7 +103,7 @@ def test_showdown_server_rejects_double_start_and_invalid_port_groups(
         def terminate(self):
             pass
 
-        def wait(self, timeout=None):
+        def wait(self, timeout: float | None = None):
             del timeout
             return 0
 
@@ -144,13 +145,36 @@ def test_showdown_server_kills_process_when_graceful_stop_times_out(tmp_path: Pa
         def kill(self):
             self.killed = True
 
-        def wait(self, timeout=None):
+        def wait(self, timeout: float | None = None):
             if not self.killed:
-                raise subprocess.TimeoutExpired("node", timeout)
+                raise subprocess.TimeoutExpired("node", timeout if timeout is not None else 0.0)
             return 0
 
     process = StuckProcess()
     server = showdown.ShowdownServer(9125, showdown_root=tmp_path, stop_timeout=0.01)
-    server.process = process
+    server.process = cast(Any, process)
     server.stop()
     assert process.killed
+
+
+@pytest.mark.stress
+def test_showdown_server_rolls_back_after_child_crash(monkeypatch, tmp_path: Path) -> None:
+    class CrashedProcess:
+        returncode = 17
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None):
+            del timeout
+            return 0
+
+    monkeypatch.setattr(showdown.subprocess, "Popen", lambda *args, **kwargs: CrashedProcess())
+    server = showdown.ShowdownServer(9126, showdown_root=tmp_path, startup_timeout=0.1)
+    with pytest.raises(RuntimeError, match="exited"):
+        server.start()
+    assert server.process is None
+    assert server._log_file is None

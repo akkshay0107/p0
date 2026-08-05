@@ -43,6 +43,17 @@ async def test_showdown_order_sets_remain_nonempty_across_many_requests(showdown
     )
     assert decisions
     assert all(decision.legal_joint_actions for decision in decisions)
+    for decision in decisions:
+        projected = tuple(
+            sorted({action for pair in decision.legal_joint_actions for action in pair})
+        )
+        observed = tuple(sorted(set(decision.legal_actions[0] + decision.legal_actions[1])))
+        assert set(projected) <= set(observed)
+        # These are independently authored protocol invariants, not legality helpers.
+        assert all(0 <= action < 49 for action in observed)
+        assert any(action in observed for action in (7, 8, 9, 10, 11)) or any(
+            action in observed for action in (1, 2, 3, 4, 5, 6, 48)
+        )
 
 
 @pytest.mark.stress

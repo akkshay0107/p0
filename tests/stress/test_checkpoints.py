@@ -25,6 +25,13 @@ def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance
     policy = _policy()
     optimizer = torch.optim.Adam(policy.parameters(), lr=0.001)
     magnet = Magnet(policy)
+    loss = torch.stack(tuple(parameter.square().mean() for parameter in policy.parameters())).sum()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        for parameter in magnet.policy.parameters():
+            parameter.add_(0.125)
     store.save_training_state(
         path,
         17,
@@ -49,6 +56,7 @@ def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance
     )
     assert episode == 17
     assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
+    assert restored_optimizer.state
     for name, parameter in restored.state_dict().items():
         torch.testing.assert_close(parameter, policy.state_dict()[name])
     for name, parameter in restored_magnet.state_dict().items():

@@ -143,6 +143,7 @@ async def test_live_self_play_captures_decisions_across_repeated_games(showdown_
     decisions = await capture_showdown_decisions(
         showdown_server,
         game_count=stress_count("P0_STRESS_SELF_PLAY_GAMES", 2),
+        max_concurrent_battles=2,
     )
     assert decisions
     assert all(decision.legal_joint_actions for decision in decisions)

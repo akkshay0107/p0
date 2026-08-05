@@ -16,13 +16,14 @@ from p0.model.resources import default_runtime_resources
 def showdown_server():
     """Start live stress tests only when the checked-out server is runnable."""
     from p0.paths import DEFAULT_PATHS
-    from p0.runtime.showdown import start_showdown_servers
+    from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 
     root = Path(DEFAULT_PATHS.showdown_root)
     if not (root / "build").is_file():
         pytest.skip("built pokemon-showdown runtime not available")
 
-    port = 8120
+    # Allocate per-test so parallel stress jobs cannot cross-connect.
+    port = allocate_loopback_ports(1)[0]
     server_configuration = ServerConfiguration(
         websocket_url=f"ws://localhost:{port}/showdown/websocket",
         authentication_url=LocalhostServerConfiguration.authentication_url,
