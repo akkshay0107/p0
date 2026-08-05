@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import numpy as np
 import numpy.typing as npt
@@ -137,6 +137,7 @@ class SimEnv(MegaEnv):
         self._series_scores = [0, 0]
         self._series_games_played = 0
         self._decision_steps = 0
+        self._resume_reset_pending = False
         self.series_id = str(uuid.uuid4())
 
     @property
@@ -148,6 +149,66 @@ class SimEnv(MegaEnv):
     def series_games_played(self) -> int:
         """Number of games played so far in the current best-of-three series."""
         return self._series_games_played
+
+    def training_state(self) -> dict[str, object]:
+        """Capture stochastic and series state needed for deterministic PPO resume."""
+        return {
+            "agent_rng": self._agent_rng.getstate(),
+            "opponent_rng": self._opponent_rng.getstate(),
+            "agent_team": self._current_team_packed(self.agent1),
+            "opponent_team": self._current_team_packed(self.agent2),
+            "series_scores": tuple(self._series_scores),
+            "series_games_played": self._series_games_played,
+            "series_id": self.series_id,
+        }
+
+    def restore_training_state(self, state: Mapping[str, object]) -> None:
+        """Restore a state previously returned by :meth:`training_state`."""
+        agent_rng = state.get("agent_rng")
+        opponent_rng = state.get("opponent_rng")
+        agent_team = state.get("agent_team")
+        opponent_team = state.get("opponent_team")
+        scores = state.get("series_scores")
+        games_played = state.get("series_games_played")
+        series_id = state.get("series_id")
+        if not isinstance(scores, (tuple, list)) or len(scores) != 2:
+            raise ValueError("Invalid SimEnv series_scores training state")
+        if (
+            not isinstance(games_played, int)
+            or not isinstance(series_id, str)
+            or not isinstance(agent_team, str)
+            or not isinstance(opponent_team, str)
+            or not agent_team.strip()
+            or not opponent_team.strip()
+        ):
+            raise ValueError("Invalid SimEnv series metadata training state")
+        try:
+            self._agent_rng.setstate(agent_rng)  # type: ignore[arg-type]
+            self._opponent_rng.setstate(opponent_rng)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid SimEnv random training state") from exc
+        self.agent1.update_team(agent_team)
+        self.agent2.update_team(opponent_team)
+        self._series_scores = [int(scores[0]), int(scores[1])]
+        self._series_games_played = games_played
+        self.series_id = series_id
+        self._resume_reset_pending = True
+
+    @staticmethod
+    def _current_team_packed(player: object) -> str:
+        """Read the packed team from poke-env's current team builder."""
+        team_builder = getattr(player, "_team", None)
+        yield_team = getattr(team_builder, "yield_team", None)
+        if not callable(yield_team):
+            raise RuntimeError("Simulation player has no serializable active team")
+        team = yield_team()
+        if not isinstance(team, str) or not team.strip():
+            raise RuntimeError("Simulation player has an invalid active team")
+        return team
+
+    def prepare_for_checkpoint(self) -> None:
+        """Mark the next reset as a clean replacement for the active game."""
+        self._resume_reset_pending = True
 
     def set_observation_targets(
         self,
@@ -168,6 +229,8 @@ class SimEnv(MegaEnv):
 
         is_new_series = sum(self._series_scores) == 0 and self._series_games_played == 0
         is_completed_series = max(self._series_scores) >= 2 or self._series_games_played >= 3
+        preserve_restored_game = self._resume_reset_pending
+        self._resume_reset_pending = False
 
         if is_completed_series or is_new_series:
             self._series_scores = [0, 0]
@@ -178,7 +241,8 @@ class SimEnv(MegaEnv):
 
         self._decision_steps = 0
         # preemptively add the game that will be played
-        self._series_games_played += 1
+        if not preserve_restored_game or is_new_series or is_completed_series:
+            self._series_games_played += 1
         return super().reset(seed=seed, options=options)
 
     def calc_reward(self, battle: AbstractBattle) -> float:

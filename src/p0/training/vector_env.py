@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -125,6 +126,17 @@ class ThreadVecEnv:
 
     def get_batched_obs2(self, device: torch.device):
         return self.obs2_buffers.to(device, non_blocking=True)
+
+    def training_state(self) -> tuple[dict[str, object], ...]:
+        """Capture each simulation's RNG and active-series state."""
+        return tuple(env.training_state() for env in self.envs)
+
+    def restore_training_state(self, states: Sequence[Mapping[str, object]]) -> None:
+        """Restore simulation state captured by :meth:`training_state`."""
+        if len(states) != self.n_envs:
+            raise ValueError("Vector environment state count does not match environment count")
+        for env, state in zip(self.envs, states, strict=True):
+            env.restore_training_state(state)
 
     def shutdown(self):
         self.executor.shutdown(wait=True, cancel_futures=True)

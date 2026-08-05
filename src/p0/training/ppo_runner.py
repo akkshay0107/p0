@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from collections.abc import Callable, Mapping
@@ -27,7 +28,7 @@ from p0.training.magnet import Magnet
 from p0.training.ppo import PPOUpdater
 from p0.training.rollout import RolloutCollector
 from p0.training.trainer import PPOTrainer
-from p0.training.utils import PPOScheduler, adamw_param_groups, default_device
+from p0.training.utils import PPOScheduler, adamw_param_groups, default_device, seed_everything
 from p0.training.vector_env import ThreadVecEnv
 
 
@@ -35,7 +36,6 @@ def _team_source(
     config: TeamSourceConfig,
     *,
     corpus_config: CorpusConfig | None = None,
-    seed: int = 0,
     is_agent: bool = True,
 ) -> TeamSource:
     """Build a team provider from the configuration, automatically parsing corpus manifests."""
@@ -53,22 +53,18 @@ def _team_source(
 
         split = CorpusSplit.TRAIN
         policy = SamplingPolicy.USAGE_WEIGHTED
-        allow_mirror = True
         if corpus_config is not None:
             split_name = corpus_config.agent_split.upper() if is_agent else "TRAIN"
             split = CorpusSplit[split_name]
             policy_name = corpus_config.sampling_policy.upper()
             policy = SamplingPolicy[policy_name]
-            allow_mirror = corpus_config.allow_mirror
 
         spec = CorpusSourceSpec(
             corpus_path=str(path),
             corpus_hash=corpus_hash,
             format_id=format_id,
             split=split,
-            seed=seed,
             sampling_policy=policy,
-            allow_mirror=allow_mirror,
         )
         return CorpusTeamSource(spec)
     return FileTeamSource(config.path)
@@ -77,11 +73,18 @@ def _team_source(
 def _tensorboard_sink(writer: SummaryWriter):
     """Create a metric sink callback for Tensorboard logging."""
 
-    def emit(metrics: Mapping[str, float], step: int, phase: str) -> None:
-        for name, value in metrics.items():
-            writer.add_scalar(f"{phase}/{name}", value, step)
+    return functools.partial(_emit_tensorboard, writer)
 
-    return emit
+
+def _emit_tensorboard(
+    writer: SummaryWriter,
+    metrics: Mapping[str, float],
+    step: int,
+    phase: str,
+) -> None:
+    """Write a metric mapping under a phase-specific Tensorboard namespace."""
+    for name, value in metrics.items():
+        writer.add_scalar(f"{phase}/{name}", value, step)
 
 
 def _close_environments(envs: list[SimEnv]) -> None:
@@ -93,6 +96,8 @@ def _close_environments(envs: list[SimEnv]) -> None:
                 asyncio.run_coroutine_threadsafe(
                     player.ps_client.stop_listening(), player.ps_client.loop
                 ).result(timeout=2.0)
+        # Environment and client shutdown cross async/thread boundaries; cleanup
+        # must continue for the remaining environments after any one failure.
         except Exception:
             logging.exception("Failed to close a simulation environment cleanly")
 
@@ -120,6 +125,7 @@ def run_training(
         None.
     """
     training, paths = config.training, config.paths
+    seed_everything(training.seed)
     resources = default_runtime_resources()
     device = default_device()
 
@@ -128,23 +134,38 @@ def run_training(
             raise FileNotFoundError(
                 f"PPO resume checkpoint does not exist: {paths.resume_checkpoint}"
             )
-        policy = policy_store.load_policy(paths.resume_checkpoint, device)
+        policy = policy_store.load_policy(
+            paths.resume_checkpoint,
+            device,
+            expected_metadata={
+                "gamma": training.gamma,
+                "value_target_semantics": "discounted_terminal_outcome.v1",
+            },
+        )
     elif paths.initial_policy_checkpoint is not None:
         if not paths.initial_policy_checkpoint.is_file():
             raise FileNotFoundError(
                 f"Initial policy checkpoint does not exist: {paths.initial_policy_checkpoint}"
             )
-        policy = policy_store.load_policy(paths.initial_policy_checkpoint, device)
+        policy = policy_store.load_policy(
+            paths.initial_policy_checkpoint,
+            device,
+            expected_metadata={
+                "gamma": training.gamma,
+                "value_target_semantics": "discounted_terminal_outcome.v1",
+            },
+        )
     else:
         policy = build_policy(ModelConfig.baseline(), resources).to(device)
 
-    policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
     optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
     scaler = GradScaler(
         "cuda", enabled=training.enable_optim and device.type == "cuda", init_scale=512.0
     )
     magnet = Magnet(policy)
     scheduler = PPOScheduler(training)
+    resume_environment_state: object | None = None
+    resume_collector_state: object | None = None
 
     start = (
         policy_store.load_training_state(
@@ -160,17 +181,20 @@ def run_training(
         if paths.resume_checkpoint is not None
         else 0
     )
+    if paths.resume_checkpoint is not None:
+        resume_metadata = policy_store.load_metadata(paths.resume_checkpoint)
+        resume_environment_state = resume_metadata.get("environment_state")
+        resume_collector_state = resume_metadata.get("collector_state")
+    policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
 
     agent_source = _team_source(
         config.environment.agent_team_source,
         corpus_config=config.corpus,
-        seed=0,
         is_agent=True,
     )
     opponent_source = _team_source(
         config.environment.opponent_team_source,
         corpus_config=config.corpus,
-        seed=1,
         is_agent=False,
     )
 
@@ -197,12 +221,16 @@ def run_training(
                     )
                 )
             vector_env = ThreadVecEnv(envs)
+            if isinstance(resume_environment_state, (tuple, list)):
+                vector_env.restore_training_state(resume_environment_state)
             writer = SummaryWriter(log_dir=str(paths.runs_dir / "ppo_training"))
             collector = RolloutCollector(
                 vector_env,
                 policy,
                 training,
             )
+            if isinstance(resume_collector_state, Mapping):
+                collector.restore_training_state(resume_collector_state)
             updater = PPOUpdater(
                 policy,
                 optimizer,

@@ -751,8 +751,6 @@ class PolicyNet(nn.Module):
         history_tokens: Tensor,
         history_mask: Tensor,
         history_age_ids: Tensor,
-        *,
-        critic_only: bool = False,
     ) -> EvalOutput:
         logits, log_probs, z, local_history = self.actor.score(
             enc,
@@ -764,8 +762,6 @@ class PolicyNet(nn.Module):
             history_mask,
             history_age_ids,
         )
-        if critic_only:
-            z = z.detach()
         value = self.critic(z)
 
         dist1 = Categorical(logits=logits[:, 0])
@@ -817,8 +813,6 @@ class PolicyNet(nn.Module):
         history_tokens: Tensor,
         history_mask: Tensor,
         history_age_ids: Tensor,
-        *,
-        critic_only: bool = False,
     ) -> EvalOutput:
         return self.evaluate(
             self.encode(obs, action_mask),
@@ -829,5 +823,4 @@ class PolicyNet(nn.Module):
             history_tokens,
             history_mask,
             history_age_ids,
-            critic_only=critic_only,
         )

@@ -41,6 +41,8 @@ class ValidatedTeam:
             if len(members) != 6:
                 raise ValueError("Expected exactly six team members")
             packed = _PACKER.join_team(members)
+        # The third-party teambuilder exposes several parser exception types;
+        # normalize all of them at this boundary to the TeamSource contract.
         except Exception as exc:
             raise ValueError("Malformed Showdown team") from exc
         if not packed:

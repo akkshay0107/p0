@@ -237,6 +237,12 @@ def _candidate_weight(
     return max(1, score)
 
 
+def _spread(**points: int) -> StatPoints:
+    """Construct a StatPoints value using Showdown's ``def`` spelling."""
+    fields = {"def": "defense"}
+    return StatPoints(**{fields.get(key, key): amount for key, amount in points.items()})
+
+
 def impute_candidates(
     nature: str,
     moves: tuple[str, ...],
@@ -253,29 +259,25 @@ def impute_candidates(
     elif role == Role.SPECIAL:
         attack = "spa"
 
-    def spread(**points: int) -> StatPoints:
-        fields = {"def": "defense"}
-        return StatPoints(**{fields.get(key, key): amount for key, amount in points.items()})
-
     if role == Role.TRICK_ROOM:
         shapes = (
-            (spread(hp=32, **{attack: 32}, defense=2), 100),
-            (spread(hp=32, defense=17, spd=17), 55),
+            (_spread(hp=32, **{attack: 32}, defense=2), 100),
+            (_spread(hp=32, defense=17, spd=17), 55),
         )
     elif role in {Role.SUPPORT, Role.SPEED_CONTROL, Role.BULKY_SETUP}:
         shapes = (
-            (spread(hp=32, defense=17, spd=17), 100),
-            (spread(hp=32, spe=32, defense=2), 65),
+            (_spread(hp=32, defense=17, spd=17), 100),
+            (_spread(hp=32, spe=32, defense=2), 65),
         )
     elif role == Role.MIXED:
         shapes = (
-            (spread(atk=32, spa=32, hp=2), 100),
-            (spread(hp=32, atk=17, spa=17), 60),
+            (_spread(atk=32, spa=32, hp=2), 100),
+            (_spread(hp=32, atk=17, spa=17), 60),
         )
     else:
         shapes = (
-            (spread(**{attack: 32}, spe=32, hp=2), 100),
-            (spread(hp=32, **{attack: 32}, defense=2), 55),
+            (_spread(**{attack: 32}, spe=32, hp=2), 100),
+            (_spread(hp=32, **{attack: 32}, defense=2), 55),
         )
     return tuple(
         SpreadCandidate(

@@ -1,5 +1,7 @@
 """Typed all-self-play rollout collection over the fixed memory channel."""
 
+from collections.abc import Mapping
+
 import numpy as np
 import torch
 
@@ -47,6 +49,11 @@ class BattleMemoryBuffer:
     def reset(self, env_id: int) -> None:
         """Reset one game's history."""
         self.tokens[env_id].clear()
+
+    def clear(self) -> None:
+        """Reset all per-battle histories at a checkpoint boundary."""
+        for tokens in self.tokens:
+            tokens.clear()
 
     def inputs(
         self,
@@ -206,20 +213,6 @@ def collect_rollouts(
             if not done_status[i]:
                 continue
 
-            hist1 = memory1.tokens[i]
-            if hist1:
-                val1 = torch.stack(hist1).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    new_tok1 = policy.series.resample_single_game(val1)[0]
-                series_store1.append(str(series_ids[i]), new_tok1)
-
-            hist2 = memory2.tokens[i]
-            if hist2:
-                val2 = torch.stack(hist2).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    new_tok2 = policy.series.resample_single_game(val2)[0]
-                series_store2.append(str(series_ids[i]), new_tok2)
-
             info = infos[i] or {}
             bootstrap_value1 = 0.0
             bootstrap_value2 = 0.0
@@ -253,6 +246,22 @@ def collect_rollouts(
                     t_out = policy.act_obs(t_obs, dummy_mask, t_s_tok, t_s_mask, *t_mem)
                     bootstrap_value1 = t_out.value[0].item()
                     bootstrap_value2 = t_out.value[1].item()
+
+            # The artificial truncation value sees only the current game. Commit
+            # its summary after inference so the game is not represented twice.
+            hist1 = memory1.tokens[i]
+            if hist1:
+                val1 = torch.stack(hist1).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    new_tok1 = policy.series.resample_single_game(val1)[0]
+                series_store1.append(str(series_ids[i]), new_tok1)
+
+            hist2 = memory2.tokens[i]
+            if hist2:
+                val2 = torch.stack(hist2).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    new_tok2 = policy.series.resample_single_game(val2)[0]
+                series_store2.append(str(series_ids[i]), new_tok2)
 
             if info.get("series_complete"):
                 series_store1.drop(series_ids[i])
@@ -308,6 +317,35 @@ class RolloutCollector:
 
     def reset_completed(self) -> None:
         self.completed_trajectories.clear()
+
+    def prepare_for_checkpoint(self) -> None:
+        """Restart at a clean battle boundary before persisting PPO state."""
+        self.completed_trajectories.clear()
+        self.first.step_counts.zero_()
+        self.second.step_counts.zero_()
+        self.memory1.clear()
+        self.memory2.clear()
+        for env in self.vector_env.envs:
+            prepare_env = getattr(env, "prepare_for_checkpoint", None)
+            if callable(prepare_env):
+                prepare_env()
+        self.vector_env.reset()
+
+    def training_state(self) -> dict[str, object]:
+        """Capture cross-game context retained by the collector."""
+        return {
+            "series_store1": self.series_store1.training_state(),
+            "series_store2": self.series_store2.training_state(),
+        }
+
+    def restore_training_state(self, state: Mapping[str, object]) -> None:
+        """Restore cross-game context captured at an episode boundary."""
+        store1 = state.get("series_store1")
+        store2 = state.get("series_store2")
+        if not isinstance(store1, Mapping) or not isinstance(store2, Mapping):
+            raise ValueError("Invalid PPO collector series training state")
+        self.series_store1.restore_training_state(store1)
+        self.series_store2.restore_training_state(store2)
 
     def get_batches(self, device: torch.device) -> list[TrajectoryBatch]:
         return prepare_trajectory_batches(

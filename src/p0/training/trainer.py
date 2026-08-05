@@ -79,8 +79,7 @@ class PPOTrainer:
                     "trajectory_count": float(len(trajectories)),
                 }
             )
-            phase = "warmup" if episode < self.training_config.warmup_episodes else "train"
-            self.metric_sink(metrics, episode + 1, phase)
+            self.metric_sink(metrics, episode + 1, "train")
             completed_episode = episode + 1
             if (episode + 1) % 10 == 0:
                 self._save(episode + 1)
@@ -88,6 +87,20 @@ class PPOTrainer:
             self._save(completed_episode)
 
     def _save(self, episode: int) -> None:
+        prepare_checkpoint = getattr(self.collector, "prepare_for_checkpoint", None)
+        if callable(prepare_checkpoint):
+            prepare_checkpoint()
+        metadata: dict[str, object] = {
+            "gamma": self.training_config.gamma,
+            "value_target_semantics": "discounted_terminal_outcome.v1",
+        }
+        vector_env = self.collector.vector_env
+        capture_state = getattr(vector_env, "training_state", None)
+        if callable(capture_state):
+            metadata["environment_state"] = capture_state()
+        capture_collector_state = getattr(self.collector, "training_state", None)
+        if callable(capture_collector_state):
+            metadata["collector_state"] = capture_collector_state()
         self.policy_store.save_training_state(
             self.checkpoint_path,
             episode,
@@ -96,5 +109,6 @@ class PPOTrainer:
             scheduler=self.scheduler,
             scaler=self.updater.scaler,
             magnet=self.magnet,
+            metadata=metadata,
             trainer_kind="ppo",
         )

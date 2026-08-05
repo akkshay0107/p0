@@ -11,6 +11,7 @@ from copy import deepcopy
 
 import torch
 
+from p0.model.factory import canonical_policy_state_dict, load_canonical_policy_state_dict
 from p0.model.policy import PolicyNet
 
 
@@ -29,14 +30,14 @@ class Magnet:
         """
         Reload the magnet weights from the live policy (state-dict copy only).
         """
-        self.policy.load_state_dict(policy.state_dict())
+        load_canonical_policy_state_dict(self.policy, canonical_policy_state_dict(policy))
         self.policy.eval()
         self.policy.requires_grad_(False)
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
-        self.policy.load_state_dict(state_dict)
+        load_canonical_policy_state_dict(self.policy, state_dict)
         self.policy.eval()
         self.policy.requires_grad_(False)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        return self.policy.state_dict()
+        return canonical_policy_state_dict(self.policy)

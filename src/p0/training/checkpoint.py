@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,7 +16,11 @@ from p0.format_config import (
 )
 from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
-from p0.model.factory import build_policy
+from p0.model.factory import (
+    build_policy,
+    canonical_policy_state_dict,
+    load_canonical_policy_state_dict,
+)
 from p0.model.policy import PolicyNet
 from p0.model.resources import RuntimeResources
 from p0.persistence import atomic_torch_save
@@ -36,7 +41,13 @@ class PolicyStore(Protocol):
         metadata: Mapping[str, Any] | None = None,
     ) -> None: ...
 
-    def load_policy(self, path: Path, device: torch.device | str) -> PolicyNet: ...
+    def load_policy(
+        self,
+        path: Path,
+        device: torch.device | str,
+        *,
+        expected_metadata: Mapping[str, Any] | None = None,
+    ) -> PolicyNet: ...
 
     def save_training_state(
         self,
@@ -66,6 +77,8 @@ class PolicyStore(Protocol):
         require_training_state: bool = False,
     ) -> int: ...
 
+    def load_metadata(self, path: Path) -> Mapping[str, Any]: ...
+
 
 class CheckpointStore:
     """The sole reader and writer for policy and training checkpoints."""
@@ -89,12 +102,19 @@ class CheckpointStore:
         artifact = self._policy_artifact(policy, POLICY_ARTIFACT, metadata)
         atomic_torch_save(path, artifact)
 
-    def load_policy(self, path: Path, device: torch.device | str) -> PolicyNet:
+    def load_policy(
+        self,
+        path: Path,
+        device: torch.device | str,
+        *,
+        expected_metadata: Mapping[str, Any] | None = None,
+    ) -> PolicyNet:
         artifact = self._load_artifact(path)
         config = self._model_config(artifact, path)
+        self._validate_provenance(artifact, path, expected_metadata)
         try:
             policy = build_policy(config, self._runtime_resources()).to(device)
-            policy.load_state_dict(artifact["model_state_dict"], strict=True)
+            load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             raise ValueError(f"Invalid policy state in checkpoint {path}") from exc
 
@@ -128,6 +148,8 @@ class CheckpointStore:
         ):
             if service is not None:
                 training_state[f"{name}_state_dict"] = service.state_dict()
+
+        training_state["rng_state"] = _capture_rng_state()
 
         artifact["training_state"] = training_state
         atomic_torch_save(path, artifact)
@@ -176,7 +198,7 @@ class CheckpointStore:
             raise ValueError(f"Training checkpoint {path} has no valid training_state")
 
         try:
-            policy.load_state_dict(artifact["model_state_dict"], strict=True)
+            load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
             for name, service in (
                 ("optimizer", optimizer),
                 ("scheduler", scheduler),
@@ -198,6 +220,10 @@ class CheckpointStore:
             if type(episode) is not int or episode < 0:
                 raise ValueError("episode must be a non-negative integer")
 
+            rng_state = training_state.get("rng_state")
+            if isinstance(rng_state, Mapping):
+                _restore_rng_state(rng_state)
+
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             raise ValueError(f"Invalid training state in checkpoint {path}") from exc
 
@@ -215,7 +241,7 @@ class CheckpointStore:
             "artifact_type": artifact_type,
             "runtime_contract_sha256": manifest.runtime_contract_sha256,
             "model_config": self._policy_config(policy).to_dict(),
-            "model_state_dict": policy.state_dict(),
+            "model_state_dict": canonical_policy_state_dict(policy),
             "provenance": dict(metadata or {}),
         }
 
@@ -255,6 +281,20 @@ class CheckpointStore:
             self._resources = RuntimeResources.from_manifest(self.manifest_path)
         return self._resources
 
+    def load_metadata(self, path: Path) -> Mapping[str, Any]:
+        """Return validated checkpoint provenance without constructing a policy."""
+        return self._load_artifact(path)["provenance"]
+
+    @staticmethod
+    def _validate_provenance(
+        artifact: Mapping[str, Any],
+        path: Path,
+        expected_metadata: Mapping[str, Any] | None,
+    ) -> None:
+        for key, expected in (expected_metadata or {}).items():
+            if artifact["provenance"].get(key) != expected:
+                raise ValueError(f"Checkpoint {path} provenance field {key!r} is incompatible")
+
     @staticmethod
     def _model_config(artifact: Mapping[str, Any], path: Path) -> ModelConfig:
         try:
@@ -272,3 +312,27 @@ class CheckpointStore:
 
 
 DEFAULT_POLICY_STORE = CheckpointStore()
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    """Capture process-level stochastic state for exact episode-boundary resume."""
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore RNG state captured by ``_capture_rng_state`` when present."""
+    python_state = state.get("python")
+    torch_state = state.get("torch")
+    if python_state is not None:
+        random.setstate(python_state)
+    if isinstance(torch_state, torch.Tensor):
+        torch.set_rng_state(torch_state)
+    cuda_state = state.get("cuda")
+    if torch.cuda.is_available() and isinstance(cuda_state, list):
+        torch.cuda.set_rng_state_all(cuda_state)

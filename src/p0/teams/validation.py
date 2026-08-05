@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import selectors
 import subprocess
+import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, NamedTuple
 
 import orjson
@@ -198,10 +201,12 @@ class PersistentShowdownValidator:
         *,
         popen_factory: Callable[..., Any] = subprocess.Popen,
         repository_root: Path = DEFAULT_PATHS.repository_root,
+        request_timeout: float = 30.0,
     ) -> None:
         self._popen_factory = popen_factory
         self._repository_root = repository_root
         self._process: Any = None
+        self._request_timeout = request_timeout
 
     def __enter__(self) -> PersistentShowdownValidator:
         validator = self._repository_root / "scripts" / "validate_champions_batch.js"
@@ -209,7 +214,10 @@ class PersistentShowdownValidator:
             ["node", str(validator), "--persistent"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # Diagnostics are intentionally discarded here: the persistent
+            # protocol is line-oriented and an undrained stderr pipe can block
+            # the validator before it produces a response.
+            stderr=subprocess.DEVNULL,
             text=True,
             cwd=self._repository_root,
         )
@@ -233,20 +241,68 @@ class PersistentShowdownValidator:
                     self._process.stdin.flush()
                     self._process.stdin.close()
                 self._process.wait(timeout=2.0)
-            except Exception:
+            except (BrokenPipeError, OSError, ValueError, subprocess.TimeoutExpired):
                 try:
                     self._process.terminate()
-                except Exception:
-                    pass
+                    self._process.wait(timeout=1.0)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    try:
+                        self._process.kill()
+                    except (OSError, ValueError):
+                        pass
+                    try:
+                        self._process.wait(timeout=1.0)
+                    except (OSError, ValueError, subprocess.TimeoutExpired):
+                        pass
             finally:
                 if self._process is not None:
                     for stream in (self._process.stdout, self._process.stderr):
                         if stream is not None:
                             try:
                                 stream.close()
-                            except Exception:
+                            except (OSError, RuntimeError, ValueError):
                                 pass
                 self._process = None
+
+    def _readline(self) -> str:
+        """Read one worker response with a bounded wait."""
+        if self._process is None or self._process.stdout is None:
+            raise RuntimeError("Persistent worker stdout is unavailable")
+        stream = self._process.stdout
+        try:
+            selector = selectors.DefaultSelector()
+            try:
+                selector.register(stream, selectors.EVENT_READ)
+                ready = selector.select(self._request_timeout)
+            finally:
+                selector.close()
+            if not ready:
+                raise TimeoutError(
+                    f"Persistent validator response timed out after {self._request_timeout:g}s"
+                )
+            return stream.readline()
+        except (AttributeError, OSError, TypeError, ValueError):
+            # Test doubles and non-file streams may not expose a selectable fd.
+            result: Queue[str | BaseException] = Queue(maxsize=1)
+
+            def read() -> None:
+                try:
+                    result.put(stream.readline())
+                # Preserve worker failures, including interpreter-level errors,
+                # so the caller receives them instead of hanging on the queue.
+                except BaseException as exc:
+                    result.put(exc)
+
+            threading.Thread(target=read, daemon=True).start()
+            try:
+                value = result.get(timeout=self._request_timeout)
+            except Empty as exc:
+                raise TimeoutError(
+                    f"Persistent validator response timed out after {self._request_timeout:g}s"
+                ) from exc
+            if isinstance(value, BaseException):
+                raise value
+            return value
 
     def validate_many(
         self,
@@ -271,6 +327,9 @@ class PersistentShowdownValidator:
             raise ValueError("batch_size must be a positive integer")
         results: list[AdmissionResult] = []
         for offset in range(0, len(variants), batch_size):
+            poll = getattr(self._process, "poll", lambda: None)
+            if poll() is not None:
+                raise RuntimeError("Persistent validator exited before completing the request")
             chunk = variants[offset : offset + batch_size]
             payload = orjson.dumps({"batch": [_variant_dict(variant) for variant in chunk]}).decode(
                 "utf-8"
@@ -278,7 +337,7 @@ class PersistentShowdownValidator:
             try:
                 self._process.stdin.write(payload + "\n")
                 self._process.stdin.flush()
-                line = self._process.stdout.readline()
+                line = self._readline()
                 if not line:
                     raise RuntimeError("Persistent worker closed stdout unexpectedly")
                 parsed = orjson.loads(line)
@@ -296,6 +355,14 @@ class PersistentShowdownValidator:
                             problems=tuple(item["problems"]),
                         )
                     )
-            except Exception as exc:
+            except (
+                BrokenPipeError,
+                OSError,
+                TimeoutError,
+                TypeError,
+                ValueError,
+                orjson.JSONDecodeError,
+                RuntimeError,
+            ) as exc:
                 raise RuntimeError(f"PersistentShowdownValidator failed: {exc}") from exc
         return tuple(results)

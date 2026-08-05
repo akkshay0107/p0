@@ -1,5 +1,7 @@
 import math
+import random
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -8,6 +10,17 @@ from p0.training.config import TrainingConfig
 
 def default_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def seed_everything(seed: int) -> None:
+    """Seed process-level generators at a training composition root."""
+    if type(seed) is not int or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def amp_enabled(config: TrainingConfig, device: torch.device) -> bool:
@@ -21,9 +34,8 @@ class PPOScheduler:
 
         self.lr_max = config.lr
         self.lr_min = 0.1 * config.lr
-        self.warmup_episodes = config.warmup_episodes
         self.ramp_up_end = int(config.ramp_up_phase * config.num_episodes)
-        self.decay_len = config.num_episodes - self.ramp_up_end
+        self.decay_len = config.num_episodes - 1 - self.ramp_up_end
 
     def alpha(self, t: int) -> float:
         """MMD magnet coefficient.
@@ -45,7 +57,6 @@ class PPOScheduler:
             "alpha_value": self.alpha_value,
             "lr_max": self.lr_max,
             "lr_min": self.lr_min,
-            "warmup_episodes": self.warmup_episodes,
             "ramp_up_end": self.ramp_up_end,
             "decay_len": self.decay_len,
         }
@@ -62,19 +73,12 @@ class PPOScheduler:
 
     def lr(self, t: int):
         """
-        Learning rate scheduling. Constant high LR for value warmup,
-        then linear increase for policy, into cosine decay.
+        Start at the minimum LR, ramp linearly, then decay to the minimum.
         """
-        if t < self.warmup_episodes:
-            return self.lr_max
-
-        if self.ramp_up_end > 0 and t <= self.ramp_up_end:
+        if t <= self.ramp_up_end:
             prog = t / self.ramp_up_end
             prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]
             return (1 - prog) * self.lr_min + prog * self.lr_max
-
-        if self.decay_len <= 0:
-            return self.lr_max
 
         prog = (t - self.ramp_up_end) / self.decay_len
         prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]

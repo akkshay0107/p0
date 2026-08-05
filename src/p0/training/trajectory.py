@@ -200,9 +200,9 @@ def compute_gae_batch(
     gae = torch.zeros(batch_size, dtype=rewards.dtype, device=rewards.device)
     bootstrap_values = bootstrap_values.to(rewards.device)
 
-    # pad with extra slot and copy over values. extra slot holds the bootstrap values for
-    # games that do not end within the alloted turns. For the other batches they get
-    # zeroed out so doesnt matter.
+    # Pad with an extra slot containing bootstrap values for games that do not
+    # end within the allotted turns. Completed games receive a zero bootstrap,
+    # so this slot does not affect their advantages.
     extended_values = torch.zeros(
         (batch_size, max_steps + 1), dtype=values.dtype, device=values.device
     )

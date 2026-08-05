@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,15 @@ from p0.teams.validation import validate_many
 def _variants_from_showdown(
     text: str, dex: Mapping[str, Any] | None = None
 ) -> tuple[TeamRecord, ...]:
-    """Parse a showdown text export into team records."""
+    """Parse a showdown text export into canonical team records.
+
+    Arguments:
+        text: Showdown export containing one or more six-member teams.
+        dex: Optional dex data used for stat-spread imputation and role labels.
+
+    Returns:
+        One deduplicated team record per canonical team hash.
+    """
     from p0.teams.source import _PACKER
 
     lines = text.replace("\r\n", "\n").split("\n")
@@ -128,9 +137,9 @@ def _variants_from_showdown(
                     roles_list.append(candidate.role)
                     continue
                 except (TypeError, ValueError) as exc:
-                    import logging
-
-                    logging.warning(f"Failed to impute stats for {m.species}: {exc}")
+                    logging.getLogger(__name__).warning(
+                        "Failed to impute stats for %s: %s", m.species, exc
+                    )
             spreads_list.append(StatPoints(hp=2, spa=32, spe=32))
 
         spreads = tuple(spreads_list)
@@ -147,7 +156,7 @@ def _variants_from_showdown(
             archetype_tags = ("balance",)
 
         metadata = TeamMetadata(
-            source_series=("cli-import",),
+            source_series=(),
             source_replays=(),
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-01T00:00:00Z",

@@ -2,8 +2,8 @@
 
 This module implements CorpusTeamSource, which loads a validated TeamCorpusManifest
 and provides allocation-free, pure-Python sampling of ValidatedTeam instances
-according to configured split bounds, curriculum stages, mirroring constraints,
-and diverse sampling policies.
+according to configured split bounds, curriculum stages, and diverse sampling
+policies.
 """
 
 from __future__ import annotations
@@ -105,7 +105,7 @@ class CorpusTeamSource:
     def _prepare_sampling(self, policy: SamplingPolicy) -> None:
         if policy == SamplingPolicy.USAGE_WEIGHTED:
             self._get_usage_weights()
-        elif policy in (SamplingPolicy.UNIFORM_CANONICAL, SamplingPolicy.MATCHUP_BALANCED):
+        elif policy == SamplingPolicy.UNIFORM_CANONICAL:
             self._get_canonical_index()
         elif policy == SamplingPolicy.UNIFORM_ARCHETYPE:
             self._get_archetype_index()
@@ -115,52 +115,14 @@ class CorpusTeamSource:
     def _sample_entry(
         self,
         rng: random.Random,
-        exclude_canonical_hash: str | None = None,
     ) -> CorpusEntry:
         entries = self._entries
         policy = self._spec.sampling_policy
 
-        if exclude_canonical_hash is not None:
-            by_canonical, canonical_keys = self._get_canonical_index()
-            eligible_keys = tuple(k for k in canonical_keys if k != exclude_canonical_hash)
-
-            if not eligible_keys:
-                raise ValueError("No eligible corpus entries remain after exclusion")
-
-            if policy in (SamplingPolicy.UNIFORM_CANONICAL, SamplingPolicy.MATCHUP_BALANCED):
-                chosen_canonical = rng.choice(eligible_keys)
-                return rng.choice(by_canonical[chosen_canonical])
-
-            entries = tuple(
-                entry for entry in self._entries if entry.canonical_hash != exclude_canonical_hash
-            )
-            if not entries:
-                raise ValueError("No eligible corpus entries remain after exclusion")
-
-            if policy == SamplingPolicy.USAGE_WEIGHTED:
-                weights = [entry.usage_count for entry in entries]
-                return rng.choices(entries, weights=weights, k=1)[0]
-
-            if policy == SamplingPolicy.UNIFORM_ARCHETYPE:
-                by_arch: dict[str, list[CorpusEntry]] = {}
-                for entry in entries:
-                    tags = entry.archetype_tags if entry.archetype_tags else ("_untagged_",)
-                    for tag in tags:
-                        by_arch.setdefault(tag, []).append(entry)
-                chosen_arch = rng.choice(tuple(sorted(by_arch.keys())))
-                return rng.choice(by_arch[chosen_arch])
-
-            if policy == SamplingPolicy.RARE_COVERAGE:
-                tot = sum(entry.usage_count for entry in entries)
-                rare_w = [max(1, tot // entry.usage_count) for entry in entries]
-                return rng.choices(entries, weights=rare_w, k=1)[0]
-
-            return rng.choice(entries)
-
         if policy == SamplingPolicy.USAGE_WEIGHTED:
             return rng.choices(entries, weights=self._get_usage_weights(), k=1)[0]
 
-        if policy in (SamplingPolicy.UNIFORM_CANONICAL, SamplingPolicy.MATCHUP_BALANCED):
+        if policy == SamplingPolicy.UNIFORM_CANONICAL:
             by_canonical, canonical_keys = self._get_canonical_index()
             chosen_canonical = rng.choice(canonical_keys)
             return rng.choice(by_canonical[chosen_canonical])
@@ -180,31 +142,6 @@ class CorpusTeamSource:
         entry = self._sample_entry(rng)
         return ValidatedTeam(packed=entry.packed, team_hash=entry.packed_sha256)
 
-    def sample_pair(self, rng: random.Random) -> tuple[ValidatedTeam, ValidatedTeam]:
-        """Return a pair of validated teams respecting the mirroring constraint."""
-        first_entry = self._sample_entry(rng)
-        first_team = ValidatedTeam(packed=first_entry.packed, team_hash=first_entry.packed_sha256)
-
-        if not self._spec.allow_mirror:
-            _, canonical_keys = self._get_canonical_index()
-            if len(canonical_keys) < 2:
-                raise ValueError(
-                    "Cannot sample non-mirror pair from a single-canonical-team corpus"
-                )
-            second_entry = self._sample_entry(
-                rng, exclude_canonical_hash=first_entry.canonical_hash
-            )
-            second_team = ValidatedTeam(
-                packed=second_entry.packed, team_hash=second_entry.packed_sha256
-            )
-            return first_team, second_team
-
-        second_entry = self._sample_entry(rng)
-        second_team = ValidatedTeam(
-            packed=second_entry.packed, team_hash=second_entry.packed_sha256
-        )
-        return first_team, second_team
-
     def describe(self) -> Mapping[str, JsonScalar | tuple[str, ...]]:
         """Describe the active corpus pool and sampling configuration."""
         return {
@@ -214,7 +151,6 @@ class CorpusTeamSource:
             "format_id": self._spec.format_id,
             "split": self._spec.split.name,
             "sampling_policy": self._spec.sampling_policy.name,
-            "allow_mirror": self._spec.allow_mirror,
             "curriculum_stage": self._spec.curriculum_stage,
             "pool_size": len(self._entries),
             "team_hashes": tuple(sorted({entry.packed_sha256 for entry in self._entries})),

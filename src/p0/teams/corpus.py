@@ -43,7 +43,6 @@ class SamplingPolicy(IntEnum):
     UNIFORM_CANONICAL = 2
     UNIFORM_ARCHETYPE = 3
     RARE_COVERAGE = 4
-    MATCHUP_BALANCED = 5
 
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
@@ -255,9 +254,7 @@ class CorpusSourceSpec:
     corpus_hash: str
     format_id: str
     split: CorpusSplit
-    seed: int
     sampling_policy: SamplingPolicy
-    allow_mirror: bool = True
     curriculum_stage: str = ""
 
     def __post_init__(self) -> None:
@@ -272,6 +269,3 @@ class CorpusSourceSpec:
 
         if self.sampling_policy is SamplingPolicy.UNSPECIFIED:
             raise ValueError("CorpusSourceSpec.sampling_policy must be specified")
-
-        if type(self.seed) is not int or self.seed < 0:
-            raise ValueError("CorpusSourceSpec.seed must be a nonnegative integer")

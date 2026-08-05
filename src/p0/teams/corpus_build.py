@@ -1,5 +1,10 @@
+"""Build, split, validate, and audit the immutable team corpus."""
+
+from __future__ import annotations
+
 import hashlib
 import json
+import math
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +25,105 @@ from p0.teams.team import TeamRecord, deduplicate_variants
 from p0.teams.validation import AdmissionResult, validate_many
 
 
+def _validate_ratios(ratio_train: float, ratio_val: float, ratio_test: float) -> None:
+    ratios = (ratio_train, ratio_val, ratio_test)
+    if any(not math.isfinite(value) or value < 0 for value in ratios):
+        raise ValueError("Corpus split ratios must be finite and non-negative")
+    if not math.isclose(sum(ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("Corpus split ratios must sum to one")
+
+
+def _split_for_key(
+    seed_key: str,
+    ratio_train: float,
+    ratio_val: float,
+    ratio_test: float,
+) -> CorpusSplit:
+    _validate_ratios(ratio_train, ratio_val, ratio_test)
+    digest = hashlib.sha256(seed_key.encode("utf-8")).hexdigest()
+    bucket = int(digest[:8], 16) % 10000
+    train_cutoff = round(ratio_train * 10000)
+    val_cutoff = train_cutoff + round(ratio_val * 10000)
+    if bucket < train_cutoff:
+        return CorpusSplit.TRAIN
+    if bucket < val_cutoff:
+        return CorpusSplit.VALIDATION
+    return CorpusSplit.TEST
+
+
+def _component_splits(
+    variants: Sequence[TeamRecord],
+    *,
+    ratio_train: float,
+    ratio_val: float,
+    ratio_test: float,
+    held_out_tags: tuple[str, ...],
+) -> tuple[CorpusSplit, ...]:
+    """Assign every connected source-series component one corpus split."""
+    _validate_ratios(ratio_train, ratio_val, ratio_test)
+    parents: dict[tuple[str, str], tuple[str, str]] = {}
+
+    def find(value: tuple[str, str]) -> tuple[str, str]:
+        parent = parents.setdefault(value, value)
+        while parents[parent] != parent:
+            parents[parent] = parents[parents[parent]]
+            parent = parents[parent]
+        return parent
+
+    def union(first: tuple[str, str], second: tuple[str, str]) -> None:
+        first_root, second_root = find(first), find(second)
+        if first_root != second_root:
+            parents[second_root] = first_root
+
+    for variant in variants:
+        series = variant.metadata.source_series
+        for current in series:
+            find(("series", current))
+        for current in series[1:]:
+            union(("series", series[0]), ("series", current))
+
+    component_members: dict[tuple[str, str], list[int]] = {}
+    for index, variant in enumerate(variants):
+        if variant.metadata.source_series:
+            root = find(("series", variant.metadata.source_series[0]))
+        else:
+            root = ("record", variant.team.team_hash)
+        component_members.setdefault(root, []).append(index)
+
+    component_assignments: dict[tuple[str, str], CorpusSplit] = {}
+    for root, indexes in component_members.items():
+        held_out = [
+            any(tag in held_out_tags for tag in variants[index].metadata.archetype_tags)
+            for index in indexes
+        ]
+        if any(held_out) and not all(held_out):
+            raise ValueError(
+                "A source-series component mixes held-out and non-held-out archetype records"
+            )
+        if all(held_out):
+            component_assignments[root] = CorpusSplit.HELD_OUT_ARCHETYPE
+            continue
+        source_series = sorted(
+            series for index in indexes for series in variants[index].metadata.source_series
+        )
+        seed_key = ",".join(dict.fromkeys(source_series)) or variants[indexes[0]].team.team_hash
+        component_assignments[root] = _split_for_key(
+            seed_key,
+            ratio_train,
+            ratio_val,
+            ratio_test,
+        )
+
+    return tuple(
+        component_assignments[
+            find(("series", variant.metadata.source_series[0]))
+            if variant.metadata.source_series
+            else ("record", variant.team.team_hash)
+        ]
+        for variant in variants
+    )
+
+
 def assign_split(
     variant: TeamRecord,
     series_to_split: dict[str, CorpusSplit],
@@ -29,30 +133,25 @@ def assign_split(
     held_out_tags: tuple[str, ...] = (),
 ) -> CorpusSplit:
     """Deterministic, series-leak-free split assignment."""
-    if any(tag in held_out_tags for tag in variant.metadata.archetype_tags):
-        return CorpusSplit.HELD_OUT_ARCHETYPE
+    _validate_ratios(ratio_train, ratio_val, ratio_test)
+    is_held_out = any(tag in held_out_tags for tag in variant.metadata.archetype_tags)
+    known = {
+        series_to_split[series]
+        for series in variant.metadata.source_series
+        if series in series_to_split
+    }
+    if len(known) > 1:
+        raise ValueError("A source-series component has contradictory split assignments")
+    if known and is_held_out != (next(iter(known)) is CorpusSplit.HELD_OUT_ARCHETYPE):
+        raise ValueError("A source-series component mixes held-out and non-held-out records")
 
-    for series in variant.metadata.source_series:
-        if series in series_to_split:
-            return series_to_split[series]
-
-    if variant.metadata.source_series:
-        seed_key = ",".join(sorted(variant.metadata.source_series))
+    if known:
+        split = next(iter(known))
+    elif is_held_out:
+        split = CorpusSplit.HELD_OUT_ARCHETYPE
     else:
-        seed_key = variant.team.team_hash
-
-    digest = hashlib.sha256(seed_key.encode("utf-8")).hexdigest()
-    bucket = int(digest[:8], 16) % 10000
-
-    train_cutoff = int(ratio_train * 10000)
-    val_cutoff = train_cutoff + int(ratio_val * 10000)
-
-    if bucket < train_cutoff:
-        split = CorpusSplit.TRAIN
-    elif bucket < val_cutoff:
-        split = CorpusSplit.VALIDATION
-    else:
-        split = CorpusSplit.TEST
+        seed_key = ",".join(sorted(variant.metadata.source_series)) or variant.team.team_hash
+        split = _split_for_key(seed_key, ratio_train, ratio_val, ratio_test)
 
     for series in variant.metadata.source_series:
         series_to_split[series] = split
@@ -147,7 +246,23 @@ def build_corpus(
     held_out_tags: tuple[str, ...] = (),
     created_at: str | None = None,
 ) -> tuple[TeamCorpusManifest, dict[str, Any]]:
-    """Admit, deduplicate, validate, and audit candidate team variants."""
+    """Admit, deduplicate, validate, and audit candidate team variants.
+
+    Arguments:
+        variants: Candidate teams, including provenance and archetype metadata.
+        tokenizer: Vocabulary used to reject out-of-vocabulary team content.
+        validator: Callable that validates the deduplicated candidates.
+        runtime_contract_sha256: Runtime ABI identity recorded in the manifest.
+        format_id: Battle format associated with the corpus.
+        ratio_train: Fraction assigned to the training split.
+        ratio_val: Fraction assigned to the validation split.
+        ratio_test: Fraction assigned to the test split.
+        held_out_tags: Archetype tags that force a component into held-out data.
+        created_at: Optional manifest timestamp.
+
+    Returns:
+        The corpus manifest and its coverage/rejection audit.
+    """
     if tokenizer is None:
         tokenizer = PokemonTokenizer.from_file(DEFAULT_PATHS.data_root / "vocab.json")
     if not runtime_contract_sha256:
@@ -158,7 +273,6 @@ def build_corpus(
     if len(validation_results) != len(deduped):
         raise RuntimeError("Validation result count does not match deduplicated variant count")
 
-    series_to_split: dict[str, CorpusSplit] = {}
     entries: list[CorpusEntry] = []
     rejections: dict[str, int] = {}
 
@@ -168,6 +282,7 @@ def build_corpus(
     split_counts: dict[str, int] = {}
     archetype_counts: dict[str, int] = {}
 
+    admitted: list[tuple[TeamRecord, AdmissionResult]] = []
     for variant, result in zip(deduped, validation_results, strict=True):
         if not result.valid or not result.packed_team:
             reason = "showdown_invalid"
@@ -186,15 +301,19 @@ def build_corpus(
             rejections[spread_reason] = rejections.get(spread_reason, 0) + 1
             continue
 
-        split = assign_split(
-            variant,
-            series_to_split,
-            ratio_train=ratio_train,
-            ratio_val=ratio_val,
-            ratio_test=ratio_test,
-            held_out_tags=held_out_tags,
-        )
+        admitted.append((variant, result))
+
+    splits = _component_splits(
+        tuple(variant for variant, _ in admitted),
+        ratio_train=ratio_train,
+        ratio_val=ratio_val,
+        ratio_test=ratio_test,
+        held_out_tags=held_out_tags,
+    )
+    for (variant, result), split in zip(admitted, splits, strict=True):
         packed = result.packed_team
+        if not isinstance(packed, str):
+            raise RuntimeError("Admitted team is missing its packed representation")
         packed_sha256 = hashlib.sha256(packed.encode("utf-8")).hexdigest()
 
         try:

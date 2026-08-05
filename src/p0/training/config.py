@@ -58,7 +58,7 @@ class TrainingConfig:
     teampreview_loss_mult: float = 1.5
     teampreview_alpha_mult: float = 2.0
     enable_optim: bool = True
-    warmup_episodes: int = 20
+    seed: int = 0
     ramp_up_phase: float = 0.1
 
     def __post_init__(self) -> None:
@@ -79,6 +79,8 @@ class TrainingConfig:
             ("gae_lambda", self.gae_lambda),
             ("ramp_up_phase", self.ramp_up_phase),
         )
+        if self.gamma >= 1.0:
+            raise ValueError("TrainingConfig.gamma must be less than 1")
 
         _non_negative(
             type(self).__name__,
@@ -98,8 +100,17 @@ class TrainingConfig:
             ("teampreview_alpha_mult", self.teampreview_alpha_mult),
         )
 
-        if not 0 <= self.warmup_episodes <= self.num_episodes:
-            raise ValueError("training.warmup_episodes must be between 0 and training.num_episodes")
+        if type(self.seed) is not int or self.seed < 0:
+            raise ValueError("training.seed must be a nonnegative integer")
+
+        if not 0.0 < self.ramp_up_phase < 1.0:
+            raise ValueError("training.ramp_up_phase must be strictly between 0 and 1")
+
+        ramp_end = int(self.ramp_up_phase * self.num_episodes)
+        if not 0 < ramp_end < self.num_episodes - 1:
+            raise ValueError(
+                "training.ramp_up_phase must produce an endpoint before the final episode"
+            )
 
         if self.magnet_refresh_interval > self.num_episodes:
             raise ValueError(
@@ -214,14 +225,13 @@ class BCConfig:
 
 @dataclass(frozen=True, slots=True)
 class CorpusConfig:
-    manifest_path: str = "teams/corpus_manifest.json"
+    manifest_path: Path = Path("teams/corpus_manifest.json")
     agent_split: str = "train"
     sampling_policy: str = "usage_weighted"
-    allow_mirror: bool = True
 
     def __post_init__(self) -> None:
         for name, value in (
-            ("manifest_path", self.manifest_path),
+            ("manifest_path", str(self.manifest_path)),
             ("agent_split", self.agent_split),
             ("sampling_policy", self.sampling_policy),
         ):
@@ -236,7 +246,6 @@ class CorpusConfig:
             "UNIFORM_CANONICAL",
             "UNIFORM_ARCHETYPE",
             "RARE_COVERAGE",
-            "MATCHUP_BALANCED",
         }:
             raise ValueError("corpus.sampling_policy is not supported")
 
@@ -245,13 +254,13 @@ class CorpusConfig:
 class EvalConfig:
     episodes_per_matchup: int = 20
     seed: int = 0
-    report_dir: str = "artifacts/eval"
+    report_dir: Path = Path("artifacts/eval")
 
     def __post_init__(self) -> None:
         _positive_ints(type(self).__name__, ("episodes_per_matchup", self.episodes_per_matchup))
         _non_negative(type(self).__name__, ("seed", self.seed))
 
-        if not self.report_dir.strip():
+        if not str(self.report_dir).strip():
             raise ValueError("evaluation.report_dir must not be empty")
 
 

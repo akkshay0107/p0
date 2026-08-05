@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
-from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.model.structured_observation import StructuredObservation, is_teampreview
 from p0.training.config import TrainingConfig
@@ -47,7 +46,6 @@ def compute_ppo_objective(
     config: TrainingConfig,
     *,
     alpha: float,
-    critic_only: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return per-step total/policy/value losses, ratios, and log-ratios."""
     log_ratio = current_log_probs - old_log_probs
@@ -60,14 +58,11 @@ def compute_ppo_objective(
     value_loss = F.mse_loss(current_values, returns, reduction="none")
     total = config.value_coef * value_loss
 
-    if not critic_only:
-        alpha_scale = alpha * torch.where(
-            team_preview.reshape(-1), config.teampreview_alpha_mult, 1.0
-        )
-        total = total + policy_loss + alpha_scale * magnet_kl
+    alpha_scale = alpha * torch.where(team_preview.reshape(-1), config.teampreview_alpha_mult, 1.0)
+    total = total + policy_loss + alpha_scale * magnet_kl
 
-        if config.residual_entropy_coef > 0.0:
-            total = total - config.residual_entropy_coef * normalized_entropy
+    if config.residual_entropy_coef > 0.0:
+        total = total - config.residual_entropy_coef * normalized_entropy
 
     total = torch.where(
         team_preview.reshape(-1),
@@ -131,35 +126,23 @@ def _build_memory_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build Bo1 memory inputs from one encoded trajectory batch."""
     dtype = encoded.tokens.dtype
-    local_lists = []
-    offset = 0
-    for episode_item in episodes:
-        local_lists.append(
-            policy.local_history_tokens(
-                encoded._replace(
-                    tokens=encoded.tokens[offset : offset + episode_item.length],
-                    aux=encoded.aux[offset : offset + episode_item.length],
-                    numerical=encoded.numerical[offset : offset + episode_item.length],
-                )
-            )
-        )
-        offset += episode_item.length
-
-    history_parts = []
-    history_mask_parts = []
-    history_age_parts = []
-    for local_tokens in local_lists:
-        for target in range(local_tokens.size(0)):
-            left = max(0, target - HISTORY_WINDOW)
-            packed, mask, ages = pack_history_tokens(local_tokens[left:target].unsqueeze(0))
-            history_parts.append(packed[0])
-            history_mask_parts.append(mask[0])
-            history_age_parts.append(ages[0])
-    history_tokens = torch.stack(history_parts)
-    history_mask = torch.stack(history_mask_parts)
-    history_age_ids = torch.stack(history_age_parts)
+    local_tokens = policy.local_history_tokens(encoded)
+    lengths = torch.tensor([item.length for item in episodes], device=device, dtype=torch.long)
+    starts = torch.cat((torch.zeros(1, device=device, dtype=torch.long), lengths.cumsum(0)[:-1]))
+    targets = torch.arange(encoded.tokens.size(0), device=device)
+    episode_starts = torch.repeat_interleave(starts, lengths)
+    history_offsets = torch.arange(-HISTORY_WINDOW, 0, device=device)
+    history_indices = targets[:, None] + history_offsets[None, :]
+    history_mask = history_indices >= episode_starts[:, None]
+    history_indices = history_indices.clamp_min(0)
+    history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
+    history_age_ids = torch.where(
+        history_mask,
+        torch.arange(HISTORY_WINDOW - 1, -1, -1, device=device)[None, :],
+        torch.zeros_like(history_indices),
+    )
     decision_count = encoded.tokens.size(0)
-    if episodes and episodes[0].series_tokens is not None:
+    if episodes and all(ep.series_tokens is not None for ep in episodes):
         series_tokens = torch.cat(
             [ep.series_tokens for ep in episodes if ep.series_tokens is not None], dim=0
         ).to(device)
@@ -221,17 +204,12 @@ def _run_batched_ppo(
             0,
         )
 
-    is_warmup = episode < config.warmup_episodes
-
     all_obs = StructuredObservation.cat([ep.observations for ep in episodes], dim=0)
     all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0)
     use_amp = amp_enabled(config, device)
 
     with autocast(device_type=device.type, enabled=use_amp):
         all_enc = policy.encode(all_obs, all_action_masks)
-
-    if is_warmup:
-        all_enc = all_enc._replace(tokens=all_enc.tokens.detach(), aux=all_enc.aux.detach())
 
     actions = torch.cat([ep.actions for ep in episodes])
     old_log_probs = torch.cat([ep.log_probs for ep in episodes])
@@ -242,13 +220,12 @@ def _run_batched_ppo(
     magnet_enc: EncodedObs | None = None
     magnet_memory: tuple[torch.Tensor, ...] | None = None
 
-    if not is_warmup:
-        with torch.inference_mode(), autocast(device_type=device.type, enabled=use_amp):
-            magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
-            magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
+    with torch.inference_mode(), autocast(device_type=device.type, enabled=use_amp):
+        magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
+        magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
 
     total_loss = torch.tensor(0.0, device=device)
-    # convert them to python floats once at the end
+    # Keep reductions on-device until the update-level aggregation below.
     metrics: dict[str, Any] = {
         "policy_loss": torch.tensor(0.0, device=device),
         "value_loss": torch.tensor(0.0, device=device),
@@ -263,21 +240,17 @@ def _run_batched_ppo(
             all_action_masks,
             actions,
             *live_memory,
-            critic_only=is_warmup,
         )
-        if not is_warmup:
-            if magnet_enc is None or magnet_memory is None:
-                raise RuntimeError("magnet evaluation inputs were not prepared")
-            with torch.inference_mode():
-                magnet_logits, _, _, _ = magnet.policy.actor.score(
-                    magnet_enc,
-                    all_action_masks,
-                    actions,
-                    *magnet_memory,
-                )
-            magnet_kl = magnet_kl_per_step(out.logits, magnet_logits)
-        else:
-            magnet_kl = torch.zeros_like(out.log_probs)
+        if magnet_enc is None or magnet_memory is None:
+            raise RuntimeError("magnet evaluation inputs were not prepared")
+        with torch.inference_mode():
+            magnet_logits, _, _, _ = magnet.policy.actor.score(
+                magnet_enc,
+                all_action_masks,
+                actions,
+                *magnet_memory,
+            )
+        magnet_kl = magnet_kl_per_step(out.logits, magnet_logits)
         step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = compute_ppo_objective(
             out.log_probs,
             out.value,
@@ -289,26 +262,19 @@ def _run_batched_ppo(
             is_teampreview(all_enc.numerical),
             config,
             alpha=alpha,
-            critic_only=is_warmup,
         )
 
     total_loss = step_loss.sum()
     total_steps = int(step_loss.numel())
 
     with torch.no_grad():
-        metrics["policy_loss"] = (
-            step_policy_loss.sum() if not is_warmup else torch.tensor(0.0, device=device)
-        )
+        metrics["policy_loss"] = step_policy_loss.sum()
         metrics["value_loss"] = step_value_loss.sum()
         metrics["normalized_entropy"] = out.norm_entropy.sum()
         metrics["magnet_kl"] = magnet_kl.sum()
-        metrics["kl_div"] = (
-            ((ratio - 1) - log_ratio).sum() if not is_warmup else torch.tensor(0.0, device=device)
-        )
+        metrics["kl_div"] = ((ratio - 1) - log_ratio).sum()
         metrics["clip_frac"] = (
             ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high)).float().sum()
-            if not is_warmup
-            else torch.tensor(0.0, device=device)
         )
 
     for k in [
@@ -383,7 +349,7 @@ def ppo_update(
     for epoch_idx in range(config.ppo_epochs):
         if cancel_requested():
             break
-        random.shuffle(episodes)
+        random.Random(config.seed + episode * config.ppo_epochs + epoch_idx).shuffle(episodes)
 
         epoch_steps = 0
         epoch_kl = 0.0

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -73,3 +73,33 @@ class SeriesTokenStore:
     def clear(self) -> None:
         """Clear the entire store."""
         self._store.clear()
+
+    def training_state(self) -> dict[str, tuple[Tensor, ...]]:
+        """Capture string-keyed series state for an episode-boundary checkpoint."""
+        state: dict[str, tuple[Tensor, ...]] = {}
+        for key, values in self._store.items():
+            if not isinstance(key, str):
+                raise ValueError("Only string-keyed series state can be checkpointed")
+            state[key] = tuple(value.clone() for value in values)
+        return state
+
+    def restore_training_state(self, state: Mapping[str, Sequence[Tensor]]) -> None:
+        """Restore series state captured by :meth:`training_state`."""
+        restored: dict[SeriesStoreKey, list[Tensor]] = {}
+        for key, values in state.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("Series checkpoint keys must be non-empty strings")
+            if not isinstance(values, Sequence):
+                raise ValueError("Series checkpoint values must be sequences of tensors")
+            if len(values) > self.max_games:
+                raise ValueError("Series checkpoint contains too many prior games")
+            restored_values: list[Tensor] = []
+            for value in values:
+                if not isinstance(value, Tensor) or value.shape != (
+                    SERIES_TOKENS_PER_GAME,
+                    self.d_model,
+                ):
+                    raise ValueError("Series checkpoint token shape does not match the policy")
+                restored_values.append(value.detach().to(device="cpu", dtype=torch.float32).clone())
+            restored[key] = restored_values
+        self._store = restored
