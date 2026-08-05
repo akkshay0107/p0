@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from typing import Any
 
@@ -11,33 +12,46 @@ from p0.teams.validation import (
     showdown_payload,
     validate_many_batched,
 )
+from tests.stress._helpers import stress_count, stress_rng
 from tests.unit.test_teams import _variant_team_validation_batch
 
 
 @pytest.mark.stress
 def test_batched_team_validation_preserves_identity_and_payload_contract() -> None:
+    count = stress_count("P0_STRESS_TEAM_VARIANTS", 1024)
+    species = ("Pikachu", "Raichu", "Zapdos", "Miraidon", "Gholdengo")
+    rng = stress_rng()
     variants = tuple(
-        _variant_team_validation_batch(species)
-        for species in ("Pikachu", "Raichu", "Zapdos", "Miraidon", "Gholdengo")
+        _variant_team_validation_batch(
+            rng.choice(species), item=f"Stress Item {index}"
+        )
+        for index in range(count)
     )
     calls: list[list[dict[str, Any]]] = []
 
     def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del args
         payload = json.loads(kwargs["input"])
+        offset = sum(len(batch) for batch in calls)
         calls.append(payload)
         response = [
-            {"valid": index % 2 == 0, "packedTeam": f"packed-{index}", "problems": []}
+            {
+                "valid": (offset + index) % 2 == 0,
+                "packedTeam": f"packed-{offset + index}",
+                "problems": [],
+            }
             for index, _ in enumerate(payload)
         ]
         return subprocess.CompletedProcess("node", 0, stdout=json.dumps(response), stderr="")
 
-    results = validate_many_batched(variants, batch_size=2, runner=runner)
+    batch_size = stress_count("P0_STRESS_TEAM_BATCH_SIZE", 64)
+    results = validate_many_batched(variants, batch_size=batch_size, runner=runner)
     assert [result.team_hash for result in results] == [
         variant.team.team_hash for variant in variants
     ]
-    assert [result.valid for result in results] == [True, False, True, False, True]
-    assert [len(batch) for batch in calls] == [2, 2, 1]
+    assert [result.valid for result in results] == [index % 2 == 0 for index in range(count)]
+    assert len(calls) == math.ceil(count / batch_size)
+    assert sum(map(len, calls)) == count
     payload = json.loads(showdown_payload(variants[0]))
     assert payload["team"]
     assert len(payload["team"]) == 6
@@ -46,8 +60,14 @@ def test_batched_team_validation_preserves_identity_and_payload_contract() -> No
 
 @pytest.mark.stress
 def test_persistent_validator_handles_repeated_batches_and_closes_worker() -> None:
+    count = stress_count("P0_STRESS_PERSISTENT_TEAM_VARIANTS", 512)
+    species = ("Pikachu", "Raichu", "Zapdos", "Miraidon", "Gholdengo")
+    rng = stress_rng()
     variants = tuple(
-        _variant_team_validation_batch(species) for species in ("Pikachu", "Raichu", "Zapdos")
+        _variant_team_validation_batch(
+            rng.choice(species), item=f"Persistent Stress Item {index}"
+        )
+        for index in range(count)
     )
     writes: list[dict[str, Any]] = []
     closed = False
@@ -95,7 +115,14 @@ def test_persistent_validator_handles_repeated_batches_and_closes_worker() -> No
             pass
 
     with PersistentShowdownValidator(popen_factory=lambda *args, **kwargs: Process()) as validator:
-        result = validator.validate_many(variants, batch_size=2)
-        assert len(result) == 3
-        assert [len(request["batch"]) for request in writes] == [2, 1]
+        batch_size = stress_count("P0_STRESS_PERSISTENT_TEAM_BATCH_SIZE", 32)
+        results = validator.validate_many(variants, batch_size=batch_size)
+        assert len(results) == count
+        assert [result.team_hash for result in results] == [
+            variant.team.team_hash for variant in variants
+        ]
+        assert [len(request["batch"]) for request in writes] == [
+            *([batch_size] * (count // batch_size)),
+            *(([count % batch_size]) if count % batch_size else []),
+        ]
     assert closed

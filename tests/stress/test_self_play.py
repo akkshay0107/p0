@@ -79,7 +79,7 @@ class _SelfPlayVecEnv:
 
 @pytest.mark.stress
 def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> None:
-    config = TrainingConfig(n_envs=2, rollout_steps=stress_repetitions(default=3))
+    config = TrainingConfig(n_envs=2, rollout_steps=stress_repetitions(default=128))
     vec_env = _SelfPlayVecEnv()
     policy = _SelfPlayPolicy()
     completed: list[Any] = []
@@ -118,7 +118,7 @@ def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> Non
 @pytest.mark.stress
 def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
     buffer = BattleMemoryBuffer(2, d_model=3)
-    for index in range(stress_repetitions(default=8)):
+    for index in range(stress_repetitions(default=2048)):
         buffer.append(torch.tensor([0, 1]), torch.full((2, 3), float(index)))
 
     history, mask, ages = buffer.inputs(torch.tensor([0, 1]), torch.device("cpu"), torch.float32)

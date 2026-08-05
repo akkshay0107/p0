@@ -7,23 +7,25 @@ import torch
 
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.shards import validate_shard_tensors
-from tests.stress._helpers import stress_count
+from tests.stress._helpers import stress_count, stress_rng
 from tests.stress.replay_fixtures import golden_replay_payload, golden_series_id
 
 
 def _compile_payloads(count: int) -> tuple[dict[str, Any], ...]:
-    return tuple(
+    payloads = [
         golden_replay_payload(
             f"golden-{index}",
             series_id=f"series-{index}",
         )
         for index in range(count)
-    )
+    ]
+    stress_rng().shuffle(payloads)
+    return tuple(payloads)
 
 
 @pytest.mark.stress
 def test_compiler_preserves_golden_replay_identity_at_scale(tmp_path) -> None:
-    count = stress_count("P0_STRESS_REPLAY_COUNT", 4)
+    count = stress_count("P0_STRESS_REPLAY_COUNT", 128)
     payloads = _compile_payloads(count)
     result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
 
@@ -60,7 +62,7 @@ def test_compiler_preserves_golden_replay_identity_at_scale(tmp_path) -> None:
 
 @pytest.mark.stress
 def test_compiler_is_deterministic_for_golden_replays(tmp_path) -> None:
-    payloads = _compile_payloads(stress_count("P0_STRESS_DETERMINISTIC_REPLAYS", 2))
+    payloads = _compile_payloads(stress_count("P0_STRESS_DETERMINISTIC_REPLAYS", 64))
     first = compile_payloads(payloads, format_id=payloads[0]["formatid"])
     second = compile_payloads(tuple(reversed(payloads)), format_id=payloads[0]["formatid"])
 
@@ -82,11 +84,21 @@ def test_compiler_is_deterministic_for_golden_replays(tmp_path) -> None:
 
 @pytest.mark.stress
 def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> None:
-    payloads = (
-        golden_replay_payload("series-a-1", series_id="series-a", game_number=1),
-        golden_replay_payload("series-a-2", series_id="series-a", game_number=2, winner="Bob"),
-        golden_replay_payload("series-b-1", series_id="series-b", game_number=1),
+    series_count = stress_count("P0_STRESS_COMPILE_SERIES", 64)
+    payloads = tuple(
+        payload
+        for index in range(series_count)
+        for payload in (
+            golden_replay_payload(f"series-{index}-1", series_id=f"series-{index}", game_number=1),
+            golden_replay_payload(
+                f"series-{index}-2",
+                series_id=f"series-{index}",
+                game_number=2,
+                winner="Bob",
+            ),
+        )
     )
+    payloads = tuple(reversed(payloads))
     result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
     assert len(result.games) == len(payloads)
 
@@ -100,10 +112,10 @@ def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> Non
         {str(summary["series_id"]) for summary in _summaries(built, shard.filename)}
         for shard in built.manifest.shards
     ]
-    assert shard_series == [
-        {golden_series_id("series-a")},
-        {golden_series_id("series-b")},
-    ]
+    assert all(len(series_ids) == 1 for series_ids in shard_series)
+    assert {next(iter(series_ids)) for series_ids in shard_series} == {
+        golden_series_id(f"series-{index}") for index in range(series_count)
+    }
 
 
 def _summaries(build, filename: str) -> list[dict[str, Any]]:

@@ -6,10 +6,10 @@ replay reconstructs.  The test also keeps the action selected by the live bot so
 that PARTIAL and UNKNOWN labels are checked against the thing that actually
 happened in the battle, rather than only against their tensor schema.
 
-For the pinned ``champions`` Showdown mod, a missing action can be represented by
-``cant``.  The current engine emits that outcome for paralysis, sleep, freeze,
+For the pinned champions Showdown mod, a missing action can be represented by
+cant.  The current engine emits that outcome for paralysis, sleep, freeze,
 flinch, recharge, no PP, the move-prevention abilities, and the move/volatile
-prevention effects listed in ``_CANT_REASONS`` below.  This inventory was checked
+prevention effects listed in _CANT_REASONS below.  This inventory was checked
 against the pinned Showdown source while adding this test; it is intentionally
 format-specific rather than a claim about every historical Showdown mod.
 """
@@ -44,8 +44,9 @@ from p0.replays.shards import validate_shard_tensors
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view
+from tests.stress._helpers import stress_count
 
-# ``cant`` reasons emitted by the checked-in Showdown commit for the champions
+# Cant reasons emitted by the checked-in Showdown commit for the champions
 # format.  The source locations are data/conditions.ts, data/abilities.ts,
 # data/moves.ts, and sim/battle-actions.ts in the pokemon-showdown submodule.
 _CANT_REASONS = frozenset(
@@ -270,10 +271,11 @@ class JsonCapturingRandomPlayer(RandomPlayer):
 
 
 def _stress_game_count() -> int:
-    value = int(os.getenv("P0_STRESS_GAME_COUNT", "20"))
-    if value < 1:
-        raise ValueError("P0_STRESS_GAME_COUNT must be positive")
-    return value
+    return stress_count("P0_STRESS_GAME_COUNT", 100)
+
+
+def _stress_concurrency() -> int:
+    return stress_count("P0_STRESS_CONCURRENCY", 4)
 
 
 def _stress_timeout(game_count: int) -> float:
@@ -451,6 +453,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
     """Play random games, persist replays/captures, and validate round-trip tensors."""
     seed = int(os.getenv("P0_STRESS_SEED", "20260802"))
     game_count = _stress_game_count()
+    concurrency = _stress_concurrency()
     replay_dir = tmp_path / "local-replays"
     observation_dir = tmp_path / "live-observations"
     resources = default_runtime_resources()
@@ -464,7 +467,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
         server_configuration=showdown_server,
         team=DEFAULT_TEST_TEAM,
         accept_open_team_sheet=True,
-        max_concurrent_battles=1,
+        max_concurrent_battles=concurrency,
         observation_builder=builder,
         observation_dir=observation_dir,
         replay_dir=replay_dir,
@@ -476,7 +479,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
         server_configuration=showdown_server,
         team=DEFAULT_TEST_TEAM,
         accept_open_team_sheet=True,
-        max_concurrent_battles=1,
+        max_concurrent_battles=concurrency,
         observation_builder=builder,
         observation_dir=observation_dir,
     )

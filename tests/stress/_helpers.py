@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -130,7 +131,7 @@ def stress_batch_sizes() -> tuple[int, ...]:
     """Return configured model batch sizes, preserving declaration order."""
     values = tuple(
         int(value.strip())
-        for value in os.getenv("P0_STRESS_BATCHES", "1,8").split(",")
+        for value in os.getenv("P0_STRESS_BATCHES", "1,8,32").split(",")
         if value.strip()
     )
     if not values or any(value < 1 for value in values):
@@ -146,3 +147,8 @@ def stress_repetitions(default: int = 32) -> int:
 def stress_count(name: str, default: int) -> int:
     """Return a configurable workload count."""
     return stress_int(name, default)
+
+
+def stress_rng(name: str = "P0_STRESS_SEED", default: int = 20260805) -> random.Random:
+    """Return a deterministic RNG for randomized stress inputs."""
+    return random.Random(stress_int(name, default, minimum=0))
