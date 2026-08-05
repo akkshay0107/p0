@@ -174,7 +174,7 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     def choose_move(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
-        if battle._wait:
+        if battle_view(battle).wait:
             return DefaultBattleOrder()
         return action_to_order(self._get_action(battle), battle)
 
@@ -471,6 +471,11 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
 
     if not 0.0 < args.top_p <= 1.0:
         raise ValueError("--top-p must be in (0.0, 1.0].")
+
+    if args.battle_format != FORMAT.battle_format:
+        raise ValueError(
+            f"--format must match the configured battle format {FORMAT.battle_format!r}."
+        )
 
     if args.max_concurrent_battles < 1:
         raise ValueError("--max-concurrent-battles must be at least 1.")

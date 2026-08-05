@@ -7,7 +7,7 @@ import logging
 import math
 import random
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -146,9 +146,13 @@ class MatchupResult:
     total_games: int
     wins_a: int
     wins_b: int
+    ties: int
     win_rate_a: float
     confidence_interval_a: tuple[float, float]
     per_team_results: Mapping[str, Mapping[str, Any]]
+    source_description: Mapping[str, Any] = field(default_factory=dict)
+    per_team_a_results: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    per_team_b_results: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,9 +162,13 @@ class MatchupResult:
             "total_games": self.total_games,
             "wins_a": self.wins_a,
             "wins_b": self.wins_b,
+            "ties": self.ties,
             "win_rate_a": self.win_rate_a,
             "confidence_interval_a": list(self.confidence_interval_a),
             "per_team_results": dict(self.per_team_results),
+            "source_description": dict(self.source_description),
+            "per_team_a_results": dict(self.per_team_a_results),
+            "per_team_b_results": dict(self.per_team_b_results),
         }
 
 
@@ -176,6 +184,7 @@ class EvaluationHarness:
         episodes_per_matchup: int = 20,
         seed: int = 0,
         port: int = 8120,
+        smoke_test: bool = False,
     ) -> None:
         self.corpus_path = corpus_path
         self.corpus_hash = corpus_hash
@@ -184,46 +193,65 @@ class EvaluationHarness:
         self.seed = seed
         self.port = port
         self.rng = random.Random(seed)
+        self.smoke_test = smoke_test
+        self.category_metadata: dict[str, Mapping[str, Any]] = {}
 
     def build_team_sources(self) -> dict[str, TeamSource]:
         """Build team sources for different categories based on the corpus manifest."""
         sources: dict[str, TeamSource] = {}
+        categories = {
+            "seen": (CorpusSplit.TRAIN, SamplingPolicy.USAGE_WEIGHTED),
+            "validation_unseen_canonical": (
+                CorpusSplit.VALIDATION,
+                SamplingPolicy.UNIFORM_CANONICAL,
+            ),
+            "test_unseen_canonical": (CorpusSplit.TEST, SamplingPolicy.UNIFORM_CANONICAL),
+            "unseen_archetypes": (
+                CorpusSplit.HELD_OUT_ARCHETYPE,
+                SamplingPolicy.UNIFORM_ARCHETYPE,
+            ),
+            "rare_species": (CorpusSplit.TRAIN, SamplingPolicy.RARE_COVERAGE),
+        }
+        failures: dict[str, str] = {}
         if self.corpus_path is not None and self.corpus_path.exists() and self.corpus_hash:
             logger.info("Loading team splits from corpus manifest: %s", self.corpus_path)
-            splits = {
-                "seen": (CorpusSplit.TRAIN, SamplingPolicy.USAGE_WEIGHTED),
-                "unseen_canonical": (CorpusSplit.VALIDATION, SamplingPolicy.UNIFORM_CANONICAL),
-                "unseen_archetypes": (
-                    CorpusSplit.HELD_OUT_ARCHETYPE,
-                    SamplingPolicy.UNIFORM_ARCHETYPE,
-                ),
-                "rare_species": (CorpusSplit.TRAIN, SamplingPolicy.RARE_COVERAGE),
-            }
-            for key, (split, policy) in splits.items():
+            for key, (split, policy) in categories.items():
                 spec = CorpusSourceSpec(
                     corpus_path=str(self.corpus_path),
                     corpus_hash=self.corpus_hash,
                     format_id=self.format_id,
                     split=split,
-                    seed=self.rng.randint(0, 1_000_000),
                     sampling_policy=policy,
                 )
                 try:
                     sources[key] = CorpusTeamSource(spec)
-                except Exception as exc:
-                    logger.warning(
-                        "Could not build CorpusTeamSource for split %s: %s", split.name, exc
-                    )
+                    self.category_metadata[key] = {
+                        **dict(sources[key].describe()),
+                        "status": "ready",
+                        "fallback": False,
+                    }
+                except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+                    failures[key] = str(exc)
 
-        if not sources:
+        else:
+            failures = {key: "corpus manifest is unavailable" for key in categories}
+
+        if failures and not self.smoke_test:
+            raise ValueError(f"Evaluation corpus categories unavailable: {failures}")
+
+        if failures and self.smoke_test:
             logger.info("Using fallback FixedTeamSource for all categories.")
             fallback = FixedTeamSource(DEFAULT_TEST_TEAM)
-            sources = {
-                "seen": fallback,
-                "unseen_canonical": fallback,
-                "unseen_archetypes": fallback,
-                "rare_species": fallback,
-            }
+            for key in categories:
+                sources.setdefault(key, fallback)
+                self.category_metadata[key] = {
+                    **dict(fallback.describe()),
+                    "status": "smoke_fallback",
+                    "fallback": True,
+                    "error": failures.get(key, ""),
+                }
+        if set(sources) != set(categories):
+            raise ValueError("Evaluation did not construct the complete category set")
         return sources
 
     async def run_matchup(
@@ -248,7 +276,7 @@ class EvaluationHarness:
             server_configuration: Showdown server connection settings.
 
         Returns:
-            Aggregated win rates and per-team results for the matchup.
+            Aggregated win rates and pair/marginal per-team results for the matchup.
         """
         logger.info(
             "Starting matchup: %s vs %s on team category '%s' (%d episodes)",
@@ -258,11 +286,9 @@ class EvaluationHarness:
             self.episodes_per_matchup,
         )
 
-        # Build players
         rng_a = random.Random(self.rng.randint(0, 1_000_000))
         rng_b = random.Random(self.rng.randint(0, 1_000_000))
 
-        # Policy A
         account_config_a = AccountConfiguration(f"evala{self.rng.randint(1000, 9999)}", None)
         if policy_a is not None:
             player_a = EvalPlayer(
@@ -285,7 +311,6 @@ class EvaluationHarness:
                 max_concurrent_battles=1,
             )
 
-        # Policy B
         account_config_b = AccountConfiguration(f"evalb{self.rng.randint(1000, 9999)}", None)
         if policy_b is not None:
             player_b = EvalPlayer(
@@ -308,32 +333,50 @@ class EvaluationHarness:
                 max_concurrent_battles=1,
             )
 
-        # Run battles
         try:
             await player_a.battle_against(player_b, n_battles=self.episodes_per_matchup)
         finally:
             await player_a.ps_client.stop_listening()
             await player_b.ps_client.stop_listening()
 
-        # Compile results
+        if len(player_a.history) != len(player_b.history):
+            raise RuntimeError("Evaluation players reported different game counts")
         wins_a = sum(1 for _, won in player_a.history if won)
         wins_b = sum(1 for _, won in player_b.history if won)
         total_games = len(player_a.history)
+        for (_, won_a), (_, won_b) in zip(player_a.history, player_b.history, strict=True):
+            if won_a and won_b:
+                raise RuntimeError("Evaluation histories report both players winning a game")
+        if wins_a + wins_b > total_games:
+            raise RuntimeError("Evaluation win counts exceed the number of games")
+        ties = total_games - wins_a - wins_b
+        if wins_a + wins_b + ties != total_games:
+            raise RuntimeError("Evaluation game outcomes do not reconcile")
 
         win_rate_a = wins_a / max(1, total_games)
         ci_a = wilson_score_interval(wins_a, total_games)
 
-        # Per team stats (using team string hashes or raw values)
         per_team: dict[str, dict[str, int]] = {}
-        for team, won in player_a.history:
-            if team is None:
+        per_team_a: dict[str, dict[str, int]] = {}
+        per_team_b: dict[str, dict[str, int]] = {}
+        for (team_a, won_a), (team_b, won_b) in zip(
+            player_a.history, player_b.history, strict=True
+        ):
+            if team_a is None or team_b is None:
                 continue
-            # Use short summary or species listing for readability if possible
-            team_key = hashlib_team(team)
+            team_key = f"{hashlib_team(team_a)}:{hashlib_team(team_b)}"
             stats = per_team.setdefault(team_key, {"wins": 0, "games": 0})
             stats["games"] += 1
-            if won:
+            if won_a:
                 stats["wins"] += 1
+            stats_a = per_team_a.setdefault(hashlib_team(team_a), {"wins": 0, "games": 0})
+            stats_a["games"] += 1
+            if won_a:
+                stats_a["wins"] += 1
+            stats_b = per_team_b.setdefault(hashlib_team(team_b), {"wins": 0, "games": 0})
+            stats_b["games"] += 1
+            if won_b:
+                stats_b["wins"] += 1
 
         per_team_results: dict[str, dict[str, Any]] = {}
         for team_key, stats in per_team.items():
@@ -352,12 +395,33 @@ class EvaluationHarness:
             total_games=total_games,
             wins_a=wins_a,
             wins_b=wins_b,
+            ties=ties,
             win_rate_a=win_rate_a,
             confidence_interval_a=ci_a,
             per_team_results=per_team_results,
+            source_description=self.category_metadata.get(
+                team_category, dict(team_source.describe())
+            ),
+            per_team_a_results=_finalize_team_results(per_team_a),
+            per_team_b_results=_finalize_team_results(per_team_b),
         )
 
 
 def hashlib_team(team_packed: str) -> str:
     """Generate a stable short identifier for a team string."""
     return hashlib.sha256(team_packed.encode("utf-8")).hexdigest()[:8]
+
+
+def _finalize_team_results(
+    values: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, Any]]:
+    """Add marginal team win rates to integer game/win counters."""
+    return {
+        team_hash: {
+            "wins": int(stats["wins"]),
+            "games": int(stats["games"]),
+            "win_rate": stats["wins"] / stats["games"],
+        }
+        for team_hash, stats in values.items()
+        if stats["games"] > 0
+    }
