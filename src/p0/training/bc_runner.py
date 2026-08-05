@@ -22,7 +22,7 @@ from p0.replays.shards import load_shard_manifest
 from p0.training.bc import BCCancelled, BCEvaluationMetrics, BCTrainer
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
-from p0.training.utils import default_device
+from p0.training.utils import default_device, seed_everything
 
 
 def _trainer_config(config: BCConfig, *, overfit: bool) -> dict[str, Any]:
@@ -30,6 +30,8 @@ def _trainer_config(config: BCConfig, *, overfit: bool) -> dict[str, Any]:
         "batch_decisions": config.batch_decisions,
         "max_chunk_size": config.max_chunk_size,
         "learning_rate": config.learning_rate,
+        "gamma": config.gamma,
+        "value_coef": config.value_coef,
         "epochs": 200 if overfit else config.epochs,
         "weight_decay": config.weight_decay,
         "max_grad_norm": config.max_grad_norm,
@@ -50,6 +52,8 @@ def _provenance(
         "dataset_hash": dataset_hash,
         "split_manifest_sha256": hashlib.sha256(split_manifest.read_bytes()).hexdigest(),
         "trainer_config": _trainer_config(config, overfit=overfit),
+        "gamma": config.gamma,
+        "value_target_semantics": "discounted_terminal_outcome.v1",
     }
 
 
@@ -64,6 +68,7 @@ def _validation_is_failed(metrics: BCEvaluationMetrics) -> bool:
                 metrics.exact_nll,
                 metrics.partial_nll,
                 metrics.exact_joint_accuracy,
+                metrics.value_loss,
             )
         )
     )
@@ -111,7 +116,17 @@ def train_bc(
     device: torch.device | str | None = None,
     cancel_requested: Callable[[], bool] = lambda: False,
 ) -> dict[str, Any]:
-    """Train one epoch at a time, validate, and checkpoint completed epochs."""
+    """Train one epoch at a time, validate, and checkpoint completed epochs.
+
+    Arguments:
+        config: Behaviour-cloning dataset, optimizer, and output configuration.
+        overfit: Use the bounded overfit mode intended for data-pipeline checks.
+        device: Device override; the runtime default is used when omitted.
+        cancel_requested: Callback polled between training units.
+
+    Returns:
+        The final training and validation metrics plus selected checkpoint state.
+    """
     shard_manifest, _ = _load_identities(config.shard_manifest, config.split_manifest)
     train_dataset = LazyReplayDataset(
         config.shard_manifest,
@@ -124,13 +139,20 @@ def train_bc(
         split_manifest=config.split_manifest,
     )
     selected_device = default_device() if device is None else torch.device(device)
+    seed_everything(config.seed)
     store = CheckpointStore()
     if config.resume_checkpoint is None:
         policy = build_policy(ModelConfig.baseline(), default_runtime_resources())
     else:
-        policy = store.load_policy(config.resume_checkpoint, selected_device)
+        policy = store.load_policy(
+            config.resume_checkpoint,
+            selected_device,
+            expected_metadata={
+                "gamma": config.gamma,
+                "value_target_semantics": "discounted_terminal_outcome.v1",
+            },
+        )
 
-    policy = compile_policy(policy, enable=selected_device.type == "cuda")
     dataset_output = config.output_dir / shard_manifest.dataset_hash
     dataset_output.mkdir(parents=True, exist_ok=True)
     latest_path = dataset_output / "bc_latest_training.pt"
@@ -151,16 +173,25 @@ def train_bc(
         provenance=provenance,
         cancel_requested=cancel_requested,
     )
-    completed_epoch = (
-        trainer.load_checkpoint(config.resume_checkpoint)
-        if config.resume_checkpoint is not None
-        else 0
-    )
+    if config.resume_checkpoint is not None:
+        completed_epoch = trainer.load_checkpoint(config.resume_checkpoint)
+        selection_state = trainer.load_selection_state(config.resume_checkpoint)
+        raw_best = selection_state.get("best_validation_nll")
+        raw_epoch = selection_state.get("selected_epoch")
+        best_validation_nll = (
+            float(raw_best) if isinstance(raw_best, (int, float)) else float("inf")
+        )
+        best_selected_epoch = int(raw_epoch) if isinstance(raw_epoch, int) else 0
+    else:
+        completed_epoch = 0
+        selection_state = {}
+        best_validation_nll = float("inf")
+        best_selected_epoch = 0
+    policy = compile_policy(policy, enable=selected_device.type == "cuda")
     initial_training = trainer.evaluate(train_dataset)
     if _validation_is_failed(initial_training):
         raise RuntimeError("Initial BC training evaluation contains invalid predictions or values")
     initial_nll = initial_training.overall_nll
-    best_validation_nll = float("inf")
     final_training = initial_training
     final_validation: BCEvaluationMetrics | None = None
     max_epochs = 200 if overfit else config.epochs
@@ -200,16 +231,27 @@ def train_bc(
                     by_decision_type={},
                     confidence_buckets={},
                     candidate_set_sizes={},
+                    value_loss=float(training["value_loss"]),
+                    value_decisions=int(training["value_decisions"]),
                 )
             final_validation = validation
-            trainer.save_checkpoint(latest_path, epoch=epoch)
             if validation.overall_nll < best_validation_nll:
                 best_validation_nll = validation.overall_nll
+                best_selected_epoch = epoch
                 store.save_policy(
                     best_path,
                     trainer.policy,
                     metadata={**provenance, "selected_epoch": epoch},
                 )
+            trainer.save_checkpoint(
+                latest_path,
+                epoch=epoch,
+                selection_state={
+                    "best_validation_nll": best_validation_nll,
+                    "selected_epoch": best_selected_epoch,
+                    "best_artifact": str(best_path),
+                },
+            )
             record = {
                 "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "epoch": epoch,

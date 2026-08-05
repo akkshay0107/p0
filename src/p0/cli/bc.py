@@ -18,8 +18,8 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("train", "evaluate"):
         command = subparsers.add_parser(name)
         command.add_argument("--config", type=Path, default=Path("config.yaml"))
-        command.add_argument("--shard-manifest", type=Path, required=True)
-        command.add_argument("--split-manifest", type=Path, required=True)
+        command.add_argument("--shard-manifest", type=Path, default=None)
+        command.add_argument("--split-manifest", type=Path, default=None)
         command.add_argument("--output-dir", type=Path, default=None)
         command.add_argument("--device", default=None)
 
@@ -45,8 +45,12 @@ def _resolved_config(args: argparse.Namespace) -> BCConfig:
 
     return replace(
         config,
-        shard_manifest=args.shard_manifest.resolve(),
-        split_manifest=args.split_manifest.resolve(),
+        shard_manifest=(
+            config.shard_manifest if args.shard_manifest is None else args.shard_manifest.resolve()
+        ),
+        split_manifest=(
+            config.split_manifest if args.split_manifest is None else args.split_manifest.resolve()
+        ),
         output_dir=output_dir,
         resume_checkpoint=(config.resume_checkpoint if resume is None else resume.resolve()),
     )

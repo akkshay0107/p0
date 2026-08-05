@@ -42,6 +42,8 @@ class BCEvaluationMetrics:
     by_decision_type: Mapping[str, Mapping[str, float | int]]
     confidence_buckets: Mapping[str, Mapping[str, float | int]]
     candidate_set_sizes: Mapping[str, int]
+    value_loss: float = 0.0
+    value_decisions: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -59,6 +61,8 @@ class BCEvaluationMetrics:
             "by_decision_type": dict(self.by_decision_type),
             "confidence_buckets": dict(self.confidence_buckets),
             "candidate_set_sizes": dict(self.candidate_set_sizes),
+            "value_loss": self.value_loss,
+            "value_decisions": self.value_decisions,
         }
 
 
@@ -247,6 +251,8 @@ class _BCEvaluationAccumulator:
     confidence_nll_sums: Tensor
     confidence_boundaries: Tensor
     candidate_counts: Tensor
+    value_loss_sum: Tensor
+    value_count: Tensor
 
     @classmethod
     def create(cls, device: torch.device) -> _BCEvaluationAccumulator:
@@ -267,7 +273,16 @@ class _BCEvaluationAccumulator:
             confidence_nll_sums=torch.zeros(4, dtype=torch.float64, device=device),
             confidence_boundaries=torch.tensor((0.25, 0.5, 0.75), device=device),
             candidate_counts=torch.zeros(0, dtype=torch.long, device=device),
+            value_loss_sum=torch.zeros((), dtype=torch.float64, device=device),
+            value_count=torch.zeros((), dtype=torch.long, device=device),
         )
+
+    def add_value(self, predictions: Tensor, targets: Tensor, mask: Tensor) -> None:
+        """Accumulate discounted terminal-outcome value diagnostics."""
+        if mask.any():
+            error = predictions[mask] - targets[mask]
+            self.value_loss_sum += error.square().to(torch.float64).sum()
+            self.value_count += mask.sum()
 
     def add(
         self,
@@ -335,6 +350,7 @@ class _BCEvaluationAccumulator:
         counts = self.counts.cpu().tolist()
         nll_sums = self.nll_sums.cpu().tolist()
         candidate_counts = self.candidate_counts.cpu().tolist()
+        value_count = int(self.value_count.item())
         decisions, labeled, unknown, exact, partial = (int(value) for value in counts[:5])
         return BCEvaluationMetrics(
             overall_nll=float(nll_sums[0]) / max(labeled, 1),
@@ -360,4 +376,6 @@ class _BCEvaluationAccumulator:
             candidate_set_sizes={
                 str(size): int(count) for size, count in enumerate(candidate_counts) if count
             },
+            value_loss=float(self.value_loss_sum.item()) / max(value_count, 1),
+            value_decisions=value_count,
         )

@@ -167,6 +167,7 @@ def _build_configuration(
     max_candidates: int,
     imputation_seed: int,
     max_decisions_per_shard: int,
+    external_rejections: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     return {
         "parser_version": REPLAY_PARSER_VERSION,
@@ -179,6 +180,7 @@ def _build_configuration(
             "seed": imputation_seed,
         },
         "max_decisions_per_shard": max_decisions_per_shard,
+        "external_rejections": list(sorted(external_rejections)),
     }
 
 
@@ -391,6 +393,7 @@ def write_tensor_shards(
     imputation_seed: int = 0,
     raw_replays: Iterable[Mapping[str, str]] | None = None,
     source_series: Mapping[str, tuple[str, ...]] | None = None,
+    external_rejections: tuple[str, ...] = (),
 ) -> ShardBuildResult:
     """Persist a compiled result as immutable, runtime-bound tensor shards.
 
@@ -405,6 +408,7 @@ def write_tensor_shards(
         imputation_seed: Random seed for stat imputation.
         raw_replays: Optional precomputed identities for raw replay payload.
         source_series: Optional precomputed mappings of source series.
+        external_rejections: Input identities rejected before replay parsing.
 
     Returns:
         The generated shard manifest and its path as a ShardBuildResult.
@@ -418,6 +422,7 @@ def write_tensor_shards(
         max_candidates=max_candidates,
         imputation_seed=imputation_seed,
         max_decisions_per_shard=max_decisions_per_shard,
+        external_rejections=external_rejections,
     )
     identities = tuple(raw_replays or _raw_replay_identities(result))
     memberships = dict(source_series or _source_series(result))
@@ -445,6 +450,7 @@ def write_tensor_shards(
     builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
+    diagnostics["rejected_input_files"] += len(external_rejections)
     current_games: list[tuple[CompiledGame, ReconstructedPerspective]] = []
     current_decisions = 0
     shard_index = 0
@@ -499,6 +505,13 @@ def write_tensor_shards(
                     "player": perspective.player,
                     "canonical_player": game.canonical_player(perspective.player),
                     "source_replay_id": game.replay_id,
+                    "outcome_valid": bool(
+                        game.document.outcome.winner in (0, 1)
+                        or any(
+                            len(line.parts) >= 2 and line.parts[1] == "tie"
+                            for line in game.document.protocol_lines
+                        )
+                    ),
                     "summary": None,
                 }
             )
@@ -543,7 +556,7 @@ def write_tensor_shards(
 
         flush()
         artifact_hashes = {entry.filename: entry.sha256 for entry in entries}
-        source_games = diagnostics.get("replays", len(result.games))
+        source_games = diagnostics.get("replays", len(result.games)) + len(external_rejections)
         timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
         manifest = ShardManifest(
             runtime_contract_sha256=runtime_hash,
@@ -557,7 +570,7 @@ def write_tensor_shards(
             source_series=memberships,
             source_games=source_games,
             accepted_games=diagnostics.get("accepted_games", source_games),
-            rejected_games=diagnostics.get("rejected_games", 0),
+            rejected_games=diagnostics.get("rejected_games", 0) + len(external_rejections),
             artifact_hashes=artifact_hashes,
             shards=tuple(entries),
             diagnostics={key: int(value) for key, value in diagnostics.items() if value >= 0},
@@ -567,6 +580,8 @@ def write_tensor_shards(
         atomic_json_save(root / "manifest.json", manifest.to_dict())
         os.replace(root, destination)
         return ShardBuildResult(destination / "manifest.json", manifest)
+    # Remove the temporary build tree even when cancellation or interruption
+    # raises outside the ordinary Exception hierarchy.
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -585,6 +600,7 @@ def compile_to_shards(
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     chunksize: int | None = None,
+    external_rejections: tuple[str, ...] = (),
 ) -> ShardBuildResult:
     """Compile normalized replay documents and persist their tensor shards.
 
@@ -600,6 +616,7 @@ def compile_to_shards(
         resources: Optional pre-loaded runtime resources.
         created_at: Optional ISO timestamp stamped into the manifest.
         chunksize: Optional ProcessPoolExecutor chunk size (see ``compile_documents``).
+        external_rejections: Input identities rejected before replay parsing.
 
     Returns:
         A ShardBuildResult containing the manifest path and manifest object.
@@ -621,6 +638,7 @@ def compile_to_shards(
         created_at=created_at,
         max_candidates=max_candidates,
         imputation_seed=imputation_seed,
+        external_rejections=external_rejections,
     )
 
 

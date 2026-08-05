@@ -214,6 +214,7 @@ class ReplayGameChunk:
     candidate_offsets: torch.Tensor
     outcome: torch.Tensor
     is_series_end: bool = False
+    outcome_valid: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -246,6 +247,7 @@ class ReplayGameChunk:
             candidate_values=self.candidate_values.to(device),
             candidate_offsets=self.candidate_offsets.to(device),
             outcome=self.outcome.to(device),
+            outcome_valid=self.outcome_valid,
         )
 
 
@@ -435,6 +437,7 @@ class LazyReplayDataset(IterableDataset):
             candidate_offsets=candidate_offsets,
             outcome=tensors["outcome"][start:end].clone(),
             is_series_end=is_series_end,
+            outcome_valid=bool(item.get("outcome_valid", False)),
         )
 
 

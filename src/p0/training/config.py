@@ -157,8 +157,14 @@ class BCConfig:
     batch_decisions: int = 256
     max_chunk_size: int = 1024
     learning_rate: float = 3e-4
+    # These objective settings are copied from TrainingConfig when the full
+    # application configuration is built; BC and PPO must share them.
+    gamma: float = 0.99
+    value_coef: float = 0.05
     epochs: int = 1
-    num_workers: int = 2
+    # BC history state is chronological across shards; multiprocessing remains
+    # opt-in until an order-preserving prefetcher is available.
+    num_workers: int = 0
     prefetch_factor: int = 2
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
@@ -184,7 +190,14 @@ class BCConfig:
             raise ValueError("bc.prefetch_factor must be positive")
 
         _positive(type(self).__name__, ("learning_rate", self.learning_rate))
-        _non_negative(type(self).__name__, ("weight_decay", self.weight_decay))
+        _unit_interval(type(self).__name__, ("gamma", self.gamma))
+        if self.gamma >= 1.0:
+            raise ValueError("BCConfig.gamma must be less than 1")
+        _non_negative(
+            type(self).__name__,
+            ("value_coef", self.value_coef),
+            ("weight_decay", self.weight_decay),
+        )
         _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))
 
         if type(self.seed) is not int:
@@ -252,6 +265,12 @@ class GlobalConfig:
     corpus: CorpusConfig = CorpusConfig()
     evaluation: EvalConfig = EvalConfig()
 
+    def __post_init__(self) -> None:
+        if self.bc.gamma != self.training.gamma:
+            raise ValueError("bc.gamma must match training.gamma")
+        if self.bc.value_coef != self.training.value_coef:
+            raise ValueError("bc.value_coef must match training.value_coef")
+
 
 def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root) -> Path:
     path = Path(value).expanduser()
@@ -315,8 +334,24 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
             else _resolve_path(config.bc.resume_checkpoint, repository_root)
         ),
     )
+    corpus = replace(
+        config.corpus,
+        manifest_path=_resolve_path(config.corpus.manifest_path, repository_root),
+    )
+    evaluation = replace(
+        config.evaluation,
+        report_dir=_resolve_path(config.evaluation.report_dir, repository_root),
+    )
 
-    return replace(config, paths=paths, bot=bot, environment=environment, bc=bc)
+    return replace(
+        config,
+        paths=paths,
+        bot=bot,
+        environment=environment,
+        bc=bc,
+        corpus=corpus,
+        evaluation=evaluation,
+    )
 
 
 def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
@@ -366,7 +401,17 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
         raise FileNotFoundError(f"Configuration file not found: {path}")
 
     try:
-        loaded = OmegaConf.load(path)
+        loaded: Any = OmegaConf.load(path)
+        loaded_bc = loaded.get("bc", {})
+        if loaded_bc is not None and not isinstance(loaded_bc, Mapping):
+            raise ValueError("BCConfig must be a mapping")
+        if isinstance(loaded_bc, Mapping):
+            duplicated_objective_fields = {"gamma", "value_coef"} & set(loaded_bc)
+            if duplicated_objective_fields:
+                fields_text = ", ".join(sorted(duplicated_objective_fields))
+                raise ValueError(
+                    f"bc.{fields_text} is derived from training; configure it under training"
+                )
         merged = OmegaConf.merge(OmegaConf.create(asdict(GlobalConfig())), loaded)
         values = OmegaConf.to_container(merged, resolve=True)
         if not isinstance(values, Mapping):
@@ -378,12 +423,16 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
             names = ", ".join(sorted(str(name) for name in unknown))
             raise ValueError(f"unknown root configuration section(s): {names}")
 
+        training = _build_section(TrainingConfig, values["training"])
+        bc_values = dict(values["bc"])
+        bc_values["gamma"] = training.gamma
+        bc_values["value_coef"] = training.value_coef
         config = GlobalConfig(
-            training=_build_section(TrainingConfig, values["training"]),
+            training=training,
             paths=_build_section(ProjectPaths, values["paths"]),
             environment=_build_environment(values["environment"]),
             bot=_build_section(BotConfig, values["bot"], bot=True),
-            bc=_build_section(BCConfig, values["bc"]),
+            bc=_build_section(BCConfig, bc_values),
             corpus=_build_section(CorpusConfig, values["corpus"]),
             evaluation=_build_section(EvalConfig, values["evaluation"]),
         )

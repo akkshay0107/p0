@@ -45,6 +45,10 @@ class BCDecisionBatch:
     history_indices: Tensor
     history_mask: Tensor
     history_age_ids: Tensor
+    outcome: Tensor
+    outcome_valid: Tensor
+    decision_index: Tensor
+    game_length: Tensor
     windows: tuple[BCGameWindow, ...]
 
     @property
@@ -100,6 +104,10 @@ def _collate_bc_window(
     history_indices: list[Tensor] = []
     history_masks: list[Tensor] = []
     history_age_ids: list[Tensor] = []
+    outcomes: list[Tensor] = []
+    outcome_valids: list[Tensor] = []
+    decision_indices: list[Tensor] = []
+    game_lengths: list[Tensor] = []
     candidate_base = 0
     context_base = 0
     batch_start = 0
@@ -129,6 +137,10 @@ def _collate_bc_window(
         loss_masks.append(game.loss_mask[start:stop])
         decision_types.append(game.decision_type[start:stop])
         exact_actions.append(game.exact_action[start:stop])
+        outcomes.append(game.outcome[start:stop])
+        outcome_valids.append(torch.full((stop - start,), game.outcome_valid, dtype=torch.bool))
+        decision_indices.append(torch.arange(start, stop, dtype=torch.long))
+        game_lengths.append(torch.full((stop - start,), game.length, dtype=torch.long))
 
         first_candidate = int(game.candidate_offsets[start])
         last_candidate = int(game.candidate_offsets[stop])
@@ -168,6 +180,10 @@ def _collate_bc_window(
         history_indices=_compact_tensors(history_indices),
         history_mask=_compact_tensors(history_masks),
         history_age_ids=_compact_tensors(history_age_ids),
+        outcome=_compact_tensors(outcomes),
+        outcome_valid=_compact_tensors(outcome_valids),
+        decision_index=_compact_tensors(decision_indices),
+        game_length=_compact_tensors(game_lengths),
         windows=tuple(windows),
     )
 

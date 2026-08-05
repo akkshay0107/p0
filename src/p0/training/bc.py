@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.amp import GradScaler, autocast
@@ -57,7 +59,17 @@ def _empty_training_totals() -> dict[str, float | int]:
         "partial_decisions": 0,
         "updates": 0,
         "games": 0,
+        "value_loss": 0.0,
+        "value_decisions": 0,
     }
+
+
+def _seed_bc_worker(worker_id: int) -> None:
+    """Derive independent Python and NumPy worker streams from Torch's seed."""
+    del worker_id
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 class BCTrainer:
@@ -91,7 +103,6 @@ class BCTrainer:
         self.batch_decisions = config.batch_decisions
         self._series_history = _BCSeriesHistory(policy.d_model)
         self.cancel_requested = cancel_requested
-        torch.manual_seed(config.seed)
 
     def train(self) -> dict[str, float | int]:
         """Run configured epochs over the streaming dataset."""
@@ -127,6 +138,9 @@ class BCTrainer:
             num_workers=num_workers,
             batch_size=None,
             prefetch_factor=prefetch_factor,
+            multiprocessing_context="spawn" if num_workers > 0 else None,
+            worker_init_fn=_seed_bc_worker if num_workers > 0 else None,
+            generator=torch.Generator().manual_seed(self.config.seed),
         )
 
         for batch in dataloader:
@@ -170,17 +184,30 @@ class BCTrainer:
             "decisions_per_update": decisions / updates if updates else 0.0,
             "games_per_update": games / updates if updates else 0.0,
             "peak_memory_bytes": peak_memory,
+            # This is mean squared error against the discounted terminal-
+            # outcome target, over decisions with verified outcomes.
+            "value_loss": float(totals["value_loss"]) / max(int(totals["value_decisions"]), 1),
+            "value_decisions": int(totals["value_decisions"]),
         }
 
-    def save_checkpoint(self, path: str | Path, *, epoch: int) -> None:
+    def save_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        epoch: int,
+        selection_state: Mapping[str, object] | None = None,
+    ) -> None:
         """Persist the policy and optimizer state through the checkpoint seam."""
+        metadata = dict(self.provenance)
+        if selection_state is not None:
+            metadata["selection_state"] = dict(selection_state)
         self.checkpoint_store.save_training_state(
             Path(path),
             epoch,
             self.policy,
             optimizer=self.optimizer,
             scaler=self.scaler,
-            metadata=self.provenance,
+            metadata=metadata,
             trainer_kind="bc",
         )
 
@@ -195,6 +222,14 @@ class BCTrainer:
             expected_metadata=self.provenance,
             require_training_state=True,
         )
+
+    def load_selection_state(self, path: str | Path) -> Mapping[str, object]:
+        """Load persisted best-policy selection state for resume-safe validation."""
+        metadata = self.checkpoint_store.load_metadata(Path(path))
+        state = metadata.get("selection_state", {})
+        if not isinstance(state, Mapping):
+            raise ValueError("BC checkpoint selection_state must be a mapping")
+        return state
 
     def _prepare_model_inputs(self, batch: BCDecisionBatch) -> _PreparedBCBatch:
         observations = batch.observations.to(self.device)
@@ -233,14 +268,28 @@ class BCTrainer:
     def _forward_batch(
         self,
         batch: BCDecisionBatch,
-    ) -> tuple[Tensor, tuple[_BCHistoryUpdate, ...]]:
+    ) -> tuple[Tensor, Tensor, tuple[_BCHistoryUpdate, ...]]:
         prepared = self._prepare_model_inputs(batch)
-        log_probs = self.policy.actor.score_joint_candidates(
-            *prepared.model_inputs,
-            batch.candidate_values.to(self.device),
-            batch.candidate_offsets.to(self.device),
+        encoded, _, series_tokens, series_mask, history_tokens, history_mask, history_age_ids = (
+            prepared.model_inputs
         )
-        return log_probs, prepared.history_updates
+        reduced = self.policy.actor.reducer(
+            encoded.tokens,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
+        return (
+            self.policy.actor.score_joint_candidates(
+                *prepared.model_inputs,
+                batch.candidate_values.to(self.device),
+                batch.candidate_offsets.to(self.device),
+            ),
+            self.policy.critic(reduced.cls),
+            prepared.history_updates,
+        )
 
     def _greedy_actions(self, model_inputs: BCModelInputs) -> tuple[Tensor, Tensor]:
         actions, log_probs, _, _ = self.policy.actor.greedy(*model_inputs)
@@ -269,23 +318,41 @@ class BCTrainer:
         labels = batch.label_kind.to(self.device)
         loss_mask = batch.loss_mask.to(self.device)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            log_probs, history_updates = self._forward_batch(batch)
+            log_probs, value_predictions, history_updates = self._forward_batch(batch)
         objective = compute_bc_objective(
             log_probs,
             batch.candidate_offsets.to(self.device),
             labels,
             loss_mask,
         )
-        loss_sum = 0.0
-        if objective.labeled_count:
-            loss = objective.loss * objective.loss_weight
-            if not torch.isfinite(loss):
-                raise ValueError("Non-finite BC loss in a collated decision batch")
-            self.scaler.scale(loss).backward()
-            loss_sum = objective.loss.detach().item() * objective.loss_weight
+        outcome = batch.outcome.to(self.device)
+        decision_index = batch.decision_index.to(self.device)
+        game_length = batch.game_length.to(self.device)
+        value_mask = batch.outcome_valid.to(self.device)
+        gamma = torch.as_tensor(self.config.gamma, device=self.device, dtype=outcome.dtype)
+        value_targets = (
+            torch.pow(gamma, (game_length - 1 - decision_index).to(outcome.dtype)) * outcome
+        )
+        value_error = value_predictions - value_targets
+        value_count = int(value_mask.sum().item())
+        value_loss = (
+            value_error.square()[value_mask].mean()
+            if value_count
+            else value_predictions.sum() * 0.0
+        )
+        policy_sum = objective.loss * objective.loss_weight
+        policy_loss = policy_sum / max(objective.loss_weight, 1.0)
+        loss_weight = max(objective.loss_weight, float(value_count))
+        total_loss = (policy_loss + self.config.value_coef * value_loss) * loss_weight
+        if not torch.isfinite(total_loss):
+            raise ValueError("Non-finite BC loss in a collated decision batch")
+        if objective.labeled_count or value_count:
+            self.scaler.scale(total_loss).backward()
 
         self._series_history.apply(history_updates)
-        totals["loss"] += loss_sum
+        # Keep the reported policy NLL independent from the auxiliary value loss;
+        # the optimizer still receives their weighted sum above.
+        totals["loss"] += policy_sum.detach().item()
         totals["loss_weight"] += objective.loss_weight
         totals["exact_nll"] += objective.exact_nll.detach().item() * objective.exact_count
         totals["partial_nll"] += objective.partial_nll.detach().item() * objective.partial_count
@@ -294,7 +361,11 @@ class BCTrainer:
         totals["exact_decisions"] += objective.exact_count
         totals["partial_decisions"] += objective.partial_count
         totals["games"] += batch.completed_game_count
-        return objective.loss_weight
+        totals.setdefault("value_loss", 0.0)
+        totals.setdefault("value_decisions", 0)
+        totals["value_loss"] += value_loss.detach().item() * value_count
+        totals["value_decisions"] += value_count
+        return loss_weight
 
     @torch.inference_mode()
     def evaluate(
@@ -316,6 +387,32 @@ class BCTrainer:
                 *model_inputs,
                 batch.candidate_values.to(self.device),
                 candidate_offsets,
+            )
+            (
+                encoded,
+                _,
+                series_tokens,
+                series_mask,
+                history_tokens,
+                history_mask,
+                history_age_ids,
+            ) = model_inputs
+            reduced = self.policy.actor.reducer(
+                encoded.tokens,
+                series_tokens,
+                series_mask,
+                history_tokens,
+                history_mask,
+                history_age_ids,
+            )
+            value_predictions = self.policy.critic(reduced.cls)
+            outcome = batch.outcome.to(self.device)
+            decision_index = batch.decision_index.to(self.device)
+            game_length = batch.game_length.to(self.device)
+            value_mask = batch.outcome_valid.to(self.device)
+            gamma = torch.as_tensor(self.config.gamma, device=self.device, dtype=outcome.dtype)
+            value_targets = (
+                torch.pow(gamma, (game_length - 1 - decision_index).to(outcome.dtype)) * outcome
             )
             validated_masks = _validate_objective_inputs(
                 candidate_log_probs.numel(),
@@ -340,6 +437,7 @@ class BCTrainer:
                 predicted=predicted,
                 best_scores=best_scores,
             )
+            accumulator.add_value(value_predictions, value_targets, value_mask)
             self._series_history.apply(prepared.history_updates)
 
         self._series_history.clear()
