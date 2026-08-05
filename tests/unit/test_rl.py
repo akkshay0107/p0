@@ -333,6 +333,7 @@ def test_evaluation_confidence_intervals_and_matchup_serialization_are_determini
         total_games=5,
         wins_a=3,
         wins_b=2,
+        ties=0,
         win_rate_a=0.6,
         confidence_interval_a=(lower, upper),
         per_team_results={team_hash: {"wins": 3, "games": 5, "win_rate": 0.6}},
@@ -348,12 +349,14 @@ def test_evaluation_team_source_fallback_is_repeatable_without_a_corpus(tmp_path
         corpus_hash="missing",
         episodes_per_matchup=5,
         seed=91,
+        smoke_test=True,
     )
     second = EvaluationHarness(
         corpus_path=tmp_path / "missing.json",
         corpus_hash="missing",
         episodes_per_matchup=5,
         seed=91,
+        smoke_test=True,
     )
     first_sources = first.build_team_sources()
     second_sources = second.build_team_sources()

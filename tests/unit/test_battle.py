@@ -1423,12 +1423,12 @@ def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monke
     env._decision_steps = 17
     env._resume_reset_pending = False
     env.series_id = "series-1"
-    env.agent1 = Player("agent-team")
-    env.agent2 = Player("opponent-team")
+    cast(Any, env).agent1 = Player("agent-team")
+    cast(Any, env).agent2 = Player("opponent-team")
 
     state = env.training_state()
-    env.agent1.update_team("wrong-agent-team")
-    env.agent2.update_team("wrong-opponent-team")
+    cast(Any, env).agent1.update_team("wrong-agent-team")
+    cast(Any, env).agent2.update_team("wrong-opponent-team")
     env._series_scores = [0, 0]
     env._series_games_played = 0
 
@@ -1436,8 +1436,8 @@ def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monke
     monkeypatch.setattr(MegaEnv, "reset", lambda self, seed=None, options=None: "reset")
 
     assert env.reset() == "reset"
-    assert env.agent1._team.yield_team() == "agent-team"
-    assert env.agent2._team.yield_team() == "opponent-team"
+    assert cast(Any, env).agent1._team.yield_team() == "agent-team"
+    assert cast(Any, env).agent2._team.yield_team() == "opponent-team"
     assert env.series_scores == [1, 0]
     assert env.series_games_played == 2
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from torch.utils.data import DataLoader
 
@@ -42,7 +44,7 @@ def test_dataset_workers_yield_each_golden_perspective_once(tmp_path, num_worker
         for index in range(count)
         for player in (0, 1)
     }
-    loader_kwargs = {"multiprocessing_context": "spawn"} if num_workers else {}
+    loader_kwargs: dict[str, Any] = {"multiprocessing_context": "spawn"} if num_workers else {}
     loader = DataLoader(
         LazyReplayDataset(built.manifest_path, verify_hashes=True),
         batch_size=None,

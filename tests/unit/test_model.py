@@ -1061,7 +1061,7 @@ def test_series_context_encoding_shapes() -> None:
     assert not series_mask_1[:, 4:].any()
 
 
-def _policy() -> PolicyNet:
+def _series_policy() -> PolicyNet:
     torch.manual_seed(0)
     config = ModelConfig(
         d_model=64,
@@ -1073,7 +1073,7 @@ def _policy() -> PolicyNet:
 
 
 def test_policy_series_resampler() -> None:
-    policy = _policy()
+    policy = _series_policy()
     game1 = torch.randn(1, 12, policy.d_model)
     tokens, mask = policy.encode_series([game1])
     assert tokens.shape == (1, SERIES_SLOTS, policy.d_model)

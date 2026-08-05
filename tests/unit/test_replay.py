@@ -1293,9 +1293,13 @@ def test_compiler_closes_process_pool_after_worker_failure(monkeypatch) -> None:
             raise RuntimeError("injected worker failure")
 
     monkeypatch.setattr(compile_module.concurrent.futures, "ProcessPoolExecutor", FailingPool)
+    monkeypatch.setattr(compile_module.os, "cpu_count", lambda: 1)
     payload = golden_replay_payload("worker-failure", series_id="worker-failure-series")
+    second_payload = golden_replay_payload(
+        "worker-failure-2", series_id="worker-failure-series-2"
+    )
     with pytest.raises(RuntimeError, match="injected worker failure"):
-        compile_payloads((payload,), format_id=payload["formatid"])
+        compile_payloads((payload, second_payload), format_id=payload["formatid"])
     assert events == ["enter", "map", "exit"]
 
 

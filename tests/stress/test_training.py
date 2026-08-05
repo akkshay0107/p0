@@ -142,7 +142,6 @@ def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
         preview,
         config,
         alpha=0.3,
-        critic_only=False,
     )
     expected_ratio = torch.exp(current_log_probs - old_log_probs)
     expected_clipped = torch.clamp(expected_ratio, 1.0 - config.clip_low, 1.0 + config.clip_high)
