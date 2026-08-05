@@ -486,13 +486,12 @@ def test_corpus_source_implements_protocol_and_describes(tmp_path: Path) -> None
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=42,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     source = CorpusTeamSource(spec)
     assert hasattr(source, "sample") and callable(source.sample)
     assert hasattr(source, "describe") and callable(source.describe)
-    rng = random.Random(spec.seed)
+    rng = random.Random(42)
     sampled = source.sample(rng)
     assert isinstance(sampled, ValidatedTeam)
     assert sampled.packed in [e.packed for e in entries]
@@ -516,7 +515,6 @@ def test_corpus_source_validates_spec(tmp_path: Path) -> None:
         corpus_hash="0" * 64,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=1,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     with pytest.raises(ValueError, match="does not match"):
@@ -528,7 +526,6 @@ def test_corpus_source_validates_spec(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id="wrong-format",
         split=CorpusSplit.TRAIN,
-        seed=1,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     with pytest.raises(ValueError, match="format"):
@@ -543,7 +540,6 @@ def test_corpus_source_rejects_empty_filtered_pool(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TEST,
-        seed=1,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     with pytest.raises(ValueError, match="No corpus entries match"):
@@ -559,7 +555,6 @@ def test_sampling_policy_usage_weighted(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=100,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     source = CorpusTeamSource(spec)
@@ -581,7 +576,6 @@ def test_sampling_policy_uniform_canonical(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=200,
         sampling_policy=SamplingPolicy.UNIFORM_CANONICAL,
     )
     source = CorpusTeamSource(spec)
@@ -608,7 +602,6 @@ def test_sampling_policy_uniform_archetype(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=300,
         sampling_policy=SamplingPolicy.UNIFORM_ARCHETYPE,
     )
     source = CorpusTeamSource(spec)
@@ -632,7 +625,6 @@ def test_sampling_policy_rare_coverage(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=400,
         sampling_policy=SamplingPolicy.RARE_COVERAGE,
     )
     source = CorpusTeamSource(spec)
@@ -655,7 +647,6 @@ def test_curriculum_stage_filtering(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=500,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
         curriculum_stage="trickroom",
     )
@@ -666,47 +657,7 @@ def test_curriculum_stage_filtering(tmp_path: Path) -> None:
         assert t.team_hash == e3.packed_sha256
 
 
-def test_mirroring_control_sample_pair(tmp_path: Path) -> None:
-    e1 = _make_entry(1, canonical_index=1)
-    e2 = _make_entry(2, canonical_index=2)
-    path, manifest = _write_manifest(tmp_path, (e1, e2))
-
-    # With allow_mirror=False, sample_pair must always return two distinct canonical teams
-    spec_no_mirror = CorpusSourceSpec(
-        corpus_path=str(path),
-        corpus_hash=manifest.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        seed=600,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
-        allow_mirror=False,
-    )
-    source_no_mirror = CorpusTeamSource(spec_no_mirror)
-    rng = random.Random(600)
-    for _ in range(50):
-        t1, t2 = source_no_mirror.sample_pair(rng)
-        # Check canonical hashes differ
-        e1_obj = next(entry for entry in (e1, e2) if entry.packed_sha256 == t1.team_hash)
-        e2_obj = next(entry for entry in (e1, e2) if entry.packed_sha256 == t2.team_hash)
-        assert e1_obj.canonical_hash != e2_obj.canonical_hash
-
-    # Single canonical team pool with allow_mirror=False raises ValueError on sample_pair
-    path_single, manifest_single = _write_manifest(tmp_path, (e1,))
-    spec_single = CorpusSourceSpec(
-        corpus_path=str(path_single),
-        corpus_hash=manifest_single.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        seed=601,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
-        allow_mirror=False,
-    )
-    source_single = CorpusTeamSource(spec_single)
-    with pytest.raises(ValueError, match="Cannot sample non-mirror pair"):
-        source_single.sample_pair(rng)
-
-
-def test_sampling_policy_matchup_balanced_and_lazy_caching(tmp_path: Path) -> None:
+def test_sampling_policy_indexes_and_lazy_caching(tmp_path: Path) -> None:
     # Under USAGE_WEIGHTED policy, canonical and archetype indexes should remain uninitialized (None) until explicitly requested
     e1 = _make_entry(1, canonical_index=1, usage_count=100)
     e2 = _make_entry(2, canonical_index=2, usage_count=100)
@@ -716,7 +667,6 @@ def test_sampling_policy_matchup_balanced_and_lazy_caching(tmp_path: Path) -> No
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=700,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     source_usage = CorpusTeamSource(spec_usage)
@@ -726,23 +676,17 @@ def test_sampling_policy_matchup_balanced_and_lazy_caching(tmp_path: Path) -> No
     rng = random.Random(700)
     assert source_usage.sample(rng) is not None
 
-    # Under MATCHUP_BALANCED policy, canonical index should be built during prepare_sampling
-    spec_matchup = CorpusSourceSpec(
+    spec_canonical = CorpusSourceSpec(
         corpus_path=str(path),
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        seed=701,
-        sampling_policy=SamplingPolicy.MATCHUP_BALANCED,
-        allow_mirror=False,
+        sampling_policy=SamplingPolicy.UNIFORM_CANONICAL,
     )
-    source_matchup = CorpusTeamSource(spec_matchup)
-    assert source_matchup._by_canonical is not None
-    assert source_matchup._canonical_keys is not None
-    assert len(source_matchup._canonical_keys) == 2
-    # Verify non-mirror sampling with exclusion works cleanly under MATCHUP_BALANCED
-    t1, t2 = source_matchup.sample_pair(rng)
-    assert t1.team_hash != t2.team_hash
+    source_canonical = CorpusTeamSource(spec_canonical)
+    assert source_canonical._by_canonical is not None
+    assert source_canonical._canonical_keys is not None
+    assert len(source_canonical._canonical_keys) == 2
 
 
 TEAM = """

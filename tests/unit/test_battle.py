@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import typing
 from types import SimpleNamespace
 from typing import Any, cast
@@ -84,7 +85,7 @@ from p0.model.structured_observation import (
 )
 from p0.model.tokenizer import tokenizer
 from p0.runtime import poke_env_patches
-from p0.runtime.env import SimEnv
+from p0.runtime.env import MegaEnv, SimEnv
 from p0.runtime.live_event_capture import consume_raw_events, set_raw_events
 from p0.runtime.poke_env_action_adapter import action_to_single_order, single_order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view, decision_view
@@ -1383,6 +1384,51 @@ def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
     assert result.token_type_ids[0] == TokenType.POKEMON
     assert len(mask) == FORMAT.action_size * 2
     assert decision_builds == 1
+
+
+def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monkeypatch):
+    class TeamBuilder:
+        def __init__(self, packed: str):
+            self.packed = packed
+
+        def yield_team(self) -> str:
+            return self.packed
+
+    class Player:
+        def __init__(self, packed: str):
+            self._team = TeamBuilder(packed)
+
+        def update_team(self, packed: str) -> None:
+            self._team = TeamBuilder(packed)
+
+    env = SimEnv.__new__(SimEnv)
+    env._agent_rng = random.Random(10)
+    env._opponent_rng = random.Random(11)
+    env._series_scores = [1, 0]
+    env._series_games_played = 2
+    env._decision_steps = 17
+    env._resume_reset_pending = False
+    env.series_id = "series-1"
+    env.agent1 = Player("agent-team")
+    env.agent2 = Player("opponent-team")
+
+    state = env.training_state()
+    env.agent1.update_team("wrong-agent-team")
+    env.agent2.update_team("wrong-opponent-team")
+    env._series_scores = [0, 0]
+    env._series_games_played = 0
+
+    env.restore_training_state(state)
+    monkeypatch.setattr(MegaEnv, "reset", lambda self, seed=None, options=None: "reset")
+
+    assert env.reset() == "reset"
+    assert env.agent1._team.yield_team() == "agent-team"
+    assert env.agent2._team.yield_team() == "opponent-team"
+    assert env.series_scores == [1, 0]
+    assert env.series_games_played == 2
+
+    env.reset()
+    assert env.series_games_played == 3
 
 
 def test_concurrent_universal_effect_stress_state():

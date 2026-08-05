@@ -306,11 +306,13 @@ def test_evaluation_harness_falls_back_without_corpus(tmp_path: Path) -> None:
         corpus_hash="nonexistent",
         episodes_per_matchup=5,
         seed=123,
+        smoke_test=True,
     )
     sources = harness.build_team_sources()
-    assert len(sources) == 4
+    assert len(sources) == 5
     for key, source in sources.items():
         assert isinstance(source, FixedTeamSource)
+        assert harness.category_metadata[key]["fallback"] is True
         # Sampled team should match DEFAULT_TEST_TEAM
         team = source.sample(harness.rng)
         assert "Pikachu" in team.packed

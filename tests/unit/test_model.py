@@ -513,7 +513,7 @@ def test_gradient_flow(dummy_obs):
     )
 
 
-def test_ppo_warmup(dummy_obs):
+def test_ppo_updates_all_policy_paths(dummy_obs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources()).to(device)
     policy.train()
@@ -530,7 +530,7 @@ def test_ppo_warmup(dummy_obs):
         action_masks=torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
         length=1,
     )
-    config = TrainingConfig(warmup_episodes=10)
+    config = TrainingConfig()
     magnet = Magnet(policy)
 
     loss, _, steps = _run_batched_ppo(
@@ -541,8 +541,12 @@ def test_ppo_warmup(dummy_obs):
     policy.zero_grad(set_to_none=True)
     loss.backward()
 
-    assert all(p.grad is None for p in policy.encoder.parameters())
-    assert all(p.grad is None for p in policy.actor.parameters())
+    assert any(
+        p.grad is not None and torch.abs(p.grad).sum() > 0 for p in policy.encoder.parameters()
+    )
+    assert any(
+        p.grad is not None and torch.abs(p.grad).sum() > 0 for p in policy.actor.parameters()
+    )
     assert any(
         p.grad is not None and not torch.all(p.grad == 0) for p in policy.critic.parameters()
     )
@@ -818,12 +822,8 @@ def test_magnet_kl_divergence_computation():
             team_preview=torch.tensor([False, False]),
             config=config,
         )
-        low, *_ = compute_ppo_objective(
-            magnet_kl=torch.zeros(2), alpha=0.5, critic_only=False, **common
-        )
-        high, *_ = compute_ppo_objective(
-            magnet_kl=torch.ones(2), alpha=0.5, critic_only=False, **common
-        )
+        low, *_ = compute_ppo_objective(magnet_kl=torch.zeros(2), alpha=0.5, **common)
+        high, *_ = compute_ppo_objective(magnet_kl=torch.ones(2), alpha=0.5, **common)
         assert (high > low).all()
 
     _test_magnet_kl_loss_sign_increases_with_divergence()
@@ -982,7 +982,7 @@ def test_ppo_keeps_series_encoder_out_of_the_bo1_graph() -> None:
         [episode],
         policy,
         Magnet(policy),
-        TrainingConfig(enable_optim=False, warmup_episodes=0),
+        TrainingConfig(enable_optim=False),
         policy.device,
         episode=1,
         alpha=0.0,

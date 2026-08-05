@@ -175,7 +175,6 @@ def test_pure_ppo_objective_clips_and_weights_team_preview():
         torch.tensor([True, False]),
         config,
         alpha=0.1,
-        critic_only=False,
     )
     assert total.shape == policy.shape == value.shape == ratio.shape == log_ratio.shape == (2,)
     assert ratio.tolist() == pytest.approx([2.0, 0.5])
@@ -245,7 +244,7 @@ def test_trainer_cancellation_saves_once_before_collecting(tmp_path):
         magnet=cast(Any, object()),
         scheduler=cast(Any, object()),
         training_config=TrainingConfig(
-            num_episodes=1, warmup_episodes=0, magnet_refresh_interval=1
+            num_episodes=9, magnet_refresh_interval=1, ramp_up_phase=0.5
         ),
         cancel_requested=lambda: True,
     )
@@ -274,10 +273,10 @@ def test_trainer_saves_final_completed_episode(tmp_path):
         magnet=cast(Any, object()),
         scheduler=cast(Any, object()),
         training_config=TrainingConfig(
-            num_episodes=2, warmup_episodes=0, magnet_refresh_interval=1
+            num_episodes=9, magnet_refresh_interval=1, ramp_up_phase=0.5
         ),
     )
 
-    trainer.run(start_episode=2)
+    trainer.run(start_episode=9)
 
-    assert saved == [(tmp_path / "checkpoint.pt", 2)]
+    assert saved == [(tmp_path / "checkpoint.pt", 9)]

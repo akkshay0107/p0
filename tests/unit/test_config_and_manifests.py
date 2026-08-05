@@ -85,6 +85,7 @@ from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 from p0.teams.validation import AdmissionResult
 from p0.training.config import (
+    BCConfig,
     CorpusConfig,
     GlobalConfig,
     TeamSourceConfig,
@@ -129,7 +130,7 @@ def test_load_config_validation_and_parsing(tmp_path):
             ),
             (
                 "magnet refresh exceeds episodes",
-                "training:\n  num_episodes: 10\n  warmup_episodes: 5\n  magnet_refresh_interval: 20\n",
+                "training:\n  num_episodes: 10\n  magnet_refresh_interval: 20\n",
                 "magnet_refresh_interval",
             ),
             (
@@ -533,17 +534,15 @@ def test_corpus_source_spec_validates() -> None:
         corpus_hash="a" * 64,
         format_id="gen9championsvgc2026regmb",
         split=CorpusSplit.TRAIN,
-        seed=0,
         sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
-    assert spec.allow_mirror and spec.curriculum_stage == ""
+    assert spec.curriculum_stage == ""
     with pytest.raises(ValueError, match="split"):
         CorpusSourceSpec(
             corpus_path="x",
             corpus_hash="a" * 64,
             format_id="f",
             split=CorpusSplit.UNSPECIFIED,
-            seed=0,
             sampling_policy=SamplingPolicy.UNIFORM_CANONICAL,
         )
 
@@ -570,12 +569,25 @@ def test_model_config_has_only_scaling_fields() -> None:
 def test_reserved_config_sections(tmp_path) -> None:
     config = load_config("config.yaml.example")
     assert config.bc.batch_decisions == 256
+    assert config.bc.gamma == config.training.gamma
+    assert config.bc.value_coef == config.training.value_coef
     assert config.corpus.agent_split == "train"
     assert config.evaluation.episodes_per_matchup == 20
     bad = tmp_path / "config.yaml"
     bad.write_text("bc:\n  bogus: 1\n", encoding="utf-8")
     with pytest.raises(ValueError, match="unknown BCConfig field"):
         load_config(bad)
+
+    duplicate_objective = tmp_path / "duplicate-objective.yaml"
+    duplicate_objective.write_text(
+        "training:\n  gamma: 0.95\nbc:\n  gamma: 0.9\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="bc.gamma is derived from training"):
+        load_config(duplicate_objective)
+
+    with pytest.raises(ValueError, match="bc.gamma must match training.gamma"):
+        GlobalConfig(training=TrainingConfig(gamma=0.95), bc=BCConfig(gamma=0.9))
 
 
 def test_schema_modules_stay_pure() -> None:
@@ -906,6 +918,22 @@ def test_token_store_batching_and_missing():
     assert not torch.any(out_mask[1])
 
 
+def test_token_store_training_state_round_trip():
+    store = SeriesTokenStore(d_model=8)
+    first = torch.randn(SERIES_TOKENS_PER_GAME, 8)
+    second = torch.randn(SERIES_TOKENS_PER_GAME, 8)
+    store.append("series-1", first)
+    store.append("series-1", second)
+
+    restored = SeriesTokenStore(d_model=8)
+    restored.restore_training_state(store.training_state())
+
+    tokens, mask = restored.get_tokens(["series-1"], device=torch.device("cpu"))
+    assert torch.all(mask[0, : 2 * SERIES_TOKENS_PER_GAME])
+    assert torch.allclose(tokens[0, :SERIES_TOKENS_PER_GAME], first)
+    assert torch.allclose(tokens[0, SERIES_TOKENS_PER_GAME : 2 * SERIES_TOKENS_PER_GAME], second)
+
+
 def test_token_store_isolates_canonical_player_perspectives():
     store = SeriesTokenStore(d_model=8)
     first_player = SeriesPerspectiveKey("series-1", 0)
@@ -1036,9 +1064,7 @@ def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
         corpus_config=CorpusConfig(
             agent_split="train",
             sampling_policy="uniform_canonical",
-            allow_mirror=False,
         ),
-        seed=42,
         is_agent=True,
     )
     assert isinstance(source, CorpusTeamSource)
@@ -1047,7 +1073,6 @@ def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
     assert desc["corpus_hash"] == manifest.corpus_hash
     assert desc["split"] == "TRAIN"
     assert desc["sampling_policy"] == "UNIFORM_CANONICAL"
-    assert desc["allow_mirror"] is False
 
 
 def test_team_source_composition_falls_back_to_file_source(tmp_path: Path) -> None:
@@ -1136,7 +1161,6 @@ def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> 
     source = _team_source(
         TeamSourceConfig(path=pool_dir),
         corpus_config=CorpusConfig(agent_split="train"),
-        seed=10,
         is_agent=True,
     )
     assert isinstance(source, CorpusTeamSource)
