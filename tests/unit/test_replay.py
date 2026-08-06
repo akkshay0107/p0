@@ -581,6 +581,30 @@ def test_replay_request_chunks_ignore_outcome_and_automatic_switch_lines() -> No
     assert "cant" not in perspective.decisions[1].evidence.tags
 
 
+def test_replay_request_chunks_keep_leading_choice_switches_together() -> None:
+    payload = _payload_replay_pipeline("leading-choice-switches")
+    lines = str(payload["log"]).splitlines()
+    turn_index = lines.index("|turn|1")
+    lines = lines[:turn_index] + [
+        "|turn|1",
+        "|switch|p1a: Eevee|Eevee, L50|100/100",
+        "|switch|p2a: Charmander|Charmander, L50|100/100",
+        "|move|p1b: Eevee|Tackle|p2b: Charmander",
+        "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|win|Alice",
+    ]
+    payload["log"] = "\n".join(lines)
+
+    document = parse_replay_payload(payload)
+    segments = _segments(document)
+    segment_tags = [
+        [line.parts[1] for line in document.protocol_lines[start:end] if len(line.parts) > 1]
+        for start, end, _ in segments
+    ]
+
+    assert segment_tags[-1] == ["turn", "switch", "switch", "move", "move", "win"]
+
+
 def test_reconstruction_recovers_target_from_still_animation() -> None:
     ots = {
         "p1": [

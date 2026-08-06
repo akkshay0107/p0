@@ -1087,7 +1087,7 @@ def _segments(document: ReplayDocument) -> tuple[tuple[int, int, DecisionType], 
     for index, start in enumerate(turns):
         end = turns[index + 1] if index + 1 < len(turns) else len(document.protocol_lines)
         boundaries = [start]
-        saw_action = False
+        saw_move = False
 
         for line in document.protocol_lines[start:end]:
             # cant is an outcome of a submitted move (flinch, paralysis,
@@ -1096,12 +1096,11 @@ def _segments(document: ReplayDocument) -> tuple[tuple[int, int, DecisionType], 
             # after an action is a forced replacement request; switches
             # before the first action belong to the current request (for
             # example a voluntary pivot at the start of a turn).
-            if _is_choice_move(line.parts) or _is_choice_switch(line.parts):
-                if _is_choice_switch(line.parts) and saw_action:
-                    boundaries.append(line.index)
-                    saw_action = False
-                else:
-                    saw_action = True
+            if _is_choice_move(line.parts):
+                saw_move = True
+            elif _is_choice_switch(line.parts) and saw_move:
+                boundaries.append(line.index)
+                saw_move = False
 
         boundaries.append(end)
 
