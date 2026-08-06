@@ -39,7 +39,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.replays.compile import compile_documents, write_tensor_shards
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.reconstruct import ReconstructedPerspective, ReconstructedSnapshot, reconstruct_both
-from p0.replays.schema import LabelKind
+from p0.replays.schema import DecisionType, LabelKind
 from p0.replays.shards import validate_shard_tensors
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import order_to_action
@@ -85,6 +85,7 @@ _REPLAY_AMBIGUITY_TAGS = frozenset(
         "preview_duplicate_lead",
         "preview_reserves_unknown",
         "externally_generated_move",
+        "submission_state_changed",
     }
 )
 
@@ -95,7 +96,8 @@ def _message_tag(line: str) -> str:
 
 
 def _endpoint_role(endpoint: str) -> str:
-    return endpoint.split("a", 1)[0].strip()
+    role = endpoint[:2]
+    return role if role in {"p1", "p2"} else ""
 
 
 def _line_has_observed_action(line: str, role: int) -> bool:
@@ -318,7 +320,6 @@ def _assert_expected_observation_fields(
         "slot_ids",
         "categorical",
         "events_cat",
-        "events_num",
         "events_side_ids",
         "events_slot_ids",
         "events_metadata",
@@ -327,10 +328,41 @@ def _assert_expected_observation_fields(
 
     # Hidden level/stat values and their provenance intentionally differ: the
     # live battle knows the player's actual values, while a replay reconstructs
-    # them from the public species/OTS information.  All other numeric columns
-    # are expected to be identical, including legality and dynamic state.
-    torch.testing.assert_close(live.numerical[:, :43], reconstructed.numerical[:, :43])
-    torch.testing.assert_close(live.numerical[:, 50:56], reconstructed.numerical[:, 50:56])
+    # them from the public species/OTS information. Replay requests also lack
+    # authoritative legality masks; -1 marks those cells as explicitly unknown.
+    # All known numeric columns must remain identical.
+    replay_prefix = reconstructed.numerical[:, :5]
+    known_prefix = replay_prefix >= 0
+    unknown_selection = reconstructed.numerical[:, 1] == 1
+    known_prefix[unknown_selection] = False
+    torch.testing.assert_close(live.numerical[:, :5][known_prefix], replay_prefix[known_prefix])
+    torch.testing.assert_close(
+        live.numerical[:, 5], reconstructed.numerical[:, 5], atol=0.011, rtol=0.0
+    )
+    torch.testing.assert_close(live.numerical[:, 6:28], reconstructed.numerical[:, 6:28])
+    known_selection = reconstructed.numerical[:, 1] != 1
+    torch.testing.assert_close(
+        live.numerical[:, 28:30][known_selection],
+        reconstructed.numerical[:, 28:30][known_selection],
+    )
+    replay_mega = reconstructed.numerical[:, 30]
+    known_mega = replay_mega >= 0
+    torch.testing.assert_close(live.numerical[:, 30][known_mega], replay_mega[known_mega])
+    torch.testing.assert_close(live.numerical[:, 31:43], reconstructed.numerical[:, 31:43])
+    replay_legality = reconstructed.numerical[:, 50:55]
+    known_legality = replay_legality >= 0
+    torch.testing.assert_close(
+        live.numerical[:, 50:55][known_legality], replay_legality[known_legality]
+    )
+    torch.testing.assert_close(live.numerical[:, 55], reconstructed.numerical[:, 55])
+    torch.testing.assert_close(
+        # A delta combines two independently percent-quantized HP endpoints.
+        live.events_num[:, 0],
+        reconstructed.events_num[:, 0],
+        atol=0.021,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(live.events_num[:, 1], reconstructed.events_num[:, 1])
 
 
 def _assert_reconstruction_labels(document: ReplayDocument) -> tuple[ReconstructedPerspective, ...]:
@@ -372,10 +404,14 @@ def _match_live_records(
         has_protocol_action = any(
             _line_has_observed_action(line, perspective.player) for line in snapshot.raw_lines
         )
+        is_turn_request = bool(snapshot.raw_lines and _message_tag(snapshot.raw_lines[0]) == "turn")
 
         record: dict[str, Any] | None = None
         if queue and (
-            decision.evidence.label_kind is not LabelKind.UNKNOWN or has_protocol_action or causes
+            decision.evidence.label_kind is not LabelKind.UNKNOWN
+            or has_protocol_action
+            or causes
+            or is_turn_request
         ):
             record = queue.pop(0)
         elif queue and decision.evidence.label_kind is LabelKind.UNKNOWN:
@@ -418,6 +454,12 @@ def _assert_live_truth(
         live_action = _live_action(record)
 
         if evidence.label_kind is LabelKind.EXACT:
+            if (
+                decision.decision_type is DecisionType.FORCED_PASS
+                and evidence.candidates == ((0, 0),)
+                and live_action is None
+            ):
+                live_action = (0, 0)
             assert live_action is not None
             assert live_action == evidence.candidates[0]
         elif evidence.label_kind is LabelKind.PARTIAL:

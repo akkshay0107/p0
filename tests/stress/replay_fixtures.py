@@ -23,7 +23,7 @@ def golden_replay_payload(
     game_number: int = 1,
     winner: str = "Alice",
     players: tuple[str, str] = ("Alice", "Bob"),
-    first_move_target: str | None = "p2a: Bulbasaur",
+    first_move_target: str | None = "p1a: Pikachu",
 ) -> dict[str, Any]:
     """Return a replay payload whose log is copied from the pinned protocol shape."""
     p1_team = [
@@ -47,7 +47,7 @@ def golden_replay_payload(
         "|move|p1a: Pikachu|Protect"
         + (f"|{first_move_target}" if first_move_target is not None else ""),
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
-        "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
+        "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur",
         "|move|p2b: Charmander|Tackle|p1b: Eevee",
         f"|win|{winner}",
     ]

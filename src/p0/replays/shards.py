@@ -1,7 +1,7 @@
 """Compiled tensor-shard artifact contract for streaming behaviour cloning.
 
 This module owns the derived-tensor layer: bounded shard files holding
-stacked schema-v4 observations and label tensors for whole chronological
+stacked schema-v5 observations and label tensors for whole chronological
 games, plus the manifest and index that tie a compiled corpus to one runtime
 contract. It may import torch and the observation schema; p0.replays.schema
 must stay torch-free, and nothing here may import p0.runtime.
@@ -18,12 +18,13 @@ from typing import Any, Mapping
 
 import torch
 
-from p0.battle.actions import ACT_SIZE
+from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION
 from p0.battle.series import SERIES_SUMMARY_SCHEMA_VERSION
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, validate_artifact_runtime_contract
 from p0.model.structured_observation import OBSERVATION_SCHEMA_VERSION, StructuredObservation
 from p0.replays.schema import (
     REPLAY_IR_SCHEMA_VERSION,
+    DecisionType,
     _is_sha256,
     _require_fields,
     _require_iso_timestamp,
@@ -461,8 +462,15 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
             & (candidates[:, 0] <= 6)
             & (candidates[:, 0] == candidates[:, 1])
         )
-        mega_first = (candidates[:, 0] >= 27) & (candidates[:, 0] <= 47)
-        mega_second = (candidates[:, 1] >= 27) & (candidates[:, 1] <= 47)
+        is_turn = tensors["decision_type"][owners] != int(DecisionType.TEAM_PREVIEW)
+        mega_first = is_turn & (
+            ((candidates[:, 0] >= 27) & (candidates[:, 0] <= 47))
+            | (candidates[:, 0] == MEGA_FORCED_ACTION)
+        )
+        mega_second = is_turn & (
+            ((candidates[:, 1] >= 27) & (candidates[:, 1] <= 47))
+            | (candidates[:, 1] == MEGA_FORCED_ACTION)
+        )
 
         if torch.any(~legal | same_switch | (mega_first & mega_second)):
             raise ValueError("Shard contains an illegal labeled candidate")

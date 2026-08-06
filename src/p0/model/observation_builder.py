@@ -27,11 +27,14 @@ from p0.model.structured_observation import (
     MOVE_SLOTS,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_HP_PROVENANCE,
+    NUM_IDX_LEGALITY_PROVENANCE,
     NUM_IDX_STATUS_COUNTER,
     NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TEAM_SIZE,
+    UNKNOWN_LEGALITY,
     CounterKind,
     EffectNamespace,
     Knownness,
@@ -125,16 +128,19 @@ def _pad_team(
     overflow = len(res) - TEAM_SIZE
     if overflow > 0:
         # only happens when an active slot placeholder pushes a 6-mon team list
-        # (opponent with open team sheet) over the row budget.prefer dropping
-        # mons that are confirmed to have not been brought
+        # over the row budget. Eviction must not depend on hidden team selection.
         actives, rest = res[:2], res[2:]
-        for i in range(len(rest) - 1, -1, -1):
-            if overflow == 0:
-                break
-            mon = rest[i][0]
-            if mon is not None and not mon.revealed and not mon.fainted:
-                rest.pop(i)
-                overflow -= 1
+        for predicate in (
+            lambda mon: mon.fainted,
+            lambda mon: not mon.revealed,
+        ):
+            for i in range(len(rest) - 1, -1, -1):
+                if overflow == 0:
+                    break
+                mon = rest[i][0]
+                if mon is not None and predicate(mon):
+                    rest.pop(i)
+                    overflow -= 1
         del rest[len(rest) - overflow :]
         res = actives + rest
 
@@ -149,7 +155,7 @@ def _selected_ally_pokemon(battle: Any) -> set[Any]:
     if battle.teampreview:
         return set(battle.team.values())
 
-    selected = {mon for mon in battle.team.values() if mon.selected_in_teampreview}
+    selected = {mon for mon in battle.team.values() if mon.selected_in_teampreview is True}
 
     # battle state authoritative, previous is fallback for trapped situations
     selected.update(mon for mon in battle.active_pokemon if mon is not None)
@@ -208,16 +214,13 @@ def _get_ordered_pokemon(
             res.append((mon, orig_idx_map.get(mon, -1), active_idx))
             assigned.add(mon)
 
-    bench, dropped = [], []
+    inactive = []
     for mon in team.values():
         if mon in assigned:
             continue
         idx = orig_idx_map.get(mon, -1)
-        if mon in selected_allies:
-            bench.append((mon, idx, None))
-        else:
-            dropped.append((mon, idx, None))
-    res += bench + dropped
+        inactive.append((mon, idx, None))
+    res += inactive
 
     return _pad_team(res)
 
@@ -239,6 +242,8 @@ def _slot_condition(
         return 1
     if is_opponent:
         return 2
+    if mon.selected_in_teampreview is None:
+        return 0
     if selected_allies is None:
         selected_allies = _selected_ally_pokemon(battle)
     return 2 if mon in selected_allies else -1
@@ -335,7 +340,7 @@ def _side_mega_available(
     *,
     is_opponent: bool,
     selected_allies: set[Any] | None = None,
-) -> bool:
+) -> bool | float:
     if is_opponent:
         if battle.opponent_used_mega_evolve:
             return False
@@ -345,10 +350,20 @@ def _side_mega_available(
             return False
         candidates = _selected_ally_pokemon(battle) if selected_allies is None else selected_allies
 
-    return any(
+    available = any(
         PokemonTokenizer.normalize_id(mon.item) in _MEGA_ITEMS and not _is_mega_form(mon)
         for mon in candidates
     )
+    if available or is_opponent:
+        return available
+    if any(
+        mon.selected_in_teampreview is None
+        and PokemonTokenizer.normalize_id(mon.item) in _MEGA_ITEMS
+        and not _is_mega_form(mon)
+        for mon in battle.team.values()
+    ):
+        return UNKNOWN_LEGALITY
+    return False
 
 
 def _write_effects(
@@ -455,6 +470,8 @@ def _ally_legality(
     any_force = decision.slots[0].force_switch or decision.slots[1].force_switch
     if decision.wait or (any_force and not slot.force_switch):
         return [0.0] * MOVE_SLOTS, 0.0
+    if not slot.legality_known:
+        return [UNKNOWN_LEGALITY] * MOVE_SLOTS, UNKNOWN_LEGALITY
     move_legal = [
         float(index < len(slot.move_targets) and bool(slot.move_targets[index]))
         for index in range(MOVE_SLOTS)
@@ -523,7 +540,14 @@ def _pokemon_numeric_into(
     row[27] = pokemon.fainted
     row[28] = cond == 1
     row[29] = cond == 2
-    row[30] = _can_mega(pokemon, battle, active_idx)
+    if (
+        active_idx is not None
+        and not is_opponent
+        and not battle.decision.slots[active_idx].mega_known
+    ):
+        row[30] = UNKNOWN_LEGALITY
+    else:
+        row[30] = _can_mega(pokemon, battle, active_idx)
     row[31] = _is_mega_form(pokemon)
 
     last_move_id = None
@@ -552,6 +576,11 @@ def _pokemon_numeric_into(
     row[48] = level_stats[5] / 300.0
     row[49] = float(stat_provenance == Provenance.SELF_KNOWN)
     row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = stat_provenance
+    row[NUM_IDX_HP_PROVENANCE] = getattr(
+        pokemon,
+        "hp_provenance",
+        Provenance.OBSERVED if is_opponent else Provenance.SELF_KNOWN,
+    )
 
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
@@ -562,6 +591,11 @@ def _pokemon_numeric_into(
         row[52] = move_legal[2]
         row[53] = move_legal[3]
         row[54] = can_switch_out
+        row[NUM_IDX_LEGALITY_PROVENANCE] = (
+            Provenance.SELF_KNOWN
+            if battle.decision.slots[active_idx].legality_known
+            else Provenance.UNKNOWN
+        )
 
     row[55] = pokemon.revealed
 
@@ -613,7 +647,7 @@ def _side_token_into(
     conditions: Mapping[Any, int],
     tok: PokemonTokenizer,
     fainted_count: int,
-    mega_available: bool,
+    mega_available: bool | float,
     cat: np.ndarray,
     num: np.ndarray,
 ) -> None:

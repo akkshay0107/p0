@@ -30,7 +30,9 @@ class SlotDecision:
     trapped: bool = False
     force_switch: bool = False
     can_mega: bool = False
+    mega_known: bool = True
     forced_move: bool = False
+    legality_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,10 @@ def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:
         mega_moves = (
             tuple(action + (MOVE_END - MOVE_START) for action in moves) if slot.can_mega else ()
         )
+        if not slot.legality_known:
+            moves = (*moves, FORCED_ACTION)
+            if slot.can_mega:
+                mega_moves = (*mega_moves, MEGA_FORCED_ACTION)
 
     return (*switches, *moves, *mega_moves) or (PASS_ACTION,)
 
@@ -139,6 +145,7 @@ def apply_joint_constraints(mask: npt.NDArray[np.bool_], view: DecisionView, fir
 
         if MEGA_MOVE_START <= first < MEGA_MOVE_END or first == MEGA_FORCED_ACTION:
             mask[27:48] = False
+            mask[MEGA_FORCED_ACTION] = False
 
         if first == PASS_ACTION:
             mask[PASS_ACTION] = False

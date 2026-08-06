@@ -55,6 +55,7 @@ from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import (
     ObservationBuilder,
+    _ally_legality,
     _cached_imputed_stats,
     _get_ordered_pokemon,
     _get_pokemon_level_stats,
@@ -81,6 +82,7 @@ from p0.model.structured_observation import (
     NUM_IDX_EFFECT_OVERFLOW,
     NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
+    UNKNOWN_LEGALITY,
     CounterKind,
     EffectNamespace,
     Provenance,
@@ -215,16 +217,36 @@ def test_protocol_parser_accepts_an_injected_resource_resolver() -> None:
     assert events[0].move_id == 17
 
 
+def test_unknown_replay_legality_uses_an_explicit_observation_sentinel() -> None:
+    decision = DecisionView(
+        slots=(
+            SlotDecision(move_targets=((1,),), legality_known=False),
+            SlotDecision(),
+        )
+    )
+    battle = cast(Any, SimpleNamespace(decision=decision))
+
+    moves, can_switch = _ally_legality(battle, 0, (None, None, None, None))
+
+    assert moves == [UNKNOWN_LEGALITY] * 4
+    assert can_switch == UNKNOWN_LEGALITY
+
+
 def test_patch_installation_is_idempotent_reversible_and_logger_scoped() -> None:
     poke_env_patches.uninstall_for_tests()
     original = DoubleBattle.parse_message
+    original_forme_change = Pokemon.forme_change
     poke_env_patches.install()
     installed = DoubleBattle.parse_message
     poke_env_patches.install()
     assert DoubleBattle.parse_message is installed
     assert installed is not original
+    charizard = Pokemon(gen=9, species="charizard")
+    charizard.forme_change("Charizard-Mega-Y, L50")
+    assert charizard.species == "charizardmegay"
     poke_env_patches.uninstall_for_tests()
     assert DoubleBattle.parse_message is original
+    assert Pokemon.forme_change is original_forme_change
 
     target = logging.getLogger("test.poke-env")
     other = logging.getLogger("test.other")
@@ -958,7 +980,7 @@ def test_ordered_pokemon_and_slot_conditions_real():
     ordered_reg = _get_ordered_pokemon(battle_reg, is_opponent=False)
     assert len(ordered_reg) == 6
 
-    # Order must be: Active (p1, p2) -> Switch/Fainted bench (p3, p4, p5) -> Dropped bench (p6)
+    # Active slots come first; inactive members retain original roster order.
     assert ordered_reg[0][0] == p1  # active slot 0
     assert ordered_reg[0][2] == 0  # active_idx
     assert ordered_reg[1][0] == p2  # active slot 1
@@ -1010,7 +1032,6 @@ def test_ordered_pokemon_and_slot_conditions_real():
     ordered_partial = _get_ordered_pokemon(partial_request_battle, is_opponent=False)
     partial_mons = [entry[0] for entry in ordered_partial]
     assert p6 in partial_mons
-    assert partial_mons.index(p6) < 5
 
     # Empty left active slot: right active must stay at index 1 with a None
     # placeholder at index 0, so seq positions match env action positions.
@@ -1025,11 +1046,11 @@ def test_ordered_pokemon_and_slot_conditions_real():
     assert ordered_le[0] == (None, -1, None)
     assert ordered_le[1][0] == p2
     assert ordered_le[1][2] == 1  # active_idx preserved
-    # placeholder overflows the 6-row budget; the trimmed mon must be an
-    # unrevealed, unfainted one (likely unbrought) — fainted p5 must survive
+    # The placeholder overflows the row budget; eviction is selection-independent
+    # and removes an inactive fainted token first.
     le_mons = [entry[0] for entry in ordered_le]
-    assert p5 in le_mons
-    assert p6 not in le_mons
+    assert p5 not in le_mons
+    assert p6 in le_mons
 
     # Same invariant for the opponent side
     battle_opp_left_empty = make_real_battle(

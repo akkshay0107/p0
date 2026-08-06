@@ -64,6 +64,9 @@ NUM_IDX_STATUS_COUNTER = 36  # StatusRecord dynamic (turns asleep / toxic stage)
 NUM_IDX_MOVE_LEGAL = 50  # 50-53: per-move-slot "legal this step" (MoveRecord dynamic)
 NUM_IDX_CAN_SWITCH_OUT = 54  # active allies only
 NUM_IDX_REVEALED = 55  # has appeared on the field this battle
+NUM_IDX_HP_PROVENANCE = NUM_PROVENANCE_START + 6
+NUM_IDX_LEGALITY_PROVENANCE = NUM_PROVENANCE_START + 7
+UNKNOWN_LEGALITY = -1.0
 
 
 ALLY_POKE_TOKENS = (0, 1, 2, 3, 4, 5)
