@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import random
 import typing
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -77,10 +78,18 @@ from p0.model.structured_observation import (
     EFFECT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
     MAX_EFFECTS,
+    NUM_IDX_CAN_MEGA,
+    NUM_IDX_CAN_SWITCH_OUT,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
+    TOKEN_IDX_ALLY_SIDE,
+    TOKEN_IDX_OPPONENT_SIDE,
     CounterKind,
     EffectNamespace,
     Provenance,
@@ -1924,3 +1933,85 @@ def test_recharge_is_encoded_as_forced_move() -> None:
     cast(Any, battle).available_moves = [[SimpleNamespace(id="recharge")], []]
     order = action_to_single_order(48, battle, fake=True, position=0)
     assert int(single_order_to_action(order, battle, fake=True, position=0)) == 48
+
+
+def _legality_fixture_view(decision: DecisionView) -> FixtureBattleView:
+    """Two-active-ally view whose only variable is the supplied decision."""
+    battle = DoubleBattle("legality", "player", logging.getLogger(__name__), 9)
+    battle._player_role = "p1"
+    allies = [Pokemon(gen=9, species=species) for species in ("charizard", "blastoise")]
+    bench = Pokemon(gen=9, species="pikachu")
+    opponent = Pokemon(gen=9, species="venusaur")
+    for mon in (*allies, opponent):
+        mon._active = mon is not bench
+    battle._team = {"p1: Charizard": allies[0], "p1: Blastoise": allies[1], "p1: Pikachu": bench}
+    battle._opponent_team = {"p2: Venusaur": opponent}
+    battle._active_pokemon = {"p1a": allies[0], "p1b": allies[1]}
+    battle._opponent_active_pokemon = {"p2a": opponent}
+
+    return FixtureBattleView(
+        team=battle.team,
+        opponent_team=battle.opponent_team,
+        active_pokemon=battle.active_pokemon,
+        opponent_active_pokemon=battle.opponent_active_pokemon,
+        available_moves=battle.available_moves,
+        available_switches=battle.available_switches,
+        can_mega_evolve=battle.can_mega_evolve,
+        force_switch=battle.force_switch,
+        trapped=battle.trapped,
+        maybe_trapped=battle.maybe_trapped,
+        teampreview=False,
+        player_role=battle.player_role,
+        wait=False,
+        weather=battle.weather,
+        fields=battle.fields,
+        side_conditions=battle.side_conditions,
+        opponent_side_conditions=battle.opponent_side_conditions,
+        turn=battle.turn,
+        used_mega_evolve=battle.used_mega_evolve,
+        opponent_used_mega_evolve=battle.opponent_used_mega_evolve,
+        decision=decision,
+    )
+
+
+def test_unknown_legality_masks_are_supersets_of_the_proven_mask() -> None:
+    proven = SlotDecision(switch_slots=(2,), move_targets=((-2, 1), (), (), ()), can_mega=True)
+    unknown = SlotDecision(
+        switch_slots=(2,),
+        move_targets=((-2, 1), (), (), ()),
+        can_mega=True,
+        legality_known=False,
+    )
+    proven_view = DecisionView(slots=(proven, proven))
+    unknown_view = DecisionView(slots=(unknown, unknown))
+
+    proven_mask = action_mask(proven_view)
+    unknown_mask = action_mask(unknown_view)
+
+    assert np.all(unknown_mask >= proven_mask)
+    # a slot locked into an unseen move must stay reachable through the forced action
+    assert set(legal_actions(unknown_view, 0)) - set(legal_actions(proven_view, 0)) == {48, 47}
+
+
+def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
+    builder = ObservationBuilder(default_runtime_resources())
+    slot = SlotDecision(switch_slots=(2,), move_targets=((-2, 1), (), (), ()), can_mega=True)
+    proven = builder.build(_legality_fixture_view(DecisionView(slots=(slot, slot))))
+
+    unknown_slot = replace(slot, legality_known=False)
+    unknown = builder.build(_legality_fixture_view(DecisionView(slots=(unknown_slot,) * 2)))
+
+    legality_columns = slice(NUM_IDX_MOVE_LEGAL, NUM_IDX_CAN_SWITCH_OUT + 1)
+    assert proven.numerical[0, legality_columns].any()
+    assert not unknown.numerical[:, legality_columns].any()
+    assert unknown.numerical[0, NUM_IDX_CAN_MEGA] == 0.0
+
+    # the gate, not a value in the legality columns, is what says "unproven"
+    assert proven.numerical[:, NUM_IDX_LEGALITY_UNKNOWN].tolist() == [0.0] * SEQUENCE_LENGTH
+    assert unknown.numerical[:2, NUM_IDX_LEGALITY_UNKNOWN].tolist() == [1.0, 1.0]
+    assert unknown.numerical[2:, NUM_IDX_LEGALITY_UNKNOWN].sum() == 0.0
+
+    gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)
+    assert unknown.numerical[TOKEN_IDX_ALLY_SIDE, gates].tolist() == [1.0, 1.0]
+    assert proven.numerical[TOKEN_IDX_ALLY_SIDE, gates].tolist() == [0.0, 0.0]
+    assert unknown.numerical[TOKEN_IDX_OPPONENT_SIDE, gates].tolist() == [0.0, 0.0]

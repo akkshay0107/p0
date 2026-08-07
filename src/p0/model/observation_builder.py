@@ -25,8 +25,11 @@ from p0.model.structured_observation import (
     EVENT_NUMERICAL_WIDTH,
     MAX_EFFECTS,
     MOVE_SLOTS,
+    NUM_IDX_CAN_MEGA,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STATUS_COUNTER,
     NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
@@ -449,17 +452,25 @@ def _pokemon_categorical_into(
 
 def _ally_legality(
     battle: BattleView, active_idx: int, move_slots: tuple[MoveView | None, ...]
-) -> tuple[list[float], float]:
+) -> tuple[list[float], float, bool]:
+    """Per-move legality, can-switch-out, and whether the source could prove them."""
     decision = battle.decision
     slot = decision.slots[active_idx]
+
+    # A source without the authoritative request emits zeros and lets the gate say so;
+    # a concrete "illegal" here would be indistinguishable from a proven restriction.
+    if not slot.legality_known:
+        return [0.0] * MOVE_SLOTS, 0.0, False
+
     any_force = decision.slots[0].force_switch or decision.slots[1].force_switch
     if decision.wait or (any_force and not slot.force_switch):
-        return [0.0] * MOVE_SLOTS, 0.0
+        return [0.0] * MOVE_SLOTS, 0.0, True
+
     move_legal = [
         float(index < len(slot.move_targets) and bool(slot.move_targets[index]))
         for index in range(MOVE_SLOTS)
     ]
-    return move_legal, float(bool(slot.switch_slots) and not slot.trapped)
+    return move_legal, float(bool(slot.switch_slots) and not slot.trapped), True
 
 
 def _pokemon_numeric_into(
@@ -523,7 +534,8 @@ def _pokemon_numeric_into(
     row[27] = pokemon.fainted
     row[28] = cond == 1
     row[29] = cond == 2
-    row[30] = _can_mega(pokemon, battle, active_idx)
+    mega_known = active_idx is None or battle.decision.slots[active_idx].legality_known
+    row[NUM_IDX_CAN_MEGA] = _can_mega(pokemon, battle, active_idx) if mega_known else 0.0
     row[31] = _is_mega_form(pokemon)
 
     last_move_id = None
@@ -556,12 +568,13 @@ def _pokemon_numeric_into(
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
     if active_idx is not None and not is_opponent and not battle.teampreview:
-        move_legal, can_switch_out = _ally_legality(battle, active_idx, move_slots)
+        move_legal, can_switch_out, legality_known = _ally_legality(battle, active_idx, move_slots)
         row[50] = move_legal[0]
         row[51] = move_legal[1]
         row[52] = move_legal[2]
         row[53] = move_legal[3]
         row[54] = can_switch_out
+        row[NUM_IDX_LEGALITY_UNKNOWN] = float(not legality_known)
 
     row[55] = pokemon.revealed
 
@@ -823,6 +836,13 @@ def _write_observation(
         categorical[idx],
         numerical[idx],
     )
+    # The joint action-mask token is decision-level, so its provenance lives on the ally
+    # side row rather than on an active Pokemon row that may be an empty placeholder.
+    if not battle.teampreview:
+        for position, slot in enumerate(battle.decision.slots):
+            numerical[idx][NUM_IDX_SLOT_LEGALITY_UNKNOWN + position] = float(
+                not slot.legality_known
+            )
     idx += 1
 
     opp_fainted = sum(mon.fainted for mon in battle.opponent_team.values())

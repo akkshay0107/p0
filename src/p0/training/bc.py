@@ -390,7 +390,7 @@ class BCTrainer:
             )
             (
                 encoded,
-                _,
+                action_mask,
                 series_tokens,
                 series_mask,
                 history_tokens,
@@ -406,6 +406,11 @@ class BCTrainer:
                 history_age_ids,
             )
             value_predictions = self.policy.critic(reduced.cls)
+            accumulator.add_legality(
+                self.policy.actor.unmasked_first_slot_logits(reduced, encoded),
+                action_mask,
+                encoded.numerical,
+            )
             outcome = batch.outcome.to(self.device)
             decision_index = batch.decision_index.to(self.device)
             game_length = batch.game_length.to(self.device)

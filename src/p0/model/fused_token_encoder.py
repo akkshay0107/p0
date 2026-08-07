@@ -29,15 +29,18 @@ from p0.model.structured_observation import (
     MAX_EFFECTS,
     MOVE_SLOTS,
     NUM_EFFECT_START,
+    NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_MOVE_LAST,
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_MOVE_PP,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STATUS_COUNTER,
     NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
     OWNER_TOKENS,
     POKEMON_TOKENS,
     SEQUENCE_LENGTH,
+    TOKEN_IDX_ALLY_SIDE,
     EffectNamespace,
     StructuredObservation,
     TokenType,
@@ -55,7 +58,8 @@ NUM_SLOTS = 7
 _POKE_POS = POKEMON_TOKENS
 _OWNER_POS = OWNER_TOKENS
 
-MOVE_DYNAMIC_WIDTH = 3  # pp fraction, last-move flag, legal-this-step
+# pp fraction, last-move flag, legal-this-step, legality-proven gate
+MOVE_DYNAMIC_WIDTH = 4
 STATUS_DYNAMIC_WIDTH = 1  # status counter (turns asleep / toxic stage)
 SPECIES_STATIC_WIDTH = 9  # six base stats, weight, mega flag, forme relationship
 
@@ -346,6 +350,9 @@ class FusedTokenEncoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
+        # One learned marker per active slot, added in place of a mask the data source
+        # could not prove. Keeps "unknown" a distinct state instead of a mask value.
+        self.unknown_legality_emb = nn.Parameter(torch.empty(2, d_model))
 
         # Event records stay in d_raw until the eight learned pooling queries
         # emit full-width reducer tokens.
@@ -399,6 +406,7 @@ class FusedTokenEncoder(nn.Module):
                 init.normal_(module.weight, std=emb_gain)
         init.normal_(self.mon_fusion_token, std=emb_gain)
         init.normal_(self.action_mask_token, std=emb_gain)
+        init.normal_(self.unknown_legality_emb, std=emb_gain)
         init.normal_(self.event_pool_queries, std=emb_gain)
         init.normal_(self.empty_event_tokens, std=emb_gain)
 
@@ -425,11 +433,17 @@ class FusedTokenEncoder(nn.Module):
 
         # MoveRecord: identity + static dex scalars + move-owned dynamics fused once
         move_ids = categorical[..., 5:9]
+        # A row whose legality is unproven carries zeros in the legal-this-step channel;
+        # the proven gate keeps that from reading as a proven "illegal this step".
+        legality_proven = (
+            1.0 - numerical[..., NUM_IDX_LEGALITY_UNKNOWN : NUM_IDX_LEGALITY_UNKNOWN + 1]
+        )
         move_dynamics = torch.stack(
             [
                 numerical[..., NUM_IDX_MOVE_PP : NUM_IDX_MOVE_PP + MOVE_SLOTS],
                 numerical[..., NUM_IDX_MOVE_LAST : NUM_IDX_MOVE_LAST + MOVE_SLOTS],
                 numerical[..., NUM_IDX_MOVE_LEGAL : NUM_IDX_MOVE_LEGAL + MOVE_SLOTS],
+                legality_proven.expand(*legality_proven.shape[:-1], MOVE_SLOTS),
             ],
             dim=-1,
         )
@@ -587,16 +601,29 @@ class FusedTokenEncoder(nn.Module):
         self,
         tokens: torch.Tensor,
         action_mask: torch.Tensor,
+        numerical: torch.Tensor,
     ) -> torch.Tensor:
+        """Append the joint action-mask token, gated by per-slot legality provenance."""
         B = tokens.size(0)
         if action_mask.shape != (B, 2, ACT_SIZE):
             raise ValueError(
                 f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
             )
-        flat_mask = action_mask.reshape(B, -1).to(tokens.dtype)
+        slot_unknown = numerical[
+            :,
+            TOKEN_IDX_ALLY_SIDE,
+            NUM_IDX_SLOT_LEGALITY_UNKNOWN : NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2,
+        ].to(tokens.dtype)
+        # An unproven slot contributes no mask magnitude; its learned marker carries the
+        # "fall back to state" signal instead.
+        gated_mask = action_mask.to(tokens.dtype) * (1.0 - slot_unknown).unsqueeze(-1)
 
-        mask_token = self.action_mask_token.expand(B, -1, -1)
-        mask_token = mask_token + self.action_mask_proj(flat_mask).unsqueeze(1)
+        unknown_marker = slot_unknown @ self.unknown_legality_emb.to(tokens.dtype)
+        mask_token = (
+            self.action_mask_token.expand(B, -1, -1)
+            + self.action_mask_proj(gated_mask.reshape(B, -1)).unsqueeze(1)
+            + unknown_marker.unsqueeze(1)
+        )
         return torch.cat([tokens, mask_token], dim=1)
 
     def forward(
@@ -680,7 +707,7 @@ class FusedTokenEncoder(nn.Module):
             + self.side_emb(side_ids)
             + self.slot_emb(slot_ids)
         )
-        out_tokens = self._append_action_mask_token(out_tokens, action_mask)
+        out_tokens = self._append_action_mask_token(out_tokens, action_mask, numerical)
 
         event_tokens = self._encode_events(obs, device)
         event_tokens = event_tokens + self.token_type_emb.weight[int(TokenType.EVENT)]

@@ -8,6 +8,10 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from p0.model.structured_observation import (
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    TOKEN_IDX_ALLY_SIDE,
+)
 from p0.replays.schema import DecisionType, LabelKind
 from p0.training._bc_batch import BCDecisionBatch
 
@@ -44,6 +48,11 @@ class BCEvaluationMetrics:
     candidate_set_sizes: Mapping[str, int]
     value_loss: float = 0.0
     value_decisions: int = 0
+    # Mean probability mass the unmasked policy puts on actions the authoritative
+    # request calls illegal, over decisions whose legality is proven. Output masking
+    # hides this at inference, so it is the only view of learned legality behaviour.
+    illegal_probability_mass: float = 0.0
+    unknown_legality_decisions: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -63,6 +72,8 @@ class BCEvaluationMetrics:
             "candidate_set_sizes": dict(self.candidate_set_sizes),
             "value_loss": self.value_loss,
             "value_decisions": self.value_decisions,
+            "illegal_probability_mass": self.illegal_probability_mass,
+            "unknown_legality_decisions": self.unknown_legality_decisions,
         }
 
 
@@ -241,6 +252,16 @@ def _finalize_evaluation_bins(
     return result
 
 
+def slot_legality_unknown(numerical: Tensor) -> Tensor:
+    """Per-decision flag for whether either active slot's legality is unproven."""
+    gates = numerical[
+        :,
+        TOKEN_IDX_ALLY_SIDE,
+        NUM_IDX_SLOT_LEGALITY_UNKNOWN : NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2,
+    ]
+    return gates.gt(0).any(dim=-1)
+
+
 @dataclass(slots=True)
 class _BCEvaluationAccumulator:
     counts: Tensor
@@ -253,6 +274,9 @@ class _BCEvaluationAccumulator:
     candidate_counts: Tensor
     value_loss_sum: Tensor
     value_count: Tensor
+    illegal_mass_sum: Tensor
+    illegal_mass_count: Tensor
+    unknown_legality_count: Tensor
 
     @classmethod
     def create(cls, device: torch.device) -> _BCEvaluationAccumulator:
@@ -275,6 +299,9 @@ class _BCEvaluationAccumulator:
             candidate_counts=torch.zeros(0, dtype=torch.long, device=device),
             value_loss_sum=torch.zeros((), dtype=torch.float64, device=device),
             value_count=torch.zeros((), dtype=torch.long, device=device),
+            illegal_mass_sum=torch.zeros((), dtype=torch.float64, device=device),
+            illegal_mass_count=torch.zeros((), dtype=torch.long, device=device),
+            unknown_legality_count=torch.zeros((), dtype=torch.long, device=device),
         )
 
     def add_value(self, predictions: Tensor, targets: Tensor, mask: Tensor) -> None:
@@ -283,6 +310,20 @@ class _BCEvaluationAccumulator:
             error = predictions[mask] - targets[mask]
             self.value_loss_sum += error.square().to(torch.float64).sum()
             self.value_count += mask.sum()
+
+    def add_legality(self, logits: Tensor, action_mask: Tensor, numerical: Tensor) -> None:
+        """Accumulate probability mass on request-illegal first-slot actions."""
+        unknown = slot_legality_unknown(numerical)
+        proven = ~unknown
+
+        # Only proven rows have an authoritative notion of "illegal" to measure against,
+        # so they are weighted in rather than indexed out, which would force a sync.
+        probabilities = torch.softmax(logits.float(), dim=-1)
+        illegal_mass = probabilities.mul(~action_mask[:, 0].bool()).sum(dim=-1)
+
+        self.unknown_legality_count += unknown.sum()
+        self.illegal_mass_sum += illegal_mass.mul(proven).sum().to(torch.float64)
+        self.illegal_mass_count += proven.sum()
 
     def add(
         self,
@@ -351,6 +392,7 @@ class _BCEvaluationAccumulator:
         nll_sums = self.nll_sums.cpu().tolist()
         candidate_counts = self.candidate_counts.cpu().tolist()
         value_count = int(self.value_count.item())
+        illegal_mass_count = int(self.illegal_mass_count.item())
         decisions, labeled, unknown, exact, partial = (int(value) for value in counts[:5])
         return BCEvaluationMetrics(
             overall_nll=float(nll_sums[0]) / max(labeled, 1),
@@ -378,4 +420,7 @@ class _BCEvaluationAccumulator:
             },
             value_loss=float(self.value_loss_sum.item()) / max(value_count, 1),
             value_decisions=value_count,
+            illegal_probability_mass=float(self.illegal_mass_sum.item())
+            / max(illegal_mass_count, 1),
+            unknown_legality_decisions=int(self.unknown_legality_count.item()),
         )

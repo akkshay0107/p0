@@ -1,4 +1,12 @@
-"""Pure scalar legality and joint-action constraints."""
+"""Pure scalar legality and joint-action constraints.
+
+A ``SlotDecision`` carries both the legality itself and whether that legality is proven.
+Live play and self-play own the authoritative ``|request|`` and leave ``legality_known``
+set; a public replay can only prove part of it, and marks the rest unknown. An unknown
+slot must yield a *superset* mask - every structurally possible action stays selectable -
+so the training denominator never excludes the action the demonstrator actually took.
+The observation encoder gates the same flag so an unproven mask is never read as fact.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +39,7 @@ class SlotDecision:
     force_switch: bool = False
     can_mega: bool = False
     forced_move: bool = False
+    legality_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +97,13 @@ def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:
         mega_moves = (
             tuple(action + (MOVE_END - MOVE_START) for action in moves) if slot.can_mega else ()
         )
+
+        # An unproven slot may be locked into a move we cannot see (Outrage, Encore,
+        # a recharge turn), which the runtime encodes as the single forced action.
+        if not slot.legality_known:
+            moves = (*moves, FORCED_ACTION)
+            if slot.can_mega:
+                mega_moves = (*mega_moves, MEGA_FORCED_ACTION)
 
     return (*switches, *moves, *mega_moves) or (PASS_ACTION,)
 

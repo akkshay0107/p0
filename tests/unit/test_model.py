@@ -33,8 +33,10 @@ from p0.model.structured_observation import (
     EVENT_METADATA_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     NUM_EFFECT_START,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
+    TOKEN_IDX_ALLY_SIDE,
     SideId,
     StructuredObservation,
     TokenType,
@@ -1101,3 +1103,28 @@ def test_compile_policy_state_dict_integrity() -> None:
     keys_after = set(compiled.state_dict().keys())
 
     assert keys_before == keys_after
+
+
+def test_unknown_legality_gate_replaces_the_mask_it_cannot_prove(policy_net):
+    """The gate must be a distinct state, and it must actually suppress the mask."""
+    observations = StructuredObservation.empty_batch(2)
+    gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)
+    observations.numerical[1, TOKEN_IDX_ALLY_SIDE, gates] = 1.0
+
+    mask = torch.zeros((2, 2, ACT_SIZE), dtype=torch.bool)
+    mask[:, :, :8] = True
+
+    with torch.no_grad():
+        tokens, _ = policy_net.encoder(observations, mask)
+        other_mask = mask.clone()
+        other_mask[:, :, 8:16] = True
+        other_tokens, _ = policy_net.encoder(observations, other_mask)
+
+    mask_token = -POOLED_EVENT_COUNT - 1
+    proven, unknown = tokens[0, mask_token], tokens[1, mask_token]
+    assert torch.isfinite(tokens).all()
+    assert not torch.allclose(proven, unknown)
+
+    # a proven row tracks its mask; an unproven row ignores mask values entirely
+    assert not torch.allclose(other_tokens[0, mask_token], proven)
+    torch.testing.assert_close(other_tokens[1, mask_token], unknown)

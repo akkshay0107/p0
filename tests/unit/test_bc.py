@@ -14,7 +14,11 @@ from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_TOKENS_PER_GAM
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import StructuredObservation
+from p0.model.structured_observation import (
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    TOKEN_IDX_ALLY_SIDE,
+    StructuredObservation,
+)
 from p0.replays.compile import compile_payloads, compile_to_shards, write_tensor_shards
 from p0.replays.dataset import LazyReplayDataset, ReplayGameChunk, assign_series_splits
 from p0.replays.schema import LabelKind
@@ -859,6 +863,24 @@ def test_split_assignment_populates_all_requested_splits_when_possible() -> None
     )
 
     assert set(manifest.assignments.values()) == {"train", "validation", "test"}
+
+
+def test_evaluation_reports_legality_diagnostics() -> None:
+    game = _chunk([int(LabelKind.EXACT)] * 2, [(7, 8), (7, 8)], [0, 1, 2])
+    gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)
+    game.observations.numerical[1, TOKEN_IDX_ALLY_SIDE, gates] = 1.0
+    policy = build_policy(
+        ModelConfig(d_model=64, nhead=4, reducer_layers=1, dim_feedforward=128),
+        default_runtime_resources(),
+    )
+    trainer = BCTrainer(policy, (game,), BCConfig(batch_decisions=2, amp=False), device="cpu")
+
+    metrics = trainer.evaluate()
+
+    # only the proven decision has an authoritative mask to be measured against
+    assert metrics.unknown_legality_decisions == 1
+    assert 0.0 < metrics.illegal_probability_mass < 1.0
+    assert metrics.to_dict()["illegal_probability_mass"] == metrics.illegal_probability_mass
 
 
 def test_validation_is_deterministic_inference_only_and_reports_all_counts() -> None:

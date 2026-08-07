@@ -42,7 +42,7 @@ from p0.model.architecture_contract import (
     SELF_TARGET_SENTINEL,
     SERIES_SLOTS,
 )
-from p0.model.cls_reducer import MemoryReducer
+from p0.model.cls_reducer import MemoryReducer, ReducerOutput
 from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import FusedTokenEncoder
 from p0.model.resources import RuntimeResources
@@ -583,6 +583,21 @@ class ActorPolicy(nn.Module):
             1, second_actions.unsqueeze(1)
         )
         return (log_prob_first + log_prob_second).squeeze(1)
+
+    def unmasked_first_slot_logits(self, reduced: ReducerOutput, enc: EncodedObs) -> Tensor:
+        """First-slot logits before legality masking, for legality diagnostics.
+
+        Reuses an already-reduced batch so the diagnostic costs one pointer-head pass
+        rather than a second reducer pass.
+        """
+        logits, _ = self._compute_pointer_logits(
+            reduced.cls,
+            self._compute_keys(reduced.pokemon),
+            enc.aux[:, 0],
+            enc.numerical,
+            head_idx=0,
+        )
+        return logits
 
     def _apply_sequential_masks(
         self,

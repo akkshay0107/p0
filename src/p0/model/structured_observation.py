@@ -36,7 +36,7 @@ CAT_EFFECT_START = CAT_IDX_STATUS_COUNTER_KIND + 1
 EFFECT_CATEGORICAL_WIDTH = 3
 CATEGORICAL_WIDTH = CAT_EFFECT_START + MAX_EFFECTS * EFFECT_CATEGORICAL_WIDTH
 
-NUM_BASE_WIDTH = 56
+NUM_BASE_WIDTH = 59
 NUM_PROVENANCE_START = NUM_BASE_WIDTH
 NUM_PROVENANCE_WIDTH = 8
 NUM_EFFECT_START = NUM_PROVENANCE_START + NUM_PROVENANCE_WIDTH
@@ -59,11 +59,17 @@ NUM_IDX_TEAM_PREVIEW = 2
 NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction (MoveRecord dynamic)
 NUM_IDX_ORIG_IDX_RATIO = 26
 NUM_IDX_FAINTED = 27
+NUM_IDX_CAN_MEGA = 30  # active allies only, request-derived like the legality columns
 NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot "was the last move used" (MoveRecord dynamic)
 NUM_IDX_STATUS_COUNTER = 36  # StatusRecord dynamic (turns asleep / toxic stage)
 NUM_IDX_MOVE_LEGAL = 50  # 50-53: per-move-slot "legal this step" (MoveRecord dynamic)
 NUM_IDX_CAN_SWITCH_OUT = 54  # active allies only
 NUM_IDX_REVEALED = 55  # has appeared on the field this battle
+# Legality provenance. A data source that cannot prove a decision's legality (a public
+# replay carries no `|request|`) writes zeros into the legality columns above and raises
+# these gates instead, so "unknown" never masquerades as a proven "illegal".
+NUM_IDX_LEGALITY_UNKNOWN = 56  # this row's move-legal / can-switch-out / can-mega are unproven
+NUM_IDX_SLOT_LEGALITY_UNKNOWN = 57  # 57-58: per-active-slot gate, ally side token only
 
 
 ALLY_POKE_TOKENS = (0, 1, 2, 3, 4, 5)
