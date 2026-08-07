@@ -12,12 +12,14 @@ from typing import Any
 
 import orjson
 from poke_env.battle import Move
+from poke_env.data import GenData
 
 from p0.battle.actions import (
     FORCED_ACTION,
     MEGA_FORCED_ACTION,
     MOVE_END,
     MOVE_START,
+    PASS_ACTION,
     SWITCH_START,
     TARGET_COUNT,
     encode_team_pair,
@@ -57,22 +59,95 @@ _ENDPOINT_ACTION_STATE_TAGS = frozenset(
     {
         "-ability",
         "-activate",
+        "-boost",
+        "-clearallboost",
+        "-clearboost",
+        "-clearnegativeboost",
+        "-clearpositiveboost",
+        "-copyboost",
         "-curestatus",
         "-end",
         "-enditem",
         "-formechange",
+        "-invertboost",
         "-item",
         "-singlemove",
         "-singleturn",
         "-start",
         "-status",
+        "-swapboost",
         "-terastallize",
         "-transform",
+        "-unboost",
         "detailschange",
     }
 )
 _GLOBAL_ACTION_STATE_TAGS = frozenset(
     {"-fieldend", "-fieldstart", "-sideend", "-sidestart", "-weather"}
+)
+_TURN_COUNTER_EFFECTS = frozenset(
+    {
+        "BIDE",
+        "BIND",
+        "CLAMP",
+        "DISABLE",
+        "DOOMDESIRE",
+        "DYNAMAX",
+        "EMBARGO",
+        "ENCORE",
+        "FIRESPIN",
+        "FUTURESIGHT",
+        "GRAVITY",
+        "GMAXCENTIFERNO",
+        "GMAXSANDBLAST",
+        "HEALBLOCK",
+        "INFESTATION",
+        "MAGMASTORM",
+        "MAGNETRISE",
+        "SANDTOMB",
+        "SKYDROP",
+        "SLOWSTART",
+        "SNAPTRAP",
+        "TAUNT",
+        "TELEKINESIS",
+        "THROATCHOP",
+        "THUNDERCAGE",
+        "UPROAR",
+        "WHIRLPOOL",
+        "WRAP",
+    }
+)
+_END_ON_MOVE_EFFECTS = frozenset(
+    {"GLAIVERUSH", "DANCER", "GRUDGE", "DESTINYBOND", "RAGE", "INSTRUCT", "FOCUSPUNCH"}
+)
+_END_ON_TURN_EFFECTS = frozenset(
+    {
+        "AFTERYOU",
+        "BANEFULBUNKER",
+        "BEAKBLAST",
+        "BURNINGBULWARK",
+        "CRAFTYSHIELD",
+        "FEINT",
+        "FLINCH",
+        "FOCUSPUNCH",
+        "FOLLOWME",
+        "INSTRUCT",
+        "KINGSSHIELD",
+        "CUSTAPBERRY",
+        "MINDREADER",
+        "MAGICCOAT",
+        "OBSTRUCT",
+        "PROTECT",
+        "QUASH",
+        "QUICKCLAW",
+        "QUICKDRAW",
+        "QUICKGUARD",
+        "RAGEPOWDER",
+        "ROOST",
+        "SPIKYSHIELD",
+        "SPOTLIGHT",
+        "WIDEGUARD",
+    }
 )
 
 
@@ -213,6 +288,8 @@ def _make_replay_pokemon(
         species=species,
         moves=moves if moves is not None else {},
         ability=ability,
+        base_ability_data=ability,
+        forme_ability_data=None,
         item=item,
         nature=nature,
         base_stats_data=base_stats if isinstance(base_stats, Mapping) else {},
@@ -255,6 +332,8 @@ class ReplayPokemon:
     revealed: bool = True
     selected_in_teampreview: bool | None = None
     ability: str | None = None
+    base_ability_data: str | None = None
+    forme_ability_data: str | None = None
     item: str | None = None
     nature: str | None = None
     base_stats_data: Mapping[str, int] = field(default_factory=dict)
@@ -342,6 +421,7 @@ class ReconstructedSnapshot:
     view: FixtureBattleView
     events: tuple[BattleEvent, ...]
     raw_lines: tuple[str, ...]
+    action_view: DecisionView | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,11 +610,14 @@ def _replay_moves(
                 "detect",
                 "endure",
                 "kingsshield",
+                "matblock",
                 "maxguard",
                 "obstruct",
                 "protect",
+                "quickguard",
                 "silktrap",
                 "spikyshield",
+                "wideguard",
             },
             current_pp=max_pp,
             max_pp=max_pp,
@@ -725,9 +808,17 @@ class _ReplayState:
                 if pokemon is None:
                     continue
                 effects = {
-                    effect: counter if effect in pokemon.presence_effects else counter + 1
+                    effect: (
+                        counter + 1
+                        if effect not in pokemon.presence_effects
+                        and effect.name in _TURN_COUNTER_EFFECTS
+                        else counter
+                    )
                     for effect, counter in pokemon.effects.items()
-                    if effect not in pokemon.turn_effects
+                    if (
+                        effect not in pokemon.turn_effects
+                        and effect.name not in _END_ON_TURN_EFFECTS
+                    )
                 }
                 status_counter = pokemon.status_counter
                 if getattr(pokemon.status, "name", "") == "TOX":
@@ -748,6 +839,7 @@ class _ReplayState:
         self._replace_active(
             side,
             pokemon,
+            ability=pokemon.forme_ability_data or pokemon.base_ability_data,
             boosts=_zero_boosts(),
             effects_data={},
             presence_effects=frozenset(),
@@ -775,6 +867,23 @@ class _ReplayState:
         status_counter = pokemon.status_counter
         if getattr(pokemon.status, "name", "") == "SLP":
             status_counter += 1
+        effects = dict(pokemon.effects)
+        presence_effects = set(pokemon.presence_effects)
+        effects = {
+            effect: counter
+            for effect, counter in effects.items()
+            if effect.name not in _END_ON_MOVE_EFFECTS
+            and not (
+                effect.name == "FLASHFIRE"
+                and move is not None
+                and getattr(move.type, "name", "") == "FIRE"
+            )
+        }
+        presence_effects.intersection_update(effects)
+        if move_id == "minimize":
+            effect = ReplayName("MINIMIZE")
+            effects.setdefault(effect, 0)
+            presence_effects.add(effect)
         self._replace_active(
             side,
             pokemon,
@@ -785,6 +894,8 @@ class _ReplayState:
                 else 0
             ),
             status_counter_data=status_counter,
+            effects_data=effects,
+            presence_effects=frozenset(presence_effects),
             preparing_data=False,
             last_move_data=move_id,
         )
@@ -798,7 +909,6 @@ class _ReplayState:
     def _species_changes(self, species: str) -> dict[str, Any]:
         data = self.species_data_index.get(normalize_id(species), {})
         base_stats = data.get("baseStats", {})
-        abilities = data.get("abilities", {})
         types = tuple(str(value) for value in data.get("types", ()) if isinstance(value, str))
         changes: dict[str, Any] = {
             "species": species,
@@ -807,8 +917,15 @@ class _ReplayState:
             "type_2_data": ReplayName(_enum_name(types[1])) if len(types) > 1 else None,
             "weight_data": float(data.get("weightkg", 0.0)),
         }
+        # Replay form names are interpreted by the same pinned Showdown dex as
+        # the live adapter. The project dex also contains custom form entries,
+        # but some of their ability overrides differ from poke-env's runtime
+        # data (for example Scolipede-Mega and Raichu-Mega-Y).
+        live_data = GenData.from_gen(9).pokedex.get(normalize_id(species), {})
+        abilities = live_data.get("abilities") or data.get("abilities", {})
         if isinstance(abilities, Mapping) and abilities.get("0"):
             changes["ability"] = str(abilities["0"])
+            changes["forme_ability_data"] = str(abilities["0"])
         return changes
 
     def apply(self, parts: Sequence[str]) -> None:
@@ -957,6 +1074,7 @@ class _ReplayState:
                         fainted=True,
                         current_hp_fraction=0.0,
                         status=ReplayName("FNT"),
+                        ability=pokemon.forme_ability_data or pokemon.base_ability_data,
                         effects_data={},
                         presence_effects=frozenset(),
                         turn_effects=frozenset(),
@@ -1000,7 +1118,12 @@ class _ReplayState:
                     boosts[stat] = max(-6, min(6, value))
                     self._replace_active(endpoint[0], current, boosts=boosts)
             return
-        if tag in ("-clearboost", "-clearnegativeboost", "-clearallboost"):
+        if tag in {
+            "-clearboost",
+            "-clearnegativeboost",
+            "-clearpositiveboost",
+            "-clearallboost",
+        }:
             targets: list[tuple[int, ReplayPokemon]] = []
             if tag == "-clearallboost":
                 targets = [
@@ -1016,7 +1139,68 @@ class _ReplayState:
                     if current is not None:
                         targets.append((endpoint[0], current))
             for side, current in targets:
-                self._replace_active(side, current, boosts=_zero_boosts())
+                boosts = dict(current.boosts)
+                if tag in {"-clearboost", "-clearallboost"}:
+                    boosts = _zero_boosts()
+                elif tag == "-clearnegativeboost":
+                    boosts = {stat: max(0, value) for stat, value in boosts.items()}
+                else:
+                    boosts = {stat: min(0, value) for stat, value in boosts.items()}
+                self._replace_active(side, current, boosts=boosts)
+            return
+        if tag == "-copyboost" and len(parts) >= 4:
+            source = self._active_for(parts[2])
+            target = self._active_for(parts[3])
+            if source is not None and target is not None:
+                _, source_pokemon = source
+                target_side, target_pokemon = target
+                self._replace_active(target_side, target_pokemon, boosts=source_pokemon.boosts)
+            return
+        if tag == "-invertboost" and len(parts) >= 3:
+            located = self._active_for(parts[2])
+            if located is not None:
+                side, pokemon = located
+                self._replace_active(
+                    side,
+                    pokemon,
+                    boosts={stat: -value for stat, value in pokemon.boosts.items()},
+                )
+            return
+        if tag == "-swapboost" and len(parts) >= 4:
+            source = self._active_for(parts[2])
+            target = self._active_for(parts[3])
+            if source is not None and target is not None:
+                source_side, source_pokemon = source
+                target_side, target_pokemon = target
+                stats = (
+                    tuple(_zero_boosts())
+                    if len(parts) < 5
+                    else tuple(
+                        stat
+                        for stat in ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
+                        if stat in parts[4] or "[from]" in parts[4]
+                    )
+                )
+                if not stats:
+                    stats = tuple(_zero_boosts())
+                source_boosts = dict(source_pokemon.boosts)
+                target_boosts = dict(target_pokemon.boosts)
+                self._replace_active(
+                    source_side,
+                    source_pokemon,
+                    boosts={
+                        **source_boosts,
+                        **{stat: target_boosts[stat] for stat in stats},
+                    },
+                )
+                self._replace_active(
+                    target_side,
+                    target_pokemon,
+                    boosts={
+                        **target_boosts,
+                        **{stat: source_boosts[stat] for stat in stats},
+                    },
+                )
             return
         if tag in ("detailschange", "-formechange") and len(parts) >= 4:
             endpoint = self._endpoint(parts[2])
@@ -1031,7 +1215,14 @@ class _ReplayState:
             if endpoint is not None:
                 current = self.active[endpoint[0]][endpoint[1]]
                 if current is not None:
-                    self._replace_active(endpoint[0], current, ability=parts[3])
+                    base_ability = current.base_ability_data or parts[3]
+                    self._replace_active(
+                        endpoint[0],
+                        current,
+                        ability=parts[3],
+                        base_ability_data=base_ability,
+                        forme_ability_data=current.forme_ability_data,
+                    )
             return
         if (tag == "-enditem" and len(parts) >= 3) or (tag == "-item" and len(parts) >= 4):
             endpoint = self._endpoint(parts[2])
@@ -1090,10 +1281,13 @@ class _ReplayState:
             else:
                 effects.setdefault(effect, 0)
                 if tag == "-activate":
-                    presence_effects.add(effect)
+                    if effect.name in _TURN_COUNTER_EFFECTS:
+                        presence_effects.discard(effect)
+                    else:
+                        presence_effects.add(effect)
                 elif tag == "-start":
                     presence_effects.discard(effect)
-                if tag in {"-singleturn", "-singlemove"}:
+                if tag in {"-singleturn", "-singlemove"} and effect.name in _END_ON_TURN_EFFECTS:
                     turn_effects.add(effect)
             self._replace_active(
                 side,
@@ -1151,6 +1345,7 @@ def _observed_move_target(
         "all",
         "allAdjacent",
         "allAdjacentFoes",
+        "allies",
         "allySide",
         "allyTeam",
         "foeSide",
@@ -1193,17 +1388,25 @@ def _switch_species(parts: Sequence[str]) -> str:
     return parts[3].split(",", 1)[0].strip()
 
 
+def _is_pivot_switch(parts: Sequence[str]) -> bool:
+    return any(
+        normalize_id(part.removeprefix("[from] "))
+        in {"uturn", "flipturn", "voltswitch", "batonpass", "partingshot"}
+        for part in parts[4:]
+    )
+
+
 def _is_choice_switch(parts: Sequence[str]) -> bool:
     """Whether a switch line represents a submitted order.
 
-    Showdown also emits ``switch`` for automatic pivots such as Parting Shot
-    and U-turn. Those lines update state and produce events, but they are not
-    decisions visible to the environment.
+    A pivot switch emitted after U-turn/Flip Turn is the outcome of the first
+    request and the replacement request is represented by that switch line.
+    Other ``[from]`` switches are automatic state updates.
     """
     return (
         len(parts) >= 3
         and parts[1] == "switch"
-        and not any(part.startswith("[from]") for part in parts[4:])
+        and (not any(part.startswith("[from]") for part in parts[4:]) or _is_pivot_switch(parts))
     )
 
 
@@ -1855,6 +2058,8 @@ def reconstruct_perspective(
         if lines and len(lines[0].parts) >= 2 and lines[0].parts[1] == "turn":
             state.apply(lines[0].parts)
             state_update_lines = lines[1:]
+        pivot_segment = bool(state_update_lines and _is_pivot_switch(state_update_lines[0].parts))
+        decision_lines = state_update_lines[:1] if pivot_segment else lines
 
         effective_species = {}
         for slot in (0, 1):
@@ -1872,7 +2077,7 @@ def reconstruct_perspective(
         )
         forced_move_slots = tuple(
             endpoint[1]
-            for line in lines
+            for line in decision_lines
             if _is_choice_move(line.parts)
             and len(line.parts) >= 4
             and (endpoint := _ReplayState._endpoint(line.parts[2])) is not None
@@ -1888,10 +2093,14 @@ def reconstruct_perspective(
         # guard below — it keeps the normal FORCED_SWITCH / TURN path.
         is_waiting = (
             decision_type is not DecisionType.TEAM_PREVIEW
-            and not (lines and len(lines[0].parts) >= 2 and lines[0].parts[1] == "turn")
-            and not _perspective_has_choice(lines, perspective)
-            and _perspective_has_choice(lines, 1 - perspective)
-            and not _is_terminal_segment(lines)
+            and not (
+                decision_lines
+                and len(decision_lines[0].parts) >= 2
+                and decision_lines[0].parts[1] == "turn"
+            )
+            and not _perspective_has_choice(decision_lines, perspective)
+            and _perspective_has_choice(decision_lines, 1 - perspective)
+            and not _is_terminal_segment(decision_lines)
         )
         view = _view(
             state,
@@ -1906,18 +2115,19 @@ def reconstruct_perspective(
         # this request's event window. Do not attach the current action's
         # consequences to the action that caused them.
         view.events = list(pending_events)
-        observed = (
+        observed_actions = (
             _preview_actions(state, lines, perspective)
             if decision_type is DecisionType.TEAM_PREVIEW
             else _observed_actions(
                 state,
-                lines,
+                decision_lines,
                 perspective,
                 counters,
                 illusion_species_by_line,
             )
         )
-        tags = list(observed[2])
+        observed = list(observed_actions[:2])
+        tags = list(observed_actions[2])
         if decision_type is DecisionType.TEAM_PREVIEW:
             tags.append("preview_selection_not_public")
         if any(action is not None and action.tag == "switch" for action in observed[:2]):
@@ -1940,8 +2150,27 @@ def reconstruct_perspective(
             if action is not None and action.action is not None:
                 if action.action not in legal_actions(view.decision, slot):
                     counters["observed_illegal_action"] += 1
+        evidence_view = view
+        if pivot_segment:
+            evidence_slots = list(view.decision.slots)
+            for slot, action in enumerate(observed[:2]):
+                if action is not None:
+                    continue
+                observed[slot] = ObservedAction(PASS_ACTION, tag="implicit_pass")
+                evidence_slots[slot] = replace(
+                    evidence_slots[slot],
+                    active=False,
+                    switch_slots=(),
+                    move_targets=(),
+                    force_switch=False,
+                    forced_move=False,
+                )
+            evidence_view = replace(
+                view,
+                decision=replace(view.decision, slots=tuple(evidence_slots)),
+            )
         request = EvidenceRequest(
-            view=view.decision,
+            view=evidence_view.decision,
             slots=(observed[0], observed[1]),
             tags=tuple(tags),
             max_candidates=max_candidates,
@@ -1967,7 +2196,12 @@ def reconstruct_perspective(
                 post_line_index=end,
                 view=view,
                 events=pending_events,
-                raw_lines=tuple(line.raw for line in lines),
+                raw_lines=tuple(line.raw for line in (decision_lines if pivot_segment else lines)),
+                # Pivot replacement requests include an implicit pass for the
+                # slot whose order was already consumed. Keep that adjusted
+                # legality view separate from the observation view, whose
+                # public state must remain identical to the live request.
+                action_view=evidence_view.decision,
             )
         )
         pending_events = events

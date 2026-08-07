@@ -31,11 +31,12 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
 from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
-from p0.format_config import FORMAT
+from p0.cli.corpus import _variants_from_showdown
+from p0.format_config import FORMAT, current_manifest
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
+from p0.model.tokenizer import PokemonTokenizer
 from p0.replays.compile import compile_documents, write_tensor_shards
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.reconstruct import ReconstructedPerspective, ReconstructedSnapshot, reconstruct_both
@@ -44,6 +45,9 @@ from p0.replays.shards import validate_shard_tensors
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view
+from p0.teams.corpus import CorpusSourceSpec, CorpusSplit, SamplingPolicy
+from p0.teams.corpus_build import build_corpus
+from p0.teams.corpus_source import CorpusTeamSource
 from tests.stress._helpers import stress_count
 
 # Cant reasons emitted by the checked-in Showdown commit for the champions
@@ -287,6 +291,44 @@ def _stress_timeout(game_count: int) -> float:
     return value
 
 
+def _stress_team_dir() -> str:
+    return os.getenv("P0_STRESS_TEAM_DIR", "teams/all")
+
+
+def _build_stress_team_source(team_dir: str | Path, manifest_path: Path) -> CorpusTeamSource:
+    directory = Path(team_dir)
+    files = tuple(
+        path
+        for path in sorted(directory.iterdir(), key=lambda item: item.name)
+        if path.is_file() and not path.name.startswith(".")
+    )
+    if not files:
+        raise ValueError(f"No team files found in {directory}")
+
+    variants = _variants_from_showdown("\n\n\n".join(path.read_text() for path in files))
+    manifest, _audit = build_corpus(
+        variants,
+        tokenizer=PokemonTokenizer.from_file(),
+        format_id=FORMAT.battle_format,
+        runtime_contract_sha256=current_manifest().runtime_contract_sha256,
+        # The stress corpus is deliberately one pool: there is no train/validation/test
+        # partition because this test is exercising replay mechanics, not generalization.
+        ratio_train=1.0,
+        ratio_val=0.0,
+        ratio_test=0.0,
+    )
+    manifest_path.write_bytes(orjson.dumps(manifest.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n")
+    return CorpusTeamSource(
+        CorpusSourceSpec(
+            corpus_path=str(manifest_path),
+            corpus_hash=manifest.corpus_hash,
+            format_id=FORMAT.battle_format,
+            split=CorpusSplit.TRAIN,
+            sampling_policy=SamplingPolicy.UNIFORM_CANONICAL,
+        )
+    )
+
+
 def _load_live_records(path: Path) -> tuple[dict[str, Any], ...]:
     artifact = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(artifact, dict) or not isinstance(artifact.get("records"), list):
@@ -503,11 +545,27 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
     random.seed(seed)
     poke_env_patches.install()
 
+    team_source = _build_stress_team_source(
+        _stress_team_dir(),
+        tmp_path / "bundled-stress-corpus.json",
+    )
+    rng = random.Random(seed)
+    batches = tuple(
+        (
+            min(concurrency, game_count - start),
+            team_source.sample(rng),
+            team_source.sample(rng),
+        )
+        for start in range(0, game_count, concurrency)
+    )
+    print(f"[stress] seed={seed} batches={len(batches)} source={team_source.describe()!r}")
+
+    _first_size, first_team_a, first_team_b = batches[0]
     player_a = JsonCapturingRandomPlayer(
         account_configuration=AccountConfiguration("StressRandomA", None),
         battle_format=FORMAT.battle_format,
         server_configuration=showdown_server,
-        team=DEFAULT_TEST_TEAM,
+        team=first_team_a.packed,
         accept_open_team_sheet=True,
         max_concurrent_battles=concurrency,
         observation_builder=builder,
@@ -519,7 +577,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
         account_configuration=AccountConfiguration("StressRandomB", None),
         battle_format=FORMAT.battle_format,
         server_configuration=showdown_server,
-        team=DEFAULT_TEST_TEAM,
+        team=first_team_b.packed,
         accept_open_team_sheet=True,
         max_concurrent_battles=concurrency,
         observation_builder=builder,
@@ -527,10 +585,13 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
     )
 
     try:
-        await asyncio.wait_for(
-            player_a.battle_against(player_b, n_battles=game_count),
-            timeout=_stress_timeout(game_count),
-        )
+        for batch_size, team_a, team_b in batches:
+            player_a.update_team(team_a.packed)
+            player_b.update_team(team_b.packed)
+            await asyncio.wait_for(
+                player_a.battle_against(player_b, n_battles=batch_size),
+                timeout=_stress_timeout(batch_size),
+            )
     finally:
         await player_a.ps_client.stop_listening()
         await player_b.ps_client.stop_listening()

@@ -546,16 +546,22 @@ def test_reconstruction_is_causal_symmetric_and_compilable() -> None:
     assert result.metrics.counters["illegal_candidates"] == 0
 
 
-def test_replay_request_chunks_ignore_outcome_and_automatic_switch_lines() -> None:
+def test_replay_request_chunks_split_outcome_and_pivot_switch_lines() -> None:
     payload = _payload_replay_pipeline("request-chunks")
     lines = str(payload["log"]).splitlines()
     turn_index = lines.index("|turn|1")
+    p1_team = [
+        {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
+        {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Meowth", "moves": ["Tackle"]},
+    ]
+    lines[2] = f"|showteam|p1|{json.dumps(p1_team, separators=(',', ':'))}"
     lines = lines[:turn_index] + [
         "|turn|1",
         "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
         "|cant|p1a: Pikachu|flinch",
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
-        "|switch|p1b: Pikachu|Pikachu, L50|100/100|[from] Parting Shot",
+        "|switch|p1b: Meowth|Meowth, L50|100/100|[from] Parting Shot",
         "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
         "|move|p2b: Charmander|Tackle|p1b: Eevee",
         "|switch|p1a: Eevee|Eevee, L50|100/100",
@@ -571,8 +577,9 @@ def test_replay_request_chunks_ignore_outcome_and_automatic_switch_lines() -> No
         [line.parts[1] for line in document.protocol_lines[start:end] if len(line.parts) > 1]
         for start, end, _ in segments
     ]
-    assert segment_tags[-3:] == [
-        ["turn", "move", "cant", "move", "switch", "move", "move"],
+    assert segment_tags[-4:] == [
+        ["turn", "move", "cant", "move"],
+        ["switch", "move", "move"],
         ["switch"],
         ["turn", "move", "win"],
     ]

@@ -304,7 +304,8 @@ def _perspective_tensors(
         ):
             fields[name].append(tensor)
 
-        mask = torch.as_tensor(action_mask(snapshot.view.decision), dtype=torch.bool)
+        decision_view = snapshot.action_view or snapshot.view.decision
+        mask = torch.as_tensor(action_mask(decision_view), dtype=torch.bool)
         values["action_mask"].append(mask)
 
         evidence = decision.evidence
@@ -731,14 +732,15 @@ def _measure_game(counters: Counter[str], game: CompiledGame) -> None:
                 # once per decision, then apply per-first-action constraints as
                 # cheap boolean array ops instead of calling validate_joint_action
                 # per candidate (81x faster — see scratch/bench_legality.py).
-                legal0 = set(legal_actions(snapshot.view.decision, 0))
-                base_slot1 = slot1_base_mask(snapshot.view.decision)
+                decision_view = snapshot.action_view or snapshot.view.decision
+                legal0 = set(legal_actions(decision_view, 0))
+                base_slot1 = slot1_base_mask(decision_view)
                 for first, second in decision.evidence.candidates:
                     if first not in legal0:
                         counters["illegal_candidates"] += 1
                         continue
                     slot1 = base_slot1.copy()
-                    apply_joint_constraints(slot1, snapshot.view.decision, first)
+                    apply_joint_constraints(slot1, decision_view, first)
                     if not slot1[second]:
                         counters["illegal_candidates"] += 1
             for tag in decision.evidence.tags:
