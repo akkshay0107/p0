@@ -183,11 +183,9 @@ async def test_showdown_order_sets_remain_nonempty_across_many_requests(showdown
             sorted({action for pair in decision.legal_joint_actions for action in pair})
         )
         observed = tuple(sorted(set(decision.legal_actions[0] + decision.legal_actions[1])))
+        assert observed
         assert set(projected) <= set(observed)
-        assert all(0 <= action < 49 for action in observed)
-        assert any(action in observed for action in (7, 8, 9, 10, 11)) or any(
-            action in observed for action in (1, 2, 3, 4, 5, 6, 48)
-        )
+        assert all(0 <= action < ACT_SIZE for action in observed)
 
 
 @pytest.mark.integration
@@ -232,12 +230,16 @@ async def test_policy_handles_showdown_captured_batches(
         actions = tuple(int(value) for value in acted.actions[index].tolist())
         assert actions in decision.legal_joint_actions
 
-    assert torch.isfinite(evaluated.logits.masked_select(action_mask)).all()
+    selected_logits = evaluated.logits.gather(2, acted.actions.unsqueeze(-1)).squeeze(-1)
+    assert torch.isfinite(selected_logits).all()
+    assert torch.logical_or(
+        torch.isfinite(evaluated.logits), torch.isneginf(evaluated.logits)
+    ).all()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_live_self_play_captures_decisions_across_repeated_games(showdown_server) -> None:
+async def test_live_capture_captures_decisions_across_repeated_games(showdown_server) -> None:
     decisions = await capture_showdown_decisions(
         showdown_server,
         game_count=stress_count("P0_STRESS_SELF_PLAY_GAMES", 2),

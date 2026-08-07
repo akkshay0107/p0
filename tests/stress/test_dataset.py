@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest
+from p0.runtime.process_context import PROCESS_CONTEXT
 from tests.stress._helpers import stress_count, stress_rng
 from tests.stress.replay_fixtures import golden_replay_payload, golden_series_id
 
@@ -44,7 +45,9 @@ def test_dataset_workers_yield_each_golden_perspective_once(tmp_path, num_worker
         for index in range(count)
         for player in (0, 1)
     }
-    loader_kwargs: dict[str, Any] = {"multiprocessing_context": "spawn"} if num_workers else {}
+    loader_kwargs: dict[str, Any] = (
+        {"multiprocessing_context": PROCESS_CONTEXT} if num_workers else {}
+    )
     loader = DataLoader(
         LazyReplayDataset(built.manifest_path, verify_hashes=True),
         batch_size=None,
@@ -67,7 +70,7 @@ def test_dataset_prefetch_and_repeated_iteration_are_stable(tmp_path) -> None:
         collate_fn=_dataset_identity,
         prefetch_factor=4,
         persistent_workers=True,
-        multiprocessing_context="spawn",
+        multiprocessing_context=PROCESS_CONTEXT,
     )
 
     def identity_rows():

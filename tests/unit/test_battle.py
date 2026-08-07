@@ -18,6 +18,7 @@ from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
+from poke_env.ps_client.ps_client import PSClient
 
 from p0.battle.actions import (
     ACT_SIZE,
@@ -112,7 +113,6 @@ from p0.runtime.poke_env_action_adapter import (
     single_order_to_action,
 )
 from p0.runtime.poke_env_battle_adapter import battle_view, current_battle_view, decision_view
-from p0.teams.source import ValidatedTeam
 from p0.teams.stat_points import (
     BaseStats,
     Role,
@@ -227,13 +227,16 @@ def test_protocol_parser_accepts_an_injected_resource_resolver() -> None:
 def test_patch_installation_is_idempotent_reversible_and_logger_scoped() -> None:
     poke_env_patches.uninstall_for_tests()
     original = DoubleBattle.parse_message
+    original_stop = PSClient.stop_listening
     poke_env_patches.install()
     installed = DoubleBattle.parse_message
     poke_env_patches.install()
     assert DoubleBattle.parse_message is installed
     assert installed is not original
+    assert PSClient.stop_listening is not original_stop
     poke_env_patches.uninstall_for_tests()
     assert DoubleBattle.parse_message is original
+    assert PSClient.stop_listening is original_stop
 
     target = logging.getLogger("test.poke-env")
     other = logging.getLogger("test.other")
@@ -700,74 +703,6 @@ def make_real_battle(
     battle._side_conditions = side_conditions or {}
     battle._opponent_side_conditions = opponent_side_conditions or {}
     return battle
-
-
-# --- FIXTURES ---
-
-
-@pytest.fixture(scope="module")
-def battle_format():
-    return FORMAT.battle_format
-
-
-@pytest.fixture(scope="module")
-def sample_team():
-    team = """
-Pikachu @ Light Ball
-Ability: Static
-Level: 50
-Jolly Nature
-- Fake Out
-- Protect
-- Thunderbolt
-- Electroweb
-
-Charizard @ Charizardite Y
-Ability: Blaze
-Level: 50
-Modest Nature
-- Heat Wave
-- Solar Beam
-- Protect
-- Weather Ball
-
-Whimsicott @ Focus Sash
-Ability: Prankster
-Level: 50
-Timid Nature
-- Moonblast
-- Tailwind
-- Encore
-- Protect
-
-Garchomp @ Sitrus Berry
-Ability: Rough Skin
-Level: 50
-Jolly Nature
-- Earthquake
-- Dragon Claw
-- Rock Slide
-- Protect
-
-Kingambit @ Black Glasses
-Ability: Defiant
-Level: 50
-Adamant Nature
-- Kowtow Cleave
-- Sucker Punch
-- Protect
-- Low Kick
-
-Glimmora @ Shuca Berry
-Ability: Toxic Debris
-Level: 50
-Modest Nature
-- Power Gem
-- Sludge Bomb
-- Earth Power
-- Protect
-"""
-    return ValidatedTeam.from_showdown(team).packed
 
 
 def test_pokemon_categorical_and_numeric_rows_real():

@@ -6,11 +6,24 @@ import pytest
 import torch
 from poke_env import LocalhostServerConfiguration, ServerConfiguration
 
+from p0.evaluation.harness import DEFAULT_TEST_TEAM
+from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
+from p0.teams.source import ValidatedTeam
 
 SHOWDOWN_TEST_PORT = 8120
+
+
+@pytest.fixture(scope="session")
+def battle_format() -> str:
+    return FORMAT.battle_format
+
+
+@pytest.fixture(scope="session")
+def sample_team() -> str:
+    return ValidatedTeam.from_showdown(DEFAULT_TEST_TEAM).packed
 
 
 @pytest.fixture(scope="function")

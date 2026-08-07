@@ -2,17 +2,19 @@ import asyncio
 
 import pytest
 import torch
+from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
 
+from p0.model.observation_builder import ObservationBuilder
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
 )
-from p0.model.tokenizer import tokenizer
+from p0.runtime.poke_env_battle_adapter import battle_view
 from tests.stress._helpers import capture_showdown_decisions, stress_count
-from tests.unit.test_battle import from_battle
 
 
 @pytest.mark.integration
@@ -21,18 +23,24 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
     """Exercise observation construction against the real local Showdown protocol."""
     captured_battles = []
     captured_errors = []
+    builder = ObservationBuilder(default_runtime_resources())
+
+    def build_observation(battle: AbstractBattle) -> StructuredObservation:
+        if not isinstance(battle, DoubleBattle):
+            raise TypeError(f"Expected DoubleBattle, got {type(battle).__name__}")
+        return builder.build(battle_view(battle))
 
     class CapturePlayer(RandomPlayer):
         def teampreview(self, battle):
             try:
-                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
+                captured_battles.append((battle.teampreview, build_observation(battle)))
             except Exception as exc:
                 captured_errors.append(f"teampreview: {exc}")
             return super().teampreview(battle)
 
         def choose_move(self, battle):
             try:
-                captured_battles.append((battle.teampreview, from_battle(battle, tokenizer)))
+                captured_battles.append((battle.teampreview, build_observation(battle)))
             except Exception as exc:
                 captured_errors.append(f"choose_move: {exc}")
             return super().choose_move(battle)

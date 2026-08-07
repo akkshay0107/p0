@@ -51,6 +51,7 @@ from p0.replays.shards import (
     observation_field_specs,
     validate_shard_tensors,
 )
+from p0.runtime.process_context import PROCESS_CONTEXT
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 REPLAY_PARSER_VERSION = 1
@@ -914,12 +915,16 @@ def compile_documents(
             chunksize = max(1, len(jobs) // (worker_count * 4))
 
         if len(jobs) <= worker_count or chunksize <= 0:
-            # For small corpora the process-pool spawn cost exceeds the
+            # For small corpora the process-pool startup cost exceeds the
             # benefit; run inline so callers get deterministic single-process
             # behaviour without the multiprocessing fork() deprecation.
             results = (_compile_worker(job) for job in jobs)
         else:
-            with concurrent.futures.ProcessPoolExecutor() as executor:
+            # Do not inherit the parent process with fork: the compiler can run
+            # after PyTorch and other threaded libraries have been initialized,
+            # which makes fork unsafe and emits a deprecation warning on Python
+            # 3.13+. Use the shared forkserver-on-Linux/spawn-elsewhere context.
+            with concurrent.futures.ProcessPoolExecutor(mp_context=PROCESS_CONTEXT) as executor:
                 results = executor.map(_compile_worker, jobs, chunksize=chunksize)
 
         for compiled, exc_name in results:

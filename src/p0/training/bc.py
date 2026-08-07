@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.replays.dataset import ReplayGameChunk
+from p0.runtime.process_context import PROCESS_CONTEXT
 from p0.training._bc_batch import (
     BCBatchDataset,
     BCDecisionBatch,
@@ -138,7 +139,7 @@ class BCTrainer:
             num_workers=num_workers,
             batch_size=None,
             prefetch_factor=prefetch_factor,
-            multiprocessing_context="spawn" if num_workers > 0 else None,
+            multiprocessing_context=PROCESS_CONTEXT if num_workers > 0 else None,
             worker_init_fn=_seed_bc_worker if num_workers > 0 else None,
             generator=torch.Generator().manual_seed(self.config.seed),
         )

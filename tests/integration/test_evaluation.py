@@ -46,8 +46,13 @@ async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
     assert result.team_category == "fallback"
     assert result.total_games == 1
     assert result.wins_a + result.wins_b == 1
+    assert result.ties == 0
     assert result.win_rate_a in (0.0, 1.0)
     assert len(result.per_team_results) == 1
+    stats = next(iter(result.per_team_results.values()))
+    assert stats["games"] == 1
+    assert stats["wins"] == result.wins_a
+    assert stats["win_rate"] == pytest.approx(stats["wins"] / stats["games"])
 
     # Check dictionary serialization
     dct = result.to_dict()
@@ -58,18 +63,32 @@ async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_server) -> None:
-    harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
-    result = await harness.run_matchup(
-        "random-a",
-        None,
-        "random-b",
-        None,
-        "seen",
-        FixedTeamSource(DEFAULT_TEST_TEAM),
-        showdown_server,
-    )
+    from p0.runtime import poke_env_patches
+
+    poke_env_patches.install()
+    try:
+        harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
+        result = await harness.run_matchup(
+            "random-a",
+            None,
+            "random-b",
+            None,
+            "fallback",
+            FixedTeamSource(DEFAULT_TEST_TEAM),
+            showdown_server,
+        )
+    finally:
+        poke_env_patches.uninstall_for_tests()
+
     assert result.total_games == 2
     assert result.wins_a + result.wins_b == result.total_games
+    assert result.ties == 0
     assert all(
         set(stats) == {"wins", "games", "win_rate"} for stats in result.per_team_results.values()
+    )
+    assert sum(stats["games"] for stats in result.per_team_results.values()) == result.total_games
+    assert all(
+        0 <= stats["wins"] <= stats["games"]
+        and stats["win_rate"] == pytest.approx(stats["wins"] / stats["games"])
+        for stats in result.per_team_results.values()
     )

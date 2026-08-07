@@ -1411,6 +1411,9 @@ def test_compiler_closes_process_pool_after_worker_failure(monkeypatch) -> None:
     events: list[str] = []
 
     class FailingPool:
+        def __init__(self, **kwargs):
+            del kwargs
+
         def __enter__(self):
             events.append("enter")
             return self

@@ -1,10 +1,11 @@
-"""Unavoidable poke-env patches."""
+"""Unavoidable poke-env compatibility patches."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from time import perf_counter
+from typing import Any, cast
 
 from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon
 from poke_env.environment.env import _EnvPlayer
@@ -13,6 +14,7 @@ from poke_env.ps_client.ps_client import PSClient
 from p0.runtime.live_event_capture import capture_message
 
 _ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
+_ORIGINAL_STOP_LISTENING = PSClient.stop_listening
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
 _ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _installed = False
@@ -70,8 +72,32 @@ def _forme_change(self: Pokemon, species: str) -> None:
     self._update_from_pokedex(normalized_species, store_species=True)
 
 
+async def _stop_listening_cleanly(self: PSClient) -> None:
+    """Close a client and drain poke-env's listener/message-handler tasks.
+
+    poke-env 0.15 closes the websocket from ``stop_listening`` but does not
+    wait for the listener future or the message-handler tasks it creates on its
+    dedicated event loop. Those tasks otherwise survive until the loop is
+    closed, producing pending-task warnings during integration-test cleanup.
+    """
+    await _ORIGINAL_STOP_LISTENING(self)
+
+    listening_future = getattr(self, "_listening_coroutine", None)
+    if listening_future is not None:
+        await asyncio.wrap_future(listening_future)
+
+    async def cancel_active_tasks() -> None:
+        tasks = tuple(cast(set[asyncio.Task[Any]], getattr(self, "_active_tasks", set())))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(cancel_active_tasks(), self.loop))
+
+
 def install(logger: logging.Logger | None = None) -> None:
-    """Install monkey patches for login waiting and message event capture."""
+    """Install compatibility patches for the pinned poke-env release."""
     global _installed
     target = logger or logging.getLogger("poke_env")
 
@@ -83,6 +109,7 @@ def install(logger: logging.Logger | None = None) -> None:
         return
 
     PSClient.wait_for_login = _wait_for_login
+    PSClient.stop_listening = _stop_listening_cleanly
     DoubleBattle.parse_message = _parse_message
     Pokemon.forme_change = _forme_change
     _installed = True
@@ -97,6 +124,7 @@ def uninstall_for_tests() -> None:
     _filtered_loggers.clear()
     if _installed:
         PSClient.wait_for_login = _ORIGINAL_WAIT_FOR_LOGIN
+        PSClient.stop_listening = _ORIGINAL_STOP_LISTENING
         DoubleBattle.parse_message = _ORIGINAL_PARSE_MESSAGE
         Pokemon.forme_change = _ORIGINAL_FORME_CHANGE
         _installed = False
