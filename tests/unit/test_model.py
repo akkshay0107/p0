@@ -619,6 +619,58 @@ def test_candidate_scoring_runs_reducer_once_per_observation_batch(policy) -> No
     assert calls == [True]
 
 
+def test_reduced_candidate_scoring_matches_the_full_pass(policy) -> None:
+    encoded, action_mask, memory = _inputs(policy, batch_size=2)
+    candidates = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.long)
+    offsets = torch.tensor([0, 2, 3], dtype=torch.long)
+
+    with torch.no_grad():
+        expected = policy.actor.score_joint_candidates(
+            encoded, action_mask, *memory, candidates, offsets
+        )
+        reduced = policy.actor.reducer(encoded.tokens, *memory)
+        actual = policy.actor.score_reduced_candidates(
+            reduced, encoded, action_mask, candidates, offsets
+        )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_greedy_reduced_matches_the_full_pass(policy) -> None:
+    encoded, action_mask, memory = _inputs(policy, batch_size=2)
+
+    with torch.inference_mode():
+        expected = policy.actor.greedy(encoded, action_mask, *memory)
+        reduced = policy.actor.reducer(encoded.tokens, *memory)
+        actual = policy.actor.greedy_reduced(reduced, encoded, action_mask)
+
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_reducer_rejects_a_local_summary_that_does_not_match_the_batch(policy) -> None:
+    encoded, _, memory = _inputs(policy, batch_size=2)
+    summary = policy.actor.reducer.local_summary(encoded.tokens)
+
+    with pytest.raises(ValueError, match="local summary"):
+        policy.actor.reducer.reduce(summary[:1], encoded.tokens, *memory)
+    with pytest.raises(ValueError, match="local summary"):
+        policy.actor.reducer.reduce(summary.to(torch.float64), encoded.tokens, *memory)
+
+
+def test_reduced_entry_points_reject_a_batch_they_did_not_reduce(policy) -> None:
+    encoded, action_mask, memory = _inputs(policy, batch_size=2)
+    reduced = policy.actor.reducer(encoded.tokens, *memory)
+    single = EncodedObs(encoded.tokens[:1], encoded.aux[:1], encoded.numerical[:1])
+    candidates = torch.tensor([[7, 8]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="Reduced batch"):
+        policy.actor.score_reduced_candidates(
+            reduced, single, action_mask[:1], candidates, torch.tensor([0, 1])
+        )
+    with pytest.raises(ValueError, match="Reduced batch"):
+        policy.actor.greedy_reduced(reduced, single, action_mask[:1])
+
+
 def test_candidate_order_does_not_change_scores(policy) -> None:
     encoded, action_mask, memory = _inputs(policy, batch_size=1)
     candidates = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.long)

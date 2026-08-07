@@ -22,7 +22,6 @@ from p0.battle.legality import (
     legal_actions,
     slot1_base_mask,
 )
-from p0.battle.series import GameSummary, SideGameSummary
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     FORMAT,
@@ -55,7 +54,7 @@ from p0.runtime.process_context import PROCESS_CONTEXT
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 REPLAY_PARSER_VERSION = 1
-REPLAY_COMPILER_VERSION = 6
+REPLAY_COMPILER_VERSION = 7
 IMPUTATION_ALGORITHM = "causal_stat_point_imputation"
 IMPUTATION_VERSION = 1
 
@@ -68,70 +67,6 @@ class ShardBuildResult:
 
 def _normalized(value: str) -> str:
     return "".join(character for character in value.casefold() if character.isalnum())
-
-
-def _summary_side(document: ReplayDocument, side: int) -> SideGameSummary | None:
-    ots = document.ots[side]
-    species = tuple(_normalized(value) for value in ots.revealed_species)
-    if len(species) < 2:
-        return None
-    moves_used: dict[str, set[str]] = {}
-    mega_species = ""
-    switch_count = 0
-    for line in document.protocol_lines:
-        parts = line.parts
-        if len(parts) < 3:
-            continue
-        if parts[1] in {"switch", "drag"} and parts[2].startswith(f"p{side + 1}"):
-            switch_count += 1
-        if parts[1] == "move" and parts[2].startswith(f"p{side + 1}") and len(parts) >= 4:
-            owner = _normalized(parts[2].split(":", 1)[-1])
-            moves_used.setdefault(owner, set()).add(_normalized(parts[3]))
-        if parts[1] == "-mega" and parts[2].startswith(f"p{side + 1}"):
-            mega_species = _normalized(parts[2].split(":", 1)[-1])
-    details = {_normalized(name): payload for name, payload in ots.revealed_details.items()}
-    items = {
-        _normalized(name): _normalized(str(payload["item"]))
-        for name, payload in details.items()
-        if payload.get("item")
-    }
-    abilities = {
-        _normalized(name): _normalized(str(payload["ability"]))
-        for name, payload in details.items()
-        if payload.get("ability")
-    }
-    return SideGameSummary(
-        leads=species[:2],
-        brought=species[:4],
-        mega_species=mega_species,
-        moves_used={name: tuple(sorted(values)) for name, values in sorted(moves_used.items())},
-        revealed_items=items,
-        revealed_abilities=abilities,
-        revealed_formes=(),
-        switch_count=switch_count,
-        pivot_count=0,
-    )
-
-
-def _game_summary(
-    game: CompiledGame,
-    *,
-    series_score: tuple[int, int],
-    canonical_roles: tuple[int, int],
-) -> GameSummary | None:
-    first_side, second_side = (_summary_side(game.document, side) for side in (0, 1))
-    if first_side is None or second_side is None:
-        return None
-    winner = (
-        -1 if game.document.outcome.winner < 0 else canonical_roles[game.document.outcome.winner]
-    )
-    return GameSummary(
-        game_number=game.game_number,
-        winner=winner,
-        series_score=series_score,
-        turns=game.document.outcome.turns,
-        sides=(first_side, second_side) if canonical_roles == (0, 1) else (second_side, first_side),
-    )
 
 
 def _runtime_hash(manifest_path: str | Path) -> str:
@@ -174,6 +109,10 @@ def _build_configuration(
         "parser_version": REPLAY_PARSER_VERSION,
         "replay_ir_version": 1,
         "compiler_version": REPLAY_COMPILER_VERSION,
+        # The dataset hash names the output directory, so the shard layout has
+        # to be part of it: a schema-only bump must land in a new directory
+        # rather than colliding with a build the reader would now reject.
+        "artifact_schema": SHARD_ARTIFACT_SCHEMA,
         "max_candidates": max_candidates,
         "imputation": {
             "algorithm": IMPUTATION_ALGORITHM,
@@ -513,7 +452,6 @@ def write_tensor_shards(
                             for line in game.document.protocol_lines
                         )
                     ),
-                    "summary": None,
                 }
             )
         series_offsets.append(game_offsets[-1])

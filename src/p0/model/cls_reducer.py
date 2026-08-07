@@ -132,6 +132,41 @@ class MemoryReducer(nn.Module):
         history_age_ids: Tensor,
     ) -> ReducerOutput:
         """Run full attention over the fixed memory window."""
+        # Validate before summarizing so a malformed window costs no attention.
+        self._validate_inputs(
+            current_tokens,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
+        return self.reduce(
+            self.local_summary(current_tokens),
+            current_tokens,
+            series_tokens,
+            series_mask,
+            history_tokens,
+            history_mask,
+            history_age_ids,
+        )
+
+    def reduce(
+        self,
+        local_summary: Tensor,
+        current_tokens: Tensor,
+        series_tokens: Tensor,
+        series_mask: Tensor,
+        history_tokens: Tensor,
+        history_mask: Tensor,
+        history_age_ids: Tensor,
+    ) -> ReducerOutput:
+        """Reduce the memory window from an already-computed local summary.
+
+        Behaviour cloning builds the per-decision local summaries to fill its
+        history window, so it passes the target rows straight back in rather
+        than paying for the same attention twice.
+        """
         self._validate_inputs(
             current_tokens,
             series_tokens,
@@ -142,8 +177,16 @@ class MemoryReducer(nn.Module):
         )
         device = current_tokens.device
         batch = current_tokens.size(0)
-
-        local_summary = self.local_summary(current_tokens)
+        if (
+            local_summary.shape != (batch, self.d_model)
+            or local_summary.dtype != current_tokens.dtype
+            or local_summary.device != current_tokens.device
+        ):
+            raise ValueError(
+                f"Expected a local summary of shape ({batch}, {self.d_model}) matching "
+                f"{current_tokens.dtype} on {current_tokens.device}; got "
+                f"{tuple(local_summary.shape)} of {local_summary.dtype} on {local_summary.device}"
+            )
 
         series_slots = torch.arange(SERIES_SLOTS, device=device)
         series = (

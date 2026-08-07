@@ -20,7 +20,6 @@ from typing import Any, Mapping
 import torch
 
 from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
-from p0.battle.series import SERIES_SUMMARY_SCHEMA_VERSION
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, validate_artifact_runtime_contract
 from p0.model.structured_observation import (
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
@@ -37,7 +36,7 @@ from p0.replays.schema import (
     _require_iso_timestamp,
 )
 
-SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v4"
+SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v5"
 BO3_COMPILATION_SEMANTICS = "canonical_player_bo3_history.v1"
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
@@ -64,8 +63,9 @@ SHARD_TENSOR_SPECS: tuple[tuple[str, tuple[int, ...], torch.dtype], ...] = (
     ("outcome", (-1,), torch.float32),
 )
 
-# Per-game GameSummary payloads ride along as JSON strings, not tensors, so
-# the series-context encoder owns their tensorization inside each game graph.
+# Per-game identity records ride along as JSON, not tensors: the series and
+# canonical-player each game belongs to, plus its outcome provenance. Series
+# context itself is continuous and rebuilt in process, never stored here.
 SHARD_SUMMARY_KEY = "series_summaries"
 
 
@@ -154,7 +154,6 @@ class ShardManifest:
     artifact_schema: str = SHARD_ARTIFACT_SCHEMA
     observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
     replay_ir_schema_version: int = REPLAY_IR_SCHEMA_VERSION
-    series_summary_schema_version: int = SERIES_SUMMARY_SCHEMA_VERSION
 
     _FIELDS = frozenset(
         {
@@ -175,7 +174,6 @@ class ShardManifest:
             "artifact_schema",
             "observation_schema_version",
             "replay_ir_schema_version",
-            "series_summary_schema_version",
         }
     )
 
@@ -193,11 +191,6 @@ class ShardManifest:
                 OBSERVATION_SCHEMA_VERSION,
             ),
             ("replay_ir_schema_version", self.replay_ir_schema_version, REPLAY_IR_SCHEMA_VERSION),
-            (
-                "series_summary_schema_version",
-                self.series_summary_schema_version,
-                SERIES_SUMMARY_SCHEMA_VERSION,
-            ),
         ):
             if declared != expected:
                 raise ValueError(
@@ -304,7 +297,6 @@ class ShardManifest:
             },
             "observation_schema_version": self.observation_schema_version,
             "replay_ir_schema_version": self.replay_ir_schema_version,
-            "series_summary_schema_version": self.series_summary_schema_version,
             "shards": [entry.to_dict() for entry in self.shards],
             "diagnostics": {key: self.diagnostics[key] for key in sorted(self.diagnostics)},
             "created_at": self.created_at,
@@ -352,7 +344,6 @@ class ShardManifest:
             },
             observation_schema_version=int(value["observation_schema_version"]),
             replay_ir_schema_version=int(value["replay_ir_schema_version"]),
-            series_summary_schema_version=int(value["series_summary_schema_version"]),
             shards=tuple(ShardIndexEntry.from_dict(entry) for entry in value["shards"]),
             diagnostics={str(key): int(count) for key, count in diagnostics.items()},
             created_at=str(value["created_at"]),

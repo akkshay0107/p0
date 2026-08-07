@@ -13,6 +13,7 @@ from torch import Tensor
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
+from p0.model.cls_reducer import ReducerOutput
 from p0.model.policy import EncodedObs, PolicyNet
 from p0.replays.dataset import ReplayGameChunk
 from p0.runtime.process_context import PROCESS_CONTEXT
@@ -39,13 +40,21 @@ class BCCancelled(RuntimeError):
     """Raised between batches so callers keep the last completed epoch checkpoint."""
 
 
-BCModelInputs = tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
-
-
 @dataclass(frozen=True, slots=True)
 class _PreparedBCBatch:
-    model_inputs: BCModelInputs
+    """One collated batch resolved into the tensors the policy consumes."""
+
+    encoded: EncodedObs
+    action_mask: Tensor
+    series_tokens: Tensor
+    series_mask: Tensor
+    history_tokens: Tensor
+    history_mask: Tensor
+    history_age_ids: Tensor
     history_updates: tuple[_BCHistoryUpdate, ...]
+    # The target rows' local summaries, already built for the history window.
+    # Handing them to the reducer keeps each batch to a single reducer pass.
+    target_local_tokens: Tensor
 
 
 def _empty_training_totals() -> dict[str, float | int]:
@@ -254,16 +263,27 @@ class BCTrainer:
             self.policy.series.resample_single_game,
         )
         return _PreparedBCBatch(
-            model_inputs=(
-                target_encoded,
-                batch.action_mask.to(self.device),
-                series_context.tokens,
-                series_context.mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
-            ),
+            encoded=target_encoded,
+            action_mask=batch.action_mask.to(self.device),
+            series_tokens=series_context.tokens,
+            series_mask=series_context.mask,
+            history_tokens=history_tokens,
+            history_mask=history_mask,
+            history_age_ids=history_age_ids,
             history_updates=series_context.updates,
+            target_local_tokens=target_local_tokens,
+        )
+
+    def _reduce(self, prepared: _PreparedBCBatch) -> ReducerOutput:
+        """Run the one memory-reducer pass this batch is allowed."""
+        return self.policy.actor.reducer.reduce(
+            prepared.target_local_tokens,
+            prepared.encoded.tokens,
+            prepared.series_tokens,
+            prepared.series_mask,
+            prepared.history_tokens,
+            prepared.history_mask,
+            prepared.history_age_ids,
         )
 
     def _forward_batch(
@@ -271,30 +291,18 @@ class BCTrainer:
         batch: BCDecisionBatch,
     ) -> tuple[Tensor, Tensor, tuple[_BCHistoryUpdate, ...]]:
         prepared = self._prepare_model_inputs(batch)
-        encoded, _, series_tokens, series_mask, history_tokens, history_mask, history_age_ids = (
-            prepared.model_inputs
-        )
-        reduced = self.policy.actor.reducer(
-            encoded.tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-        )
+        reduced = self._reduce(prepared)
         return (
-            self.policy.actor.score_joint_candidates(
-                *prepared.model_inputs,
+            self.policy.actor.score_reduced_candidates(
+                reduced,
+                prepared.encoded,
+                prepared.action_mask,
                 batch.candidate_values.to(self.device),
                 batch.candidate_offsets.to(self.device),
             ),
             self.policy.critic(reduced.cls),
             prepared.history_updates,
         )
-
-    def _greedy_actions(self, model_inputs: BCModelInputs) -> tuple[Tensor, Tensor]:
-        actions, log_probs, _, _ = self.policy.actor.greedy(*model_inputs)
-        return actions, log_probs
 
     def _step_optimizer(self, loss_weight: float) -> bool:
         if loss_weight <= 0:
@@ -382,29 +390,15 @@ class BCTrainer:
 
         for batch in collate_bc_batches(source, chunk_size):
             prepared = self._prepare_model_inputs(batch)
-            model_inputs = prepared.model_inputs
+            encoded, action_mask = prepared.encoded, prepared.action_mask
+            reduced = self._reduce(prepared)
             candidate_offsets = batch.candidate_offsets.to(self.device)
-            candidate_log_probs = self.policy.actor.score_joint_candidates(
-                *model_inputs,
-                batch.candidate_values.to(self.device),
-                candidate_offsets,
-            )
-            (
+            candidate_log_probs = self.policy.actor.score_reduced_candidates(
+                reduced,
                 encoded,
                 action_mask,
-                series_tokens,
-                series_mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
-            ) = model_inputs
-            reduced = self.policy.actor.reducer(
-                encoded.tokens,
-                series_tokens,
-                series_mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
+                batch.candidate_values.to(self.device),
+                candidate_offsets,
             )
             value_predictions = self.policy.critic(reduced.cls)
             accumulator.add_legality(
@@ -433,7 +427,9 @@ class BCTrainer:
                 marginal_nll,
                 torch.zeros_like(marginal_nll),
             )
-            predicted, best_scores = self._greedy_actions(model_inputs)
+            predicted, best_scores, _, _ = self.policy.actor.greedy_reduced(
+                reduced, encoded, action_mask
+            )
             accumulator.add(
                 batch,
                 candidate_offsets=candidate_offsets,

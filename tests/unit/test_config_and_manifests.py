@@ -19,12 +19,7 @@ from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.status import Status
 
-from p0.battle.series import (
-    MAX_PRIOR_GAMES,
-    GameSummary,
-    SeriesPerspectiveKey,
-    SideGameSummary,
-)
+from p0.battle.series import SeriesPerspectiveKey
 from p0.cli.build_vocab import build
 from p0.cli.corpus import _variants_from_showdown
 from p0.cli.corpus import main as corpus_main
@@ -331,32 +326,6 @@ def _series_record() -> SeriesRecord:
     )
 
 
-def _side_summary() -> SideGameSummary:
-    return SideGameSummary(
-        leads=("koraidon", "fluttermane"),
-        brought=("koraidon", "fluttermane", "amoonguss"),
-        mega_species="",
-        moves_used={"koraidon": ("collisioncourse",)},
-        revealed_items={"koraidon": "clearamulet"},
-        revealed_abilities={"koraidon": "orichalcumpulse"},
-        revealed_formes=(),
-        switch_count=2,
-        pivot_count=0,
-        plan_tags=("protect",),
-    )
-
-
-def _game_summary() -> GameSummary:
-    return GameSummary(
-        game_number=1,
-        winner=0,
-        series_score=(1, 0),
-        turns=9,
-        sides=(_side_summary(), _side_summary()),
-        speed_observations=("koraidon>fluttermane",),
-    )
-
-
 def _shard_manifest() -> ShardManifest:
     entry = ShardIndexEntry(
         filename="shard-000.pt", sha256="c" * 64, decisions=10, games=2, series=1, byte_size=1024
@@ -457,18 +426,6 @@ def test_ir_validates_construction() -> None:
         SeriesRecord.from_dict({**_series_record().to_dict(), "score": [1, 0]})
 
 
-def test_game_summary_round_trip() -> None:
-    summary = _game_summary()
-    assert GameSummary.from_dict(summary.to_dict()) == summary
-    assert MAX_PRIOR_GAMES == 2
-    with pytest.raises(ValueError, match="schema"):
-        GameSummary.from_dict({**summary.to_dict(), "summary_schema": 2})
-    with pytest.raises(ValueError, match="normalized"):
-        SideGameSummary.from_dict({**_side_summary().to_dict(), "leads": ["Koraidon", "x"]})
-    with pytest.raises(ValueError, match="credit the winner"):
-        GameSummary.from_dict({**summary.to_dict(), "series_score": [0, 1]})
-
-
 def test_observation_specs_are_derived() -> None:
     from p0.model.structured_observation import StructuredObservation
 
@@ -507,6 +464,11 @@ def test_shard_manifest_contract() -> None:
         ShardManifest.from_dict({**manifest.to_dict(), "artifact_schema": "p0.replay_shard.v0"})
     with pytest.raises(ValueError, match="observation_schema_version"):
         ShardManifest.from_dict({**manifest.to_dict(), "observation_schema_version": 2})
+    # Series context is continuous and rebuilt in process, so the retired
+    # symbolic-summary field must not reappear in a manifest.
+    assert "series_summary_schema_version" not in manifest.to_dict()
+    with pytest.raises(ValueError, match="unknown"):
+        ShardManifest.from_dict({**manifest.to_dict(), "series_summary_schema_version": 1})
 
 
 def test_corpus_manifest_contract() -> None:

@@ -390,12 +390,15 @@ class LazyReplayDataset(IterableDataset):
         ):
             raise ValueError(f"Shard index metadata does not match payload {path}")
 
+        # outcome_valid gates every value-head decision, so a shard that omitted
+        # it would silently train the critic on nothing.
         required_summary_fields = {
             "series_id",
             "game_number",
             "player",
             "canonical_player",
-            "summary",
+            "source_replay_id",
+            "outcome_valid",
         }
         if not all(
             isinstance(item, Mapping) and required_summary_fields <= set(item) for item in summaries
@@ -437,7 +440,7 @@ class LazyReplayDataset(IterableDataset):
             candidate_offsets=candidate_offsets,
             outcome=tensors["outcome"][start:end].clone(),
             is_series_end=is_series_end,
-            outcome_valid=bool(item.get("outcome_valid", False)),
+            outcome_valid=bool(item["outcome_valid"]),
         )
 
 

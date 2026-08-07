@@ -97,6 +97,15 @@ class EvalOutput(NamedTuple):
     logits: Tensor
 
 
+def _require_matching_batch(reduced: ReducerOutput, enc: EncodedObs) -> None:
+    """Reject a reduced batch that was not produced from these observations."""
+    if reduced.cls.size(0) != enc.tokens.size(0):
+        raise ValueError(
+            f"Reduced batch of {reduced.cls.size(0)} does not match "
+            f"{enc.tokens.size(0)} encoded observations"
+        )
+
+
 class CandidateScorer(Protocol):
     """Pinned seam for behaviour-cloning candidate marginalization.
 
@@ -422,14 +431,28 @@ class ActorPolicy(nn.Module):
         history_age_ids: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Choose one legal joint action through the autoregressive path."""
-        reduced = self.reducer(
-            enc.tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
+        return self.greedy_reduced(
+            self.reducer(
+                enc.tokens,
+                series_tokens,
+                series_mask,
+                history_tokens,
+                history_mask,
+                history_age_ids,
+            ),
+            enc,
+            action_mask,
         )
+
+    @torch.no_grad()
+    def greedy_reduced(
+        self,
+        reduced: ReducerOutput,
+        enc: EncodedObs,
+        action_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Choose one legal joint action from a batch that is already reduced."""
+        _require_matching_batch(reduced, enc)
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
 
@@ -506,6 +529,32 @@ class ActorPolicy(nn.Module):
         log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
         return logits, log_probs, z, reduced.local_history_token
 
+    def _validated_offsets(
+        self,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> Tensor:
+        """Check the ragged candidate encoding and align its offsets to the batch."""
+        batch_size = enc.tokens.size(0)
+        if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
+            raise ValueError("candidate_values must have shape (candidates, 2)")
+        if candidate_values.dtype != torch.long:
+            raise ValueError("candidate_values must use torch.long action ids")
+        if candidate_offsets.dim() != 1 or candidate_offsets.numel() != batch_size + 1:
+            raise ValueError("candidate_offsets must have one boundary per observation")
+        if action_mask.shape != (batch_size, 2, self.act_size):
+            raise ValueError("action_mask shape does not match encoded observations")
+        if candidate_values.device != enc.tokens.device or action_mask.device != enc.tokens.device:
+            raise ValueError("candidate tensors and action_mask must share the encoded device")
+        offsets = candidate_offsets.to(device=enc.tokens.device, dtype=torch.long)
+        if offsets[0].item() != 0 or offsets[-1].item() != candidate_values.size(0):
+            raise ValueError("candidate_offsets must start at zero and end at candidate count")
+        if torch.any(offsets[1:] < offsets[:-1]):
+            raise ValueError("candidate_offsets must be nondecreasing")
+        return offsets
+
     def score_joint_candidates(
         self,
         enc: EncodedObs,
@@ -520,23 +569,9 @@ class ActorPolicy(nn.Module):
     ) -> Tensor:
         """Score ragged candidates after one stateless reducer pass."""
         batch_size = enc.tokens.size(0)
-        if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
-            raise ValueError("candidate_values must have shape (candidates, 2)")
-        if candidate_values.dtype != torch.long:
-            raise ValueError("candidate_values must use torch.long action ids")
-        if candidate_offsets.dim() != 1 or candidate_offsets.numel() != batch_size + 1:
-            raise ValueError("candidate_offsets must have one boundary per observation")
-        if action_mask.shape != (batch_size, 2, self.act_size):
-            raise ValueError("action_mask shape does not match encoded observations")
         if series_tokens.size(0) != batch_size or history_tokens.size(0) != batch_size:
             raise ValueError("memory inputs must match encoded observation batch size")
-        if candidate_values.device != enc.tokens.device or action_mask.device != enc.tokens.device:
-            raise ValueError("candidate tensors and action_mask must share the encoded device")
-        offsets = candidate_offsets.to(device=enc.tokens.device, dtype=torch.long)
-        if offsets[0].item() != 0 or offsets[-1].item() != candidate_values.size(0):
-            raise ValueError("candidate_offsets must start at zero and end at candidate count")
-        if torch.any(offsets[1:] < offsets[:-1]):
-            raise ValueError("candidate_offsets must be nondecreasing")
+        offsets = self._validated_offsets(enc, action_mask, candidate_values, candidate_offsets)
         reduced = self.reducer(
             enc.tokens,
             series_tokens,
@@ -545,6 +580,30 @@ class ActorPolicy(nn.Module):
             history_mask,
             history_age_ids,
         )
+        return self._score_reduced(reduced, enc, action_mask, candidate_values, offsets)
+
+    def score_reduced_candidates(
+        self,
+        reduced: ReducerOutput,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> Tensor:
+        """Score ragged candidates against a batch that is already reduced."""
+        _require_matching_batch(reduced, enc)
+        offsets = self._validated_offsets(enc, action_mask, candidate_values, candidate_offsets)
+        return self._score_reduced(reduced, enc, action_mask, candidate_values, offsets)
+
+    def _score_reduced(
+        self,
+        reduced: ReducerOutput,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        candidate_values: Tensor,
+        offsets: Tensor,
+    ) -> Tensor:
+        batch_size = enc.tokens.size(0)
         if candidate_values.numel() == 0:
             return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
         if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
