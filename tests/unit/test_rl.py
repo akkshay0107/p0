@@ -16,6 +16,7 @@ from p0.battle.actions import ACT_SIZE
 from p0.evaluation.harness import (
     EvaluationHarness,
 )
+from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import ActOutput
@@ -43,9 +44,12 @@ class FakePolicy:
         self.device = torch.device("cpu")
         self.d_model = 1
         self.batch_sizes: list[int] = []
-        self.series = SimpleNamespace(
-            resample_single_game=lambda x: torch.zeros((x.size(0), 4, self.d_model))
-        )
+        self.summarized_lengths: list[int] = []
+        self.series = SimpleNamespace(resample_single_game=self._resample_single_game)
+
+    def _resample_single_game(self, history: torch.Tensor) -> torch.Tensor:
+        self.summarized_lengths.append(history.size(1))
+        return torch.zeros((history.size(0), 4, self.d_model))
 
     def act_obs(
         self,
@@ -72,8 +76,9 @@ class FakePolicy:
 
 
 class FakeVecEnv:
-    def __init__(self, n_envs: int):
+    def __init__(self, n_envs: int, done_status: int = 1):
         self.n_envs = n_envs
+        self.done_status = done_status
         self.last_masks1 = np.ones((n_envs, 2, ACT_SIZE), dtype=np.bool_)
         self.last_masks2 = np.ones((n_envs, 2, ACT_SIZE), dtype=np.bool_)
         self.obs1_buffers = StructuredObservation.empty_batch(n_envs)
@@ -98,16 +103,23 @@ class FakeVecEnv:
         self, actions: list[dict[str, np.ndarray]]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
         self.received_actions.append(actions)
-        rewards1 = np.array([0.0, 1.0, 1.0], dtype=np.float32)
-        rewards2 = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        dones = np.ones(self.n_envs, dtype=np.bool_)
+        rewards1 = np.resize(np.array([0.0, 1.0, 1.0], dtype=np.float32), self.n_envs)
+        rewards2 = np.resize(np.array([0.0, 0.0, 1.0], dtype=np.float32), self.n_envs)
+        done_status = np.full(self.n_envs, self.done_status, dtype=np.int64)
+        infos: list[dict[str, Any]] = []
+        for env_id in range(self.n_envs):
+            info: dict[str, Any] = {"series_id": f"series-{env_id}"}
+            if self.done_status == 2:
+                info["terminal_observation1"] = StructuredObservation.empty_batch(1)[0]
+                info["terminal_observation2"] = StructuredObservation.empty_batch(1)[0]
+            infos.append(info)
         return (
             self.last_masks1,
             self.last_masks2,
             rewards1,
             rewards2,
-            dones,
-            [{"series_id": f"series-{i}"} for i in range(self.n_envs)],
+            done_status,
+            infos,
         )
 
 
@@ -121,6 +133,56 @@ class BufferBindingEnv:
         obs2: StructuredObservation,
     ) -> None:
         self.targets = (obs1, obs2)
+
+
+class StatusEnv(BufferBindingEnv):
+    """Minimal SimEnv stand-in reporting a fixed terminated/truncated state."""
+
+    def __init__(self, *, terminated: bool, truncated: bool):
+        super().__init__()
+        self.terminated = terminated
+        self.truncated = truncated
+        self.agent1 = SimpleNamespace(username="agent1")
+        self.agent2 = SimpleNamespace(username="agent2")
+        self.series_id = "series-0"
+        self.series_scores = [0, 0]
+        self.series_games_played = 1
+
+    def _observations(self) -> dict[str, dict[str, np.ndarray]]:
+        mask = np.ones(2 * ACT_SIZE, dtype=np.int64)
+        return {name: {"action_mask": mask} for name in ("agent1", "agent2")}
+
+    def reset(self) -> tuple[dict[str, dict[str, np.ndarray]], dict[str, Any]]:
+        return self._observations(), {}
+
+    def step(self, action: dict[str, np.ndarray]):
+        del action
+        flags = {"agent1": self.terminated, "agent2": self.terminated}
+        return (
+            self._observations(),
+            {"agent1": 0.0, "agent2": 0.0},
+            flags,
+            {"agent1": self.truncated, "agent2": self.truncated},
+            {},
+        )
+
+
+@pytest.mark.parametrize(
+    ("terminated", "truncated", "expected"),
+    [(False, False, 0), (True, False, 1), (False, True, 2)],
+)
+def test_thread_vec_env_reports_a_tri_state_done_status(
+    terminated: bool, truncated: bool, expected: int
+) -> None:
+    # A boolean array here would report truncation as termination, which
+    # silently disables bootstrapping for every game that hits the step cap.
+    vec_env = ThreadVecEnv(cast(Any, [StatusEnv(terminated=terminated, truncated=truncated)]))
+    try:
+        done_status = vec_env.step([{}])[4]
+        assert done_status.dtype == np.int64
+        assert done_status.tolist() == [expected]
+    finally:
+        vec_env.shutdown()
 
 
 def test_thread_vec_env_binds_each_env_to_its_preallocated_rows():
@@ -226,6 +288,8 @@ def test_collect_rollouts_records_both_self_play_streams():
 
     assert len(buffer) == 2 * config.n_envs
     assert all(torch.all(episode.actions == 7) for episode in buffer)
+    assert all(float(episode.dones[-1]) == 1.0 for episode in buffer)
+    assert all(episode.bootstrap_value == 0.0 for episode in buffer)
     assert trajectories1.step_counts.tolist() == [0, 0, 0]
     assert trajectories2.step_counts.tolist() == [0, 0, 0]
     assert all(not entries for entries in memory1.tokens)
@@ -235,6 +299,87 @@ def test_collect_rollouts_records_both_self_play_streams():
     ]
     assert all(action.tolist() == [7, 7] for action in side_two_actions)
     assert policy.batch_sizes == [2 * config.n_envs]
+
+
+def test_truncated_rollout_bootstraps_instead_of_ending_the_game():
+    config = TrainingConfig(n_envs=3, rollout_steps=1)
+    vec_env = FakeVecEnv(config.n_envs, done_status=2)
+    policy = FakePolicy(action=7)
+    buffer: list[TrajectoryBatch] = []
+    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
+    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
+
+    from p0.model.token_store import SeriesTokenStore
+
+    collect_rollouts(
+        cast(Any, vec_env),
+        cast(Any, policy),
+        buffer,
+        config,
+        trajectories1,
+        trajectories2,
+        BattleMemoryBuffer(config.n_envs, 1),
+        BattleMemoryBuffer(config.n_envs, 1),
+        SeriesTokenStore(1),
+        SeriesTokenStore(1),
+    )
+
+    assert len(buffer) == 2 * config.n_envs
+    # A truncated game is not a terminal state: it keeps a zero done flag so the
+    # value target bootstraps off the terminal observation instead of assuming 0.
+    assert all(float(episode.dones[-1]) == 0.0 for episode in buffer)
+    assert all(episode.bootstrap_value == pytest.approx(0.25) for episode in buffer)
+
+
+def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
+    memory = BattleMemoryBuffer(1, d_model=1)
+    env_ids = torch.tensor([0])
+    total = HISTORY_WINDOW + 5
+    for step in range(total):
+        memory.append(env_ids, torch.full((1, 1), float(step)))
+
+    # The end-of-game series summary compresses every decision.
+    assert len(memory.tokens[0]) == total
+
+    history, mask, ages = memory.inputs(env_ids, torch.device("cpu"), torch.float32)
+    assert history.shape == (1, HISTORY_WINDOW, 1)
+    assert bool(mask.all())
+    assert history[0, -1, 0].item() == float(total - 1)
+    assert history[0, 0, 0].item() == float(total - HISTORY_WINDOW)
+    assert ages[0, -1].item() == 0
+
+
+def test_end_of_game_series_summary_sees_every_decision():
+    from p0.model.token_store import SeriesTokenStore
+
+    vec_env = FakeVecEnv(1, done_status=0)
+    policy = FakePolicy(action=7)
+    memory1 = BattleMemoryBuffer(1, 1)
+    memory2 = BattleMemoryBuffer(1, 1)
+
+    def collect(steps: int) -> None:
+        collect_rollouts(
+            cast(Any, vec_env),
+            cast(Any, policy),
+            [],
+            TrainingConfig(n_envs=1, rollout_steps=steps),
+            TrajectoryStorage.allocate(1, max_steps=200, d_model=1),
+            TrajectoryStorage.allocate(1, max_steps=200, d_model=1),
+            memory1,
+            memory2,
+            SeriesTokenStore(1),
+            SeriesTokenStore(1),
+        )
+
+    # Run past the reducer window without finishing the game.
+    collect(HISTORY_WINDOW + 5)
+    assert not policy.summarized_lengths
+
+    vec_env.done_status = 1
+    collect(1)
+
+    # The summary compresses the whole battle, not just the reducer window.
+    assert policy.summarized_lengths == [HISTORY_WINDOW + 6, HISTORY_WINDOW + 6]
 
 
 def test_storage_allocates_completes_and_resets_one_environment():

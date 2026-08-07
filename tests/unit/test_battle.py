@@ -1347,6 +1347,103 @@ def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
     assert decision_builds == 1
 
 
+def test_calc_reward_scores_each_seat_without_touching_the_series():
+    env = SimEnv.__new__(SimEnv)
+    env._series_scores = [0, 0]
+    won = SimpleNamespace(finished=True, won=True, lost=False)
+    lost = SimpleNamespace(finished=True, won=False, lost=True)
+
+    # poke-env scores every agent from its own battle object, so a game that
+    # credited the series here would credit both players for the same win.
+    assert SimEnv.calc_reward(env, cast(Any, won)) == 1.0
+    assert SimEnv.calc_reward(env, cast(Any, lost)) == -1.0
+    assert SimEnv.calc_reward(env, cast(Any, SimpleNamespace(finished=False))) == 0.0
+    assert env.series_scores == [0, 0]
+
+
+def _stepping_env(monkeypatch, battle: Any, *, decision_steps: int = 0) -> SimEnv:
+    agents = ("agent1", "agent2")
+    monkeypatch.setattr(
+        MegaEnv,
+        "step",
+        lambda self, actions: (
+            {},
+            dict.fromkeys(agents, 0.0),
+            {agent: bool(battle.finished and battle.wiped) for agent in agents},
+            {agent: bool(battle.finished and not battle.wiped) for agent in agents},
+            {},
+        ),
+    )
+    env = SimEnv.__new__(SimEnv)
+    env._series_scores = [0, 0]
+    env._decision_steps = decision_steps
+    cast(Any, env).battle1 = battle
+    return env
+
+
+@pytest.mark.parametrize("wiped", [True, False])
+def test_step_treats_every_finished_battle_as_terminal(monkeypatch, wiped: bool):
+    # poke-env only reports termination on a one-sided wipeout, so ties,
+    # forfeits and timer losses reach us flagged as truncations.
+    battle = SimpleNamespace(finished=True, won=True, lost=False, wiped=wiped)
+    env = _stepping_env(monkeypatch, battle)
+
+    _, _, terminated, truncated, _ = env.step({})
+
+    assert all(terminated.values())
+    assert not any(truncated.values())
+    assert env.series_scores == [1, 0]
+
+
+def test_step_truncates_an_unfinished_game_at_the_decision_cap(monkeypatch):
+    battle = SimpleNamespace(finished=False, won=False, lost=False, wiped=False)
+    env = _stepping_env(monkeypatch, battle, decision_steps=197)
+
+    _, rewards, terminated, truncated, _ = env.step({})
+
+    assert not any(terminated.values())
+    assert all(truncated.values())
+    assert all(reward == 0.0 for reward in rewards.values())
+    # A game cut short by the cap has no result to credit.
+    assert env.series_scores == [0, 0]
+
+
+def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):
+    monkeypatch.setattr(MegaEnv, "reset", lambda self, seed=None, options=None: "reset")
+    env = SimEnv.__new__(SimEnv)
+    env._series_scores = [0, 0]
+    env._series_games_played = 1
+    env._resume_reset_pending = False
+    env._agent_rng = random.Random(1)
+    env._opponent_rng = random.Random(2)
+    env.series_id = "series-1"
+    battle = SimpleNamespace(finished=True, won=True, lost=False)
+
+    env._record_game_result(cast(Any, battle))
+    env.reset()
+    assert env.series_scores == [1, 0]
+    assert env.series_games_played == 2
+
+    env._record_game_result(cast(Any, battle))
+    assert env.series_scores == [2, 0]
+
+    sampled: list[str] = []
+    cast(Any, env)._agent_team_source = SimpleNamespace(
+        sample=lambda rng: SimpleNamespace(packed="agent-team")
+    )
+    cast(Any, env)._opponent_team_source = SimpleNamespace(
+        sample=lambda rng: SimpleNamespace(packed="opponent-team")
+    )
+    cast(Any, env).agent1 = SimpleNamespace(update_team=sampled.append)
+    cast(Any, env).agent2 = SimpleNamespace(update_team=sampled.append)
+
+    env.reset()
+    assert env.series_scores == [0, 0]
+    assert env.series_games_played == 1
+    assert env.series_id != "series-1"
+    assert sampled == ["agent-team", "opponent-team"]
+
+
 def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monkeypatch):
     class TeamBuilder:
         def __init__(self, packed: str):
@@ -1822,6 +1919,20 @@ def _adapter_battle(*, teampreview: bool = False, forced: bool = False) -> Doubl
     }.items():
         setattr(battle, name, value)
     return cast(DoubleBattle, battle)
+
+
+def test_switch_slots_identify_roster_members_not_shared_base_species() -> None:
+    battle = _adapter_battle()
+    team = dict(cast(Any, battle).team)
+    twin = SimpleNamespace(base_species="Urshifu")
+    other = SimpleNamespace(base_species="Urshifu")
+    team["p1: Urshifu-A"] = twin
+    team["p1: Urshifu-B"] = other
+    cast(Any, battle).team = team
+    cast(Any, battle).available_switches = [[twin], []]
+
+    # The twin is appended after the six originals, so it owns roster slot 6.
+    assert decision_view(battle).slots[0].switch_slots == (6,)
 
 
 def test_runtime_action_adapters_round_trip_control_move_and_preview_orders() -> None:

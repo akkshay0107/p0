@@ -178,10 +178,12 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
             )
         )
 
-        switches = {pokemon.base_species for pokemon in available_switches[position]}
-        switch_slots = tuple(
-            index for index, pokemon in enumerate(team) if pokemon.base_species in switches
-        )
+        # poke-env draws available switches out of ``battle.team`` itself, so
+        # roster identity is the real relation; the species name was only ever a
+        # proxy for it. Identity is matched by id() because poke-env's Pokemon
+        # defines __eq__ and callers may pass unhashable stand-ins.
+        switches = {id(pokemon) for pokemon in available_switches[position]}
+        switch_slots = tuple(index for index, pokemon in enumerate(team) if id(pokemon) in switches)
 
         forced_move = (
             not any(move_targets)
@@ -194,6 +196,9 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
                 switch_slots=switch_slots,
                 move_targets=move_targets,
                 active=active is not None and not active.fainted,
+                # Open team sheets make every trapping ability public, so a
+                # request that reports maybe-trapped is in practice trapped.
+                # Offering the switch anyway produced invalid choices live.
                 trapped=trapped[position] or maybe_trapped[position],
                 force_switch=force_switch[position],
                 can_mega=can_mega_evolve[position],

@@ -96,7 +96,7 @@ def _knownness(value: object | None, resolved_id: int) -> Knownness:
 
 
 def _status_counter_kind(status: object | None) -> CounterKind:
-    """StatusRecord counter semantics (schema v3, plan §3.1).
+    """StatusRecord counter semantics.
 
     SLP counts public turns already slept (never the hidden RNG total duration);
     TOX is the badly-poisoned stage that scales the damage tick, the same role

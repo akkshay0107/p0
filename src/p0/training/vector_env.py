@@ -113,13 +113,15 @@ class ThreadVecEnv:
         masks2 = np.stack([r[2] for r in results]) if results[0][2] is not None else None  # type: ignore
         rewards1 = np.array([r[3] for r in results], dtype=np.float32)
         rewards2 = np.array([r[4] for r in results], dtype=np.float32)
-        dones = np.array([r[5] for r in results], dtype=bool)
+        # 0 running, 1 terminated, 2 truncated. A boolean array here would fold
+        # truncation into termination and silently disable bootstrapping.
+        done_status = np.array([r[5] for r in results], dtype=np.int64)
         infos = [r[6] for r in results]
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
         self.last_infos = infos
-        return masks1, masks2, rewards1, rewards2, dones, infos
+        return masks1, masks2, rewards1, rewards2, done_status, infos
 
     def get_batched_obs1(self, device: torch.device):
         return self.obs1_buffers.to(device, non_blocking=True)

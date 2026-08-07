@@ -246,32 +246,48 @@ class SimEnv(MegaEnv):
         return super().reset(seed=seed, options=options)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
+        """Score one finished game from the passed battle's own perspective.
+
+        poke-env calls this once per agent per step, with that agent's battle
+        object, so it must stay free of side effects. The series score is
+        credited once per game by :meth:`_record_game_result`.
+        """
         if not battle.finished:
             return 0.0
 
-        rew = 0.0
+        if battle.won:
+            return 1.0
+        if battle.lost:
+            return -1.0
+        return 0.0
+
+    def _record_game_result(self, battle: AbstractBattle) -> None:
+        """Credit one finished game to the best-of-three score."""
         if battle.won:
             self._series_scores[0] += 1
-            rew = 1.0
         elif battle.lost:
             self._series_scores[1] += 1
-            rew = -1.0
-
-        return rew
 
     def step(self, actions):
         self._decision_steps += 1
         obs, rewards, terminated, truncated, info = super().step(actions)
 
-        if (
-            self._decision_steps >= 198
-            and not any(terminated.values())
-            and not any(truncated.values())
-        ):
-            for k in truncated:
-                truncated[k] = True
-            for k in rewards:
-                rewards[k] = 0.0
+        # poke-env reports termination only when exactly one side is wiped out,
+        # so ties, forfeits and timer losses arrive as truncations. Any finished
+        # battle is terminal here; truncation is reserved for the step cap below,
+        # which is the only case whose value target should bootstrap.
+        battle = self.battle1
+        if battle is not None and battle.finished:
+            for agent in terminated:
+                terminated[agent] = True
+            for agent in truncated:
+                truncated[agent] = False
+            self._record_game_result(battle)
+        elif self._decision_steps >= 198 and not any(truncated.values()):
+            for agent in truncated:
+                truncated[agent] = True
+            for agent in rewards:
+                rewards[agent] = 0.0
 
         return obs, rewards, terminated, truncated, info
 

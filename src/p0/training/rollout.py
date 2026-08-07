@@ -40,11 +40,11 @@ class BattleMemoryBuffer:
     def append(self, env_ids: torch.Tensor, history_tokens: torch.Tensor) -> None:
         if history_tokens.shape != (env_ids.numel(), self.d_model):
             raise ValueError("history token batch does not match selected environments")
+        # The whole battle is retained: the reducer window is the last
+        # HISTORY_WINDOW entries, but the end-of-game series summary compresses
+        # every decision, the same way behaviour cloning and live play do.
         for env_id, token in zip(env_ids.tolist(), history_tokens, strict=True):
-            entries = self.tokens[env_id]
-            entries.append(token.detach().to(device="cpu", dtype=torch.float32))
-            if len(entries) > HISTORY_WINDOW:
-                del entries[0]
+            self.tokens[env_id].append(token.detach().to(device="cpu", dtype=torch.float32))
 
     def reset(self, env_id: int) -> None:
         """Reset one game's history."""
@@ -65,7 +65,7 @@ class BattleMemoryBuffer:
         masks = []
         ages = []
         for env_id in env_ids.tolist():
-            current = self.tokens[env_id]
+            current = self.tokens[env_id][-HISTORY_WINDOW:]
             values = (
                 torch.stack(current).to(device=device, dtype=dtype).unsqueeze(0)
                 if current
@@ -130,7 +130,10 @@ def collect_rollouts(
         infos = vec_env.last_infos
         assert infos is not None
 
-        series_ids = [str(info["series_id"]) for info in infos if info]
+        # Positional: series_ids[i] and infos[i] must describe environment i.
+        if len(infos) != n_envs:
+            raise ValueError(f"Expected {n_envs} environment infos, got {len(infos)}")
+        series_ids = [str(info["series_id"]) for info in infos]
         series_tokens1, series_mask1 = series_store1.get_tokens(series_ids, device)
         series_tokens2, series_mask2 = series_store2.get_tokens(series_ids, device)
         current_series_tokens = torch.cat([series_tokens1, series_tokens2], dim=0)
@@ -213,7 +216,7 @@ def collect_rollouts(
             if not done_status[i]:
                 continue
 
-            info = infos[i] or {}
+            info = infos[i]
             bootstrap_value1 = 0.0
             bootstrap_value2 = 0.0
 
