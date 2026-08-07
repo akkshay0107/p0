@@ -967,18 +967,13 @@ def test_ordered_pokemon_and_slot_conditions_real():
     ordered_reg = _get_ordered_pokemon(battle_reg, is_opponent=False)
     assert len(ordered_reg) == 6
 
-    # Order must be: Active (p1, p2) -> Switch/Fainted bench (p3, p4, p5) -> Dropped bench (p6)
+    # Order must be: Active (p1, p2) -> the rest in team order. Team selection is
+    # hidden information in a replay, so it must never influence row order.
     assert ordered_reg[0][0] == p1  # active slot 0
     assert ordered_reg[0][2] == 0  # active_idx
     assert ordered_reg[1][0] == p2  # active slot 1
     assert ordered_reg[1][2] == 1  # active_idx
-
-    bench_mons = [ordered_reg[i][0] for i in range(2, 5)]
-    assert p3 in bench_mons
-    assert p4 in bench_mons
-    assert p5 in bench_mons
-
-    assert ordered_reg[5][0] == p6  # dropped
+    assert [entry[0] for entry in ordered_reg[2:]] == [p3, p4, p5, p6]
 
     # Request-backed selection is persistent even when trapping makes all
     # available-switch lists temporarily empty.
@@ -1004,8 +999,8 @@ def test_ordered_pokemon_and_slot_conditions_real():
         == 2
     )
 
-    # Request metadata can be partial. A currently available switch must still
-    # be treated as selected so an empty active slot cannot trim its token.
+    # Request metadata can be partial. Every roster member keeps its row, and an
+    # empty active slot cannot trim a currently available switch.
     for mon in team:
         mon._selected_in_teampreview = False
         mon._last_request = None
@@ -1017,9 +1012,9 @@ def test_ordered_pokemon_and_slot_conditions_real():
         available_switches=[[p3, p6], [p3, p6]],
     )
     ordered_partial = _get_ordered_pokemon(partial_request_battle, is_opponent=False)
-    partial_mons = [entry[0] for entry in ordered_partial]
-    assert p6 in partial_mons
-    assert partial_mons.index(p6) < 5
+    # the row budget is one short with an empty active slot, and the fainted member
+    # is the one that can no longer act, so it is the row that goes
+    assert [entry[0] for entry in ordered_partial] == [None, p2, p1, p3, p4, p6]
 
     # Empty left active slot: right active must stay at index 1 with a None
     # placeholder at index 0, so seq positions match env action positions.
@@ -1034,11 +1029,11 @@ def test_ordered_pokemon_and_slot_conditions_real():
     assert ordered_le[0] == (None, -1, None)
     assert ordered_le[1][0] == p2
     assert ordered_le[1][2] == 1  # active_idx preserved
-    # placeholder overflows the 6-row budget; the trimmed mon must be an
-    # unrevealed, unfainted one (likely unbrought) — fainted p5 must survive
+    # placeholder overflows the 6-row budget; a fainted member is the one that can no
+    # longer be chosen, so it is trimmed before any mon that could still act
     le_mons = [entry[0] for entry in ordered_le]
-    assert p5 in le_mons
-    assert p6 not in le_mons
+    assert p5 not in le_mons
+    assert p6 in le_mons
 
     # Same invariant for the opponent side
     battle_opp_left_empty = make_real_battle(
@@ -1135,23 +1130,31 @@ def test_global_and_side_field_tokens_include_mega_availability():
 
     mega._selected_in_teampreview = True
     regular._selected_in_teampreview = True
-    assert _side_mega_available(
-        battle,
-        is_opponent=False,
-        selected_allies={mega, regular},
+    assert _side_mega_available(battle, is_opponent=False, selected_allies={mega, regular}) == (
+        True,
+        True,
     )
 
-    assert not _side_mega_available(
-        battle,
-        is_opponent=False,
-        selected_allies={regular},
+    assert _side_mega_available(battle, is_opponent=False, selected_allies={regular}) == (
+        False,
+        True,
     )
+
+    # a reserve whose selection is still hidden holds the only stone: unknown, not false
+    unrevealed = Pokemon(gen=9, species="charizard")
+    unrevealed._item = "charizarditey"
+    unrevealed._selected_in_teampreview = None  # type: ignore[assignment]
+    battle._team["p1: Charizard"] = unrevealed
+    assert _side_mega_available(battle, is_opponent=False, selected_allies={regular}) == (
+        False,
+        False,
+    )
+    del battle._team["p1: Charizard"]
 
     battle._used_mega_evolve = True
-    assert not _side_mega_available(
-        battle,
-        is_opponent=False,
-        selected_allies={mega, regular},
+    assert _side_mega_available(battle, is_opponent=False, selected_allies={mega, regular}) == (
+        False,
+        True,
     )
 
 
@@ -1989,8 +1992,9 @@ def test_unknown_legality_masks_are_supersets_of_the_proven_mask() -> None:
     unknown_mask = action_mask(unknown_view)
 
     assert np.all(unknown_mask >= proven_mask)
-    # a slot locked into an unseen move must stay reachable through the forced action
-    assert set(legal_actions(unknown_view, 0)) - set(legal_actions(proven_view, 0)) == {48, 47}
+    # an unseen lock (Outrage, Encore, recharge) and an unasked slot's pass must both
+    # stay reachable, so the forced-move and pass actions join the superset
+    assert set(legal_actions(unknown_view, 0)) - set(legal_actions(proven_view, 0)) == {0, 47, 48}
 
 
 def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
@@ -1999,7 +2003,9 @@ def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
     proven = builder.build(_legality_fixture_view(DecisionView(slots=(slot, slot))))
 
     unknown_slot = replace(slot, legality_known=False)
-    unknown = builder.build(_legality_fixture_view(DecisionView(slots=(unknown_slot,) * 2)))
+    unknown = builder.build(
+        _legality_fixture_view(DecisionView(slots=(unknown_slot, unknown_slot)))
+    )
 
     legality_columns = slice(NUM_IDX_MOVE_LEGAL, NUM_IDX_CAN_SWITCH_OUT + 1)
     assert proven.numerical[0, legality_columns].any()

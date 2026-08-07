@@ -28,6 +28,7 @@ from p0.model.structured_observation import (
     NUM_IDX_CAN_MEGA,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_HP_FRACTION,
     NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STATUS_COUNTER,
@@ -128,16 +129,20 @@ def _pad_team(
     overflow = len(res) - TEAM_SIZE
     if overflow > 0:
         # only happens when an active slot placeholder pushes a 6-mon team list
-        # (opponent with open team sheet) over the row budget.prefer dropping
-        # mons that are confirmed to have not been brought
+        # (opponent with open team sheet) over the row budget. Eviction must stay
+        # decidable from public state, so it never consults team selection.
         actives, rest = res[:2], res[2:]
-        for i in range(len(rest) - 1, -1, -1):
-            if overflow == 0:
-                break
-            mon = rest[i][0]
-            if mon is not None and not mon.revealed and not mon.fainted:
-                rest.pop(i)
-                overflow -= 1
+        for predicate in (
+            lambda mon: mon.fainted,
+            lambda mon: not mon.revealed,
+        ):
+            for i in range(len(rest) - 1, -1, -1):
+                if overflow == 0:
+                    break
+                mon = rest[i][0]
+                if mon is not None and predicate(mon):
+                    rest.pop(i)
+                    overflow -= 1
         del rest[len(rest) - overflow :]
         res = actives + rest
 
@@ -152,7 +157,7 @@ def _selected_ally_pokemon(battle: Any) -> set[Any]:
     if battle.teampreview:
         return set(battle.team.values())
 
-    selected = {mon for mon in battle.team.values() if mon.selected_in_teampreview}
+    selected = {mon for mon in battle.team.values() if mon.selected_in_teampreview is True}
 
     # battle state authoritative, previous is fallback for trapped situations
     selected.update(mon for mon in battle.active_pokemon if mon is not None)
@@ -199,9 +204,6 @@ def _get_ordered_pokemon(
         res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
         return _pad_team(res)
 
-    if selected_allies is None:
-        selected_allies = _selected_ally_pokemon(battle)
-
     res = []
     assigned = set()
     for active_idx, mon in enumerate(active):
@@ -211,16 +213,9 @@ def _get_ordered_pokemon(
             res.append((mon, orig_idx_map.get(mon, -1), active_idx))
             assigned.add(mon)
 
-    bench, dropped = [], []
-    for mon in team.values():
-        if mon in assigned:
-            continue
-        idx = orig_idx_map.get(mon, -1)
-        if mon in selected_allies:
-            bench.append((mon, idx, None))
-        else:
-            dropped.append((mon, idx, None))
-    res += bench + dropped
+    # Row order must not depend on team selection: a public replay cannot know it
+    # until a reserve appears, and an order that drifts would break replay parity.
+    res += [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values() if mon not in assigned]
 
     return _pad_team(res)
 
@@ -242,6 +237,8 @@ def _slot_condition(
         return 1
     if is_opponent:
         return 2
+    if mon.selected_in_teampreview is None:
+        return 0
     if selected_allies is None:
         selected_allies = _selected_ally_pokemon(battle)
     return 2 if mon in selected_allies else -1
@@ -338,20 +335,35 @@ def _side_mega_available(
     *,
     is_opponent: bool,
     selected_allies: set[Any] | None = None,
-) -> bool:
+) -> tuple[bool, bool]:
+    """Whether the side still holds a mega stone, and whether that is knowable.
+
+    A replay cannot see an unbrought reserve's item, so a side whose only mega-stone
+    holder has not been revealed reports "unknown" instead of a false negative.
+    """
     if is_opponent:
         if battle.opponent_used_mega_evolve:
-            return False
+            return False, True
         candidates = battle.opponent_team.values()
     else:
         if battle.used_mega_evolve:
-            return False
+            return False, True
         candidates = _selected_ally_pokemon(battle) if selected_allies is None else selected_allies
 
-    return any(
+    available = any(
         PokemonTokenizer.normalize_id(mon.item) in _MEGA_ITEMS and not _is_mega_form(mon)
         for mon in candidates
     )
+    if available or is_opponent:
+        return available, True
+
+    unresolved = any(
+        mon.selected_in_teampreview is None
+        and PokemonTokenizer.normalize_id(mon.item) in _MEGA_ITEMS
+        and not _is_mega_form(mon)
+        for mon in battle.team.values()
+    )
+    return False, not unresolved
 
 
 def _write_effects(
@@ -489,7 +501,7 @@ def _pokemon_numeric_into(
     if pokemon is None:
         return
 
-    row[5] = float(pokemon.current_hp_fraction)
+    row[NUM_IDX_HP_FRACTION] = float(pokemon.current_hp_fraction)
 
     base_stats = pokemon.base_stats
     row[6] = base_stats["hp"] / 160.0
@@ -822,7 +834,7 @@ def _write_observation(
     idx += 1
 
     ally_fainted = sum(mon.fainted for mon in battle.team.values())
-    ally_mega_available = _side_mega_available(
+    ally_mega_available, ally_mega_known = _side_mega_available(
         battle,
         is_opponent=False,
         selected_allies=selected_allies,
@@ -836,6 +848,8 @@ def _write_observation(
         categorical[idx],
         numerical[idx],
     )
+    # Mega availability is legality-shaped: the same gate marks it unproven.
+    numerical[idx][NUM_IDX_LEGALITY_UNKNOWN] = float(not ally_mega_known)
     # The joint action-mask token is decision-level, so its provenance lives on the ally
     # side row rather than on an active Pokemon row that may be an empty placeholder.
     if not battle.teampreview:
@@ -846,7 +860,7 @@ def _write_observation(
     idx += 1
 
     opp_fainted = sum(mon.fainted for mon in battle.opponent_team.values())
-    opp_mega_available = _side_mega_available(battle, is_opponent=True)
+    opp_mega_available, _ = _side_mega_available(battle, is_opponent=True)
     _side_token_into(
         battle,
         battle.opponent_side_conditions,

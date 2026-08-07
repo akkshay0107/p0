@@ -6,7 +6,7 @@ import asyncio
 import logging
 from time import perf_counter
 
-from poke_env.battle import AbstractBattle, DoubleBattle
+from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon
 from poke_env.environment.env import _EnvPlayer
 from poke_env.ps_client.ps_client import PSClient
 
@@ -14,6 +14,7 @@ from p0.runtime.live_event_capture import capture_message
 
 _ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
+_ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _installed = False
 _filtered_loggers: list[logging.Logger] = []
 
@@ -63,6 +64,12 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     return _ORIGINAL_PARSE_MESSAGE(self, split_message)
 
 
+def _forme_change(self: Pokemon, species: str) -> None:
+    """Preserve the observed battle form in addition to its changed dex data."""
+    normalized_species = species.split(",", 1)[0]
+    self._update_from_pokedex(normalized_species, store_species=True)
+
+
 def install(logger: logging.Logger | None = None) -> None:
     """Install monkey patches for login waiting and message event capture."""
     global _installed
@@ -77,6 +84,7 @@ def install(logger: logging.Logger | None = None) -> None:
 
     PSClient.wait_for_login = _wait_for_login
     DoubleBattle.parse_message = _parse_message
+    Pokemon.forme_change = _forme_change
     _installed = True
 
 
@@ -90,6 +98,7 @@ def uninstall_for_tests() -> None:
     if _installed:
         PSClient.wait_for_login = _ORIGINAL_WAIT_FOR_LOGIN
         DoubleBattle.parse_message = _ORIGINAL_PARSE_MESSAGE
+        Pokemon.forme_change = _ORIGINAL_FORME_CHANGE
         _installed = False
 
 

@@ -105,7 +105,13 @@ def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:
             if slot.can_mega:
                 mega_moves = (*mega_moves, MEGA_FORCED_ACTION)
 
-    return (*switches, *moves, *mega_moves) or (PASS_ACTION,)
+    actions = (*switches, *moves, *mega_moves)
+    if slot.legality_known:
+        return actions or (PASS_ACTION,)
+
+    # Passing cannot be ruled out either: a mid-turn replacement request asks one slot
+    # and passes the other, and neither is visible without the request itself.
+    return (*actions, PASS_ACTION)
 
 
 def action_mask(view: DecisionView) -> npt.NDArray[np.bool_]:

@@ -1,8 +1,24 @@
-"""Pure player-relative replay reconstruction from protocol lines."""
+"""Pure player-relative replay reconstruction from protocol lines.
+
+Three concerns live here, in this order:
+
+* ``_ReplayState`` -- a line-by-line state machine over the public protocol (HP, status,
+  boosts, effects, field and side state, PP, Illusion aliases). It never sees a request.
+* boundary segmentation -- ``_update_blocks`` splits the log on the separators Showdown
+  writes whenever its turn loop resumes, so the decision boundaries come from the log
+  itself rather than from turn-marker heuristics.
+* evidence -- what each player provably ordered in a block, handed to
+  ``p0.replays.evidence`` for EXACT/PARTIAL/UNKNOWN labelling.
+
+A public replay contains no ``|request|``, so reconstruction never asserts a legality it
+cannot show. Emitted masks are supersets marked ``legality_known=False``; the encoder
+gates them so an unproven mask is never read as a proven restriction.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import re
 import typing
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -10,12 +26,15 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 import orjson
+from poke_env.battle import Move
+from poke_env.data import GenData
 
 from p0.battle.actions import (
     FORCED_ACTION,
     MEGA_FORCED_ACTION,
     MOVE_END,
     MOVE_START,
+    PASS_ACTION,
     SWITCH_START,
     TARGET_COUNT,
     encode_team_pair,
@@ -49,6 +68,101 @@ from p0.teams.stat_points import (
     calculate_stats,
     impute_candidates,
     select_candidate,
+)
+
+_ENDPOINT_ACTION_STATE_TAGS = frozenset(
+    {
+        "-ability",
+        "-activate",
+        "-boost",
+        "-clearallboost",
+        "-clearboost",
+        "-clearnegativeboost",
+        "-clearpositiveboost",
+        "-copyboost",
+        "-curestatus",
+        "-end",
+        "-enditem",
+        "-formechange",
+        "-invertboost",
+        "-item",
+        "-singlemove",
+        "-singleturn",
+        "-start",
+        "-status",
+        "-swapboost",
+        "-terastallize",
+        "-transform",
+        "-unboost",
+        "detailschange",
+    }
+)
+_GLOBAL_ACTION_STATE_TAGS = frozenset(
+    {"-fieldend", "-fieldstart", "-sideend", "-sidestart", "-weather"}
+)
+_TURN_COUNTER_EFFECTS = frozenset(
+    {
+        "BIDE",
+        "BIND",
+        "CLAMP",
+        "DISABLE",
+        "DOOMDESIRE",
+        "DYNAMAX",
+        "EMBARGO",
+        "ENCORE",
+        "FIRESPIN",
+        "FUTURESIGHT",
+        "GRAVITY",
+        "GMAXCENTIFERNO",
+        "GMAXSANDBLAST",
+        "HEALBLOCK",
+        "INFESTATION",
+        "MAGMASTORM",
+        "MAGNETRISE",
+        "SANDTOMB",
+        "SKYDROP",
+        "SLOWSTART",
+        "SNAPTRAP",
+        "TAUNT",
+        "TELEKINESIS",
+        "THROATCHOP",
+        "THUNDERCAGE",
+        "UPROAR",
+        "WHIRLPOOL",
+        "WRAP",
+    }
+)
+_END_ON_MOVE_EFFECTS = frozenset(
+    {"GLAIVERUSH", "DANCER", "GRUDGE", "DESTINYBOND", "RAGE", "INSTRUCT", "FOCUSPUNCH"}
+)
+_END_ON_TURN_EFFECTS = frozenset(
+    {
+        "AFTERYOU",
+        "BANEFULBUNKER",
+        "BEAKBLAST",
+        "BURNINGBULWARK",
+        "CRAFTYSHIELD",
+        "FEINT",
+        "FLINCH",
+        "FOCUSPUNCH",
+        "FOLLOWME",
+        "INSTRUCT",
+        "KINGSSHIELD",
+        "CUSTAPBERRY",
+        "MINDREADER",
+        "MAGICCOAT",
+        "OBSTRUCT",
+        "PROTECT",
+        "QUASH",
+        "QUICKCLAW",
+        "QUICKDRAW",
+        "QUICKGUARD",
+        "RAGEPOWDER",
+        "ROOST",
+        "SPIKYSHIELD",
+        "SPOTLIGHT",
+        "WIDEGUARD",
+    }
 )
 
 
@@ -113,6 +227,48 @@ def _species_identity_index(dex: Mapping[str, Any]) -> dict[str, str]:
     return aliases
 
 
+def _species_data_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """Index exact species and form aliases by normalized identifier."""
+    index: dict[str, Mapping[str, Any]] = {}
+    entries = tuple(entry for entry in dex.get("species", ()) if isinstance(entry, Mapping))
+    by_name = {
+        normalize_id(str(entry.get("id", entry.get("name", "")))): entry for entry in entries
+    }
+    for entry in entries:
+        for value in (entry.get("id"), entry.get("name")):
+            if isinstance(value, str) and value:
+                index[normalize_id(value)] = entry
+        base = entry.get("baseSpecies")
+        base_entry = by_name.get(normalize_id(str(base))) if base else None
+        fallback = base_entry if isinstance(base_entry, Mapping) else entry
+        for value in (*entry.get("formeOrder", ()), *entry.get("otherFormes", ())):
+            if isinstance(value, str) and value:
+                index.setdefault(normalize_id(value), fallback)
+    return index
+
+
+def _move_data_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    return {
+        normalize_id(str(entry.get("id", entry.get("name", "")))): entry
+        for entry in dex.get("moves", ())
+        if isinstance(entry, Mapping)
+    }
+
+
+def _enum_name(value: str) -> str:
+    """Return a poke-env-compatible enum member name for a protocol value."""
+    normalized = normalize_id(value)
+    aliases = {
+        "sunnyday": "SUNNYDAY",
+        "raindance": "RAINDANCE",
+        "trickroom": "TRICK_ROOM",
+        "magicroom": "MAGIC_ROOM",
+        "wonderroom": "WONDER_ROOM",
+        "toxicspikes": "TOXIC_SPIKES",
+    }
+    return aliases.get(normalized, normalized.upper())
+
+
 _BASE_STATS_CACHE: dict[str, dict[str, dict[str, int]]] = {}
 
 
@@ -132,21 +288,29 @@ def _get_base_stats_index(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
 
 def _make_replay_pokemon(
     species: str,
-    base_stats_index: Mapping[str, Mapping[str, int]],
+    species_data_index: Mapping[str, Mapping[str, Any]],
+    move_data_index: Mapping[str, Mapping[str, Any]],
     moves: Mapping[str, ReplayMove] | None = None,
     ability: str | None = None,
     item: str | None = None,
     nature: str | None = None,
 ) -> ReplayPokemon:
     normalized = normalize_id(species)
-    base_stats = base_stats_index.get(normalized, {})
+    species_data = species_data_index.get(normalized, {})
+    base_stats = species_data.get("baseStats", {})
+    types = tuple(str(value) for value in species_data.get("types", ()) if isinstance(value, str))
     return ReplayPokemon(
         species=species,
         moves=moves if moves is not None else {},
         ability=ability,
+        base_ability_data=ability,
+        forme_ability_data=None,
         item=item,
         nature=nature,
-        base_stats_data=base_stats,
+        base_stats_data=base_stats if isinstance(base_stats, Mapping) else {},
+        type_1_data=ReplayName(_enum_name(types[0])) if types else None,
+        type_2_data=ReplayName(_enum_name(types[1])) if len(types) > 1 else None,
+        weight_data=float(species_data.get("weightkg", 0.0)),
     )
 
 
@@ -168,6 +332,8 @@ class ReplayMove:
     id: str
     type: ReplayName = ReplayName("unknown")
     category: ReplayName = ReplayName("unknown")
+    target: str = "normal"
+    increments_protect_counter: bool = False
     current_pp: int | None = None
     max_pp: int | None = None
 
@@ -179,14 +345,34 @@ class ReplayPokemon:
     current_hp_fraction: float = 1.0
     fainted: bool = False
     revealed: bool = True
-    selected_in_teampreview: bool = False
+    selected_in_teampreview: bool | None = None
     ability: str | None = None
+    base_ability_data: str | None = None
+    forme_ability_data: str | None = None
     item: str | None = None
     nature: str | None = None
     base_stats_data: Mapping[str, int] = field(default_factory=dict)
+    type_1_data: ReplayName | None = None
+    type_2_data: ReplayName | None = None
+    weight_data: float = 0.0
     status: Any = None
     boosts: Mapping[str, int] = field(default_factory=_zero_boosts)
     level: int | None = 50
+    effects_data: Mapping[ReplayName, int] = field(default_factory=dict)
+    presence_effects: frozenset[ReplayName] = frozenset()
+    turn_effects: frozenset[ReplayName] = frozenset()
+    active_turns: int = 0
+    protect_counter_data: int = 0
+    status_counter_data: int = 0
+    preparing_data: bool = False
+    last_move_data: str | None = None
+
+    @property
+    def hp_provenance(self) -> int:
+        # Replay HP may be quantized to the uploader's public percentage.
+        from p0.model.structured_observation import Provenance
+
+        return int(Provenance.OBSERVED)
 
     @property
     def base_species(self) -> str:
@@ -194,11 +380,11 @@ class ReplayPokemon:
 
     @property
     def type_1(self) -> Any:
-        return None
+        return self.type_1_data
 
     @property
     def type_2(self) -> Any:
-        return None
+        return self.type_2_data
 
     @property
     def base_stats(self) -> Mapping[str, int]:
@@ -210,31 +396,33 @@ class ReplayPokemon:
 
     @property
     def protect_counter(self) -> int:
-        return 0
+        return self.protect_counter_data
 
     @property
     def first_turn(self) -> bool:
-        return False
+        return self.active_turns == 1
 
     @property
     def weight(self) -> float:
-        return 0.0
+        return self.weight_data
 
     @property
     def effects(self) -> Mapping[Any, int]:
-        return {}
+        return self.effects_data
 
     @property
     def status_counter(self) -> int:
-        return 0
+        return self.status_counter_data
 
     @property
     def preparing(self) -> Any:
-        return 0.0
+        return self.preparing_data
 
     @property
-    def last_move(self) -> None:
-        return None
+    def last_move(self) -> ReplayMove | None:
+        if self.last_move_data is None:
+            return None
+        return self.moves.get(self.last_move_data)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,9 +452,7 @@ class ReconstructedPerspective:
             game_id=self.game_id,
             series_id=series_id or self.game_id,
             game_number=game_number,
-            protocol_lines=tuple(
-                snapshot_line for snapshot in self.snapshots for snapshot_line in snapshot.raw_lines
-            ),
+            protocol_lines=self._protocol_lines,
             ots_payloads=self._ots_payloads,
             winner=outcome.winner,
             end_reason=outcome.end_reason,
@@ -277,6 +463,7 @@ class ReconstructedPerspective:
 
     _outcome: Any = None
     _ots_payloads: tuple[str, str] = ("", "")
+    _protocol_lines: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +476,34 @@ class StatPointEstimate:
     points: StatPoints
     precomputed: tuple[int, int, int, int, int, int] | None
     confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class PerspectiveKnowledge:
+    """Private facts recoverable for one player from the complete replay."""
+
+    player: int
+    selected_species: frozenset[str]
+    selection_size: int
+    selection_complete: bool
+
+    def __post_init__(self) -> None:
+        if self.player not in (0, 1):
+            raise ValueError("PerspectiveKnowledge.player must be 0 or 1")
+        if self.selection_size < 0:
+            raise ValueError("PerspectiveKnowledge.selection_size must be non-negative")
+        if len(self.selected_species) > self.selection_size:
+            raise ValueError("Recovered selections exceed the declared team size")
+        if self.selection_complete != (len(self.selected_species) == self.selection_size):
+            raise ValueError("selection_complete does not match the recovered selection count")
+
+    def selected_state(self, side: int, species: str) -> bool | None:
+        """Return own oracle selection, leaving opponent and ambiguous members unknown."""
+        if side != self.player:
+            return None
+        if normalize_id(species) in self.selected_species:
+            return True
+        return False if self.selection_complete else None
 
 
 def impute_stat_points(
@@ -371,17 +586,78 @@ def impute_stat_points(
     return tuple(estimates)
 
 
-def _replay_moves(names: tuple[str, ...]) -> dict[str, ReplayMove]:
-    return {name: ReplayMove(name) for name in names}
+def _format_generation(format_id: str) -> int:
+    match = re.match(r"gen(\d+)", normalize_id(format_id))
+    return int(match.group(1)) if match is not None else 9
+
+
+def _live_max_pp(move_id: str, generation: int, data: Mapping[str, Any]) -> int | None:
+    """Use the same move PP contract as the live poke-env observation path."""
+    try:
+        return int(Move(move_id, generation).max_pp)
+    except (KeyError, ValueError):
+        pp = int(data.get("pp", 0))
+        value = pp if data.get("noPPBoosts") else pp * 8 // 5
+        return value or None
+
+
+def _replay_moves(
+    names: tuple[str, ...],
+    move_data_index: Mapping[str, Mapping[str, Any]],
+    generation: int,
+) -> dict[str, ReplayMove]:
+    moves: dict[str, ReplayMove] = {}
+    for name in names:
+        move_id = normalize_id(name)
+        data = move_data_index.get(move_id, {})
+        max_pp = _live_max_pp(move_id, generation, data)
+        moves[move_id] = ReplayMove(
+            id=move_id,
+            type=ReplayName(_enum_name(str(data.get("type", "unknown")))),
+            category=ReplayName(_enum_name(str(data.get("category", "unknown")))),
+            target=str(data.get("target", "normal")),
+            increments_protect_counter=move_id
+            in {
+                "banefulbunker",
+                "burningbulwark",
+                "detect",
+                "endure",
+                "kingsshield",
+                "matblock",
+                "maxguard",
+                "obstruct",
+                "protect",
+                "quickguard",
+                "silktrap",
+                "spikyshield",
+                "wideguard",
+            },
+            current_pp=max_pp,
+            max_pp=max_pp,
+        )
+    return moves
 
 
 class _ReplayState:
-    def __init__(self, document: ReplayDocument, dex: Mapping[str, Any]):
+    def __init__(
+        self,
+        document: ReplayDocument,
+        dex: Mapping[str, Any],
+        knowledge: PerspectiveKnowledge,
+    ):
         self.turn = 0
         self.used_mega = [False, False]
         self.active: list[list[ReplayPokemon | None]] = [[None, None], [None, None]]
         self.base_stats_index = _get_base_stats_index(dex)
         self.species_identity_index = _species_identity_index(dex)
+        self.species_data_index = _species_data_index(dex)
+        self.move_data_index = _move_data_index(dex)
+        self.generation = _format_generation(document.metadata.format_id)
+        self.mega_items = frozenset(
+            normalize_id(str(entry.get("requiredItem", "")))
+            for entry in dex.get("transformations", ())
+            if isinstance(entry, Mapping) and entry.get("isMega") and entry.get("requiredItem")
+        )
         self.teams: list[list[ReplayPokemon]] = []
         for side in (0, 1):
             side_teams = []
@@ -392,19 +668,35 @@ class _ReplayState:
                 )
                 ability = str(details.get("ability", "")) or None
                 item = str(details.get("item", "")) or None
-                nature = str(details.get("nature", "")) or None
                 pokemon = _make_replay_pokemon(
                     species=species,
-                    base_stats_index=self.base_stats_index,
-                    moves=_replay_moves(moves_tuple),
+                    species_data_index=self.species_data_index,
+                    move_data_index=self.move_data_index,
+                    moves=_replay_moves(
+                        moves_tuple,
+                        self.move_data_index,
+                        self.generation,
+                    ),
                     ability=ability,
                     item=item,
-                    nature=nature,
+                    # poke-env's OTS parser does not expose nature on its
+                    # Pokemon objects. Matching that runtime contract avoids a
+                    # replay-only feature unavailable during live inference.
+                    nature=None,
+                )
+                pokemon = replace(
+                    pokemon,
+                    current_hp_fraction=0.0,
+                    revealed=False,
+                    selected_in_teampreview=knowledge.selected_state(side, species),
                 )
                 side_teams.append(pokemon)
             self.teams.append(side_teams)
         self.hp: dict[str, float] = {}
         self.fainted: set[str] = set()
+        self.weather: dict[ReplayName, int] = {}
+        self.fields: dict[ReplayName, int] = {}
+        self.side_conditions: list[dict[ReplayName, int]] = [{}, {}]
         # A switch can initially identify an Illusion user as another roster
         # member. Keep the pre-effect object so a later ``replace`` line can
         # restore the disguised member before transferring runtime state to
@@ -433,7 +725,7 @@ class _ReplayState:
         existing = self.team_pokemon(side, species)
         if existing is not None:
             return existing
-        pokemon = _make_replay_pokemon(species, self.base_stats_index)
+        pokemon = _make_replay_pokemon(species, self.species_data_index, self.move_data_index)
         if len(self.teams[side]) < 6:
             self.teams[side].append(pokemon)
         return pokemon
@@ -513,6 +805,142 @@ class _ReplayState:
     def hp_for(self, identifier: str) -> float | None:
         return self.hp.get(identifier.split(":", 1)[0])
 
+    def _active_for(self, identifier: str) -> tuple[int, ReplayPokemon] | None:
+        endpoint = self._endpoint(identifier)
+        if endpoint is None:
+            return None
+        pokemon = self.active[endpoint[0]][endpoint[1]]
+        if pokemon is None:
+            return None
+        return endpoint[0], pokemon
+
+    def _end_turn(self, turn: int) -> None:
+        self.turn = turn
+        for side in (0, 1):
+            for pokemon in tuple(self.active[side]):
+                if pokemon is None:
+                    continue
+                effects = {
+                    effect: (
+                        counter + 1
+                        if effect not in pokemon.presence_effects
+                        and effect.name in _TURN_COUNTER_EFFECTS
+                        else counter
+                    )
+                    for effect, counter in pokemon.effects.items()
+                    if (
+                        effect not in pokemon.turn_effects
+                        and effect.name not in _END_ON_TURN_EFFECTS
+                    )
+                }
+                status_counter = pokemon.status_counter
+                if getattr(pokemon.status, "name", "") == "TOX":
+                    status_counter += 1
+                self._replace_active(
+                    side,
+                    pokemon,
+                    active_turns=pokemon.active_turns + 1,
+                    effects_data=effects,
+                    turn_effects=frozenset(),
+                    status_counter_data=status_counter,
+                )
+
+    def _clear_switch_state(self, side: int, pokemon: ReplayPokemon) -> None:
+        status_counter = pokemon.status_counter
+        if getattr(pokemon.status, "name", "") == "TOX":
+            status_counter = 0
+        self._replace_active(
+            side,
+            pokemon,
+            ability=pokemon.forme_ability_data or pokemon.base_ability_data,
+            boosts=_zero_boosts(),
+            effects_data={},
+            presence_effects=frozenset(),
+            turn_effects=frozenset(),
+            active_turns=0,
+            protect_counter_data=0,
+            status_counter_data=status_counter,
+            preparing_data=False,
+            last_move_data=None,
+        )
+
+    def _apply_move(self, parts: Sequence[str]) -> None:
+        if len(parts) < 4:
+            return
+        located = self._active_for(parts[2])
+        if located is None:
+            return
+        side, pokemon = located
+        move_id = normalize_id(parts[3])
+        move = pokemon.moves.get(move_id)
+        failed = any(part in {"[miss]", "[still]", "[notarget]"} for part in parts[4:])
+        moves = dict(pokemon.moves)
+        if move is not None and move.current_pp is not None and _is_choice_move(parts):
+            moves[move_id] = replace(move, current_pp=max(0, move.current_pp - 1))
+        status_counter = pokemon.status_counter
+        if getattr(pokemon.status, "name", "") == "SLP":
+            status_counter += 1
+        effects = dict(pokemon.effects)
+        presence_effects = set(pokemon.presence_effects)
+        effects = {
+            effect: counter
+            for effect, counter in effects.items()
+            if effect.name not in _END_ON_MOVE_EFFECTS
+            and not (
+                effect.name == "FLASHFIRE"
+                and move is not None
+                and getattr(move.type, "name", "") == "FIRE"
+            )
+        }
+        presence_effects.intersection_update(effects)
+        if move_id == "minimize":
+            effect = ReplayName("MINIMIZE")
+            effects.setdefault(effect, 0)
+            presence_effects.add(effect)
+        self._replace_active(
+            side,
+            pokemon,
+            moves=moves,
+            protect_counter_data=(
+                pokemon.protect_counter + 1
+                if move is not None and move.increments_protect_counter and not failed
+                else 0
+            ),
+            status_counter_data=status_counter,
+            effects_data=effects,
+            presence_effects=frozenset(presence_effects),
+            preparing_data=False,
+            last_move_data=move_id,
+        )
+
+    @staticmethod
+    def _effect(value: str) -> ReplayName:
+        _, separator, remainder = value.partition(":")
+        name = remainder.strip() if separator else value
+        return ReplayName(_enum_name(name))
+
+    def _species_changes(self, species: str) -> dict[str, Any]:
+        data = self.species_data_index.get(normalize_id(species), {})
+        base_stats = data.get("baseStats", {})
+        types = tuple(str(value) for value in data.get("types", ()) if isinstance(value, str))
+        changes: dict[str, Any] = {
+            "species": species,
+            "base_stats_data": base_stats if isinstance(base_stats, Mapping) else {},
+            "type_1_data": ReplayName(_enum_name(types[0])) if types else None,
+            "type_2_data": ReplayName(_enum_name(types[1])) if len(types) > 1 else None,
+            "weight_data": float(data.get("weightkg", 0.0)),
+        }
+        # Replay form names are interpreted by the same pinned Showdown dex as
+        # the live adapter. The project dex also contains custom form entries,
+        # but some of their ability overrides differ from poke-env's runtime
+        # data (for example Scolipede-Mega and Raichu-Mega-Y).
+        live_data = GenData.from_gen(9).pokedex.get(normalize_id(species), {})
+        abilities = live_data.get("abilities") or data.get("abilities", {})
+        if isinstance(abilities, Mapping) and abilities.get("0"):
+            changes["ability"] = str(abilities["0"])
+            changes["forme_ability_data"] = str(abilities["0"])
+        return changes
+
     def apply(self, parts: Sequence[str]) -> None:
         """Advance the state machine by applying one parsed protocol line.
 
@@ -532,19 +960,31 @@ class _ReplayState:
             return
         tag = parts[1]
         if tag == "turn" and len(parts) >= 3 and parts[2].isdigit():
-            self.turn = int(parts[2])
+            self._end_turn(int(parts[2]))
             return
         if tag in ("switch", "drag") and len(parts) >= 3:
             endpoint = self._endpoint(parts[2])
             if endpoint is None:
                 return
             side, slot = endpoint
+            endpoint_id = parts[2].split(":", 1)[0]
+            outgoing = self.active[side][slot]
+            if outgoing is None:
+                outgoing = self.identifiers.get(endpoint_id)
+            if outgoing is not None:
+                self._clear_switch_state(side, outgoing)
             species = _switch_species(parts) or "unknown"
             pokemon = self.pokemon_for(side, species)
             for active_slot, active in enumerate(self.active[side]):
                 if active is pokemon:
                     self._promote_active_illusion_if_duplicate(side, active_slot, species)
             hp_fraction = get_hp_fraction(parts[4]) if len(parts) >= 5 else 1.0
+            hp_status = parts[4].split() if len(parts) >= 5 else ()
+            switch_status = (
+                ReplayName(_enum_name(hp_status[-1]))
+                if hp_status and hp_status[-1] in {"brn", "frz", "par", "psn", "slp", "tox"}
+                else pokemon.status
+            )
             if any(active is pokemon for active in self.active[side]):
                 # A duplicate displayed species is the characteristic replay
                 # shape of an Illusion masking a roster member that is already
@@ -555,6 +995,9 @@ class _ReplayState:
                     fainted=False,
                     current_hp_fraction=hp_fraction,
                     selected_in_teampreview=True,
+                    revealed=True,
+                    status=switch_status,
+                    active_turns=0,
                 )
             elif (
                 pokemon.fainted
@@ -567,13 +1010,32 @@ class _ReplayState:
                     fainted=False,
                     current_hp_fraction=hp_fraction,
                     selected_in_teampreview=True,
+                    revealed=True,
+                    status=switch_status,
+                    active_turns=0,
                 )
             self.active[side][slot] = pokemon
             self._illusion_baselines[(side, slot)] = pokemon
-            endpoint_id = parts[2].split(":", 1)[0]
             self.hp[endpoint_id] = hp_fraction
             self.identifiers[parts[2]] = pokemon
             self.identifiers[endpoint_id] = pokemon
+            return
+        if tag == "move":
+            self._apply_move(parts)
+            return
+        if tag == "cant" and len(parts) >= 3:
+            located = self._active_for(parts[2])
+            if located is not None:
+                side, pokemon = located
+                status_counter = pokemon.status_counter
+                if getattr(pokemon.status, "name", "") == "SLP":
+                    status_counter += 1
+                self._replace_active(
+                    side,
+                    pokemon,
+                    protect_counter_data=0,
+                    status_counter_data=status_counter,
+                )
             return
         if tag == "replace" and len(parts) >= 4:
             endpoint = self._endpoint(parts[2])
@@ -619,7 +1081,17 @@ class _ReplayState:
                 side, slot = endpoint
                 pokemon = self.active[side][slot]
                 if pokemon is not None:
-                    self._replace_active(side, pokemon, fainted=True, current_hp_fraction=0.0)
+                    self._replace_active(
+                        side,
+                        pokemon,
+                        fainted=True,
+                        current_hp_fraction=0.0,
+                        status=ReplayName("FNT"),
+                        ability=pokemon.forme_ability_data or pokemon.base_ability_data,
+                        effects_data={},
+                        presence_effects=frozenset(),
+                        turn_effects=frozenset(),
+                    )
                     self.fainted.add(parts[2].split(":", 1)[0])
                 self.active[side][slot] = None
             return
@@ -639,10 +1111,10 @@ class _ReplayState:
             if endpoint is not None:
                 current = self.active[endpoint[0]][endpoint[1]]
                 if current is not None:
-                    status = (
-                        None if tag == "-curestatus" else (parts[3] if len(parts) >= 4 else None)
-                    )
-                    self._replace_active(endpoint[0], current, status=status)
+                    status = None
+                    if tag == "-status" and len(parts) >= 4:
+                        status = ReplayName(_enum_name(parts[3]))
+                    self._replace_active(endpoint[0], current, status=status, status_counter_data=0)
             return
         if tag in ("-boost", "-unboost", "-setboost") and len(parts) >= 4:
             endpoint = self._endpoint(parts[2])
@@ -652,13 +1124,19 @@ class _ReplayState:
                     boosts = dict(current.boosts)
                     stat = parts[3]
                     if tag == "-setboost":
-                        boosts[stat] = int(parts[4]) if len(parts) >= 5 else 0
+                        value = int(parts[4]) if len(parts) >= 5 else 0
                     else:
                         delta = int(parts[4]) if len(parts) >= 5 else 0
-                        boosts[stat] = boosts.get(stat, 0) + (delta if tag == "-boost" else -delta)
+                        value = boosts.get(stat, 0) + (delta if tag == "-boost" else -delta)
+                    boosts[stat] = max(-6, min(6, value))
                     self._replace_active(endpoint[0], current, boosts=boosts)
             return
-        if tag in ("-clearboost", "-clearnegativeboost", "-clearallboost"):
+        if tag in {
+            "-clearboost",
+            "-clearnegativeboost",
+            "-clearpositiveboost",
+            "-clearallboost",
+        }:
             targets: list[tuple[int, ReplayPokemon]] = []
             if tag == "-clearallboost":
                 targets = [
@@ -674,21 +1152,90 @@ class _ReplayState:
                     if current is not None:
                         targets.append((endpoint[0], current))
             for side, current in targets:
-                self._replace_active(side, current, boosts=_zero_boosts())
+                boosts = dict(current.boosts)
+                if tag in {"-clearboost", "-clearallboost"}:
+                    boosts = _zero_boosts()
+                elif tag == "-clearnegativeboost":
+                    boosts = {stat: max(0, value) for stat, value in boosts.items()}
+                else:
+                    boosts = {stat: min(0, value) for stat, value in boosts.items()}
+                self._replace_active(side, current, boosts=boosts)
+            return
+        if tag == "-copyboost" and len(parts) >= 4:
+            source = self._active_for(parts[2])
+            target = self._active_for(parts[3])
+            if source is not None and target is not None:
+                _, source_pokemon = source
+                target_side, target_pokemon = target
+                self._replace_active(target_side, target_pokemon, boosts=source_pokemon.boosts)
+            return
+        if tag == "-invertboost" and len(parts) >= 3:
+            located = self._active_for(parts[2])
+            if located is not None:
+                side, pokemon = located
+                self._replace_active(
+                    side,
+                    pokemon,
+                    boosts={stat: -value for stat, value in pokemon.boosts.items()},
+                )
+            return
+        if tag == "-swapboost" and len(parts) >= 4:
+            source = self._active_for(parts[2])
+            target = self._active_for(parts[3])
+            if source is not None and target is not None:
+                source_side, source_pokemon = source
+                target_side, target_pokemon = target
+                stats = (
+                    tuple(_zero_boosts())
+                    if len(parts) < 5
+                    else tuple(
+                        stat
+                        for stat in ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
+                        if stat in parts[4] or "[from]" in parts[4]
+                    )
+                )
+                if not stats:
+                    stats = tuple(_zero_boosts())
+                source_boosts = dict(source_pokemon.boosts)
+                target_boosts = dict(target_pokemon.boosts)
+                self._replace_active(
+                    source_side,
+                    source_pokemon,
+                    boosts={
+                        **source_boosts,
+                        **{stat: target_boosts[stat] for stat in stats},
+                    },
+                )
+                self._replace_active(
+                    target_side,
+                    target_pokemon,
+                    boosts={
+                        **target_boosts,
+                        **{stat: source_boosts[stat] for stat in stats},
+                    },
+                )
             return
         if tag in ("detailschange", "-formechange") and len(parts) >= 4:
             endpoint = self._endpoint(parts[2])
             if endpoint is not None:
                 current = self.active[endpoint[0]][endpoint[1]]
                 if current is not None:
-                    self._replace_active(endpoint[0], current, species=parts[3].split(",", 1)[0])
+                    species = parts[3].split(",", 1)[0]
+                    self._replace_active(endpoint[0], current, **self._species_changes(species))
             return
         if tag == "-ability" and len(parts) >= 4:
             endpoint = self._endpoint(parts[2])
             if endpoint is not None:
                 current = self.active[endpoint[0]][endpoint[1]]
                 if current is not None:
-                    self._replace_active(endpoint[0], current, ability=parts[3])
+                    base_ability = current.base_ability_data or parts[3]
+                    self._replace_active(
+                        endpoint[0],
+                        current,
+                        ability=parts[3],
+                        base_ability_data=base_ability,
+                        forme_ability_data=current.forme_ability_data,
+                    )
             return
         if (tag == "-enditem" and len(parts) >= 3) or (tag == "-item" and len(parts) >= 4):
             endpoint = self._endpoint(parts[2])
@@ -705,6 +1252,69 @@ class _ReplayState:
             endpoint = self._endpoint(parts[2])
             if endpoint is not None:
                 self.used_mega[endpoint[0]] = True
+            return
+        if tag == "-weather" and len(parts) >= 3:
+            self.weather = (
+                {} if normalize_id(parts[2]) == "none" else {self._effect(parts[2]): self.turn}
+            )
+            return
+        if tag in {"-fieldstart", "-fieldend"} and len(parts) >= 3:
+            effect = self._effect(parts[2])
+            if tag == "-fieldstart":
+                self.fields[effect] = self.turn
+            else:
+                self.fields.pop(effect, None)
+            return
+        if tag in {"-sidestart", "-sideend"} and len(parts) >= 4:
+            side_prefix = parts[2][:2]
+            if side_prefix not in {"p1", "p2"}:
+                return
+            conditions = self.side_conditions[int(side_prefix[1]) - 1]
+            effect = self._effect(parts[3])
+            if tag == "-sideend":
+                conditions.pop(effect, None)
+            elif effect.name in {"SPIKES", "TOXIC_SPIKES"}:
+                conditions[effect] = conditions.get(effect, 0) + 1
+            else:
+                conditions.setdefault(effect, self.turn)
+            return
+        if tag in {"-activate", "-start", "-end", "-singleturn", "-singlemove"} and len(parts) >= 4:
+            located = self._active_for(parts[2])
+            if located is None:
+                return
+            side, pokemon = located
+            effect = self._effect(parts[3])
+            effects = dict(pokemon.effects)
+            presence_effects = set(pokemon.presence_effects)
+            turn_effects = set(pokemon.turn_effects)
+            if tag == "-end":
+                effects.pop(effect, None)
+                presence_effects.discard(effect)
+                turn_effects.discard(effect)
+            else:
+                effects.setdefault(effect, 0)
+                if tag == "-activate":
+                    if effect.name in _TURN_COUNTER_EFFECTS:
+                        presence_effects.discard(effect)
+                    else:
+                        presence_effects.add(effect)
+                elif tag == "-start":
+                    presence_effects.discard(effect)
+                if tag in {"-singleturn", "-singlemove"} and effect.name in _END_ON_TURN_EFFECTS:
+                    turn_effects.add(effect)
+            self._replace_active(
+                side,
+                pokemon,
+                effects_data=effects,
+                presence_effects=frozenset(presence_effects),
+                turn_effects=frozenset(turn_effects),
+            )
+            return
+        if tag == "-prepare" and len(parts) >= 4:
+            located = self._active_for(parts[2])
+            if located is not None:
+                side, pokemon = located
+                self._replace_active(side, pokemon, preparing_data=True)
 
 
 def _team_mapping(team: Sequence[ReplayPokemon]) -> dict[str, ReplayPokemon]:
@@ -718,11 +1328,45 @@ def _target_code(actor: str, target: str | None) -> int | None:
     target_endpoint = _ReplayState._endpoint(target)
     if actor_endpoint is None or target_endpoint is None:
         return None
-    if actor_endpoint == target_endpoint:
-        return -2
     if actor_endpoint[0] == target_endpoint[0]:
-        return -1
-    return target_endpoint[1]
+        return -(target_endpoint[1] + 1)
+    return target_endpoint[1] + 1
+
+
+def _observed_move_target(
+    state: _ReplayState,
+    side: int,
+    slot: int,
+    move_slot: int | None,
+    actor: str,
+    target: str | None,
+    *,
+    species: str | None = None,
+) -> int | None:
+    active = state.active[side][slot]
+    if species is not None:
+        active = state.team_pokemon(side, species)
+    if active is None or move_slot is None:
+        return None
+    moves = tuple(active.moves.values())
+    if move_slot >= len(moves):
+        return None
+    move_target = moves[move_slot].target
+    if move_target == "self":
+        return 0
+    if move_target in {
+        "all",
+        "allAdjacent",
+        "allAdjacentFoes",
+        "allies",
+        "allySide",
+        "allyTeam",
+        "foeSide",
+        "randomNormal",
+        "scripted",
+    }:
+        return 0
+    return _target_code(actor, target)
 
 
 def _move_slot(
@@ -757,17 +1401,25 @@ def _switch_species(parts: Sequence[str]) -> str:
     return parts[3].split(",", 1)[0].strip()
 
 
+def _is_pivot_switch(parts: Sequence[str]) -> bool:
+    return any(
+        normalize_id(part.removeprefix("[from] "))
+        in {"uturn", "flipturn", "voltswitch", "batonpass", "partingshot"}
+        for part in parts[4:]
+    )
+
+
 def _is_choice_switch(parts: Sequence[str]) -> bool:
     """Whether a switch line represents a submitted order.
 
-    Showdown also emits ``switch`` for automatic pivots such as Parting Shot
-    and U-turn. Those lines update state and produce events, but they are not
-    decisions visible to the environment.
+    A pivot switch emitted after U-turn/Flip Turn is the outcome of the first
+    request and the replacement request is represented by that switch line.
+    Other ``[from]`` switches are automatic state updates.
     """
     return (
         len(parts) >= 3
         and parts[1] == "switch"
-        and not any(part.startswith("[from]") for part in parts[4:])
+        and (not any(part.startswith("[from]") for part in parts[4:]) or _is_pivot_switch(parts))
     )
 
 
@@ -780,25 +1432,89 @@ def _is_choice_move(parts: Sequence[str]) -> bool:
     )
 
 
-def _perspective_has_choice(lines: Sequence[Any], perspective: int) -> bool:
-    """Whether *perspective* submitted a move or switch in *lines*."""
-    for line in lines:
-        parts = line.parts
-        if not (_is_choice_move(parts) or _is_choice_switch(parts)):
+_ACTION_TAGS = frozenset({"move", "switch", "cant"})
+
+
+def _is_action_line(parts: Sequence[str]) -> bool:
+    """Whether a protocol line is a player's answer to a request.
+
+    Every ``move``/``switch``/``cant`` line is the visible consequence of a submitted
+    order, including a pivot's ``[from]`` switch, which answers its own replacement
+    request. Automatic state updates (``drag``, item-swapped forms) never are.
+    """
+    return len(parts) >= 3 and parts[1] in _ACTION_TAGS
+
+
+def _is_separator(parts: Sequence[str]) -> bool:
+    """Whether a line is Showdown's update-block separator (a bare ``|``)."""
+    return len(parts) == 2 and parts[1] == ""
+
+
+def _update_blocks(document: ReplayDocument) -> tuple[tuple[int, int], ...]:
+    """Split the log on the separators Showdown writes when its turn loop resumes.
+
+    ``Battle.turnLoop`` emits an empty log entry every time the simulator resumes,
+    which is exactly once per answered request (plus the residual and terminal
+    phases). Segmenting on those separators recovers the request boundaries instead
+    of guessing them from turn markers.
+    """
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    for line in document.protocol_lines:
+        if not _is_separator(line.parts):
             continue
-        endpoint = _ReplayState._endpoint(parts[2])
-        if endpoint is not None and endpoint[0] == perspective:
-            return True
-    return False
+        if line.index > start:
+            bounds.append((start, line.index))
+        start = line.index
+    total = len(document.protocol_lines)
+    if start < total:
+        bounds.append((start, total))
+    return tuple(bounds)
 
 
-def _is_terminal_segment(lines: Sequence[Any]) -> bool:
-    """Whether *lines* contain a game-ending ``win`` or ``tie`` marker."""
-    for line in lines:
-        parts = line.parts
-        if len(parts) >= 2 and parts[1] in ("win", "tie"):
-            return True
-    return False
+def _decision_blocks(document: ReplayDocument) -> tuple[tuple[int, int, DecisionType], ...]:
+    """Return the update blocks that answer a request, with their decision type.
+
+    Residual and terminal blocks carry no order, so they stay part of the following
+    decision's event window rather than becoming decisions of their own.
+    """
+    lines = document.protocol_lines
+    if not any(_is_separator(line.parts) for line in lines) and any(
+        _is_action_line(line.parts) for line in lines
+    ):
+        # Without separators the request boundaries are unrecoverable, and guessing
+        # them is what this segmentation exists to remove. Fail loudly instead.
+        raise ValueError(
+            "Replay log has protocol actions but no update-block separators; "
+            "request boundaries cannot be recovered from it"
+        )
+
+    has_preview = any(len(line.parts) > 1 and line.parts[1] == "teampreview" for line in lines)
+    blocks: list[tuple[int, int, DecisionType]] = []
+    turn_started = False
+
+    for start, end in _update_blocks(document):
+        block = lines[start:end]
+        if not any(_is_action_line(line.parts) for line in block):
+            # a residual/terminal block still moves the turn cursor it may contain
+            turn_started = turn_started or any(
+                len(line.parts) > 1 and line.parts[1] == "turn" for line in block
+            )
+            continue
+
+        if has_preview and not blocks:
+            decision_type = DecisionType.TEAM_PREVIEW
+        elif turn_started:
+            decision_type = DecisionType.TURN
+        else:
+            # no turn marker since the previous decision: the simulator interrupted
+            # the turn to ask one side for a replacement
+            decision_type = DecisionType.FORCED_SWITCH
+
+        blocks.append((start, end, decision_type))
+        turn_started = any(len(line.parts) > 1 and line.parts[1] == "turn" for line in block)
+
+    return tuple(blocks)
 
 
 def _animation_targets(lines: Sequence[Any]) -> dict[tuple[int, int, str], str]:
@@ -851,6 +1567,57 @@ def _illusion_species_by_line(lines: Sequence[Any]) -> dict[tuple[int, int, int]
             for index in range(start, line.index):
                 resolved[(index, endpoint[0], endpoint[1])] = species
     return resolved
+
+
+def _perspective_knowledge(
+    document: ReplayDocument,
+    perspective: int,
+    dex: Mapping[str, Any],
+) -> PerspectiveKnowledge:
+    """Recover private team selection without backfilling opponent knowledge."""
+    player_id = f"p{perspective + 1}"
+    roster = document.ots[perspective].revealed_species
+    roster_by_identity: dict[str, str] = {}
+    species_identities = _species_identity_index(dex)
+    for species in roster:
+        normalized = normalize_id(species)
+        identity = species_identities.get(normalized, normalized)
+        roster_by_identity.setdefault(identity, normalized)
+
+    selection_size = min(4, len(roster))
+    for line in document.protocol_lines:
+        if (
+            len(line.parts) >= 4
+            and line.parts[1] == "teamsize"
+            and line.parts[2] == player_id
+            and line.parts[3].isdigit()
+        ):
+            selection_size = int(line.parts[3])
+
+    illusion_species = _illusion_species_by_line(document.protocol_lines)
+    selected: set[str] = set()
+    for line in document.protocol_lines:
+        parts = line.parts
+        if len(parts) < 4 or parts[1] not in {"switch", "drag"}:
+            continue
+        endpoint = _ReplayState._endpoint(parts[2])
+        if endpoint is None or endpoint[0] != perspective:
+            continue
+        species = illusion_species.get(
+            (line.index, perspective, endpoint[1]), _switch_species(parts)
+        )
+        normalized = normalize_id(species)
+        identity = species_identities.get(normalized, normalized)
+        roster_species = roster_by_identity.get(identity)
+        if roster_species is not None:
+            selected.add(roster_species)
+
+    return PerspectiveKnowledge(
+        player=perspective,
+        selected_species=frozenset(selected),
+        selection_size=selection_size,
+        selection_complete=len(selected) == selection_size,
+    )
 
 
 def _infer_illusion_active_species(
@@ -929,13 +1696,22 @@ def _observed_actions(
     observed: list[ObservedAction | None] = [None, None]
     tags: list[str] = []
     mega_slots: set[tuple[int, int]] = set()
+    submission_invalidated: set[tuple[int, int]] = set()
+    globally_invalidated = False
     animation_targets = _animation_targets(lines)
     for line in lines:
         parts = line.parts
+        tag = parts[1] if len(parts) >= 2 else ""
         if len(parts) >= 3 and parts[1] == "-mega":
             endpoint = _ReplayState._endpoint(parts[2])
             if endpoint is not None:
                 mega_slots.add(endpoint)
+        if len(parts) >= 3 and tag in _ENDPOINT_ACTION_STATE_TAGS:
+            endpoint = _ReplayState._endpoint(parts[2])
+            if endpoint is not None:
+                submission_invalidated.add(endpoint)
+        elif tag in _GLOBAL_ACTION_STATE_TAGS:
+            globally_invalidated = True
         if len(parts) < 3:
             continue
         if parts[1] == "move":
@@ -950,6 +1726,14 @@ def _observed_actions(
             if observed[slot] is not None:
                 observed[slot] = ObservedAction(None, exact=False, tag="multiple_moves_same_slot")
                 diagnostics["externally_generated_move"] += 1
+                continue
+            if endpoint in submission_invalidated or globally_invalidated:
+                # The request was submitted before this state transition. A
+                # replay move records the engine's resulting execution, which
+                # need not be the command the player originally selected.
+                observed[slot] = ObservedAction(None, exact=False, tag="submission_state_changed")
+                diagnostics["submission_state_changed"] += 1
+                tags.append("submission_state_changed")
                 continue
             move = parts[3] if len(parts) >= 4 else ""
             forced = normalize_id(move) in {"struggle", "recharge"}
@@ -977,7 +1761,15 @@ def _observed_actions(
                 move,
                 species=effective_species,
             )
-            target_code = _target_code(parts[2], target)
+            target_code = _observed_move_target(
+                state,
+                perspective,
+                slot,
+                move_slot,
+                parts[2],
+                target,
+                species=effective_species,
+            )
             if move_slot is None or target_code is None:
                 diagnostics["move_slot_or_target_unknown"] += 1
                 observed[slot] = ObservedAction(
@@ -987,7 +1779,22 @@ def _observed_actions(
                 action = MOVE_START + move_slot * TARGET_COUNT + target_code + 2
                 if endpoint in mega_slots:
                     action += MOVE_END - MOVE_START
-                observed[slot] = ObservedAction(action, tag=target_tag)
+                if target_code == 0:
+                    observed[slot] = ObservedAction(action, tag=target_tag)
+                else:
+                    mega_offset = MOVE_END - MOVE_START if endpoint in mega_slots else 0
+                    alternatives = tuple(
+                        MOVE_START + move_slot * TARGET_COUNT + target + 2 + mega_offset
+                        for target in (-2, -1, 1, 2)
+                    )
+                    if target_tag != "move":
+                        tags.append(target_tag)
+                    observed[slot] = ObservedAction(
+                        action,
+                        alternatives=alternatives,
+                        exact=False,
+                        tag="execution_target",
+                    )
         elif _is_choice_switch(parts):
             endpoint = _ReplayState._endpoint(parts[2])
             if endpoint is None or endpoint[0] != perspective:
@@ -1013,8 +1820,17 @@ def _observed_actions(
 
 
 def _preview_actions(
-    state: _ReplayState, lines: Sequence[Any], perspective: int
+    state: _ReplayState,
+    lines: Sequence[Any],
+    perspective: int,
+    knowledge: PerspectiveKnowledge,
 ) -> tuple[ObservedAction | None, ObservedAction | None, tuple[str, ...]]:
+    """Read the team-preview order: leads from the log, backline once fully revealed.
+
+    The leads are public the moment they switch in. The backline is not, but the
+    complete replay reveals which reserves were brought, so the label for the second
+    action is deferred to that oracle rather than guessed at preview time.
+    """
     leads: list[str] = []
     for line in lines:
         if len(line.parts) < 3 or line.parts[1] != "switch":
@@ -1027,11 +1843,13 @@ def _preview_actions(
             leads.append(species)
     if len(leads) != 2:
         return None, None, ("preview_leads_unknown",)
+
+    roster = state.teams[perspective]
     try:
         lead_indices = tuple(
             next(
                 index
-                for index, pokemon in enumerate(state.teams[perspective])
+                for index, pokemon in enumerate(roster)
                 if normalize_id(pokemon.species) == normalize_id(species)
             )
             for species in leads
@@ -1040,8 +1858,31 @@ def _preview_actions(
         return None, None, ("preview_roster_unknown",)
     if len(set(lead_indices)) != 2:
         return None, None, ("preview_duplicate_lead",)
-    team_size = len(state.teams[perspective])
+
+    team_size = len(roster)
     first = encode_team_pair(lead_indices[0], lead_indices[1], team_size=team_size)
+    reserves = tuple(
+        index
+        for index, pokemon in enumerate(roster)
+        if index not in lead_indices
+        and knowledge.selected_state(perspective, pokemon.species) is True
+    )
+    if knowledge.selection_complete and len(reserves) == 2:
+        # which reserve was ordered third is never public, so both orderings of the
+        # revealed pair stay candidates instead of one of them being asserted
+        return (
+            ObservedAction(first, tag="preview_leads"),
+            ObservedAction(
+                alternatives=(
+                    encode_team_pair(reserves[0], reserves[1], team_size=team_size),
+                    encode_team_pair(reserves[1], reserves[0], team_size=team_size),
+                ),
+                exact=False,
+                tag="preview_reserves_revealed",
+            ),
+            ("preview_reserves_revealed",),
+        )
+
     alternatives = tuple(
         encode_team_pair(first_index, second_index, team_size=team_size)
         for first_index in range(team_size)
@@ -1057,66 +1898,6 @@ def _preview_actions(
     )
 
 
-def _segments(document: ReplayDocument) -> tuple[tuple[int, int, DecisionType], ...]:
-    """Partition the protocol lines into contiguous decision segments.
-
-    Args:
-        document: The complete parsed replay document.
-
-    Returns:
-        A tuple of (start_index, end_index, decision_type) representing the protocol line
-        boundaries for each decision request.
-    """
-    turns: list[int] = []
-    preview: list[int] = []
-
-    for line in document.protocol_lines:
-        if len(line.parts) > 1:
-            if line.parts[1] == "turn":
-                turns.append(line.index)
-            elif line.parts[1] == "teampreview":
-                preview.append(line.index)
-
-    segments: list[tuple[int, int, DecisionType]] = []
-
-    if preview and turns and turns[0] > 0:
-        segments.append((0, turns[0], DecisionType.TEAM_PREVIEW))
-    elif preview and not turns:
-        segments.append((0, len(document.protocol_lines), DecisionType.TEAM_PREVIEW))
-
-    for index, start in enumerate(turns):
-        end = turns[index + 1] if index + 1 < len(turns) else len(document.protocol_lines)
-        boundaries = [start]
-        saw_action = False
-
-        for line in document.protocol_lines[start:end]:
-            # cant is an outcome of a submitted move (flinch, paralysis,
-            # sleep, Armor Tail, ...), and drag is an automatic battle
-            # effect. Neither creates a new request in poke-env. A switch
-            # after an action is a forced replacement request; switches
-            # before the first action belong to the current request (for
-            # example a voluntary pivot at the start of a turn).
-            if _is_choice_move(line.parts) or _is_choice_switch(line.parts):
-                if _is_choice_switch(line.parts) and saw_action:
-                    boundaries.append(line.index)
-                    saw_action = False
-                else:
-                    saw_action = True
-
-        boundaries.append(end)
-
-        segments.extend(
-            (left, right, DecisionType.TURN)
-            for left, right in zip(boundaries, boundaries[1:])
-            if left < right
-        )
-
-    if not segments and not preview:
-        segments.append((0, len(document.protocol_lines), DecisionType.TURN))
-
-    return tuple(segments)
-
-
 def _view(
     state: _ReplayState,
     perspective: int,
@@ -1124,7 +1905,6 @@ def _view(
     preview: bool,
     effective_species: Mapping[tuple[int, int], str] | None = None,
     forced_move_slots: Sequence[int] = (),
-    wait: bool = False,
 ) -> FixtureBattleView:
     """Build a player-relative pre-decision view from the current state.
 
@@ -1141,8 +1921,6 @@ def _view(
             Illusion species to display instead of the disguised alias.
         forced_move_slots: Slot indices that are locked into a forced move
             (Struggle / Recharge) during this segment.
-        wait: When ``True``, both slots are forced to ``PASS_ACTION`` — used
-            for ``FORCED_PASS`` decisions where only the opponent acts.
 
     Returns:
         A ``FixtureBattleView`` ready for evidence extraction.
@@ -1166,8 +1944,23 @@ def _view(
         actual_index = next(index for index, pokemon in enumerate(teams[side]) if pokemon is actual)
         teams[side][actual_index] = effective
         active[side][slot] = effective
+    teams[perspective] = [
+        replace(pokemon, current_hp_fraction=1.0)
+        if not pokemon.revealed and pokemon.current_hp_fraction == 0.0
+        else pokemon
+        for pokemon in teams[perspective]
+    ]
     own_active = tuple(active[perspective])
     opponent_active = tuple(active[opponent])
+    can_mega_evolve = tuple(
+        bool(
+            pokemon is not None
+            and not state.used_mega[perspective]
+            and normalize_id(pokemon.item or "") in state.mega_items
+            and "mega" not in normalize_id(pokemon.species)
+        )
+        for pokemon in own_active
+    )
     slots = []
     known_switches = tuple(
         tuple(
@@ -1180,11 +1973,13 @@ def _view(
         for _ in (0, 1)
     )
     for slot_index, pokemon in enumerate(own_active):
-        moves = () if pokemon is None else tuple((tuple((-2, -1, 0, 1)),) for _ in pokemon.moves)
+        moves = () if pokemon is None else tuple((tuple((-2, -1, 0, 1, 2)),) for _ in pokemon.moves)
         switch_slots = tuple(
             index
             for index, candidate in enumerate(teams[perspective])
-            if not candidate.fainted and candidate not in own_active
+            if candidate.selected_in_teampreview is not False
+            and not candidate.fainted
+            and candidate not in own_active
         )
         slots.append(
             SlotDecision(
@@ -1196,15 +1991,19 @@ def _view(
                 # as conservative switch candidates, but only assert the
                 # forced-switch phase when a known selected reserve exists.
                 force_switch=pokemon is None and bool(known_switches[slot_index]),
-                can_mega=not state.used_mega[perspective],
+                can_mega=can_mega_evolve[slot_index],
                 forced_move=slot_index in forced_move_slots,
+                # Replays contain executed outcomes, not the authoritative
+                # request mask sent to this player. The action superset stays
+                # available for evidence extraction, but its provenance is
+                # explicitly unknown to the observation encoder.
+                legality_known=False,
             )
         )
     decision = DecisionView(
         slots=(slots[0], slots[1]),
         team_preview=preview,
         team_size=max(1, len(teams[perspective])),
-        wait=wait,
     )
     return FixtureBattleView(
         team=_team_mapping(teams[perspective]),
@@ -1215,17 +2014,17 @@ def _view(
             tuple(pokemon.moves) if pokemon is not None else () for pokemon in own_active
         ),
         available_switches=known_switches,
-        can_mega_evolve=(not state.used_mega[perspective],) * 2,
+        can_mega_evolve=can_mega_evolve,
         force_switch=tuple(slot.force_switch for slot in slots),
         trapped=(False, False),
         maybe_trapped=(False, False),
         teampreview=preview,
         player_role=f"p{perspective + 1}",
         wait=False,
-        weather={},
-        fields={},
-        side_conditions={},
-        opponent_side_conditions={},
+        weather=dict(state.weather),
+        fields=dict(state.fields),
+        side_conditions=dict(state.side_conditions[perspective]),
+        opponent_side_conditions=dict(state.side_conditions[opponent]),
         turn=state.turn,
         used_mega_evolve=state.used_mega[perspective],
         opponent_used_mega_evolve=state.used_mega[opponent],
@@ -1234,32 +2033,39 @@ def _view(
     )
 
 
-def _events_and_update(
-    state: _ReplayState, lines: Sequence[Any], diagnostics: Counter[str]
+def _parse_window(
+    raw_events: Sequence[RawBattleEvent], diagnostics: Counter[str]
 ) -> tuple[BattleEvent, ...]:
-    raw_events: list[RawBattleEvent] = []
-    for line in lines:
-        raw_events.append(build_raw_event(line.parts, state.hp_for))
-        # The live capture snapshots HP immediately before each parsed
-        # protocol line. Apply each line after building its raw event so two
-        # consecutive damage/heal messages get the same pre-HP baselines as
-        # poke-env, rather than all seeing the state from the start of the
-        # request.
-        try:
-            state.apply(line.parts)
-        except (TypeError, ValueError, IndexError):
-            diagnostics["state_update_errors"] += 1
+    """Tokenize one request's raw-line window with the shared event parser."""
     before = Counter(EVENT_DIAGNOSTICS)
     try:
-        events = parse_events(raw_events, tokenizer)
+        events = parse_events(list(raw_events), tokenizer)
     except (TypeError, ValueError, IndexError):
         diagnostics["parser_errors"] += 1
-        diagnostics["parse_error_lines"] += len(lines)
+        diagnostics["parse_error_lines"] += len(raw_events)
         events = []
     after = Counter(EVENT_DIAGNOSTICS)
     for key, count in after.items():
         diagnostics[key] += max(0, count - before[key])
     return tuple(events)
+
+
+def _implicit_pass_slots(
+    observed: Sequence[ObservedAction | None],
+    decision_type: DecisionType,
+) -> tuple[int, ...]:
+    """Slots that provably passed because only the other slot was asked.
+
+    A mid-turn replacement request asks a single slot; the other slot's order was
+    already consumed this turn, so its pass is structural rather than inferred. The
+    perspective must have answered the request for this to hold — a side that only
+    waited submitted nothing at all.
+    """
+    if decision_type is not DecisionType.FORCED_SWITCH:
+        return ()
+    if not any(action is not None for action in observed):
+        return ()
+    return tuple(slot for slot, action in enumerate(observed) if action is None)
 
 
 def reconstruct_perspective(
@@ -1269,7 +2075,14 @@ def reconstruct_perspective(
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
 ) -> ReconstructedPerspective:
-    """Build pre-decision player-relative views while enforcing causal cutoffs.
+    """Rebuild one player's pre-decision views and action evidence from a replay.
+
+    The protocol lines are walked exactly once. At every update block that answers a
+    request, the state machine holds the pre-decision state and the raw lines seen
+    since the previous request form that decision's event window, mirroring what the
+    live environment presents. Legality is never guessed: the emitted mask is a
+    superset marked unproven, so no observation cell claims a restriction the replay
+    cannot show.
 
     Arguments:
         document: The complete parsed replay document.
@@ -1289,22 +2102,35 @@ def reconstruct_perspective(
 
         dex = default_runtime_resources().dex
 
-    state = _ReplayState(document, dex)
+    knowledge = _perspective_knowledge(document, perspective, dex)
+    state = _ReplayState(document, dex, knowledge)
     counters: Counter[str] = Counter()
+    if not knowledge.selection_complete:
+        counters["own_selection_incomplete"] += 1
+
     snapshots: list[ReconstructedSnapshot] = []
     decisions: list[DecisionRecord] = []
-    pending_events: tuple[BattleEvent, ...] = ()
     illusion_species_by_line = _illusion_species_by_line(document.protocol_lines)
+    decision_blocks = _decision_blocks(document)
 
-    for decision_index, (start, end, decision_type) in enumerate(_segments(document)):
+    window: list[RawBattleEvent] = []
+    cursor = 0
+    for decision_index, (start, end, decision_type) in enumerate(decision_blocks):
+        # replay everything between the previous request and this one, so the state
+        # machine and the event window advance together over a single line pass
+        for line in document.protocol_lines[cursor:start]:
+            window.append(build_raw_event(line.parts, state.hp_for))
+            state.apply(line.parts)
+        cursor = start
+
         lines = document.protocol_lines[start:end]
+        preview = decision_type is DecisionType.TEAM_PREVIEW
 
         effective_species = {}
         for slot in (0, 1):
             species = illusion_species_by_line.get((start - 1, perspective, slot))
             if species is not None:
                 effective_species[(perspective, slot)] = species
-
         effective_species.update(
             _infer_illusion_active_species(
                 state,
@@ -1313,6 +2139,7 @@ def reconstruct_perspective(
                 illusion_species_by_line,
             )
         )
+
         forced_move_slots = tuple(
             endpoint[1]
             for line in lines
@@ -1322,35 +2149,20 @@ def reconstruct_perspective(
             and endpoint[0] == perspective
             and normalize_id(line.parts[3]) in {"struggle", "recharge"}
         )
-        # Detect a one-sided waiting segment: only the opponent has an
-        # asynchronous replacement or pivot choice, so this perspective is
-        # forced to pass. Boundary rule 1: a terminal KO that ends the game
-        # has no later request, so it must not produce a FORCED_PASS record.
-        # Boundary rule 2: a simultaneous replacement where this perspective
-        # must also choose is handled by the ``not _perspective_has_choice``
-        # guard below — it keeps the normal FORCED_SWITCH / TURN path.
-        is_waiting = (
-            decision_type is not DecisionType.TEAM_PREVIEW
-            and not _perspective_has_choice(lines, perspective)
-            and _perspective_has_choice(lines, 1 - perspective)
-            and not _is_terminal_segment(lines)
-        )
+
         view = _view(
             state,
             perspective,
-            preview=decision_type is DecisionType.TEAM_PREVIEW,
+            preview=preview,
             effective_species=effective_species,
             forced_move_slots=forced_move_slots,
-            wait=is_waiting,
         )
-        # The live environment presents the state after the preceding
-        # request's protocol messages and exposes exactly those messages as
-        # this request's event window. Do not attach the current action's
-        # consequences to the action that caused them.
-        view.events = list(pending_events)
-        observed = (
-            _preview_actions(state, lines, perspective)
-            if decision_type is DecisionType.TEAM_PREVIEW
+        view.events = list(_parse_window(window, counters))
+        window = []
+
+        observed_actions = (
+            _preview_actions(state, lines, perspective, knowledge)
+            if preview
             else _observed_actions(
                 state,
                 lines,
@@ -1359,33 +2171,39 @@ def reconstruct_perspective(
                 illusion_species_by_line,
             )
         )
-        tags = list(observed[2])
-        if decision_type is DecisionType.TEAM_PREVIEW:
+        observed = list(observed_actions[:2])
+        tags = list(observed_actions[2])
+        if preview:
             tags.append("preview_selection_not_public")
-        if any(action is not None and action.tag == "switch" for action in observed[:2]):
-            if any(action is not None and action.tag == "move" for action in observed[:2]):
-                decision_type = DecisionType.PIVOT_SWITCH
-            elif any(
-                view.decision.slots[index].force_switch
-                for index in (0, 1)
-                if observed[index] is not None
-            ):
-                decision_type = DecisionType.FORCED_SWITCH
-        elif is_waiting:
-            decision_type = DecisionType.FORCED_PASS
-            tags.append("forced_pass")
-        for slot, action in enumerate(observed[:2]):
+
+        for slot in _implicit_pass_slots(observed, decision_type):
+            observed[slot] = ObservedAction(PASS_ACTION, tag="implicit_pass")
+
+        if decision_type is DecisionType.FORCED_SWITCH and any(
+            _is_pivot_switch(line.parts) for line in lines
+        ):
+            decision_type = DecisionType.PIVOT_SWITCH
+
+        for slot, action in enumerate(observed):
             if action is not None and action.action is not None:
                 if action.action not in legal_actions(view.decision, slot):
                     counters["observed_illegal_action"] += 1
-        request = EvidenceRequest(
-            view=view.decision,
-            slots=(observed[0], observed[1]),
-            tags=tuple(tags),
-            max_candidates=max_candidates,
-            unknown=False,
+
+        # A block in which this side shows no order at all is either a wait or an
+        # action whose execution never reached the log. Enumerating the whole legal
+        # set as candidates would supervise on a set we have no evidence for.
+        no_observed_order = not any(action is not None for action in observed)
+        if no_observed_order:
+            tags.append("no_observed_order")
+        evidence = extract_action_evidence(
+            EvidenceRequest(
+                view=view.decision,
+                slots=(observed[0], observed[1]),
+                tags=tuple(tags),
+                max_candidates=max_candidates,
+                unknown=no_observed_order,
+            )
         )
-        evidence = extract_action_evidence(request)
         decisions.append(
             DecisionRecord(
                 decision_index=decision_index,
@@ -1396,21 +2214,18 @@ def reconstruct_perspective(
                 evidence=evidence,
             )
         )
-        events = _events_and_update(state, lines, counters)
         snapshots.append(
             ReconstructedSnapshot(
                 decision_index=decision_index,
-                turn=state.turn
-                if decision_type is not DecisionType.TURN
-                else (lines[0].turn or state.turn),
+                turn=view.turn,
                 pre_line_index=start,
                 post_line_index=end,
                 view=view,
-                events=pending_events,
+                events=tuple(view.events),
                 raw_lines=tuple(line.raw for line in lines),
             )
         )
-        pending_events = events
+
     diagnostics = ReplayDiagnostics(dict(counters), ())
     return ReconstructedPerspective(
         game_id=document.metadata.replay_id,
@@ -1420,6 +2235,7 @@ def reconstruct_perspective(
         diagnostics=diagnostics,
         _outcome=document.outcome,
         _ots_payloads=(document.ots[0].raw_payload, document.ots[1].raw_payload),
+        _protocol_lines=tuple(line.raw for line in document.protocol_lines),
     )
 
 

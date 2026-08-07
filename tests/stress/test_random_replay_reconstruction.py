@@ -17,9 +17,9 @@ format-specific rather than a claim about every historical Showdown mod.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
 
@@ -31,11 +31,22 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
 from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
+from p0.battle.events import get_hp_fraction
 from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import StructuredObservation
+from p0.model.structured_observation import (
+    NUM_IDX_CAN_MEGA,
+    NUM_IDX_CAN_SWITCH_OUT,
+    NUM_IDX_HP_FRACTION,
+    NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_SLOT_CONDITION_UNKNOWN,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    TOKEN_IDX_ALLY_SIDE,
+    StructuredObservation,
+)
 from p0.replays.compile import compile_documents, write_tensor_shards
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.reconstruct import ReconstructedPerspective, ReconstructedSnapshot, reconstruct_both
@@ -85,6 +96,9 @@ _REPLAY_AMBIGUITY_TAGS = frozenset(
         "preview_duplicate_lead",
         "preview_reserves_unknown",
         "externally_generated_move",
+        # the submitted order left no trace: the mon was KO'd before it acted, or the
+        # request was answered with a pass that the protocol never renders
+        "no_observed_order",
     }
 )
 
@@ -126,12 +140,23 @@ def _cant_reasons(snapshot: ReconstructedSnapshot, role: int) -> tuple[str, ...]
     return tuple(dict.fromkeys(reasons))
 
 
-def _record_key(record: dict[str, Any]) -> tuple[bool, int]:
-    return bool(record["teampreview"]), int(record["turn"])
+def _showteam_offset(document: ReplayDocument) -> tuple[int, int]:
+    """Where the harness spliced open-team-sheet lines into the captured log.
+
+    The live cursor counts only lines poke-env parsed, and ``showteam`` is not one of
+    them, so cursors at or past the splice point are shifted by the inserted lines.
+    """
+    indices = [
+        line.index
+        for line in document.protocol_lines
+        if len(line.parts) > 1 and line.parts[1] == "showteam"
+    ]
+    return (len(document.protocol_lines), 0) if not indices else (indices[0], len(indices))
 
 
-def _snapshot_key(snapshot: ReconstructedSnapshot) -> tuple[bool, int]:
-    return snapshot.view.teampreview, snapshot.turn
+def _live_boundary(record: dict[str, Any], splice_index: int, splice_count: int) -> int:
+    cursor = int(record["replay_cursor"])
+    return cursor if cursor <= splice_index else cursor + splice_count
 
 
 class JsonCapturingRandomPlayer(RandomPlayer):
@@ -207,6 +232,11 @@ class JsonCapturingRandomPlayer(RandomPlayer):
                 "teampreview": bool(battle.teampreview),
                 "player_role": str(battle.player_role),
                 "action": None if action is None else list(action),
+                # The count of replay-visible lines consumed before this request is the
+                # shared boundary: reconstruction reaches the same line index when it
+                # segments the log, so the two sides are matched exactly rather than
+                # by a turn heuristic.
+                "replay_cursor": len(battle._replay_data),
                 # Save the individual pre-fusion fields, not a fused model input.
                 "tensors": [tensor.clone() for tensor in observation.tensors()],
             }
@@ -221,7 +251,13 @@ class JsonCapturingRandomPlayer(RandomPlayer):
     def _write_observation_tensors(self, battle: AbstractBattle) -> None:
         replay_id = battle.battle_tag.removeprefix("battle-")
         role = str(battle.player_role)
-        payload = {"records": self._live_records.pop(battle.battle_tag, [])}
+        payload = {
+            "records": self._live_records.pop(battle.battle_tag, []),
+            # This side's own copy of the protocol stream. For the player that does not
+            # write the replay it is an independent capture of the same battle, which
+            # is what makes the line-stream comparison a real check.
+            "lines": ["|".join(message) for message in battle._replay_data],
+        }
         self.observation_dir.mkdir(parents=True, exist_ok=True)
         path = self.observation_dir / f"{replay_id}-{role}.pt"
         torch.save(payload, path)
@@ -285,11 +321,18 @@ def _stress_timeout(game_count: int) -> float:
     return value
 
 
-def _load_live_records(path: Path) -> tuple[dict[str, Any], ...]:
+def _load_live_artifact(path: Path) -> dict[str, Any]:
     artifact = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(artifact, dict) or not isinstance(artifact.get("records"), list):
+    if (
+        not isinstance(artifact, dict)
+        or not isinstance(artifact.get("records"), list)
+        or not isinstance(artifact.get("lines"), list)
+    ):
         raise AssertionError(f"Malformed live observation artifact: {path}")
-    return tuple(cast(dict[str, Any], record) for record in artifact["records"])
+    return {
+        "records": tuple(cast(dict[str, Any], record) for record in artifact["records"]),
+        "lines": tuple(str(line) for line in artifact["lines"]),
+    }
 
 
 def _live_tensors(record: dict[str, Any]) -> StructuredObservation:
@@ -312,25 +355,73 @@ def _assert_expected_observation_fields(
     live: StructuredObservation,
     reconstructed: StructuredObservation,
 ) -> None:
+    """Compare every field a public replay can reproduce at a shared boundary."""
     for name in (
         "token_type_ids",
         "side_ids",
         "slot_ids",
         "categorical",
         "events_cat",
-        "events_num",
         "events_side_ids",
         "events_slot_ids",
         "events_metadata",
     ):
         torch.testing.assert_close(getattr(live, name), getattr(reconstructed, name))
 
-    # Hidden level/stat values and their provenance intentionally differ: the
-    # live battle knows the player's actual values, while a replay reconstructs
-    # them from the public species/OTS information.  All other numeric columns
-    # are expected to be identical, including legality and dynamic state.
-    torch.testing.assert_close(live.numerical[:, :43], reconstructed.numerical[:, :43])
-    torch.testing.assert_close(live.numerical[:, 50:56], reconstructed.numerical[:, 50:56])
+    # Replays store the player's own HP as a percentage, so the HP column and the
+    # event HP deltas are quantized relative to the live capture.
+    torch.testing.assert_close(live.events_num, reconstructed.events_num, atol=0.02, rtol=0)
+    torch.testing.assert_close(
+        live.numerical[:, NUM_IDX_HP_FRACTION],
+        reconstructed.numerical[:, NUM_IDX_HP_FRACTION],
+        atol=0.02,
+        rtol=0,
+    )
+
+    # Which reserves the player brought is private until one appears, so a row the
+    # replay cannot place yet reports the unknown slot condition instead of guessing,
+    # and its side-token mega availability rides the same gate.
+    known_rows = reconstructed.numerical[:, NUM_IDX_SLOT_CONDITION_UNKNOWN] == 0
+    known_rows[TOKEN_IDX_ALLY_SIDE] = (
+        reconstructed.numerical[TOKEN_IDX_ALLY_SIDE, NUM_IDX_LEGALITY_UNKNOWN] == 0
+    )
+    columns = [index for index in range(43) if index != NUM_IDX_CAN_MEGA]
+    columns.remove(NUM_IDX_HP_FRACTION)
+    torch.testing.assert_close(
+        live.numerical[known_rows][:, columns], reconstructed.numerical[known_rows][:, columns]
+    )
+    _assert_legality_provenance(live, reconstructed)
+
+
+def _assert_legality_provenance(
+    live: StructuredObservation,
+    reconstructed: StructuredObservation,
+) -> None:
+    """A reconstructed legality cell must match live exactly, or be marked unproven.
+
+    Hidden level/stat values and their provenance intentionally differ: the live battle
+    knows the player's actual values, while a replay reconstructs them from the public
+    species/OTS information. Legality is different — it must never be *wrong*, so a
+    replay either proves it or raises the unknown gate and writes zeros.
+    """
+    gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)
+    assert torch.all(live.numerical[:, NUM_IDX_LEGALITY_UNKNOWN] == 0)
+    assert torch.all(live.numerical[TOKEN_IDX_ALLY_SIDE, gates] == 0)
+
+    unproven = reconstructed.numerical[:, NUM_IDX_LEGALITY_UNKNOWN] > 0
+    legality = slice(NUM_IDX_MOVE_LEGAL, NUM_IDX_CAN_SWITCH_OUT + 1)
+    assert torch.all(reconstructed.numerical[unproven][:, legality] == 0), (
+        "An unproven legality row must carry zeros, never a guessed value"
+    )
+    assert torch.all(reconstructed.numerical[unproven, NUM_IDX_CAN_MEGA] == 0)
+
+    proven = ~unproven
+    torch.testing.assert_close(
+        live.numerical[proven][:, legality], reconstructed.numerical[proven][:, legality]
+    )
+    torch.testing.assert_close(
+        live.numerical[proven, NUM_IDX_CAN_MEGA], reconstructed.numerical[proven, NUM_IDX_CAN_MEGA]
+    )
 
 
 def _assert_reconstruction_labels(document: ReplayDocument) -> tuple[ReconstructedPerspective, ...]:
@@ -358,92 +449,198 @@ def _assert_reconstruction_labels(document: ReplayDocument) -> tuple[Reconstruct
 def _match_live_records(
     perspective: ReconstructedPerspective,
     live_records: tuple[dict[str, Any], ...],
+    document: ReplayDocument,
 ) -> tuple[tuple[ReconstructedSnapshot, dict[str, Any]], ...]:
-    """Match replay decisions to request-time captures, allowing no-request segments."""
-    queues: dict[tuple[bool, int], list[dict[str, Any]]] = defaultdict(list)
-    for record in live_records:
-        queues[_record_key(record)].append(record)
+    """Pair requests with decisions at the boundary both sides can name.
+
+    Reconstruction is not required to reproduce the live request schedule, so waits and
+    requests answered with no order are dropped. Every request that carried an order is
+    a shared boundary and must be represented by a decision at the same line index.
+    """
+    splice_index, splice_count = _showteam_offset(document)
+    boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
 
     matched: list[tuple[ReconstructedSnapshot, dict[str, Any]]] = []
-    for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
-        key = _snapshot_key(snapshot)
-        queue = queues[key]
-        causes = _cant_reasons(snapshot, perspective.player)
-        has_protocol_action = any(
-            _line_has_observed_action(line, perspective.player) for line in snapshot.raw_lines
-        )
-
-        record: dict[str, Any] | None = None
-        if queue and (
-            decision.evidence.label_kind is not LabelKind.UNKNOWN or has_protocol_action or causes
-        ):
-            record = queue.pop(0)
-        elif queue and decision.evidence.label_kind is LabelKind.UNKNOWN:
-            # A request can be visible in the replay while poke-env was waiting
-            # for this side, or while both slots had only implicit/default passes.
-            candidate = queue[0]
-            action = _live_action(candidate)
-            if action is None or all(value in {-2, 0} for value in action):
-                record = queue.pop(0)
-
-        if record is None:
-            if decision.evidence.label_kind is not LabelKind.UNKNOWN:
-                raise AssertionError(
-                    f"No live request matched {perspective.game_id} p{perspective.player + 1} "
-                    f"decision {decision.decision_index} at turn {snapshot.turn}"
-                )
-            # This is the intended no-request UNKNOWN: the protocol segment has
-            # no order from this player and no live order was captured for it.
-            assert not has_protocol_action and not causes
+    for record in live_records:
+        if _live_action(record) is None:
             continue
+        boundary = _live_boundary(record, splice_index, splice_count)
+        snapshot = boundaries.get(boundary)
+        if snapshot is None:
+            raise AssertionError(
+                f"No reconstructed decision at line {boundary} for "
+                f"{perspective.game_id} p{perspective.player + 1} turn {record['turn']}; "
+                f"decision boundaries were {sorted(boundaries)}"
+            )
         matched.append((snapshot, record))
-
-    leftovers = [record for records in queues.values() for record in records]
-    if leftovers:
-        raise AssertionError(
-            f"{len(leftovers)} live requests were not represented by replay decisions for "
-            f"p{perspective.player + 1}: {leftovers[0]!r}"
-        )
     return tuple(matched)
 
 
 def _assert_live_truth(
     perspective: ReconstructedPerspective,
     live_records: tuple[dict[str, Any], ...],
+    document: ReplayDocument,
     builder: ObservationBuilder,
 ) -> None:
-    for snapshot, record in _match_live_records(perspective, live_records):
+    for snapshot, record in _match_live_records(perspective, live_records, document):
         decision = perspective.decisions[snapshot.decision_index]
         evidence = decision.evidence
         live_action = _live_action(record)
+        assert live_action is not None
 
         if evidence.label_kind is LabelKind.EXACT:
-            assert live_action is not None
             assert live_action == evidence.candidates[0]
         elif evidence.label_kind is LabelKind.PARTIAL:
-            assert live_action is not None
             assert live_action in evidence.candidates
-        elif evidence.label_kind is LabelKind.UNKNOWN:
+        else:
             reasons = _cant_reasons(snapshot, perspective.player)
-            tags = set(evidence.tags)
-            if live_action is None:
-                assert not any(
-                    _line_has_observed_action(line, perspective.player)
-                    for line in snapshot.raw_lines
-                )
-            elif reasons:
+            if reasons:
                 assert set(reasons) <= _CANT_REASONS, (
                     f"Unknown cant reason was not in the researched taxonomy: {reasons}"
                 )
             else:
-                assert tags & _REPLAY_AMBIGUITY_TAGS, (
+                assert set(evidence.tags) & _REPLAY_AMBIGUITY_TAGS, (
                     f"Selected live action {live_action} became UNKNOWN without a known "
                     f"reconstruction reason: tags={evidence.tags!r}"
                 )
 
         reconstructed = builder.build(snapshot.view, {}).cpu()
-        live = _live_tensors(record)
-        _assert_expected_observation_fields(live, reconstructed)
+        _assert_expected_observation_fields(_live_tensors(record), reconstructed)
+
+
+_ORACLE_SKIPPED_TAGS = frozenset({"", "t:", "expire", "uhtmlchange", "showteam", "win", "tie"})
+
+
+def _oracle_battle(document: ReplayDocument, perspective: int) -> DoubleBattle:
+    """A real poke-env battle to diff the pure state machine against."""
+    # poke-env derives the role from the |player| lines by username, so the oracle
+    # must impersonate the perspective's player rather than set the role directly.
+    return DoubleBattle(
+        document.metadata.replay_id,
+        document.metadata.player_names[perspective],
+        logging.getLogger("p0.stress.oracle"),
+        gen=9,
+    )
+
+
+def _oracle_effects(pokemon: Any) -> tuple[str, ...]:
+    return tuple(sorted(effect.name for effect in pokemon.effects))
+
+
+def _assert_poke_env_state_agreement(
+    perspective: ReconstructedPerspective,
+    document: ReplayDocument,
+) -> None:
+    """Diff the pure replay state machine against poke-env over the same lines.
+
+    Only fields both can know from public protocol are compared. This isolates a state
+    tracking regression (Illusion, boosts, field state) from a boundary or tensor
+    problem, and covers the Illusion handling that poke-env and p0 implement apart.
+    """
+    battle = _oracle_battle(document, perspective.player)
+    boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
+    ally = f"p{perspective.player + 1}"
+
+    for line in document.protocol_lines:
+        snapshot = boundaries.get(line.index)
+        if snapshot is not None and battle.active_pokemon != [None, None]:
+            for slot, mon in enumerate(battle.active_pokemon):
+                reconstructed = snapshot.view.active_pokemon[slot]
+                if mon is None or reconstructed is None:
+                    assert (mon is None) == (reconstructed is None), (
+                        f"Active slot {slot} disagrees at line {line.index}"
+                    )
+                    continue
+                assert mon.fainted == reconstructed.fainted
+                assert mon.current_hp_fraction == pytest.approx(
+                    reconstructed.current_hp_fraction, abs=0.02
+                )
+                assert dict(mon.boosts) == dict(reconstructed.boosts)
+                live_status = None if mon.status is None else mon.status.name
+                own_status = getattr(reconstructed.status, "name", reconstructed.status)
+                assert live_status == (None if own_status is None else str(own_status).upper())
+
+            assert {weather.name for weather in battle.weather} == {
+                weather.name for weather in snapshot.view.weather
+            }
+            assert {field.name for field in battle.fields} == {
+                field.name for field in snapshot.view.fields
+            }
+            assert {condition.name for condition in battle.side_conditions} == {
+                condition.name for condition in snapshot.view.side_conditions
+            }
+
+        if line.parts[1] in _ORACLE_SKIPPED_TAGS:
+            continue
+        try:
+            battle.parse_message(list(line.parts))
+        except (AssertionError, IndexError, KeyError, NotImplementedError, ValueError) as error:
+            raise AssertionError(
+                f"poke-env rejected {ally} line {line.index}: {line.raw!r} ({error})"
+            ) from error
+
+
+def _hp_fields_agree(left: str, right: str) -> bool:
+    """Whether two HP fields describe the same health within percent quantization.
+
+    Each player receives its own mons' HP exactly and the opponent's rounded to a
+    percentage, so the same battle line differs in precision between the two streams.
+    """
+    left_value, _, left_status = left.partition(" ")
+    right_value, _, right_status = right.partition(" ")
+    if left_status != right_status or "/" not in left_value or "/" not in right_value:
+        return False
+    return abs(get_hp_fraction(left) - get_hp_fraction(right)) <= 0.02
+
+
+def _protocol_lines_agree(left: str, right: str) -> bool:
+    """Whether two captures of one protocol line differ only in HP precision."""
+    left_parts = left.split("|")
+    right_parts = right.split("|")
+    if len(left_parts) != len(right_parts):
+        return False
+    return all(
+        expected == actual or _hp_fields_agree(expected, actual)
+        for expected, actual in zip(left_parts, right_parts, strict=True)
+    )
+
+
+def _assert_line_stream_fidelity(
+    document: ReplayDocument,
+    live_lines: tuple[str, ...],
+) -> None:
+    """The parsed replay must be the line stream this player actually received.
+
+    Isolating this from grouping turns a downstream tensor mismatch into a line-level
+    diff, which is where a parsing or capture regression actually originates.
+    """
+    splice_index, splice_count = _showteam_offset(document)
+    parsed = [line.raw for line in document.protocol_lines]
+    spliced = parsed[splice_index : splice_index + splice_count]
+    assert all(_message_tag(line) == "showteam" for line in spliced)
+
+    without_splice = parsed[:splice_index] + parsed[splice_index + splice_count :]
+    assert len(without_splice) == len(live_lines)
+    for parsed_line, live_line in zip(without_splice, live_lines, strict=True):
+        assert _protocol_lines_agree(parsed_line, live_line), (
+            f"Parsed line {parsed_line!r} is not the captured line {live_line!r}"
+        )
+
+
+def _assert_decision_boundaries_partition_the_log(
+    perspective: ReconstructedPerspective,
+    document: ReplayDocument,
+) -> None:
+    """Decisions must be ordered, disjoint, and quote the log they point at."""
+    cursor = 0
+    for snapshot in perspective.snapshots:
+        assert cursor <= snapshot.pre_line_index < snapshot.post_line_index
+        assert snapshot.raw_lines == tuple(
+            line.raw
+            for line in document.protocol_lines[snapshot.pre_line_index : snapshot.post_line_index]
+        )
+        cursor = snapshot.post_line_index
+    assert cursor <= len(document.protocol_lines)
 
 
 @pytest.mark.integration
@@ -509,16 +706,17 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
     assert len(documents) == game_count
     assert all(document.outcome.terminal_line_index is not None for document in documents)
 
-    perspectives_by_game = {
-        document.metadata.replay_id: _assert_reconstruction_labels(document)
-        for document in documents
-    }
-    for replay_id, perspectives in perspectives_by_game.items():
-        for perspective in perspectives:
+    for document in documents:
+        replay_id = document.metadata.replay_id
+        for perspective in _assert_reconstruction_labels(document):
             role = f"p{perspective.player + 1}"
             path = observation_dir / f"{replay_id}-{role}.pt"
             assert path.is_file(), f"Missing live observation capture: {path}"
-            _assert_live_truth(perspective, _load_live_records(path), builder)
+            artifact = _load_live_artifact(path)
+            _assert_line_stream_fidelity(document, artifact["lines"])
+            _assert_decision_boundaries_partition_the_log(perspective, document)
+            _assert_poke_env_state_agreement(perspective, document)
+            _assert_live_truth(perspective, artifact["records"], document, builder)
 
     compilation = compile_documents(
         documents,

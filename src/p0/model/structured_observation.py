@@ -55,7 +55,13 @@ TOKEN_IDX_GLOBAL_FIELD = 12
 TOKEN_IDX_ALLY_SIDE = 13
 TOKEN_IDX_OPPONENT_SIDE = 14
 
+# 0-4: one-hot slot condition, offset by one so -1 (a reserve the player did not
+# bring) fits. Index 1 doubles as "unknown": an empty row, or a replay row whose
+# team selection is not public yet.
+NUM_IDX_SLOT_CONDITION = 0
+NUM_IDX_SLOT_CONDITION_UNKNOWN = 1
 NUM_IDX_TEAM_PREVIEW = 2
+NUM_IDX_HP_FRACTION = 5
 NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction (MoveRecord dynamic)
 NUM_IDX_ORIG_IDX_RATIO = 26
 NUM_IDX_FAINTED = 27

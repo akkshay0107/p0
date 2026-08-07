@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from p0.battle.actions import PASS_ACTION
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, load_active_runtime_manifest
 from p0.replays import compile as compile_module
@@ -23,7 +24,7 @@ from p0.replays.identity import linked_replay_ids
 from p0.replays.oracle import OracleCase, OracleExpectation, validate_oracle
 from p0.replays.protocol import ReplayParseError, parse_replay_payload
 from p0.replays.reconstruct import (
-    _segments,
+    _decision_blocks,
     impute_stat_points,
     reconstruct_both,
     reconstruct_perspective,
@@ -67,15 +68,20 @@ def _payload_replay_dataset(replay_id: str, parent: str = "series-1") -> dict[st
         "|teampreview",
         f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
         f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+        # a bare "|" is Showdown's update-block separator: the simulator writes one
+        # every time it resumes, so each separator opens exactly one answered request
+        "|",
         "|switch|p1a: Pikachu|Pikachu, L50",
         "|switch|p1b: Eevee|Eevee, L50",
         "|switch|p2a: Bulbasaur|Bulbasaur, L50",
         "|switch|p2b: Charmander|Charmander, L50",
         "|turn|1",
-        "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
+        "|",
+        "|move|p1a: Pikachu|Protect|p1a: Pikachu",
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
-        "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
+        "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur",
         "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|",
         "|win|Alice",
     ]
     return {
@@ -136,7 +142,7 @@ def test_lazy_dataset_yields_canonical_bo3_game_perspectives(
     assert [chunk.canonical_player for chunk in chunks] == [0, 1, 0, 1]
     assert [chunk.is_series_end for chunk in chunks] == [False, False, True, True]
     assert all(chunk.length == 2 for chunk in chunks)
-    assert chunks[2].candidate_offsets.tolist() == [0, 0, 1]
+    assert chunks[2].candidate_offsets.tolist() == [0, 0, 4]
 
 
 def test_canonical_player_identity_survives_replay_side_swap(tmp_path: Path) -> None:
@@ -238,15 +244,20 @@ def _payload_replay_pipeline(
         "|teampreview",
         f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
         f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+        # a bare "|" is Showdown's update-block separator: the simulator writes one
+        # every time it resumes, so each separator opens exactly one answered request
+        "|",
         "|switch|p1a: Pikachu|Pikachu, L50",
         "|switch|p1b: Eevee|Eevee, L50",
         "|switch|p2a: Bulbasaur|Bulbasaur, L50",
         "|switch|p2b: Charmander|Charmander, L50",
         "|turn|1",
-        "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
+        "|",
+        "|move|p1a: Pikachu|Protect|p1a: Pikachu",
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
-        "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
+        "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur",
         "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|",
         f"|win|{winner}",
     ]
     return {
@@ -538,47 +549,97 @@ def test_reconstruction_is_causal_symmetric_and_compilable() -> None:
     left, right = game.perspectives
     assert left.player == 0 and right.player == 1
     assert left.decisions[0].evidence.label_kind.name == "UNKNOWN"
-    assert left.decisions[1].evidence.exact_action == (9, 10)
-    assert right.decisions[1].evidence.exact_action == (9, 10)
+    assert left.decisions[1].evidence.label_kind is LabelKind.PARTIAL
+    assert right.decisions[1].evidence.label_kind is LabelKind.PARTIAL
+    assert (9, 11) in left.decisions[1].evidence.candidates
+    assert (9, 11) in right.decisions[1].evidence.candidates
     assert left.snapshots[1].pre_line_index < left.snapshots[1].post_line_index
     assert result.metrics.counters["illegal_candidates"] == 0
 
 
-def test_replay_request_chunks_ignore_outcome_and_automatic_switch_lines() -> None:
+def test_decision_blocks_follow_the_logs_own_request_boundaries() -> None:
+    """Each answered request is one update block, including mid-turn replacements."""
     payload = _payload_replay_pipeline("request-chunks")
     lines = str(payload["log"]).splitlines()
     turn_index = lines.index("|turn|1")
+    p1_team = [
+        {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
+        {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Meowth", "moves": ["Tackle"]},
+    ]
+    lines[2] = f"|showteam|p1|{json.dumps(p1_team, separators=(',', ':'))}"
     lines = lines[:turn_index] + [
         "|turn|1",
-        "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
-        "|cant|p1a: Pikachu|flinch",
+        "|",
+        "|move|p1a: Pikachu|Protect|p1a: Pikachu",
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
-        "|switch|p1b: Pikachu|Pikachu, L50|100/100|[from] Parting Shot",
-        "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
+        "|",
+        "|switch|p1b: Meowth|Meowth, L50|100/100|[from] Parting Shot",
+        "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur",
         "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|",
         "|switch|p1a: Eevee|Eevee, L50|100/100",
         "|turn|2",
+        "|",
         "|move|p1a: Eevee|Tackle|p2a: Bulbasaur",
+        "|",
         "|win|Alice",
     ]
     payload["log"] = "\n".join(lines)
 
     document = parse_replay_payload(payload)
-    segments = _segments(document)
-    segment_tags = [
-        [line.parts[1] for line in document.protocol_lines[start:end] if len(line.parts) > 1]
-        for start, end, _ in segments
+    blocks = _decision_blocks(document)
+    block_tags = [
+        [line.parts[1] for line in document.protocol_lines[start:end] if line.parts[1]]
+        for start, end, _ in blocks
     ]
-    assert segment_tags[-3:] == [
-        ["turn", "move", "cant", "move", "switch", "move", "move"],
-        ["switch"],
-        ["turn", "move", "win"],
+
+    assert block_tags[-4:] == [
+        ["move", "move"],
+        ["switch", "move", "move"],
+        ["switch", "turn"],
+        ["move"],
     ]
+    assert [decision_type for _, _, decision_type in blocks[-4:]] == [
+        DecisionType.TURN,
+        DecisionType.FORCED_SWITCH,
+        DecisionType.FORCED_SWITCH,
+        DecisionType.TURN,
+    ]
+    # the terminal win block answers nothing and must not become a decision
+    assert blocks[-1][1] < len(document.protocol_lines)
 
     perspective = reconstruct_perspective(document, perspective=0)
     assert perspective.diagnostics.counters.get("observed_illegal_action", 0) == 0
-    assert perspective.decisions[1].evidence.exact_action == (9, 10)
-    assert "cant" not in perspective.decisions[1].evidence.tags
+    assert perspective.decisions[-3].decision_type is DecisionType.PIVOT_SWITCH
+
+
+def test_a_turn_start_block_keeps_voluntary_switches_with_its_moves() -> None:
+    """Switches chosen at the start of a turn share the turn's request block."""
+    payload = _payload_replay_pipeline("leading-choice-switches")
+    lines = str(payload["log"]).splitlines()
+    turn_index = lines.index("|turn|1")
+    lines = lines[:turn_index] + [
+        "|turn|1",
+        "|",
+        "|switch|p1a: Eevee|Eevee, L50|100/100",
+        "|switch|p2a: Charmander|Charmander, L50|100/100",
+        "|move|p1b: Eevee|Tackle|p2b: Charmander",
+        "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|",
+        "|win|Alice",
+    ]
+    payload["log"] = "\n".join(lines)
+
+    document = parse_replay_payload(payload)
+    blocks = _decision_blocks(document)
+    block_tags = [
+        [line.parts[1] for line in document.protocol_lines[start:end] if line.parts[1]]
+        for start, end, _ in blocks
+    ]
+
+    assert block_tags[-1] == ["switch", "switch", "move", "move"]
+    assert blocks[-1][2] is DecisionType.TURN
 
 
 def test_reconstruction_recovers_target_from_still_animation() -> None:
@@ -599,18 +660,21 @@ def test_reconstruction_recovers_target_from_still_animation() -> None:
             "|teampreview",
             f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
             f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+            "|",
             "|switch|p1a: Archaludon|Archaludon, L50|100/100",
             "|switch|p1b: Swampert|Swampert, L50|0 fnt",
             "|faint|p1b: Swampert",
             "|switch|p2a: Whimsicott|Whimsicott, L50|100/100",
             "|switch|p2b: Grimmsnarl|Grimmsnarl, L50|100/100",
             "|turn|1",
+            "|",
             "|move|p1a: Archaludon|Electro Shot||[still]",
             "|-prepare|p1a: Archaludon|Electro Shot",
             "|-boost|p1a: Archaludon|spa|1",
             "|-anim|p1a: Archaludon|Electro Shot|p2b: Grimmsnarl",
             "|-damage|p2b: Grimmsnarl|0 fnt",
             "|faint|p2b: Grimmsnarl",
+            "|",
             "|win|Alice",
         ]
     )
@@ -618,8 +682,9 @@ def test_reconstruction_recovers_target_from_still_animation() -> None:
     perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
 
     evidence = perspective.decisions[1].evidence
-    assert evidence.label_kind.name == "EXACT"
-    assert evidence.exact_action == (10, 0)  # Electro Shot -> p2b, plus implicit pass.
+    assert evidence.label_kind is LabelKind.PARTIAL
+    assert (11, 0) in evidence.candidates  # Executed p2b target remains candidate-contained.
+    assert "execution_target" in evidence.tags
     assert "move_anim_target" in evidence.tags
     assert perspective.diagnostics.counters.get("move_slot_or_target_unknown", 0) == 0
 
@@ -640,8 +705,52 @@ def test_reconstruction_marks_struggle_as_forced_move() -> None:
     perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
 
     assert perspective.snapshots[1].view.decision.slots[0].forced_move
-    assert perspective.decisions[1].evidence.exact_action[0] == 48
+    assert all(candidate[0] == 48 for candidate in perspective.decisions[1].evidence.candidates)
     assert perspective.diagnostics.counters.get("observed_illegal_action", 0) == 0
+
+
+def test_reconstruction_does_not_label_post_submission_execution_as_the_order() -> None:
+    payload = _payload_replay_pipeline("post-submission-state-change")
+    payload["log"] = str(payload["log"]).replace(
+        "|move|p1a: Pikachu|Protect|p1a: Pikachu",
+        "\n".join(
+            (
+                "|-start|p1a: Pikachu|Disable|Protect",
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu",
+            )
+        ),
+    )
+
+    perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
+
+    evidence = perspective.decisions[1].evidence
+    assert evidence.label_kind is LabelKind.PARTIAL
+    assert len(evidence.candidates) > 1
+    assert "submission_state_changed" in evidence.tags
+    assert perspective.diagnostics.counters["submission_state_changed"] == 1
+
+
+def test_reconstruction_applies_absolute_boost_updates() -> None:
+    payload = _payload_replay_pipeline("absolute-boost")
+    payload["log"] = str(payload["log"]).replace(
+        "|win|Alice",
+        "\n".join(
+            (
+                "|-setboost|p1a: Pikachu|spa|3",
+                "|turn|2",
+                "|",
+                "|move|p1a: Pikachu|Tackle|p2a: Bulbasaur",
+                "|",
+                "|win|Alice",
+            )
+        ),
+    )
+
+    perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
+
+    active = perspective.snapshots[2].view.active_pokemon[0]
+    assert active is not None
+    assert active.boosts["spa"] == 3
 
 
 def test_reconstruction_restores_illusion_alias_on_replace() -> None:
@@ -664,11 +773,13 @@ def test_reconstruction_restores_illusion_alias_on_replace() -> None:
             "|teampreview",
             f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
             f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+            "|",
             "|switch|p1a: Toxapex|Toxapex, L50|100/100",
             "|switch|p1b: Grimmsnarl|Grimmsnarl, L50|100/100",
             "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
             "|switch|p2b: Charmander|Charmander, L50|100/100",
             "|turn|1",
+            "|",
             "|move|p2a: Bulbasaur|Tackle|p1a: Toxapex",
             "|-damage|p1a: Toxapex|0 fnt",
             "|replace|p1a: Zoroark|Zoroark-Hisui, L50",
@@ -676,9 +787,13 @@ def test_reconstruction_restores_illusion_alias_on_replace() -> None:
             "|faint|p1a: Zoroark",
             "|-damage|p1b: Grimmsnarl|0 fnt",
             "|faint|p1b: Grimmsnarl",
+            "|",
             "|switch|p1a: Incineroar|Incineroar, L50|100/100",
             "|switch|p1b: Toxapex|Toxapex, L50|100/100",
             "|turn|2",
+            "|",
+            "|move|p1b: Toxapex|Protect|p1b: Toxapex",
+            "|",
             "|win|Alice",
         ]
     )
@@ -761,24 +876,31 @@ def test_reconstruction_does_not_share_active_illusion_alias_state() -> None:
             "|teampreview",
             f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
             f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+            "|",
             "|switch|p1a: Blaziken|Blaziken, L50|100/100",
             "|switch|p1b: Toxapex|Toxapex, L50|100/100",
             "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
             "|switch|p2b: Charmander|Charmander, L50|100/100",
             "|turn|1",
+            "|",
             "|move|p2a: Bulbasaur|Tackle|p1b: Toxapex",
             "|-damage|p1b: Toxapex|50/100",
             "|move|p2b: Charmander|Tackle|p1a: Blaziken",
             "|-damage|p1a: Blaziken|0 fnt",
             "|faint|p1a: Blaziken",
+            "|",
             "|switch|p1a: Toxapex|Toxapex, L50|100/100",
             "|turn|2",
+            "|",
             "|move|p2a: Bulbasaur|Tackle|p1a: Toxapex",
             "|-damage|p1a: Toxapex|0 fnt",
             "|replace|p1a: Zoroark|Zoroark-Hisui, L50",
             "|-end|p1a: Zoroark|Illusion",
             "|faint|p1a: Zoroark",
             "|turn|3",
+            "|",
+            "|move|p1b: Toxapex|Protect|p1b: Toxapex",
+            "|",
             "|win|Alice",
         ]
     )
@@ -847,8 +969,8 @@ def test_controlled_oracle_requires_candidate_containment() -> None:
         "normal-move",
         _payload_replay_pipeline("oracle"),
         (
-            OracleExpectation(0, 1, (9, 10)),
-            OracleExpectation(1, 1, (9, 10)),
+            OracleExpectation(0, 1, (9, 11)),
+            OracleExpectation(1, 1, (9, 11)),
         ),
     )
     result = validate_oracle(case)
@@ -976,15 +1098,18 @@ def _payload_replay_shards(replay_id: str) -> dict[str, object]:
         "|teampreview",
         f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
         f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+        "|",
         "|switch|p1a: Pikachu|Pikachu, L50|100/100",
         "|switch|p1b: Eevee|Eevee, L50|100/100",
         "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
         "|switch|p2b: Charmander|Charmander, L50|100/100",
         "|turn|1",
+        "|",
         "|move|p1a: Pikachu|Protect|p2a: Bulbasaur",
         "|move|p1b: Eevee|Tackle|p2b: Charmander",
         "|move|p2a: Bulbasaur|Protect|p1a: Pikachu",
         "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|",
         "|win|Alice",
     ]
     return {
@@ -999,7 +1124,7 @@ def _payload_replay_shards(replay_id: str) -> dict[str, object]:
     }
 
 
-def test_replay_fixture_compiles_to_runtime_bound_schema_v4_shard(tmp_path: Path) -> None:
+def test_replay_fixture_compiles_to_runtime_bound_schema_v5_shard(tmp_path: Path) -> None:
     result = compile_payloads((_payload_replay_shards("shard-fixture"),))
     built = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
 
@@ -1019,7 +1144,7 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v4_shard(tmp_path: Path
     )
     assert tensors["categorical"].shape[0] == manifest.decisions
     assert tensors["action_mask"].shape == (4, 2, 49)
-    assert tensors["candidate_offsets"].tolist() == [0, 0, 1, 1, 2]
+    assert tensors["candidate_offsets"].tolist() == [0, 0, 4, 4, 8]
     assert tensors["game_offsets"].tolist() == [0, 2, 4]
     assert tensors["series_offsets"].tolist() == [0, 4]
     assert len(payload["series_summaries"]) == manifest.games
@@ -1075,11 +1200,13 @@ def _payload_ko_scenario(
         "|teampreview",
         f"|showteam|p1|{json.dumps(p1_team, separators=(',', ':'))}",
         f"|showteam|p2|{json.dumps(p2_team, separators=(',', ':'))}",
+        "|",
         "|switch|p1a: Pikachu|Pikachu, L50|100/100",
         "|switch|p1b: Eevee|Eevee, L50|100/100",
         "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
         "|switch|p2b: Charmander|Charmander, L50|100/100",
         "|turn|1",
+        "|",
     ]
     if pivot:
         # One-sided pivot request: p2 voluntarily switches one slot and acts
@@ -1096,12 +1223,14 @@ def _payload_ko_scenario(
                 "|move|p1a: Pikachu|Thunderbolt|p2a: Bulbasaur",
                 "|-damage|p2a: Bulbasaur|0/100",
                 "|faint|p2a: Bulbasaur",
+                # the replacement answers its own request, so it opens a new block
+                "|",
                 "|switch|p2a: Venusaur|Venusaur, L50|100/100",
             ]
         )
 
     if terminal:
-        lines.append("|win|Alice")
+        lines.extend(["|", "|win|Alice"])
     elif simultaneous:
         lines.extend(
             [
@@ -1109,8 +1238,10 @@ def _payload_ko_scenario(
                 "|faint|p1a: Pikachu",
                 "|switch|p1a: Squirtle|Squirtle, L50|100/100",
                 "|turn|2",
+                "|",
                 "|move|p1a: Squirtle|Protect|p2a: Venusaur",
                 "|move|p2a: Venusaur|Protect|p1a: Squirtle",
+                "|",
                 "|win|Alice",
             ]
         )
@@ -1118,8 +1249,10 @@ def _payload_ko_scenario(
         lines.extend(
             [
                 "|turn|2",
+                "|",
                 "|move|p1a: Pikachu|Tackle|p2a: Venusaur",
                 "|move|p2a: Venusaur|Protect|p1a: Pikachu",
+                "|",
                 "|win|Alice",
             ]
         )
@@ -1135,57 +1268,51 @@ def _payload_ko_scenario(
     }
 
 
-def test_forced_pass_for_one_sided_ko_replacement() -> None:
-    """The waiting perspective gets an exact (PASS, PASS) FORCED_PASS."""
+def test_a_waiting_perspective_is_unknown_rather_than_a_fabricated_pass() -> None:
+    """A side that only watched a replacement submitted nothing observable."""
     document = parse_replay_payload(_payload_ko_scenario("ko-onesided"))
     alice, bob = reconstruct_both(document)
 
-    # Alice (p0) waits during Bob's replacement after the KO.
-    alice_pass = [d for d in alice.decisions if d.decision_type is DecisionType.FORCED_PASS]
-    assert len(alice_pass) == 1
-    assert alice_pass[0].evidence.label_kind is LabelKind.EXACT
-    assert alice_pass[0].evidence.exact_action == (0, 0)
-    assert alice_pass[0].evidence.candidates == ((0, 0),)
-    assert "forced_pass" in alice_pass[0].evidence.tags
+    replacement = next(
+        decision
+        for decision in bob.decisions
+        if decision.decision_type is DecisionType.FORCED_SWITCH
+    )
+    # Bob answered the request: the switch is exact and the unasked slot's pass is
+    # structural, not inferred.
+    assert replacement.evidence.label_kind is LabelKind.EXACT
+    assert replacement.evidence.exact_action[1] == PASS_ACTION
 
-    # Bob (p1) waits during Alice's attack that caused the KO.
-    bob_pass = [d for d in bob.decisions if d.decision_type is DecisionType.FORCED_PASS]
-    assert len(bob_pass) == 1
-    assert bob_pass[0].evidence.label_kind is LabelKind.EXACT
-    assert bob_pass[0].evidence.exact_action == (0, 0)
+    waiting = alice.decisions[replacement.decision_index]
+    assert waiting.pre_line_index == replacement.pre_line_index
+    assert waiting.evidence.label_kind is LabelKind.UNKNOWN
+    assert waiting.evidence.candidates == ()
 
 
-def test_forced_pass_for_one_sided_pivot_request() -> None:
-    """A one-sided voluntary pivot also produces a FORCED_PASS for the waiter."""
-    document = parse_replay_payload(_payload_ko_scenario("pivot-onesided", pivot=True))
+def test_no_decision_is_typed_forced_pass() -> None:
+    """FORCED_PASS was a synthesized request; boundaries now come from the log."""
+    documents = (
+        parse_replay_payload(_payload_ko_scenario("no-pass-ko")),
+        parse_replay_payload(_payload_ko_scenario("no-pass-pivot", pivot=True)),
+        parse_replay_payload(_payload_ko_scenario("no-pass-simul", simultaneous=True)),
+        parse_replay_payload(_payload_ko_scenario("no-pass-terminal", terminal=True)),
+    )
+    for document in documents:
+        for perspective in reconstruct_both(document):
+            assert all(
+                decision.decision_type is not DecisionType.FORCED_PASS
+                for decision in perspective.decisions
+            )
+
+
+def test_both_perspectives_share_every_decision_boundary() -> None:
+    """Requests are per-block, so the two perspectives segment the log identically."""
+    document = parse_replay_payload(_payload_ko_scenario("shared-boundaries", simultaneous=True))
     alice, bob = reconstruct_both(document)
 
-    alice_pass = [d for d in alice.decisions if d.decision_type is DecisionType.FORCED_PASS]
-    assert len(alice_pass) == 1
-    assert alice_pass[0].evidence.label_kind is LabelKind.EXACT
-    assert alice_pass[0].evidence.exact_action == (0, 0)
-
-    bob_pivot = [d for d in bob.decisions if d.decision_type is DecisionType.PIVOT_SWITCH]
-    assert len(bob_pivot) == 1
-
-
-def test_forced_pass_skipped_for_simultaneous_replacements() -> None:
-    """Boundary rule 2: both players choosing is not a FORCED_PASS."""
-    document = parse_replay_payload(_payload_ko_scenario("simul", simultaneous=True))
-    alice, bob = reconstruct_both(document)
-
-    # Neither perspective should have a FORCED_PASS during the simultaneous
-    # replacement segment (both have choice actions there).
-    for perspective in (alice, bob):
-        pass_decisions = [
-            d for d in perspective.decisions if d.decision_type is DecisionType.FORCED_PASS
-        ]
-        # Alice has a pass during the initial attack segment (Bob has no action
-        # there), but NOT during the simultaneous replacement segment.
-        if perspective is bob:
-            assert len(pass_decisions) == 1
-        else:
-            assert all(d.evidence.exact_action == (0, 0) for d in pass_decisions)
+    assert [decision.pre_line_index for decision in alice.decisions] == [
+        decision.pre_line_index for decision in bob.decisions
+    ]
 
 
 def test_forced_pass_skipped_for_terminal_ko() -> None:
@@ -1198,6 +1325,8 @@ def test_forced_pass_skipped_for_terminal_ko() -> None:
         d for d in alice.decisions if d.post_line_index == len(document.protocol_lines)
     ]
     assert all(d.decision_type is not DecisionType.FORCED_PASS for d in terminal_decisions)
+
+
 def _build_dataset_from_payloads(tmp_path, payloads):
     result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
     return write_tensor_shards(
@@ -1254,17 +1383,20 @@ def test_dataset_rejects_missing_and_duplicate_source_records(tmp_path) -> None:
 def test_compiler_retains_exact_partial_unknown_and_rejected_labels() -> None:
     exact = golden_replay_payload("exact", series_id="label-series")
     partial = golden_replay_payload("partial", series_id="label-series-2", first_move_target=None)
+    partial["log"] = str(partial["log"]).replace(
+        "|move|p1a: Pikachu|Protect\n", "|move|p1a: Pikachu|Tackle\n"
+    )
     result = compile_payloads((exact, partial), format_id=exact["formatid"])
     counters = result.metrics.counters
     assert counters["accepted_games"] == 2
-    assert counters["label_exact"] == 3
-    assert counters["label_partial"] == 1
+    assert counters["label_exact"] == 0
+    assert counters["label_partial"] == 4
     assert counters["label_unknown"] == 4
 
     capped = compile_payloads((partial,), format_id=partial["formatid"], max_candidates=1)
     assert capped.metrics.counters["label_partial"] == 0
-    assert capped.metrics.counters["label_exact"] == 1
-    assert capped.metrics.counters["label_unknown"] == 3
+    assert capped.metrics.counters["label_exact"] == 0
+    assert capped.metrics.counters["label_unknown"] == 4
 
     rejected = golden_replay_payload("rejected", series_id="rejected-series")
     rejected["log"] = "\n".join(
@@ -1295,9 +1427,7 @@ def test_compiler_closes_process_pool_after_worker_failure(monkeypatch) -> None:
     monkeypatch.setattr(compile_module.concurrent.futures, "ProcessPoolExecutor", FailingPool)
     monkeypatch.setattr(compile_module.os, "cpu_count", lambda: 1)
     payload = golden_replay_payload("worker-failure", series_id="worker-failure-series")
-    second_payload = golden_replay_payload(
-        "worker-failure-2", series_id="worker-failure-series-2"
-    )
+    second_payload = golden_replay_payload("worker-failure-2", series_id="worker-failure-series-2")
     with pytest.raises(RuntimeError, match="injected worker failure"):
         compile_payloads((payload, second_payload), format_id=payload["formatid"])
     assert events == ["enter", "map", "exit"]

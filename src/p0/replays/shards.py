@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 import torch
 
-from p0.battle.actions import ACT_SIZE
+from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
 from p0.battle.series import SERIES_SUMMARY_SCHEMA_VERSION
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, validate_artifact_runtime_contract
 from p0.model.structured_observation import (
@@ -29,6 +29,7 @@ from p0.model.structured_observation import (
 )
 from p0.replays.schema import (
     REPLAY_IR_SCHEMA_VERSION,
+    DecisionType,
     MaskProvenance,
     _is_sha256,
     _require_fields,
@@ -479,8 +480,19 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
             & (candidates[:, 0] <= 6)
             & (candidates[:, 0] == candidates[:, 1])
         )
-        mega_first = (candidates[:, 0] >= 27) & (candidates[:, 0] <= 47)
-        mega_second = (candidates[:, 1] >= 27) & (candidates[:, 1] <= 47)
+        # Only one mega per turn, but the same id range encodes team-preview pairs,
+        # where both actions legitimately fall inside it.
+        is_turn = tensors["decision_type"][owners] != int(DecisionType.TEAM_PREVIEW)
+        mega_first = (
+            is_turn
+            & (candidates[:, 0] >= MEGA_MOVE_START)
+            & (candidates[:, 0] <= MEGA_FORCED_ACTION)
+        )
+        mega_second = (
+            is_turn
+            & (candidates[:, 1] >= MEGA_MOVE_START)
+            & (candidates[:, 1] <= MEGA_FORCED_ACTION)
+        )
 
         if torch.any(~legal | same_switch | (mega_first & mega_second)):
             raise ValueError("Shard contains an illegal labeled candidate")
