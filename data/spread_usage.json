@@ -82,6 +82,13 @@
   "max_spreads_per_bucket": 15,
   "min_nature_share": 0.005,
   "schema": 2,
+  "source": {
+    "exports": {
+      "gen9championsvgc2026regmb-1760.json": "02aeefcada5928a6f2b21583c1ae30aa61fb638ba952eed9f1a011f781eccdf7",
+      "gen9championsvgc2026regmbbo3-1760.json": "56ffb15d16477a72f8f38935a5dfc4db274aa06c09520b717fdc22e59dde780e"
+    },
+    "month": "2026-07"
+  },
   "spreads": {
     "abomasnow": {
       "brave": [

@@ -8,8 +8,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
+import orjson
 import pytest
 
+from p0.cli.build_spreads import DEFAULT_MONTH, USAGE_URL
 from p0.format_config import FORMAT, current_manifest
 from p0.model.tokenizer import PokemonTokenizer
 from p0.teams.corpus import (
@@ -31,6 +33,7 @@ from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FileTeamSource, FixedTeamSource, ValidatedTeam
 from p0.teams.spread_usage import (
     BO3_BLEND_WEIGHT,
+    DEFAULT_SPREAD_TABLE_PATH,
     SPREAD_USAGE_SCHEMA,
     build_spread_table,
     cosmetic_forme_aliases,
@@ -1319,3 +1322,24 @@ def test_load_rejects_unresolvable_aliases() -> None:
 def test_load_accepts_a_single_hop_alias() -> None:
     table = load_spread_table(_payload(_ONE_BUCKET, {"cosmetic": "real"}))
     assert table.best("cosmetic", "timid") == table.best("real", "timid")
+
+
+def test_usage_export_url_matches_the_published_layout() -> None:
+    """The artifact can only be rebuilt if this URL keeps matching Smogon's layout."""
+    url = USAGE_URL.format(month="2026-07", format_id=FORMAT.battle_format, cutoff=1760)
+    assert url == (
+        "https://www.smogon.com/stats/2026-07/chaos/gen9championsvgc2026regmb-1760.json.gz"
+    )
+
+
+def test_shipped_spread_table_records_the_exports_it_came_from() -> None:
+    """A stale month must be visible in the committed artifact, not just in the builder."""
+    payload = orjson.loads(DEFAULT_SPREAD_TABLE_PATH.read_bytes())
+    source = payload["source"]
+
+    assert source["month"] == DEFAULT_MONTH
+    assert set(source["exports"]) == {
+        f"{FORMAT.battle_format}-1760.json",
+        f"{FORMAT.bo3_format}-1760.json",
+    }
+    assert all(len(digest) == 64 for digest in source["exports"].values())
