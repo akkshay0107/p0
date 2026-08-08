@@ -112,7 +112,8 @@
         "battle_format": "gen9championsvgc2026regmb",
         "bo3_format": "gen9championsvgc2026regmbbo3",
         "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
-        "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
+        "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac",
+        "spread_usage_sha256": "dd7336d665a33febee43bc6250c812400541b52eefc8a4ffbcaabd034b757ad3"
       }
     },
     "teams": {
@@ -153,8 +154,8 @@
     "resources": {
       "major_sha256": "a8f003cc0298e8b2eba0c45fb40883177e57ffea9586bb1b68ec868345d58647",
       "major_version": 1,
-      "minor_sha256": "bf9dac57bbf9ed3d6f47876fa654484f1cd8da77d626fe8149b0b201bd49fc3c",
-      "minor_version": 0
+      "minor_sha256": "d1f9454b6d646c800f16a65cfbdcdf8ea8741bb56c1cbce8d8ffbacdb4d5facd",
+      "minor_version": 1
     },
     "teams": {
       "major_sha256": "5431cdcc82a335c9c3a9f39a3b930978c6271e51a1d68ab26f4ce0c470c4d49a",

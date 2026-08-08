@@ -11,7 +11,7 @@ from typing import Any, Sequence
 import orjson
 import pytest
 
-from p0.cli.build_spreads import DEFAULT_MONTH, USAGE_URL
+from p0.cli.build_spreads import DEFAULT_CUTOFF, DEFAULT_MONTH, USAGE_URL
 from p0.format_config import FORMAT, current_manifest
 from p0.model.tokenizer import PokemonTokenizer
 from p0.teams.corpus import (
@@ -1326,7 +1326,9 @@ def test_load_accepts_a_single_hop_alias() -> None:
 
 def test_usage_export_url_matches_the_published_layout() -> None:
     """The artifact can only be rebuilt if this URL keeps matching Smogon's layout."""
-    url = USAGE_URL.format(month="2026-07", format_id=FORMAT.battle_format, cutoff=1760)
+    # The literal is the point: it pins the external layout Smogon publishes, which
+    # no constant in this repo can verify for us.
+    url = USAGE_URL.format(month="2026-07", format_id="gen9championsvgc2026regmb", cutoff=1760)
     assert url == (
         "https://www.smogon.com/stats/2026-07/chaos/gen9championsvgc2026regmb-1760.json.gz"
     )
@@ -1339,7 +1341,7 @@ def test_shipped_spread_table_records_the_exports_it_came_from() -> None:
 
     assert source["month"] == DEFAULT_MONTH
     assert set(source["exports"]) == {
-        f"{FORMAT.battle_format}-1760.json",
-        f"{FORMAT.bo3_format}-1760.json",
+        f"{FORMAT.battle_format}-{DEFAULT_CUTOFF}.json",
+        f"{FORMAT.bo3_format}-{DEFAULT_CUTOFF}.json",
     }
     assert all(len(digest) == 64 for digest in source["exports"].values())

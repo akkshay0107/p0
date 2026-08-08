@@ -22,6 +22,7 @@ ROOT = DEFAULT_PATHS.repository_root
 DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
 DEFAULT_VOCAB = ROOT / "data" / "vocab.json"
 DEFAULT_MANIFEST = ROOT / "data" / "runtime_manifest.json"
+DEFAULT_SPREAD_USAGE = ROOT / "data" / "spread_usage.json"
 
 TABLES = (
     "species",
@@ -65,6 +66,7 @@ def build(
     vocab_path: Path,
     manifest_path: Path,
     coverage_path: Path | None = None,
+    spread_usage_path: Path = DEFAULT_SPREAD_USAGE,
 ) -> dict[str, Any]:
     """Build the vocab mapping, checking for schema and dataset coverage.
 
@@ -73,6 +75,7 @@ def build(
         vocab_path: Destination for the atomically written vocabulary.
         manifest_path: Destination for the atomically written runtime manifest.
         coverage_path: Optional destination for the coverage audit JSON.
+        spread_usage_path: Spread priors pinned as a minor resource identity.
 
     Returns:
         The generated coverage audit.
@@ -183,7 +186,12 @@ def build(
     )
     atomic_json_save(
         manifest_path,
-        update_resource_contract(base, vocab_path=vocab_path, dex_path=dex_path).to_dict(),
+        update_resource_contract(
+            base,
+            vocab_path=vocab_path,
+            dex_path=dex_path,
+            spread_usage_path=spread_usage_path,
+        ).to_dict(),
     )
     return coverage
 

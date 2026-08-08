@@ -177,6 +177,10 @@ class GlobalContract:
         return self.payload("resources", "minor")["champions_dex_sha256"]
 
     @property
+    def spread_usage_sha256(self) -> str:
+        return self.payload("resources", "minor")["spread_usage_sha256"]
+
+    @property
     def showdown_commit(self) -> str:
         return self.payload("resources", "minor")["showdown_commit"]
 
@@ -480,13 +484,23 @@ def _validate_subsystem_payload(name: str, payloads: Mapping[str, Mapping[str, A
             raise ValueError("resources major payload vocabulary_sha256 must be a SHA-256 digest")
         _validate_exact_fields(
             minor,
-            frozenset({"champions_dex_sha256", "showdown_commit", "battle_format", "bo3_format"}),
+            frozenset(
+                {
+                    "champions_dex_sha256",
+                    "spread_usage_sha256",
+                    "showdown_commit",
+                    "battle_format",
+                    "bo3_format",
+                }
+            ),
             "resources minor payload",
         )
         if not _is_sha256(minor["champions_dex_sha256"]):
             raise ValueError(
                 "resources minor payload champions_dex_sha256 must be a SHA-256 digest"
             )
+        if not _is_sha256(minor["spread_usage_sha256"]):
+            raise ValueError("resources minor payload spread_usage_sha256 must be a SHA-256 digest")
         for field in ("showdown_commit", "battle_format", "bo3_format"):
             _require_non_empty_string(minor[field], f"resources minor payload {field}")
     elif name == "replays":
@@ -656,21 +670,32 @@ def current_manifest(
     *,
     vocab_path: str | Path = DEFAULT_PATHS.data_root / "vocab.json",
     dex_path: str | Path = DEFAULT_PATHS.data_root / "champions_dex.json",
+    spread_usage_path: str | Path = DEFAULT_PATHS.data_root / "spread_usage.json",
 ) -> GlobalContract:
     """Project resource files onto the checked-in contract with explicit version bumps."""
     return update_resource_contract(
-        active_global_contract(), vocab_path=vocab_path, dex_path=dex_path
+        active_global_contract(),
+        vocab_path=vocab_path,
+        dex_path=dex_path,
+        spread_usage_path=spread_usage_path,
     )
 
 
 def update_resource_contract(
-    base: GlobalContract, *, vocab_path: str | Path, dex_path: str | Path
+    base: GlobalContract,
+    *,
+    vocab_path: str | Path,
+    dex_path: str | Path,
+    spread_usage_path: str | Path,
 ) -> GlobalContract:
     """Return a version-bumped resources contract for newly written resource files."""
     major = _thaw(base.payload("resources", "major"))
     minor = _thaw(base.payload("resources", "minor"))
     major["vocabulary_sha256"] = sha256_json_file(vocab_path)
     minor["champions_dex_sha256"] = sha256_file(dex_path)
+    # Minor because refreshing the usage month shifts opponent stat estimates without
+    # changing any tensor or artifact schema, so an existing policy still loads.
+    minor["spread_usage_sha256"] = sha256_file(spread_usage_path)
     if major != _thaw(base.payload("resources", "major")):
         return base.with_subsystem_update("resources", major_payload=major, minor_payload=minor)
     if minor != _thaw(base.payload("resources", "minor")):
@@ -705,11 +730,16 @@ def load_active_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> 
     minor_resources = contract.payload("resources", "minor")
     vocab = sha256_json_file(Path(path).with_name("vocab.json"))
     dex = sha256_file(Path(path).with_name("champions_dex.json"))
+    spreads = sha256_file(Path(path).with_name("spread_usage.json"))
     mismatches = []
     if resources["vocabulary_sha256"] != vocab:
         mismatches.append(f"vocabulary={resources['vocabulary_sha256']}, actual={vocab}")
     if minor_resources["champions_dex_sha256"] != dex:
         mismatches.append(f"champions_dex={minor_resources['champions_dex_sha256']}, actual={dex}")
+    if minor_resources["spread_usage_sha256"] != spreads:
+        mismatches.append(
+            f"spread_usage={minor_resources['spread_usage_sha256']}, actual={spreads}"
+        )
     if mismatches:
         raise ValueError(
             "Global contract does not describe active resources: " + "; ".join(mismatches)

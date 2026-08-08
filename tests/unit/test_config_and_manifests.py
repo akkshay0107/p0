@@ -33,6 +33,7 @@ from p0.format_config import (
     canonical_json_sha256,
     current_manifest,
     load_runtime_manifest,
+    sha256_file,
     validate_artifact_runtime_contract,
 )
 from p0.model.architecture_contract import SERIES_SLOTS, SERIES_TOKENS_PER_GAME
@@ -46,6 +47,7 @@ from p0.model.fused_token_encoder import (
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.token_store import SeriesTokenStore
 from p0.model.tokenizer import PokemonTokenizer, Resolution, tokenizer
+from p0.paths import DEFAULT_PATHS
 from p0.replays.schema import (
     ActionEvidence,
     DecisionRecord,
@@ -263,15 +265,30 @@ def test_global_contract_freezes_payloads_and_bumps_only_the_required_identity()
         minor_payload={**contract.payload("resources", "minor"), "showdown_commit": "next"},
     )
     assert changed_minor.global_sha256 == contract.global_sha256
-    assert changed_minor.subsystem("resources").minor_version == 1
+    # Relative to whatever the shipped contract is at, so later bumps do not break this.
+    assert (
+        changed_minor.subsystem("resources").minor_version
+        == contract.subsystem("resources").minor_version + 1
+    )
 
     changed_major = contract.with_subsystem_update(
         "model",
         major_payload={**contract.payload("model", "major"), "tensor_abi": "next"},
     )
     assert changed_major.global_sha256 != contract.global_sha256
-    assert changed_major.subsystem("model").major_version == 2
-    assert changed_major.subsystem("model").minor_version == 0
+    assert (
+        changed_major.subsystem("model").major_version
+        == contract.subsystem("model").major_version + 1
+    )
+
+    # A major bump resets minor. Asserted on a subsystem whose minor is non-zero, so
+    # the reset is actually observable rather than trivially already zero.
+    bumped = contract.with_subsystem_update(
+        "resources",
+        major_payload={**contract.payload("resources", "major"), "resource_feature_abi": "next"},
+    )
+    assert contract.subsystem("resources").minor_version > 0
+    assert bumped.subsystem("resources").minor_version == 0
 
 
 def test_global_contract_rejects_hash_valid_but_malformed_subsystem_payload():
@@ -1290,3 +1307,26 @@ def test_enum_like_tables_lazy_cache_alias_and_missing_member_results() -> None:
     assert tokenizer_instance.weathers["unknown-weather"] == 0
     assert tokenizer_instance.status["burn"] == 5
     assert tokenizer_instance.status["unknown-status"] == 0
+
+
+def test_spread_table_refresh_is_a_minor_contract_change(tmp_path):
+    """Refreshing the usage month must not invalidate existing checkpoints."""
+    vocab, dex = _resources(tmp_path, base_power=90)
+    table = tmp_path / "spread_usage.json"
+    table.write_text(json.dumps({"schema": 2, "spreads": {}}))
+    original = current_manifest(vocab_path=vocab, dex_path=dex, spread_usage_path=table)
+
+    table.write_text(json.dumps({"schema": 2, "spreads": {}, "month": "2026-08"}))
+    refreshed = current_manifest(vocab_path=vocab, dex_path=dex, spread_usage_path=table)
+
+    assert refreshed.spread_usage_sha256 != original.spread_usage_sha256
+    # Only the minor identity moves, so a policy trained on the old priors still loads.
+    assert refreshed.global_sha256 == original.global_sha256
+
+
+def test_active_contract_rejects_an_unrecorded_spread_table() -> None:
+    """A table edited without a contract bump must fail loudly, not sample stale priors."""
+    contract = active_global_contract()
+    assert contract.spread_usage_sha256 == sha256_file(
+        DEFAULT_PATHS.data_root / "spread_usage.json"
+    )
