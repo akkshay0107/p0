@@ -29,6 +29,13 @@ from p0.teams.corpus_build import (
 )
 from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FileTeamSource, FixedTeamSource, ValidatedTeam
+from p0.teams.spread_usage import (
+    BO3_BLEND_WEIGHT,
+    SPREAD_USAGE_SCHEMA,
+    build_spread_table,
+    load_spread_table,
+    parse_spread_key,
+)
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import (
     CanonicalTeam,
@@ -1057,3 +1064,113 @@ def test_batched_team_validation_rejects_timeout_crash_and_malformed_output() ->
 
     with pytest.raises(RuntimeError, match="malformed"):
         validate_many_batched((variant,), runner=malformed_runner)
+
+
+def _chaos(species: str, spreads: dict[str, float]) -> dict[str, Any]:
+    """Build a minimal chaos export carrying one species' spread distribution."""
+    return {"data": {species: {"Spreads": spreads}}}
+
+
+def test_parse_spread_key_rejects_illegal_and_malformed() -> None:
+    nature, points = parse_spread_key("Impish:32/0/21/0/11/2")
+    assert nature == "impish"
+    assert points == StatPoints(hp=32, defense=21, spd=11, spe=2)
+
+    assert parse_spread_key("Impish:33/0/0/0/0/0") is None, "per-stat cap of 32"
+    assert parse_spread_key("Impish:32/32/32/0/0/0") is None, "66-point budget"
+    assert parse_spread_key("Impish:32/0/0/0/0") is None, "needs six stats"
+    assert parse_spread_key("Impish:a/0/0/0/0/0") is None
+    assert parse_spread_key("32/0/0/0/0/0") is None, "needs a nature"
+
+
+def test_spread_table_blends_shared_buckets_toward_bo3() -> None:
+    only_bo3 = "Timid:2/0/0/32/0/32"
+    only_bo1 = "Timid:32/0/0/32/0/2"
+    payload = build_spread_table(
+        _chaos("Whimsicott", {only_bo1: 10.0}),
+        _chaos("Whimsicott", {only_bo3: 1.0}),
+        format_id=FORMAT.battle_format,
+    )
+    bucket = load_spread_table(payload).lookup("Whimsicott", "timid")
+
+    # Each source normalizes to 1.0 first, so the raw 10:1 count gap is irrelevant
+    # and the blend lands on the configured 0.8/0.2 split.
+    assert [prior.points for prior in bucket] == [
+        StatPoints(hp=2, spa=32, spe=32),
+        StatPoints(hp=32, spa=32, spe=2),
+    ]
+    assert bucket[0].weight == pytest.approx(BO3_BLEND_WEIGHT, abs=1e-4)
+    assert bucket[1].weight == pytest.approx(1.0 - BO3_BLEND_WEIGHT, abs=1e-4)
+
+
+def test_spread_table_uses_single_source_when_bucket_is_absent() -> None:
+    payload = build_spread_table(
+        _chaos("Sylveon", {"Calm:32/0/0/0/32/2": 5.0}),
+        _chaos("Incineroar", {"Impish:32/0/32/0/2/0": 5.0}),
+        format_id=FORMAT.battle_format,
+    )
+    table = load_spread_table(payload)
+
+    # A bucket only one export carries is taken whole rather than down-weighted.
+    assert table.best("Sylveon", "calm") == StatPoints(hp=32, spd=32, spe=2)
+    assert table.best("Incineroar", "impish") == StatPoints(hp=32, defense=32, spd=2)
+    assert table.lookup("Sylveon", "calm")[0].weight == pytest.approx(1.0)
+
+
+def test_spread_table_prunes_rare_natures() -> None:
+    common = "Timid:2/0/0/32/0/32"
+    rare = "Hardy:32/0/32/0/2/0"
+    export = _chaos("Gholdengo", {common: 99.0, rare: 1.0})
+    table = load_spread_table(
+        build_spread_table(export, export, format_id=FORMAT.battle_format, min_nature_share=0.05)
+    )
+
+    assert table.best("Gholdengo", "timid") is not None
+    assert table.best("Gholdengo", "hardy") is None, "1% share is below the 5% floor"
+
+    kept = load_spread_table(
+        build_spread_table(export, export, format_id=FORMAT.battle_format, min_nature_share=0.0)
+    )
+    assert kept.best("Gholdengo", "hardy") is not None
+
+
+def test_spread_table_truncates_and_renormalizes() -> None:
+    # Each allocation sums to 64, so all twenty are legal and distinct.
+    spreads = {f"Jolly:{n}/{32 - n}/0/0/0/32": float(20 - n) for n in range(20)}
+    export = _chaos("Garchomp", spreads)
+    bucket = load_spread_table(
+        build_spread_table(export, export, format_id=FORMAT.battle_format, max_spreads=5)
+    ).lookup("Garchomp", "jolly")
+
+    assert len(bucket) == 5
+    assert sum(prior.weight for prior in bucket) == pytest.approx(1.0)
+    # Stored weight-descending, so the argmax is entry zero.
+    assert [prior.weight for prior in bucket] == sorted(
+        (prior.weight for prior in bucket), reverse=True
+    )
+
+
+def test_spread_table_rejects_unsupported_schema() -> None:
+    payload = build_spread_table(
+        _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
+        _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
+        format_id=FORMAT.battle_format,
+    )
+    payload["schema"] = SPREAD_USAGE_SCHEMA + 1
+    with pytest.raises(ValueError, match="schema"):
+        load_spread_table(payload)
+
+
+def test_spread_table_lookup_normalizes_species_and_nature() -> None:
+    payload = build_spread_table(
+        _chaos("Charizard-Mega-Y", {"Timid:2/0/0/32/0/32": 1.0}),
+        _chaos("Charizard-Mega-Y", {"Timid:2/0/0/32/0/32": 1.0}),
+        format_id=FORMAT.battle_format,
+    )
+    table = load_spread_table(payload)
+
+    expected = StatPoints(hp=2, spa=32, spe=32)
+    assert table.best("Charizard-Mega-Y", "Timid") == expected
+    assert table.best("charizardmegay", "timid") == expected
+    assert table.best("Missingno", "timid") is None
+    assert table.lookup("Missingno", "timid") == ()
