@@ -22,6 +22,7 @@ from p0.teams.corpus import (
     corpus_content_hash,
 )
 from p0.teams.corpus_build import (
+    _component_splits,
     audit_corpus,
     build_corpus,
     populate_pool_directories,
@@ -615,6 +616,40 @@ def test_sampling_policy_uniform_archetype(tmp_path: Path) -> None:
     # Should be close to 50/50 across the two archetypes
     assert 220 <= tag_counts["balance"] <= 380
     assert 220 <= tag_counts["hyperoffense"] <= 380
+
+
+def test_uniform_archetype_rejects_untagged_pool(tmp_path: Path) -> None:
+    """An untagged pool must fail loudly, not collapse into uniform-over-entries."""
+    entries = tuple(_make_entry(i, tags=()) for i in range(3))
+    path, manifest = _write_manifest(tmp_path, entries)
+    spec = CorpusSourceSpec(
+        corpus_path=str(path),
+        corpus_hash=manifest.corpus_hash,
+        format_id=FORMAT.battle_format,
+        split=CorpusSplit.TRAIN,
+        sampling_policy=SamplingPolicy.UNIFORM_ARCHETYPE,
+    )
+    with pytest.raises(ValueError, match="requires archetype tags"):
+        CorpusTeamSource(spec)
+
+
+def test_held_out_tags_reject_untagged_corpus() -> None:
+    """Requesting a hold-out with no tags anywhere would silently populate no split."""
+    variants = (_variant_team_corpus(metadata=replace(_metadata(), archetype_tags=())),)
+    with pytest.raises(ValueError, match="no team record carries an archetype tag"):
+        _component_splits(
+            variants,
+            ratio_train=0.8,
+            ratio_val=0.1,
+            ratio_test=0.1,
+            held_out_tags=("trick-room",),
+        )
+
+    # The same corpus must still split cleanly when no hold-out is requested.
+    splits = _component_splits(
+        variants, ratio_train=0.8, ratio_val=0.1, ratio_test=0.1, held_out_tags=()
+    )
+    assert splits[0] is not CorpusSplit.HELD_OUT_ARCHETYPE
 
 
 def test_sampling_policy_rare_coverage(tmp_path: Path) -> None:

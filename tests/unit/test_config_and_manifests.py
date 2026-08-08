@@ -1178,8 +1178,9 @@ def test_variants_from_showdown_with_dex() -> None:
     assert len(variant.spreads) == 6
     # Verify exact spreads were imputed rather than the default fallback
     assert any(spread != StatPoints(hp=2, spa=32, spe=32) for spread in variant.spreads)
-    # Verify role/archetype tags reflect classified roles
-    assert "imputed" in variant.metadata.archetype_tags
+    # Provenance lives on the record itself; archetype tagging is unwired for now.
+    assert variant.spread_provenance == "imputed"
+    assert variant.metadata.archetype_tags == ()
 
 
 def _migrated_runtime_files(tmp_path: Path) -> tuple[Path, Path]:

@@ -61,6 +61,16 @@ def _component_splits(
 ) -> tuple[CorpusSplit, ...]:
     """Assign every connected source-series component one corpus split."""
     _validate_ratios(ratio_train, ratio_val, ratio_test)
+
+    # Requesting a hold-out against a wholly untagged corpus would produce an empty
+    # HELD_OUT_ARCHETYPE split and route those teams into train, silently turning a
+    # generalization measurement into a training-set one.
+    if held_out_tags and not any(variant.metadata.archetype_tags for variant in variants):
+        raise ValueError(
+            f"held_out_tags={held_out_tags} was requested but no team record carries an "
+            "archetype tag; archetype tagging is currently unwired"
+        )
+
     parents: dict[tuple[str, str], tuple[str, str]] = {}
 
     def find(value: tuple[str, str]) -> tuple[str, str]:

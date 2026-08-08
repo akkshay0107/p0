@@ -90,6 +90,16 @@ class CorpusTeamSource:
                 tags = entry.archetype_tags if entry.archetype_tags else ("_untagged_",)
                 for tag in tags:
                     by_archetype.setdefault(tag, []).append(entry)
+
+            # A wholly untagged pool would collapse this policy into uniform sampling
+            # over every entry, which is indistinguishable from the default policy at
+            # runtime. Refuse it rather than silently sample the wrong distribution.
+            if set(by_archetype) == {"_untagged_"}:
+                raise ValueError(
+                    "UNIFORM_ARCHETYPE sampling requires archetype tags, but no corpus "
+                    "entry carries one; archetype tagging is currently unwired"
+                )
+
             self._by_archetype = by_archetype
             self._archetype_keys = tuple(sorted(by_archetype.keys()))
         return self._by_archetype, self._archetype_keys

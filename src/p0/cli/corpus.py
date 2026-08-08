@@ -20,7 +20,6 @@ from p0.teams.corpus_build import (
 )
 from p0.teams.stat_points import (
     BaseStats,
-    Role,
     StatPoints,
     select_candidate,
 )
@@ -35,7 +34,7 @@ def _variants_from_showdown(
 
     Arguments:
         text: Showdown export containing one or more six-member teams.
-        dex: Optional dex data used for stat-spread imputation and role labels.
+        dex: Optional dex data used for stat-spread imputation.
 
     Returns:
         One deduplicated team record per canonical team hash.
@@ -111,7 +110,6 @@ def _variants_from_showdown(
     variants: list[TeamRecord] = []
     for team, usage in canonical_dict.values():
         spreads_list: list[StatPoints] = []
-        roles_list: list[Role] = []
         for m in team.members:
             species_entry = species_by_id.get(normalize_id(m.species).casefold())
             base_mapping = (
@@ -134,7 +132,6 @@ def _variants_from_showdown(
                         seed=0,
                     )
                     spreads_list.append(candidate.points)
-                    roles_list.append(candidate.role)
                     continue
                 except (TypeError, ValueError) as exc:
                     logging.getLogger(__name__).warning(
@@ -143,25 +140,16 @@ def _variants_from_showdown(
             spreads_list.append(StatPoints(hp=2, spa=32, spe=32))
 
         spreads = tuple(spreads_list)
-        if roles_list:
-            if any(role == Role.TRICK_ROOM for role in roles_list):
-                archetype_tags = ("trick-room", "imputed")
-            elif any(role == Role.SPEED_CONTROL for role in roles_list):
-                archetype_tags = ("speed-control", "imputed")
-            elif any(role in (Role.PHYSICAL, Role.SPECIAL, Role.MIXED) for role in roles_list):
-                archetype_tags = ("offense", "imputed")
-            else:
-                archetype_tags = ("balance", "imputed")
-        else:
-            archetype_tags = ("balance",)
-
+        # Archetype tagging is unwired pending a team-sheet tagger. Roles derived from
+        # imputed spreads could not recover speed-control, which is a move property, so
+        # no tags are emitted rather than emitting a silently incomplete vocabulary.
         metadata = TeamMetadata(
             source_series=(),
             source_replays=(),
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-01T00:00:00Z",
             usage_count=usage,
-            archetype_tags=archetype_tags,
+            archetype_tags=(),
         )
         variants.append(TeamRecord(team=team, spreads=spreads, metadata=metadata))
 
