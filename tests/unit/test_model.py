@@ -52,6 +52,10 @@ ACT_SIZE = FORMAT.action_size
 
 @pytest.fixture
 def policy_net():
+    # Seeded because tests below assert that two inputs produce different outputs.
+    # Without a seed the initialization depends on whatever consumed the global RNG
+    # earlier in the session, so adding a test elsewhere could make one fail.
+    torch.manual_seed(0)
     return build_policy(
         ModelConfig(128, 4, 2, 512),
         default_runtime_resources(),

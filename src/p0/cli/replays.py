@@ -36,7 +36,6 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--cache-dir", type=Path, default=Path("artifacts/replays"))
     build.add_argument("--output-dir", type=Path, default=Path("artifacts/shards"))
     build.add_argument("--max-candidates", type=int, default=256)
-    build.add_argument("--imputation-seed", type=int, default=0)
     build.add_argument("--max-decisions-per-shard", type=int, default=4096)
     build.add_argument("--runtime-manifest", type=Path, default=DEFAULT_RUNTIME_MANIFEST)
     build.add_argument(
@@ -134,7 +133,6 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
         output_dir=args.output_dir,
         format_id=FORMAT.bo3_format,
         max_candidates=args.max_candidates,
-        imputation_seed=args.imputation_seed,
         max_decisions_per_shard=args.max_decisions_per_shard,
         manifest_path=args.runtime_manifest,
         external_rejections=tuple(parse_errors),

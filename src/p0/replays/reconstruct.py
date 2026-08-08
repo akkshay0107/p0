@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import typing
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -62,12 +61,11 @@ from p0.replays.schema import (
     GameRecord,
     ReplayDiagnostics,
 )
+from p0.teams.spread_usage import load_spread_table_file
 from p0.teams.stat_points import (
     BaseStats,
     StatPoints,
     calculate_stats,
-    impute_candidates,
-    select_candidate,
 )
 
 _ENDPOINT_ACTION_STATE_TAGS = frozenset(
@@ -510,9 +508,15 @@ def impute_stat_points(
     document: ReplayDocument,
     *,
     dex: Mapping[str, Any],
-    seed: int = 0,
 ) -> tuple[StatPointEstimate, ...]:
-    """Seed a legal public-spread estimate, or return explicit UNKNOWN values."""
+    """Estimate each OTS member's spread from usage priors, or return UNKNOWN.
+
+    Uses the same deterministic argmax the observation builder uses, so compiled
+    replay tensors and live inference agree on how an opponent is estimated.
+    """
+    # Loaded per process rather than passed in: compilation fans out over a process
+    # pool, and the loader's cache is cheaper than pickling the table to each worker.
+    table = load_spread_table_file()
     species_entries = dex.get("species", ())
     by_id = {
         normalize_id(str(entry.get("id", entry.get("name", "")))): entry
@@ -559,28 +563,26 @@ def impute_stat_points(
                     StatPointEstimate(side, species, "UNKNOWN", StatPoints(), None, 0.0)
                 )
                 continue
-            value: dict[str, typing.Any] = dict(
-                nature=str(details.get("nature", "serious")),
-                item=str(details.get("item", "")),
-                ability=str(details.get("ability", "")),
-                moves=moves,
-                move_categories=categories,
-                base_stats=BaseStats.from_mapping(base_mapping),
-            )
-            candidates = impute_candidates(**value)
-            candidate = select_candidate(seed=seed + side * 1009 + index, **value)
+            nature = str(details.get("nature", "serious"))
+            estimate = table.resolve(species, nature, categories)
+            if estimate is None:
+                estimates.append(
+                    StatPointEstimate(side, species, "UNKNOWN", StatPoints(), None, 0.0)
+                )
+                continue
+
+            base_stats = BaseStats.from_mapping(base_mapping)
             stats = tuple[int, int, int, int, int, int](
-                calculate_stats(value["base_stats"], candidate.points, value["nature"], level)
+                calculate_stats(base_stats, estimate.points, nature, level)
             )
-            total_weight = sum(item.weight for item in candidates)
             estimates.append(
                 StatPointEstimate(
                     side,
                     species,
                     "IMPUTED",
-                    candidate.points,
+                    estimate.points,
                     stats,
-                    candidate.weight / max(1, total_weight),
+                    estimate.confidence,
                 )
             )
     return tuple(estimates)

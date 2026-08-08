@@ -28,6 +28,7 @@ from p0.format_config import (
     active_global_contract,
     canonical_json_sha256,
     load_active_runtime_manifest,
+    sha256_file,
     validate_artifact_runtime_contract,
 )
 from p0.model.observation_builder import ObservationBuilder
@@ -52,6 +53,7 @@ from p0.replays.shards import (
     validate_shard_tensors,
 )
 from p0.runtime.process_context import PROCESS_CONTEXT
+from p0.teams.spread_usage import DEFAULT_SPREAD_TABLE_PATH
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 _REPLAY_CONTRACT = active_global_contract().payload("replays", "major")
@@ -103,7 +105,6 @@ def _raw_replay_identities(
 def _build_configuration(
     *,
     max_candidates: int,
-    imputation_seed: int,
     max_decisions_per_shard: int,
     external_rejections: tuple[str, ...] = (),
 ) -> dict[str, Any]:
@@ -119,7 +120,10 @@ def _build_configuration(
         "imputation": {
             "algorithm": IMPUTATION_ALGORITHM,
             "version": IMPUTATION_VERSION,
-            "seed": imputation_seed,
+            # Imputation is now data-dependent, so the priors are part of the
+            # dataset identity: rebuilding the table must not silently produce a
+            # corpus that collides with one built from different usage months.
+            "table_sha256": sha256_file(DEFAULT_SPREAD_TABLE_PATH),
         },
         "max_decisions_per_shard": max_decisions_per_shard,
         "external_rejections": list(sorted(external_rejections)),
@@ -332,7 +336,6 @@ def write_tensor_shards(
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     max_candidates: int = 256,
-    imputation_seed: int = 0,
     raw_replays: Iterable[Mapping[str, str]] | None = None,
     source_series: Mapping[str, tuple[str, ...]] | None = None,
     external_rejections: tuple[str, ...] = (),
@@ -347,7 +350,6 @@ def write_tensor_shards(
         resources: Optional preloaded runtime resources.
         created_at: Optional deterministic manifest timestamp.
         max_candidates: Maximum number of action candidates per decision.
-        imputation_seed: Random seed for stat imputation.
         raw_replays: Optional precomputed identities for raw replay payload.
         source_series: Optional precomputed mappings of source series.
         external_rejections: Input identities rejected before replay parsing.
@@ -362,7 +364,6 @@ def write_tensor_shards(
     runtime_hash = _runtime_hash(manifest_path)
     build_config = _build_configuration(
         max_candidates=max_candidates,
-        imputation_seed=imputation_seed,
         max_decisions_per_shard=max_decisions_per_shard,
         external_rejections=external_rejections,
     )
@@ -535,7 +536,6 @@ def compile_to_shards(
     format_id: str | None = None,
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
-    imputation_seed: int = 0,
     max_decisions_per_shard: int = 4096,
     manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
     resources: RuntimeResources | None = None,
@@ -551,7 +551,6 @@ def compile_to_shards(
         format_id: Optional exact format filter.
         max_candidates: Maximum number of action candidates per decision.
         dex: Optional stat dex for imputation.
-        imputation_seed: Random seed for stat imputation.
         max_decisions_per_shard: Maximum decisions packed into a single shard.
         manifest_path: Path to the runtime manifest for contract validation.
         resources: Optional pre-loaded runtime resources.
@@ -567,7 +566,6 @@ def compile_to_shards(
         format_id=format_id,
         max_candidates=max_candidates,
         dex=dex,
-        imputation_seed=imputation_seed,
         chunksize=chunksize,
     )
     return write_tensor_shards(
@@ -578,7 +576,6 @@ def compile_to_shards(
         resources=resources,
         created_at=created_at,
         max_candidates=max_candidates,
-        imputation_seed=imputation_seed,
         external_rejections=external_rejections,
     )
 
@@ -730,7 +727,6 @@ def _compile_worker(
         tuple[int, int],
         int,
         Mapping[str, Any] | None,
-        int,
     ],
 ) -> tuple[CompiledGame | None, str | None]:
     (
@@ -740,12 +736,11 @@ def _compile_worker(
         canonical_player_roles,
         max_candidates,
         dex,
-        imputation_seed,
     ) = args
     estimates = ()
 
     if dex is not None:
-        estimates = impute_stat_points(document, dex=dex, seed=imputation_seed)
+        estimates = impute_stat_points(document, dex=dex)
 
     try:
         perspectives = reconstruct_both(document, max_candidates=max_candidates, dex=dex)
@@ -770,7 +765,6 @@ def compile_documents(
     format_id: str | None = None,
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
-    imputation_seed: int = 0,
     chunksize: int | None = None,
 ) -> CompilationResult:
     """Compile a stream of raw ReplayDocuments into state-machine verified CompiledGames.
@@ -783,7 +777,6 @@ def compile_documents(
         format_id: Optional exact format filter.
         max_candidates: Maximum number of action candidates per decision.
         dex: Optional stat dex for imputation.
-        imputation_seed: Random seed for stat imputation.
         chunksize: Optional ProcessPoolExecutor chunk size. When ``None`` (the
             default) a value is derived from the job count and CPU count. For
             small corpora (fewer jobs than workers) compilation runs inline to
@@ -842,7 +835,6 @@ def compile_documents(
                     membership.canonical_player_roles,
                     max_candidates,
                     dex,
-                    imputation_seed,
                 )
             )
 
@@ -909,7 +901,6 @@ def compile_payloads(
     format_id: str | None = None,
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
-    imputation_seed: int = 0,
     chunksize: int | None = None,
 ) -> CompilationResult:
     """Parse raw replay JSON payloads and compile them into verified games."""
@@ -920,7 +911,6 @@ def compile_payloads(
         format_id=format_id,
         max_candidates=max_candidates,
         dex=dex,
-        imputation_seed=imputation_seed,
         chunksize=chunksize,
     )
 

@@ -14,18 +14,32 @@ normalized to a probability distribution before mixing.
 
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, NamedTuple
 
+import orjson
+
+from p0.paths import DEFAULT_PATHS
 from p0.teams.stat_points import (
     STAT_POINT_LIMIT,
     STAT_POINT_TOTAL_LIMIT,
     StatPoints,
+    fallback_points,
 )
 from p0.teams.team import normalize_id
 
-SPREAD_USAGE_SCHEMA = 1
+SPREAD_USAGE_SCHEMA = 2
+
+# Recorded on each estimate so downstream metrics can separate a usage-backed spread
+# from a move-category shape, which are not comparably reliable.
+IMPUTED_FROM_USAGE = "usage"
+IMPUTED_FROM_FALLBACK = "fallback"
+
+DEFAULT_SPREAD_TABLE_PATH = DEFAULT_PATHS.data_root / "spread_usage.json"
 
 # Bo3 is the format replays are compiled against, so it leads the blend; Bo1 covers
 # roughly 98 extra species and contributes the remainder.
@@ -49,20 +63,20 @@ class SpreadPrior(NamedTuple):
     weight: float
 
 
+class SpreadEstimate(NamedTuple):
+    """A resolved spread, how much usage backs it, and where it came from."""
+
+    points: StatPoints
+    confidence: float
+    origin: str
+
+
 @dataclass(frozen=True, slots=True)
 class SpreadTable:
     """Usage-derived spread priors, keyed by normalized species and lowercase nature."""
 
     buckets: Mapping[tuple[str, str], tuple[SpreadPrior, ...]]
     format_id: str
-    schema: int = SPREAD_USAGE_SCHEMA
-
-    def __post_init__(self) -> None:
-        if self.schema != SPREAD_USAGE_SCHEMA:
-            raise ValueError(
-                f"Unsupported spread table schema: expected={SPREAD_USAGE_SCHEMA}, "
-                f"actual={self.schema}"
-            )
 
     def lookup(self, species: str, nature: str) -> tuple[SpreadPrior, ...]:
         """Return the bucket for a species and nature, empty when absent."""
@@ -75,6 +89,104 @@ class SpreadTable:
         """
         bucket = self.lookup(species, nature)
         return bucket[0].points if bucket else None
+
+    def resolve(
+        self, species: str, nature: str, move_categories: tuple[str, ...]
+    ) -> SpreadEstimate | None:
+        """Estimate a spread from the usage prior, falling back to move categories.
+
+        Returns None when neither source can produce one, which callers record as an
+        explicit UNKNOWN rather than substituting a blind guess.
+        """
+        bucket = self.lookup(species, nature)
+        if bucket:
+            return SpreadEstimate(bucket[0].points, bucket[0].weight, IMPUTED_FROM_USAGE)
+
+        return self._fallback_estimate(move_categories)
+
+    def sample(
+        self, species: str, nature: str, move_categories: tuple[str, ...], rng: random.Random
+    ) -> SpreadEstimate | None:
+        """Draw a spread in proportion to usage, for generating varied teams.
+
+        Mirrors resolve() except that a populated bucket is sampled by weight rather
+        than reduced to its argmax.
+        """
+        bucket = self.lookup(species, nature)
+        if not bucket:
+            return self._fallback_estimate(move_categories)
+
+        prior = rng.choices(bucket, weights=[entry.weight for entry in bucket], k=1)[0]
+        return SpreadEstimate(prior.points, prior.weight, IMPUTED_FROM_USAGE)
+
+    @staticmethod
+    def _fallback_estimate(move_categories: tuple[str, ...]) -> SpreadEstimate | None:
+        """Shape a spread from move categories when no usage bucket exists."""
+        points = fallback_points(move_categories)
+        if points is None:
+            return None
+
+        # A category fallback is a shape, not an observed frequency, so it carries no
+        # usage share to report as confidence.
+        return SpreadEstimate(points, 0.0, IMPUTED_FROM_FALLBACK)
+
+
+def cosmetic_forme_aliases(dex: Mapping[str, Any]) -> dict[str, str]:
+    """Map purely cosmetic formes onto the base species whose priors they can share.
+
+    Usage exports report cosmetic formes under the base name, so without this a
+    Florges-Blue sheet would miss the Florges bucket entirely. A forme qualifies only
+    when it carries no base stats of its own or carries stats identical to the base:
+    Floette's forme list mixes cosmetic colours with Floette-Eternal and Floette-Mega,
+    which are separate Pokemon whose spreads must never be folded together.
+    """
+    entries = [entry for entry in dex.get("species", ()) if isinstance(entry, Mapping)]
+    by_id: dict[str, Mapping[str, Any]] = {
+        normalize_id(str(entry.get("id", entry.get("name", "")))): entry for entry in entries
+    }
+
+    def canonical_id(entry: Mapping[str, Any]) -> str:
+        """Resolve one entry to the species whose priors it may share.
+
+        Anchored on baseSpecies rather than on whichever entry happens to list the
+        forme: Alcremie's variants each list all the others, so listing order would
+        otherwise decide the target and could alias two formes onto each other.
+        """
+        own_id = normalize_id(str(entry.get("id", entry.get("name", ""))))
+        base_id = normalize_id(str(entry.get("baseSpecies", "")))
+        if not base_id or base_id == own_id:
+            return own_id
+
+        base_entry = by_id.get(base_id)
+        if base_entry is None:
+            return own_id
+
+        own_stats = entry.get("baseStats")
+        base_stats = base_entry.get("baseStats")
+        if not isinstance(own_stats, Mapping) or not isinstance(base_stats, Mapping):
+            return own_id
+        if dict(own_stats) != dict(base_stats):
+            return own_id
+
+        return base_id
+
+    aliases: dict[str, str] = {}
+    for entry in entries:
+        own_id = normalize_id(str(entry.get("id", entry.get("name", ""))))
+        target = canonical_id(entry)
+        if target != own_id:
+            aliases[own_id] = target
+
+        # Cosmetic formes carry no dex record of their own, so they exist only in the
+        # listing entry's forme names and inherit its stats by construction.
+        for name in (*entry.get("formeOrder", ()), *entry.get("cosmeticFormes", ())):
+            if not isinstance(name, str) or not name:
+                continue
+            forme_id = normalize_id(name)
+            if forme_id != target and forme_id not in by_id:
+                aliases[forme_id] = target
+
+    return aliases
 
 
 def parse_spread_key(key: str) -> tuple[str, StatPoints] | None:
@@ -153,6 +265,7 @@ def build_spread_table(
     bo3: Mapping[str, Any],
     *,
     format_id: str,
+    dex: Mapping[str, Any],
     max_spreads: int = MAX_SPREADS_PER_BUCKET,
     min_nature_share: float = MIN_NATURE_SHARE,
 ) -> dict[str, Any]:
@@ -167,6 +280,7 @@ def build_spread_table(
         bo1: Parsed chaos export for the singles-ladder format.
         bo3: Parsed chaos export for the Bo3 format.
         format_id: Battle format the artifact is declared against.
+        dex: Champions dex, used to alias cosmetic formes onto their base species.
         max_spreads: Maximum spreads retained per bucket.
         min_nature_share: Drop a bucket when its nature accounts for less than this
             share of its species' spread mass in every export that carries it.
@@ -220,6 +334,14 @@ def build_spread_table(
         ]
         serialized.setdefault(species_id, {})[nature] = rows
 
+    # Only aliases that would actually resolve are stored: the target must carry
+    # buckets, and a forme the exports report separately keeps its own.
+    aliases = {
+        forme: target
+        for forme, target in sorted(cosmetic_forme_aliases(dex).items())
+        if target in serialized and forme not in serialized
+    }
+
     return {
         "schema": SPREAD_USAGE_SCHEMA,
         "format_id": format_id,
@@ -227,6 +349,7 @@ def build_spread_table(
         "max_spreads_per_bucket": max_spreads,
         "min_nature_share": min_nature_share,
         "weight_scale": WEIGHT_SCALE,
+        "aliases": aliases,
         "spreads": serialized,
     }
 
@@ -250,6 +373,29 @@ def load_spread_table(payload: Mapping[str, Any]) -> SpreadTable:
         for nature, rows in by_nature.items():
             buckets[(str(species_id), str(nature))] = _load_bucket(rows, species_id, nature)
 
+    # Cosmetic formes point at the base species' tuples rather than copying them, so
+    # aliasing costs one dict entry per forme and nothing in the serialized artifact.
+    aliases = payload.get("aliases", {})
+    if not isinstance(aliases, Mapping):
+        raise ValueError("Spread table 'aliases' must be a mapping")
+
+    # Aliases are expanded against the real buckets only, so a target that is itself
+    # an alias would resolve to nothing and a missing target would do nothing at all.
+    # Both are silent, so reject them here instead of serving empty lookups.
+    for forme, target in aliases.items():
+        if str(target) not in spreads:
+            raise ValueError(f"Spread alias points at an unknown species: {forme} -> {target}")
+        if str(target) in aliases:
+            raise ValueError(f"Spread alias resolves through another alias: {forme} -> {target}")
+
+    natures_by_species: dict[str, list[tuple[str, tuple[SpreadPrior, ...]]]] = {}
+    for (species_id, nature), bucket in buckets.items():
+        natures_by_species.setdefault(species_id, []).append((nature, bucket))
+
+    for forme, target in aliases.items():
+        for nature, bucket in natures_by_species.get(str(target), ()):
+            buckets.setdefault((str(forme), nature), bucket)
+
     return SpreadTable(buckets=buckets, format_id=str(payload.get("format_id", "")))
 
 
@@ -268,5 +414,31 @@ def _load_bucket(rows: Any, species_id: str, nature: str) -> tuple[SpreadPrior, 
             raise ValueError(f"Spread weight must be positive: {species_id}/{nature}")
         parsed.append((points, weight))
 
-    total = sum(weight for _, weight in parsed)
+    # best() and resolve() take entry zero as the argmax, so a bucket that is not
+    # weight-descending would silently hand back a spread that is not the most used.
+    # The writer sorts, but nothing else guarantees the artifact on disk still is.
+    weights = [weight for _, weight in parsed]
+    if weights != sorted(weights, reverse=True):
+        raise ValueError(f"Spread bucket is not weight-descending: {species_id}/{nature}")
+
+    total = sum(weights)
     return tuple(SpreadPrior(points, weight / total) for points, weight in parsed)
+
+
+@lru_cache(maxsize=2)
+def load_spread_table_file(path: Path = DEFAULT_SPREAD_TABLE_PATH) -> SpreadTable:
+    """Load and cache a spread table from disk.
+
+    Cached because every observation build consults the table, and re-parsing a
+    multi-megabyte artifact per battle would dominate the build cost.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Spread table not found: {path}. Build it with 'python -m p0.cli.build_spreads'."
+        )
+    try:
+        payload = orjson.loads(path.read_bytes())
+    except (OSError, orjson.JSONDecodeError) as exc:
+        raise ValueError(f"Malformed spread table: {path}") from exc
+
+    return load_spread_table(payload)

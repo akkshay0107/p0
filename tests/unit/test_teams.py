@@ -33,6 +33,7 @@ from p0.teams.spread_usage import (
     BO3_BLEND_WEIGHT,
     SPREAD_USAGE_SCHEMA,
     build_spread_table,
+    cosmetic_forme_aliases,
     load_spread_table,
     parse_spread_key,
 )
@@ -1071,8 +1072,18 @@ def _chaos(species: str, spreads: dict[str, float]) -> dict[str, Any]:
     return {"data": {species: {"Spreads": spreads}}}
 
 
+def _dex(*species: dict[str, Any]) -> dict[str, Any]:
+    """Build a minimal dex carrying only what forme aliasing reads."""
+    return {"species": list(species), "moves": []}
+
+
+_BASE_STATS = {"hp": 78, "atk": 65, "def": 68, "spa": 112, "spd": 154, "spe": 75}
+
+
 def test_parse_spread_key_rejects_illegal_and_malformed() -> None:
-    nature, points = parse_spread_key("Impish:32/0/21/0/11/2")
+    parsed = parse_spread_key("Impish:32/0/21/0/11/2")
+    assert parsed is not None
+    nature, points = parsed
     assert nature == "impish"
     assert points == StatPoints(hp=32, defense=21, spd=11, spe=2)
 
@@ -1090,6 +1101,7 @@ def test_spread_table_blends_shared_buckets_toward_bo3() -> None:
         _chaos("Whimsicott", {only_bo1: 10.0}),
         _chaos("Whimsicott", {only_bo3: 1.0}),
         format_id=FORMAT.battle_format,
+        dex=_dex(),
     )
     bucket = load_spread_table(payload).lookup("Whimsicott", "timid")
 
@@ -1108,6 +1120,7 @@ def test_spread_table_uses_single_source_when_bucket_is_absent() -> None:
         _chaos("Sylveon", {"Calm:32/0/0/0/32/2": 5.0}),
         _chaos("Incineroar", {"Impish:32/0/32/0/2/0": 5.0}),
         format_id=FORMAT.battle_format,
+        dex=_dex(),
     )
     table = load_spread_table(payload)
 
@@ -1122,14 +1135,18 @@ def test_spread_table_prunes_rare_natures() -> None:
     rare = "Hardy:32/0/32/0/2/0"
     export = _chaos("Gholdengo", {common: 99.0, rare: 1.0})
     table = load_spread_table(
-        build_spread_table(export, export, format_id=FORMAT.battle_format, min_nature_share=0.05)
+        build_spread_table(
+            export, export, format_id=FORMAT.battle_format, dex=_dex(), min_nature_share=0.05
+        )
     )
 
     assert table.best("Gholdengo", "timid") is not None
     assert table.best("Gholdengo", "hardy") is None, "1% share is below the 5% floor"
 
     kept = load_spread_table(
-        build_spread_table(export, export, format_id=FORMAT.battle_format, min_nature_share=0.0)
+        build_spread_table(
+            export, export, format_id=FORMAT.battle_format, dex=_dex(), min_nature_share=0.0
+        )
     )
     assert kept.best("Gholdengo", "hardy") is not None
 
@@ -1139,7 +1156,9 @@ def test_spread_table_truncates_and_renormalizes() -> None:
     spreads = {f"Jolly:{n}/{32 - n}/0/0/0/32": float(20 - n) for n in range(20)}
     export = _chaos("Garchomp", spreads)
     bucket = load_spread_table(
-        build_spread_table(export, export, format_id=FORMAT.battle_format, max_spreads=5)
+        build_spread_table(
+            export, export, format_id=FORMAT.battle_format, dex=_dex(), max_spreads=5
+        )
     ).lookup("Garchomp", "jolly")
 
     assert len(bucket) == 5
@@ -1155,6 +1174,7 @@ def test_spread_table_rejects_unsupported_schema() -> None:
         _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
         _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
         format_id=FORMAT.battle_format,
+        dex=_dex(),
     )
     payload["schema"] = SPREAD_USAGE_SCHEMA + 1
     with pytest.raises(ValueError, match="schema"):
@@ -1166,6 +1186,7 @@ def test_spread_table_lookup_normalizes_species_and_nature() -> None:
         _chaos("Charizard-Mega-Y", {"Timid:2/0/0/32/0/32": 1.0}),
         _chaos("Charizard-Mega-Y", {"Timid:2/0/0/32/0/32": 1.0}),
         format_id=FORMAT.battle_format,
+        dex=_dex(),
     )
     table = load_spread_table(payload)
 
@@ -1174,3 +1195,127 @@ def test_spread_table_lookup_normalizes_species_and_nature() -> None:
     assert table.best("charizardmegay", "timid") == expected
     assert table.best("Missingno", "timid") is None
     assert table.lookup("Missingno", "timid") == ()
+
+
+def test_cosmetic_formes_alias_onto_their_base_species() -> None:
+    dex = _dex(
+        {
+            "id": "florges",
+            "name": "Florges",
+            "baseSpecies": "Florges",
+            "baseStats": _BASE_STATS,
+            "formeOrder": ["Florges", "Florges-Blue", "Florges-White"],
+        }
+    )
+    aliases = cosmetic_forme_aliases(dex)
+
+    # Colour variants carry no dex record of their own, so they inherit the base.
+    assert aliases["florgesblue"] == "florges"
+    assert aliases["florgeswhite"] == "florges"
+    assert "florges" not in aliases
+
+
+def test_formes_with_distinct_base_stats_are_never_aliased() -> None:
+    """Floette's forme list mixes cosmetic colours with genuinely separate Pokemon."""
+    eternal_stats = {"hp": 74, "atk": 65, "def": 67, "spa": 125, "spd": 128, "spe": 92}
+    dex = _dex(
+        {
+            "id": "floette",
+            "name": "Floette",
+            "baseSpecies": "Floette",
+            "baseStats": {"hp": 54, "atk": 45, "def": 47, "spa": 75, "spd": 98, "spe": 52},
+            "formeOrder": ["Floette", "Floette-Blue", "Floette-Eternal"],
+            "otherFormes": ["Floette-Eternal"],
+        },
+        {
+            "id": "floetteeternal",
+            "name": "Floette-Eternal",
+            "baseSpecies": "Floette",
+            "baseStats": eternal_stats,
+        },
+    )
+    aliases = cosmetic_forme_aliases(dex)
+
+    assert aliases["floetteblue"] == "floette", "cosmetic colour still folds"
+    assert "floetteeternal" not in aliases, "different base stats must stay separate"
+
+
+def test_aliases_resolve_in_one_hop_without_cycles() -> None:
+    """Variants that all list each other must converge on one canonical target."""
+    shared = dict(_BASE_STATS)
+    dex = _dex(
+        *(
+            {
+                "id": f"alcremie{flavour}",
+                "name": f"Alcremie-{flavour}",
+                "baseSpecies": "Alcremie",
+                "baseStats": shared,
+                "formeOrder": ["Alcremie-ruby", "Alcremie-matcha"],
+            }
+            for flavour in ("ruby", "matcha")
+        ),
+        {"id": "alcremie", "name": "Alcremie", "baseSpecies": "Alcremie", "baseStats": shared},
+    )
+    aliases = cosmetic_forme_aliases(dex)
+
+    assert aliases["alcremieruby"] == "alcremie"
+    assert aliases["alcremiematcha"] == "alcremie"
+    assert not [key for key, value in aliases.items() if value in aliases], "no alias chains"
+    assert not [key for key, value in aliases.items() if key == value], "no self references"
+
+
+def test_aliased_forme_shares_the_base_species_bucket() -> None:
+    dex = _dex(
+        {
+            "id": "florges",
+            "name": "Florges",
+            "baseSpecies": "Florges",
+            "baseStats": _BASE_STATS,
+            "formeOrder": ["Florges", "Florges-Blue"],
+        }
+    )
+    export = _chaos("Florges", {"Modest:32/0/20/12/2/0": 1.0})
+    table = load_spread_table(
+        build_spread_table(export, export, format_id=FORMAT.battle_format, dex=dex)
+    )
+
+    expected = StatPoints(hp=32, defense=20, spa=12, spd=2)
+    assert table.best("Florges", "modest") == expected
+    assert table.best("Florges-Blue", "modest") == expected
+
+    # The alias shares the base tuple rather than duplicating rows in the artifact.
+    assert table.lookup("Florges-Blue", "modest") is table.lookup("Florges", "modest")
+
+
+def _payload(spreads: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
+    return {
+        "schema": SPREAD_USAGE_SCHEMA,
+        "format_id": FORMAT.battle_format,
+        "weight_scale": 1_000_000,
+        "aliases": aliases or {},
+        "spreads": spreads,
+    }
+
+
+_ONE_BUCKET = {"real": {"timid": [[2, 0, 0, 32, 0, 32, 1000]]}}
+
+
+def test_load_rejects_bucket_that_is_not_weight_descending() -> None:
+    """best() takes entry zero as the argmax, so unsorted rows would answer wrongly."""
+    unsorted_rows = {"real": {"timid": [[32, 0, 0, 32, 0, 2, 100], [2, 0, 0, 32, 0, 32, 900]]}}
+    with pytest.raises(ValueError, match="weight-descending"):
+        load_spread_table(_payload(unsorted_rows))
+
+
+def test_load_rejects_unresolvable_aliases() -> None:
+    # An alias whose target is itself an alias expands against nothing, and one whose
+    # target does not exist expands to nothing; both would serve empty lookups.
+    with pytest.raises(ValueError, match="unknown species"):
+        load_spread_table(_payload(_ONE_BUCKET, {"ghost": "missing"}))
+    with pytest.raises(ValueError, match="unknown species|through another alias"):
+        load_spread_table(_payload(_ONE_BUCKET, {"first": "second", "second": "real"}))
+
+
+def test_load_accepts_a_single_hop_alias() -> None:
+    table = load_spread_table(_payload(_ONE_BUCKET, {"cosmetic": "real"}))
+    assert table.best("cosmetic", "timid") == table.best("real", "timid")

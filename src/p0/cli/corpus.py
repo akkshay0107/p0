@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -18,13 +19,16 @@ from p0.teams.corpus_build import (
     build_corpus,
     populate_pool_directories,
 )
-from p0.teams.stat_points import (
-    BaseStats,
-    StatPoints,
-    select_candidate,
-)
+from p0.teams.spread_usage import load_spread_table_file
+from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord, normalize_id
 from p0.teams.validation import validate_many
+
+# Fixed so repeated corpus builds from the same export are byte-identical.
+CORPUS_SPREAD_SEED = 0
+
+# Last resort when a member has neither a usage prior nor enough moves to fall back.
+DEFAULT_SPREAD = StatPoints(hp=2, spa=32, spe=32)
 
 
 def _variants_from_showdown(
@@ -63,16 +67,8 @@ def _variants_from_showdown(
             f"Showdown text parsed into {len(members)} members, expected {len(unique_teams) * 6}"
         )
 
-    species_by_id = (
-        {
-            normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): entry
-            for entry in dex.get("species", ())
-            if isinstance(entry, Mapping)
-        }
-        if isinstance(dex, Mapping)
-        else {}
-    )
-
+    # Only move categories are needed from the dex now: spreads come from the usage
+    # table as Stat Points, so base stats are never converted into stats here.
     move_categories = (
         {
             normalize_id(str(entry.get("id", entry.get("name", "")))).casefold(): str(
@@ -107,37 +103,29 @@ def _variants_from_showdown(
         else:
             canonical_dict[team.team_hash] = (team, usage)
 
+    # Corpus teams sample the usage priors rather than taking the argmax, so generated
+    # teams carry the meta's real spread variety. Seeded so builds stay reproducible.
+    rng = random.Random(CORPUS_SPREAD_SEED)
+    table = load_spread_table_file()
+
     variants: list[TeamRecord] = []
     for team, usage in canonical_dict.values():
         spreads_list: list[StatPoints] = []
         for m in team.members:
-            species_entry = species_by_id.get(normalize_id(m.species).casefold())
-            base_mapping = (
-                species_entry.get("baseStats") if isinstance(species_entry, Mapping) else None
+            categories = tuple(
+                move_categories.get(normalize_id(move).casefold(), "") for move in m.moves
             )
-            if isinstance(base_mapping, Mapping):
-                try:
-                    moves = m.moves
-                    categories = tuple(
-                        move_categories.get(normalize_id(move).casefold(), "") for move in moves
-                    )
-                    base_stats = BaseStats.from_mapping(base_mapping)
-                    candidate = select_candidate(
-                        nature=m.nature or "serious",
-                        moves=moves,
-                        move_categories=categories,
-                        item=m.item,
-                        ability=m.ability,
-                        base_stats=base_stats,
-                        seed=0,
-                    )
-                    spreads_list.append(candidate.points)
-                    continue
-                except (TypeError, ValueError) as exc:
-                    logging.getLogger(__name__).warning(
-                        "Failed to impute stats for %s: %s", m.species, exc
-                    )
-            spreads_list.append(StatPoints(hp=2, spa=32, spe=32))
+            estimate = table.sample(m.species, m.nature or "serious", categories, rng)
+            if estimate is None:
+                # Every team member must carry a playable spread, so unlike the
+                # observation path this cannot resolve to UNKNOWN. Reached only when
+                # an export lists fewer than two moves of any one category.
+                logging.getLogger(__name__).warning(
+                    "No spread prior or fallback for %s; using the default spread", m.species
+                )
+                spreads_list.append(DEFAULT_SPREAD)
+                continue
+            spreads_list.append(estimate.points)
 
         spreads = tuple(spreads_list)
         # Archetype tagging is unwired pending a team-sheet tagger. Roles derived from

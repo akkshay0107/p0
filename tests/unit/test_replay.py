@@ -49,6 +49,7 @@ from p0.replays.scrape import (
     read_fetch_index,
 )
 from p0.replays.shards import load_shard_manifest
+from p0.teams.stat_points import BaseStats, StatPoints, calculate_stats
 from tests.stress.replay_fixtures import golden_replay_payload
 
 
@@ -375,7 +376,7 @@ def test_link_extraction_is_same_format_and_model_agnostic() -> None:
     ) == ("gen9championsvgc2026regmbbo3-101",)
 
 
-def test_packed_open_team_sheet_and_seeded_imputation() -> None:
+def test_packed_open_team_sheet_imputation_is_deterministic() -> None:
     payload = _payload_replay_pipeline("packed")
     payload["log"] = "\n".join(
         [
@@ -409,9 +410,17 @@ def test_packed_open_team_sheet_and_seeded_imputation() -> None:
             {"id": "tackle", "category": "Physical"},
         ],
     }
-    first = impute_stat_points(document, dex=dex, seed=7)
-    second = impute_stat_points(document, dex=dex, seed=7)
-    assert first == second and all(item.provenance == "IMPUTED" for item in first)
+    first = impute_stat_points(document, dex=dex)
+    second = impute_stat_points(document, dex=dex)
+    assert first == second
+
+    # Pikachu is covered by the usage priors; Bulbasaur is not, and its sheet reveals
+    # only one physical and one status move, so no fallback category reaches two.
+    by_species = {item.species: item for item in first}
+    assert by_species["Pikachu"].provenance == "IMPUTED"
+    assert by_species["Pikachu"].confidence > 0.0
+    assert by_species["Bulbasaur"].provenance == "UNKNOWN"
+    assert by_species["Bulbasaur"].precomputed is None
 
 
 def test_new_schema_records_round_trip() -> None:
@@ -846,14 +855,27 @@ def test_imputation_uses_base_form_stats_for_missing_form_entry() -> None:
                 },
             }
         ],
-        "moves": [],
+        # Two status moves so the category fallback resolves, letting the assertion
+        # below reach the stat computation that consumes the base form's baseStats.
+        "moves": [
+            {"id": "protect", "category": "Status"},
+            {"id": "tackle", "category": "Status"},
+        ],
     }
 
-    estimate = impute_stat_points(document, dex=dex, seed=0)[0]
+    estimate = impute_stat_points(document, dex=dex)[0]
 
     assert estimate.species == "Florges-Blue"
     assert estimate.provenance == "IMPUTED"
     assert estimate.precomputed is not None
+
+    # Florges-Blue has no usage bucket of its own, so this is the fallback shape
+    # scaled by the base form's stats rather than a usage-backed spread.
+    assert estimate.points == StatPoints(hp=32, defense=17, spd=17)
+    expected = calculate_stats(
+        BaseStats.from_mapping(dex["species"][0]["baseStats"]), estimate.points, "serious", 50
+    )
+    assert estimate.precomputed == expected
 
 
 def test_reconstruction_does_not_share_active_illusion_alias_state() -> None:

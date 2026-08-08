@@ -20,6 +20,7 @@ from p0.teams.spread_usage import (
 
 ROOT = DEFAULT_PATHS.repository_root
 DEFAULT_USAGE_DIR = ROOT / "data" / "raw" / "usage"
+DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
 DEFAULT_OUTPUT = ROOT / "data" / "spread_usage.json"
 DEFAULT_CUTOFF = 1760
 
@@ -39,6 +40,7 @@ def _read_chaos(path: Path) -> dict[str, Any]:
 def build(
     bo1_path: Path,
     bo3_path: Path,
+    dex_path: Path,
     output_path: Path,
     max_spreads: int,
     min_nature_share: float,
@@ -48,6 +50,7 @@ def build(
         _read_chaos(bo1_path),
         _read_chaos(bo3_path),
         format_id=FORMAT.battle_format,
+        dex=_read_chaos(dex_path),
         max_spreads=max_spreads,
         min_nature_share=min_nature_share,
     )
@@ -64,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--usage-dir", type=Path, default=DEFAULT_USAGE_DIR)
     parser.add_argument("--cutoff", type=int, default=DEFAULT_CUTOFF)
+    parser.add_argument("--dex", type=Path, default=DEFAULT_DEX)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--max-spreads", type=int, default=MAX_SPREADS_PER_BUCKET)
     parser.add_argument("--min-nature-share", type=float, default=MIN_NATURE_SHARE)
@@ -72,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     payload = build(
         args.usage_dir / f"{FORMAT.battle_format}-{args.cutoff}.json",
         args.usage_dir / f"{FORMAT.bo3_format}-{args.cutoff}.json",
+        args.dex,
         args.out,
         args.max_spreads,
         args.min_nature_share,

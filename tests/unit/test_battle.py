@@ -113,15 +113,12 @@ from p0.runtime.poke_env_action_adapter import (
     single_order_to_action,
 )
 from p0.runtime.poke_env_battle_adapter import battle_view, current_battle_view, decision_view
+from p0.teams.spread_usage import IMPUTED_FROM_FALLBACK, IMPUTED_FROM_USAGE, load_spread_table_file
 from p0.teams.stat_points import (
     BaseStats,
-    Role,
     StatPoints,
     calculate_stats,
-    classify_role,
-    impute_candidates,
-    imputed_stats,
-    select_candidate,
+    fallback_points,
 )
 
 
@@ -1298,8 +1295,6 @@ def test_stat_resolution_provenance_and_cache_behavior():
     assert values == (0.0,) * 6
     assert provenance == Provenance.UNKNOWN
 
-    import typing
-
     expected = typing.cast(tuple[int, int, int, int, int, int], tuple((155, 93, 98, 177, 105, 152)))
     values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
     assert values == tuple(float(value) for value in expected)
@@ -1558,55 +1553,60 @@ def test_stat_point_validation(points, error):
         StatPoints(**points)
 
 
-def _input(*, moves=("Heat Wave", "Protect"), categories=("special", "status"), nature="modest"):
-    return typing.cast(
-        dict[str, typing.Any],
-        dict(
-            nature=nature,
-            item="charizarditey",
-            ability="blaze",
-            moves=moves,
-            move_categories=categories,
-            base_stats=CHARIZARD,
-        ),
-    )
+def test_fallback_follows_move_category_priority() -> None:
+    physical = StatPoints(hp=32, atk=32, spe=2)
+    special = StatPoints(hp=32, spa=32, spe=2)
+    status = StatPoints(hp=32, defense=17, spd=17)
+
+    assert fallback_points(("physical", "physical", "status", "status")) == physical
+    assert fallback_points(("special", "special", "status", "status")) == special
+    assert fallback_points(("status", "status", "special", "physical")) == status
+
+    # Physical wins a tie with special regardless of which stat the species favours.
+    assert fallback_points(("physical", "physical", "special", "special")) == physical
+
+    # Every shape spends the full budget and stays legal.
+    for categories in (("physical",) * 2, ("special",) * 2, ("status",) * 2):
+        points = fallback_points(categories)
+        assert points is not None
+        assert sum(points.as_tuple()) == 66
 
 
-def test_imputer_is_legal_deterministic_and_role_sensitive():
-    value = _input()
-    assert classify_role(value["nature"], value["moves"], value["move_categories"]) == Role.SPECIAL
-    assert impute_candidates(**value) == impute_candidates(**value)
-    assert impute_candidates(**value)[0].points == StatPoints(hp=2, spa=32, spe=32)
-    assert all(sum(candidate.points.as_tuple()) <= 66 for candidate in impute_candidates(**value))
-    assert select_candidate(seed=7, **value) == select_candidate(seed=7, **value)
+def test_fallback_is_unknown_when_no_category_reaches_two() -> None:
+    # Four moves across three categories always leave one category with two, so this
+    # is only reachable when fewer than four moves are known.
+    assert fallback_points(("physical", "special", "status")) is None
+    assert fallback_points(()) is None
+    assert fallback_points(("physical",)) is None
 
 
-def test_imputed_level_stats_are_cached_by_static_team_facts():
-    value = _input()
-    imputed_stats.cache_clear()
-    first = imputed_stats(**value)
-    second = imputed_stats(**value)
+def test_usage_prior_beats_fallback_and_reports_confidence() -> None:
+    table = load_spread_table_file()
+    categories = ("physical", "status", "physical", "status")
+
+    covered = table.resolve("Incineroar", "Impish", categories)
+    assert covered is not None
+    assert covered.origin == IMPUTED_FROM_USAGE
+    assert 0.0 < covered.confidence <= 1.0
+    assert sum(covered.points.as_tuple()) <= 66
+
+    # The prior is consulted before the fallback, so a covered species must not
+    # collapse onto the generic physical shape.
+    assert covered.points != StatPoints(hp=32, atk=32, spe=2)
+
+    uncovered = table.resolve("Missingno", "Impish", categories)
+    assert uncovered is not None
+    assert uncovered.origin == IMPUTED_FROM_FALLBACK
+    assert uncovered.confidence == 0.0
+    assert uncovered.points == StatPoints(hp=32, atk=32, spe=2)
+
+
+def test_usage_prior_resolution_is_deterministic() -> None:
+    table = load_spread_table_file()
+    categories = ("special", "status", "special", "status")
+    first = table.resolve("Charizard-Mega-Y", "Timid", categories)
+    second = table.resolve("Charizard-Mega-Y", "Timid", categories)
     assert first == second
-    assert imputed_stats.cache_info().hits == 1
-
-
-def test_trick_room_and_support_shapes_do_not_assume_fast_offense():
-    trick_room = _input(
-        moves=("Trick Room", "Heat Wave"),
-        categories=("status", "special"),
-        nature="quiet",
-    )
-    support = _input(moves=("Protect", "Follow Me"), categories=("status", "status"), nature="calm")
-    assert (
-        classify_role(trick_room["nature"], trick_room["moves"], trick_room["move_categories"])
-        == Role.TRICK_ROOM
-    )
-    assert impute_candidates(**trick_room)[0].points.spe == 0
-    assert (
-        classify_role(support["nature"], support["moves"], support["move_categories"])
-        == Role.SUPPORT
-    )
-    assert impute_candidates(**support)[0].points == StatPoints(hp=32, defense=17, spd=17)
 
 
 def _struggle_battle(move_id: str, can_mega: bool) -> DoubleBattle:

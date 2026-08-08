@@ -1,10 +1,15 @@
-"""Champions Stat Point calculation and deterministic spread imputation."""
+"""Champions Stat Point arithmetic and the spread fallback used without usage data.
+
+Stat Point spreads are hidden in Champions, so opponent stats are always estimated.
+Empirical priors live in p0.teams.spread_usage; this module owns the level-clause
+stat arithmetic those priors feed, plus the move-category fallback used for species
+the usage exports do not cover.
+"""
 
 from __future__ import annotations
 
-import random
+from collections import Counter
 from dataclasses import dataclass
-from enum import StrEnum
 from functools import lru_cache
 from typing import Mapping, NamedTuple
 
@@ -124,200 +129,33 @@ def calculate_stats(
     return tuple(result)  # type: ignore[return-value]
 
 
-class Role(StrEnum):
-    PHYSICAL = "physical-attacker"
-    SPECIAL = "special-attacker"
-    MIXED = "mixed-attacker"
-    SPEED_CONTROL = "speed-control"
-    TRICK_ROOM = "trick-room"
-    SUPPORT = "support"
-    BULKY_SETUP = "bulky-setup"
+MOVE_CATEGORY_PHYSICAL = "physical"
+MOVE_CATEGORY_SPECIAL = "special"
+MOVE_CATEGORY_STATUS = "status"
+
+# Both fallback shapes spend the full 66-point budget.
+_FALLBACK_PHYSICAL = StatPoints(hp=32, atk=32, spe=2)
+_FALLBACK_SPECIAL = StatPoints(hp=32, spa=32, spe=2)
+_FALLBACK_STATUS = StatPoints(hp=32, defense=17, spd=17)
 
 
-class SpreadCandidate(NamedTuple):
-    points: StatPoints
-    weight: int
-    role: Role
+def fallback_points(move_categories: tuple[str, ...]) -> StatPoints | None:
+    """Guess a spread from move categories alone, for species with no usage data.
 
+    Categories are tested in a fixed physical, special, status order rather than by
+    base stat, so the result depends only on the moves and never on the species.
 
-_SPEED_CONTROL = frozenset({"tailwind", "icywind", "electroweb", "trickroom"})
-_SUPPORT = frozenset(
-    {
-        "protect",
-        "detect",
-        "wideguard",
-        "fakeout",
-        "followme",
-        "ragepowder",
-        "helpinghand",
-        "spore",
-        "willowisp",
-        "recover",
-        "roost",
-        "slackoff",
-    }
-)
-_SETUP = frozenset({"calmmind", "bulkup", "coil", "curse", "irondefense", "nastyplot"})
-_RECOVERY = frozenset({"recover", "roost", "slackoff", "synthesis", "moonlight", "softboiled"})
-_PRIORITY = frozenset(
-    {"aquajet", "bulletpunch", "extremespeed", "fakeout", "iceshard", "suckerpunch"}
-)
-_SPEED_ABILITIES = frozenset({"chlorophyll", "sandrush", "swiftswim", "surgesurfer"})
-_OFFENSE_ITEMS = frozenset({"choiceband", "choicespecs", "lifeorb"})
+    Returns None when no category reaches two moves, which happens only when fewer
+    than four moves are known: four moves across three categories always leave one
+    category with at least two. Callers treat None as an explicit UNKNOWN rather
+    than substituting a blind guess.
+    """
+    counts = Counter(category.lower() for category in move_categories)
 
-
-def _normalized_id(value: str) -> str:
-    return "".join(char for char in value.lower() if char.isalnum())
-
-
-def classify_role(nature: str, moves: tuple[str, ...], move_categories: tuple[str, ...]) -> Role:
-    nature_lower = nature.lower()
-    moves_set = {_normalized_id(move) for move in moves}
-    physical = sum(category.lower() == "physical" for category in move_categories)
-    special = sum(category.lower() == "special" for category in move_categories)
-
-    if "trickroom" in moves_set or nature_lower in {"brave", "quiet", "relaxed", "sassy"}:
-        return Role.TRICK_ROOM
-
-    if moves_set & _SPEED_CONTROL:
-        return Role.SPEED_CONTROL
-
-    if moves_set & _SETUP:
-        return Role.BULKY_SETUP
-
-    if len(moves_set & _SUPPORT) >= 2 and physical + special <= 1:
-        return Role.SUPPORT
-
-    if physical and special:
-        return Role.MIXED
-
-    if physical:
-        return Role.PHYSICAL
-
-    if special:
-        return Role.SPECIAL
-
-    return Role.SUPPORT
-
-
-def _candidate_weight(
-    nature: str,
-    moves: tuple[str, ...],
-    item: str,
-    ability: str,
-    base_stats: BaseStats,
-    points: StatPoints,
-    role: Role,
-    base_weight: int,
-) -> int:
-    allocation = points.as_dict()
-    moves_set = {_normalized_id(move) for move in moves}
-    item_norm = _normalized_id(item)
-    ability_norm = _normalized_id(ability)
-    boosted = NATURE_IMPACTS.get(nature.lower(), ("", ""))[0]
-    score = base_weight + allocation.get(boosted, 0)
-
-    if item_norm in _OFFENSE_ITEMS:
-        score += max(allocation["atk"], allocation["spa"])
-
-    if ability_norm in _SPEED_ABILITIES:
-        score += allocation["spe"]
-
-    if moves_set & _PRIORITY:
-        score += allocation["hp"] // 2
-
-    if moves_set & _RECOVERY or role in {Role.SUPPORT, Role.BULKY_SETUP}:
-        score += (allocation["hp"] + allocation["def"] + allocation["spd"]) // 3
-
-    if role == Role.TRICK_ROOM:
-        score += STAT_POINT_LIMIT - allocation["spe"]
-
-    defense_total = base_stats.defense + base_stats.spd
-    offense_total = base_stats.atk + base_stats.spa
-
-    if defense_total > offense_total:
-        score += allocation["hp"] // 2
-
-    return max(1, score)
-
-
-def _spread(**points: int) -> StatPoints:
-    """Construct a StatPoints value using Showdown's ``def`` spelling."""
-    fields = {"def": "defense"}
-    return StatPoints(**{fields.get(key, key): amount for key, amount in points.items()})
-
-
-def impute_candidates(
-    nature: str,
-    moves: tuple[str, ...],
-    move_categories: tuple[str, ...],
-    item: str,
-    ability: str,
-    base_stats: BaseStats,
-) -> tuple[SpreadCandidate, ...]:
-    """Return a small deterministic set of legal, weighted candidate spreads."""
-    role = classify_role(nature, moves, move_categories)
-    attack = "atk" if base_stats.atk >= base_stats.spa else "spa"
-    if role == Role.PHYSICAL:
-        attack = "atk"
-    elif role == Role.SPECIAL:
-        attack = "spa"
-
-    if role == Role.TRICK_ROOM:
-        shapes = (
-            (_spread(hp=32, **{attack: 32}, defense=2), 100),
-            (_spread(hp=32, defense=17, spd=17), 55),
-        )
-    elif role in {Role.SUPPORT, Role.SPEED_CONTROL, Role.BULKY_SETUP}:
-        shapes = (
-            (_spread(hp=32, defense=17, spd=17), 100),
-            (_spread(hp=32, spe=32, defense=2), 65),
-        )
-    elif role == Role.MIXED:
-        shapes = (
-            (_spread(atk=32, spa=32, hp=2), 100),
-            (_spread(hp=32, atk=17, spa=17), 60),
-        )
-    else:
-        shapes = (
-            (_spread(**{attack: 32}, spe=32, hp=2), 100),
-            (_spread(hp=32, **{attack: 32}, defense=2), 55),
-        )
-    return tuple(
-        SpreadCandidate(
-            points,
-            _candidate_weight(nature, moves, item, ability, base_stats, points, role, weight),
-            role,
-        )
-        for points, weight in shapes
-    )
-
-
-def select_candidate(
-    nature: str,
-    moves: tuple[str, ...],
-    move_categories: tuple[str, ...],
-    item: str,
-    ability: str,
-    base_stats: BaseStats,
-    seed: int | None = None,
-) -> SpreadCandidate:
-    candidates = impute_candidates(nature, moves, move_categories, item, ability, base_stats)
-    if seed is None:
-        return candidates[0]
-    weights = [item.weight for item in candidates]
-    return random.Random(seed).choices(candidates, weights=weights, k=1)[0]
-
-
-@lru_cache(maxsize=8192)
-def imputed_stats(
-    nature: str,
-    moves: tuple[str, ...],
-    move_categories: tuple[str, ...],
-    item: str,
-    ability: str,
-    base_stats: BaseStats,
-    level: int = 50,
-) -> tuple[int, int, int, int, int, int]:
-    candidate = select_candidate(nature, moves, move_categories, item, ability, base_stats)
-    return calculate_stats(base_stats, candidate.points, nature, level)
+    if counts[MOVE_CATEGORY_PHYSICAL] >= 2:
+        return _FALLBACK_PHYSICAL
+    if counts[MOVE_CATEGORY_SPECIAL] >= 2:
+        return _FALLBACK_SPECIAL
+    if counts[MOVE_CATEGORY_STATUS] >= 2:
+        return _FALLBACK_STATUS
+    return None

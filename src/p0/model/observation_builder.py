@@ -47,7 +47,11 @@ from p0.model.structured_observation import (
     effect_num_slice,
 )
 from p0.model.tokenizer import PokemonTokenizer
-from p0.teams.stat_points import BaseStats, imputed_stats
+from p0.teams.spread_usage import load_spread_table_file
+from p0.teams.stat_points import BaseStats, calculate_stats
+
+# The format's level clause pins every Pokemon to level 50.
+FORMAT_LEVEL = 50
 
 _DEFAULT_RESOURCES = default_runtime_resources()
 _MEGA_ITEMS = _DEFAULT_RESOURCES.mega_items
@@ -244,17 +248,25 @@ def _slot_condition(
     return 2 if mon in selected_allies else -1
 
 
-def _imputation_input(pokemon: PokemonView) -> dict | None:
-    if not pokemon.species or not pokemon.nature or len(pokemon.moves) != MOVE_SLOTS:
+def _imputed_stats(pokemon: PokemonView) -> tuple[int, int, int, int, int, int] | None:
+    """Estimate level-50 stats from the usage priors, or None when unrecoverable.
+
+    Only the species and nature are required: the usage prior is keyed on those, and
+    move categories matter solely for the fallback used on uncovered species. A
+    partially revealed opponent therefore still gets a usage-backed estimate.
+    """
+    species = pokemon.species
+    nature = pokemon.nature
+    if not species or not nature:
         return None
-    moves = tuple(pokemon.moves.values())
-    return dict(
-        nature=str(pokemon.nature).lower(),
-        item=PokemonTokenizer.normalize_id(pokemon.item or ""),
-        ability=PokemonTokenizer.normalize_id(pokemon.ability or ""),
-        moves=tuple(move.id for move in moves),
-        move_categories=tuple(move.category.name.lower() for move in moves),
-        base_stats=BaseStats.from_mapping(pokemon.base_stats),
+
+    categories = tuple(move.category.name.lower() for move in pokemon.moves.values())
+    estimate = load_spread_table_file().resolve(species, str(nature), categories)
+    if estimate is None:
+        return None
+
+    return calculate_stats(
+        BaseStats.from_mapping(pokemon.base_stats), estimate.points, str(nature), FORMAT_LEVEL
     )
 
 
@@ -264,10 +276,9 @@ def _cached_imputed_stats(
     result = cache.get(pokemon)
     if result is not None:
         return result
-    value = _imputation_input(pokemon)
-    if value is None:
+    result = _imputed_stats(pokemon)
+    if result is None:
         return None
-    result = imputed_stats(**value)
     cache[pokemon] = result
     return result
 
