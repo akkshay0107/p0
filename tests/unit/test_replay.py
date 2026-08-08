@@ -9,8 +9,16 @@ import torch
 from p0.battle.actions import PASS_ACTION
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, load_active_runtime_manifest
+from p0.model.observation_builder import ObservationBuilder
+from p0.model.resources import default_runtime_resources
+from p0.paths import DEFAULT_PATHS
 from p0.replays import compile as compile_module
-from p0.replays.compile import compile_payloads, write_tensor_shards
+from p0.replays.compile import (
+    CompilationResult,
+    _perspective_tensors,
+    compile_payloads,
+    write_tensor_shards,
+)
 from p0.replays.dataset import (
     LazyReplayDataset,
     SeriesSplitManifest,
@@ -1555,3 +1563,65 @@ def test_reconstructed_views_carry_the_opponent_open_team_sheet_nature() -> None
     # Our own team's nature is never attached to live battle Pokemon, so a replay
     # must not invent one or reconstructed tensors would diverge from live capture.
     assert own == {None}
+
+
+def _payload_with_ots_natures(replay_id: str) -> dict[str, object]:
+    """A pipeline payload whose open team sheets declare natures, as real replays do."""
+    natures = {"Pikachu": "Jolly", "Eevee": "Adamant", "Bulbasaur": "Bold", "Charmander": "Timid"}
+    payload = _payload_replay_pipeline(replay_id)
+    lines = []
+    for line in str(payload["log"]).splitlines():
+        if line.startswith("|showteam|"):
+            head, _, body = line.rpartition("|")
+            roster = json.loads(body)
+            for mon in roster:
+                mon["nature"] = natures[mon["species"]]
+            line = f"{head}|{json.dumps(roster, separators=(',', ':'))}"
+        lines.append(line)
+    payload["log"] = "\n".join(lines)
+    return payload
+
+
+def _numerical_rows(result: CompilationResult) -> list[tuple[float, ...]]:
+    builder = ObservationBuilder(default_runtime_resources())
+    rows: list[tuple[float, ...]] = []
+    for game in result.games:
+        for perspective in game.perspectives:
+            fields, _ = _perspective_tensors(
+                game, perspective, builder=builder, stat_estimates=game.stat_estimates
+            )
+            for step in fields["numerical"]:
+                rows.extend(tuple(token) for token in step)
+    return rows
+
+
+def test_dex_adds_imputation_metrics_without_changing_tensors() -> None:
+    """Supplying a dex must buy diagnostics, not a different training signal.
+
+    The estimates and the observation builder consult the same spread table, so the
+    opponent stats they produce agree. Anything else would mean replay tensors drift
+    from what the same battle produces live.
+    """
+    dex = json.loads((DEFAULT_PATHS.data_root / "champions_dex.json").read_text(encoding="utf-8"))
+    without = compile_payloads((_payload_with_ots_natures("metrics-off"),))
+    with_dex = compile_payloads((_payload_with_ots_natures("metrics-on"),), dex=dex)
+
+    assert _numerical_rows(without) == _numerical_rows(with_dex)
+
+    assert without.metrics.counters.get("imputations", 0) == 0
+    assert with_dex.metrics.counters["imputations"] > 0
+    assert with_dex.metrics.counters["imputation_confidence_sum"] > 0.0
+
+
+def test_our_own_stats_are_never_overridden_by_estimates() -> None:
+    """Live reads our own exact stats from the request, so replays must not impute them."""
+    dex = json.loads((DEFAULT_PATHS.data_root / "champions_dex.json").read_text(encoding="utf-8"))
+    result = compile_payloads((_payload_with_ots_natures("own-side"),), dex=dex)
+    assert result.games
+
+    # Estimates cover both sides, but only the opponent's may reach the observation.
+    for game in result.games:
+        assert {estimate.side for estimate in game.stat_estimates} == {0, 1}
+        for perspective in game.perspectives:
+            snapshot = perspective.snapshots[0]
+            assert all(mon.nature is None for mon in snapshot.view.team.values())

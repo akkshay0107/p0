@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, FORMAT
+from p0.paths import DEFAULT_PATHS
 from p0.replays.compile import compile_to_shards
 from p0.replays.dataset import assign_series_splits, write_split_manifest
 from p0.replays.group import group_replays
@@ -38,6 +39,12 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--max-candidates", type=int, default=256)
     build.add_argument("--max-decisions-per-shard", type=int, default=4096)
     build.add_argument("--runtime-manifest", type=Path, default=DEFAULT_RUNTIME_MANIFEST)
+    build.add_argument(
+        "--dex",
+        type=Path,
+        default=DEFAULT_PATHS.data_root / "champions_dex.json",
+        help="Champions dex supplying base stats and move categories for stat imputation.",
+    )
     build.add_argument(
         "--max-parse-errors",
         type=int,
@@ -128,10 +135,18 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
             f"({args.max_parse_errors}): {tuple(parse_errors)}"
         )
 
+    # Required rather than optional: without it every open-team-sheet member
+    # compiles with no spread estimate, which shows up as a silently unimputed
+    # corpus rather than as an error.
+    if not args.dex.is_file():
+        raise FileNotFoundError(f"Champions dex not found: {args.dex}")
+    dex = json.loads(args.dex.read_text(encoding="utf-8"))
+
     built = compile_to_shards(
         documents=documents,
         output_dir=args.output_dir,
         format_id=FORMAT.bo3_format,
+        dex=dex,
         max_candidates=args.max_candidates,
         max_decisions_per_shard=args.max_decisions_per_shard,
         manifest_path=args.runtime_manifest,

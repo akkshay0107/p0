@@ -224,13 +224,15 @@ def _perspective_tensors(
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
         snapshot.view.stat_cache = {}
         overrides = {}
-        for side, team in ((0, snapshot.view.team), (1, snapshot.view.opponent_team)):
-            for pokemon in team.values():
-                precomputed = estimates.get(
-                    (side if perspective.player == 0 else 1 - side, _normalized(pokemon.species))
-                )
-                if precomputed is not None:
-                    overrides[pokemon] = precomputed
+        # Only the opponent is overridden. Live battles read our own exact stats from
+        # the request message and mark them SELF_KNOWN, so imputing our own side here
+        # would train the model on estimates for stats it can trust at inference.
+        # Public replays cannot recover those exact stats either way.
+        opponent_side = 1 if perspective.player == 0 else 0
+        for pokemon in snapshot.view.opponent_team.values():
+            precomputed = estimates.get((opponent_side, _normalized(pokemon.species)))
+            if precomputed is not None:
+                overrides[pokemon] = precomputed
         # ReconstructedSnapshot.events is the request-scoped event window.
         # Keep the handoff explicit so observations cannot silently fall back
         # to FixtureBattleView's default empty event list.
