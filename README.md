@@ -149,12 +149,21 @@ For a default-sized run:
 
     uv run python bench/benchmark_reducer_depth.py --dtype float32 --seed 7 --warmup 2 --iterations 5 --repeats 5 --batch-size 2 --time-steps 4 --deep-reducer-layers 3
 
-`data/runtime_manifest.json` contains one human-readable, load-breaking runtime contract.
-Checkpoints reference its `runtime_contract_sha256`. Vocabulary, action-layout, tensor-ABI,
-or resource-feature-ABI changes require a new checkpoint or an explicit transfer tool.
-Dex balance/learnset changes and Showdown revisions are recorded as mechanics provenance;
-they do not prevent an existing policy from loading and continuing training. Old checkpoint
-dictionaries containing `runtime_manifest_sha256` are intentionally unsupported.
+`data/runtime_manifest.json` is the sole runtime contract. It contains versioned major/minor
+identities for actions, model layout, resources, replays, checkpoints, and team corpora. Every
+major identity contributes to `global_sha256`; a breaking change must update that subsystem's
+major payload, increment its major version, reset its minor version, and therefore change the
+global hash. A nonbreaking change increments only the subsystem's minor version and updates its
+minor payload and hash.
+
+Generated replay, split, and corpus artifacts reference `global_contract_sha256`. Checkpoints
+also embed an immutable global-contract snapshot: a major mismatch fails before training setup,
+while a minor mismatch is logged as a warning. Vocabulary and dex identities are validated when the
+active global contract is loaded. Legacy artifacts and checkpoints using the former runtime-contract
+reference are intentionally unsupported; rebuild generated artifacts from this clean slate.
+
+The standalone artifact verification command is intentionally deferred until checkpoint, model,
+replay-shard, dataset, and resource verification can share one interface.
 
 ## Development verification
 
