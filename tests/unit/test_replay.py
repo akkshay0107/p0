@@ -1519,3 +1519,39 @@ def test_replay_fetcher_recovers_corrupt_raw_cache_and_rejects_bad_index(tmp_pat
     fetcher.index_path.write_bytes(b"not-json\n")
     with pytest.raises((ValueError, ReplayFetchError)):
         read_fetch_index(fetcher.index_path)
+
+
+def test_reconstructed_views_carry_the_opponent_open_team_sheet_nature() -> None:
+    """Stat imputation keys on nature, and only the opponent's is available live."""
+    payload = _payload_replay_pipeline("ots-nature")
+    natures = {"Pikachu": "Jolly", "Eevee": "Adamant", "Bulbasaur": "Bold", "Charmander": "Timid"}
+
+    lines = []
+    for line in str(payload["log"]).splitlines():
+        if line.startswith("|showteam|"):
+            head, _, body = line.rpartition("|")
+            roster = json.loads(body)
+            for mon in roster:
+                mon["nature"] = natures[mon["species"]]
+            line = f"{head}|{json.dumps(roster, separators=(',', ':'))}"
+        lines.append(line)
+    payload["log"] = "\n".join(lines)
+
+    result = compile_payloads((payload,))
+    assert result.games
+
+    own: set[str | None] = set()
+    opponent: set[str | None] = set()
+    for game in result.games:
+        for perspective in game.perspectives:
+            for snapshot in perspective.snapshots:
+                own.update(mon.nature for mon in snapshot.view.team.values())
+                opponent.update(mon.nature for mon in snapshot.view.opponent_team.values())
+
+    # The opponent's sheet is what |showteam| delivers live, so it must survive here.
+    assert opponent and None not in opponent
+    assert opponent <= set(natures.values())
+
+    # Our own team's nature is never attached to live battle Pokemon, so a replay
+    # must not invent one or reconstructed tensors would diverge from live capture.
+    assert own == {None}

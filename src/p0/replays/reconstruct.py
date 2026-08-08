@@ -670,6 +670,14 @@ class _ReplayState:
                 )
                 ability = str(details.get("ability", "")) or None
                 item = str(details.get("item", "")) or None
+                # Live battles only ever receive the opponent's sheet: poke-env skips
+                # our own role when handling |showteam| and does not attach the team we
+                # submitted to our battle Pokemon. Mirroring that asymmetry keeps replay
+                # tensors byte-identical to live ones, which the reconstruction stress
+                # test asserts. Our own stats are exact anyway, so nothing is lost.
+                nature = (
+                    str(details.get("nature", "")) or None if side != knowledge.player else None
+                )
                 pokemon = _make_replay_pokemon(
                     species=species,
                     species_data_index=self.species_data_index,
@@ -681,10 +689,11 @@ class _ReplayState:
                     ),
                     ability=ability,
                     item=item,
-                    # poke-env's OTS parser does not expose nature on its
-                    # Pokemon objects. Matching that runtime contract avoids a
-                    # replay-only feature unavailable during live inference.
-                    nature=None,
+                    # The team sheet reveals nature, and the poke_env_patches nature
+                    # fix makes it available on live Pokemon objects too, so carrying
+                    # it here keeps replay and live views on the same contract rather
+                    # than leaving stat imputation blind on one of them.
+                    nature=nature,
                 )
                 pokemon = replace(
                     pokemon,

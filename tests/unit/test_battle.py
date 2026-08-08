@@ -2067,3 +2067,42 @@ def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
     assert unknown.numerical[TOKEN_IDX_ALLY_SIDE, gates].tolist() == [1.0, 1.0]
     assert proven.numerical[TOKEN_IDX_ALLY_SIDE, gates].tolist() == [0.0, 0.0]
     assert unknown.numerical[TOKEN_IDX_OPPONENT_SIDE, gates].tolist() == [0.0, 0.0]
+
+
+# Champions sheets spend Stat Points, so their packed EV field is empty.
+_EV_LESS_SHEET = "Incineroar||sitrusberry|intimidate|fakeout,partingshot|Impish|||||50|"
+_EV_BEARING_SHEET = (
+    "Incineroar||sitrusberry|intimidate|fakeout,partingshot|Impish|252,0,0,0,4,0||||50|"
+)
+
+
+def _teambuilder_mon(packed: str):
+    from poke_env.teambuilder.teambuilder import Teambuilder
+
+    return Teambuilder.parse_packed_team(packed)[0]
+
+
+def test_poke_env_drops_the_open_team_sheet_nature_without_the_patch() -> None:
+    """poke-env 0.15 gates nature behind a non-zero EV check, which Champions never trips."""
+    from poke_env.battle.pokemon import Pokemon
+
+    assert not poke_env_patches.is_installed()
+    assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET)).nature is None
+    # The same sheet keeps its nature once EVs are present, isolating the cause.
+    assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_BEARING_SHEET)).nature == "impish"
+
+
+def test_nature_patch_restores_the_open_team_sheet_nature() -> None:
+    from poke_env.battle.pokemon import Pokemon
+
+    poke_env_patches.install()
+    try:
+        mon = Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET))
+        assert mon.nature == "impish"
+        # A sheet that declares no nature must stay unset rather than be invented.
+        no_nature = _teambuilder_mon("Incineroar||sitrusberry|intimidate|fakeout||||||50|")
+        assert Pokemon(gen=9, teambuilder=no_nature).nature is None
+    finally:
+        poke_env_patches.uninstall_for_tests()
+
+    assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET)).nature is None

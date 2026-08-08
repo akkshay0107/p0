@@ -10,6 +10,7 @@ from typing import Any, cast
 from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon
 from poke_env.environment.env import _EnvPlayer
 from poke_env.ps_client.ps_client import PSClient
+from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
 
 from p0.runtime.live_event_capture import capture_message
 
@@ -17,6 +18,7 @@ _ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
 _ORIGINAL_STOP_LISTENING = PSClient.stop_listening
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
 _ORIGINAL_FORME_CHANGE = Pokemon.forme_change
+_ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
 _installed = False
 _filtered_loggers: list[logging.Logger] = []
 
@@ -72,6 +74,22 @@ def _forme_change(self: Pokemon, species: str) -> None:
     self._update_from_pokedex(normalized_species, store_species=True)
 
 
+def _update_from_teambuilder(self: Pokemon, tb: TeambuilderPokemon) -> None:
+    """Keep the open-team-sheet nature that poke-env drops for EV-less formats.
+
+    poke-env 0.15 assigns nature only inside ``if not all(e == 0 for e in tb.evs)``,
+    so a sheet that declares a nature but no EVs loses it. Champions spends Stat
+    Points rather than EVs, so every opponent sheet parses with all-zero EVs and
+    the revealed nature is discarded - which is exactly the nature stat imputation
+    keys on. Upstream deleted the gate in PR #920, merged 2026-05-31 but unreleased
+    as of 0.15.0, so this restores that behaviour without moving off the pin.
+    """
+    _ORIGINAL_UPDATE_FROM_TEAMBUILDER(self, tb)
+
+    if self._nature is None and tb.nature is not None:
+        self._nature = tb.nature.lower()
+
+
 async def _stop_listening_cleanly(self: PSClient) -> None:
     """Close a client and drain poke-env's listener/message-handler tasks.
 
@@ -112,6 +130,7 @@ def install(logger: logging.Logger | None = None) -> None:
     PSClient.stop_listening = _stop_listening_cleanly
     DoubleBattle.parse_message = _parse_message
     Pokemon.forme_change = _forme_change
+    Pokemon._update_from_teambuilder = _update_from_teambuilder
     _installed = True
 
 
@@ -127,6 +146,7 @@ def uninstall_for_tests() -> None:
         PSClient.stop_listening = _ORIGINAL_STOP_LISTENING
         DoubleBattle.parse_message = _ORIGINAL_PARSE_MESSAGE
         Pokemon.forme_change = _ORIGINAL_FORME_CHANGE
+        Pokemon._update_from_teambuilder = _ORIGINAL_UPDATE_FROM_TEAMBUILDER
         _installed = False
 
 
