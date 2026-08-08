@@ -29,6 +29,7 @@ from p0.format_config import (
     RESOURCE_FEATURE_ABI,
     TENSOR_ABI,
     RuntimeManifest,
+    active_global_contract,
     canonical_json_sha256,
     current_manifest,
     load_runtime_manifest,
@@ -224,7 +225,7 @@ def test_runtime_manifest_round_trips_one_readable_contract(tmp_path):
     assert restored.tensor_abi == TENSOR_ABI
     assert restored.resource_feature_abi == RESOURCE_FEATURE_ABI
     assert restored.action == ACTION_CONTRACT
-    assert restored.runtime_contract_sha256 == canonical_json_sha256(restored.runtime_contract())
+    assert restored.global_sha256 == manifest.global_sha256
 
 
 def test_canonical_hash_ignores_object_order_but_not_required_semantics():
@@ -244,33 +245,59 @@ def test_vocabulary_expansion_breaks_contract_but_dex_change_does_not(tmp_path):
 
     dex.write_text(json.dumps({"moves": [{"id": "test", "basePower": 80}]}))
     rebalanced = current_manifest(vocab_path=vocab, dex_path=dex)
-    assert rebalanced.runtime_contract_sha256 == original.runtime_contract_sha256
+    assert rebalanced.global_sha256 == original.global_sha256
     assert rebalanced.champions_dex_sha256 != original.champions_dex_sha256
 
     vocab, dex = _resources(tmp_path, extra_species=True, base_power=80)
     expanded = current_manifest(vocab_path=vocab, dex_path=dex)
-    assert expanded.runtime_contract_sha256 != original.runtime_contract_sha256
+    assert expanded.global_sha256 != original.global_sha256
 
 
-def test_artifact_validation_compares_only_runtime_contract(tmp_path):
-    vocab, dex = _resources(tmp_path)
-    manifest = current_manifest(vocab_path=vocab, dex_path=dex)
-    manifest_path = tmp_path / "runtime_manifest.json"
-    _write_manifest(manifest_path, manifest)
-    artifact = {"runtime_contract_sha256": manifest.runtime_contract_sha256}
-    assert validate_artifact_runtime_contract(artifact, manifest_path) == manifest
+def test_global_contract_freezes_payloads_and_bumps_only_the_required_identity():
+    contract = active_global_contract()
+    with pytest.raises(TypeError):
+        contract.payload("actions", "major")["action_count"] = 50  # type: ignore[index]
 
-    changed_provenance = deepcopy(manifest.to_dict())
-    changed_provenance["mechanics_provenance"]["showdown_commit"] = "new-commit"
-    manifest_path.write_text(json.dumps(changed_provenance), encoding="utf-8")
-    validate_artifact_runtime_contract(artifact, manifest_path)
+    changed_minor = contract.with_subsystem_update(
+        "resources",
+        minor_payload={**contract.payload("resources", "minor"), "showdown_commit": "next"},
+    )
+    assert changed_minor.global_sha256 == contract.global_sha256
+    assert changed_minor.subsystem("resources").minor_version == 1
 
-    artifact["runtime_contract_sha256"] = "0" * 64
+    changed_major = contract.with_subsystem_update(
+        "model",
+        major_payload={**contract.payload("model", "major"), "tensor_abi": "next"},
+    )
+    assert changed_major.global_sha256 != contract.global_sha256
+    assert changed_major.subsystem("model").major_version == 2
+    assert changed_major.subsystem("model").minor_version == 0
+
+
+def test_global_contract_rejects_hash_valid_but_malformed_subsystem_payload():
+    contract = active_global_contract()
+    contracts = {
+        name: {
+            "major": dict(contract.payload(name, "major")),
+            "minor": dict(contract.payload(name, "minor")),
+        }
+        for name in contract.subsystems
+    }
+    contracts["actions"]["major"] = {}
+    with pytest.raises(ValueError, match="actions major payload"):
+        RuntimeManifest.create(contracts, contract.subsystems)
+
+
+def test_artifact_validation_uses_only_the_active_global_contract():
+    manifest = active_global_contract()
+    artifact = {"global_contract_sha256": manifest.global_sha256}
+    assert validate_artifact_runtime_contract(artifact) == manifest
+    artifact["global_contract_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="incompatible"):
-        validate_artifact_runtime_contract(artifact, manifest_path)
+        validate_artifact_runtime_contract(artifact)
 
 
-ACTIVE_CONTRACT = load_runtime_manifest().runtime_contract_sha256
+ACTIVE_CONTRACT = load_runtime_manifest().global_sha256
 
 
 def _evidence(kind: LabelKind) -> ActionEvidence:
@@ -331,7 +358,7 @@ def _shard_manifest() -> ShardManifest:
         filename="shard-000.pt", sha256="c" * 64, decisions=10, games=2, series=1, byte_size=1024
     )
     return ShardManifest(
-        runtime_contract_sha256=ACTIVE_CONTRACT,
+        global_contract_sha256=ACTIVE_CONTRACT,
         shards=(entry,),
         diagnostics={"oov_ids": 0},
         created_at="2026-07-17T00:00:00Z",
@@ -364,7 +391,7 @@ def _corpus_entry(packed: str = "packed-team") -> CorpusEntry:
 
 def _corpus_manifest(entries: tuple[CorpusEntry, ...]) -> TeamCorpusManifest:
     return TeamCorpusManifest(
-        runtime_contract_sha256=ACTIVE_CONTRACT,
+        global_contract_sha256=ACTIVE_CONTRACT,
         format_id="gen9championsvgc2026regmb",
         corpus_hash=corpus_content_hash(entries),
         entries=entries,
@@ -457,8 +484,8 @@ def test_shard_manifest_contract() -> None:
     assert manifest.decisions == 10 and manifest.games == 2 and manifest.series == 1
     assert load_shard_manifest(manifest.to_dict()) == manifest
     with pytest.raises(ValueError, match="incompatible"):
-        load_shard_manifest({**manifest.to_dict(), "runtime_contract_sha256": "0" * 64})
-    with pytest.raises(ValueError, match="legacy"):
+        load_shard_manifest({**manifest.to_dict(), "global_contract_sha256": "0" * 64})
+    with pytest.raises(ValueError, match="unknown"):
         load_shard_manifest({**manifest.to_dict(), "runtime_manifest_sha256": "0" * 64})
     with pytest.raises(ValueError, match="artifact schema"):
         ShardManifest.from_dict({**manifest.to_dict(), "artifact_schema": "p0.replay_shard.v0"})
@@ -577,10 +604,10 @@ def test_active_contract_is_reg_m_b_and_manifest_matches_sources():
     assert manifest.battle_format == FORMAT.battle_format
     assert manifest.bo3_format == FORMAT.bo3_format
     assert manifest.action == ACTION_CONTRACT
-    assert len(manifest.runtime_contract_sha256) == 64
+    assert len(manifest.global_sha256) == 64
 
 
-def test_runtime_resources_allow_updated_dex_content(tmp_path):
+def test_runtime_resources_reject_unrecorded_dex_content(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     for name in ("runtime_manifest.json", "vocab.json", "champions_dex.json"):
@@ -590,9 +617,8 @@ def test_runtime_resources_allow_updated_dex_content(tmp_path):
     dex["moves"][0]["basePower"] = int(dex["moves"][0].get("basePower", 0)) + 1
     dex_path.write_text(json.dumps(dex), encoding="utf-8")
 
-    resources = RuntimeResources.from_manifest(data / "runtime_manifest.json")
-
-    assert resources.dex["moves"][0]["basePower"] == dex["moves"][0]["basePower"]
+    with pytest.raises(ValueError, match="default global manifest"):
+        RuntimeResources.from_manifest(data / "runtime_manifest.json")
 
 
 def test_every_legal_content_key_resolves():
@@ -1010,13 +1036,13 @@ def _mock_validator(
 
 def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
-    contract_hash = current_manifest().runtime_contract_sha256
+    contract_hash = current_manifest().global_sha256
     v1 = _mock_variant("Pikachu")
     manifest, _ = build_corpus(
         (v1,),
         tokenizer=tokenizer,
         validator=_mock_validator,
-        runtime_contract_sha256=contract_hash,
+        global_contract_sha256=contract_hash,
         format_id=FORMAT.battle_format,
     )
     manifest_path = tmp_path / "corpus_manifest.json"
@@ -1108,13 +1134,13 @@ def test_corpus_cli_build_and_audit(
 
 def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> None:
     tokenizer = PokemonTokenizer(_mock_vocab())
-    contract_hash = current_manifest().runtime_contract_sha256
+    contract_hash = current_manifest().global_sha256
     v1 = _mock_variant("Pikachu")
     manifest, _ = build_corpus(
         (v1,),
         tokenizer=tokenizer,
         validator=_mock_validator,
-        runtime_contract_sha256=contract_hash,
+        global_contract_sha256=contract_hash,
         format_id=FORMAT.battle_format,
     )
     pool_dir = tmp_path / "pool_all"
@@ -1158,7 +1184,7 @@ def test_variants_from_showdown_with_dex() -> None:
 
 def _migrated_runtime_files(tmp_path: Path) -> tuple[Path, Path]:
     vocab = tmp_path / "vocab.json"
-    dex = tmp_path / "dex.json"
+    dex = tmp_path / "champions_dex.json"
     vocab.write_text(
         json.dumps({"species": {"pikachu": 1}, "moves": {"tackle": 1}}), encoding="utf-8"
     )
@@ -1169,7 +1195,7 @@ def _migrated_runtime_files(tmp_path: Path) -> tuple[Path, Path]:
 def _migrated_shard_manifest(contract: str) -> ShardManifest:
     entry = ShardIndexEntry("shard-000.pt", "c" * 64, 10, 2, 1, 100)
     return ShardManifest(
-        runtime_contract_sha256=contract,
+        global_contract_sha256=contract,
         shards=(entry,),
         diagnostics={"oov_ids": 0},
         created_at="2026-07-17T00:00:00Z",
@@ -1189,11 +1215,11 @@ def test_runtime_manifest_digest_is_semantic_and_round_trips(tmp_path: Path) -> 
     vocab, dex = _migrated_runtime_files(tmp_path)
     manifest = current_manifest(vocab_path=vocab, dex_path=dex)
     reordered = json.loads(json.dumps(manifest.to_dict()))
-    reordered["runtime_contract"] = {
-        key: reordered["runtime_contract"][key]
-        for key in reversed(tuple(reordered["runtime_contract"]))
+    reordered["contracts"]["actions"]["major"] = {
+        key: reordered["contracts"]["actions"]["major"][key]
+        for key in reversed(tuple(reordered["contracts"]["actions"]["major"]))
     }
-    assert canonical_json_sha256(reordered["runtime_contract"]) == manifest.runtime_contract_sha256
+    assert RuntimeManifest.from_dict(reordered) == manifest
     path = tmp_path / "runtime_manifest.json"
     path.write_text(json.dumps(reordered), encoding="utf-8")
     assert load_runtime_manifest(path) == manifest
@@ -1202,13 +1228,13 @@ def test_runtime_manifest_digest_is_semantic_and_round_trips(tmp_path: Path) -> 
 def test_shard_manifest_round_trip_and_tamper_detection(tmp_path: Path) -> None:
     vocab, dex = _migrated_runtime_files(tmp_path)
     runtime = current_manifest(vocab_path=vocab, dex_path=dex)
-    manifest = _migrated_shard_manifest(runtime.runtime_contract_sha256)
+    manifest = _migrated_shard_manifest(runtime.global_sha256)
     assert ShardManifest.from_dict(manifest.to_dict()) == manifest
     manifest_path = tmp_path / "runtime_manifest.json"
     manifest_path.write_text(json.dumps(runtime.to_dict()), encoding="utf-8")
-    with pytest.raises(ValueError, match="incompatible"):
+    with pytest.raises(ValueError, match="default global manifest"):
         load_shard_manifest(
-            {**manifest.to_dict(), "runtime_contract_sha256": "b" * 64}, manifest_path
+            {**manifest.to_dict(), "global_contract_sha256": "b" * 64}, manifest_path
         )
     with pytest.raises(ValueError, match="source_series"):
         ShardManifest.from_dict({**manifest.to_dict(), "source_series": {"series-1": ("game-1",)}})
@@ -1226,7 +1252,7 @@ def test_corpus_manifest_hash_is_order_independent_but_packed_content_bound() ->
         for index, letter in enumerate(("a", "b", "c"))
     )
     manifest = TeamCorpusManifest(
-        runtime_contract_sha256="d" * 64,
+        global_contract_sha256="d" * 64,
         format_id="gen9championsvgc2026regmb",
         corpus_hash=corpus_content_hash(entries),
         entries=entries,

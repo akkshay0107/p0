@@ -16,6 +16,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 from p0.battle.series import SeriesPerspectiveKey
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
+    active_global_contract,
     validate_artifact_runtime_contract,
 )
 from p0.model.structured_observation import StructuredObservation
@@ -30,7 +31,9 @@ from p0.replays.shards import (
     validate_shard_tensors,
 )
 
-SPLIT_ARTIFACT_SCHEMA = "p0.replay_split.v2"
+SPLIT_ARTIFACT_SCHEMA = active_global_contract().payload("replays", "major")[
+    "split_artifact_schema"
+]
 SPLITS = frozenset({"train", "validation", "test"})
 
 
@@ -38,14 +41,14 @@ SPLITS = frozenset({"train", "validation", "test"})
 class SeriesSplitManifest:
     """Stable series-to-split assignments tied to one runtime contract."""
 
-    runtime_contract_sha256: str
+    global_contract_sha256: str
     seed: int
     assignments: Mapping[str, str]
     dataset_hash: str
     artifact_schema: str = SPLIT_ARTIFACT_SCHEMA
 
     _FIELDS = frozenset(
-        {"artifact_schema", "runtime_contract_sha256", "dataset_hash", "seed", "assignments"}
+        {"artifact_schema", "global_contract_sha256", "dataset_hash", "seed", "assignments"}
     )
 
     def __post_init__(self) -> None:
@@ -55,8 +58,8 @@ class SeriesSplitManifest:
                 f"expected {SPLIT_ARTIFACT_SCHEMA}"
             )
 
-        if not _is_sha256(self.runtime_contract_sha256):
-            raise ValueError("SeriesSplitManifest.runtime_contract_sha256 must be a SHA-256 digest")
+        if not _is_sha256(self.global_contract_sha256):
+            raise ValueError("SeriesSplitManifest.global_contract_sha256 must be a SHA-256 digest")
 
         if not _is_sha256(self.dataset_hash):
             raise ValueError("SeriesSplitManifest.dataset_hash must be a SHA-256 digest")
@@ -74,7 +77,7 @@ class SeriesSplitManifest:
     def to_dict(self) -> dict[str, Any]:
         return {
             "artifact_schema": self.artifact_schema,
-            "runtime_contract_sha256": self.runtime_contract_sha256,
+            "global_contract_sha256": self.global_contract_sha256,
             "dataset_hash": self.dataset_hash,
             "seed": self.seed,
             "assignments": {
@@ -91,7 +94,7 @@ class SeriesSplitManifest:
 
         return cls(
             artifact_schema=str(value["artifact_schema"]),
-            runtime_contract_sha256=str(value["runtime_contract_sha256"]),
+            global_contract_sha256=str(value["global_contract_sha256"]),
             seed=int(value["seed"]),
             assignments={str(series_id): str(split) for series_id, split in assignments.items()},
             dataset_hash=str(value["dataset_hash"]),
@@ -104,7 +107,7 @@ def assign_series_splits(
     seed: int = 0,
     validation_fraction: float = 0.1,
     test_fraction: float = 0.1,
-    runtime_contract_sha256: str,
+    global_contract_sha256: str,
     dataset_hash: str,
 ) -> SeriesSplitManifest:
     """Assign complete series deterministically while keeping requested splits populated."""
@@ -164,7 +167,7 @@ def assign_series_splits(
     }
 
     return SeriesSplitManifest(
-        runtime_contract_sha256,
+        global_contract_sha256,
         seed,
         assignments,
         dataset_hash=dataset_hash,
@@ -280,7 +283,7 @@ class LazyReplayDataset(IterableDataset):
             loaded_split = load_split_manifest(split_manifest, runtime_manifest_path)
 
         if loaded_split is not None and (
-            loaded_split.runtime_contract_sha256 != self.manifest.runtime_contract_sha256
+            loaded_split.global_contract_sha256 != self.manifest.global_contract_sha256
         ):
             raise ValueError("Split and shard manifests reference different runtime contracts")
 
@@ -373,6 +376,9 @@ class LazyReplayDataset(IterableDataset):
 
         if payload.get("dataset_hash") != self.manifest.dataset_hash:
             raise ValueError(f"Shard and manifest reference different datasets: {path}")
+
+        if payload.get("global_contract_sha256") != self.manifest.global_contract_sha256:
+            raise ValueError(f"Shard and manifest reference different global contracts: {path}")
 
         tensors = payload.get("tensors")
         summaries = payload.get(SHARD_SUMMARY_KEY)

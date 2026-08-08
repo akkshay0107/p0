@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Mapping
 from pathlib import Path
@@ -11,8 +12,9 @@ import torch
 
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
+    ContractCompatibility,
+    checkpoint_contract_compatibility,
     load_active_runtime_manifest,
-    validate_artifact_runtime_contract,
 )
 from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
@@ -28,6 +30,7 @@ from p0.persistence import atomic_torch_save
 CHECKPOINT_SCHEMA = CHECKPOINT_ARTIFACT_SCHEMA
 POLICY_ARTIFACT = "policy"
 TRAINING_ARTIFACT = "training"
+LOGGER = logging.getLogger(__name__)
 
 
 class PolicyStore(Protocol):
@@ -79,6 +82,8 @@ class PolicyStore(Protocol):
 
     def load_metadata(self, path: Path) -> Mapping[str, Any]: ...
 
+    def preflight(self, path: Path) -> ContractCompatibility: ...
+
 
 class CheckpointStore:
     """The sole reader and writer for policy and training checkpoints."""
@@ -90,6 +95,8 @@ class CheckpointStore:
         resources: RuntimeResources | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
+        if self.manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
+            raise ValueError("CheckpointStore always uses the default global runtime manifest")
         self._resources = resources
 
     def save_policy(
@@ -101,6 +108,12 @@ class CheckpointStore:
     ) -> None:
         artifact = self._policy_artifact(policy, POLICY_ARTIFACT, metadata)
         atomic_torch_save(path, artifact)
+
+    def preflight(self, path: Path) -> ContractCompatibility:
+        """Reject a major checkpoint contract difference before training setup begins."""
+        artifact = self._read_artifact(path)
+        self._validate_envelope(artifact, path)
+        return self._validate_checkpoint_contract(artifact, path)
 
     def load_policy(
         self,
@@ -239,13 +252,22 @@ class CheckpointStore:
         return {
             "artifact_schema": CHECKPOINT_SCHEMA,
             "artifact_type": artifact_type,
-            "runtime_contract_sha256": manifest.runtime_contract_sha256,
+            "global_contract_sha256": manifest.global_sha256,
+            "global_contract": manifest.to_dict(),
             "model_config": self._policy_config(policy).to_dict(),
             "model_state_dict": canonical_policy_state_dict(policy),
             "provenance": dict(metadata or {}),
         }
 
     def _load_artifact(self, path: Path) -> Mapping[str, Any]:
+        artifact = self._read_artifact(path)
+        self._validate_envelope(artifact, path)
+        self._validate_checkpoint_contract(artifact, path)
+        self._model_config(artifact, path)
+        return artifact
+
+    @staticmethod
+    def _read_artifact(path: Path) -> Mapping[str, Any]:
         try:
             artifact = torch.load(path, weights_only=True, map_location="cpu")
         except (OSError, RuntimeError, EOFError, ValueError, IndexError) as exc:
@@ -254,7 +276,15 @@ class CheckpointStore:
         if not isinstance(artifact, Mapping):
             raise ValueError(f"Malformed checkpoint {path}: expected a mapping")
 
-        if "runtime_manifest_sha256" in artifact or artifact.get("artifact_schema") is None:
+        return artifact
+
+    @staticmethod
+    def _validate_envelope(artifact: Mapping[str, Any], path: Path) -> None:
+        if (
+            "runtime_manifest_sha256" in artifact
+            or "runtime_contract_sha256" in artifact
+            or artifact.get("artifact_schema") is None
+        ):
             raise ValueError(
                 f"Unsupported legacy checkpoint format at {path}; "
                 f"expected artifact_schema={CHECKPOINT_SCHEMA!r}"
@@ -272,9 +302,22 @@ class CheckpointStore:
         if not isinstance(provenance, Mapping):
             raise ValueError(f"Checkpoint {path} provenance must be a mapping")
 
-        validate_artifact_runtime_contract(artifact, self.manifest_path)
-        self._model_config(artifact, path)
-        return artifact
+    def _validate_checkpoint_contract(
+        self, artifact: Mapping[str, Any], path: Path
+    ) -> ContractCompatibility:
+        compatibility = checkpoint_contract_compatibility(artifact, self.manifest_path)
+        if not compatibility.is_compatible:
+            raise ValueError(
+                f"Checkpoint {path} is incompatible with the active global contract: "
+                + "; ".join(compatibility.major_differences)
+            )
+        if compatibility.status == "warning":
+            LOGGER.warning(
+                "Checkpoint %s has non-breaking global contract differences: %s",
+                path,
+                "; ".join(compatibility.minor_differences),
+            )
+        return compatibility
 
     def _runtime_resources(self) -> RuntimeResources:
         if self._resources is None:

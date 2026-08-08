@@ -102,13 +102,13 @@ def _write_dataset_replay_dataset(tmp_path: Path, payloads: tuple[dict[str, obje
 
 
 def test_split_assignment_is_order_independent_and_round_trips(tmp_path: Path) -> None:
-    runtime_hash = load_active_runtime_manifest(DEFAULT_RUNTIME_MANIFEST).runtime_contract_sha256
+    global_hash = load_active_runtime_manifest(DEFAULT_RUNTIME_MANIFEST).global_sha256
     first = assign_series_splits(
         ("series-b", "series-a"),
         seed=17,
         validation_fraction=0.2,
         test_fraction=0.2,
-        runtime_contract_sha256=runtime_hash,
+        global_contract_sha256=global_hash,
         dataset_hash="a" * 64,
     )
     second = assign_series_splits(
@@ -116,7 +116,7 @@ def test_split_assignment_is_order_independent_and_round_trips(tmp_path: Path) -
         seed=17,
         validation_fraction=0.2,
         test_fraction=0.2,
-        runtime_contract_sha256=runtime_hash,
+        global_contract_sha256=global_hash,
         dataset_hash="a" * 64,
     )
     assert first.to_dict() == second.to_dict()
@@ -192,9 +192,9 @@ def test_split_dataset_keeps_series_together(tmp_path: Path) -> None:
         ),
     )
     series_ids = sorted({str(summary["series_id"]) for summary in torch_summaries(built)})
-    runtime_hash = built.manifest.runtime_contract_sha256
+    global_hash = built.manifest.global_contract_sha256
     split = SeriesSplitManifest(
-        runtime_hash,
+        global_hash,
         0,
         {series_ids[0]: "train", series_ids[1]: "test"},
         dataset_hash=built.manifest.dataset_hash,
@@ -1167,8 +1167,8 @@ def test_shard_manifest_rejects_runtime_contract_mismatch(tmp_path: Path) -> Non
     result = compile_payloads((_payload_replay_shards("shard-fixture"),))
     built = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
     value = json.loads(built.manifest_path.read_text(encoding="utf-8"))
-    value["runtime_contract_sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="runtime contract"):
+    value["global_contract_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="global contract"):
         load_shard_manifest(value, DEFAULT_RUNTIME_MANIFEST)
 
 

@@ -8,10 +8,14 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Mapping, NamedTuple
 
+from p0.format_config import active_global_contract
+
 STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
 STAT_POINT_LIMIT = 32
 STAT_POINT_TOTAL_LIMIT = 66
-STAT_POINT_IMPUTER_VERSION = 1
+STAT_POINT_IMPUTER_VERSION = active_global_contract().payload("teams", "major")[
+    "stat_point_imputer_version"
+]
 
 NATURE_IMPACTS: dict[str, tuple[str, str]] = {
     "adamant": ("atk", "spa"),

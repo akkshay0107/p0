@@ -294,12 +294,12 @@ def test_corpus_builder_admits_valid_variants() -> None:
         (v1, v2),
         tokenizer=tokenizer,
         validator=_mock_validator,
-        runtime_contract_sha256="a" * 64,
+        global_contract_sha256="a" * 64,
         format_id=FORMAT.battle_format,
     )
     assert len(manifest.entries) == 2
     assert manifest.format_id == FORMAT.battle_format
-    assert manifest.runtime_contract_sha256 == "a" * 64
+    assert manifest.global_contract_sha256 == "a" * 64
     assert audit["admitted_count"] == 2
     assert audit["rejected_count"] == 0
     assert set(audit["species_coverage"]) >= {"pikachu", "charizard"}
@@ -313,7 +313,7 @@ def test_corpus_builder_rejects_oov_species() -> None:
         (v_valid, v_oov),
         tokenizer=tokenizer,
         validator=_mock_validator,
-        runtime_contract_sha256="a" * 64,
+        global_contract_sha256="a" * 64,
     )
     assert len(manifest.entries) == 1
     assert audit["admitted_count"] == 1
@@ -353,7 +353,7 @@ def test_corpus_builder_rejects_showdown_invalid() -> None:
     v1 = _variant_team_corpus_build("Pikachu", source_series=("s1",))
     v2 = _variant_team_corpus_build("Charizard", source_series=("s2",))
     manifest, audit = build_corpus(
-        (v1, v2), tokenizer=tokenizer, validator=failing_validator, runtime_contract_sha256="a" * 64
+        (v1, v2), tokenizer=tokenizer, validator=failing_validator, global_contract_sha256="a" * 64
     )
     assert len(manifest.entries) == 1
     assert audit["rejected_count"] == 1
@@ -371,7 +371,7 @@ def test_split_assignment_prevents_series_leakage() -> None:
         (v1, v2, v3),
         tokenizer=tokenizer,
         validator=_mock_validator,
-        runtime_contract_sha256="a" * 64,
+        global_contract_sha256="a" * 64,
         ratio_train=0.5,
         ratio_val=0.5,
         ratio_test=0.0,
@@ -390,7 +390,7 @@ def test_audit_corpus_and_coverage() -> None:
         "Charizard", source_series=("s2",), usage_count=5, archetypes=("balance",)
     )
     manifest, audit = build_corpus(
-        (v1, v2), tokenizer=tokenizer, validator=_mock_validator, runtime_contract_sha256="b" * 64
+        (v1, v2), tokenizer=tokenizer, validator=_mock_validator, global_contract_sha256="b" * 64
     )
     re_audit = audit_corpus(manifest)
     assert re_audit["admitted_count"] == 2
@@ -415,7 +415,7 @@ def test_populate_pool_directories(tmp_path: Path) -> None:
         unique_variants,
         tokenizer=tokenizer,
         validator=_mock_validator,
-        runtime_contract_sha256="c" * 64,
+        global_contract_sha256="c" * 64,
     )
     populate_pool_directories(manifest, output_root=tmp_path, reduced_limit=2)
 
@@ -465,7 +465,7 @@ def _write_manifest(
 ) -> tuple[Path, TeamCorpusManifest]:
     manifest = TeamCorpusManifest(
         artifact_schema=CORPUS_MANIFEST_SCHEMA,
-        runtime_contract_sha256=current_manifest().runtime_contract_sha256,
+        global_contract_sha256=current_manifest().global_sha256,
         format_id=FORMAT.battle_format,
         corpus_hash=corpus_content_hash(entries),
         entries=entries,

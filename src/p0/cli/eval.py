@@ -175,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "episodes_per_matchup": episodes,
         "seed": seed,
-        "runtime_contract_sha256": runtime_manifest.runtime_contract_sha256,
+        "global_contract_sha256": runtime_manifest.global_sha256,
         "policy_a": str(args.checkpoint) if args.checkpoint else "Random",
         "policy_b": str(args.opponent_checkpoint) if args.opponent_checkpoint else "Random",
         "fallback": any(

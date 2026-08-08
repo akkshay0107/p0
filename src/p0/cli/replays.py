@@ -145,7 +145,7 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "manifest_path": str(built.manifest_path.resolve()),
         "dataset_hash": manifest.dataset_hash,
-        "runtime_hash": manifest.runtime_contract_sha256,
+        "global_hash": manifest.global_contract_sha256,
         "source_games": manifest.source_games,
         "accepted_games": manifest.accepted_games,
         "rejected_games": manifest.rejected_games,
@@ -165,7 +165,7 @@ def _create_splits(args: argparse.Namespace) -> dict[str, Any]:
         seed=args.seed,
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,
-        runtime_contract_sha256=manifest.runtime_contract_sha256,
+        global_contract_sha256=manifest.global_contract_sha256,
         dataset_hash=manifest.dataset_hash,
     )
 
@@ -181,7 +181,7 @@ def _create_splits(args: argparse.Namespace) -> dict[str, Any]:
         "split_manifest_path": str(output.resolve()),
         "shard_manifest_path": str(args.shard_manifest.resolve()),
         "dataset_hash": manifest.dataset_hash,
-        "runtime_hash": manifest.runtime_contract_sha256,
+        "global_hash": manifest.global_contract_sha256,
         "source_series": len(series_ids),
         "source_games": manifest.source_games,
         "accepted_games": manifest.accepted_games,

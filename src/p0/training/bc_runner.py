@@ -102,8 +102,8 @@ def _load_identities(
     shard_value = json.loads(shard_manifest_path.read_text(encoding="utf-8"))
     shard_manifest = load_shard_manifest(shard_value)
     split_manifest = load_split_manifest(split_manifest_path)
-    if split_manifest.runtime_contract_sha256 != shard_manifest.runtime_contract_sha256:
-        raise ValueError("BC shard and split manifests reference different runtime contracts")
+    if split_manifest.global_contract_sha256 != shard_manifest.global_contract_sha256:
+        raise ValueError("BC shard and split manifests reference different global contracts")
     if split_manifest.dataset_hash != shard_manifest.dataset_hash:
         raise ValueError("BC shard and split manifests reference different datasets")
     return shard_manifest, split_manifest
@@ -127,6 +127,10 @@ def train_bc(
     Returns:
         The final training and validation metrics plus selected checkpoint state.
     """
+    store = CheckpointStore()
+    if config.resume_checkpoint is not None:
+        store.preflight(config.resume_checkpoint)
+
     shard_manifest, _ = _load_identities(config.shard_manifest, config.split_manifest)
     train_dataset = LazyReplayDataset(
         config.shard_manifest,
@@ -140,7 +144,6 @@ def train_bc(
     )
     selected_device = default_device() if device is None else torch.device(device)
     seed_everything(config.seed)
-    store = CheckpointStore()
     if config.resume_checkpoint is None:
         policy = build_policy(ModelConfig.baseline(), default_runtime_resources())
     else:
@@ -281,7 +284,7 @@ def train_bc(
     )
     result = {
         "dataset_hash": shard_manifest.dataset_hash,
-        "runtime_hash": shard_manifest.runtime_contract_sha256,
+        "global_hash": shard_manifest.global_contract_sha256,
         "completed_epoch": completed_epoch,
         "cancelled": cancelled,
         "overfit_passed": overfit_passed,
@@ -325,7 +328,7 @@ def evaluate_bc(
         raise RuntimeError("BC evaluation contains invalid predictions or non-finite values")
     return {
         "dataset_hash": shard_manifest.dataset_hash,
-        "runtime_hash": shard_manifest.runtime_contract_sha256,
+        "global_hash": shard_manifest.global_contract_sha256,
         "split": split,
         "checkpoint": str(checkpoint.resolve()),
         "metrics": metrics.to_dict(),

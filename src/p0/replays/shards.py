@@ -20,7 +20,11 @@ from typing import Any, Mapping
 import torch
 
 from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
-from p0.format_config import DEFAULT_RUNTIME_MANIFEST, validate_artifact_runtime_contract
+from p0.format_config import (
+    DEFAULT_RUNTIME_MANIFEST,
+    active_global_contract,
+    validate_artifact_runtime_contract,
+)
 from p0.model.structured_observation import (
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     OBSERVATION_SCHEMA_VERSION,
@@ -36,8 +40,12 @@ from p0.replays.schema import (
     _require_iso_timestamp,
 )
 
-SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v5"
-BO3_COMPILATION_SEMANTICS = "canonical_player_bo3_history.v1"
+SHARD_ARTIFACT_SCHEMA = active_global_contract().payload("replays", "major")[
+    "shard_artifact_schema"
+]
+BO3_COMPILATION_SEMANTICS = active_global_contract().payload("replays", "major")[
+    "compilation_semantics"
+]
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
 # T is the shard's decision count and C its total candidate count. Candidates
@@ -137,7 +145,7 @@ class ShardIndexEntry:
 class ShardManifest:
     """Index and immutable identity for one compiled shard family."""
 
-    runtime_contract_sha256: str
+    global_contract_sha256: str
     shards: tuple[ShardIndexEntry, ...]
     diagnostics: Mapping[str, int]
     created_at: str
@@ -157,7 +165,7 @@ class ShardManifest:
 
     _FIELDS = frozenset(
         {
-            "runtime_contract_sha256",
+            "global_contract_sha256",
             "dataset_hash",
             "source_format_id",
             "compilation_semantics",
@@ -197,9 +205,9 @@ class ShardManifest:
                     f"ShardManifest.{name} {declared!r} does not match the active {expected}"
                 )
 
-        if not _is_sha256(self.runtime_contract_sha256):
+        if not _is_sha256(self.global_contract_sha256):
             raise ValueError(
-                "ShardManifest.runtime_contract_sha256 must be a lowercase SHA-256 digest"
+                "ShardManifest.global_contract_sha256 must be a lowercase SHA-256 digest"
             )
 
         if not _is_sha256(self.dataset_hash):
@@ -276,7 +284,7 @@ class ShardManifest:
         """Convert the manifest identity to a JSON-serializable dictionary."""
         return {
             "artifact_schema": self.artifact_schema,
-            "runtime_contract_sha256": self.runtime_contract_sha256,
+            "global_contract_sha256": self.global_contract_sha256,
             "dataset_hash": self.dataset_hash,
             "source_format_id": self.source_format_id,
             "compilation_semantics": self.compilation_semantics,
@@ -326,7 +334,7 @@ class ShardManifest:
 
         return cls(
             artifact_schema=str(value["artifact_schema"]),
-            runtime_contract_sha256=str(value["runtime_contract_sha256"]),
+            global_contract_sha256=str(value["global_contract_sha256"]),
             dataset_hash=str(value["dataset_hash"]),
             source_format_id=str(value["source_format_id"]),
             compilation_semantics=str(value["compilation_semantics"]),

@@ -56,13 +56,27 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
                 dtype=target.dtype,
             ).to(stress_device)
 
-        categorical[..., 0] = random_ids(categorical[..., 0], stress_policy.encoder.species_emb.num_embeddings)
-        categorical[..., 1] = random_ids(categorical[..., 1], stress_policy.encoder.ability_emb.num_embeddings)
-        categorical[..., 2] = random_ids(categorical[..., 2], stress_policy.encoder.item_emb.num_embeddings)
-        categorical[..., 3:5] = random_ids(categorical[..., 3:5], stress_policy.encoder.type_emb.num_embeddings)
-        categorical[..., 5:9] = random_ids(categorical[..., 5:9], stress_policy.encoder.move_emb.num_embeddings)
-        categorical[..., 9:13] = random_ids(categorical[..., 9:13], stress_policy.encoder.type_emb.num_embeddings)
-        categorical[..., 13:17] = random_ids(categorical[..., 13:17], stress_policy.encoder.category_emb.num_embeddings)
+        categorical[..., 0] = random_ids(
+            categorical[..., 0], stress_policy.encoder.species_emb.num_embeddings
+        )
+        categorical[..., 1] = random_ids(
+            categorical[..., 1], stress_policy.encoder.ability_emb.num_embeddings
+        )
+        categorical[..., 2] = random_ids(
+            categorical[..., 2], stress_policy.encoder.item_emb.num_embeddings
+        )
+        categorical[..., 3:5] = random_ids(
+            categorical[..., 3:5], stress_policy.encoder.type_emb.num_embeddings
+        )
+        categorical[..., 5:9] = random_ids(
+            categorical[..., 5:9], stress_policy.encoder.move_emb.num_embeddings
+        )
+        categorical[..., 9:13] = random_ids(
+            categorical[..., 9:13], stress_policy.encoder.type_emb.num_embeddings
+        )
+        categorical[..., 13:17] = random_ids(
+            categorical[..., 13:17], stress_policy.encoder.category_emb.num_embeddings
+        )
         categorical[..., CAT_IDX_STATUS] = random_ids(
             categorical[..., CAT_IDX_STATUS], stress_policy.encoder.status_emb.num_embeddings
         )
@@ -70,7 +84,9 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
             categorical[..., CAT_IDX_STATUS_COUNTER_KIND],
             stress_policy.encoder.counter_kind_emb.num_embeddings,
         )
-        categorical[..., 24] = random_ids(categorical[..., 24], stress_policy.encoder.nature_emb.num_embeddings)
+        categorical[..., 24] = random_ids(
+            categorical[..., 24], stress_policy.encoder.nature_emb.num_embeddings
+        )
         observation.categorical[
             ..., CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
         ] = 4
@@ -89,17 +105,15 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
         history_mask = torch.ones(
             (batch_size, HISTORY_WINDOW), dtype=torch.bool, device=stress_device
         )
-        history_age_ids = torch.arange(HISTORY_WINDOW, device=stress_device).expand(
-            batch_size, -1
-        )
+        history_age_ids = torch.arange(HISTORY_WINDOW, device=stress_device).expand(batch_size, -1)
         prior_games = [
             [
-                torch.randn(
-                    (HISTORY_WINDOW, stress_policy.d_model), generator=generator
-                ).to(stress_device),
-                torch.randn(
-                    (HISTORY_WINDOW, stress_policy.d_model), generator=generator
-                ).to(stress_device),
+                torch.randn((HISTORY_WINDOW, stress_policy.d_model), generator=generator).to(
+                    stress_device
+                ),
+                torch.randn((HISTORY_WINDOW, stress_policy.d_model), generator=generator).to(
+                    stress_device
+                ),
             ]
             for _ in range(batch_size)
         ]
@@ -187,7 +201,7 @@ def test_policy_scores_ragged_candidates_with_empty_decision_rows(
 
         assert log_probs.shape == (candidate_values.shape[0],)
         assert not torch.isnan(log_probs).any()
-        nonempty_starts = candidate_offsets[:-1][
-            candidate_offsets[1:] > candidate_offsets[:-1]
-        ].to(stress_device)
+        nonempty_starts = candidate_offsets[:-1][candidate_offsets[1:] > candidate_offsets[:-1]].to(
+            stress_device
+        )
         assert torch.isfinite(log_probs[nonempty_starts]).all()

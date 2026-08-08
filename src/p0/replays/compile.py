@@ -25,6 +25,7 @@ from p0.battle.legality import (
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     FORMAT,
+    active_global_contract,
     canonical_json_sha256,
     load_active_runtime_manifest,
     validate_artifact_runtime_contract,
@@ -53,10 +54,11 @@ from p0.replays.shards import (
 from p0.runtime.process_context import PROCESS_CONTEXT
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
-REPLAY_PARSER_VERSION = 1
-REPLAY_COMPILER_VERSION = 7
-IMPUTATION_ALGORITHM = "causal_stat_point_imputation"
-IMPUTATION_VERSION = 1
+_REPLAY_CONTRACT = active_global_contract().payload("replays", "major")
+REPLAY_PARSER_VERSION = _REPLAY_CONTRACT["parser_version"]
+REPLAY_COMPILER_VERSION = _REPLAY_CONTRACT["compiler_version"]
+IMPUTATION_ALGORITHM = _REPLAY_CONTRACT["imputation_algorithm"]
+IMPUTATION_VERSION = _REPLAY_CONTRACT["imputation_version"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +72,7 @@ def _normalized(value: str) -> str:
 
 
 def _runtime_hash(manifest_path: str | Path) -> str:
-    return load_active_runtime_manifest(manifest_path).runtime_contract_sha256
+    return load_active_runtime_manifest(manifest_path).global_sha256
 
 
 def _source_series(result: CompilationResult) -> dict[str, tuple[str, ...]]:
@@ -143,7 +145,7 @@ def _dataset_hash(
         "source_format_id": source_format_id,
         "compilation_semantics": BO3_COMPILATION_SEMANTICS,
         "build_config": dict(build_config),
-        "runtime_contract_sha256": runtime_hash,
+        "global_contract_sha256": runtime_hash,
     }
     return canonical_json_sha256(identity)
 
@@ -304,7 +306,7 @@ def _save_shard(
         path,
         {
             "artifact_schema": SHARD_ARTIFACT_SCHEMA,
-            "runtime_contract_sha256": runtime_hash,
+            "global_contract_sha256": runtime_hash,
             "dataset_hash": dataset_hash,
             "tensors": tensors,
             SHARD_SUMMARY_KEY: summaries,
@@ -498,7 +500,7 @@ def write_tensor_shards(
         source_games = diagnostics.get("replays", len(result.games)) + len(external_rejections)
         timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
         manifest = ShardManifest(
-            runtime_contract_sha256=runtime_hash,
+            global_contract_sha256=runtime_hash,
             dataset_hash=dataset_hash,
             source_format_id=source_format_id,
             build_config=build_config,

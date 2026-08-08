@@ -22,9 +22,7 @@ def test_batched_team_validation_preserves_identity_and_payload_contract() -> No
     species = ("Pikachu", "Raichu", "Zapdos", "Miraidon", "Gholdengo")
     rng = stress_rng()
     variants = tuple(
-        _variant_team_validation_batch(
-            rng.choice(species), item=f"Stress Item {index}"
-        )
+        _variant_team_validation_batch(rng.choice(species), item=f"Stress Item {index}")
         for index in range(count)
     )
     calls: list[list[dict[str, Any]]] = []
@@ -64,9 +62,7 @@ def test_persistent_validator_handles_repeated_batches_and_closes_worker() -> No
     species = ("Pikachu", "Raichu", "Zapdos", "Miraidon", "Gholdengo")
     rng = stress_rng()
     variants = tuple(
-        _variant_team_validation_batch(
-            rng.choice(species), item=f"Persistent Stress Item {index}"
-        )
+        _variant_team_validation_batch(rng.choice(species), item=f"Persistent Stress Item {index}")
         for index in range(count)
     )
     writes: list[dict[str, Any]] = []

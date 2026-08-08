@@ -23,8 +23,11 @@ from enum import IntEnum
 from typing import Any, Mapping
 
 from p0.battle.actions import ACT_SIZE
+from p0.format_config import active_global_contract
 
-REPLAY_IR_SCHEMA_VERSION = 1
+REPLAY_IR_SCHEMA_VERSION = active_global_contract().payload("replays", "major")[
+    "replay_ir_schema_version"
+]
 
 
 class GroupingMethod(IntEnum):

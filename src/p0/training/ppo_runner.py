@@ -125,15 +125,17 @@ def run_training(
         None.
     """
     training, paths = config.training, config.paths
+    checkpoint_path = paths.resume_checkpoint or paths.initial_policy_checkpoint
+    if checkpoint_path is not None:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"PPO checkpoint does not exist: {checkpoint_path}")
+        policy_store.preflight(checkpoint_path)
+
     seed_everything(training.seed)
     resources = default_runtime_resources()
     device = default_device()
 
     if paths.resume_checkpoint is not None:
-        if not paths.resume_checkpoint.is_file():
-            raise FileNotFoundError(
-                f"PPO resume checkpoint does not exist: {paths.resume_checkpoint}"
-            )
         policy = policy_store.load_policy(
             paths.resume_checkpoint,
             device,
@@ -143,10 +145,6 @@ def run_training(
             },
         )
     elif paths.initial_policy_checkpoint is not None:
-        if not paths.initial_policy_checkpoint.is_file():
-            raise FileNotFoundError(
-                f"Initial policy checkpoint does not exist: {paths.initial_policy_checkpoint}"
-            )
         policy = policy_store.load_policy(
             paths.initial_policy_checkpoint,
             device,

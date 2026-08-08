@@ -5,24 +5,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 
-from p0.format_config import FORMAT
+from p0.format_config import active_global_contract
 
-ACT_SIZE = FORMAT.action_size
-PASS_ACTION = 0
-SWITCH_START = 1
-SWITCH_END = 7
-MOVE_START = 7
-MOVE_END = 27
-MEGA_MOVE_START = 27
-MEGA_MOVE_END = 47
-MEGA_FORCED_ACTION = 47
-FORCED_ACTION = 48
-MOVE_SLOT_COUNT = 4
-TARGET_COUNT = 5
-TEAM_SIZE = 6
+_ACTION_CONTRACT = active_global_contract().payload("actions", "major")
+_RANGES = {entry["meaning"]: entry for entry in _ACTION_CONTRACT["ranges"]}
 
-if ACT_SIZE != 49:
-    raise RuntimeError(f"The action layout requires 49 actions, got {ACT_SIZE}")
+ACT_SIZE = _ACTION_CONTRACT["action_count"]
+PASS_ACTION = _RANGES["pass"]["start"]
+SWITCH_START = _RANGES["switch"]["start"]
+SWITCH_END = _RANGES["switch"]["end"]
+MOVE_START = _RANGES["move"]["start"]
+MOVE_END = _RANGES["move"]["end"]
+MEGA_MOVE_START = _RANGES["mega_move"]["start"]
+MEGA_MOVE_END = _RANGES["mega_move"]["end"]
+MEGA_FORCED_ACTION = _RANGES["mega_forced_move"]["start"]
+FORCED_ACTION = _RANGES["forced_move"]["start"]
+MOVE_SLOT_COUNT = _RANGES["move"]["move_slots"]
+TARGET_COUNT = len(_RANGES["move"]["targets"])
+TEAM_SIZE = _ACTION_CONTRACT["team_preview"]["roster_size"]
 
 
 class ActionKind(IntEnum):

@@ -238,7 +238,7 @@ def build_corpus(
     *,
     tokenizer: PokemonTokenizer | None = None,
     validator: Callable[..., Sequence[AdmissionResult]] = validate_many,
-    runtime_contract_sha256: str = "",
+    global_contract_sha256: str = "",
     format_id: str = FORMAT.battle_format,
     ratio_train: float = 0.8,
     ratio_val: float = 0.1,
@@ -252,7 +252,7 @@ def build_corpus(
         variants: Candidate teams, including provenance and archetype metadata.
         tokenizer: Vocabulary used to reject out-of-vocabulary team content.
         validator: Callable that validates the deduplicated candidates.
-        runtime_contract_sha256: Runtime ABI identity recorded in the manifest.
+        global_contract_sha256: Global major-contract identity recorded in the manifest.
         format_id: Battle format associated with the corpus.
         ratio_train: Fraction assigned to the training split.
         ratio_val: Fraction assigned to the validation split.
@@ -265,8 +265,8 @@ def build_corpus(
     """
     if tokenizer is None:
         tokenizer = PokemonTokenizer.from_file(DEFAULT_PATHS.data_root / "vocab.json")
-    if not runtime_contract_sha256:
-        runtime_contract_sha256 = current_manifest().runtime_contract_sha256
+    if not global_contract_sha256:
+        global_contract_sha256 = current_manifest().global_sha256
 
     deduped = deduplicate_variants(variants)
     validation_results = validator(deduped)
@@ -352,7 +352,7 @@ def build_corpus(
     )
     manifest = TeamCorpusManifest(
         artifact_schema=CORPUS_MANIFEST_SCHEMA,
-        runtime_contract_sha256=runtime_contract_sha256,
+        global_contract_sha256=global_contract_sha256,
         format_id=format_id,
         corpus_hash=corpus_content_hash(ordered_entries),
         entries=ordered_entries,
@@ -408,7 +408,7 @@ def populate_pool_directories(
 
     reduced_manifest = TeamCorpusManifest(
         artifact_schema=manifest.artifact_schema,
-        runtime_contract_sha256=manifest.runtime_contract_sha256,
+        global_contract_sha256=manifest.global_contract_sha256,
         format_id=manifest.format_id,
         corpus_hash=corpus_content_hash(ordered_reduced),
         entries=ordered_reduced,

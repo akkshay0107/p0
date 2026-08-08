@@ -272,7 +272,7 @@ def main(argv: list[str] | None = None) -> None:
             variants,
             tokenizer=tokenizer,
             validator=validate_many,
-            runtime_contract_sha256=current_manifest().runtime_contract_sha256,
+            global_contract_sha256=current_manifest().global_sha256,
             format_id=args.format_id,
             ratio_train=args.train_ratio,
             ratio_val=args.val_ratio,

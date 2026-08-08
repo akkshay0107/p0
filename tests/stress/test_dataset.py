@@ -94,7 +94,7 @@ def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_pat
     )
     built = _build_dataset_from_payloads(tmp_path, payloads)
     split = SeriesSplitManifest(
-        runtime_contract_sha256=built.manifest.runtime_contract_sha256,
+        global_contract_sha256=built.manifest.global_contract_sha256,
         seed=7,
         assignments={
             golden_series_id(f"train-series-{index}"): "train" for index in range(series_count)

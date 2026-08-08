@@ -14,15 +14,7 @@ from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
-from p0.format_config import (
-    ACTION_CONTRACT,
-    FORMAT,
-    RESOURCE_FEATURE_ABI,
-    TENSOR_ABI,
-    RuntimeManifest,
-    canonical_json_sha256,
-    sha256_file,
-)
+from p0.format_config import active_global_contract, load_global_contract, update_resource_contract
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_json_save
 
@@ -183,27 +175,16 @@ def build(
     if missing_content:
         raise ValueError(f"Champions coverage audit failed: missing={missing_content}")
 
-    contract = {
-        "tensor_abi": TENSOR_ABI,
-        "vocabulary_sha256": canonical_json_sha256(vocab),
-        "action": ACTION_CONTRACT,
-        "resource_feature_abi": RESOURCE_FEATURE_ABI,
-    }
-    manifest = RuntimeManifest(
-        tensor_abi=TENSOR_ABI,
-        vocabulary_sha256=contract["vocabulary_sha256"],
-        action=ACTION_CONTRACT,
-        resource_feature_abi=RESOURCE_FEATURE_ABI,
-        runtime_contract_sha256=canonical_json_sha256(contract),
-        champions_dex_sha256=sha256_file(dex_path),
-        showdown_commit=FORMAT.showdown_commit,
-        battle_format=FORMAT.battle_format,
-        bo3_format=FORMAT.bo3_format,
-    )
     atomic_json_save(vocab_path, vocab)
     if coverage_path is not None:
         atomic_json_save(coverage_path, coverage)
-    atomic_json_save(manifest_path, manifest.to_dict())
+    base = (
+        load_global_contract(manifest_path) if manifest_path.exists() else active_global_contract()
+    )
+    atomic_json_save(
+        manifest_path,
+        update_resource_contract(base, vocab_path=vocab_path, dex_path=dex_path).to_dict(),
+    )
     return coverage
 
 

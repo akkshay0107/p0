@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from p0.format_config import active_global_contract
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
@@ -46,7 +47,8 @@ def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path):
     assert artifact["artifact_schema"] == CHECKPOINT_SCHEMA
     assert artifact["artifact_type"] == "training"
     assert "runtime_manifest_sha256" not in artifact
-    assert len(artifact["runtime_contract_sha256"]) == 64
+    assert len(artifact["global_contract_sha256"]) == 64
+    assert artifact["global_contract"]["global_sha256"] == artifact["global_contract_sha256"]
     assert artifact["model_config"]["d_model"] == 32
     assert artifact["provenance"] == {}
 
@@ -331,15 +333,44 @@ def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance
         torch.testing.assert_close(parameter, magnet.state_dict()[name])
 
 
-def test_checkpoint_rejects_runtime_contract_tampering(tmp_path: Path) -> None:
+def test_checkpoint_rejects_global_contract_tampering(tmp_path: Path) -> None:
     path = tmp_path / "policy.pt"
     store = CheckpointStore()
     store.save_policy(path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources()))
     artifact = torch.load(path, weights_only=False)
-    artifact["runtime_contract_sha256"] = "0" * 64
+    artifact["global_contract_sha256"] = "0" * 64
     torch.save(artifact, path)
-    with pytest.raises(ValueError, match="runtime contract"):
+    with pytest.raises(ValueError, match="global_contract_sha256"):
         store.load_policy(path, "cpu")
+
+
+def test_checkpoint_contract_minor_drift_warns_and_major_drift_fails(
+    tmp_path: Path, caplog
+) -> None:
+    path = tmp_path / "policy.pt"
+    store = CheckpointStore()
+    store.save_policy(path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources()))
+    artifact = torch.load(path, weights_only=False)
+    active = active_global_contract()
+    minor = active.with_subsystem_update(
+        "resources",
+        minor_payload={**active.payload("resources", "minor"), "showdown_commit": "next"},
+    )
+    artifact["global_contract"] = minor.to_dict()
+    artifact["global_contract_sha256"] = minor.global_sha256
+    torch.save(artifact, path)
+    store.preflight(path)
+    assert "non-breaking global contract differences" in caplog.text
+
+    major = active.with_subsystem_update(
+        "model",
+        major_payload={**active.payload("model", "major"), "tensor_abi": "next"},
+    )
+    artifact["global_contract"] = major.to_dict()
+    artifact["global_contract_sha256"] = major.global_sha256
+    torch.save(artifact, path)
+    with pytest.raises(ValueError, match="incompatible"):
+        store.preflight(path)
 
 
 def test_checkpoint_rejects_weights_only_resume_when_training_is_required(tmp_path: Path) -> None:
@@ -396,7 +427,9 @@ def test_showdown_server_start_stop_owns_process_log_and_command(
             del args
 
     monkeypatch.setattr(showdown.subprocess, "Popen", FakeProcess)
-    monkeypatch.setattr(showdown.socket, "create_connection", lambda *args, **kwargs: FakeConnection())
+    monkeypatch.setattr(
+        showdown.socket, "create_connection", lambda *args, **kwargs: FakeConnection()
+    )
     server = showdown.ShowdownServer(
         9123,
         showdown_root=tmp_path,
@@ -443,7 +476,9 @@ def test_showdown_server_rejects_double_start_and_invalid_port_groups(
             return 0
 
     monkeypatch.setattr(showdown.subprocess, "Popen", FakeProcess)
-    monkeypatch.setattr(showdown.socket, "create_connection", lambda *args, **kwargs: _CheckpointConnection())
+    monkeypatch.setattr(
+        showdown.socket, "create_connection", lambda *args, **kwargs: _CheckpointConnection()
+    )
     server = showdown.ShowdownServer(9124, showdown_root=tmp_path, startup_timeout=1)
     server.start()
     with pytest.raises(RuntimeError, match="already started"):

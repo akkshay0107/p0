@@ -22,11 +22,14 @@ from typing import Any, Mapping
 
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
+    active_global_contract,
     canonical_json_sha256,
     validate_artifact_runtime_contract,
 )
 
-CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v1"
+CORPUS_MANIFEST_SCHEMA = active_global_contract().payload("teams", "major")[
+    "corpus_manifest_schema"
+]
 
 
 class CorpusSplit(IntEnum):
@@ -146,7 +149,7 @@ def corpus_content_hash(entries: tuple[CorpusEntry, ...]) -> str:
 class TeamCorpusManifest:
     """The single loadable description of a validated team corpus."""
 
-    runtime_contract_sha256: str
+    global_contract_sha256: str
     format_id: str
     corpus_hash: str
     entries: tuple[CorpusEntry, ...]
@@ -156,7 +159,7 @@ class TeamCorpusManifest:
 
     _FIELDS = frozenset(
         {
-            "runtime_contract_sha256",
+            "global_contract_sha256",
             "format_id",
             "corpus_hash",
             "entries",
@@ -173,9 +176,9 @@ class TeamCorpusManifest:
                 f"expected {CORPUS_MANIFEST_SCHEMA}"
             )
 
-        if not _is_sha256(self.runtime_contract_sha256):
+        if not _is_sha256(self.global_contract_sha256):
             raise ValueError(
-                "TeamCorpusManifest.runtime_contract_sha256 must be a lowercase SHA-256 digest"
+                "TeamCorpusManifest.global_contract_sha256 must be a lowercase SHA-256 digest"
             )
 
         if not self.format_id:
@@ -207,7 +210,7 @@ class TeamCorpusManifest:
     def to_dict(self) -> dict[str, Any]:
         return {
             "artifact_schema": self.artifact_schema,
-            "runtime_contract_sha256": self.runtime_contract_sha256,
+            "global_contract_sha256": self.global_contract_sha256,
             "format_id": self.format_id,
             "corpus_hash": self.corpus_hash,
             "entries": [entry.to_dict() for entry in self.entries],
@@ -223,7 +226,7 @@ class TeamCorpusManifest:
             raise ValueError("TeamCorpusManifest.sampling_metadata must be a JSON object")
         return cls(
             artifact_schema=str(value["artifact_schema"]),
-            runtime_contract_sha256=str(value["runtime_contract_sha256"]),
+            global_contract_sha256=str(value["global_contract_sha256"]),
             format_id=str(value["format_id"]),
             corpus_hash=str(value["corpus_hash"]),
             entries=tuple(CorpusEntry.from_dict(entry) for entry in value["entries"]),

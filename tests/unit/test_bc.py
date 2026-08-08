@@ -904,7 +904,7 @@ def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:
 def test_split_assignment_populates_all_requested_splits_when_possible() -> None:
     manifest = assign_series_splits(
         ("a", "b", "c", "d", "e"),
-        runtime_contract_sha256="a" * 64,
+        global_contract_sha256="a" * 64,
         dataset_hash="b" * 64,
     )
 
