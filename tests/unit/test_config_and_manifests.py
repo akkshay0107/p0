@@ -72,7 +72,6 @@ from p0.teams.corpus import (
     CorpusEntry,
     CorpusSourceSpec,
     CorpusSplit,
-    SamplingPolicy,
     TeamCorpusManifest,
     corpus_content_hash,
     load_corpus_manifest,
@@ -402,7 +401,6 @@ def _corpus_entry(packed: str = "packed-team") -> CorpusEntry:
         packed_sha256=hashlib.sha256(packed.encode()).hexdigest(),
         split=CorpusSplit.TRAIN,
         usage_count=3,
-        archetype_tags=("rain",),
     )
 
 
@@ -413,7 +411,7 @@ def _corpus_manifest(entries: tuple[CorpusEntry, ...]) -> TeamCorpusManifest:
         corpus_hash=corpus_content_hash(entries),
         entries=entries,
         created_at="2026-07-17T00:00:00Z",
-        sampling_metadata={"policy": "usage_weighted"},
+        sampling_metadata={"sampling": "uniform_canonical"},
     )
 
 
@@ -533,6 +531,8 @@ def test_corpus_manifest_contract() -> None:
         TeamCorpusManifest.from_dict({**manifest.to_dict(), "corpus_hash": "0" * 64})
     with pytest.raises(ValueError, match="Duplicate corpus entry"):
         _corpus_manifest((entries[0], entries[0]))
+    with pytest.raises(ValueError, match="unknown"):
+        CorpusEntry.from_dict({**entries[0].to_dict(), "archetype_tags": []})
 
 
 def test_corpus_source_spec_validates() -> None:
@@ -541,16 +541,14 @@ def test_corpus_source_spec_validates() -> None:
         corpus_hash="a" * 64,
         format_id="gen9championsvgc2026regmb",
         split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
-    assert spec.curriculum_stage == ""
+    assert spec.split is CorpusSplit.TRAIN
     with pytest.raises(ValueError, match="split"):
         CorpusSourceSpec(
             corpus_path="x",
             corpus_hash="a" * 64,
             format_id="f",
             split=CorpusSplit.UNSPECIFIED,
-            sampling_policy=SamplingPolicy.UNIFORM_CANONICAL,
         )
 
 
@@ -1029,7 +1027,6 @@ def _mock_variant(species: str = "Pikachu") -> TeamRecord:
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-02T00:00:00Z",
             usage_count=5 if species == "Pikachu" else 3,
-            archetype_tags=("offense",),
         ),
     )
 
@@ -1069,7 +1066,6 @@ def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
         TeamSourceConfig(path=manifest_path),
         corpus_config=CorpusConfig(
             agent_split="train",
-            sampling_policy="uniform_canonical",
         ),
         is_agent=True,
     )
@@ -1078,7 +1074,7 @@ def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
     assert desc["kind"] == "corpus"
     assert desc["corpus_hash"] == manifest.corpus_hash
     assert desc["split"] == "TRAIN"
-    assert desc["sampling_policy"] == "UNIFORM_CANONICAL"
+    assert desc["sampling"] == "uniform_canonical"
 
 
 def test_team_source_composition_falls_back_to_file_source(tmp_path: Path) -> None:
@@ -1195,9 +1191,7 @@ def test_variants_from_showdown_with_dex() -> None:
     assert len(variant.spreads) == 6
     # Verify exact spreads were imputed rather than the default fallback
     assert any(spread != StatPoints(hp=2, spa=32, spe=32) for spread in variant.spreads)
-    # Provenance lives on the record itself; archetype tagging is unwired for now.
     assert variant.spread_provenance == "imputed"
-    assert variant.metadata.archetype_tags == ()
 
 
 def _migrated_runtime_files(tmp_path: Path) -> tuple[Path, Path]:

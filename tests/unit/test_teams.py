@@ -19,12 +19,10 @@ from p0.teams.corpus import (
     CorpusEntry,
     CorpusSourceSpec,
     CorpusSplit,
-    SamplingPolicy,
     TeamCorpusManifest,
     corpus_content_hash,
 )
 from p0.teams.corpus_build import (
-    _component_splits,
     audit_corpus,
     build_corpus,
     populate_pool_directories,
@@ -112,7 +110,6 @@ def _metadata(source="series-1", usage=1):
         first_seen="2026-01-01T00:00:00Z",
         last_seen="2026-01-02T00:00:00Z",
         usage_count=usage,
-        archetype_tags=("balance",),
     )
 
 
@@ -222,7 +219,6 @@ def _variant_team_corpus_build(
     species: str = "Pikachu",
     source_series: tuple[str, ...] = ("series-1",),
     usage_count: int = 1,
-    archetypes: tuple[str, ...] = ("balance",),
     move: str = "Fake Out",
 ) -> TeamRecord:
     members = (
@@ -278,7 +274,6 @@ def _variant_team_corpus_build(
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-02T00:00:00Z",
             usage_count=usage_count,
-            archetype_tags=archetypes,
         ),
     )
 
@@ -376,9 +371,7 @@ def test_split_assignment_prevents_series_leakage() -> None:
     tokenizer = PokemonTokenizer(_mock_vocab_team_corpus_build())
     v1 = _variant_team_corpus_build("Pikachu", source_series=("shared-series",))
     v2 = _variant_team_corpus_build("Charizard", source_series=("shared-series",))
-    v3 = _variant_team_corpus_build(
-        "Whimsicott", source_series=("other-series",), archetypes=("held_out",)
-    )
+    v3 = _variant_team_corpus_build("Whimsicott", source_series=("other-series",))
     manifest, _ = build_corpus(
         (v1, v2, v3),
         tokenizer=tokenizer,
@@ -387,28 +380,24 @@ def test_split_assignment_prevents_series_leakage() -> None:
         ratio_train=0.5,
         ratio_val=0.5,
         ratio_test=0.0,
-        held_out_tags=("held_out",),
     )
     assert len(manifest.entries) == 3
     by_species = {entry.canonical_hash: entry.split for entry in manifest.entries}
     assert by_species[v1.team.team_hash] == by_species[v2.team.team_hash]
-    assert by_species[v3.team.team_hash] == CorpusSplit.HELD_OUT_ARCHETYPE
+    assert by_species[v3.team.team_hash] in {CorpusSplit.TRAIN, CorpusSplit.VALIDATION}
 
 
 def test_audit_corpus_and_coverage() -> None:
     tokenizer = PokemonTokenizer(_mock_vocab_team_corpus_build())
-    v1 = _variant_team_corpus_build("Pikachu", usage_count=10, archetypes=("hyperoffense",))
-    v2 = _variant_team_corpus_build(
-        "Charizard", source_series=("s2",), usage_count=5, archetypes=("balance",)
-    )
+    v1 = _variant_team_corpus_build("Pikachu", usage_count=10)
+    v2 = _variant_team_corpus_build("Charizard", source_series=("s2",), usage_count=5)
     manifest, audit = build_corpus(
         (v1, v2), tokenizer=tokenizer, validator=_mock_validator, global_contract_sha256="b" * 64
     )
     re_audit = audit_corpus(manifest)
     assert re_audit["admitted_count"] == 2
     assert "pikachu" in re_audit["species_coverage"]
-    assert "hyperoffense" in re_audit["archetype_counts"]
-    assert re_audit["archetype_counts"]["hyperoffense"] == 1
+    assert sum(re_audit["split_counts"].values()) == 2
 
 
 def test_populate_pool_directories(tmp_path: Path) -> None:
@@ -453,7 +442,6 @@ def _make_entry(
     canonical_index: int | None = None,
     split: CorpusSplit = CorpusSplit.TRAIN,
     usage_count: int = 10,
-    tags: tuple[str, ...] = ("balance",),
 ) -> CorpusEntry:
     if canonical_index is None:
         canonical_index = index
@@ -467,7 +455,6 @@ def _make_entry(
         packed_sha256=packed_sha256,
         split=split,
         usage_count=usage_count,
-        archetype_tags=tags,
         spread_provenance="imputed",
     )
 
@@ -499,7 +486,6 @@ def test_corpus_source_implements_protocol_and_describes(tmp_path: Path) -> None
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     source = CorpusTeamSource(spec)
     assert hasattr(source, "sample") and callable(source.sample)
@@ -528,7 +514,6 @@ def test_corpus_source_validates_spec(tmp_path: Path) -> None:
         corpus_hash="0" * 64,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     with pytest.raises(ValueError, match="does not match"):
         CorpusTeamSource(bad_spec)
@@ -539,7 +524,6 @@ def test_corpus_source_validates_spec(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id="wrong-format",
         split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     with pytest.raises(ValueError, match="format"):
         CorpusTeamSource(bad_format)
@@ -553,33 +537,12 @@ def test_corpus_source_rejects_empty_filtered_pool(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TEST,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
     with pytest.raises(ValueError, match="No corpus entries match"):
         CorpusTeamSource(spec)
 
 
-def test_sampling_policy_usage_weighted(tmp_path: Path) -> None:
-    e_common = _make_entry(1, usage_count=10000)
-    e_rare = _make_entry(2, usage_count=1)
-    path, manifest = _write_manifest(tmp_path, (e_common, e_rare))
-    spec = CorpusSourceSpec(
-        corpus_path=str(path),
-        corpus_hash=manifest.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
-    )
-    source = CorpusTeamSource(spec)
-    rng = random.Random(100)
-    counts = {e_common.packed_sha256: 0, e_rare.packed_sha256: 0}
-    for _ in range(500):
-        t = source.sample(rng)
-        counts[t.team_hash] += 1
-    assert counts[e_common.packed_sha256] > 490
-
-
-def test_sampling_policy_uniform_canonical(tmp_path: Path) -> None:
+def test_uniform_canonical_sampling(tmp_path: Path) -> None:
     # 90 entries for canonical 1, 10 entries for canonical 2
     entries_1 = tuple(_make_entry(i, canonical_index=1, usage_count=100) for i in range(1, 91))
     entries_2 = tuple(_make_entry(i, canonical_index=2, usage_count=100) for i in range(91, 101))
@@ -589,7 +552,6 @@ def test_sampling_policy_uniform_canonical(tmp_path: Path) -> None:
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.UNIFORM_CANONICAL,
     )
     source = CorpusTeamSource(spec)
     rng = random.Random(200)
@@ -605,135 +567,24 @@ def test_sampling_policy_uniform_canonical(tmp_path: Path) -> None:
         assert 220 <= count <= 380
 
 
-def test_sampling_policy_uniform_archetype(tmp_path: Path) -> None:
-    # 50 balance entries, 2 hyperoffense entries
-    entries_bal = tuple(_make_entry(i, tags=("balance",)) for i in range(1, 51))
-    entries_ho = tuple(_make_entry(i, tags=("hyperoffense",)) for i in range(51, 53))
-    path, manifest = _write_manifest(tmp_path, entries_bal + entries_ho)
-    spec = CorpusSourceSpec(
-        corpus_path=str(path),
-        corpus_hash=manifest.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.UNIFORM_ARCHETYPE,
-    )
-    source = CorpusTeamSource(spec)
-    rng = random.Random(300)
-    tag_counts: dict[str, int] = {"balance": 0, "hyperoffense": 0}
-    for _ in range(600):
-        t = source.sample(rng)
-        e = next(entry for entry in entries_bal + entries_ho if entry.packed_sha256 == t.team_hash)
-        tag_counts[e.archetype_tags[0]] += 1
-    # Should be close to 50/50 across the two archetypes
-    assert 220 <= tag_counts["balance"] <= 380
-    assert 220 <= tag_counts["hyperoffense"] <= 380
-
-
-def test_uniform_archetype_rejects_untagged_pool(tmp_path: Path) -> None:
-    """An untagged pool must fail loudly, not collapse into uniform-over-entries."""
-    entries = tuple(_make_entry(i, tags=()) for i in range(3))
-    path, manifest = _write_manifest(tmp_path, entries)
-    spec = CorpusSourceSpec(
-        corpus_path=str(path),
-        corpus_hash=manifest.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.UNIFORM_ARCHETYPE,
-    )
-    with pytest.raises(ValueError, match="requires archetype tags"):
-        CorpusTeamSource(spec)
-
-
-def test_held_out_tags_reject_untagged_corpus() -> None:
-    """Requesting a hold-out with no tags anywhere would silently populate no split."""
-    variants = (_variant_team_corpus(metadata=replace(_metadata(), archetype_tags=())),)
-    with pytest.raises(ValueError, match="no team record carries an archetype tag"):
-        _component_splits(
-            variants,
-            ratio_train=0.8,
-            ratio_val=0.1,
-            ratio_test=0.1,
-            held_out_tags=("trick-room",),
-        )
-
-    # The same corpus must still split cleanly when no hold-out is requested.
-    splits = _component_splits(
-        variants, ratio_train=0.8, ratio_val=0.1, ratio_test=0.1, held_out_tags=()
-    )
-    assert splits[0] is not CorpusSplit.HELD_OUT_ARCHETYPE
-
-
-def test_sampling_policy_rare_coverage(tmp_path: Path) -> None:
-    e_common = _make_entry(1, usage_count=10000)
-    e_rare = _make_entry(2, usage_count=1)
-    path, manifest = _write_manifest(tmp_path, (e_common, e_rare))
-    spec = CorpusSourceSpec(
-        corpus_path=str(path),
-        corpus_hash=manifest.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.RARE_COVERAGE,
-    )
-    source = CorpusTeamSource(spec)
-    rng = random.Random(400)
-    counts = {e_common.packed_sha256: 0, e_rare.packed_sha256: 0}
-    for _ in range(500):
-        t = source.sample(rng)
-        counts[t.team_hash] += 1
-    # Rare should be sampled overwhelmingly more often when inversely weighted
-    assert counts[e_rare.packed_sha256] > 490
-
-
-def test_curriculum_stage_filtering(tmp_path: Path) -> None:
-    e1 = _make_entry(1, tags=("balance",))
-    e2 = _make_entry(2, tags=("hyperoffense",))
-    e3 = _make_entry(3, tags=("trickroom",))
-    path, manifest = _write_manifest(tmp_path, (e1, e2, e3))
-    spec = CorpusSourceSpec(
-        corpus_path=str(path),
-        corpus_hash=manifest.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
-        curriculum_stage="trickroom",
-    )
-    source = CorpusTeamSource(spec)
-    rng = random.Random(500)
-    for _ in range(20):
-        t = source.sample(rng)
-        assert t.team_hash == e3.packed_sha256
-
-
-def test_sampling_policy_indexes_and_lazy_caching(tmp_path: Path) -> None:
-    # Under USAGE_WEIGHTED policy, canonical and archetype indexes should remain uninitialized (None) until explicitly requested
+def test_uniform_sampling_index(tmp_path: Path) -> None:
+    # Uniform canonical sampling builds its canonical index at construction time.
     e1 = _make_entry(1, canonical_index=1, usage_count=100)
     e2 = _make_entry(2, canonical_index=2, usage_count=100)
     path, manifest = _write_manifest(tmp_path, (e1, e2))
-    spec_usage = CorpusSourceSpec(
+    spec = CorpusSourceSpec(
         corpus_path=str(path),
         corpus_hash=manifest.corpus_hash,
         format_id=FORMAT.battle_format,
         split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.USAGE_WEIGHTED,
     )
-    source_usage = CorpusTeamSource(spec_usage)
-    assert source_usage._by_canonical is None
-    assert source_usage._by_archetype is None
-    # Sampling should succeed without building unneeded indexes
+    source = CorpusTeamSource(spec)
+    assert source._by_canonical is None
     rng = random.Random(700)
-    assert source_usage.sample(rng) is not None
-
-    spec_canonical = CorpusSourceSpec(
-        corpus_path=str(path),
-        corpus_hash=manifest.corpus_hash,
-        format_id=FORMAT.battle_format,
-        split=CorpusSplit.TRAIN,
-        sampling_policy=SamplingPolicy.UNIFORM_CANONICAL,
-    )
-    source_canonical = CorpusTeamSource(spec_canonical)
-    assert source_canonical._by_canonical is not None
-    assert source_canonical._canonical_keys is not None
-    assert len(source_canonical._canonical_keys) == 2
+    assert source.sample(rng) is not None
+    assert source._by_canonical is not None
+    assert source._canonical_keys is not None
+    assert len(source._canonical_keys) == 2
 
 
 TEAM = """
@@ -887,7 +738,6 @@ def _variant_team_validation_batch(
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-02T00:00:00Z",
             usage_count=1,
-            archetype_tags=("balance",),
         ),
     )
 

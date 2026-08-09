@@ -37,15 +37,6 @@ class CorpusSplit(IntEnum):
     TRAIN = 1
     VALIDATION = 2
     TEST = 3
-    HELD_OUT_ARCHETYPE = 4
-
-
-class SamplingPolicy(IntEnum):
-    UNSPECIFIED = 0
-    USAGE_WEIGHTED = 1
-    UNIFORM_CANONICAL = 2
-    UNIFORM_ARCHETYPE = 3
-    RARE_COVERAGE = 4
 
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
@@ -76,7 +67,6 @@ class CorpusEntry:
     packed_sha256: str
     split: CorpusSplit
     usage_count: int
-    archetype_tags: tuple[str, ...] = ()
     spread_provenance: str = "imputed"
 
     _FIELDS = frozenset(
@@ -86,7 +76,6 @@ class CorpusEntry:
             "packed_sha256",
             "split",
             "usage_count",
-            "archetype_tags",
             "spread_provenance",
         }
     )
@@ -121,7 +110,6 @@ class CorpusEntry:
             "packed_sha256": self.packed_sha256,
             "split": int(self.split),
             "usage_count": self.usage_count,
-            "archetype_tags": list(self.archetype_tags),
             "spread_provenance": self.spread_provenance,
         }
 
@@ -134,7 +122,6 @@ class CorpusEntry:
             packed_sha256=str(value["packed_sha256"]),
             split=CorpusSplit(value["split"]),
             usage_count=int(value["usage_count"]),
-            archetype_tags=tuple(str(tag) for tag in value["archetype_tags"]),
             spread_provenance=str(value["spread_provenance"]),
         )
 
@@ -257,8 +244,6 @@ class CorpusSourceSpec:
     corpus_hash: str
     format_id: str
     split: CorpusSplit
-    sampling_policy: SamplingPolicy
-    curriculum_stage: str = ""
 
     def __post_init__(self) -> None:
         if not self.corpus_path or not self.format_id:
@@ -269,6 +254,3 @@ class CorpusSourceSpec:
 
         if self.split is CorpusSplit.UNSPECIFIED:
             raise ValueError("CorpusSourceSpec.split must be specified")
-
-        if self.sampling_policy is SamplingPolicy.UNSPECIFIED:
-            raise ValueError("CorpusSourceSpec.sampling_policy must be specified")

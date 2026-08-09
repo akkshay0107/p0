@@ -1,4 +1,4 @@
-"""Harness for policy evaluation against seen, unseen, and archetype team sets."""
+"""Harness for policy evaluation against seen and unseen team sets."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.rl_player import RLPlayer, TeamPlayerMixin
 from p0.runtime import poke_env_patches
-from p0.teams.corpus import CorpusSourceSpec, CorpusSplit, SamplingPolicy
+from p0.teams.corpus import CorpusSourceSpec, CorpusSplit
 from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FixedTeamSource, TeamSource
 
@@ -200,28 +200,19 @@ class EvaluationHarness:
         """Build team sources for different categories based on the corpus manifest."""
         sources: dict[str, TeamSource] = {}
         categories = {
-            "seen": (CorpusSplit.TRAIN, SamplingPolicy.USAGE_WEIGHTED),
-            "validation_unseen_canonical": (
-                CorpusSplit.VALIDATION,
-                SamplingPolicy.UNIFORM_CANONICAL,
-            ),
-            "test_unseen_canonical": (CorpusSplit.TEST, SamplingPolicy.UNIFORM_CANONICAL),
-            "unseen_archetypes": (
-                CorpusSplit.HELD_OUT_ARCHETYPE,
-                SamplingPolicy.UNIFORM_ARCHETYPE,
-            ),
-            "rare_species": (CorpusSplit.TRAIN, SamplingPolicy.RARE_COVERAGE),
+            "seen": CorpusSplit.TRAIN,
+            "validation_unseen_canonical": CorpusSplit.VALIDATION,
+            "test_unseen_canonical": CorpusSplit.TEST,
         }
         failures: dict[str, str] = {}
         if self.corpus_path is not None and self.corpus_path.exists() and self.corpus_hash:
             logger.info("Loading team splits from corpus manifest: %s", self.corpus_path)
-            for key, (split, policy) in categories.items():
+            for key, split in categories.items():
                 spec = CorpusSourceSpec(
                     corpus_path=str(self.corpus_path),
                     corpus_hash=self.corpus_hash,
                     format_id=self.format_id,
                     split=split,
-                    sampling_policy=policy,
                 )
                 try:
                     sources[key] = CorpusTeamSource(spec)

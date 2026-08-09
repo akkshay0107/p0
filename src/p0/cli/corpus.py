@@ -128,16 +128,12 @@ def _variants_from_showdown(
             spreads_list.append(estimate.points)
 
         spreads = tuple(spreads_list)
-        # Archetype tagging is unwired pending a team-sheet tagger. Roles derived from
-        # imputed spreads could not recover speed-control, which is a move property, so
-        # no tags are emitted rather than emitting a silently incomplete vocabulary.
         metadata = TeamMetadata(
             source_series=(),
             source_replays=(),
             first_seen="2026-01-01T00:00:00Z",
             last_seen="2026-01-01T00:00:00Z",
             usage_count=usage,
-            archetype_tags=(),
         )
         variants.append(TeamRecord(team=team, spreads=spreads, metadata=metadata))
 

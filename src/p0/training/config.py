@@ -227,27 +227,17 @@ class BCConfig:
 class CorpusConfig:
     manifest_path: Path = Path("teams/corpus_manifest.json")
     agent_split: str = "train"
-    sampling_policy: str = "usage_weighted"
 
     def __post_init__(self) -> None:
         for name, value in (
             ("manifest_path", str(self.manifest_path)),
             ("agent_split", self.agent_split),
-            ("sampling_policy", self.sampling_policy),
         ):
             if not value.strip():
                 raise ValueError(f"corpus.{name} must not be empty")
 
         if self.agent_split.upper() not in {"TRAIN", "VALIDATION", "TEST"}:
             raise ValueError("corpus.agent_split must be train, validation, or test")
-
-        if self.sampling_policy.upper() not in {
-            "USAGE_WEIGHTED",
-            "UNIFORM_CANONICAL",
-            "UNIFORM_ARCHETYPE",
-            "RARE_COVERAGE",
-        }:
-            raise ValueError("corpus.sampling_policy is not supported")
 
 
 @dataclass(frozen=True, slots=True)

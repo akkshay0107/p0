@@ -118,13 +118,13 @@
     },
     "teams": {
       "major": {
-        "corpus_manifest_schema": "p0.team_corpus.v1",
+        "corpus_manifest_schema": "p0.team_corpus.v2",
         "stat_point_imputer_version": 2
       },
       "minor": {}
     }
   },
-  "global_sha256": "14689843eda5c0b1820bd5b08dad7671bdca044ca668958410725aa0d0335c72",
+  "global_sha256": "65efc990df1343c5ed4c9f23379bd4767d7f2a914faeb2095ccb858246b6f216",
   "manifest_schema": 3,
   "subsystems": {
     "actions": {
@@ -158,9 +158,9 @@
       "minor_version": 1
     },
     "teams": {
-      "major_sha256": "5431cdcc82a335c9c3a9f39a3b930978c6271e51a1d68ab26f4ce0c470c4d49a",
-      "major_version": 2,
-      "minor_sha256": "39b2395e7f1aa9929f9bc0a4609e073d00b3a7f181b8cf3af096b0bac5d44577",
+      "major_sha256": "85885b2d8481db81103b57d7a8829dc0ee6c2b26d341fcc55fe9072f6bd87a90",
+      "major_version": 3,
+      "minor_sha256": "925f6215846af3685d9385cf38ea9be5837093af4860b4b9126936b5276baf58",
       "minor_version": 0
     }
   }

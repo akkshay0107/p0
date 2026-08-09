@@ -44,7 +44,7 @@ def _team_source(
         path = path / "corpus_manifest.json"
 
     if path.suffix == ".json" or (path.is_file() and path.name.endswith(".json")):
-        from p0.teams.corpus import CorpusSourceSpec, CorpusSplit, SamplingPolicy
+        from p0.teams.corpus import CorpusSourceSpec, CorpusSplit
         from p0.teams.corpus_source import CorpusTeamSource
 
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -52,19 +52,15 @@ def _team_source(
         format_id = str(raw.get("format_id", FORMAT.battle_format))
 
         split = CorpusSplit.TRAIN
-        policy = SamplingPolicy.USAGE_WEIGHTED
         if corpus_config is not None:
             split_name = corpus_config.agent_split.upper() if is_agent else "TRAIN"
             split = CorpusSplit[split_name]
-            policy_name = corpus_config.sampling_policy.upper()
-            policy = SamplingPolicy[policy_name]
 
         spec = CorpusSourceSpec(
             corpus_path=str(path),
             corpus_hash=corpus_hash,
             format_id=format_id,
             split=split,
-            sampling_policy=policy,
         )
         return CorpusTeamSource(spec)
     return FileTeamSource(config.path)

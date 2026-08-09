@@ -117,7 +117,6 @@ class TeamMetadata:
     first_seen: str
     last_seen: str
     usage_count: int = 1
-    archetype_tags: tuple[str, ...] = ()
     evidence_game: int = 0
     evidence_event: int = 0
 
@@ -135,7 +134,6 @@ class TeamMetadata:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "usage_count": self.usage_count,
-            "archetype_tags": list(self.archetype_tags),
             "evidence_game": self.evidence_game,
             "evidence_event": self.evidence_event,
         }
@@ -148,7 +146,6 @@ class TeamMetadata:
             "first_seen",
             "last_seen",
             "usage_count",
-            "archetype_tags",
             "evidence_game",
             "evidence_event",
         }
@@ -165,9 +162,6 @@ class TeamMetadata:
                 first_seen=str(value["first_seen"]),
                 last_seen=str(value["last_seen"]),
                 usage_count=int(cast(int, value["usage_count"])),
-                archetype_tags=tuple(
-                    str(item) for item in cast(list[object], value["archetype_tags"])
-                ),
                 evidence_game=int(cast(int, value["evidence_game"])),
                 evidence_event=int(cast(int, value["evidence_event"])),
             )
@@ -274,9 +268,6 @@ def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ..
             first_seen=min(previous.metadata.first_seen, variant.metadata.first_seen),
             last_seen=max(previous.metadata.last_seen, variant.metadata.last_seen),
             usage_count=previous.metadata.usage_count + variant.metadata.usage_count,
-            archetype_tags=tuple(
-                sorted(set(previous.metadata.archetype_tags + variant.metadata.archetype_tags))
-            ),
             evidence_game=min(previous.metadata.evidence_game, variant.metadata.evidence_game),
             evidence_event=min(previous.metadata.evidence_event, variant.metadata.evidence_event),
         )

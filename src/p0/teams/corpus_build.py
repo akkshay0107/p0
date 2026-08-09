@@ -57,19 +57,9 @@ def _component_splits(
     ratio_train: float,
     ratio_val: float,
     ratio_test: float,
-    held_out_tags: tuple[str, ...],
 ) -> tuple[CorpusSplit, ...]:
     """Assign every connected source-series component one corpus split."""
     _validate_ratios(ratio_train, ratio_val, ratio_test)
-
-    # Requesting a hold-out against a wholly untagged corpus would produce an empty
-    # HELD_OUT_ARCHETYPE split and route those teams into train, silently turning a
-    # generalization measurement into a training-set one.
-    if held_out_tags and not any(variant.metadata.archetype_tags for variant in variants):
-        raise ValueError(
-            f"held_out_tags={held_out_tags} was requested but no team record carries an "
-            "archetype tag; archetype tagging is currently unwired"
-        )
 
     parents: dict[tuple[str, str], tuple[str, str]] = {}
 
@@ -102,17 +92,6 @@ def _component_splits(
 
     component_assignments: dict[tuple[str, str], CorpusSplit] = {}
     for root, indexes in component_members.items():
-        held_out = [
-            any(tag in held_out_tags for tag in variants[index].metadata.archetype_tags)
-            for index in indexes
-        ]
-        if any(held_out) and not all(held_out):
-            raise ValueError(
-                "A source-series component mixes held-out and non-held-out archetype records"
-            )
-        if all(held_out):
-            component_assignments[root] = CorpusSplit.HELD_OUT_ARCHETYPE
-            continue
         source_series = sorted(
             series for index in indexes for series in variants[index].metadata.source_series
         )
@@ -140,11 +119,9 @@ def assign_split(
     ratio_train: float = 0.8,
     ratio_val: float = 0.1,
     ratio_test: float = 0.1,
-    held_out_tags: tuple[str, ...] = (),
 ) -> CorpusSplit:
     """Deterministic, series-leak-free split assignment."""
     _validate_ratios(ratio_train, ratio_val, ratio_test)
-    is_held_out = any(tag in held_out_tags for tag in variant.metadata.archetype_tags)
     known = {
         series_to_split[series]
         for series in variant.metadata.source_series
@@ -152,13 +129,9 @@ def assign_split(
     }
     if len(known) > 1:
         raise ValueError("A source-series component has contradictory split assignments")
-    if known and is_held_out != (next(iter(known)) is CorpusSplit.HELD_OUT_ARCHETYPE):
-        raise ValueError("A source-series component mixes held-out and non-held-out records")
 
     if known:
         split = next(iter(known))
-    elif is_held_out:
-        split = CorpusSplit.HELD_OUT_ARCHETYPE
     else:
         seed_key = ",".join(sorted(variant.metadata.source_series)) or variant.team.team_hash
         split = _split_for_key(seed_key, ratio_train, ratio_val, ratio_test)
@@ -175,13 +148,10 @@ def audit_corpus(manifest: TeamCorpusManifest) -> dict[str, Any]:
     move_set: set[str] = set()
     item_set: set[str] = set()
     split_counts: dict[str, int] = {}
-    archetype_counts: dict[str, int] = {}
 
     for entry in manifest.entries:
         split_name = entry.split.name
         split_counts[split_name] = split_counts.get(split_name, 0) + 1
-        for tag in entry.archetype_tags:
-            archetype_counts[tag] = archetype_counts.get(tag, 0) + 1
 
         parts = entry.packed.split("]")
         for part in parts:
@@ -208,7 +178,6 @@ def audit_corpus(manifest: TeamCorpusManifest) -> dict[str, Any]:
         "move_coverage": tuple(sorted(move_set)),
         "item_coverage": tuple(sorted(item_set)),
         "split_counts": split_counts,
-        "archetype_counts": archetype_counts,
     }
 
 
@@ -253,13 +222,12 @@ def build_corpus(
     ratio_train: float = 0.8,
     ratio_val: float = 0.1,
     ratio_test: float = 0.1,
-    held_out_tags: tuple[str, ...] = (),
     created_at: str | None = None,
 ) -> tuple[TeamCorpusManifest, dict[str, Any]]:
     """Admit, deduplicate, validate, and audit candidate team variants.
 
     Arguments:
-        variants: Candidate teams, including provenance and archetype metadata.
+        variants: Candidate teams, including provenance metadata.
         tokenizer: Vocabulary used to reject out-of-vocabulary team content.
         validator: Callable that validates the deduplicated candidates.
         global_contract_sha256: Global major-contract identity recorded in the manifest.
@@ -267,7 +235,6 @@ def build_corpus(
         ratio_train: Fraction assigned to the training split.
         ratio_val: Fraction assigned to the validation split.
         ratio_test: Fraction assigned to the test split.
-        held_out_tags: Archetype tags that force a component into held-out data.
         created_at: Optional manifest timestamp.
 
     Returns:
@@ -290,7 +257,6 @@ def build_corpus(
     move_set: set[str] = set()
     item_set: set[str] = set()
     split_counts: dict[str, int] = {}
-    archetype_counts: dict[str, int] = {}
 
     admitted: list[tuple[TeamRecord, AdmissionResult]] = []
     for variant, result in zip(deduped, validation_results, strict=True):
@@ -318,7 +284,6 @@ def build_corpus(
         ratio_train=ratio_train,
         ratio_val=ratio_val,
         ratio_test=ratio_test,
-        held_out_tags=held_out_tags,
     )
     for (variant, result), split in zip(admitted, splits, strict=True):
         packed = result.packed_team
@@ -333,7 +298,6 @@ def build_corpus(
                 packed_sha256=packed_sha256,
                 split=split,
                 usage_count=variant.metadata.usage_count,
-                archetype_tags=variant.metadata.archetype_tags,
                 spread_provenance=variant.spread_provenance,
             )
         except ValueError as exc:
@@ -344,8 +308,6 @@ def build_corpus(
         entries.append(entry)
         split_name = split.name
         split_counts[split_name] = split_counts.get(split_name, 0) + 1
-        for tag in entry.archetype_tags:
-            archetype_counts[tag] = archetype_counts.get(tag, 0) + 1
 
         for member in variant.team.members:
             species_set.add(PokemonTokenizer.normalize_id(member.species))
@@ -383,7 +345,6 @@ def build_corpus(
         "move_coverage": tuple(sorted(move_set)),
         "item_coverage": tuple(sorted(item_set)),
         "split_counts": split_counts,
-        "archetype_counts": archetype_counts,
     }
 
     return manifest, audit

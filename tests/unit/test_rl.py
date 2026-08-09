@@ -454,7 +454,7 @@ def test_evaluation_harness_falls_back_without_corpus(tmp_path: Path) -> None:
         smoke_test=True,
     )
     sources = harness.build_team_sources()
-    assert len(sources) == 5
+    assert len(sources) == 3
     for key, source in sources.items():
         assert isinstance(source, FixedTeamSource)
         assert harness.category_metadata[key]["fallback"] is True

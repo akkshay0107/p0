@@ -70,7 +70,6 @@ bc:
 corpus:
   manifest_path: teams/corpus_manifest.json
   agent_split: train
-  sampling_policy: usage_weighted
 
 evaluation:
   episodes_per_matchup: 20
