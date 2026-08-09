@@ -28,6 +28,7 @@ from p0.training._bc_metrics import (
     BCEvaluationMetrics,
     BCObjective,
     _BCEvaluationAccumulator,
+    _compute_bc_objective_unchecked,
     _ragged_logsumexp,
     _validate_objective_inputs,
     compute_bc_objective,
@@ -51,6 +52,8 @@ class _PreparedBCBatch:
     history_tokens: Tensor
     history_mask: Tensor
     history_age_ids: Tensor
+    candidate_values: Tensor
+    candidate_offsets: Tensor
     history_updates: tuple[_BCHistoryUpdate, ...]
     # The target rows' local summaries, already built for the history window.
     # Handing them to the reducer keeps each batch to a single reducer pass.
@@ -257,6 +260,8 @@ class BCTrainer:
         history_mask = batch.history_mask.to(self.device)
         history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
         history_age_ids = batch.history_age_ids.to(self.device)
+        candidate_values = batch.candidate_values.to(self.device)
+        candidate_offsets = batch.candidate_offsets.to(self.device)
         series_context = self._series_history.prepare(
             batch.windows,
             target_local_tokens,
@@ -270,6 +275,8 @@ class BCTrainer:
             history_tokens=history_tokens,
             history_mask=history_mask,
             history_age_ids=history_age_ids,
+            candidate_values=candidate_values,
+            candidate_offsets=candidate_offsets,
             history_updates=series_context.updates,
             target_local_tokens=target_local_tokens,
         )
@@ -289,19 +296,20 @@ class BCTrainer:
     def _forward_batch(
         self,
         batch: BCDecisionBatch,
-    ) -> tuple[Tensor, Tensor, tuple[_BCHistoryUpdate, ...]]:
+    ) -> tuple[Tensor, Tensor, tuple[_BCHistoryUpdate, ...], Tensor]:
         prepared = self._prepare_model_inputs(batch)
         reduced = self._reduce(prepared)
         return (
-            self.policy.actor.score_reduced_candidates(
+            self.policy.actor._score_reduced_candidates_unchecked(
                 reduced,
                 prepared.encoded,
                 prepared.action_mask,
-                batch.candidate_values.to(self.device),
-                batch.candidate_offsets.to(self.device),
+                prepared.candidate_values,
+                prepared.candidate_offsets,
             ),
             self.policy.critic(reduced.cls),
             prepared.history_updates,
+            prepared.candidate_offsets,
         )
 
     def _step_optimizer(self, loss_weight: float) -> bool:
@@ -324,15 +332,45 @@ class BCTrainer:
         batch: BCDecisionBatch,
         totals: dict[str, float | int],
     ) -> float:
-        labels = batch.label_kind.to(self.device)
+        validated_masks = _validate_objective_inputs(
+            batch.candidate_values.size(0),
+            batch.candidate_offsets,
+            batch.label_kind,
+            batch.loss_mask,
+        )
+        candidate_values = batch.candidate_values
+        if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
+            raise ValueError("candidate_values must have shape (candidates, 2)")
+        if candidate_values.dtype != torch.long:
+            raise ValueError("candidate_values must use torch.long action ids")
+        if candidate_values.numel() and torch.any(
+            (candidate_values < 0) | (candidate_values >= self.policy.actor.act_size)
+        ):
+            raise ValueError("candidate action ids are outside the action contract")
+        exact_cpu, partial_cpu, _, labeled_cpu = validated_masks
+        exact_count = int(exact_cpu.sum())
+        partial_count = int(partial_cpu.sum())
+        labeled_count = int(labeled_cpu.sum())
+        loss_weight = float(batch.loss_mask.sum())
         loss_mask = batch.loss_mask.to(self.device)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            log_probs, value_predictions, history_updates = self._forward_batch(batch)
-        objective = compute_bc_objective(
+            log_probs, value_predictions, history_updates, candidate_offsets = self._forward_batch(
+                batch
+            )
+        exact = exact_cpu.to(self.device)
+        partial = partial_cpu.to(self.device)
+        labeled = labeled_cpu.to(self.device)
+        objective = _compute_bc_objective_unchecked(
             log_probs,
-            batch.candidate_offsets.to(self.device),
-            labels,
+            candidate_offsets,
             loss_mask,
+            exact,
+            partial,
+            labeled,
+            exact_count=exact_count,
+            partial_count=partial_count,
+            labeled_count=labeled_count,
+            loss_weight=loss_weight,
         )
         outcome = batch.outcome.to(self.device)
         decision_index = batch.decision_index.to(self.device)
@@ -343,7 +381,7 @@ class BCTrainer:
             torch.pow(gamma, (game_length - 1 - decision_index).to(outcome.dtype)) * outcome
         )
         value_error = value_predictions - value_targets
-        value_count = int(value_mask.sum().item())
+        value_count = int(batch.outcome_valid.sum())
         value_loss = (
             value_error.square()[value_mask].mean()
             if value_count
@@ -392,12 +430,12 @@ class BCTrainer:
             prepared = self._prepare_model_inputs(batch)
             encoded, action_mask = prepared.encoded, prepared.action_mask
             reduced = self._reduce(prepared)
-            candidate_offsets = batch.candidate_offsets.to(self.device)
+            candidate_offsets = prepared.candidate_offsets
             candidate_log_probs = self.policy.actor.score_reduced_candidates(
                 reduced,
                 encoded,
                 action_mask,
-                batch.candidate_values.to(self.device),
+                prepared.candidate_values,
                 candidate_offsets,
             )
             value_predictions = self.policy.critic(reduced.cls)

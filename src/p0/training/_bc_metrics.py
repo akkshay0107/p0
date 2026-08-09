@@ -183,6 +183,34 @@ def compute_bc_objective(
         label_kind,
         loss_mask,
     )
+    return _compute_bc_objective_unchecked(
+        candidate_log_probs,
+        candidate_offsets,
+        loss_mask,
+        exact,
+        partial,
+        labeled,
+        exact_count=int(exact.sum().item()),
+        partial_count=int(partial.sum().item()),
+        labeled_count=int(labeled.sum().item()),
+        loss_weight=float(loss_mask.sum().item()),
+    )
+
+
+def _compute_bc_objective_unchecked(
+    candidate_log_probs: Tensor,
+    candidate_offsets: Tensor,
+    loss_mask: Tensor,
+    exact: Tensor,
+    partial: Tensor,
+    labeled: Tensor,
+    *,
+    exact_count: int,
+    partial_count: int,
+    labeled_count: int,
+    loss_weight: float,
+) -> BCObjective:
+    """Compute the objective after the batch contract was validated at its boundary."""
     marginal_log_probs = _ragged_logsumexp(candidate_log_probs, candidate_offsets)
 
     # Selection avoids the undefined zero-times-negative-infinity result for UNKNOWN rows.
@@ -191,16 +219,11 @@ def compute_bc_objective(
         -marginal_log_probs * loss_mask,
         torch.zeros_like(marginal_log_probs),
     )
-    mask_total = loss_mask.sum()
-    labeled_count = int(labeled.sum().item())
-    loss_weight = float(mask_total.item())
-    exact_count = int(exact.sum().item())
-    partial_count = int(partial.sum().item())
     exact_nll = (-marginal_log_probs[exact]).sum() / max(exact_count, 1)
     partial_nll = (-marginal_log_probs[partial]).sum() / max(partial_count, 1)
 
     return BCObjective(
-        loss=per_decision_loss.sum() / mask_total.clamp_min(1.0),
+        loss=per_decision_loss.sum() / max(loss_weight, 1.0),
         exact_nll=exact_nll,
         partial_nll=partial_nll,
         marginal_log_probs=marginal_log_probs,

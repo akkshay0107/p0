@@ -595,7 +595,45 @@ class ActorPolicy(nn.Module):
         offsets = self._validated_offsets(enc, action_mask, candidate_values, candidate_offsets)
         return self._score_reduced(reduced, enc, action_mask, candidate_values, offsets)
 
+    def _score_reduced_candidates_unchecked(
+        self,
+        reduced: ReducerOutput,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> Tensor:
+        """Score candidates whose shard contract was validated before device transfer."""
+        _require_matching_batch(reduced, enc)
+        return self._score_reduced_unchecked(
+            reduced,
+            enc,
+            action_mask,
+            candidate_values,
+            candidate_offsets,
+        )
+
     def _score_reduced(
+        self,
+        reduced: ReducerOutput,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        candidate_values: Tensor,
+        offsets: Tensor,
+    ) -> Tensor:
+        if candidate_values.numel() == 0:
+            return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
+        if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
+            raise ValueError("candidate action ids are outside the action contract")
+        return self._score_reduced_unchecked(
+            reduced,
+            enc,
+            action_mask,
+            candidate_values,
+            offsets,
+        )
+
+    def _score_reduced_unchecked(
         self,
         reduced: ReducerOutput,
         enc: EncodedObs,
@@ -606,8 +644,6 @@ class ActorPolicy(nn.Module):
         batch_size = enc.tokens.size(0)
         if candidate_values.numel() == 0:
             return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
-        if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
-            raise ValueError("candidate action ids are outside the action contract")
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
         logits1, keys1 = self._compute_pointer_logits(
