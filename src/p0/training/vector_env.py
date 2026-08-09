@@ -48,17 +48,14 @@ class ThreadVecEnv:
         mask1 = np.reshape(obs[agent1]["action_mask"], (2, ACT_SIZE))
         mask2 = np.reshape(obs[agent2]["action_mask"], (2, ACT_SIZE)) if agent2 in obs else None
 
-        return env_id, mask1, mask2, info
+        return mask1, mask2, info
 
     def reset(self):
-        futures = [self.executor.submit(self._reset_env, i, env) for i, env in enumerate(self.envs)]
+        results = list(self.executor.map(self._reset_env, range(self.n_envs), self.envs))
 
-        results = [f.result() for f in futures]
-        results.sort(key=lambda x: x[0])  # r[0] is env_id
-
-        masks1 = np.stack([r[1] for r in results])
-        masks2 = np.stack([r[2] for r in results]) if results[0][2] is not None else None  # type: ignore
-        infos = [r[3] for r in results]
+        masks1 = np.stack([r[0] for r in results])
+        masks2 = np.stack([r[1] for r in results]) if results[0][1] is not None else None  # type: ignore
+        infos = [r[2] for r in results]
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
@@ -89,34 +86,30 @@ class ThreadVecEnv:
                 terminal_obs1 = self.obs1_buffers[env_id].clone()
                 terminal_obs2 = self.obs2_buffers[env_id].clone()
 
-            _, mask1, mask2, _ = self._reset_env(env_id, env)
+            mask1, mask2, _ = self._reset_env(env_id, env)
             info["series_id"] = env.series_id  # type: ignore
             info["series_complete"] = series_complete  # type: ignore
             info["terminal_observation1"] = terminal_obs1  # type: ignore
             info["terminal_observation2"] = terminal_obs2  # type: ignore
-            return env_id, mask1, mask2, reward1, reward2, done_status, info
+            return mask1, mask2, reward1, reward2, done_status, info
 
         info["series_id"] = env.series_id  # type: ignore
         info["series_complete"] = False  # type: ignore
-        return env_id, mask1, mask2, reward1, reward2, done_status, info
+        return mask1, mask2, reward1, reward2, done_status, info
 
     def step(self, actions: list[dict]):
-        futures = [
-            self.executor.submit(self._step_env, i, env, actions[i])
-            for i, env in enumerate(self.envs)
-        ]
+        if len(actions) != self.n_envs:
+            raise ValueError("Number of actions must match the number of environments")
+        results = list(self.executor.map(self._step_env, range(self.n_envs), self.envs, actions))
 
-        results = [f.result() for f in futures]
-        results.sort(key=lambda x: x[0])  # r[0] is env_id (guarantees order)
-
-        masks1 = np.stack([r[1] for r in results])
-        masks2 = np.stack([r[2] for r in results]) if results[0][2] is not None else None  # type: ignore
-        rewards1 = np.array([r[3] for r in results], dtype=np.float32)
-        rewards2 = np.array([r[4] for r in results], dtype=np.float32)
+        masks1 = np.stack([r[0] for r in results])
+        masks2 = np.stack([r[1] for r in results]) if results[0][1] is not None else None  # type: ignore
+        rewards1 = np.array([r[2] for r in results], dtype=np.float32)
+        rewards2 = np.array([r[3] for r in results], dtype=np.float32)
         # 0 running, 1 terminated, 2 truncated. A boolean array here would fold
         # truncation into termination and silently disable bootstrapping.
-        done_status = np.array([r[5] for r in results], dtype=np.int64)
-        infos = [r[6] for r in results]
+        done_status = np.array([r[4] for r in results], dtype=np.int64)
+        infos = [r[5] for r in results]
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2

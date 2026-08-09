@@ -198,6 +198,15 @@ def test_thread_vec_env_binds_each_env_to_its_preallocated_rows():
         vec_env.shutdown()
 
 
+def test_thread_vec_env_rejects_an_action_count_mismatch():
+    vec_env = ThreadVecEnv(cast(Any, [BufferBindingEnv(), BufferBindingEnv()]))
+    try:
+        with pytest.raises(ValueError, match="Number of actions"):
+            vec_env.step([{}])
+    finally:
+        vec_env.shutdown()
+
+
 def test_compute_gae_batch_matches_single_episode_reference():
     def compute_gae_reference(
         rewards: torch.Tensor,
