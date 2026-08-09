@@ -45,7 +45,6 @@ from p0.teams.team import (
     TeamMetadata,
     TeamRecord,
     deduplicate_variants,
-    validate_evidence_cutoff,
 )
 from p0.teams.validation import (
     AdmissionResult,
@@ -150,19 +149,6 @@ def test_team_record_serialization_round_trip_is_strict():
     )
     with pytest.raises(ValueError, match="fields"):
         TeamRecord.from_dict({**variant.to_dict(), "unexpected": True})
-
-
-def test_opponent_evidence_rejects_future_games():
-    validate_evidence_cutoff(
-        own_team=False, game_number=2, event_index=20, evidence_game=2, evidence_event=20
-    )
-    validate_evidence_cutoff(
-        own_team=True, game_number=1, event_index=0, evidence_game=3, evidence_event=99
-    )
-    with pytest.raises(ValueError, match="future"):
-        validate_evidence_cutoff(
-            own_team=False, game_number=1, event_index=10, evidence_game=1, evidence_event=11
-        )
 
 
 def _mock_vocab_team_corpus_build() -> dict[str, dict[str, int]]:

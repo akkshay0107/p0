@@ -274,13 +274,3 @@ def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ..
         deduped[hash_key] = replace(previous, metadata=metadata)
 
     return tuple(deduped[k] for k in sorted(deduped, key=lambda item: (item[0], repr(item[1]))))
-
-
-def validate_evidence_cutoff(
-    *, own_team: bool, game_number: int, event_index: int, evidence_game: int, evidence_event: int
-) -> None:
-    if min(event_index, evidence_game, evidence_event) < 0 or game_number < 1:
-        raise ValueError("Game numbers must be positive and evidence cutoffs nonnegative")
-
-    if not own_team and (evidence_game, evidence_event) > (game_number, event_index):
-        raise ValueError("Opponent Stat Point evidence cannot come from the future")
