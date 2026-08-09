@@ -763,7 +763,11 @@ def validate_artifact_runtime_contract(
     reference = artifact.get("global_contract_sha256")
     if not _is_sha256(reference):
         raise ValueError("Artifact has no valid global_contract_sha256 reference")
-    contract = load_active_global_contract(path)
+    manifest_path = Path(path)
+    if manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
+        # Preserve the explicit path guard and its error for unsupported manifests.
+        load_active_global_contract(manifest_path)
+    contract = active_global_contract()
     if reference != contract.global_sha256:
         raise ValueError(
             "Artifact global contract is incompatible with the active runtime: "
