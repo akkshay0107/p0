@@ -21,7 +21,7 @@ from p0.model.policy import PolicyNet
 from p0.rl_player import RLPlayer, TeamPlayerMixin
 from p0.runtime import poke_env_patches
 from p0.teams.corpus import CorpusSourceSpec, CorpusSplit
-from p0.teams.corpus_source import CorpusTeamSource
+from p0.teams.corpus_source import CorpusTeamPool, CorpusTeamSource
 from p0.teams.source import FixedTeamSource, TeamSource
 
 # Default Pikachu/Charizard test team used as fallback when no corpus is available
@@ -207,22 +207,33 @@ class EvaluationHarness:
         failures: dict[str, str] = {}
         if self.corpus_path is not None and self.corpus_path.exists() and self.corpus_hash:
             logger.info("Loading team splits from corpus manifest: %s", self.corpus_path)
-            for key, split in categories.items():
-                spec = CorpusSourceSpec(
-                    corpus_path=str(self.corpus_path),
-                    corpus_hash=self.corpus_hash,
-                    format_id=self.format_id,
-                    split=split,
-                )
-                try:
-                    sources[key] = CorpusTeamSource(spec)
-                    self.category_metadata[key] = {
-                        **dict(sources[key].describe()),
-                        "status": "ready",
-                        "fallback": False,
-                    }
-                except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
-                    failures[key] = str(exc)
+            base_spec = CorpusSourceSpec(
+                corpus_path=str(self.corpus_path),
+                corpus_hash=self.corpus_hash,
+                format_id=self.format_id,
+                split=CorpusSplit.TRAIN,
+            )
+            try:
+                pool = CorpusTeamPool.from_spec(base_spec)
+            except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+                failures = {key: str(exc) for key in categories}
+            else:
+                for key, split in categories.items():
+                    spec = CorpusSourceSpec(
+                        corpus_path=str(self.corpus_path),
+                        corpus_hash=self.corpus_hash,
+                        format_id=self.format_id,
+                        split=split,
+                    )
+                    try:
+                        sources[key] = CorpusTeamSource(spec, pool=pool)
+                        self.category_metadata[key] = {
+                            **dict(sources[key].describe()),
+                            "status": "ready",
+                            "fallback": False,
+                        }
+                    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+                        failures[key] = str(exc)
 
         else:
             failures = {key: "corpus manifest is unavailable" for key in categories}

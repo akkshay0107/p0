@@ -16,15 +16,40 @@ import orjson
 from p0.teams.corpus import (
     CorpusEntry,
     CorpusSourceSpec,
+    CorpusSplit,
+    TeamCorpusManifest,
     load_corpus_manifest,
 )
 from p0.teams.source import JsonScalar, ValidatedTeam
 
 
-class CorpusTeamSource:
-    """A load-time verified, corpus-backed team sampling source."""
+class CorpusTeamPool:
+    """One validated corpus manifest with immutable split and sampling views."""
 
-    def __init__(self, spec: CorpusSourceSpec) -> None:
+    def __init__(self, spec: CorpusSourceSpec, manifest: TeamCorpusManifest) -> None:
+        self._corpus_path = spec.corpus_path
+        self._corpus_hash = manifest.corpus_hash
+        self._format_id = manifest.format_id
+        entries_by_split: dict[CorpusSplit, tuple[CorpusEntry, ...]] = {}
+        canonical_pools_by_split: dict[CorpusSplit, tuple[tuple[CorpusEntry, ...], ...]] = {}
+        team_hashes_by_split: dict[CorpusSplit, tuple[str, ...]] = {}
+        for split in (CorpusSplit.TRAIN, CorpusSplit.VALIDATION, CorpusSplit.TEST):
+            entries = tuple(entry for entry in manifest.entries if entry.split is split)
+            by_canonical: dict[str, list[CorpusEntry]] = {}
+            for entry in entries:
+                by_canonical.setdefault(entry.canonical_hash, []).append(entry)
+            entries_by_split[split] = entries
+            canonical_pools_by_split[split] = tuple(
+                tuple(by_canonical[key]) for key in sorted(by_canonical)
+            )
+            team_hashes_by_split[split] = tuple(sorted(entry.packed_sha256 for entry in entries))
+        self._entries_by_split = entries_by_split
+        self._canonical_pools_by_split = canonical_pools_by_split
+        self._team_hashes_by_split = team_hashes_by_split
+
+    @classmethod
+    def from_spec(cls, spec: CorpusSourceSpec) -> CorpusTeamPool:
+        """Load and validate one manifest for one or more split-specific sources."""
         path = Path(spec.corpus_path)
         if not path.exists():
             raise FileNotFoundError(f"Corpus manifest file not found: {path}")
@@ -35,42 +60,54 @@ class CorpusTeamSource:
             raise ValueError(f"Malformed corpus manifest file: {path}") from exc
 
         manifest = load_corpus_manifest(raw_data)
+        pool = cls(spec, manifest)
+        pool.validate_spec(spec)
+        return pool
 
-        if manifest.corpus_hash != spec.corpus_hash:
+    def validate_spec(self, spec: CorpusSourceSpec) -> None:
+        if spec.corpus_path != self._corpus_path:
+            raise ValueError("Corpus source specs must share one manifest path")
+        if spec.corpus_hash != self._corpus_hash:
             raise ValueError(
-                f"Corpus hash does not match: declared={spec.corpus_hash}, actual={manifest.corpus_hash}"
+                f"Corpus hash does not match: declared={spec.corpus_hash}, actual={self._corpus_hash}"
             )
-        if manifest.format_id != spec.format_id:
+        if spec.format_id != self._format_id:
             raise ValueError(
-                f"Format ID mismatch: declared={spec.format_id}, actual={manifest.format_id}"
+                f"Format ID mismatch: declared={spec.format_id}, actual={self._format_id}"
             )
 
-        filtered = [entry for entry in manifest.entries if entry.split == spec.split]
+    def entries(self, split: CorpusSplit) -> tuple[CorpusEntry, ...]:
+        return self._entries_by_split[split]
 
-        if not filtered:
+    def canonical_pools(self, split: CorpusSplit) -> tuple[tuple[CorpusEntry, ...], ...]:
+        return self._canonical_pools_by_split[split]
+
+    def team_hashes(self, split: CorpusSplit) -> tuple[str, ...]:
+        return self._team_hashes_by_split[split]
+
+
+class CorpusTeamSource:
+    """A load-time verified, corpus-backed team sampling source."""
+
+    def __init__(self, spec: CorpusSourceSpec, *, pool: CorpusTeamPool | None = None) -> None:
+        if pool is None:
+            pool = CorpusTeamPool.from_spec(spec)
+        else:
+            pool.validate_spec(spec)
+        entries = pool.entries(spec.split)
+        if not entries:
             raise ValueError(f"No corpus entries match split={spec.split.name}")
 
         self._spec = spec
-        self._entries = tuple(filtered)
-        self._by_canonical: dict[str, list[CorpusEntry]] | None = None
-        self._canonical_keys: tuple[str, ...] | None = None
-
-    def _get_canonical_index(self) -> tuple[dict[str, list[CorpusEntry]], tuple[str, ...]]:
-        if self._by_canonical is None or self._canonical_keys is None:
-            by_canonical: dict[str, list[CorpusEntry]] = {}
-            for entry in self._entries:
-                by_canonical.setdefault(entry.canonical_hash, []).append(entry)
-            self._by_canonical = by_canonical
-            self._canonical_keys = tuple(sorted(by_canonical.keys()))
-        return self._by_canonical, self._canonical_keys
+        self._entries = entries
+        self._canonical_pools = pool.canonical_pools(spec.split)
+        self._team_hashes = pool.team_hashes(spec.split)
 
     def _sample_entry(
         self,
         rng: random.Random,
     ) -> CorpusEntry:
-        by_canonical, canonical_keys = self._get_canonical_index()
-        chosen_canonical = rng.choice(canonical_keys)
-        return rng.choice(by_canonical[chosen_canonical])
+        return rng.choice(rng.choice(self._canonical_pools))
 
     def sample(self, rng: random.Random) -> ValidatedTeam:
         """Return a single validated team sampled uniformly by canonical team."""
@@ -87,5 +124,5 @@ class CorpusTeamSource:
             "split": self._spec.split.name,
             "sampling": "uniform_canonical",
             "pool_size": len(self._entries),
-            "team_hashes": tuple(sorted({entry.packed_sha256 for entry in self._entries})),
+            "team_hashes": self._team_hashes,
         }

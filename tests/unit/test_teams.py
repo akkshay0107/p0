@@ -554,7 +554,7 @@ def test_uniform_canonical_sampling(tmp_path: Path) -> None:
 
 
 def test_uniform_sampling_index(tmp_path: Path) -> None:
-    # Uniform canonical sampling builds its canonical index at construction time.
+    # Uniform canonical sampling builds its immutable pools at construction time.
     e1 = _make_entry(1, canonical_index=1, usage_count=100)
     e2 = _make_entry(2, canonical_index=2, usage_count=100)
     path, manifest = _write_manifest(tmp_path, (e1, e2))
@@ -565,12 +565,9 @@ def test_uniform_sampling_index(tmp_path: Path) -> None:
         split=CorpusSplit.TRAIN,
     )
     source = CorpusTeamSource(spec)
-    assert source._by_canonical is None
+    assert len(source._canonical_pools) == 2
     rng = random.Random(700)
     assert source.sample(rng) is not None
-    assert source._by_canonical is not None
-    assert source._canonical_keys is not None
-    assert len(source._canonical_keys) == 2
 
 
 TEAM = """
