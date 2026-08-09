@@ -68,8 +68,7 @@ def fetch_usage_export(month: str, format_id: str, cutoff: int, destination: Pat
 def _read_chaos(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(
-            f"Usage export not found: {path}. Re-download it with "
-            "'python -m p0.cli.build_spreads --fetch'."
+            f"Usage export not found: {path}. Re-download it with 'p0-build-spreads --fetch'."
         )
     try:
         return orjson.loads(path.read_bytes())

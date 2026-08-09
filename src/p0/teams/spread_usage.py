@@ -434,7 +434,7 @@ def load_spread_table_file(path: Path = DEFAULT_SPREAD_TABLE_PATH) -> SpreadTabl
     """
     if not path.exists():
         raise FileNotFoundError(
-            f"Spread table not found: {path}. Build it with 'python -m p0.cli.build_spreads'."
+            f"Spread table not found: {path}. Build it with 'p0-build-spreads'."
         )
     try:
         payload = orjson.loads(path.read_bytes())

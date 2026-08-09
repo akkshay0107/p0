@@ -188,7 +188,8 @@ uv run python bench/benchmark_memory_channel.py --batch-size 8 --iterations 20
 ```
 
 The installed command-line interfaces include `p0-train`, `p0-bc`, `p0-replays`,
-`p0-play`, `p0-build-vocab`, and `p0-export-training`.
+`p0-corpus`, `p0-eval`, `p0-play`, `p0-build-vocab`, `p0-build-spreads`, and
+`p0-export-training`.
 
 ---
 
