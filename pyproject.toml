@@ -63,7 +63,7 @@ torch = [
 venvPath = "."
 venv = ".venv"
 reportPrivateImportUsage = false
-include = ["src/p0", "tests"]
+include = ["src/p0", "tests/unit", "tests/integration"]
 
 [tool.ruff]
 line-length = 100
@@ -72,8 +72,8 @@ line-length = 100
 select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.pytest.ini_options]
-addopts = "-m 'not integration and not network and not stress'"
-testpaths = ["tests"]
+addopts = "-m 'not network and not stress'"
+testpaths = ["tests/unit", "tests/integration"]
 markers = [
     "integration: requires a built local Showdown server",
     "network: requires access to the public replay endpoint",

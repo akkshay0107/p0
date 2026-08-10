@@ -16,6 +16,7 @@ from p0.battle.events import EVENT_DIAGNOSTICS, BattleEvent, truncate_events
 from p0.battle.views import BattleView, MoveView, PokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
+    CAT_IDX_NATURE,
     CAT_IDX_STATUS_COUNTER_KIND,
     CAT_KNOWNNESS_START,
     CATEGORICAL_WIDTH,
@@ -26,11 +27,17 @@ from p0.model.structured_observation import (
     MAX_EFFECTS,
     MOVE_SLOTS,
     NUM_IDX_CAN_MEGA,
+    NUM_IDX_CAN_SWITCH_OUT,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
     NUM_IDX_HP_FRACTION,
     NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_LEVEL_STATS,
+    NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_PREPARING,
+    NUM_IDX_REVEALED,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    NUM_IDX_STAT_PROVENANCE,
     NUM_IDX_STATUS_COUNTER,
     NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
@@ -455,7 +462,7 @@ def _pokemon_categorical_into(
             row[9 + i] = tok.move_type_id(move)
             row[13 + i] = tok.move_category_id(move)
     row[17] = tok.status_id(pokemon.status)
-    row[24] = tok.nature_id(pokemon)
+    row[CAT_IDX_NATURE] = tok.nature_id(pokemon)
     row[CAT_IDX_STATUS_COUNTER_KIND] = _status_counter_kind(pokemon.status)
     values = (
         pokemon.species or pokemon.base_species,
@@ -470,7 +477,7 @@ def _pokemon_categorical_into(
     )
     for index, value in enumerate(values):
         row[CAT_KNOWNNESS_START + index] = _knownness(value, int(row[index]))
-    row[CAT_KNOWNNESS_START + 24] = _knownness(pokemon.nature, int(row[24]))
+    row[CAT_KNOWNNESS_START + CAT_IDX_NATURE] = _knownness(pokemon.nature, int(row[CAT_IDX_NATURE]))
 
 
 def _ally_legality(
@@ -576,30 +583,22 @@ def _pokemon_numeric_into(
 
     row[NUM_IDX_STATUS_COUNTER] = min(pokemon.status_counter, 5) / 5.0
 
-    row[42] = pokemon.preparing
+    row[NUM_IDX_PREPARING] = pokemon.preparing
 
     level_stats, stat_provenance = _get_pokemon_level_stats(pokemon, is_opponent, precomputed_stats)
-    row[43] = level_stats[0] / 300.0
-    row[44] = level_stats[1] / 300.0
-    row[45] = level_stats[2] / 300.0
-    row[46] = level_stats[3] / 300.0
-    row[47] = level_stats[4] / 300.0
-    row[48] = level_stats[5] / 300.0
-    row[49] = float(stat_provenance == Provenance.SELF_KNOWN)
+    row[NUM_IDX_LEVEL_STATS : NUM_IDX_LEVEL_STATS + 6] = [stat / 300.0 for stat in level_stats]
+    row[NUM_IDX_STAT_PROVENANCE] = float(stat_provenance == Provenance.SELF_KNOWN)
     row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = stat_provenance
 
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
     if active_idx is not None and not is_opponent and not battle.teampreview:
         move_legal, can_switch_out, legality_known = _ally_legality(battle, active_idx, move_slots)
-        row[50] = move_legal[0]
-        row[51] = move_legal[1]
-        row[52] = move_legal[2]
-        row[53] = move_legal[3]
-        row[54] = can_switch_out
+        row[NUM_IDX_MOVE_LEGAL : NUM_IDX_MOVE_LEGAL + MOVE_SLOTS] = move_legal
+        row[NUM_IDX_CAN_SWITCH_OUT] = can_switch_out
         row[NUM_IDX_LEGALITY_UNKNOWN] = float(not legality_known)
 
-    row[55] = pokemon.revealed
+    row[NUM_IDX_REVEALED] = pokemon.revealed
 
 
 def _global_field_token_into(

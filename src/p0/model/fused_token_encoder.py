@@ -16,6 +16,7 @@ from p0.model.architecture_contract import EVENT_RAW_WIDTH, POOLED_EVENT_COUNT
 from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_NATURE,
     CAT_IDX_STATUS,
     CAT_IDX_STATUS_COUNTER_KIND,
     CAT_KNOWNNESS_START,
@@ -474,7 +475,7 @@ class FusedTokenEncoder(nn.Module):
             )
         )
 
-        nature = self.nature_proj(self.nature_emb(categorical[..., 24]))
+        nature = self.nature_proj(self.nature_emb(categorical[..., CAT_IDX_NATURE]))
 
         effects = self._embed_typed_effects(categorical, numerical)
         scalars = self.pokemon_scalar_proj(numerical[..., self._pokemon_scalar_idx])

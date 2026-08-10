@@ -28,18 +28,19 @@ TEAM_SIZE = 6
 MOVE_SLOTS = 4
 MAX_EFFECTS = 12
 SEQUENCE_LENGTH = OBSERVATION_ENTITY_COUNT
-POKEMON_IDENTITY_WIDTH = 25
+POKEMON_IDENTITY_WIDTH = 19
 CAT_IDX_STATUS = 17
-CAT_KNOWNNESS_START = 25
+CAT_IDX_NATURE = 18
+CAT_KNOWNNESS_START = 19
 CAT_KNOWNNESS_WIDTH = POKEMON_IDENTITY_WIDTH
 CAT_IDX_STATUS_COUNTER_KIND = CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
 CAT_EFFECT_START = CAT_IDX_STATUS_COUNTER_KIND + 1
 EFFECT_CATEGORICAL_WIDTH = 3
 CATEGORICAL_WIDTH = CAT_EFFECT_START + MAX_EFFECTS * EFFECT_CATEGORICAL_WIDTH
 
-NUM_BASE_WIDTH = 59
+NUM_BASE_WIDTH = 54
 NUM_PROVENANCE_START = NUM_BASE_WIDTH
-NUM_PROVENANCE_WIDTH = 8
+NUM_PROVENANCE_WIDTH = 6
 NUM_EFFECT_START = NUM_PROVENANCE_START + NUM_PROVENANCE_WIDTH
 EFFECT_NUMERICAL_WIDTH = 5
 NUM_IDX_EFFECT_COUNT = NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
@@ -69,14 +70,17 @@ NUM_IDX_FAINTED = 27
 NUM_IDX_CAN_MEGA = 30  # active allies only, request-derived like the legality columns
 NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot "was the last move used" (MoveRecord dynamic)
 NUM_IDX_STATUS_COUNTER = 36  # StatusRecord dynamic (turns asleep / toxic stage)
-NUM_IDX_MOVE_LEGAL = 50  # 50-53: per-move-slot "legal this step" (MoveRecord dynamic)
-NUM_IDX_CAN_SWITCH_OUT = 54  # active allies only
-NUM_IDX_REVEALED = 55  # has appeared on the field this battle
+NUM_IDX_PREPARING = 37
+NUM_IDX_LEVEL_STATS = 38  # 38-43: level-50 derived stats
+NUM_IDX_STAT_PROVENANCE = 44
+NUM_IDX_MOVE_LEGAL = 45  # 45-48: per-move-slot "legal this step" (MoveRecord dynamic)
+NUM_IDX_CAN_SWITCH_OUT = 49  # active allies only
+NUM_IDX_REVEALED = 50  # has appeared on the field this battle
 # Legality provenance. A data source that cannot prove a decision's legality (a public
 # replay carries no `|request|`) writes zeros into the legality columns above and raises
 # these gates instead, so "unknown" never masquerades as a proven "illegal".
-NUM_IDX_LEGALITY_UNKNOWN = 56  # this row's move-legal / can-switch-out / can-mega are unproven
-NUM_IDX_SLOT_LEGALITY_UNKNOWN = 57  # 57-58: per-active-slot gate, ally side token only
+NUM_IDX_LEGALITY_UNKNOWN = 51  # this row's move-legal / can-switch-out / can-mega are unproven
+NUM_IDX_SLOT_LEGALITY_UNKNOWN = 52  # 52-53: per-active-slot gate, ally side token only
 
 
 ALLY_POKE_TOKENS = (0, 1, 2, 3, 4, 5)
@@ -141,6 +145,7 @@ def _observation_layout_descriptor() -> dict[str, object]:
         "pokemon_identity_width": POKEMON_IDENTITY_WIDTH,
         "categorical": {
             "status": CAT_IDX_STATUS,
+            "nature": CAT_IDX_NATURE,
             "knownness_start": CAT_KNOWNNESS_START,
             "knownness_width": CAT_KNOWNNESS_WIDTH,
             "status_counter_kind": CAT_IDX_STATUS_COUNTER_KIND,
@@ -184,6 +189,9 @@ def _observation_layout_descriptor() -> dict[str, object]:
             "can_mega": NUM_IDX_CAN_MEGA,
             "move_last": NUM_IDX_MOVE_LAST,
             "status_counter": NUM_IDX_STATUS_COUNTER,
+            "preparing": NUM_IDX_PREPARING,
+            "level_stats": NUM_IDX_LEVEL_STATS,
+            "stat_provenance": NUM_IDX_STAT_PROVENANCE,
             "move_legal": NUM_IDX_MOVE_LEGAL,
             "can_switch_out": NUM_IDX_CAN_SWITCH_OUT,
             "revealed": NUM_IDX_REVEALED,

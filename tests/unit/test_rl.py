@@ -425,6 +425,31 @@ def test_completed_batch_prepares_returns_advantages_and_chunks():
     assert prepared[0].advantages is not None
 
 
+def test_completed_batch_only_moves_ppo_inputs_to_target_device():
+    batch = TrajectoryBatch(
+        observations=StructuredObservation.empty_batch(1),
+        action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
+        actions=torch.zeros((1, 2), dtype=torch.long),
+        log_probs=torch.zeros(1),
+        values=torch.zeros(1),
+        rewards=torch.ones(1),
+        dones=torch.ones(1),
+        length=1,
+    )
+
+    prepared = prepare_trajectory_batches(
+        [batch], torch.device("meta"), gamma=0.99, gae_lambda=0.95
+    )
+    result = prepared[0]
+
+    assert result.observations.categorical.device.type == "meta"
+    assert result.returns is not None and result.returns.device.type == "meta"
+    assert result.advantages is not None and result.advantages.device.type == "meta"
+    assert result.values.device.type == "cpu"
+    assert result.rewards.device.type == "cpu"
+    assert result.dones.device.type == "cpu"
+
+
 def test_action_validation_rejects_orders_outside_battle_order_space():
     valid_order = PassBattleOrder()
     battle = cast(

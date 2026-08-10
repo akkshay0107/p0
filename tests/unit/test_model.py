@@ -22,6 +22,7 @@ from p0.model.resources import default_runtime_resources
 from p0.model.series_context import DynamicSeriesResampler
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_NATURE,
     CAT_IDX_STATUS_COUNTER_KIND,
     CAT_KNOWNNESS_START,
     CAT_KNOWNNESS_WIDTH,
@@ -184,9 +185,9 @@ def test_nature_embedding_correctness(policy_net):
 
     # Create dummy categorical tensors with different natures
     cat1 = torch.zeros((1, CATEGORICAL_WIDTH), dtype=torch.long)
-    cat1[0, 24] = 5  # arbitrary nature ID
+    cat1[0, CAT_IDX_NATURE] = 5  # arbitrary nature ID
     cat2 = torch.zeros((1, CATEGORICAL_WIDTH), dtype=torch.long)
-    cat2[0, 24] = 12  # different nature ID
+    cat2[0, CAT_IDX_NATURE] = 12  # different nature ID
     num = torch.zeros((1, NUMERICAL_WIDTH))
 
     out1 = encoder._embed_pokemon_super(cat1, num)
@@ -558,6 +559,58 @@ def test_ppo_updates_all_policy_paths(dummy_obs):
     )
 
 
+def test_ppo_caches_magnet_logits_for_repeated_epochs(dummy_obs, monkeypatch):
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
+    magnet = Magnet(policy)
+    episode = TrajectoryBatch(
+        observations=dummy_obs[0].unsqueeze(0),
+        actions=torch.tensor([[1, 2]], dtype=torch.long),
+        log_probs=torch.zeros(1),
+        values=torch.zeros(1),
+        rewards=torch.zeros(1),
+        dones=torch.ones(1),
+        action_masks=torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
+        returns=torch.zeros(1),
+        advantages=torch.ones(1),
+        length=1,
+    )
+
+    calls = 0
+    original_score = magnet.policy.actor.score
+
+    def counted_score(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_score(*args, **kwargs)
+
+    monkeypatch.setattr(magnet.policy.actor, "score", counted_score)
+    cache: dict[int, torch.Tensor] = {}
+    config = TrainingConfig(enable_optim=False)
+
+    _run_batched_ppo(
+        [episode],
+        policy,
+        magnet,
+        config,
+        policy.device,
+        episode=0,
+        alpha=config.magnet_alpha,
+        magnet_cache=cache,
+    )
+    _run_batched_ppo(
+        [episode],
+        policy,
+        magnet,
+        config,
+        policy.device,
+        episode=0,
+        alpha=config.magnet_alpha,
+        magnet_cache=cache,
+    )
+    assert calls == 1
+    assert list(cache) == [id(episode)]
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
 
@@ -894,6 +947,8 @@ def _policy():
 def test_fixed_memory_and_observation_contract() -> None:
     observation = StructuredObservation.empty_batch(2)
     assert SEQUENCE_LENGTH == 15
+    assert CATEGORICAL_WIDTH == 75
+    assert NUMERICAL_WIDTH == 122
     assert EVENT_COUNT == 64
     assert observation.token_type_ids.shape == (2, 15)
     assert observation.events_num.shape == (2, 64, EVENT_NUMERICAL_WIDTH)

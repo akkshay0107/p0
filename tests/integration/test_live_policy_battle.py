@@ -18,7 +18,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.rl_player import RLPlayer
 from p0.runtime import poke_env_patches
 from p0.teams.source import FixedTeamSource
-from tests.stress._helpers import capture_showdown_decisions, stress_count
+from tests.integration.helpers import capture_showdown_decisions, integration_count
 
 TEAM = """
 Pikachu @ Light Ball
@@ -160,7 +160,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
 async def test_observed_showdown_orders_round_trip_to_recorded_actions(showdown_server) -> None:
     decisions = await capture_showdown_decisions(
         showdown_server,
-        game_count=stress_count("P0_STRESS_ACTION_GAMES", 2),
+        game_count=integration_count("P0_INTEGRATION_ACTION_GAMES", 2),
     )
     assert decisions
 
@@ -174,7 +174,7 @@ async def test_observed_showdown_orders_round_trip_to_recorded_actions(showdown_
 async def test_showdown_order_sets_remain_nonempty_across_many_requests(showdown_server) -> None:
     decisions = await capture_showdown_decisions(
         showdown_server,
-        game_count=stress_count("P0_STRESS_ACTION_GAMES", 2),
+        game_count=integration_count("P0_INTEGRATION_ACTION_GAMES", 2),
     )
     assert decisions
     assert all(decision.legal_joint_actions for decision in decisions)
@@ -242,7 +242,7 @@ async def test_policy_handles_showdown_captured_batches(
 async def test_live_capture_captures_decisions_across_repeated_games(showdown_server) -> None:
     decisions = await capture_showdown_decisions(
         showdown_server,
-        game_count=stress_count("P0_STRESS_SELF_PLAY_GAMES", 2),
+        game_count=integration_count("P0_INTEGRATION_SELF_PLAY_GAMES", 2),
         max_concurrent_battles=2,
     )
     assert decisions

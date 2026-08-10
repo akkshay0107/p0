@@ -176,6 +176,9 @@ uv run pytest -q
 uv build
 ```
 
+The default pytest command runs unit and local integration tests. Network and
+stress suites are opt-in and must be selected explicitly.
+
 The BC `batch_decisions` setting is an explicit target-window budget. Each window
 recomputes its local context under current weights before updating, while retaining
 past-only context and the fixed 48-decision cap. BC, PPO, evaluation, and play use

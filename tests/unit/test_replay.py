@@ -58,7 +58,7 @@ from p0.replays.scrape import (
 )
 from p0.replays.shards import load_shard_manifest
 from p0.teams.stat_points import BaseStats, StatPoints, calculate_stats
-from tests.stress.replay_fixtures import golden_replay_payload
+from tests.unit.replay_fixtures import golden_replay_payload
 
 
 def _payload_replay_dataset(replay_id: str, parent: str = "series-1") -> dict[str, object]:

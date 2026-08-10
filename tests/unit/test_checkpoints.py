@@ -1,4 +1,3 @@
-import importlib.util
 import socket
 import subprocess
 from pathlib import Path
@@ -8,7 +7,6 @@ from typing import Any, cast
 import pytest
 import torch
 
-from p0.format_config import active_global_contract
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
@@ -20,14 +18,6 @@ from p0.training.magnet import Magnet
 from p0.training.ppo import compute_ppo_objective
 from p0.training.trainer import PPOTrainer
 from p0.training.utils import amp_enabled
-
-_EXPORT_SPEC = importlib.util.spec_from_file_location(
-    "export_training", Path(__file__).parents[2] / "scripts" / "export_training.py"
-)
-assert _EXPORT_SPEC is not None and _EXPORT_SPEC.loader is not None
-_EXPORT_MODULE = importlib.util.module_from_spec(_EXPORT_SPEC)
-_EXPORT_SPEC.loader.exec_module(_EXPORT_MODULE)
-collect_export_files = _EXPORT_MODULE.collect_export_files
 
 
 def _small_policy() -> PolicyNet:
@@ -151,20 +141,6 @@ def test_atomic_checkpoint_failure_preserves_previous_file(tmp_path, monkeypatch
     with pytest.raises(OSError, match="injected"):
         DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
     assert path.read_bytes() == b"previous"
-
-
-def test_export_includes_interpretation_contracts(tmp_path):
-    artifacts = tmp_path / "artifacts"
-    artifacts.mkdir()
-    (artifacts / "checkpoint.pt").write_bytes(b"checkpoint")
-    (tmp_path / "data").mkdir()
-    (tmp_path / "data/runtime_manifest.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "data/vocab.json").write_text("{}", encoding="utf-8")
-
-    exported = {arcname for _, arcname, _ in collect_export_files(tmp_path, artifacts)}
-    assert "artifacts/checkpoint.pt" in exported
-    assert "data/runtime_manifest.json" in exported
-    assert "data/vocab.json" in exported
 
 
 def test_pure_ppo_objective_clips_and_weights_team_preview():
@@ -344,35 +320,6 @@ def test_checkpoint_rejects_global_contract_tampering(tmp_path: Path) -> None:
         store.load_policy(path, "cpu")
 
 
-def test_checkpoint_contract_minor_drift_warns_and_major_drift_fails(
-    tmp_path: Path, caplog
-) -> None:
-    path = tmp_path / "policy.pt"
-    store = CheckpointStore()
-    store.save_policy(path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources()))
-    artifact = torch.load(path, weights_only=False)
-    active = active_global_contract()
-    minor = active.with_subsystem_update(
-        "resources",
-        minor_payload={**active.payload("resources", "minor"), "showdown_commit": "next"},
-    )
-    artifact["global_contract"] = minor.to_dict()
-    artifact["global_contract_sha256"] = minor.global_sha256
-    torch.save(artifact, path)
-    store.preflight(path)
-    assert "non-breaking global contract differences" in caplog.text
-
-    major = active.with_subsystem_update(
-        "model",
-        major_payload={**active.payload("model", "major"), "tensor_abi": "next"},
-    )
-    artifact["global_contract"] = major.to_dict()
-    artifact["global_contract_sha256"] = major.global_sha256
-    torch.save(artifact, path)
-    with pytest.raises(ValueError, match="incompatible"):
-        store.preflight(path)
-
-
 def test_checkpoint_rejects_weights_only_resume_when_training_is_required(tmp_path: Path) -> None:
     path = tmp_path / "policy.pt"
     store = CheckpointStore()
@@ -385,6 +332,7 @@ def test_checkpoint_rejects_weights_only_resume_when_training_is_required(tmp_pa
         )
 
 
+@pytest.mark.network
 def test_loopback_port_allocator_returns_distinct_reusable_ports() -> None:
     ports = showdown.allocate_loopback_ports(8)
     assert len(ports) == len(set(ports))

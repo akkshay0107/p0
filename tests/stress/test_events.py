@@ -8,7 +8,7 @@ from p0.battle.events import (
 )
 from p0.model.tokenizer import tokenizer
 from tests.stress._helpers import stress_repetitions, stress_rng
-from tests.stress.replay_fixtures import golden_raw_events
+from tests.unit.replay_fixtures import golden_raw_events
 
 
 @pytest.mark.stress

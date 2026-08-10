@@ -169,6 +169,55 @@ def _build_memory_inputs(
     )
 
 
+def _compute_magnet_logits(
+    episodes: Sequence[TrajectoryBatch],
+    magnet: Magnet,
+    config: TrainingConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute frozen-policy logits without retaining intermediate tensors."""
+    observations = StructuredObservation.cat([episode.observations for episode in episodes], dim=0)
+    action_masks = torch.cat([episode.action_masks for episode in episodes], dim=0)
+    actions = torch.cat([episode.actions for episode in episodes], dim=0)
+
+    with (
+        torch.inference_mode(),
+        autocast(
+            device_type=device.type,
+            enabled=amp_enabled(config, device),
+        ),
+    ):
+        encoded = magnet.policy.encode(observations, action_masks)
+        memory = _build_memory_inputs(magnet.policy, encoded, list(episodes), device)
+        logits, _, _, _ = magnet.policy.actor.score(
+            encoded,
+            action_masks,
+            actions,
+            *memory,
+        )
+    return logits.detach()
+
+
+def _cached_magnet_logits(
+    episodes: Sequence[TrajectoryBatch],
+    magnet: Magnet,
+    config: TrainingConfig,
+    device: torch.device,
+    cache: dict[int, torch.Tensor],
+) -> torch.Tensor:
+    """Return GPU-resident magnet logits, computing each trajectory once per update."""
+    missing = [episode for episode in episodes if id(episode) not in cache]
+    if missing:
+        logits = _compute_magnet_logits(missing, magnet, config, device)
+        offset = 0
+        for episode in missing:
+            end = offset + episode.length
+            cache[id(episode)] = logits[offset:end]
+            offset = end
+
+    return torch.cat([cache[id(episode)] for episode in episodes], dim=0)
+
+
 def _run_batched_ppo(
     episodes: list[TrajectoryBatch],
     policy: PolicyNet,
@@ -177,6 +226,7 @@ def _run_batched_ppo(
     device: torch.device,
     episode: int,
     alpha: float,
+    magnet_cache: dict[int, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float], int]:
     """Evaluate one PPO minibatch with one reducer pass per decision.
 
@@ -217,12 +267,16 @@ def _run_batched_ppo(
     returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None])
 
     live_memory = _build_memory_inputs(policy, all_enc, episodes, device)
-    magnet_enc: EncodedObs | None = None
-    magnet_memory: tuple[torch.Tensor, ...] | None = None
-
-    with torch.inference_mode(), autocast(device_type=device.type, enabled=use_amp):
-        magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
-        magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
+    if magnet_cache is None:
+        magnet_logits = _compute_magnet_logits(episodes, magnet, config, device)
+    else:
+        magnet_logits = _cached_magnet_logits(
+            episodes,
+            magnet,
+            config,
+            device,
+            magnet_cache,
+        )
 
     total_loss = torch.tensor(0.0, device=device)
     # Keep reductions on-device until the update-level aggregation below.
@@ -241,15 +295,6 @@ def _run_batched_ppo(
             actions,
             *live_memory,
         )
-        if magnet_enc is None or magnet_memory is None:
-            raise RuntimeError("magnet evaluation inputs were not prepared")
-        with torch.inference_mode():
-            magnet_logits, _, _, _ = magnet.policy.actor.score(
-                magnet_enc,
-                all_action_masks,
-                actions,
-                *magnet_memory,
-            )
         magnet_kl = magnet_kl_per_step(out.logits, magnet_logits)
         step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = compute_ppo_objective(
             out.log_probs,
@@ -320,15 +365,24 @@ def ppo_update(
     policy.train()
     t0 = time.time()
 
-    with torch.no_grad():
-        all_returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None])
-        all_values = torch.cat([ep.values for ep in episodes])
-        var_y = torch.var(all_returns)
-        if var_y > 1e-8:
-            explained_var = 1.0 - torch.var(all_returns - all_values) / var_y
-        else:
-            explained_var = torch.tensor(0.0)
-        explained_var = explained_var.item()
+    explained_variances = {
+        episode.explained_variance for episode in episodes if episode.explained_variance is not None
+    }
+    if explained_variances:
+        if len(explained_variances) != 1:
+            raise ValueError("Prepared trajectories must share one explained-variance metric")
+        explained_var = explained_variances.pop()
+    else:
+        with torch.no_grad():
+            all_returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None])
+            all_values = torch.cat([ep.values for ep in episodes])
+            var_y = torch.var(all_returns, unbiased=False)
+            if var_y > 1e-8:
+                explained_var = float(
+                    (1.0 - torch.var(all_returns - all_values, unbiased=False) / var_y).item()
+                )
+            else:
+                explained_var = 0.0
 
     tot_policy_loss = 0.0
     tot_value_loss = 0.0
@@ -341,6 +395,7 @@ def ppo_update(
     num_updates = 0
     num_skipped = 0
     epochs_done = 0
+    magnet_cache: dict[int, torch.Tensor] = {}
 
     effective_batch_size = config.minibatch_size * (
         (config.batch_size + config.minibatch_size - 1) // config.minibatch_size
@@ -380,7 +435,14 @@ def ppo_update(
                 chunk.sort(key=lambda ep: ep.length, reverse=True)
 
                 batch_loss, batch_metrics, batch_steps = _run_batched_ppo(
-                    chunk, policy, magnet, config, policy.device, episode, alpha
+                    chunk,
+                    policy,
+                    magnet,
+                    config,
+                    policy.device,
+                    episode,
+                    alpha,
+                    magnet_cache,
                 )
 
                 tot_policy_loss += batch_metrics["policy_loss"]
@@ -451,6 +513,10 @@ def ppo_update(
         tot_steps += epoch_steps
         tot_kl_div += epoch_kl
         epochs_done += 1
+
+    # No subsequent work consumes these gradients. Clear the final minibatch's
+    # gradient storage before the next rollout begins.
+    optimizer.zero_grad(set_to_none=True)
 
     if epochs_done == 0 or tot_steps == 0:
         return {

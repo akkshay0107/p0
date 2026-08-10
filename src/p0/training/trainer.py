@@ -65,7 +65,12 @@ class PPOTrainer:
                 logging.warning("No trajectories collected, skipping update")
                 completed_episode = episode + 1
                 continue
-            stats = self.updater.update(trajectories, episode, alpha)
+            trajectory_count = len(trajectories)
+            try:
+                stats = self.updater.update(trajectories, episode, alpha)
+            finally:
+                # The next rollout does not need the previous update's GPU copies.
+                del trajectories
             if (episode + 1) % refresh_interval == 0:
                 self.magnet.refresh(self.policy)
                 logging.info(f"Refreshed magnet at episode {episode + 1}")
@@ -76,7 +81,7 @@ class PPOTrainer:
                 {
                     "rollout_seconds": rollout_seconds,
                     "learning_rate": float(self.updater.optimizer.param_groups[0]["lr"]),
-                    "trajectory_count": float(len(trajectories)),
+                    "trajectory_count": float(trajectory_count),
                 }
             )
             self.metric_sink(metrics, episode + 1, "train")

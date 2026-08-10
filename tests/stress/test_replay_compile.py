@@ -8,7 +8,7 @@ import torch
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.shards import validate_shard_tensors
 from tests.stress._helpers import stress_count, stress_rng
-from tests.stress.replay_fixtures import golden_replay_payload, golden_series_id
+from tests.unit.replay_fixtures import golden_replay_payload, golden_series_id
 
 
 def _compile_payloads(count: int) -> tuple[dict[str, Any], ...]:

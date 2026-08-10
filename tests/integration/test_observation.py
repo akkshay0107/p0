@@ -14,7 +14,7 @@ from p0.model.structured_observation import (
     StructuredObservation,
 )
 from p0.runtime.poke_env_battle_adapter import battle_view
-from tests.stress._helpers import capture_showdown_decisions, stress_count
+from tests.integration.helpers import capture_showdown_decisions, integration_count
 
 
 @pytest.mark.integration
@@ -80,7 +80,7 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
 async def test_live_showdown_observations_remain_valid(showdown_server) -> None:
     decisions = await capture_showdown_decisions(
         showdown_server,
-        game_count=stress_count("P0_STRESS_OBSERVATION_GAMES", 2),
+        game_count=integration_count("P0_INTEGRATION_OBSERVATION_GAMES", 2),
     )
     assert decisions
 

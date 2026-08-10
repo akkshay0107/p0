@@ -28,10 +28,7 @@ def sample_team() -> str:
 
 @pytest.fixture(scope="function")
 def showdown_server():
-    """
-    Starts a local Pokemon Showdown server on the dedicated test port.
-    Ensures it is running before yielding, and cleans it up afterward.
-    """
+    """Start a local Showdown server for integration tests."""
     from p0.paths import DEFAULT_PATHS
     from p0.runtime.showdown import start_showdown_servers
 

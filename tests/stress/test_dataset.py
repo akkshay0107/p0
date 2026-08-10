@@ -9,7 +9,7 @@ from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest
 from p0.runtime.process_context import PROCESS_CONTEXT
 from tests.stress._helpers import stress_count, stress_rng
-from tests.stress.replay_fixtures import golden_replay_payload, golden_series_id
+from tests.unit.replay_fixtures import golden_replay_payload, golden_series_id
 
 
 def _dataset_identity(chunk):

@@ -1,4 +1,4 @@
-"""Golden Showdown protocol fixtures used by replay-pipeline stress tests."""
+"""Small deterministic replay and event fixtures used by unit tests."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def golden_replay_payload(
     players: tuple[str, str] = ("Alice", "Bob"),
     first_move_target: str | None = "p1a: Pikachu",
 ) -> dict[str, Any]:
-    """Return a replay payload whose log is copied from the pinned protocol shape."""
+    """Return a replay payload with the pinned protocol shape."""
     p1_team = [
         {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
         {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
@@ -68,7 +68,7 @@ def golden_replay_payload(
 
 
 def golden_raw_events() -> tuple[RawBattleEvent, ...]:
-    """Return Showdown event lines with an independently documented type order."""
+    """Return Showdown event lines with a documented type order."""
     return (
         RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
         RawBattleEvent(("", "move", "p1a: Pikachu", "definitely-not-a-move", "p2a: Charizard")),

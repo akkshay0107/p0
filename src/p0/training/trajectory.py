@@ -26,6 +26,7 @@ class TrajectoryBatch:
     series_tokens: torch.Tensor | None = None
     series_mask: torch.Tensor | None = None
     bootstrap_value: float = 0.0
+    explained_variance: float | None = None
 
     def __post_init__(self) -> None:
         if self.length <= 0:
@@ -70,6 +71,20 @@ class TrajectoryBatch:
             series_tokens=None if self.series_tokens is None else self.series_tokens.to(device),
             series_mask=None if self.series_mask is None else self.series_mask.to(device),
             bootstrap_value=self.bootstrap_value,
+        )
+
+    def to_ppo_device(self, device: torch.device | str) -> TrajectoryBatch:
+        """Move only tensors consumed by the PPO update to device."""
+        return replace(
+            self,
+            observations=self.observations.to(device),
+            action_masks=self.action_masks.to(device),
+            actions=self.actions.to(device),
+            log_probs=self.log_probs.to(device),
+            returns=None if self.returns is None else self.returns.to(device),
+            advantages=None if self.advantages is None else self.advantages.to(device),
+            series_tokens=None if self.series_tokens is None else self.series_tokens.to(device),
+            series_mask=None if self.series_mask is None else self.series_mask.to(device),
         )
 
 
@@ -261,14 +276,28 @@ def prepare_trajectory_batches(
                 trajectory,
                 returns=advantage + trajectory.values,
                 advantages=advantage,
-            ).to(device)
+            )
         )
 
     flat = torch.cat([batch.advantages for batch in completed if batch.advantages is not None])
     mean, std = flat.mean(), flat.std(unbiased=False).clamp_min(1e-8)
 
+    all_returns = torch.cat([batch.returns for batch in completed if batch.returns is not None])
+    all_values = torch.cat([batch.values for batch in completed])
+    var_y = torch.var(all_returns, unbiased=False)
+    if var_y > 1e-8:
+        explained_variance = float(
+            (1.0 - torch.var(all_returns - all_values, unbiased=False) / var_y).item()
+        )
+    else:
+        explained_variance = 0.0
+
     return [
-        replace(batch, advantages=(batch.advantages - mean) / std)
+        replace(
+            batch,
+            advantages=(batch.advantages - mean) / std,
+            explained_variance=explained_variance,
+        ).to_ppo_device(device)
         for batch in completed
         if batch.advantages is not None
     ]

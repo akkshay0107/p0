@@ -75,6 +75,7 @@ from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_NATURE,
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
     EVENT_COUNT,
@@ -85,6 +86,7 @@ from p0.model.structured_observation import (
     NUM_IDX_EFFECT_OVERFLOW,
     NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_PREPARING,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
@@ -703,7 +705,7 @@ def make_real_battle(
 
 
 def test_pokemon_categorical_and_numeric_rows_real():
-    # None Pokemon returns 24 zeros
+    # None Pokemon returns zeros
     empty_cat = np.zeros(CATEGORICAL_WIDTH, dtype=np.int64)
     _pokemon_categorical_into(None, tokenizer, _iter_move_slots(None), empty_cat)
     assert not empty_cat.any()
@@ -755,10 +757,8 @@ def test_pokemon_categorical_and_numeric_rows_real():
     # Status
     assert cat[17] == tokenizer.status_id(Status.BRN)
 
-    assert not cat[18:24].any()
-
     # Nature
-    assert cat[24] == tokenizer.nature_id(mon) > 0
+    assert cat[CAT_IDX_NATURE] == tokenizer.nature_id(mon) > 0
     battle = make_real_battle()
 
     # None Pokemon returns mostly zeros except for condition flag (e.g. cond=1 -> row[2] = 1.0)
@@ -824,7 +824,7 @@ def test_pokemon_categorical_and_numeric_rows_real():
     assert row[28] == 1.0  # cond == 1
     assert row[29] == 0.0  # cond == 2
     assert row[36] == 3.0 / 5.0  # Status counter
-    assert row[42] == 1.0  # Preparing (preparing_move is not None)
+    assert row[NUM_IDX_PREPARING] == 1.0  # Preparing (preparing_move is not None)
 
     battle._can_mega_evolve = [True, False]
     row_mega_active = np.zeros(NUMERICAL_WIDTH, dtype=np.float32)
@@ -1762,7 +1762,7 @@ def test_candidate_cap_degrades_to_explicit_unknown_evidence() -> None:
 
 
 def test_protocol_event_stream_matches_showdown_golden_types() -> None:
-    from tests.stress.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
+    from tests.unit.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
 
     EVENT_DIAGNOSTICS.clear()
     events = parse_protocol_events(list(golden_raw_events()), tokenizer)
@@ -1779,7 +1779,7 @@ def test_protocol_event_stream_matches_showdown_golden_types() -> None:
 
 
 def test_event_truncation_keeps_priority_events_and_protocol_order() -> None:
-    from tests.stress.replay_fixtures import golden_raw_events
+    from tests.unit.replay_fixtures import golden_raw_events
 
     EVENT_DIAGNOSTICS.clear()
     events = parse_protocol_events(list(golden_raw_events()), tokenizer)
@@ -1792,7 +1792,7 @@ def test_event_truncation_keeps_priority_events_and_protocol_order() -> None:
 
 
 def test_malformed_and_incomplete_protocol_lines_are_diagnosed_without_fabrication() -> None:
-    from tests.stress.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
+    from tests.unit.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
 
     EVENT_DIAGNOSTICS.clear()
     raw_events = list(golden_raw_events())
@@ -1816,7 +1816,7 @@ def test_malformed_and_incomplete_protocol_lines_are_diagnosed_without_fabricati
 
 
 def test_event_truncation_handles_below_equal_and_above_capacity_limits() -> None:
-    from tests.stress.replay_fixtures import golden_raw_events
+    from tests.unit.replay_fixtures import golden_raw_events
 
     events = parse_protocol_events(list(golden_raw_events()) * 2, tokenizer)
     assert len(events) > EVENT_COUNT
@@ -1844,7 +1844,7 @@ def test_observation_overflow_contract_holds_at_capacity_boundaries() -> None:
 
 
 def test_reconstructed_observations_clear_reused_buffer_state() -> None:
-    from tests.stress.replay_fixtures import golden_replay_payload
+    from tests.unit.replay_fixtures import golden_replay_payload
 
     document = parse_replay_payload(golden_replay_payload("buffer-reuse"))
     perspective = reconstruct_both(document)[0]

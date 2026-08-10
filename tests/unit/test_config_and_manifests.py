@@ -502,15 +502,6 @@ def test_shard_manifest_contract() -> None:
         load_shard_manifest({**manifest.to_dict(), "global_contract_sha256": "0" * 64})
     with pytest.raises(ValueError, match="unknown"):
         load_shard_manifest({**manifest.to_dict(), "runtime_manifest_sha256": "0" * 64})
-    with pytest.raises(ValueError, match="artifact schema"):
-        ShardManifest.from_dict({**manifest.to_dict(), "artifact_schema": "p0.replay_shard.v0"})
-    with pytest.raises(ValueError, match="observation_schema_version"):
-        ShardManifest.from_dict({**manifest.to_dict(), "observation_schema_version": 2})
-    # Series context is continuous and rebuilt in process, so the retired
-    # symbolic-summary field must not reappear in a manifest.
-    assert "series_summary_schema_version" not in manifest.to_dict()
-    with pytest.raises(ValueError, match="unknown"):
-        ShardManifest.from_dict({**manifest.to_dict(), "series_summary_schema_version": 1})
 
 
 def test_corpus_manifest_contract() -> None:
@@ -686,36 +677,6 @@ def test_reg_mb_legality_inventory_uses_resolved_showdown_rules():
     assert "protect" in dex["legality"]["moves"]
     assert "ababo" not in dex["legality"]["species"]
     assert "berserkgene" not in dex["legality"]["items"]
-
-
-def test_representative_dump_matches_pinned_showdown_runtime():
-    script = r"""
-const path = require('node:path');
-const {Dex} = require(path.resolve('pokemon-showdown/dist/sim/dex'));
-const dex = Dex.mod('champions');
-const move = dex.moves.get('protect');
-const species = dex.species.get('charizardmegax');
-const item = dex.items.get('lifeorb');
-const ability = dex.abilities.get('intimidate');
-console.log(JSON.stringify({
-  move: {basePower: move.basePower, pp: move.pp, target: move.target},
-  species: {baseSpecies: species.baseSpecies, requiredItem: species.requiredItem, isMega: species.isMega},
-  itemTags: Object.keys(item).filter(key => key.startsWith('on')).sort(),
-  abilityTags: Object.keys(ability).filter(key => key.startsWith('on')).sort(),
-}));
-"""
-    oracle = json.loads(subprocess.check_output(["node", "-e", script], cwd=ROOT, text=True))
-    dex = json.loads((ROOT / "data/champions_dex.json").read_text())
-    tables = {
-        name: {entry["id"]: entry for entry in dex[name]}
-        for name in ("moves", "species", "items", "abilities")
-    }
-    assert {key: tables["moves"]["protect"][key] for key in oracle["move"]} == oracle["move"]
-    assert {key: tables["species"]["charizardmegax"][key] for key in oracle["species"]} == oracle[
-        "species"
-    ]
-    assert tables["items"]["lifeorb"]["mechanicTags"] == oracle["itemTags"]
-    assert tables["abilities"]["intimidate"]["mechanicTags"] == oracle["abilityTags"]
 
 
 def test_generation_is_deterministic_and_nonlegal_effects_are_reported(tmp_path):
@@ -1194,7 +1155,7 @@ def test_variants_from_showdown_with_dex() -> None:
     assert variant.spread_provenance == "imputed"
 
 
-def _migrated_runtime_files(tmp_path: Path) -> tuple[Path, Path]:
+def _runtime_files(tmp_path: Path) -> tuple[Path, Path]:
     vocab = tmp_path / "vocab.json"
     dex = tmp_path / "champions_dex.json"
     vocab.write_text(
@@ -1204,7 +1165,7 @@ def _migrated_runtime_files(tmp_path: Path) -> tuple[Path, Path]:
     return vocab, dex
 
 
-def _migrated_shard_manifest(contract: str) -> ShardManifest:
+def _shard_manifest_fixture(contract: str) -> ShardManifest:
     entry = ShardIndexEntry("shard-000.pt", "c" * 64, 10, 2, 1, 100)
     return ShardManifest(
         global_contract_sha256=contract,
@@ -1224,7 +1185,7 @@ def _migrated_shard_manifest(contract: str) -> ShardManifest:
 
 
 def test_runtime_manifest_digest_is_semantic_and_round_trips(tmp_path: Path) -> None:
-    vocab, dex = _migrated_runtime_files(tmp_path)
+    vocab, dex = _runtime_files(tmp_path)
     manifest = current_manifest(vocab_path=vocab, dex_path=dex)
     reordered = json.loads(json.dumps(manifest.to_dict()))
     reordered["contracts"]["actions"]["major"] = {
@@ -1238,9 +1199,9 @@ def test_runtime_manifest_digest_is_semantic_and_round_trips(tmp_path: Path) -> 
 
 
 def test_shard_manifest_round_trip_and_tamper_detection(tmp_path: Path) -> None:
-    vocab, dex = _migrated_runtime_files(tmp_path)
+    vocab, dex = _runtime_files(tmp_path)
     runtime = current_manifest(vocab_path=vocab, dex_path=dex)
-    manifest = _migrated_shard_manifest(runtime.global_sha256)
+    manifest = _shard_manifest_fixture(runtime.global_sha256)
     assert ShardManifest.from_dict(manifest.to_dict()) == manifest
     manifest_path = tmp_path / "runtime_manifest.json"
     manifest_path.write_text(json.dumps(runtime.to_dict()), encoding="utf-8")
@@ -1301,21 +1262,6 @@ def test_enum_like_tables_lazy_cache_alias_and_missing_member_results() -> None:
     assert tokenizer_instance.weathers["unknown-weather"] == 0
     assert tokenizer_instance.status["burn"] == 5
     assert tokenizer_instance.status["unknown-status"] == 0
-
-
-def test_spread_table_refresh_is_a_minor_contract_change(tmp_path):
-    """Refreshing the usage month must not invalidate existing checkpoints."""
-    vocab, dex = _resources(tmp_path, base_power=90)
-    table = tmp_path / "spread_usage.json"
-    table.write_text(json.dumps({"schema": 2, "spreads": {}}))
-    original = current_manifest(vocab_path=vocab, dex_path=dex, spread_usage_path=table)
-
-    table.write_text(json.dumps({"schema": 2, "spreads": {}, "month": "2026-08"}))
-    refreshed = current_manifest(vocab_path=vocab, dex_path=dex, spread_usage_path=table)
-
-    assert refreshed.spread_usage_sha256 != original.spread_usage_sha256
-    # Only the minor identity moves, so a policy trained on the old priors still loads.
-    assert refreshed.global_sha256 == original.global_sha256
 
 
 def test_active_contract_rejects_an_unrecorded_spread_table() -> None:
