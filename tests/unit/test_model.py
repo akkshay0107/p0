@@ -4,6 +4,13 @@ from typing import Any, cast
 import pytest
 import torch
 
+from p0.battle.actions import (
+    MEGA_MOVE_END,
+    MEGA_MOVE_START,
+    MOVE_END,
+    MOVE_START,
+    encode_team_pair,
+)
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import (
     CURRENT_REDUCER_TOKEN_COUNT,
@@ -34,10 +41,13 @@ from p0.model.structured_observation import (
     EVENT_METADATA_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     NUM_EFFECT_START,
+    NUM_IDX_ORIG_IDX_RATIO,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TOKEN_IDX_ALLY_SIDE,
+    TOKEN_IDX_GLOBAL_FIELD,
     SideId,
     StructuredObservation,
     TokenType,
@@ -632,6 +642,162 @@ def _inputs(policy, batch_size: int = 2):
     return encoded, action_mask, policy.empty_memory(batch_size)
 
 
+def test_forced_move_keys_use_the_move_pointer_and_mega_constraint(policy) -> None:
+    batch_size = 2
+    obs = StructuredObservation.empty_batch(batch_size)
+    obs.numerical[:, policy.actor.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] = 0.5
+    action_mask = torch.zeros((batch_size, 2, ACT_SIZE), dtype=torch.bool)
+    action_mask[:, 0, 48] = True
+    action_mask[:, 1, 47] = True
+
+    enc = policy.encode(obs, action_mask)
+    memory = policy.empty_memory(batch_size)
+    reduced = policy.actor.reducer(enc.tokens, *memory)
+    entity_keys = policy.actor._compute_keys(reduced.pokemon)
+    logits, keys = policy.actor._compute_pointer_logits(
+        reduced.cls, entity_keys, enc.aux[:, 0], enc.numerical, head_idx=0
+    )
+
+    owner_key = entity_keys[:, policy.actor.ally_poke_entities[0]]
+    q_move = policy.actor.q_proj1(torch.cat([reduced.cls, owner_key], dim=-1)).chunk(4, dim=-1)[1]
+    torch.testing.assert_close(
+        keys[:, 48], policy.actor.struggle_key.unsqueeze(0).expand(batch_size, -1)
+    )
+    torch.testing.assert_close(
+        keys[:, 47],
+        (policy.actor.struggle_key + policy.actor.mega_emb).unsqueeze(0).expand(batch_size, -1),
+    )
+    torch.testing.assert_close(
+        logits[:, 47:49],
+        torch.einsum("bd,bnd->bn", q_move, keys[:, 47:49]) / (policy.actor.d_k**0.5),
+    )
+
+    actions = torch.tensor([[48, 47], [48, 47]])
+    output = policy.evaluate(enc, action_mask, actions, *memory)
+    assert torch.isfinite(output.logits[:, 0, 48]).all()
+
+    masked_logits = policy.actor._apply_sequential_masks(
+        output.logits,
+        torch.tensor([47, 47]),
+        action_mask,
+        torch.tensor([False, False]),
+    )
+    assert (masked_logits[:, 1, 47] == float("-inf")).all()
+
+
+def test_team_preview_pointer_is_symmetric_and_uses_phase_roles(policy) -> None:
+    obs = StructuredObservation.empty_batch(1)
+    obs.numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] = 1.0
+    action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
+
+    enc = policy.encode(obs, action_mask)
+    reduced = policy.actor.reducer(enc.tokens, *policy.empty_memory(1))
+    entity_keys = policy.actor._compute_keys(reduced.pokemon)
+    expected_entity_norm = torch.full_like(entity_keys[:, :8, 0], policy.actor.d_k**0.5)
+    torch.testing.assert_close(
+        entity_keys[:, :8].norm(dim=-1), expected_entity_norm, atol=3e-5, rtol=1e-5
+    )
+    logits, action_keys = policy.actor._compute_pointer_logits(
+        reduced.cls,
+        entity_keys,
+        enc.aux[:, 0],
+        enc.numerical,
+        head_idx=0,
+    )
+
+    left_right = encode_team_pair(0, 1)
+    right_left = encode_team_pair(1, 0)
+    expected_pair_key = policy.actor.tp_pair_proj(
+        (entity_keys[:, 0] + entity_keys[:, 1]) / (2.0**0.5)
+    )
+    owner_key = policy.actor.tp_lead_role.unsqueeze(0)
+    q_tp = policy.actor.q_proj1(torch.cat([reduced.cls, owner_key], dim=-1)).chunk(4, dim=-1)[3]
+    expected_logit = (q_tp * expected_pair_key).sum(dim=-1) / (policy.actor.d_k**0.5)
+
+    torch.testing.assert_close(action_keys[:, left_right], expected_pair_key)
+    torch.testing.assert_close(action_keys[:, right_left], expected_pair_key)
+    torch.testing.assert_close(logits[:, left_right], expected_logit)
+    torch.testing.assert_close(logits[:, right_left], expected_logit)
+
+    ctx_a1 = action_keys[:, left_right]
+    logits2, action_keys2 = policy.actor._compute_pointer_logits(
+        reduced.cls,
+        entity_keys,
+        enc.aux[:, 1],
+        enc.numerical,
+        head_idx=1,
+        ctx_a1=ctx_a1,
+    )
+    owner_key2 = policy.actor.tp_back_role.unsqueeze(0)
+    q_tp2 = policy.actor.q_proj2(torch.cat([reduced.cls, owner_key2, ctx_a1], dim=-1)).chunk(
+        4, dim=-1
+    )[3]
+    expected_logit2 = (q_tp2 * expected_pair_key).sum(dim=-1) / (policy.actor.d_k**0.5)
+    torch.testing.assert_close(action_keys2[:, left_right], expected_pair_key)
+    torch.testing.assert_close(logits2[:, left_right], expected_logit2)
+
+
+def test_action_families_are_scaled_dot_product_pointers_for_both_heads(policy) -> None:
+    obs = StructuredObservation.empty_batch(2)
+    obs.numerical[:, policy.actor.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] = torch.arange(1, 7) / 6
+    action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.bool)
+
+    enc = policy.encode(obs, action_mask)
+    reduced = policy.actor.reducer(enc.tokens, *policy.empty_memory(2))
+    entity_keys = policy.actor._compute_keys(reduced.pokemon)
+    logits, action_keys = policy.actor._compute_pointer_logits(
+        reduced.cls,
+        entity_keys,
+        enc.aux[:, 0],
+        enc.numerical,
+        head_idx=0,
+    )
+
+    owner_key = entity_keys[:, policy.actor.ally_poke_entities[0]]
+    q_switch, q_move, q_pass, _ = policy.actor.q_proj1(
+        torch.cat([reduced.cls, owner_key], dim=-1)
+    ).chunk(4, dim=-1)
+    move_keys = action_keys[:, MOVE_START:MOVE_END]
+    mega_keys = action_keys[:, MEGA_MOVE_START:MEGA_MOVE_END]
+
+    torch.testing.assert_close(
+        logits[:, 0],
+        (q_pass * action_keys[:, 0]).sum(dim=-1) / (policy.actor.d_k**0.5),
+    )
+    torch.testing.assert_close(
+        logits[:, 1:7],
+        torch.einsum("bd,bnd->bn", q_switch, action_keys[:, 1:7]) / (policy.actor.d_k**0.5),
+    )
+    torch.testing.assert_close(
+        logits[:, MOVE_START:MOVE_END],
+        torch.einsum("bd,bnd->bn", q_move, move_keys) / (policy.actor.d_k**0.5),
+    )
+    torch.testing.assert_close(
+        logits[:, MEGA_MOVE_START:MEGA_MOVE_END],
+        torch.einsum("bd,bnd->bn", q_move, mega_keys) / (policy.actor.d_k**0.5),
+    )
+
+    ctx_a1 = move_keys[:, 0]
+    logits2, action_keys2 = policy.actor._compute_pointer_logits(
+        reduced.cls,
+        entity_keys,
+        enc.aux[:, 1],
+        enc.numerical,
+        head_idx=1,
+        ctx_a1=ctx_a1,
+    )
+    owner_key2 = entity_keys[:, policy.actor.ally_poke_entities[1]]
+    q_move2 = policy.actor.q_proj2(torch.cat([reduced.cls, owner_key2, ctx_a1], dim=-1)).chunk(
+        4, dim=-1
+    )[1]
+    torch.testing.assert_close(
+        logits2[:, MOVE_START:MOVE_END],
+        torch.einsum("bd,bnd->bn", q_move2, action_keys2[:, MOVE_START:MOVE_END])
+        / (policy.actor.d_k**0.5),
+    )
+    assert not hasattr(policy.actor, "pointer_temp")
+
+
 def test_singleton_candidate_scores_match_standard_joint_scoring(policy) -> None:
     encoded, action_mask, memory = _inputs(policy)
     candidates = torch.tensor([[7, 8], [9, 10]], dtype=torch.long)
@@ -888,7 +1054,6 @@ def test_magnet_kl_divergence_computation():
         with torch.no_grad():
             for p in policy.parameters():
                 p.add_(torch.randn_like(p) * 0.05)
-            policy.actor.pointer_temp.add_(0.5)
             live, mag = _live_and_magnet_logits(policy, magnet, obs, masks, actions)
             kl_drifted = magnet_kl_per_step(live, mag)
         assert (kl_drifted > 1e-4).any()

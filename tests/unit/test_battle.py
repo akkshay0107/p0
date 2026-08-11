@@ -1652,44 +1652,6 @@ def test_struggle_env_roundtrip():
     assert single_order_to_action(order, mega_battle, fake=True, position=0) == 47
 
 
-def test_struggle_policy_logits():
-    B = 2
-    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
-
-    obs = StructuredObservation.empty_batch(B)
-    obs.numerical[:, :, -1] = 0.5  # fake ratios so orig_ids aren't all 0
-
-    action_mask = torch.zeros((B, 2, ACT_SIZE), dtype=torch.bool)
-    action_mask[:, 0, 48] = True
-    action_mask[:, 1, 47] = True
-
-    enc = policy.encode(obs, action_mask)
-    memory = policy.empty_memory(B)
-
-    reduced = policy.actor.reducer(enc.tokens, *memory)
-    z = reduced.cls
-    k_entity_extended = policy.actor._compute_keys(reduced.pokemon)
-    logits, keys = policy.actor._compute_pointer_logits(
-        z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
-    )
-
-    torch.testing.assert_close(keys[:, 48], policy.actor.struggle_key.unsqueeze(0).expand(B, -1))
-
-    torch.testing.assert_close(
-        keys[:, 47], (policy.actor.struggle_key + policy.actor.mega_emb).unsqueeze(0).expand(B, -1)
-    )
-
-    actions = torch.tensor([[48, 47], [48, 47]])
-    out = policy.evaluate(enc, action_mask, actions, *memory)
-
-    assert torch.isfinite(out.logits[:, 0, 48]).all()
-
-    logits2 = policy.actor._apply_sequential_masks(
-        out.logits, torch.tensor([47, 47]), action_mask, torch.tensor([False, False])
-    )
-    assert (logits2[:, 1, 47] == float("-inf")).all()
-
-
 def test_action_ids_cover_all_boundary_categories() -> None:
     expected = {
         0: SlotAction(ActionKind.PASS),

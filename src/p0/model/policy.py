@@ -198,24 +198,31 @@ class ActorPolicy(nn.Module):
 
         self.w_k_entity = nn.Linear(d_model, self.d_k)
         self.w_k_move = nn.Linear(d_model, self.d_k)
+        self.entity_key_norm = nn.LayerNorm(self.d_k)
 
         # fused query projector for the 4 query types
         # switch, move, pass, teampreview (mega reuses q_move with mega_emb keys)
-        self.q_proj1 = nn.Linear(d_model, 4 * self.d_k)
-        self.q_proj2 = nn.Linear(d_model + self.d_k, 4 * self.d_k)
+        self.q_proj1 = nn.Linear(d_model + self.d_k, 4 * self.d_k)
+        self.q_proj2 = nn.Linear(d_model + 2 * self.d_k, 4 * self.d_k)
 
-        self.joint_move_mlp = nn.Sequential(
-            nn.Linear(3 * self.d_k, self.d_k), nn.GELU(), nn.Linear(self.d_k, 1)
+        self.move_target_proj = nn.Sequential(
+            nn.Linear(2 * self.d_k, self.d_k),
+            nn.GELU(),
+            nn.Linear(self.d_k, self.d_k),
+            nn.LayerNorm(self.d_k),
         )
-        self.joint_tp_mlp = nn.Sequential(
-            nn.Linear(3 * self.d_k, self.d_k), nn.GELU(), nn.Linear(self.d_k, 1)
+        self.tp_pair_proj = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(self.d_k, self.d_k),
+            nn.LayerNorm(self.d_k),
         )
 
         self.mega_emb = nn.Parameter(torch.empty(self.d_k))
         self.pass_key = nn.Parameter(torch.empty(self.d_k))
         self.struggle_key = nn.Parameter(torch.empty(self.d_k))
         self.target_self_key = nn.Parameter(torch.empty(self.d_k))
-        self.pointer_temp = nn.Parameter(torch.tensor(0.01))
+        self.tp_lead_role = nn.Parameter(torch.empty(self.d_k))
+        self.tp_back_role = nn.Parameter(torch.empty(self.d_k))
 
         # Entity keys are emitted as the first twelve outputs of the reducer;
         # the learned self key is appended after the real target entities.
@@ -237,9 +244,15 @@ class ActorPolicy(nn.Module):
     @torch.no_grad()
     def _init_weights(self):
         init.normal_(self.mega_emb, std=0.02)
-        init.normal_(self.pass_key, std=0.02)
-        init.normal_(self.struggle_key, std=0.02)
-        init.normal_(self.target_self_key, std=0.02)
+        for key in (
+            self.pass_key,
+            self.struggle_key,
+            self.target_self_key,
+            self.tp_lead_role,
+            self.tp_back_role,
+        ):
+            init.normal_(key, std=1.0)
+            key.mul_(math.sqrt(self.d_k) / key.norm())
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 init.orthogonal_(module.weight, gain=1.0)
@@ -247,7 +260,7 @@ class ActorPolicy(nn.Module):
 
     def _compute_keys(self, tokens_ctx: Tensor) -> Tensor:
         B = tokens_ctx.size(0)
-        k_entity = self.w_k_entity(tokens_ctx[:, :N_KEY_ENTITIES])
+        k_entity = self.entity_key_norm(self.w_k_entity(tokens_ctx[:, :N_KEY_ENTITIES]))
 
         k_self = self.target_self_key.unsqueeze(0).unsqueeze(1).expand(B, 1, -1)
         k_entity_extended = torch.cat([k_entity, k_self], dim=1)
@@ -263,16 +276,47 @@ class ActorPolicy(nn.Module):
         head_idx: int,
         ctx_a1: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
+        """Build phase-aware queries and score every action with attention.
+
+        Arguments:
+          z: Reduced battle-state summaries, one per batch row.
+          k_entity_extended: Projected entity keys plus the learned self-target key.
+          aux_moves: Encoded move tokens for the decision slot being scored.
+          numerical: Observation numerics used for phase and switch-slot routing.
+          head_idx: Zero for the first decision and one for the second decision.
+          ctx_a1: The exact key scored for the selected first action; required by head one.
+
+        Returns:
+          Raw scaled-dot-product logits and their corresponding action keys.
+        """
+        if head_idx not in (0, 1):
+            raise ValueError(f"head_idx must be 0 or 1, got {head_idx}")
+        if head_idx == 1 and ctx_a1 is None:
+            raise ValueError("ctx_a1 must be provided for head 2")
+
         B = z.size(0)
         device = z.device
+        pointer_scale = math.sqrt(self.d_k)
 
         k_moves = self.w_k_move(aux_moves)
+        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
+        is_tp = is_teampreview(numerical)
 
         if head_idx == 0:
-            q_all = self.q_proj1(z)
+            decision_owner = torch.where(
+                is_tp.unsqueeze(-1),
+                self.tp_lead_role.unsqueeze(0),
+                k_ally[:, 0],
+            )
+            q_all = self.q_proj1(torch.cat([z, decision_owner], dim=-1))
         else:
-            assert ctx_a1 is not None, "ctx_a1 must be provided for head 2"
-            z_ctx = torch.cat([z, ctx_a1], dim=-1)
+            assert ctx_a1 is not None
+            decision_owner = torch.where(
+                is_tp.unsqueeze(-1),
+                self.tp_back_role.unsqueeze(0),
+                k_ally[:, 1],
+            )
+            z_ctx = torch.cat([z, decision_owner, ctx_a1], dim=-1)
             q_all = self.q_proj2(z_ctx)
 
         q_switch, q_move, q_pass, q_tp = torch.split(q_all, self.d_k, dim=-1)
@@ -282,13 +326,12 @@ class ActorPolicy(nn.Module):
         logits = torch.zeros((B, self.act_size + 1), device=device)
         action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
-        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / math.sqrt(self.d_k)).to(
+        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / pointer_scale).to(
             logits.dtype
         )
         action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
 
-        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
-        switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / math.sqrt(self.d_k)
+        switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / pointer_scale
         orig_ids = torch.round(numerical[:, self.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
         orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
         logits.scatter_(1, orig_ids, switch_scores.to(logits.dtype))
@@ -299,61 +342,54 @@ class ActorPolicy(nn.Module):
         k_targets = k_entity_extended[:, self.target_entity_indices, :]
         k_moves_grid = k_moves.unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
         k_targets_grid = k_targets.unsqueeze(1).expand(-1, 4, -1, -1).reshape(B, 20, self.d_k)
-        q_move_grid = q_move.unsqueeze(1).expand(-1, 20, -1)
 
-        joint_move_input = torch.cat([k_moves_grid, k_targets_grid, q_move_grid], dim=-1)
-        move_scores = self.joint_move_mlp(joint_move_input).squeeze(-1)
-        move_ctxs = k_moves_grid + k_targets_grid
+        move_action_keys = self.move_target_proj(torch.cat([k_moves_grid, k_targets_grid], dim=-1))
+        move_scores = torch.einsum("bd,bnd->bn", q_move, move_action_keys) / pointer_scale
 
         logits[:, MOVE_START:MOVE_END] = move_scores.to(logits.dtype)
-        action_keys[:, MOVE_START:MOVE_END, :] = move_ctxs.to(action_keys.dtype)
+        action_keys[:, MOVE_START:MOVE_END, :] = move_action_keys.to(action_keys.dtype)
 
         k_mega_moves_grid = (
             (k_moves + self.mega_emb).unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
         )
-        joint_mega_input = torch.cat([k_mega_moves_grid, k_targets_grid, q_move_grid], dim=-1)
-        mega_scores = self.joint_move_mlp(joint_mega_input).squeeze(-1)
-        mega_ctxs = k_mega_moves_grid + k_targets_grid
+        mega_action_keys = self.move_target_proj(
+            torch.cat([k_mega_moves_grid, k_targets_grid], dim=-1)
+        )
+        mega_scores = torch.einsum("bd,bnd->bn", q_move, mega_action_keys) / pointer_scale
 
         logits[:, MEGA_START:MEGA_END] = mega_scores.to(logits.dtype)
-        action_keys[:, MEGA_START:MEGA_END, :] = mega_ctxs.to(action_keys.dtype)
+        action_keys[:, MEGA_START:MEGA_END, :] = mega_action_keys.to(action_keys.dtype)
 
         mega_struggle_key = self.struggle_key + self.mega_emb
         logits[:, MEGA_STRUGGLE_START] = (
-            (q_move * mega_struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
+            (q_move * mega_struggle_key).sum(dim=-1) / pointer_scale
         ).to(logits.dtype)
         action_keys[:, MEGA_STRUGGLE_START] = (
             mega_struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
         )
 
-        logits[:, STRUGGLE_START] = (
-            (q_move * self.struggle_key).sum(dim=-1) / math.sqrt(self.d_k)
-        ).to(logits.dtype)
+        logits[:, STRUGGLE_START] = ((q_move * self.struggle_key).sum(dim=-1) / pointer_scale).to(
+            logits.dtype
+        )
         action_keys[:, STRUGGLE_START] = (
             self.struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
         )
 
-        is_tp = is_teampreview(numerical).unsqueeze(-1)
+        is_tp_column = is_tp.unsqueeze(-1)
 
-        k_lead_grid = k_ally.unsqueeze(2).expand(-1, -1, 6, -1).reshape(B, TP_END, self.d_k)
-        k_back_grid = k_ally.unsqueeze(1).expand(-1, 6, -1, -1).reshape(B, TP_END, self.d_k)
-        q_tp_grid = q_tp.unsqueeze(1).expand(-1, TP_END, -1)
+        k_left_grid = k_ally.unsqueeze(2).expand(-1, -1, 6, -1).reshape(B, TP_END, self.d_k)
+        k_right_grid = k_ally.unsqueeze(1).expand(-1, 6, -1, -1).reshape(B, TP_END, self.d_k)
+        tp_pair_keys = self.tp_pair_proj((k_left_grid + k_right_grid) / math.sqrt(2.0))
+        tp_scores = torch.einsum("bd,bnd->bn", q_tp, tp_pair_keys) / pointer_scale
 
-        joint_tp_input = torch.cat([k_lead_grid, k_back_grid, q_tp_grid], dim=-1)
-        tp_scores = self.joint_tp_mlp(joint_tp_input).squeeze(-1)
-
-        tp_ctxs = k_lead_grid + k_back_grid
-
-        logits[:, TP_START:TP_END] = torch.where(is_tp, tp_scores, logits[:, TP_START:TP_END]).to(
-            logits.dtype
-        )
+        logits[:, TP_START:TP_END] = torch.where(
+            is_tp_column, tp_scores, logits[:, TP_START:TP_END]
+        ).to(logits.dtype)
         action_keys[:, TP_START:TP_END, :] = torch.where(
-            is_tp.unsqueeze(-1), tp_ctxs, action_keys[:, TP_START:TP_END, :]
+            is_tp_column.unsqueeze(-1), tp_pair_keys, action_keys[:, TP_START:TP_END, :]
         ).to(action_keys.dtype)
 
-        # prevent pointer temp from becoming negative / 0
-        logits = logits[:, : self.act_size] * self.pointer_temp.clamp_min(1e-4)
-        return logits, action_keys[:, : self.act_size]
+        return logits[:, : self.act_size], action_keys[:, : self.act_size]
 
     @staticmethod
     def _apply_top_p(logits: Tensor, top_p: float) -> Tensor:
