@@ -8,7 +8,8 @@ Three concerns live here, in this order:
   writes whenever its turn loop resumes, so the decision boundaries come from the log
   itself rather than from turn-marker heuristics.
 * evidence -- what each player provably ordered in a block, handed to
-  ``p0.replays.evidence`` for EXACT/PARTIAL/UNKNOWN labelling.
+  ``p0.replays.evidence`` for EXACT/PARTIAL/UNKNOWN labelling. Blocks where only the
+  opponent answered a replacement request advance state without creating a policy row.
 
 A public replay contains no ``|request|``, so reconstruction never asserts a legality it
 cannot show. Emitted masks are supersets marked ``legality_known=False``; the encoder
@@ -2088,12 +2089,12 @@ def reconstruct_perspective(
 ) -> ReconstructedPerspective:
     """Rebuild one player's pre-decision views and action evidence from a replay.
 
-    The protocol lines are walked exactly once. At every update block that answers a
-    request, the state machine holds the pre-decision state and the raw lines seen
-    since the previous request form that decision's event window, mirroring what the
-    live environment presents. Legality is never guessed: the emitted mask is a
-    superset marked unproven, so no observation cell claims a restriction the replay
-    cannot show.
+    The protocol lines are walked exactly once. At each request this player answered,
+    the state machine holds the pre-decision state and the raw lines seen since their
+    previous request form the event window. Opponent-only replacement requests advance
+    state without emitting a snapshot, matching the live policy's wait path. Legality
+    is never guessed: the emitted mask is a superset marked unproven, so no observation
+    cell claims a restriction the replay cannot show.
 
     Arguments:
         document: The complete parsed replay document.
@@ -2126,7 +2127,7 @@ def reconstruct_perspective(
 
     window: list[RawBattleEvent] = []
     cursor = 0
-    for decision_index, (start, end, decision_type) in enumerate(decision_blocks):
+    for start, end, decision_type in decision_blocks:
         # replay everything between the previous request and this one, so the state
         # machine and the event window advance together over a single line pass
         for line in document.protocol_lines[cursor:start]:
@@ -2136,6 +2137,41 @@ def reconstruct_perspective(
 
         lines = document.protocol_lines[start:end]
         preview = decision_type is DecisionType.TEAM_PREVIEW
+
+        observed_actions = (
+            _preview_actions(state, lines, perspective, knowledge)
+            if preview
+            else _observed_actions(
+                state,
+                lines,
+                perspective,
+                counters,
+                illusion_species_by_line,
+            )
+        )
+        observed = list(observed_actions[:2])
+        tags = list(observed_actions[2])
+        if preview:
+            tags.append("preview_selection_not_public")
+
+        for slot in _implicit_pass_slots(observed, decision_type):
+            observed[slot] = ObservedAction(PASS_ACTION, tag="implicit_pass")
+
+        if decision_type is DecisionType.FORCED_SWITCH and any(
+            _is_pivot_switch(line.parts) for line in lines
+        ):
+            decision_type = DecisionType.PIVOT_SWITCH
+
+        no_observed_order = not any(action is not None for action in observed)
+        if no_observed_order and decision_type in {
+            DecisionType.FORCED_SWITCH,
+            DecisionType.PIVOT_SWITCH,
+        }:
+            # Live play bypasses the policy while the other player answers a
+            # replacement request. Retain this window so the next real decision
+            # observes the same accumulated events as the live event capture.
+            counters["waiting_requests_skipped"] += 1
+            continue
 
         effective_species = {}
         for slot in (0, 1):
@@ -2171,39 +2207,13 @@ def reconstruct_perspective(
         view.events = list(_parse_window(window, counters))
         window = []
 
-        observed_actions = (
-            _preview_actions(state, lines, perspective, knowledge)
-            if preview
-            else _observed_actions(
-                state,
-                lines,
-                perspective,
-                counters,
-                illusion_species_by_line,
-            )
-        )
-        observed = list(observed_actions[:2])
-        tags = list(observed_actions[2])
-        if preview:
-            tags.append("preview_selection_not_public")
-
-        for slot in _implicit_pass_slots(observed, decision_type):
-            observed[slot] = ObservedAction(PASS_ACTION, tag="implicit_pass")
-
-        if decision_type is DecisionType.FORCED_SWITCH and any(
-            _is_pivot_switch(line.parts) for line in lines
-        ):
-            decision_type = DecisionType.PIVOT_SWITCH
-
         for slot, action in enumerate(observed):
             if action is not None and action.action is not None:
                 if action.action not in legal_actions(view.decision, slot):
                     counters["observed_illegal_action"] += 1
 
-        # A block in which this side shows no order at all is either a wait or an
-        # action whose execution never reached the log. Enumerating the whole legal
-        # set as candidates would supervise on a set we have no evidence for.
-        no_observed_order = not any(action is not None for action in observed)
+        # A normal turn whose submitted action never executed remains a real policy
+        # timestep, but its hidden order cannot provide action supervision.
         if no_observed_order:
             tags.append("no_observed_order")
         evidence = extract_action_evidence(
@@ -2215,6 +2225,7 @@ def reconstruct_perspective(
                 unknown=no_observed_order,
             )
         )
+        decision_index = len(decisions)
         decisions.append(
             DecisionRecord(
                 decision_index=decision_index,

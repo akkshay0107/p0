@@ -179,7 +179,6 @@ class JsonCapturingRandomPlayer(RandomPlayer):
         self.observation_paths: list[Path] = []
         self._showteam_lines: dict[str, list[str]] = {}
         self._live_records: dict[str, list[dict[str, Any]]] = {}
-        self._wait_request_keys: set[tuple[str, int, int]] = set()
         super().__init__(**kwargs)
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> None:
@@ -189,20 +188,6 @@ class JsonCapturingRandomPlayer(RandomPlayer):
                 self._showteam_lines.setdefault(battle_tag, []).append("|".join(split_message))
 
         await super()._handle_battle_message(split_messages)
-
-    async def _handle_battle_request(
-        self, battle: AbstractBattle, maybe_default_order: bool = False
-    ) -> None:
-        # poke-env uses _wait when this side received the request but does not
-        # get to submit an order.  Keep that observation as the ground truth
-        # for a replay segment that reconstructs to UNKNOWN with no action.
-        if battle._wait and battle.last_request is not None:
-            key = (battle.battle_tag, battle.turn, id(battle.last_request))
-            if key not in self._wait_request_keys:
-                self._wait_request_keys.add(key)
-                self._record_decision(cast(DoubleBattle, battle), None)
-
-        await super()._handle_battle_request(battle, maybe_default_order)
 
     def teampreview(self, battle: AbstractBattle) -> str:
         result = super().teampreview(battle)
@@ -224,14 +209,14 @@ class JsonCapturingRandomPlayer(RandomPlayer):
         self._record_decision(double_battle, action)
         return result
 
-    def _record_decision(self, battle: DoubleBattle, action: tuple[int, int] | None) -> None:
+    def _record_decision(self, battle: DoubleBattle, action: tuple[int, int]) -> None:
         observation = self.observation_builder.build(battle_view(battle)).cpu()
         self._live_records.setdefault(battle.battle_tag, []).append(
             {
                 "turn": int(battle.turn),
                 "teampreview": bool(battle.teampreview),
                 "player_role": str(battle.player_role),
-                "action": None if action is None else list(action),
+                "action": list(action),
                 # The count of replay-visible lines consumed before this request is the
                 # shared boundary: reconstruction reaches the same line index when it
                 # segments the log, so the two sides are matched exactly rather than

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from p0.battle.actions import PASS_ACTION
+from p0.battle.events import EventTypeId
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, load_active_runtime_manifest
 from p0.model.observation_builder import ObservationBuilder
@@ -1298,8 +1299,8 @@ def _payload_ko_scenario(
     }
 
 
-def test_a_waiting_perspective_is_unknown_rather_than_a_fabricated_pass() -> None:
-    """A side that only watched a replacement submitted nothing observable."""
+def test_a_waiting_perspective_omits_the_policy_row_and_preserves_events() -> None:
+    """A side that only watched a replacement must match the live wait path."""
     document = parse_replay_payload(_payload_ko_scenario("ko-onesided"))
     alice, bob = reconstruct_both(document)
 
@@ -1313,10 +1314,34 @@ def test_a_waiting_perspective_is_unknown_rather_than_a_fabricated_pass() -> Non
     assert replacement.evidence.label_kind is LabelKind.EXACT
     assert replacement.evidence.exact_action[1] == PASS_ACTION
 
-    waiting = alice.decisions[replacement.decision_index]
-    assert waiting.pre_line_index == replacement.pre_line_index
-    assert waiting.evidence.label_kind is LabelKind.UNKNOWN
-    assert waiting.evidence.candidates == ()
+    assert all(
+        decision.pre_line_index != replacement.pre_line_index for decision in alice.decisions
+    )
+    assert alice.diagnostics.counters["waiting_requests_skipped"] == 1
+    assert [decision.decision_index for decision in alice.decisions] == list(
+        range(len(alice.decisions))
+    )
+
+    next_snapshot = next(
+        snapshot
+        for snapshot in alice.snapshots
+        if snapshot.pre_line_index > replacement.pre_line_index
+    )
+    event_types = tuple(event.event_type for event in next_snapshot.events)
+    assert EventTypeId.FAINT in event_types
+    assert EventTypeId.SWITCH_IN in event_types
+    assert event_types.index(EventTypeId.FAINT) < event_types.index(EventTypeId.SWITCH_IN)
+
+
+def test_a_normal_turn_without_an_executed_order_remains_unknown() -> None:
+    """Missing execution evidence must not erase a real turn request."""
+    document = parse_replay_payload(_payload_ko_scenario("unexecuted-turn", pivot=True))
+    alice, _ = reconstruct_both(document)
+
+    decision = alice.decisions[1]
+    assert decision.decision_type is DecisionType.TURN
+    assert decision.evidence.label_kind is LabelKind.UNKNOWN
+    assert "no_observed_order" in decision.evidence.tags
 
 
 def test_no_decision_is_typed_forced_pass() -> None:
@@ -1335,14 +1360,22 @@ def test_no_decision_is_typed_forced_pass() -> None:
             )
 
 
-def test_both_perspectives_share_every_decision_boundary() -> None:
-    """Requests are per-block, so the two perspectives segment the log identically."""
+def test_both_perspectives_keep_a_simultaneous_replacement_boundary() -> None:
+    """A replacement block answered by both players remains in both timelines."""
     document = parse_replay_payload(_payload_ko_scenario("shared-boundaries", simultaneous=True))
     alice, bob = reconstruct_both(document)
 
-    assert [decision.pre_line_index for decision in alice.decisions] == [
-        decision.pre_line_index for decision in bob.decisions
-    ]
+    alice_boundaries = {
+        decision.pre_line_index
+        for decision in alice.decisions
+        if decision.decision_type is DecisionType.FORCED_SWITCH
+    }
+    bob_boundaries = {
+        decision.pre_line_index
+        for decision in bob.decisions
+        if decision.decision_type is DecisionType.FORCED_SWITCH
+    }
+    assert alice_boundaries & bob_boundaries
 
 
 def test_forced_pass_skipped_for_terminal_ko() -> None:
