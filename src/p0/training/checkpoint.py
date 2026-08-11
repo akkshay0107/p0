@@ -369,7 +369,7 @@ def _capture_rng_state() -> dict[str, Any]:
 
 
 def _restore_rng_state(state: Mapping[str, Any]) -> None:
-    """Restore RNG state captured by ``_capture_rng_state`` when present."""
+    """Restore RNG state captured by _capture_rng_state when present."""
     python_state = state.get("python")
     torch_state = state.get("torch")
     if python_state is not None:

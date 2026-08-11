@@ -2,7 +2,7 @@
 
 Champions hides Stat Point spreads, so an opponent's real stats are never observable.
 Smogon's chaos usage exports publish spreads in Champions Stat Point units already
-(``Nature:hp/atk/def/spa/spd/spe``), keyed jointly with the nature, which open team
+(Nature:hp/atk/def/spa/spd/spe), keyed jointly with the nature, which open team
 sheets reveal. This module turns those exports into a compact prior keyed on
 (species, nature) and provides the runtime lookup used to impute stats.
 
@@ -190,7 +190,7 @@ def cosmetic_forme_aliases(dex: Mapping[str, Any]) -> dict[str, str]:
 
 
 def parse_spread_key(key: str) -> tuple[str, StatPoints] | None:
-    """Parse a chaos ``Nature:hp/atk/def/spa/spd/spe`` key, rejecting illegal spreads."""
+    """Parse a chaos Nature:hp/atk/def/spa/spd/spe key, rejecting illegal spreads."""
     nature, separator, allocation = key.partition(":")
     if not separator:
         return None
@@ -273,7 +273,7 @@ def build_spread_table(
 
     Each (species, nature) bucket present in both exports is mixed
     BO3_BLEND_WEIGHT toward Bo3; a bucket present in only one export is taken from
-    that export alone. Buckets are then truncated to the most-used ``max_spreads``
+    that export alone. Buckets are then truncated to the most-used max_spreads
     entries and renormalized so the stored weights describe the truncated bucket.
 
     Arguments:

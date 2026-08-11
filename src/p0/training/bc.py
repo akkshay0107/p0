@@ -248,6 +248,9 @@ class BCTrainer:
         observations = batch.observations.to(self.device)
         context_action_mask = batch.context_action_mask.to(self.device)
         encoded = self.policy.encode(observations, context_action_mask)
+        # Build h_t for every decision from that decision's current tokens only.
+        # The target row is later reduced into z_t with its history; h_t remains
+        # the local snapshot used to populate other rows' history windows.
         local_tokens = self.policy.local_history_tokens(encoded)
         target_indices = batch.target_indices.to(self.device)
         target_local_tokens = local_tokens[target_indices]
@@ -282,7 +285,12 @@ class BCTrainer:
         )
 
     def _reduce(self, prepared: _PreparedBCBatch) -> ReducerOutput:
-        """Run the one memory-reducer pass this batch is allowed."""
+        """Run the one memory-reducer pass this batch is allowed.
+
+        target_local_tokens are h_t summaries for the target rows. The
+        reducer turns each one into z_t, the memory-aware readout consumed by
+        the actor and critic; it does not replace the history snapshots.
+        """
         return self.policy.actor.reducer.reduce(
             prepared.target_local_tokens,
             prepared.encoded.tokens,

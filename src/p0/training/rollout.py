@@ -40,6 +40,9 @@ class BattleMemoryBuffer:
     def append(self, env_ids: torch.Tensor, history_tokens: torch.Tensor) -> None:
         if history_tokens.shape != (env_ids.numel(), self.d_model):
             raise ValueError("history token batch does not match selected environments")
+        # The policy returns the pre-memory local summary (h_t) here, not the
+        # post-memory cls readout. Store detached snapshots so this rollout
+        # cache does not connect autograd graphs across environment steps.
         # The whole battle is retained: the reducer window is the last
         # HISTORY_WINDOW entries, but the end-of-game series summary compresses
         # every decision, the same way behaviour cloning and live play do.

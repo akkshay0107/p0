@@ -386,7 +386,7 @@ def _build_environment(values: Any) -> EnvironmentConfig:
 
 
 def load_config(config_path: str | Path | None = None) -> GlobalConfig:
-    """Load required ``config.yaml`` and apply its values to source defaults."""
+    """Load required config.yaml and apply its values to source defaults."""
     path = (
         DEFAULT_PATHS.repository_root / "config.yaml" if config_path is None else Path(config_path)
     )

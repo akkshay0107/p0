@@ -84,7 +84,7 @@ class SeriesTokenStore:
         return state
 
     def restore_training_state(self, state: Mapping[str, Sequence[Tensor]]) -> None:
-        """Restore series state captured by :meth:`training_state`."""
+        """Restore series state captured by the training_state method."""
         restored: dict[SeriesStoreKey, list[Tensor]] = {}
         for key, values in state.items():
             if not isinstance(key, str) or not key:

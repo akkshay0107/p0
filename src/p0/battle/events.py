@@ -62,8 +62,8 @@ class EventTypeId(IntEnum):
 
 EVENT_TYPE_COUNT = max(EventTypeId) + 1
 
-# Counters for silent event-pipeline degradations: "oov_ids", "missing_pre_hp",
-# "grounding_misses". Reset with .clear().
+# Counters for silent event-pipeline degradations include out of vocabulary ids,
+# missing pre-HP values, and grounding misses. Reset with clear.
 EVENT_DIAGNOSTICS: Counter[str] = Counter()
 
 # Mirrors tokenizer.Resolution.OOV without importing the model layer.
@@ -175,7 +175,7 @@ def build_raw_event(
 ) -> RawBattleEvent:
     """Shared raw-line producer for live capture and replay reconstruction.
 
-    Both producers must snapshot the entity's HP *before* the line is applied,
+    Both producers must snapshot the entity's HP before the line is applied,
     so damage/heal deltas are computed against identical baselines in training
     and replay. Keep every raw-line -> RawBattleEvent rule in this function.
     """

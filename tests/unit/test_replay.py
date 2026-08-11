@@ -78,7 +78,7 @@ def _payload_replay_dataset(replay_id: str, parent: str = "series-1") -> dict[st
         "|teampreview",
         f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
         f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
-        # a bare "|" is Showdown's update-block separator: the simulator writes one
+        # a bare vertical bar is Showdown's update-block separator: the simulator writes one
         # every time it resumes, so each separator opens exactly one answered request
         "|",
         "|switch|p1a: Pikachu|Pikachu, L50",
@@ -254,7 +254,7 @@ def _payload_replay_pipeline(
         "|teampreview",
         f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
         f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
-        # a bare "|" is Showdown's update-block separator: the simulator writes one
+        # a bare vertical bar is Showdown's update-block separator: the simulator writes one
         # every time it resumes, so each separator opens exactly one answered request
         "|",
         "|switch|p1a: Pikachu|Pikachu, L50",
@@ -1212,9 +1212,9 @@ def _payload_ko_scenario(
 ) -> dict[str, object]:
     """Build a replay where one player KOs the other and a replacement follows.
 
-    *terminal* -- the KO ends the game immediately (no later request).
-    *simultaneous* -- both players need a replacement (boundary rule 2).
-    *pivot* -- the opponent's switch is a voluntary pivot, not a forced replacement.
+    terminal means the KO ends the game immediately with no later request.
+    simultaneous means both players need a replacement at the same boundary.
+    pivot means the opponent's switch is voluntary rather than forced.
     """
     p1_team = [
         {"species": "Pikachu", "moves": ["Thunderbolt", "Tackle"]},

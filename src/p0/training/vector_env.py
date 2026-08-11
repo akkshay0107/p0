@@ -127,7 +127,7 @@ class ThreadVecEnv:
         return tuple(env.training_state() for env in self.envs)
 
     def restore_training_state(self, states: Sequence[Mapping[str, object]]) -> None:
-        """Restore simulation state captured by :meth:`training_state`."""
+        """Restore simulation state captured by the training_state method."""
         if len(states) != self.n_envs:
             raise ValueError("Vector environment state count does not match environment count")
         for env, state in zip(self.envs, states, strict=True):

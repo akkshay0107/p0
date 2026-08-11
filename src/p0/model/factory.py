@@ -38,7 +38,7 @@ def compile_policy(
 
 
 def canonical_policy_state_dict(policy: PolicyNet) -> OrderedDict[str, torch.Tensor]:
-    """Return policy weights without ``torch.compile`` wrapper namespaces."""
+    """Return policy weights without torch.compile wrapper namespaces."""
     canonical: OrderedDict[str, torch.Tensor] = OrderedDict()
     for name, value in policy.state_dict().items():
         canonical[name.replace("._orig_mod.", ".").removeprefix("_orig_mod.")] = value

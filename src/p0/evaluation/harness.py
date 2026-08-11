@@ -270,9 +270,9 @@ class EvaluationHarness:
 
         Arguments:
             name_a: Display name for the first policy.
-            policy_a: First policy, or ``None`` for a random player.
+            policy_a: First policy, or None for a random player.
             name_b: Display name for the second policy.
-            policy_b: Second policy, or ``None`` for a random player.
+            policy_b: Second policy, or None for a random player.
             team_category: Label used to aggregate the matchup results.
             team_source: Team sampler shared by both players.
             server_configuration: Showdown server connection settings.

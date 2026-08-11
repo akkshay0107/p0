@@ -557,7 +557,7 @@ def compile_to_shards(
         manifest_path: Path to the runtime manifest for contract validation.
         resources: Optional pre-loaded runtime resources.
         created_at: Optional ISO timestamp stamped into the manifest.
-        chunksize: Optional ProcessPoolExecutor chunk size (see ``compile_documents``).
+        chunksize: Optional ProcessPoolExecutor chunk size (see compile_documents).
         external_rejections: Input identities rejected before replay parsing.
 
     Returns:
@@ -779,7 +779,7 @@ def compile_documents(
         format_id: Optional exact format filter.
         max_candidates: Maximum number of action candidates per decision.
         dex: Optional stat dex for imputation.
-        chunksize: Optional ProcessPoolExecutor chunk size. When ``None`` (the
+        chunksize: Optional ProcessPoolExecutor chunk size. When None (the
             default) a value is derived from the job count and CPU count. For
             small corpora (fewer jobs than workers) compilation runs inline to
             avoid the overhead of spawning a process pool.

@@ -47,7 +47,7 @@ class _TeamPreviewEnvPlayer(_EnvPlayer):
 def enable_environment_team_preview(player: _EnvPlayer) -> None:
     """Enable policy-selected preview for poke-env's private environment player.
 
-    poke-env 0.15 constructs ``_EnvPlayer`` internally and exposes no player
+    poke-env 0.15 constructs _EnvPlayer internally and exposes no player
     factory. The instance-local class replacement is therefore isolated here.
     """
     player.__class__ = _TeamPreviewEnvPlayer
@@ -77,7 +77,7 @@ def _forme_change(self: Pokemon, species: str) -> None:
 def _update_from_teambuilder(self: Pokemon, tb: TeambuilderPokemon) -> None:
     """Keep the open-team-sheet nature that poke-env drops for EV-less formats.
 
-    poke-env 0.15 assigns nature only inside ``if not all(e == 0 for e in tb.evs)``,
+    poke-env 0.15 assigns nature only inside if not all(e == 0 for e in tb.evs),
     so a sheet that declares a nature but no EVs loses it. Champions spends Stat
     Points rather than EVs, so every opponent sheet parses with all-zero EVs and
     the revealed nature is discarded - which is exactly the nature stat imputation
@@ -93,7 +93,7 @@ def _update_from_teambuilder(self: Pokemon, tb: TeambuilderPokemon) -> None:
 async def _stop_listening_cleanly(self: PSClient) -> None:
     """Close a client and drain poke-env's listener/message-handler tasks.
 
-    poke-env 0.15 closes the websocket from ``stop_listening`` but does not
+    poke-env 0.15 closes the websocket from stop_listening but does not
     wait for the listener future or the message-handler tasks it creates on its
     dedicated event loop. Those tasks otherwise survive until the loop is
     closed, producing pending-task warnings during integration-test cleanup.

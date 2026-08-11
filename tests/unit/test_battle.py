@@ -1173,7 +1173,7 @@ def test_side_events_ground_to_owning_side():
         team=[ally],
         opponent_team=[opponent],
     )
-    # Showdown side identifiers carry the username: "p1: Username", not "p1".
+    # Showdown side identifiers carry the username after p1 or p2, not just the side id.
     set_raw_events(
         battle,
         [
@@ -2020,7 +2020,7 @@ def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
     assert not unknown.numerical[:, legality_columns].any()
     assert unknown.numerical[0, NUM_IDX_CAN_MEGA] == 0.0
 
-    # the gate, not a value in the legality columns, is what says "unproven"
+    # the gate, not a value in the legality columns, is what says unproven
     assert proven.numerical[:, NUM_IDX_LEGALITY_UNKNOWN].tolist() == [0.0] * SEQUENCE_LENGTH
     assert unknown.numerical[:2, NUM_IDX_LEGALITY_UNKNOWN].tolist() == [1.0, 1.0]
     assert unknown.numerical[2:, NUM_IDX_LEGALITY_UNKNOWN].sum() == 0.0

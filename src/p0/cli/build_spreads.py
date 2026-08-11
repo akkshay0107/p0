@@ -1,7 +1,7 @@
 """Build the empirical Stat Point spread priors from Showdown usage exports.
 
 The raw exports live under a gitignored cache, so a clean checkout cannot rebuild
-the artifact without re-downloading them. ``--fetch`` performs that download so a
+the artifact without re-downloading them. --fetch performs that download so a
 rebuild is reproducible from the repository alone.
 """
 

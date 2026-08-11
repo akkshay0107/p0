@@ -78,7 +78,7 @@ class PokeEnvBattleView:
 
     @property
     def wait(self):
-        # poke-env exposes wait as ``_wait`` (asserted integer reason code). This is a
+        # poke-env exposes wait as _wait (asserted integer reason code). This is a
         # version-pinned access point: poke-env is locked to 0.15.0 in pyproject.toml.
         return self._battle._wait
 
@@ -120,7 +120,7 @@ class PokeEnvBattleView:
         return self._battle.get_pokemon(identifier)
 
     def consume_events(self):
-        # ``last_request`` is a poke-env private attribute; poke-env is pinned to 0.15.0.
+        # last_request is a poke-env private attribute; poke-env is pinned to 0.15.0.
         # It is used as part of a monotonic key to detect when a new request has arrived.
         key = (self._battle.turn, id(self._battle.last_request))
         if key != self._events_key:
@@ -178,7 +178,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
             )
         )
 
-        # poke-env draws available switches out of ``battle.team`` itself, so
+        # poke-env draws available switches out of battle.team itself, so
         # roster identity is the real relation; the species name was only ever a
         # proxy for it. Identity is matched by id() because poke-env's Pokemon
         # defines __eq__ and callers may pass unhashable stand-ins.

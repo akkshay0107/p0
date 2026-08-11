@@ -2,7 +2,7 @@
 
 Series context itself is continuous, not symbolic: a completed game is
 summarized by compressing its per-decision local history tokens through
-``DynamicSeriesResampler``. Those tokens are a function of the current
+DynamicSeriesResampler. Those tokens are a function of the current
 weights, so they are always produced in process and never persisted. This
 key is what behaviour cloning, self-play, and live play use to keep each
 canonical player's prior-game state apart while they do it.

@@ -1,7 +1,7 @@
 """Structured tensor observation schema shared by encode, rollouts, and evaluation.
 
-Defines the fixed categorical/numerical/sequence layout of ``StructuredObservation``, the
-``ActionMasker`` helpers, and the observer-facing indices used across the model and runtime.
+Defines the fixed categorical/numerical/sequence layout of StructuredObservation, the
+ActionMasker helpers, and the observer-facing indices used across the model and runtime.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ TOKEN_IDX_ALLY_SIDE = 13
 TOKEN_IDX_OPPONENT_SIDE = 14
 
 # 0-4: one-hot slot condition, offset by one so -1 (a reserve the player did not
-# bring) fits. Index 1 doubles as "unknown": an empty row, or a replay row whose
+# bring) fits. Index 1 doubles as unknown: an empty row, or a replay row whose
 # team selection is not public yet.
 NUM_IDX_SLOT_CONDITION = 0
 NUM_IDX_SLOT_CONDITION_UNKNOWN = 1
@@ -68,17 +68,17 @@ NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction (MoveRecord dynamic)
 NUM_IDX_ORIG_IDX_RATIO = 26
 NUM_IDX_FAINTED = 27
 NUM_IDX_CAN_MEGA = 30  # active allies only, request-derived like the legality columns
-NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot "was the last move used" (MoveRecord dynamic)
+NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot was the last move used (MoveRecord dynamic)
 NUM_IDX_STATUS_COUNTER = 36  # StatusRecord dynamic (turns asleep / toxic stage)
 NUM_IDX_PREPARING = 37
 NUM_IDX_LEVEL_STATS = 38  # 38-43: level-50 derived stats
 NUM_IDX_STAT_PROVENANCE = 44
-NUM_IDX_MOVE_LEGAL = 45  # 45-48: per-move-slot "legal this step" (MoveRecord dynamic)
+NUM_IDX_MOVE_LEGAL = 45  # 45-48: per-move-slot legal this step (MoveRecord dynamic)
 NUM_IDX_CAN_SWITCH_OUT = 49  # active allies only
 NUM_IDX_REVEALED = 50  # has appeared on the field this battle
 # Legality provenance. A data source that cannot prove a decision's legality (a public
-# replay carries no `|request|`) writes zeros into the legality columns above and raises
-# these gates instead, so "unknown" never masquerades as a proven "illegal".
+# replay carries no |request|) writes zeros into the legality columns above and raises
+# these gates instead, so unknown never masquerades as a proven illegal action.
 NUM_IDX_LEGALITY_UNKNOWN = 51  # this row's move-legal / can-switch-out / can-mega are unproven
 NUM_IDX_SLOT_LEGALITY_UNKNOWN = 52  # 52-53: per-active-slot gate, ally side token only
 

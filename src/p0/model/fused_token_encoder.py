@@ -100,7 +100,7 @@ _TARGET_CLASS_INDEX = {name: index for index, name in enumerate(_TARGET_CLASSES)
 _TARGET_CLASS_ALIASES = {
     # Distance is irrelevant with two active slots per side, so these have the
     # same selectable Pokemon in doubles. Other Showdown target types remain
-    # distinct, including `all` (includes the user) and `allAdjacent` (does not).
+    # distinct, including all (includes the user) and allAdjacent (does not).
     "normal": "selectedpokemon",
     "any": "selectedpokemon",
 }
@@ -352,7 +352,7 @@ class FusedTokenEncoder(nn.Module):
         )
         self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
         # One learned marker per active slot, added in place of a mask the data source
-        # could not prove. Keeps "unknown" a distinct state instead of a mask value.
+        # could not prove. Keeps unknown as a distinct state instead of a mask value.
         self.unknown_legality_emb = nn.Parameter(torch.empty(2, d_model))
 
         # Event records stay in d_raw until the eight learned pooling queries
@@ -435,7 +435,7 @@ class FusedTokenEncoder(nn.Module):
         # MoveRecord: identity + static dex scalars + move-owned dynamics fused once
         move_ids = categorical[..., 5:9]
         # A row whose legality is unproven carries zeros in the legal-this-step channel;
-        # the proven gate keeps that from reading as a proven "illegal this step".
+        # the proven gate keeps that from reading as a proven illegal action this step.
         legality_proven = (
             1.0 - numerical[..., NUM_IDX_LEGALITY_UNKNOWN : NUM_IDX_LEGALITY_UNKNOWN + 1]
         )
@@ -616,7 +616,7 @@ class FusedTokenEncoder(nn.Module):
             NUM_IDX_SLOT_LEGALITY_UNKNOWN : NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2,
         ].to(tokens.dtype)
         # An unproven slot contributes no mask magnitude; its learned marker carries the
-        # "fall back to state" signal instead.
+        # a fall back to state signal instead.
         gated_mask = action_mask.to(tokens.dtype) * (1.0 - slot_unknown).unsqueeze(-1)
 
         unknown_marker = slot_unknown @ self.unknown_legality_emb.to(tokens.dtype)

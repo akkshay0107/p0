@@ -126,6 +126,9 @@ def _build_memory_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build Bo1 memory inputs from one encoded trajectory batch."""
     dtype = encoded.tokens.dtype
+    # Compute each decision's local-only h_t once. Past h_t values are used as
+    # history inputs for later rows; z_t is intentionally not recycled as a
+    # history token because it already contains the prior memory context.
     local_tokens = policy.local_history_tokens(encoded)
     lengths = torch.tensor([item.length for item in episodes], device=device, dtype=torch.long)
     starts = torch.cat((torch.zeros(1, device=device, dtype=torch.long), lengths.cumsum(0)[:-1]))

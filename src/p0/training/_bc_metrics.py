@@ -339,7 +339,7 @@ class _BCEvaluationAccumulator:
         unknown = slot_legality_unknown(numerical)
         proven = ~unknown
 
-        # Only proven rows have an authoritative notion of "illegal" to measure against,
+        # Only proven rows have an authoritative notion of illegal to measure against,
         # so they are weighted in rather than indexed out, which would force a sync.
         probabilities = torch.softmax(logits.float(), dim=-1)
         illegal_mass = probabilities.mul(~action_mask[:, 0].bool()).sum(dim=-1)

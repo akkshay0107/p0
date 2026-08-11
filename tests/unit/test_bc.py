@@ -227,8 +227,8 @@ def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
 
 
 def _count_reducer_passes(trainer: BCTrainer, monkeypatch) -> list[int]:
-    """Count memory-window reductions. ``forward`` funnels through ``reduce``,
-    so patching only ``reduce`` counts each pass exactly once."""
+    """Count memory-window reductions. forward funnels through reduce,
+    so patching only reduce counts each pass exactly once."""
     passes = [0]
     reducer = trainer.policy.actor.reducer
     original = reducer.reduce

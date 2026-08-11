@@ -40,7 +40,7 @@ def get_action_mask(battle: AbstractBattle) -> list[int]:
 
 
 def _get_current_action_mask(battle: AbstractBattle) -> list[int]:
-    """Build the mask from the view refreshed by ``SimEnv.embed_battle``."""
+    """Build the mask from the view refreshed by SimEnv.embed_battle."""
     if not isinstance(battle, DoubleBattle):
         raise TypeError(f"Expected DoubleBattle, got {type(battle).__name__}")
 
@@ -163,7 +163,7 @@ class SimEnv(MegaEnv):
         }
 
     def restore_training_state(self, state: Mapping[str, object]) -> None:
-        """Restore a state previously returned by :meth:`training_state`."""
+        """Restore a state previously returned by the training_state method."""
         agent_rng = state.get("agent_rng")
         opponent_rng = state.get("opponent_rng")
         agent_team = state.get("agent_team")
@@ -250,7 +250,7 @@ class SimEnv(MegaEnv):
 
         poke-env calls this once per agent per step, with that agent's battle
         object, so it must stay free of side effects. The series score is
-        credited once per game by :meth:`_record_game_result`.
+        credited once per game by the record_game_result method.
         """
         if not battle.finished:
             return 0.0

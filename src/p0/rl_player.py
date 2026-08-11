@@ -153,6 +153,10 @@ class RLPlayer(TeamPlayerMixin, Player):
         return series_tokens, series_mask, history_tokens, history_mask, history_age_ids
 
     def _append_history(self, battle: DoubleBattle, token: torch.Tensor) -> None:
+        # token is the reducer's pre-memory local summary (h_t), not the
+        # post-memory cls readout used for the action/value decision. Store
+        # it detached so the live battle cache is a snapshot of this completed
+        # decision rather than a cross-turn autograd graph.
         key = self._battle_key(battle)
         entries = self._battle_history.setdefault(key, [])
         entries.append(token.detach().to(torch.float32).cpu())
@@ -169,6 +173,8 @@ class RLPlayer(TeamPlayerMixin, Player):
         with torch.no_grad():
             out = self.policy.act_obs(obs, mask, *self._memory_inputs(battle), top_p=self.top_p)
 
+        # Waiting requests return before _get_action; every token appended here
+        # therefore corresponds to an actual policy decision.
         self._append_history(battle, out.history_token[0])
         return out.actions[0].cpu().numpy()
 

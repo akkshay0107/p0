@@ -143,7 +143,7 @@ def _cant_reasons(snapshot: ReconstructedSnapshot, role: int) -> tuple[str, ...]
 def _showteam_offset(document: ReplayDocument) -> tuple[int, int]:
     """Where the harness spliced open-team-sheet lines into the captured log.
 
-    The live cursor counts only lines poke-env parsed, and ``showteam`` is not one of
+    The live cursor counts only lines poke-env parsed, and showteam is not one of
     them, so cursors at or past the splice point are shifted by the inserted lines.
     """
     indices = [
@@ -386,7 +386,7 @@ def _assert_legality_provenance(
 
     Hidden level/stat values and their provenance intentionally differ: the live battle
     knows the player's actual values, while a replay reconstructs them from the public
-    species/OTS information. Legality is different — it must never be *wrong*, so a
+    species/OTS information. Legality is different — it must never be wrong, so a
     replay either proves it or raises the unknown gate and writes zeros.
     """
     gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)

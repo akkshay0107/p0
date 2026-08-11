@@ -1,9 +1,9 @@
 """Pure scalar legality and joint-action constraints.
 
-A ``SlotDecision`` carries both the legality itself and whether that legality is proven.
-Live play and self-play own the authoritative ``|request|`` and leave ``legality_known``
+A SlotDecision carries both the legality itself and whether that legality is proven.
+Live play and self-play own the authoritative |request| and leave legality_known
 set; a public replay can only prove part of it, and marks the rest unknown. An unknown
-slot must yield a *superset* mask - every structurally possible action stays selectable -
+slot must yield a superset mask - every structurally possible action stays selectable -
 so the training denominator never excludes the action the demonstrator actually took.
 The observation encoder gates the same flag so an unproven mask is never read as fact.
 """
@@ -130,7 +130,7 @@ def slot1_base_mask(view: DecisionView) -> npt.NDArray[np.bool_]:
 
 
 def apply_joint_constraints(mask: npt.NDArray[np.bool_], view: DecisionView, first: int) -> None:
-    """Apply the sequential slot-1 joint-action constraints in place to ``mask``."""
+    """Apply the sequential slot-1 joint-action constraints in place to mask."""
     if view.team_preview:
         try:
             first_pair = decode_team_pair(first, view.team_size)

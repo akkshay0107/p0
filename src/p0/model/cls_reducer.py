@@ -21,7 +21,14 @@ from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 
 class ReducerOutput(NamedTuple):
-    """The outputs needed by actor, critic, and runtime orchestration."""
+    """The outputs needed by actor, critic, and runtime orchestration.
+
+    cls is the memory-aware readout used for the current policy/value
+    decision. local_history_token is deliberately the pre-memory summary
+    of the current observation; callers store that token for a later turn.
+    Keeping these representations separate prevents history from becoming a
+    recursively nested copy of the entire reducer context.
+    """
 
     cls: Tensor
     pokemon: Tensor
@@ -31,7 +38,7 @@ class ReducerOutput(NamedTuple):
 def pack_history_tokens(history_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     """Pack chronological history into the fixed 48-slot reducer input.
 
-    ``history_tokens`` is ordered oldest to newest. The returned age identity
+    history_tokens is ordered oldest to newest. The returned age identity
     is zero for the newest valid token and increases toward the oldest token.
     """
     if history_tokens.dim() != 3 or history_tokens.size(1) > HISTORY_WINDOW:
@@ -131,7 +138,13 @@ class MemoryReducer(nn.Module):
         history_mask: Tensor,
         history_age_ids: Tensor,
     ) -> ReducerOutput:
-        """Run full attention over the fixed memory window."""
+        """Run full attention over the fixed memory window.
+
+        The local summary is computed from current_tokens alone before it
+        enters the memory reducer. This is the token returned as
+        local_history_token; the post-attention token returned as cls
+        is the one used by the actor and critic for the current decision.
+        """
         # Validate before summarizing so a malformed window costs no attention.
         self._validate_inputs(
             current_tokens,
@@ -165,7 +178,9 @@ class MemoryReducer(nn.Module):
 
         Behaviour cloning builds the per-decision local summaries to fill its
         history window, so it passes the target rows straight back in rather
-        than paying for the same attention twice.
+        than paying for the same attention twice. The supplied summary must
+        describe the same current observation as current_tokens; it must
+        not be a previous cls output or a summary from another row.
         """
         self._validate_inputs(
             current_tokens,
@@ -195,6 +210,9 @@ class MemoryReducer(nn.Module):
         history = (
             history_tokens + self.history_age_emb(history_age_ids) + self.segment_emb.weight[1]
         )
+        # Position 0 is seeded with the current-turn-only summary. The
+        # transformer's output at this position becomes cls after it has
+        # attended to history, series context, and all current tokens.
         current = torch.cat([local_summary[:, None], current_tokens], dim=1)
         current = current + self.current_position_emb.weight[None] + self.segment_emb.weight[2]
 
@@ -213,13 +231,22 @@ class MemoryReducer(nn.Module):
 
         current_start = SERIES_SLOTS + HISTORY_WINDOW
         return ReducerOutput(
+            # cls is the post-memory readout for this decision.
             cls=encoded[:, current_start],
             pokemon=encoded[:, current_start + 1 : current_start + 1 + len(POKEMON_TOKENS)],
+            # Store the pre-memory summary so each history entry remains a
+            # local snapshot rather than recursively containing prior memory.
             local_history_token=local_summary,
         )
 
     def local_summary(self, current_tokens: Tensor) -> Tensor:
-        """Summarize current tokens before any memory interaction."""
+        """Summarize current tokens before any memory interaction.
+
+        This method intentionally cannot see series/history tokens or future
+        outcomes. Its output is both the initial reducer readout and the
+        snapshot that runtime stores for the next decision; training may keep
+        the graph when it reuses local summaries for differentiable history.
+        """
         if current_tokens.dim() != 3 or current_tokens.shape[1:] != (
             CURRENT_TOKEN_COUNT,
             self.d_model,

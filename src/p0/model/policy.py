@@ -1,7 +1,7 @@
 """Policy network: fixed memory reducer, fused token encoder, and the 49-action joint heads.
 
-Defines ``ActorPolicy`` (stateless action sampling/scoring with sequential joint-action masks)
-and ``PolicyNet`` (full actor+critic model). Shared by live play, rollouts, and behaviour-cloning
+Defines ActorPolicy (stateless action sampling/scoring with sequential joint-action masks)
+and PolicyNet (full actor+critic model). Shared by live play, rollouts, and behaviour-cloning
 candidate marginalization.
 """
 
@@ -82,6 +82,13 @@ class EncodedObs(NamedTuple):
 
 
 class ActOutput(NamedTuple):
+    """Outputs for one action decision.
+
+    value is predicted from the post-memory cls readout. The
+    history_token is the pre-memory h_t snapshot returned by the reducer
+    for storage as the next turn's history.
+    """
+
     actions: Tensor
     log_probs: Tensor
     value: Tensor
@@ -89,6 +96,8 @@ class ActOutput(NamedTuple):
 
 
 class EvalOutput(NamedTuple):
+    """Outputs for evaluating an existing action decision."""
+
     log_probs: Tensor
     entropy: Tensor
     norm_entropy: Tensor
@@ -827,7 +836,12 @@ class PolicyNet(nn.Module):
         return self.series(histories)
 
     def local_history_tokens(self, encoded: EncodedObs) -> Tensor:
-        """Generate causal per-decision tokens without memory interaction."""
+        """Generate causal h_t tokens without memory interaction.
+
+        These are current-turn-only summaries used to construct history
+        windows. They are not the memory-aware cls readouts used by the
+        action and value heads.
+        """
         return self.actor.reducer.local_summary(encoded.tokens)
 
     def empty_memory(self, batch_size: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:

@@ -1,7 +1,7 @@
 """Builds structured battle observations and per-slot action masks from poke-env battles.
 
-Implements the observation builder that serializes a ``DoubleBattle`` into the
-``StructuredObservation`` contract (entities, categoricals, numericals, action mask and
+Implements the observation builder that serializes a DoubleBattle into the
+StructuredObservation contract (entities, categoricals, numericals, action mask and
 team-preview state) consumed by the policy and the runtime.
 """
 
@@ -357,7 +357,7 @@ def _side_mega_available(
     """Whether the side still holds a mega stone, and whether that is knowable.
 
     A replay cannot see an unbrought reserve's item, so a side whose only mega-stone
-    holder has not been revealed reports "unknown" instead of a false negative.
+    holder has not been revealed reports unknown instead of a false negative.
     """
     if is_opponent:
         if battle.opponent_used_mega_evolve:
@@ -488,7 +488,7 @@ def _ally_legality(
     slot = decision.slots[active_idx]
 
     # A source without the authoritative request emits zeros and lets the gate say so;
-    # a concrete "illegal" here would be indistinguishable from a proven restriction.
+    # a concrete illegal value here would be indistinguishable from a proven restriction.
     if not slot.legality_known:
         return [0.0] * MOVE_SLOTS, 0.0, False
 
@@ -683,8 +683,8 @@ def _ground_identifier(
     entity_id: str,
     pokemon_to_slot: dict[Any, tuple[SideId, int]],
 ) -> tuple[SideId, int]:
-    # Side identifiers arrive as bare "p1"/"p2" or "p1: Username"; Pokemon
-    # identifiers carry a position letter ("p1a: Name"), so the third
+    # Side identifiers arrive as bare p1 or p2, or p1 followed by a username.
+    # Pokemon identifiers carry a position letter, so the third
     # character distinguishes the two without a lookup.
     if len(entity_id) >= 2 and (len(entity_id) == 2 or entity_id[2] == ":"):
         prefix = entity_id[:2]
@@ -783,7 +783,7 @@ def _write_observation(
       stat_overrides: optional per-species base stat overrides keyed by species identifier
 
     Returns:
-      None; writes directly into the ``out`` buffers
+      None; writes directly into the out buffers
     """
     token_types = out.token_type_ids.numpy()
     sides = out.side_ids.numpy()

@@ -1,18 +1,16 @@
 """Pure player-relative replay reconstruction from protocol lines.
 
-Three concerns live here, in this order:
+Three concerns live here, in this order. First, the replay state is a line-by-line
+state machine over the public protocol covering HP, status, boosts, effects, field
+and side state, PP, and Illusion aliases. It never sees a request. Second, boundary
+segmentation splits the log on the separators Showdown writes whenever its turn loop
+resumes, so decision boundaries come from the log rather than turn-marker heuristics.
+Third, evidence records what each player provably ordered in a block. Blocks where
+only the opponent answered a replacement request advance state without creating a
+policy row.
 
-* ``_ReplayState`` -- a line-by-line state machine over the public protocol (HP, status,
-  boosts, effects, field and side state, PP, Illusion aliases). It never sees a request.
-* boundary segmentation -- ``_update_blocks`` splits the log on the separators Showdown
-  writes whenever its turn loop resumes, so the decision boundaries come from the log
-  itself rather than from turn-marker heuristics.
-* evidence -- what each player provably ordered in a block, handed to
-  ``p0.replays.evidence`` for EXACT/PARTIAL/UNKNOWN labelling. Blocks where only the
-  opponent answered a replacement request advance state without creating a policy row.
-
-A public replay contains no ``|request|``, so reconstruction never asserts a legality it
-cannot show. Emitted masks are supersets marked ``legality_known=False``; the encoder
+A public replay contains no |request|, so reconstruction never asserts a legality it
+cannot show. Emitted masks are supersets marked legality_known=False; the encoder
 gates them so an unproven mask is never read as a proven restriction.
 """
 
@@ -275,8 +273,8 @@ def _get_base_stats_index(dex: Mapping[str, Any]) -> dict[str, dict[str, int]]:
     """Compute the species base-stats index, caching by a content fingerprint.
 
     The cache is keyed by a SHA-256 of the canonical JSON of the dex's
-    ``species`` list, avoiding the stale-hit and memory-leak problems of an
-    ``id(dex)``-keyed cache when callers pass freshly-loaded mappings.
+    species list, avoiding the stale-hit and memory-leak problems of an
+    id(dex)-keyed cache when callers pass freshly-loaded mappings.
     """
     species = dex.get("species", ())
     fingerprint = hashlib.sha256(orjson.dumps(species, option=orjson.OPT_SORT_KEYS)).hexdigest()
@@ -710,7 +708,7 @@ class _ReplayState:
         self.fields: dict[ReplayName, int] = {}
         self.side_conditions: list[dict[ReplayName, int]] = [{}, {}]
         # A switch can initially identify an Illusion user as another roster
-        # member. Keep the pre-effect object so a later ``replace`` line can
+        # member. Keep the pre-effect object so a later replace line can
         # restore the disguised member before transferring runtime state to
         # the revealed Pokemon.
         self._illusion_baselines: dict[tuple[int, int], ReplayPokemon] = {}
@@ -956,14 +954,14 @@ class _ReplayState:
     def apply(self, parts: Sequence[str]) -> None:
         """Advance the state machine by applying one parsed protocol line.
 
-        Dispatches on ``parts[1]`` (the Showdown tag) to update active
+        Dispatches on parts[1] (the Showdown tag) to update active
         pokemon, HP, boosts, status, weather, fields, and Illusion aliases.
-        Each handler mutates ``self.teams``, ``self.active``, ``self.hp``,
-        and ``self.identifiers`` in place so the next ``_view`` call observes
+        Each handler mutates self.teams, self.active, self.hp,
+        and self.identifiers in place so the next _view call observes
         the post-line state.
 
         Arguments:
-            parts: The split protocol line (``|tag|...``).
+            parts: The split protocol line (|tag|...).
 
         Returns:
             None; mutates the replay state in place.
@@ -1058,7 +1056,7 @@ class _ReplayState:
             if current is None:
                 return
 
-            # ``replace`` is an Illusion identity transition. Damage and
+            # replace is an Illusion identity transition. Damage and
             # faint lines preceding it were keyed to the displayed alias, so
             # move those runtime fields to the actual roster member while
             # restoring the alias member's pre-Illusion state.
@@ -1426,7 +1424,7 @@ def _is_choice_switch(parts: Sequence[str]) -> bool:
 
     A pivot switch emitted after U-turn/Flip Turn is the outcome of the first
     request and the replacement request is represented by that switch line.
-    Other ``[from]`` switches are automatic state updates.
+    Other [from] switches are automatic state updates.
     """
     return (
         len(parts) >= 3
@@ -1450,22 +1448,22 @@ _ACTION_TAGS = frozenset({"move", "switch", "cant"})
 def _is_action_line(parts: Sequence[str]) -> bool:
     """Whether a protocol line is a player's answer to a request.
 
-    Every ``move``/``switch``/``cant`` line is the visible consequence of a submitted
-    order, including a pivot's ``[from]`` switch, which answers its own replacement
-    request. Automatic state updates (``drag``, item-swapped forms) never are.
+    Every move/switch/cant line is the visible consequence of a submitted
+    order, including a pivot's [from] switch, which answers its own replacement
+    request. Automatic state updates (drag, item-swapped forms) never are.
     """
     return len(parts) >= 3 and parts[1] in _ACTION_TAGS
 
 
 def _is_separator(parts: Sequence[str]) -> bool:
-    """Whether a line is Showdown's update-block separator (a bare ``|``)."""
+    """Whether a line is Showdown's update-block separator (a bare |)."""
     return len(parts) == 2 and parts[1] == ""
 
 
 def _update_blocks(document: ReplayDocument) -> tuple[tuple[int, int], ...]:
     """Split the log on the separators Showdown writes when its turn loop resumes.
 
-    ``Battle.turnLoop`` emits an empty log entry every time the simulator resumes,
+    Battle.turnLoop emits an empty log entry every time the simulator resumes,
     which is exactly once per answered request (plus the residual and terminal
     phases). Segmenting on those separators recovers the request boundaries instead
     of guessing them from turn markers.
@@ -1532,9 +1530,9 @@ def _decision_blocks(document: ReplayDocument) -> tuple[tuple[int, int, Decision
 def _animation_targets(lines: Sequence[Any]) -> dict[tuple[int, int, str], str]:
     """Collect targets from animation lines paired with targetless move lines.
 
-    Showdown deliberately clears the target field on a ``move`` line when it
-    appends ``[still]``.  Some moves, notably Electro Shot in rain, then emit a
-    separate ``-anim`` line containing the target.  Keep the first target for
+    Showdown deliberately clears the target field on a move line when it
+    appends [still].  Some moves, notably Electro Shot in rain, then emit a
+    separate -anim line containing the target.  Keep the first target for
     each actor/move pair; later animation lines can describe additional hits
     rather than a new choice.
     """
@@ -1555,8 +1553,8 @@ def _animation_targets(lines: Sequence[Any]) -> dict[tuple[int, int, str], str]:
 def _illusion_species_by_line(lines: Sequence[Any]) -> dict[tuple[int, int, int], str]:
     """Resolve action labels emitted while an Illusion is still disguised.
 
-    The replay can split the alias ``switch`` and its later ``replace`` across
-    request/turn chunks. The future ``replace`` is valid supervision for the
+    The replay can split the alias switch and its later replace across
+    request/turn chunks. The future replace is valid supervision for the
     observed action, even though it must not be applied to the pre-decision
     state until its protocol line is reached.
     """
@@ -1642,7 +1640,7 @@ def _infer_illusion_active_species(
 
     A same-species switch can mean either that an earlier Illusion is leaving
     and the real roster member is entering, or that a new Illusion is entering
-    now. The latter has a future ``replace`` entry for the current switch and
+    now. The latter has a future replace entry for the current switch and
     must not change this segment's pre-decision view.
     """
     inferred: dict[tuple[int, int], str] = {}
@@ -1688,8 +1686,8 @@ def _observed_actions(
 ) -> tuple[ObservedAction | None, ObservedAction | None, tuple[str, ...]]:
     """Extract the observed slot-0 and slot-1 actions for one decision segment.
 
-    Walks the segment's protocol lines and maps each submitted ``move`` or
-    ``switch`` order belonging to *perspective* into an ``ObservedAction``
+    Walks the segment's protocol lines and maps each submitted move or
+    switch order belonging to perspective into an ObservedAction
     using the 49-action codec. Target ambiguity, forced-move (Struggle /
     Recharge), and Illusion-disguised switches are resolved conservatively.
 
@@ -1702,8 +1700,8 @@ def _observed_actions(
             resolving displayed aliases to actual roster members.
 
     Returns:
-        A ``(slot0, slot1, tags)`` triple where each slot is an
-        ``ObservedAction`` or ``None`` when no action was observed.
+        A (slot0, slot1, tags) triple where each slot is an
+        ObservedAction or None when no action was observed.
     """
     observed: list[ObservedAction | None] = [None, None]
     tags: list[str] = []
@@ -1920,22 +1918,22 @@ def _view(
 ) -> FixtureBattleView:
     """Build a player-relative pre-decision view from the current state.
 
-    Constructs the ``FixtureBattleView`` and ``DecisionView`` that the live
+    Constructs the FixtureBattleView and DecisionView that the live
     environment would present at this request boundary. The view reflects
-    the state *before* the segment's protocol lines are applied, with
+    the state before the segment's protocol lines are applied, with
     Illusion aliases and forced-move slots overlaid where applicable.
 
     Arguments:
         state: The replay state machine (pre-segment view).
         perspective: The player index (0 or 1) to build the view for.
         preview: Whether this is a team-preview decision.
-        effective_species: Optional mapping of ``(side, slot)`` to the actual
+        effective_species: Optional mapping of (side, slot) to the actual
             Illusion species to display instead of the disguised alias.
         forced_move_slots: Slot indices that are locked into a forced move
             (Struggle / Recharge) during this segment.
 
     Returns:
-        A ``FixtureBattleView`` ready for evidence extraction.
+        A FixtureBattleView ready for evidence extraction.
     """
     opponent = 1 - perspective
     teams = [list(state.teams[side]) for side in (0, 1)]
