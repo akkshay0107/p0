@@ -28,7 +28,7 @@ from p0.model.cls_reducer import pack_history_tokens
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
 from p0.model.observation_builder import ObservationBuilder
-from p0.model.policy import PolicyNet
+from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.model.token_store import SeriesTokenStore
 from p0.runtime import poke_env_patches
@@ -150,10 +150,16 @@ class RLPlayer(TeamPlayerMixin, Player):
         series_tokens, series_mask = self._series_store.get_tokens(
             [base_id], device=self.policy.device
         )
-        return series_tokens, series_mask, history_tokens, history_mask, history_age_ids
+        return MemoryInputs(
+            series_tokens=series_tokens,
+            series_mask=series_mask,
+            history_tokens=history_tokens,
+            history_mask=history_mask,
+            history_age_ids=history_age_ids,
+        )
 
     def _append_history(self, battle: DoubleBattle, token: torch.Tensor) -> None:
-        # token is the reducer's pre-memory local summary (h_t), not the
+        # token is the reducer pre-memory local summary, not the
         # post-memory cls readout used for the action/value decision. Store
         # it detached so the live battle cache is a snapshot of this completed
         # decision rather than a cross-turn autograd graph.
@@ -171,9 +177,11 @@ class RLPlayer(TeamPlayerMixin, Player):
         mask = mask.unsqueeze(0).to(self.policy.device)
 
         with torch.no_grad():
-            out = self.policy.act_obs(obs, mask, *self._memory_inputs(battle), top_p=self.top_p)
+            encoded = self.policy.encode(obs, mask)
+            prepared = self.policy.prepare(encoded, self._memory_inputs(battle))
+            out = self.policy.act(prepared, mask, top_p=self.top_p)
 
-        # Waiting requests return before _get_action; every token appended here
+        # Waiting requests return before action selection; every token appended here
         # therefore corresponds to an actual policy decision.
         self._append_history(battle, out.history_token[0])
         return out.actions[0].cpu().numpy()

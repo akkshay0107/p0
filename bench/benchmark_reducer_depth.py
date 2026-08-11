@@ -19,9 +19,9 @@ from p0.battle.actions import ACT_SIZE
 from p0.model.architecture_contract import CURRENT_REDUCER_TOKEN_COUNT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
-from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.policy import EncodedObs, MemoryInputs, PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import StructuredObservation
+from p0.model.structured_observation import StructuredObservation, is_teampreview
 from p0.training.checkpoint import CheckpointStore
 from p0.training.utils import default_device
 
@@ -155,35 +155,51 @@ def _make_config(benchmark: BenchmarkConfig, reducer_layers: int) -> ModelConfig
     )
 
 
-def _repeat_memory(memory: tuple[Tensor, ...], repeats: int) -> tuple[Tensor, ...]:
-    return tuple(value.repeat_interleave(repeats, dim=0) for value in memory)
+def _repeat_memory(memory: MemoryInputs, repeats: int) -> MemoryInputs:
+    return MemoryInputs(
+        series_tokens=memory.series_tokens.repeat_interleave(repeats, dim=0),
+        series_mask=memory.series_mask.repeat_interleave(repeats, dim=0),
+        history_tokens=memory.history_tokens.repeat_interleave(repeats, dim=0),
+        history_mask=memory.history_mask.repeat_interleave(repeats, dim=0),
+        history_age_ids=memory.history_age_ids.repeat_interleave(repeats, dim=0),
+    )
 
 
 def _build_inputs(
     policy: PolicyNet,
     benchmark: BenchmarkConfig,
     device: torch.device,
-) -> tuple[EncodedObs, Tensor, tuple[Tensor, ...]]:
+) -> tuple[EncodedObs, Tensor, MemoryInputs]:
     observations = StructuredObservation.empty_batch(benchmark.batch_size).to(device)
     action_mask = torch.ones((benchmark.batch_size, 2, ACT_SIZE), dtype=torch.bool, device=device)
     encoded = policy.encode(observations, action_mask)
+    memory = MemoryInputs.empty(
+        benchmark.batch_size,
+        policy.d_model,
+        device,
+        next(policy.parameters()).dtype,
+    )
     if benchmark.time_steps == 1:
-        return encoded, action_mask, policy.empty_memory(benchmark.batch_size)
+        return encoded, action_mask, memory
     return (
         EncodedObs(
             tokens=encoded.tokens.repeat_interleave(benchmark.time_steps, dim=0),
             aux=encoded.aux.repeat_interleave(benchmark.time_steps, dim=0),
             numerical=encoded.numerical.repeat_interleave(benchmark.time_steps, dim=0),
+            phase=encoded.phase.repeat_interleave(benchmark.time_steps, dim=0),
+            local_history_token=encoded.local_history_token.repeat_interleave(
+                benchmark.time_steps, dim=0
+            ),
         ),
         action_mask.repeat_interleave(benchmark.time_steps, dim=0),
-        _repeat_memory(policy.empty_memory(benchmark.batch_size), benchmark.time_steps),
+        _repeat_memory(memory, benchmark.time_steps),
     )
 
 
 def _sample(
     policy: PolicyNet,
     encoded: EncodedObs,
-    memory: tuple[Tensor, ...],
+    memory: MemoryInputs,
     device: torch.device,
     iterations: int,
 ) -> float:
@@ -191,7 +207,15 @@ def _sample(
     start = time.perf_counter()
     with torch.inference_mode():
         for _ in range(iterations):
-            policy.actor.reducer(encoded.tokens, *memory)
+            policy.actor.reducer.reduce(
+                encoded.local_history_token,
+                encoded.tokens,
+                memory.series_tokens,
+                memory.series_mask,
+                memory.history_tokens,
+                memory.history_mask,
+                memory.history_age_ids,
+            )
     synchronize(device)
     return (time.perf_counter() - start) / iterations
 
@@ -199,7 +223,7 @@ def _sample(
 def _peak_memory(
     policy: PolicyNet,
     encoded: EncodedObs,
-    memory: tuple[Tensor, ...],
+    memory: MemoryInputs,
     device: torch.device,
 ) -> int:
     policy.zero_grad(set_to_none=True)
@@ -208,7 +232,15 @@ def _peak_memory(
         profile_memory=True,
         record_shapes=False,
     ) as profile:
-        reduced = policy.actor.reducer(encoded.tokens, *memory)
+        reduced = policy.actor.reducer.reduce(
+            encoded.local_history_token,
+            encoded.tokens,
+            memory.series_tokens,
+            memory.series_mask,
+            memory.history_tokens,
+            memory.history_mask,
+            memory.history_age_ids,
+        )
         reduced.cls.square().mean().backward()
     current = 0
     peak = 0
@@ -250,34 +282,26 @@ def _validation_metric(
 ) -> Metric:
     if artifact is None:
         return Metric.unavailable("compatible BC validation inputs were not supplied")
+    tokens = artifact["tokens"].to(device=device, dtype=dtype)
+    numerical = artifact["numerical"].to(device=device, dtype=dtype)
     encoded = EncodedObs(
-        tokens=artifact["tokens"].to(device=device, dtype=dtype),
+        tokens=tokens,
         aux=artifact["aux"].to(device=device, dtype=dtype),
-        numerical=artifact["numerical"].to(device=device, dtype=dtype),
+        numerical=numerical,
+        phase=is_teampreview(numerical),
+        local_history_token=policy.actor.reducer.local_summary(tokens),
     )
     action_mask = artifact["action_mask"].to(device=device, dtype=torch.bool)
     actions = artifact["actions"].to(device=device, dtype=torch.long)
-    memory = tuple(
-        artifact[name].to(
-            device=device,
-            dtype=(
-                torch.long
-                if name == "history_age_ids"
-                else torch.bool
-                if name in {"series_mask", "history_mask"}
-                else dtype
-            ),
-        )
-        for name in (
-            "series_tokens",
-            "series_mask",
-            "history_tokens",
-            "history_mask",
-            "history_age_ids",
-        )
+    memory = MemoryInputs(
+        series_tokens=artifact["series_tokens"].to(device=device, dtype=dtype),
+        series_mask=artifact["series_mask"].to(device=device, dtype=torch.bool),
+        history_tokens=artifact["history_tokens"].to(device=device, dtype=dtype),
+        history_mask=artifact["history_mask"].to(device=device, dtype=torch.bool),
+        history_age_ids=artifact["history_age_ids"].to(device=device, dtype=torch.long),
     )
     with torch.inference_mode():
-        output = policy.evaluate(encoded, action_mask, actions, *memory)
+        output = policy.evaluate(policy.prepare(encoded, memory), action_mask, actions)
     return Metric.available(float((-output.log_probs).mean().item()))
 
 
@@ -304,7 +328,15 @@ def _run_variant(
     encoded, _, memory = _build_inputs(policy, benchmark, device)
     with torch.inference_mode():
         for _ in range(benchmark.warmup):
-            policy.actor.reducer(encoded.tokens, *memory)
+            policy.actor.reducer.reduce(
+                encoded.local_history_token,
+                encoded.tokens,
+                memory.series_tokens,
+                memory.series_mask,
+                memory.history_tokens,
+                memory.history_mask,
+                memory.history_age_ids,
+            )
     samples = [
         _sample(policy, encoded, memory, device, benchmark.iterations)
         for _ in range(benchmark.repeats)

@@ -51,19 +51,25 @@ class FakePolicy:
         self.summarized_lengths.append(history.size(1))
         return torch.zeros((history.size(0), 4, self.d_model))
 
-    def act_obs(
+    def encode(self, obs: StructuredObservation, action_mask: torch.Tensor):
+        del action_mask
+        return obs
+
+    def prepare(self, encoded, memory):
+        return encoded, memory
+
+    def act(
         self,
-        obs: StructuredObservation,
+        prepared,
         action_mask: torch.Tensor,
-        series_tokens: torch.Tensor,
-        series_mask: torch.Tensor,
-        history_tokens: torch.Tensor,
-        history_mask: torch.Tensor,
-        history_age_ids: torch.Tensor,
+        *,
+        top_p: float = 1.0,
+        deterministic: bool = False,
     ) -> ActOutput:
-        assert torch.count_nonzero(series_tokens) == 0
-        assert torch.count_nonzero(series_mask) == 0
-        del history_tokens, history_mask, history_age_ids
+        del top_p, deterministic
+        _, memory = prepared
+        assert torch.count_nonzero(memory.series_tokens) == 0
+        assert torch.count_nonzero(memory.series_mask) == 0
         batch_size = action_mask.size(0)
         self.batch_sizes.append(batch_size)
         actions = torch.full((batch_size, 2), self.action, dtype=torch.long)
@@ -492,7 +498,7 @@ def test_evaluation_harness_falls_back_without_corpus(tmp_path: Path) -> None:
     for key, source in sources.items():
         assert isinstance(source, FixedTeamSource)
         assert harness.category_metadata[key]["fallback"] is True
-        # Sampled team should match DEFAULT_TEST_TEAM
+        # Sampled team should match the default test team
         team = source.sample(harness.rng)
         assert "Pikachu" in team.packed
 

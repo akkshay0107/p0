@@ -129,41 +129,6 @@ class MemoryReducer(nn.Module):
         ):
             raise ValueError("history age ids must be in [0, 48)")
 
-    def forward(
-        self,
-        current_tokens: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
-    ) -> ReducerOutput:
-        """Run full attention over the fixed memory window.
-
-        The local summary is computed from current_tokens alone before it
-        enters the memory reducer. This is the token returned as
-        local_history_token; the post-attention token returned as cls
-        is the one used by the actor and critic for the current decision.
-        """
-        # Validate before summarizing so a malformed window costs no attention.
-        self._validate_inputs(
-            current_tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-        )
-        return self.reduce(
-            self.local_summary(current_tokens),
-            current_tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-        )
-
     def reduce(
         self,
         local_summary: Tensor,
@@ -190,6 +155,10 @@ class MemoryReducer(nn.Module):
             history_mask,
             history_age_ids,
         )
+        # Historical summaries are immutable observations for the current
+        # decision. Detaching here prevents later losses from traversing back
+        # through earlier observations while keeping the current summary live.
+        history_tokens = history_tokens.detach()
         device = current_tokens.device
         batch = current_tokens.size(0)
         if (
@@ -211,7 +180,7 @@ class MemoryReducer(nn.Module):
             history_tokens + self.history_age_emb(history_age_ids) + self.segment_emb.weight[1]
         )
         # Position 0 is seeded with the current-turn-only summary. The
-        # transformer's output at this position becomes cls after it has
+        # The transformer output at this position becomes the readout after it has
         # attended to history, series context, and all current tokens.
         current = torch.cat([local_summary[:, None], current_tokens], dim=1)
         current = current + self.current_position_emb.weight[None] + self.segment_emb.weight[2]

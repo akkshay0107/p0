@@ -8,7 +8,8 @@ candidate marginalization.
 from __future__ import annotations
 
 import math
-from typing import NamedTuple, Protocol
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -68,17 +69,72 @@ TP_START = 0
 TP_END = TEAM_SIZE**2
 
 
-class EncodedObs(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class EncodedObs:
     tokens: Tensor
     aux: Tensor
     numerical: Tensor
+    phase: Tensor
+    local_history_token: Tensor
 
-    def step(self, n: int, t: int) -> EncodedObs:
+    def __post_init__(self) -> None:
+        batch_shape = self.tokens.shape[:-2]
+        if self.phase.shape != batch_shape or self.phase.dtype != torch.bool:
+            raise ValueError("phase must be a boolean tensor matching the encoded batch shape")
+        if self.local_history_token.shape != (*batch_shape, self.tokens.size(-1)):
+            raise ValueError("local_history_token must match the encoded batch and model width")
+
+    def __getitem__(self, index) -> EncodedObs:
         return EncodedObs(
-            tokens=self.tokens[t, :n],
-            aux=self.aux[t, :n],
-            numerical=self.numerical[t, :n],
+            tokens=self.tokens[index],
+            aux=self.aux[index],
+            numerical=self.numerical[index],
+            phase=self.phase[index],
+            local_history_token=self.local_history_token[index],
         )
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryInputs:
+    """Immutable series and battle-history inputs for one policy batch."""
+
+    series_tokens: Tensor
+    series_mask: Tensor
+    history_tokens: Tensor
+    history_mask: Tensor
+    history_age_ids: Tensor
+
+    @classmethod
+    def empty(
+        cls,
+        batch_size: int,
+        d_model: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> MemoryInputs:
+        if type(batch_size) is not int or batch_size < 0:
+            raise ValueError("batch_size must be a non-negative integer")
+        return cls(
+            series_tokens=torch.zeros(
+                (batch_size, SERIES_SLOTS, d_model), device=device, dtype=dtype
+            ),
+            series_mask=torch.zeros((batch_size, SERIES_SLOTS), device=device, dtype=torch.bool),
+            history_tokens=torch.zeros(
+                (batch_size, HISTORY_WINDOW, d_model), device=device, dtype=dtype
+            ),
+            history_mask=torch.zeros((batch_size, HISTORY_WINDOW), device=device, dtype=torch.bool),
+            history_age_ids=torch.zeros(
+                (batch_size, HISTORY_WINDOW), device=device, dtype=torch.long
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDecision:
+    """Encoded observation and memory-aware readout for one policy decision."""
+
+    encoded: EncodedObs
+    reduced: ReducerOutput
 
 
 class ActOutput(NamedTuple):
@@ -113,36 +169,6 @@ def _require_matching_batch(reduced: ReducerOutput, enc: EncodedObs) -> None:
             f"Reduced batch of {reduced.cls.size(0)} does not match "
             f"{enc.tokens.size(0)} encoded observations"
         )
-
-
-class CandidateScorer(Protocol):
-    """Pinned seam for behaviour-cloning candidate marginalization.
-
-    The contract: run the stateless reducer once per observation, expand only the action-scoring
-    stage across each decision's candidate joint actions, apply the
-    sequential second-action mask per candidate first action, and return
-    joint log-probabilities after one fixed-window reducer pass
-    per observation.
-
-    Candidates use the shard ragged encoding: candidate_offsets has length
-    T + 1 and decision t owns candidate_values[offsets[t]:offsets[t + 1]]
-    rows of joint action pairs. The result is flat per-candidate joint
-    log-probabilities aligned with candidate_values rows; the marginal NLL
-    is the negative log of each decision's summed candidate probability.
-    """
-
-    def score_joint_candidates(
-        self,
-        enc: EncodedObs,
-        action_mask: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
-        candidate_values: Tensor,
-        candidate_offsets: Tensor,
-    ) -> Tensor: ...
 
 
 class ValueHead(nn.Module):
@@ -210,7 +236,7 @@ class ActorPolicy(nn.Module):
         self.entity_key_norm = nn.LayerNorm(self.d_k)
 
         # fused query projector for the 4 query types
-        # switch, move, pass, teampreview (mega reuses q_move with mega_emb keys)
+        # switch, move, pass, and team preview, with mega reusing the move query
         self.q_proj1 = nn.Linear(d_model + self.d_k, 4 * self.d_k)
         self.q_proj2 = nn.Linear(d_model + 2 * self.d_k, 4 * self.d_k)
 
@@ -282,6 +308,7 @@ class ActorPolicy(nn.Module):
         k_entity_extended: Tensor,
         aux_moves: Tensor,
         numerical: Tensor,
+        phase: Tensor,
         head_idx: int,
         ctx_a1: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
@@ -291,7 +318,8 @@ class ActorPolicy(nn.Module):
           z: Reduced battle-state summaries, one per batch row.
           k_entity_extended: Projected entity keys plus the learned self-target key.
           aux_moves: Encoded move tokens for the decision slot being scored.
-          numerical: Observation numerics used for phase and switch-slot routing.
+          numerical: Observation numerics used for switch-slot routing.
+          phase: Immutable team-preview flags captured during observation encoding.
           head_idx: Zero for the first decision and one for the second decision.
           ctx_a1: The exact key scored for the selected first action; required by head one.
 
@@ -309,7 +337,7 @@ class ActorPolicy(nn.Module):
 
         k_moves = self.w_k_move(aux_moves)
         k_ally = k_entity_extended[:, self.ally_poke_entities, :]
-        is_tp = is_teampreview(numerical)
+        is_tp = phase
 
         if head_idx == 0:
             decision_owner = torch.where(
@@ -330,7 +358,7 @@ class ActorPolicy(nn.Module):
 
         q_switch, q_move, q_pass, q_tp = torch.split(q_all, self.d_k, dim=-1)
 
-        # one scratch column past act_size absorbs the switch scatter of empty
+        # one scratch column past the action count absorbs the switch scatter of empty
         # ally rows (orig ratio 0), which would otherwise land on the pass slot
         logits = torch.zeros((B, self.act_size + 1), device=device)
         action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
@@ -413,31 +441,21 @@ class ActorPolicy(nn.Module):
 
         return torch.empty_like(logits).scatter(-1, sorted_indices, sorted_logits)
 
-    def sample(
+    def sample_reduced(
         self,
+        reduced: ReducerOutput,
         enc: EncodedObs,
         action_mask: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
         *,
         top_p: float = 1.0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        reduced = self.reducer(
-            enc.tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-        )
+        """Sample actions from a reducer output that was already computed."""
+        _require_matching_batch(reduced, enc)
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
 
         logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
         )
         logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
         sample_logits1 = self._apply_top_p(logits1, top_p) if top_p < 1.0 else logits1
@@ -449,13 +467,17 @@ class ActorPolicy(nn.Module):
         ctx_a1 = keys1[batch_idx, a1]
 
         logits2, _ = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
+            z,
+            k_entity_extended,
+            enc.aux[:, 1],
+            enc.numerical,
+            enc.phase,
+            head_idx=1,
+            ctx_a1=ctx_a1,
         )
 
         logits = torch.stack([logits1, logits2], dim=1)
-        logits = self._apply_sequential_masks(
-            logits, a1, action_mask, is_teampreview(enc.numerical)
-        )
+        logits = self._apply_sequential_masks(logits, a1, action_mask, enc.phase)
         sample_logits2 = self._apply_top_p(logits[:, 1], top_p) if top_p < 1.0 else logits[:, 1]
 
         dist2 = Categorical(logits=sample_logits2)
@@ -463,31 +485,6 @@ class ActorPolicy(nn.Module):
         log_probs = dist1.log_prob(a1) + dist2.log_prob(a2)
         actions = torch.stack([a1, a2], dim=-1)
         return actions, log_probs, z, reduced.local_history_token
-
-    @torch.no_grad()
-    def greedy(
-        self,
-        enc: EncodedObs,
-        action_mask: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Choose one legal joint action through the autoregressive path."""
-        return self.greedy_reduced(
-            self.reducer(
-                enc.tokens,
-                series_tokens,
-                series_mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
-            ),
-            enc,
-            action_mask,
-        )
 
     @torch.no_grad()
     def greedy_reduced(
@@ -502,7 +499,7 @@ class ActorPolicy(nn.Module):
         k_entity_extended = self._compute_keys(reduced.pokemon)
 
         logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
         )
         logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
         a1 = torch.argmax(logits1, dim=-1)
@@ -514,6 +511,7 @@ class ActorPolicy(nn.Module):
             k_entity_extended,
             enc.aux[:, 1],
             enc.numerical,
+            enc.phase,
             head_idx=1,
             ctx_a1=ctx_a1,
         )
@@ -521,7 +519,7 @@ class ActorPolicy(nn.Module):
             torch.stack([logits1, logits2], dim=1),
             a1,
             action_mask,
-            is_teampreview(enc.numerical),
+            enc.phase,
         )
         a2 = torch.argmax(logits[:, 1], dim=-1)
         actions = torch.stack([a1, a2], dim=-1)
@@ -530,30 +528,20 @@ class ActorPolicy(nn.Module):
         ) + F.log_softmax(logits[:, 1], dim=-1).gather(1, a2.unsqueeze(1)).squeeze(1)
         return actions, log_probs, z, reduced.local_history_token
 
-    def score(
+    def score_reduced(
         self,
+        reduced: ReducerOutput,
         enc: EncodedObs,
         action_mask: Tensor,
         actions: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        reduced = self.reducer(
-            enc.tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-        )
+        """Score actions from a reducer output that was already computed."""
+        _require_matching_batch(reduced, enc)
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
 
         logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
         )
         a1 = actions[:, 0]
 
@@ -561,13 +549,17 @@ class ActorPolicy(nn.Module):
         ctx_a1 = keys1[batch_idx, a1]
 
         logits2, _ = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 1], enc.numerical, head_idx=1, ctx_a1=ctx_a1
+            z,
+            k_entity_extended,
+            enc.aux[:, 1],
+            enc.numerical,
+            enc.phase,
+            head_idx=1,
+            ctx_a1=ctx_a1,
         )
 
         logits = torch.stack([logits1, logits2], dim=1)
-        logits = self._apply_sequential_masks(
-            logits, a1, action_mask, is_teampreview(enc.numerical)
-        )
+        logits = self._apply_sequential_masks(logits, a1, action_mask, enc.phase)
 
         dist1 = Categorical(logits=logits[:, 0])
         dist2 = Categorical(logits=logits[:, 1])
@@ -600,33 +592,6 @@ class ActorPolicy(nn.Module):
             raise ValueError("candidate_offsets must be nondecreasing")
         return offsets
 
-    def score_joint_candidates(
-        self,
-        enc: EncodedObs,
-        action_mask: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
-        candidate_values: Tensor,
-        candidate_offsets: Tensor,
-    ) -> Tensor:
-        """Score ragged candidates after one stateless reducer pass."""
-        batch_size = enc.tokens.size(0)
-        if series_tokens.size(0) != batch_size or history_tokens.size(0) != batch_size:
-            raise ValueError("memory inputs must match encoded observation batch size")
-        offsets = self._validated_offsets(enc, action_mask, candidate_values, candidate_offsets)
-        reduced = self.reducer(
-            enc.tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-        )
-        return self._score_reduced(reduced, enc, action_mask, candidate_values, offsets)
-
     def score_reduced_candidates(
         self,
         reduced: ReducerOutput,
@@ -639,24 +604,6 @@ class ActorPolicy(nn.Module):
         _require_matching_batch(reduced, enc)
         offsets = self._validated_offsets(enc, action_mask, candidate_values, candidate_offsets)
         return self._score_reduced(reduced, enc, action_mask, candidate_values, offsets)
-
-    def _score_reduced_candidates_unchecked(
-        self,
-        reduced: ReducerOutput,
-        enc: EncodedObs,
-        action_mask: Tensor,
-        candidate_values: Tensor,
-        candidate_offsets: Tensor,
-    ) -> Tensor:
-        """Score candidates whose shard contract was validated before device transfer."""
-        _require_matching_batch(reduced, enc)
-        return self._score_reduced_unchecked(
-            reduced,
-            enc,
-            action_mask,
-            candidate_values,
-            candidate_offsets,
-        )
 
     def _score_reduced(
         self,
@@ -692,7 +639,7 @@ class ActorPolicy(nn.Module):
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
         logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, head_idx=0
+            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
         )
         counts = offsets[1:] - offsets[:-1]
         candidate_batch = torch.repeat_interleave(
@@ -706,6 +653,7 @@ class ActorPolicy(nn.Module):
             k_entity_extended[candidate_batch],
             enc.aux[candidate_batch, 1],
             enc.numerical[candidate_batch],
+            enc.phase[candidate_batch],
             head_idx=1,
             ctx_a1=candidate_ctx,
         )
@@ -714,7 +662,7 @@ class ActorPolicy(nn.Module):
             candidate_logits,
             first_actions,
             action_mask[candidate_batch],
-            is_teampreview(enc.numerical[candidate_batch]),
+            enc.phase[candidate_batch],
         )
         log_prob_first = F.log_softmax(candidate_logits[:, 0], dim=-1).gather(
             1, first_actions.unsqueeze(1)
@@ -735,6 +683,7 @@ class ActorPolicy(nn.Module):
             self._compute_keys(reduced.pokemon),
             enc.aux[:, 0],
             enc.numerical,
+            enc.phase,
             head_idx=0,
         )
         return logits
@@ -762,18 +711,18 @@ class ActorPolicy(nn.Module):
         mask2[pass_mask, 0] = False
 
         # Ensure all 4 selected Pokemon are unique (no overlap between Lead and Back).
-        # compute overlap for all B rows simultaneously, gate with is_tp.
-        # eliminates the is_tp.any() GPU->CPU sync
+        # Compute overlap for all batch rows simultaneously and gate with the phase flag.
+        # This eliminates a device synchronization while checking the phase flag.
         p1_1 = action1 // TEAM_SIZE  # (B,) — meaningful only for tp rows
         p2_1 = action1 % TEAM_SIZE  # (B,)
-        p1_2 = self.all_a // TEAM_SIZE  # (TP_END,)
-        p2_2 = self.all_a % TEAM_SIZE  # (TP_END,)
+        p1_2 = self.all_a // TEAM_SIZE  # team preview left positions
+        p2_2 = self.all_a % TEAM_SIZE  # team preview right positions
         tp_overlap = (
             (p1_2[None] == p1_1[:, None])
             | (p1_2[None] == p2_1[:, None])
             | (p2_2[None] == p1_1[:, None])
             | (p2_2[None] == p2_1[:, None])
-        )  # (B, TP_END)
+        )  # batch by team preview action count
         mask2[:, :TP_END] = mask2[:, :TP_END] & ~(is_tp[:, None] & tp_overlap)
 
         # If no valid action remains, force pass action to be valid for Pokemon 2
@@ -835,30 +784,6 @@ class PolicyNet(nn.Module):
         """Encode completed game turn histories into series tokens and mask."""
         return self.series(histories)
 
-    def local_history_tokens(self, encoded: EncodedObs) -> Tensor:
-        """Generate causal h_t tokens without memory interaction.
-
-        These are current-turn-only summaries used to construct history
-        windows. They are not the memory-aware cls readouts used by the
-        action and value heads.
-        """
-        return self.actor.reducer.local_summary(encoded.tokens)
-
-    def empty_memory(self, batch_size: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Create explicit masked memory inputs for an independent Game 1."""
-        if type(batch_size) is not int or batch_size < 0:
-            raise ValueError("batch_size must be a non-negative integer")
-        device = self.device
-        dtype = next(self.parameters()).dtype
-        series = torch.zeros((batch_size, SERIES_SLOTS, self.d_model), device=device, dtype=dtype)
-        series_mask = torch.zeros((batch_size, SERIES_SLOTS), device=device, dtype=torch.bool)
-        history = torch.zeros(
-            (batch_size, HISTORY_WINDOW, self.d_model), device=device, dtype=dtype
-        )
-        history_mask = torch.zeros((batch_size, HISTORY_WINDOW), device=device, dtype=torch.bool)
-        history_age_ids = torch.zeros((batch_size, HISTORY_WINDOW), device=device, dtype=torch.long)
-        return series, series_mask, history, history_mask, history_age_ids
-
     def encode(
         self,
         obs: StructuredObservation,
@@ -867,60 +792,68 @@ class PolicyNet(nn.Module):
         if obs.categorical.dim() != 3:
             raise ValueError("PolicyNet.encode expects a batched StructuredObservation.")
         tokens, aux = self.encoder(obs, action_mask)
-        return EncodedObs(tokens=tokens, aux=aux, numerical=obs.numerical)
+        return EncodedObs(
+            tokens=tokens,
+            aux=aux,
+            numerical=obs.numerical,
+            phase=is_teampreview(obs.numerical).detach().clone(),
+            local_history_token=self.actor.reducer.local_summary(tokens),
+        )
+
+    def prepare(self, encoded: EncodedObs, memory: MemoryInputs) -> PreparedDecision:
+        """Build the memory-aware readout from one encoded observation batch."""
+        reduced = self.actor.reducer.reduce(
+            encoded.local_history_token,
+            encoded.tokens,
+            memory.series_tokens,
+            memory.series_mask,
+            memory.history_tokens,
+            memory.history_mask,
+            memory.history_age_ids,
+        )
+        return PreparedDecision(encoded=encoded, reduced=reduced)
 
     def act(
         self,
-        enc: EncodedObs,
+        prepared: PreparedDecision,
         action_mask: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
         *,
         top_p: float = 1.0,
+        deterministic: bool = False,
     ) -> ActOutput:
-        # NOTE: with top_p < 1.0 the returned log_probs are taken w.r.t. the
-        # truncated sampling distribution, not the full policy, while evaluate
-        # always scores against the full distribution. Rollouts collected for
-        # PPO training must therefore use top_p=1.0 (the default) or the
-        # importance ratios will be wrong, top_p < 1.0 is for
-        # evaluation/play only.
+        """Select a joint action from an already-prepared decision."""
         if not 0.0 < top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
-        actions, log_probs, z, local_history = self.actor.sample(
-            enc,
-            action_mask,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-            top_p=top_p,
-        )
+        if deterministic:
+            actions, log_probs, z, local_history = self.actor.greedy_reduced(
+                prepared.reduced,
+                prepared.encoded,
+                action_mask,
+            )
+        else:
+            # Truncated sampling probabilities are valid for evaluation only.
+            # PPO collection must use top p equal to one so old log probabilities
+            # match the distribution evaluated during optimization.
+            actions, log_probs, z, local_history = self.actor.sample_reduced(
+                prepared.reduced,
+                prepared.encoded,
+                action_mask,
+                top_p=top_p,
+            )
         return ActOutput(actions, log_probs, self.critic(z), local_history)
 
     def evaluate(
         self,
-        enc: EncodedObs,
+        prepared: PreparedDecision,
         action_mask: Tensor,
         actions: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
     ) -> EvalOutput:
-        logits, log_probs, z, local_history = self.actor.score(
-            enc,
+        """Evaluate actions from an already-prepared decision."""
+        logits, log_probs, z, local_history = self.actor.score_reduced(
+            prepared.reduced,
+            prepared.encoded,
             action_mask,
             actions,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
         )
         value = self.critic(z)
 
@@ -940,47 +873,22 @@ class PolicyNet(nn.Module):
 
         return EvalOutput(log_probs, entropy, norm_entropy, value, local_history, logits)
 
-    def act_obs(
+    def score_candidates(
         self,
-        obs: StructuredObservation,
+        prepared: PreparedDecision,
         action_mask: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
-        *,
-        top_p: float = 1.0,
-    ) -> ActOutput:
-        return self.act(
-            self.encode(obs, action_mask),
+        candidate_values: Tensor,
+        candidate_offsets: Tensor,
+    ) -> Tensor:
+        """Score ragged joint-action candidates from one prepared decision batch."""
+        return self.actor.score_reduced_candidates(
+            prepared.reduced,
+            prepared.encoded,
             action_mask,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-            top_p=top_p,
+            candidate_values,
+            candidate_offsets,
         )
 
-    def evaluate_obs(
-        self,
-        obs: StructuredObservation,
-        action_mask: Tensor,
-        actions: Tensor,
-        series_tokens: Tensor,
-        series_mask: Tensor,
-        history_tokens: Tensor,
-        history_mask: Tensor,
-        history_age_ids: Tensor,
-    ) -> EvalOutput:
-        return self.evaluate(
-            self.encode(obs, action_mask),
-            action_mask,
-            actions,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
-        )
+    def unmasked_first_slot_logits(self, prepared: PreparedDecision) -> Tensor:
+        """Return first-slot logits for legality diagnostics."""
+        return self.actor.unmasked_first_slot_logits(prepared.reduced, prepared.encoded)

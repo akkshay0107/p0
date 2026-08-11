@@ -13,7 +13,7 @@ import torch
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
-from p0.model.policy import PolicyNet
+from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.training.utils import default_device
@@ -83,14 +83,16 @@ def run_benchmark(args: argparse.Namespace) -> None:
         action_mask = torch.ones(
             (batch_size, 2, FORMAT.action_size), dtype=torch.bool, device=device
         )
-        series, series_mask, history, history_mask, history_age_ids = policy_eager.empty_memory(
-            batch_size
+        memory = MemoryInputs.empty(
+            batch_size,
+            policy_eager.d_model,
+            device,
+            next(policy_eager.parameters()).dtype,
         )
 
         def run_act(p: PolicyNet):
-            return p.act_obs(
-                obs, action_mask, series, series_mask, history, history_mask, history_age_ids
-            )
+            encoded = p.encode(obs, action_mask)
+            return p.act(p.prepare(encoded, memory), action_mask)
 
         # Warmup Eager
         _synchronize(device)

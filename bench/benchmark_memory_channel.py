@@ -13,7 +13,7 @@ import torch
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
-from p0.model.policy import EncodedObs, PolicyNet
+from p0.model.policy import EncodedObs, MemoryInputs, PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.training.utils import default_device
@@ -50,18 +50,26 @@ def _event_pooler(
 def _fixed_reducer(
     policy: PolicyNet,
     encoded: EncodedObs,
-    memory: tuple[torch.Tensor, ...],
+    memory: MemoryInputs,
 ) -> object:
-    return policy.actor.reducer(encoded.tokens, *memory)
+    return policy.actor.reducer.reduce(
+        encoded.local_history_token,
+        encoded.tokens,
+        memory.series_tokens,
+        memory.series_mask,
+        memory.history_tokens,
+        memory.history_mask,
+        memory.history_age_ids,
+    )
 
 
 def _policy_inference(
     policy: PolicyNet,
     encoded: EncodedObs,
     action_mask: torch.Tensor,
-    memory: tuple[torch.Tensor, ...],
+    memory: MemoryInputs,
 ) -> object:
-    return policy.act(encoded, action_mask, *memory)
+    return policy.act(policy.prepare(encoded, memory), action_mask)
 
 
 def benchmark(args: argparse.Namespace) -> None:
@@ -81,7 +89,12 @@ def benchmark(args: argparse.Namespace) -> None:
         (args.batch_size, 2, FORMAT.action_size), dtype=torch.bool, device=device
     )
     encoded = policy.encode(observations, action_mask)
-    memory = policy.empty_memory(args.batch_size)
+    memory = MemoryInputs.empty(
+        args.batch_size,
+        policy.d_model,
+        device,
+        next(policy.parameters()).dtype,
+    )
 
     operations: dict[str, Callable[[], object]] = {
         "event_pooler": partial(_event_pooler, policy, observations, device),

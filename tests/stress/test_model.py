@@ -6,6 +6,7 @@ import torch
 from p0.battle.actions import FORCED_ACTION, MOVE_START
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW
+from p0.model.policy import MemoryInputs
 from p0.model.structured_observation import (
     CAT_IDX_STATUS,
     CAT_IDX_STATUS_COUNTER_KIND,
@@ -20,6 +21,15 @@ from tests.stress._helpers import (
 )
 
 ACT_SIZE = FORMAT.action_size
+
+
+def _empty_memory(policy, batch_size: int) -> MemoryInputs:
+    return MemoryInputs.empty(
+        batch_size,
+        policy.d_model,
+        policy.device,
+        next(policy.parameters()).dtype,
+    )
 
 
 def _minimal_model_action_mask(batch_size: int, device: torch.device) -> torch.Tensor:
@@ -91,9 +101,12 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
             ..., CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
         ] = 4
 
-        empty_memory = stress_policy.empty_memory(batch_size)
+        empty_memory = _empty_memory(stress_policy, batch_size)
         with torch.inference_mode():
-            empty_acted = stress_policy.act_obs(observation, action_mask, *empty_memory)
+            encoded = stress_policy.encode(observation, action_mask)
+            empty_acted = stress_policy.act(
+                stress_policy.prepare(encoded, empty_memory), action_mask
+            )
         assert torch.isfinite(empty_acted.log_probs).all()
         assert torch.isfinite(empty_acted.value).all()
         assert torch.all(action_mask.gather(2, empty_acted.actions.unsqueeze(-1)).squeeze(-1))
@@ -120,15 +133,15 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
         series_tokens, series_mask = stress_policy.encode_series(prior_games)
 
         with torch.inference_mode():
-            acted = stress_policy.act_obs(
-                observation,
-                action_mask,
+            memory = MemoryInputs(
                 series_tokens,
                 series_mask,
                 history,
                 history_mask,
                 history_age_ids,
             )
+            encoded = stress_policy.encode(observation, action_mask)
+            acted = stress_policy.act(stress_policy.prepare(encoded, memory), action_mask)
 
         assert acted.actions.shape == (batch_size, 2)
         assert torch.isfinite(acted.log_probs).all()
@@ -139,15 +152,7 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
 
         # The same full-memory path must remain stable across randomized calls.
         with torch.inference_mode():
-            acted = stress_policy.act_obs(
-                observation,
-                action_mask,
-                series_tokens,
-                series_mask,
-                history,
-                history_mask,
-                history_age_ids,
-            )
+            acted = stress_policy.act(stress_policy.prepare(encoded, memory), action_mask)
 
         assert acted.actions.shape == (batch_size, 2)
         assert torch.isfinite(acted.log_probs).all()
@@ -166,7 +171,7 @@ def test_policy_scores_ragged_candidates_with_empty_decision_rows(
     batch_size = 64
     observation = StructuredObservation.empty_batch(batch_size).to(stress_device)
     action_mask = torch.ones((batch_size, 2, ACT_SIZE), dtype=torch.bool, device=stress_device)
-    memory = stress_policy.empty_memory(batch_size)
+    memory = _empty_memory(stress_policy, batch_size)
     encoded = stress_policy.encode(observation, action_mask)
     rng = stress_rng()
     for _ in range(stress_repetitions(default=64)):
@@ -191,10 +196,9 @@ def test_policy_scores_ragged_candidates_with_empty_decision_rows(
         )
 
         with torch.inference_mode():
-            log_probs = stress_policy.actor.score_joint_candidates(
-                encoded,
+            log_probs = stress_policy.score_candidates(
+                stress_policy.prepare(encoded, memory),
                 action_mask,
-                *memory,
                 candidate_values,
                 candidate_offsets,
             )

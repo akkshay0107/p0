@@ -418,8 +418,11 @@ def test_model_inputs_encode_all_game_windows_once() -> None:
         prepared = trainer._prepare_model_inputs(batch)
 
     assert encode.call_count == 1
-    assert prepared.encoded.tokens.size(0) == batch.decisions
-    assert prepared.history_tokens.shape[:2] == (batch.decisions, HISTORY_WINDOW)
+    assert prepared.prepared.encoded.tokens.size(0) == batch.decisions
+    assert prepared.memory.history_tokens.shape[:2] == (
+        batch.decisions,
+        HISTORY_WINDOW,
+    )
 
 
 def test_continued_chunk_matches_per_window_reference_inputs() -> None:
@@ -440,17 +443,19 @@ def test_continued_chunk_matches_per_window_reference_inputs() -> None:
             game.observations[context_start:],
             game.action_mask[context_start:],
         )
-        local_tokens = trainer.policy.local_history_tokens(encoded)
+        local_tokens = encoded.local_history_token
         expected_history_tokens = local_tokens[
             batch.history_indices
         ] * batch.history_mask.unsqueeze(-1)
 
-    torch.testing.assert_close(actual.encoded.tokens, encoded.tokens[batch.target_indices])
-    torch.testing.assert_close(actual.encoded.aux, encoded.aux[batch.target_indices])
-    torch.testing.assert_close(actual.encoded.numerical, encoded.numerical[batch.target_indices])
-    torch.testing.assert_close(actual.history_tokens, expected_history_tokens)
-    torch.testing.assert_close(actual.history_mask, batch.history_mask)
-    torch.testing.assert_close(actual.history_age_ids, batch.history_age_ids)
+    torch.testing.assert_close(actual.prepared.encoded.tokens, encoded.tokens[batch.target_indices])
+    torch.testing.assert_close(actual.prepared.encoded.aux, encoded.aux[batch.target_indices])
+    torch.testing.assert_close(
+        actual.prepared.encoded.numerical, encoded.numerical[batch.target_indices]
+    )
+    torch.testing.assert_close(actual.memory.history_tokens, expected_history_tokens)
+    torch.testing.assert_close(actual.memory.history_mask, batch.history_mask)
+    torch.testing.assert_close(actual.memory.history_age_ids, batch.history_age_ids)
 
 
 def test_completed_game_does_not_emit_a_second_observation_payload() -> None:
@@ -519,8 +524,9 @@ def test_ordered_history_validation_logic():
 
         prepared = trainer._prepare_model_inputs(batch)
 
-        assert not prepared.series_mask[0].any()
-        assert prepared.series_mask[1, :SERIES_TOKENS_PER_GAME].all()
+        series_mask = prepared.memory.series_mask
+        assert not series_mask[0].any()
+        assert series_mask[1, :SERIES_TOKENS_PER_GAME].all()
 
     _test_ordered_history_allows_skipped_game_numbers()
 
@@ -550,7 +556,7 @@ def test_ordered_history_validation_logic():
         trainer = _trainer(first_a, minibatch_size=4)
         batch = next(collate_bc_batches((first_a, first_b, third_a, second_b), 4))
 
-        series_mask = trainer._prepare_model_inputs(batch).series_mask
+        series_mask = trainer._prepare_model_inputs(batch).memory.series_mask
 
         assert not series_mask[:2].any()
         assert series_mask[2:, :SERIES_TOKENS_PER_GAME].all()
@@ -638,12 +644,12 @@ def test_same_batch_next_game_receives_differentiable_series_context() -> None:
     batch = next(collate_bc_batches((first, second), 4))
 
     prepared = trainer._prepare_model_inputs(batch)
-    series_mask = prepared.series_mask
+    series_mask = prepared.memory.series_mask
 
     assert not series_mask[:2].any()
     assert series_mask[2:, :4].all()
     assert not series_mask[2:, 4:].any()
-    assert prepared.series_tokens.requires_grad
+    assert prepared.memory.series_tokens.requires_grad
 
 
 def test_cross_batch_series_history_truncates_encoder_gradients() -> None:
@@ -665,15 +671,15 @@ def test_cross_batch_series_history_truncates_encoder_gradients() -> None:
     first_tokens = torch.randn(2, trainer.policy.d_model, requires_grad=True)
 
     with patch.object(
-        trainer.policy,
-        "local_history_tokens",
+        trainer.policy.actor.reducer,
+        "local_summary",
         return_value=first_tokens,
     ):
         first_prepared = trainer._prepare_model_inputs(first_batch)
     trainer._series_history.apply(first_prepared.history_updates)
 
     second_prepared = trainer._prepare_model_inputs(second_batch)
-    second_prepared.series_tokens.sum().backward()
+    second_prepared.memory.series_tokens.sum().backward()
 
     assert first_tokens.grad is None
 

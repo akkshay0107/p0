@@ -8,7 +8,7 @@ import torch
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
-from p0.model.policy import PolicyNet
+from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
 from p0.training.config import TrainingConfig
@@ -40,11 +40,11 @@ class BattleMemoryBuffer:
     def append(self, env_ids: torch.Tensor, history_tokens: torch.Tensor) -> None:
         if history_tokens.shape != (env_ids.numel(), self.d_model):
             raise ValueError("history token batch does not match selected environments")
-        # The policy returns the pre-memory local summary (h_t) here, not the
+        # The policy returns the pre-memory local summary here, not the
         # post-memory cls readout. Store detached snapshots so this rollout
         # cache does not connect autograd graphs across environment steps.
         # The whole battle is retained: the reducer window is the last
-        # HISTORY_WINDOW entries, but the end-of-game series summary compresses
+        # The fixed history window entries are retained, but the end-of-game series summary compresses
         # every decision, the same way behaviour cloning and live play do.
         for env_id, token in zip(env_ids.tolist(), history_tokens, strict=True):
             self.tokens[env_id].append(token.detach().to(device="cpu", dtype=torch.float32))
@@ -133,7 +133,7 @@ def collect_rollouts(
         infos = vec_env.last_infos
         assert infos is not None
 
-        # Positional: series_ids[i] and infos[i] must describe environment i.
+        # Positional results must describe the corresponding environment.
         if len(infos) != n_envs:
             raise ValueError(f"Expected {n_envs} environment infos, got {len(infos)}")
         series_ids = [str(info["series_id"]) for info in infos]
@@ -144,18 +144,18 @@ def collect_rollouts(
 
         memory1_inputs = memory1.inputs(idx_all, device, torch.float32)
         memory2_inputs = memory2.inputs(idx_all, device, torch.float32)
-        current_memory = tuple(
-            torch.cat([first, second], dim=0)
-            for first, second in zip(memory1_inputs, memory2_inputs, strict=True)
+        current_memory = MemoryInputs(
+            series_tokens=current_series_tokens,
+            series_mask=current_series_mask,
+            history_tokens=torch.cat([memory1_inputs[0], memory2_inputs[0]], dim=0),
+            history_mask=torch.cat([memory1_inputs[1], memory2_inputs[1]], dim=0),
+            history_age_ids=torch.cat([memory1_inputs[2], memory2_inputs[2]], dim=0),
         )
 
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled(config, device)):
-            current_out = policy.act_obs(
-                current_obs,
+            current_out = policy.act(
+                policy.prepare(policy.encode(current_obs, current_mask), current_memory),
                 current_mask,
-                current_series_tokens,
-                current_series_mask,
-                *current_memory,
             )
 
         memory1.append(idx_all, current_out.history_token[:n_envs])
@@ -236,7 +236,6 @@ def collect_rollouts(
                 idx_tensor = torch.tensor([i], dtype=torch.long, device=device)
                 mem1 = memory1.inputs(idx_tensor, device, torch.float32)
                 mem2 = memory2.inputs(idx_tensor, device, torch.float32)
-                t_mem = tuple(torch.cat([m1, m2], dim=0) for m1, m2 in zip(mem1, mem2, strict=True))
 
                 s_tok1, s_mask1 = series_store1.get_tokens([str(series_ids[i])], device)
                 s_tok2, s_mask2 = series_store2.get_tokens([str(series_ids[i])], device)
@@ -249,7 +248,17 @@ def collect_rollouts(
                         device_type=device.type, enabled=amp_enabled(config, device)
                     ),
                 ):
-                    t_out = policy.act_obs(t_obs, dummy_mask, t_s_tok, t_s_mask, *t_mem)
+                    t_memory = MemoryInputs(
+                        series_tokens=t_s_tok,
+                        series_mask=t_s_mask,
+                        history_tokens=torch.cat([mem1[0], mem2[0]], dim=0),
+                        history_mask=torch.cat([mem1[1], mem2[1]], dim=0),
+                        history_age_ids=torch.cat([mem1[2], mem2[2]], dim=0),
+                    )
+                    t_out = policy.act(
+                        policy.prepare(policy.encode(t_obs, dummy_mask), t_memory),
+                        dummy_mask,
+                    )
                     bootstrap_value1 = t_out.value[0].item()
                     bootstrap_value2 = t_out.value[1].item()
 

@@ -13,8 +13,8 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
-from p0.model.policy import EncodedObs, PolicyNet
-from p0.model.structured_observation import StructuredObservation, is_teampreview
+from p0.model.policy import EncodedObs, MemoryInputs, PolicyNet
+from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.trajectory import TrajectoryBatch
@@ -123,13 +123,13 @@ def _build_memory_inputs(
     encoded: EncodedObs,
     episodes: list[TrajectoryBatch],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> MemoryInputs:
     """Build Bo1 memory inputs from one encoded trajectory batch."""
     dtype = encoded.tokens.dtype
-    # Compute each decision's local-only h_t once. Past h_t values are used as
-    # history inputs for later rows; z_t is intentionally not recycled as a
+    # Compute one local-only summary for each decision. Past summaries are used as
+    # history inputs for later rows; the memory-aware readout is intentionally not recycled as a
     # history token because it already contains the prior memory context.
-    local_tokens = policy.local_history_tokens(encoded)
+    local_tokens = encoded.local_history_token
     lengths = torch.tensor([item.length for item in episodes], device=device, dtype=torch.long)
     starts = torch.cat((torch.zeros(1, device=device, dtype=torch.long), lengths.cumsum(0)[:-1]))
     targets = torch.arange(encoded.tokens.size(0), device=device)
@@ -163,12 +163,12 @@ def _build_memory_inputs(
             device=device,
             dtype=torch.bool,
         )
-    return (
-        series_tokens,
-        series_mask,
-        history_tokens,
-        history_mask,
-        history_age_ids,
+    return MemoryInputs(
+        series_tokens=series_tokens,
+        series_mask=series_mask,
+        history_tokens=history_tokens,
+        history_mask=history_mask,
+        history_age_ids=history_age_ids,
     )
 
 
@@ -192,12 +192,9 @@ def _compute_magnet_logits(
     ):
         encoded = magnet.policy.encode(observations, action_masks)
         memory = _build_memory_inputs(magnet.policy, encoded, list(episodes), device)
-        logits, _, _, _ = magnet.policy.actor.score(
-            encoded,
-            action_masks,
-            actions,
-            *memory,
-        )
+        logits = magnet.policy.evaluate(
+            magnet.policy.prepare(encoded, memory), action_masks, actions
+        ).logits
     return logits.detach()
 
 
@@ -293,10 +290,9 @@ def _run_batched_ppo(
     }
     with autocast(device_type=device.type, enabled=use_amp):
         out = policy.evaluate(
-            all_enc,
+            policy.prepare(all_enc, live_memory),
             all_action_masks,
             actions,
-            *live_memory,
         )
         magnet_kl = magnet_kl_per_step(out.logits, magnet_logits)
         step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = compute_ppo_objective(
@@ -307,7 +303,7 @@ def _run_batched_ppo(
             old_log_probs,
             advantages,
             returns,
-            is_teampreview(all_enc.numerical),
+            all_enc.phase,
             config,
             alpha=alpha,
         )
@@ -517,7 +513,7 @@ def ppo_update(
         tot_kl_div += epoch_kl
         epochs_done += 1
 
-    # No subsequent work consumes these gradients. Clear the final minibatch's
+    # No subsequent work consumes these gradients. Clear the final minibatch
     # gradient storage before the next rollout begins.
     optimizer.zero_grad(set_to_none=True)
 

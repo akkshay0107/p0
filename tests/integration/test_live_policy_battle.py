@@ -13,6 +13,7 @@ from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
+from p0.model.policy import MemoryInputs
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.rl_player import RLPlayer
@@ -207,16 +208,18 @@ async def test_policy_handles_showdown_captured_batches(
     for index, decision in enumerate(selected):
         for position, actions in enumerate(decision.legal_actions):
             action_mask[index, position, list(actions)] = True
-    memory = model_policy.empty_memory(batch_size)
+    memory = MemoryInputs.empty(
+        batch_size,
+        model_policy.d_model,
+        model_policy.device,
+        next(model_policy.parameters()).dtype,
+    )
 
     with torch.inference_mode():
-        acted = model_policy.act_obs(observation, action_mask, *memory)
-        evaluated = model_policy.evaluate_obs(
-            observation,
-            action_mask,
-            acted.actions,
-            *memory,
-        )
+        encoded = model_policy.encode(observation, action_mask)
+        prepared = model_policy.prepare(encoded, memory)
+        acted = model_policy.act(prepared, action_mask)
+        evaluated = model_policy.evaluate(prepared, action_mask, acted.actions)
 
     assert acted.actions.shape == (batch_size, 2)
     assert torch.all((acted.actions >= 0) & (acted.actions < FORMAT.action_size))

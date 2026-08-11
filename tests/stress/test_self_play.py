@@ -27,8 +27,15 @@ class _SelfPlayPolicy:
             resample_single_game=lambda tokens: torch.full((tokens.size(0), 4, self.d_model), 9.0)
         )
 
-    def act_obs(self, obs, action_mask, series_tokens, series_mask, *memory):
-        del obs, series_tokens, series_mask, memory
+    def encode(self, obs, action_mask):
+        del action_mask
+        return obs
+
+    def prepare(self, encoded, memory):
+        return encoded, memory
+
+    def act(self, prepared, action_mask, *, top_p=1.0, deterministic=False):
+        del prepared, top_p, deterministic
         self.calls += 1
         batch = action_mask.size(0)
         return ActOutput(
