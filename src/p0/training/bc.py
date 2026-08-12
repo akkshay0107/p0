@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -13,6 +15,7 @@ from torch import Tensor
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
+from p0.battle.actions import TEAM_SIZE
 from p0.model.policy import MemoryInputs, PolicyNet, PreparedDecision
 from p0.replays.dataset import ReplayGameChunk
 from p0.runtime.process_context import PROCESS_CONTEXT
@@ -36,6 +39,44 @@ from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
 from p0.training.config import BCConfig
 
 
+def _expand_team_preview_orbits(
+    candidate_values: Tensor,
+    candidate_offsets: Tensor,
+    team_preview: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Add all four within-pair orientations for team-preview candidates."""
+    if candidate_values.numel() == 0:
+        return candidate_values, candidate_offsets
+
+    counts = candidate_offsets[1:] - candidate_offsets[:-1]
+    team_preview = team_preview.to(device=candidate_values.device, dtype=torch.bool)
+    first, second = candidate_values.unbind(dim=-1)
+    first_swap = (first % TEAM_SIZE) * TEAM_SIZE + first // TEAM_SIZE
+    second_swap = (second % TEAM_SIZE) * TEAM_SIZE + second // TEAM_SIZE
+    orbit_values = torch.stack(
+        (
+            candidate_values,
+            torch.stack((first_swap, second), dim=-1),
+            torch.stack((first, second_swap), dim=-1),
+            torch.stack((first_swap, second_swap), dim=-1),
+        ),
+        dim=1,
+    )
+    row_preview = torch.repeat_interleave(team_preview, counts)
+    keep = torch.arange(4, device=candidate_values.device).unsqueeze(0) < torch.where(
+        row_preview, 4, 1
+    ).unsqueeze(-1)
+    expanded_values = orbit_values[keep]
+    expanded_counts = counts * torch.where(team_preview, 4, 1)
+    expanded_offsets = torch.cat(
+        (
+            candidate_offsets.new_zeros(1),
+            expanded_counts.cumsum(0).to(dtype=candidate_offsets.dtype),
+        )
+    )
+    return expanded_values, expanded_offsets
+
+
 class BCCancelled(RuntimeError):
     """Raised between batches so callers keep the last completed epoch checkpoint."""
 
@@ -52,7 +93,7 @@ class _PreparedBCBatch:
     history_updates: tuple[_BCHistoryUpdate, ...]
 
 
-def _empty_training_totals() -> dict[str, float | int]:
+def _empty_training_totals() -> dict[str, Any]:
     return {
         "loss": 0.0,
         "loss_weight": 0.0,
@@ -125,7 +166,7 @@ class BCTrainer:
         """Train exactly one epoch and return its decision-weighted metrics."""
         return self._metrics(self._train_epoch_totals())
 
-    def _train_epoch_totals(self) -> dict[str, float | int]:
+    def _train_epoch_totals(self) -> dict[str, Any]:
         self.policy.train()
         self._series_history.clear()
         if self.device.type == "cuda":
@@ -169,7 +210,7 @@ class BCTrainer:
         self._series_history.clear()
         return totals
 
-    def _metrics(self, totals: dict[str, float | int]) -> dict[str, float | int]:
+    def _metrics(self, totals: dict[str, Any]) -> dict[str, float | int]:
         peak_memory = (
             torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
         )
@@ -253,6 +294,11 @@ class BCTrainer:
         history_age_ids = batch.history_age_ids.to(self.device)
         candidate_values = batch.candidate_values.to(self.device)
         candidate_offsets = batch.candidate_offsets.to(self.device)
+        candidate_values, candidate_offsets = _expand_team_preview_orbits(
+            candidate_values,
+            candidate_offsets,
+            target_encoded.phase,
+        )
         series_context = self._series_history.prepare(
             batch.windows,
             target_local_tokens,
@@ -285,6 +331,7 @@ class BCTrainer:
                 prepared.action_mask,
                 prepared.candidate_values,
                 prepared.candidate_offsets,
+                validated=True,
             ),
             self.policy.critic(prepared.prepared.reduced.cls),
             prepared.history_updates,
@@ -299,8 +346,20 @@ class BCTrainer:
         for parameter in self.policy.parameters():
             if parameter.grad is not None:
                 parameter.grad.mul_(inverse_weight)
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.policy.parameters(), self.config.max_grad_norm
+        )
         previous_scale = self.scaler.get_scale()
+        if not bool(torch.isfinite(grad_norm).item()):
+            logging.warning(
+                "Non-finite BC gradient norm detected; discarding the accumulated update "
+                f"(loss scale={previous_scale:.0f})"
+            )
+            if self.amp_enabled:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            return False
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
@@ -309,8 +368,17 @@ class BCTrainer:
     def _backward_chunk(
         self,
         batch: BCDecisionBatch,
-        totals: dict[str, float | int],
+        totals: dict[str, Any],
     ) -> float:
+        """Backpropagate one validated decision chunk and update running totals.
+
+        Arguments:
+          batch: Collated CPU batch containing one contiguous set of decisions.
+          totals: Mutable epoch totals receiving detached reporting tensors.
+
+        Returns:
+          The scalar weight used to normalize the accumulated optimizer update.
+        """
         validated_masks = _validate_objective_inputs(
             batch.candidate_values.size(0),
             batch.candidate_offsets,
@@ -327,15 +395,18 @@ class BCTrainer:
         ):
             raise ValueError("candidate action ids are outside the action contract")
         exact_cpu, partial_cpu, _, labeled_cpu = validated_masks
-        exact_count = int(exact_cpu.sum())
-        partial_count = int(partial_cpu.sum())
-        labeled_count = int(labeled_cpu.sum())
-        loss_weight = float(batch.loss_mask.sum())
+        exact_count = exact_cpu.sum()
+        partial_count = partial_cpu.sum()
+        labeled_count = labeled_cpu.sum()
+        loss_weight = batch.loss_mask.sum()
         loss_mask = batch.loss_mask.to(self.device)
         with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            log_probs, value_predictions, history_updates, candidate_offsets = self._forward_batch(
-                batch
-            )
+            (
+                log_probs,
+                value_predictions,
+                history_updates,
+                candidate_offsets,
+            ) = self._forward_batch(batch)
         exact = exact_cpu.to(self.device)
         partial = partial_cpu.to(self.device)
         labeled = labeled_cpu.to(self.device)
@@ -367,21 +438,19 @@ class BCTrainer:
             else value_predictions.sum() * 0.0
         )
         policy_sum = objective.loss * objective.loss_weight
-        policy_loss = policy_sum / max(objective.loss_weight, 1.0)
-        loss_weight = max(objective.loss_weight, float(value_count))
+        policy_loss = policy_sum / objective.loss_weight.clamp_min(1.0)
+        loss_weight = max(float(objective.loss_weight), float(value_count))
         total_loss = (policy_loss + self.config.value_coef * value_loss) * loss_weight
-        if not torch.isfinite(total_loss):
-            raise ValueError("Non-finite BC loss in a collated decision batch")
         if objective.labeled_count or value_count:
             self.scaler.scale(total_loss).backward()
 
         self._series_history.apply(history_updates)
         # Keep the reported policy NLL independent from the auxiliary value loss;
         # the optimizer still receives their weighted sum above.
-        totals["loss"] += policy_sum.detach().item()
+        totals["loss"] += policy_sum.detach()
         totals["loss_weight"] += objective.loss_weight
-        totals["exact_nll"] += objective.exact_nll.detach().item() * objective.exact_count
-        totals["partial_nll"] += objective.partial_nll.detach().item() * objective.partial_count
+        totals["exact_nll"] += objective.exact_nll.detach() * objective.exact_count
+        totals["partial_nll"] += objective.partial_nll.detach() * objective.partial_count
         totals["decisions"] += batch.decisions
         totals["labeled_decisions"] += objective.labeled_count
         totals["exact_decisions"] += objective.exact_count
@@ -389,7 +458,7 @@ class BCTrainer:
         totals["games"] += batch.completed_game_count
         totals.setdefault("value_loss", 0.0)
         totals.setdefault("value_decisions", 0)
-        totals["value_loss"] += value_loss.detach().item() * value_count
+        totals["value_loss"] += value_loss.detach() * value_count
         totals["value_decisions"] += value_count
         return loss_weight
 
@@ -406,6 +475,12 @@ class BCTrainer:
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
 
         for batch in collate_bc_batches(source, chunk_size):
+            validated_masks = _validate_objective_inputs(
+                batch.candidate_values.size(0),
+                batch.candidate_offsets,
+                batch.label_kind,
+                batch.loss_mask,
+            )
             prepared = self._prepare_model_inputs(batch)
             encoded = prepared.prepared.encoded
             reduced = prepared.prepared.reduced
@@ -416,6 +491,7 @@ class BCTrainer:
                 action_mask,
                 prepared.candidate_values,
                 candidate_offsets,
+                validated=True,
             )
             value_predictions = self.policy.critic(reduced.cls)
             accumulator.add_legality(
@@ -431,12 +507,6 @@ class BCTrainer:
             value_targets = (
                 torch.pow(gamma, (game_length - 1 - decision_index).to(outcome.dtype)) * outcome
             )
-            validated_masks = _validate_objective_inputs(
-                candidate_log_probs.numel(),
-                batch.candidate_offsets,
-                batch.label_kind,
-                batch.loss_mask,
-            )
             masks = tuple(mask.to(self.device) for mask in validated_masks)
             marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
             safe_nll = torch.where(
@@ -448,7 +518,7 @@ class BCTrainer:
             predicted, best_scores = greedy.actions, greedy.log_probs
             accumulator.add(
                 batch,
-                candidate_offsets=candidate_offsets,
+                candidate_offsets=batch.candidate_offsets.to(self.device),
                 masks=masks,  # pyright: ignore[reportArgumentType]
                 marginal_nll=marginal_nll,
                 safe_nll=safe_nll,

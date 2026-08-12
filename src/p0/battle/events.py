@@ -195,7 +195,7 @@ def get_hp_fraction(hp_status: str) -> float:
 
     try:
         num, den_str = hp_part.split("/")
-        den_clean = "".join(c for c in den_str if c.isdigit() or c == ".")
+        den_clean = den_str.strip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ% ")
         return float(num) / float(den_clean)
     except (ValueError, ZeroDivisionError):
         return 0.0
@@ -265,6 +265,10 @@ def parse_events(
 
         tag = message[1]
         order = len(events)
+
+        if tag in ("turn", "upkeep"):
+            last_attacker = None
+            continue
 
         if tag == "move" and len(message) >= 4:
             last_attacker = message[2]

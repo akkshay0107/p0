@@ -1257,11 +1257,16 @@ def test_tokenizer_aliases_and_resolution_keep_unknown_zero_distinct_from_known_
 
 def test_enum_like_tables_lazy_cache_alias_and_missing_member_results() -> None:
     tokenizer_instance = PokemonTokenizer({"weathers": {"raindance": 4}, "status": {"brn": 5}})
+    assert tokenizer_instance.weathers["R-a-i-n"] == 4
     assert tokenizer_instance.weathers["rain"] == 4
-    assert tokenizer_instance.weathers["rain"] == 4
+    assert tokenizer_instance.weathers == {"rain": 4}
     assert tokenizer_instance.weathers["unknown-weather"] == 0
+    assert "unknownweather" not in tokenizer_instance.weathers
     assert tokenizer_instance.status["burn"] == 5
+    assert tokenizer_instance.status[Status.BRN] == 5
     assert tokenizer_instance.status["unknown-status"] == 0
+    assert tokenizer_instance.status == {"burn": 5, "brn": 5}
+    assert all(isinstance(key, str) for key in tokenizer_instance.status)
 
 
 def test_active_contract_rejects_an_unrecorded_spread_table() -> None:

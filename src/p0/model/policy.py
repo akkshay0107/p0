@@ -377,20 +377,22 @@ class ActorPolicy(nn.Module):
         )
 
         k_targets = k_entity_extended[:, self.target_entity_indices, :]
-        k_moves_grid = k_moves.unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
-        k_targets_grid = k_targets.unsqueeze(1).expand(-1, 4, -1, -1).reshape(B, 20, self.d_k)
+        # Broadcast grids remain views until concatenation materializes
+        # each combined move-target record once.
+        k_moves_grid = k_moves.unsqueeze(2).expand(-1, -1, 5, -1)
+        k_targets_grid = k_targets.unsqueeze(1).expand(-1, 4, -1, -1)
 
-        move_action_keys = self.move_target_proj(torch.cat([k_moves_grid, k_targets_grid], dim=-1))
+        move_action_keys = self.move_target_proj(
+            torch.cat([k_moves_grid, k_targets_grid], dim=-1).reshape(B, 20, 2 * self.d_k)
+        )
         move_scores = torch.einsum("bd,bnd->bn", q_move, move_action_keys) / pointer_scale
 
         logits[:, MOVE_START:MOVE_END] = move_scores.to(logits.dtype)
         action_keys[:, MOVE_START:MOVE_END, :] = move_action_keys.to(action_keys.dtype)
 
-        k_mega_moves_grid = (
-            (k_moves + self.mega_emb).unsqueeze(2).expand(-1, -1, 5, -1).reshape(B, 20, self.d_k)
-        )
+        k_mega_moves_grid = (k_moves + self.mega_emb).unsqueeze(2).expand(-1, -1, 5, -1)
         mega_action_keys = self.move_target_proj(
-            torch.cat([k_mega_moves_grid, k_targets_grid], dim=-1)
+            torch.cat([k_mega_moves_grid, k_targets_grid], dim=-1).reshape(B, 20, 2 * self.d_k)
         )
         mega_scores = torch.einsum("bd,bnd->bn", q_move, mega_action_keys) / pointer_scale
 
@@ -414,9 +416,8 @@ class ActorPolicy(nn.Module):
 
         is_tp_column = is_tp.unsqueeze(-1)
 
-        k_left_grid = k_ally.unsqueeze(2).expand(-1, -1, 6, -1).reshape(B, TP_END, self.d_k)
-        k_right_grid = k_ally.unsqueeze(1).expand(-1, 6, -1, -1).reshape(B, TP_END, self.d_k)
-        tp_pair_keys = self.tp_pair_proj((k_left_grid + k_right_grid) / math.sqrt(2.0))
+        tp_pair_keys_grid = (k_ally.unsqueeze(2) + k_ally.unsqueeze(1)) / math.sqrt(2.0)
+        tp_pair_keys = self.tp_pair_proj(tp_pair_keys_grid.reshape(B, TP_END, self.d_k))
         tp_scores = torch.einsum("bd,bnd->bn", q_tp, tp_pair_keys) / pointer_scale
 
         logits[:, TP_START:TP_END] = torch.where(
@@ -577,19 +578,30 @@ class ActorPolicy(nn.Module):
         batch_size = enc.tokens.size(0)
         if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
             raise ValueError("candidate_values must have shape (candidates, 2)")
+
         if candidate_values.dtype != torch.long:
             raise ValueError("candidate_values must use torch.long action ids")
+
         if candidate_offsets.dim() != 1 or candidate_offsets.numel() != batch_size + 1:
             raise ValueError("candidate_offsets must have one boundary per observation")
+
         if action_mask.shape != (batch_size, 2, self.act_size):
             raise ValueError("action_mask shape does not match encoded observations")
+
         if candidate_values.device != enc.tokens.device or action_mask.device != enc.tokens.device:
             raise ValueError("candidate tensors and action_mask must share the encoded device")
-        offsets = candidate_offsets.to(device=enc.tokens.device, dtype=torch.long)
-        if offsets[0].item() != 0 or offsets[-1].item() != candidate_values.size(0):
+
+        # Inspect source offsets before transfer so CPU-produced BC batches do not
+        # pay for device synchronization during scalar contract checks.
+        if candidate_offsets[0].item() != 0 or candidate_offsets[
+            -1
+        ].item() != candidate_values.size(0):
             raise ValueError("candidate_offsets must start at zero and end at candidate count")
-        if torch.any(offsets[1:] < offsets[:-1]):
+
+        if bool(torch.any(candidate_offsets[1:] < candidate_offsets[:-1]).item()):
             raise ValueError("candidate_offsets must be nondecreasing")
+
+        offsets = candidate_offsets.to(device=enc.tokens.device, dtype=torch.long)
         return offsets
 
     def score_reduced_candidates(
@@ -599,9 +611,25 @@ class ActorPolicy(nn.Module):
         action_mask: Tensor,
         candidate_values: Tensor,
         candidate_offsets: Tensor,
+        *,
+        validated: bool = False,
     ) -> Tensor:
-        """Score ragged candidates against a batch that is already reduced."""
+        """Score ragged candidates against a batch that is already reduced.
+
+        Setting validated=True bypasses every candidate-contract check. It is
+        reserved for callers that validated the complete source batch before
+        moving it to the policy device.
+        """
         _require_matching_batch(reduced, enc)
+        if validated:
+            return self._score_reduced_unchecked(
+                reduced,
+                enc,
+                action_mask,
+                candidate_values,
+                candidate_offsets,
+            )
+
         offsets = self._validated_offsets(enc, action_mask, candidate_values, candidate_offsets)
         return self._score_reduced(reduced, enc, action_mask, candidate_values, offsets)
 
@@ -697,22 +725,21 @@ class ActorPolicy(nn.Module):
     ) -> Tensor:
         mask2 = action_mask[:, 1].clone().bool()
 
-        # If Pokemon 1 switches to slot idx, Pokemon 2 cannot switch to the same slot
+        # Both active Pokémon cannot switch into the same team slot.
         switch_mask = (1 <= action1) & (action1 <= 6) & (~is_tp)
         mask2[switch_mask, action1[switch_mask]] = 0
 
-        # Only one Mega per turn.
-        # Mega moves are 27-46, plus 47 for Mega Struggle.
+        # A first-slot Mega action masks the full second-slot Mega range because
+        # only one active Pokémon may Mega Evolve per turn.
         mega_mask = (action1 >= 27) & (action1 <= 47) & (~is_tp)
         mask2[mega_mask, 27:48] = False
 
-        # If Pokemon 1 passes, Pokemon 2 cannot pass as well unless no valid moves left
+        # A double pass is illegal unless the fallback below finds no other action.
         pass_mask = (action1 == 0) & (~is_tp)
         mask2[pass_mask, 0] = False
 
-        # Ensure all 4 selected Pokemon are unique (no overlap between Lead and Back).
-        # Compute overlap for all batch rows simultaneously and gate with the phase flag.
-        # This eliminates a device synchronization while checking the phase flag.
+        # Team preview requires four unique Pokémon across the lead and back pairs.
+        # Phase-gated vectorization avoids synchronizing on the team-preview flag.
         p1_1 = action1 // TEAM_SIZE  # (B,) — meaningful only for tp rows
         p2_1 = action1 % TEAM_SIZE  # (B,)
         p1_2 = self.all_a // TEAM_SIZE  # team preview left positions
@@ -725,7 +752,7 @@ class ActorPolicy(nn.Module):
         )  # batch by team preview action count
         mask2[:, :TP_END] = mask2[:, :TP_END] & ~(is_tp[:, None] & tp_overlap)
 
-        # If no valid action remains, force pass action to be valid for Pokemon 2
+        # Forced-action edge cases need PASS_START as a total fallback.
         no_valid = mask2.sum(-1) == 0
         mask2[no_valid, 0] = True
 
@@ -750,7 +777,6 @@ class PolicyNet(nn.Module):
         self.act_size = ACT_SIZE
         self.d_model = config.d_model
 
-        # shared backbone + policy head
         self.encoder = FusedTokenEncoder(
             config.d_model,
             config.nhead,
@@ -766,7 +792,6 @@ class PolicyNet(nn.Module):
             dim_feedforward=config.dim_feedforward,
         )
 
-        # value head
         self.critic = ValueHead(config.d_model)
 
         self.series = DynamicSeriesResampler(
@@ -832,7 +857,7 @@ class PolicyNet(nn.Module):
             )
         else:
             # Truncated sampling probabilities are valid for evaluation only.
-            # PPO collection must use top p equal to one so old log probabilities
+            # PPO collection must use top-p equal to one so old log probabilities
             # match the distribution evaluated during optimization.
             actions, log_probs, z, local_history = self.actor.sample_reduced(
                 prepared.reduced,
@@ -879,14 +904,21 @@ class PolicyNet(nn.Module):
         action_mask: Tensor,
         candidate_values: Tensor,
         candidate_offsets: Tensor,
+        *,
+        validated: bool = False,
     ) -> Tensor:
-        """Score ragged joint-action candidates from one prepared decision batch."""
+        """Score ragged joint-action candidates from one prepared decision batch.
+
+        Setting validated=True delegates directly to unchecked scoring and is
+        safe only after the caller validates the complete source batch.
+        """
         return self.actor.score_reduced_candidates(
             prepared.reduced,
             prepared.encoded,
             action_mask,
             candidate_values,
             candidate_offsets,
+            validated=validated,
         )
 
     def unmasked_first_slot_logits(self, prepared: PreparedDecision) -> Tensor:

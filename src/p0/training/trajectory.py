@@ -11,7 +11,7 @@ from p0.model.architecture_contract import SERIES_SLOTS
 from p0.model.structured_observation import StructuredObservation
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class TrajectoryBatch:
     observations: StructuredObservation
     action_masks: torch.Tensor
@@ -88,7 +88,7 @@ class TrajectoryBatch:
         )
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class TrajectoryStorage:
     step_counts: torch.Tensor
     observations: StructuredObservation

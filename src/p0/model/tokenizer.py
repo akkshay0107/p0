@@ -12,11 +12,11 @@ CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
 
 
 class _EnumIdTable(dict["NamedEffectView | str", int]):
-    """Vocabulary IDs cached per enum-like member, resolved from member names.
+    """
+    Vocabulary IDs resolved from enum-like members and normalized names.
 
-    Members are resolved lazily so this module never has to import the runtime
-    enum classes; after the first resolution a lookup is a plain dict hit,
-    identical in cost to a precomputed table.
+    Successful resolutions are cached under normalized strings. Unknown inputs
+    and caller-owned enum-like objects are not retained by the table.
     """
 
     def __init__(self, table: dict[str, int], aliases: dict[str, str] | None = None):
@@ -27,14 +27,19 @@ class _EnumIdTable(dict["NamedEffectView | str", int]):
     def __missing__(self, member: NamedEffectView | str) -> int:
         name = member if isinstance(member, str) else member.name
         normalized = PokemonTokenizer.normalize_id(name)
-        alias = self._aliases.get(normalized)
-        value = self._table.get(alias) if alias else None
+        if not normalized:
+            return 0
 
-        if value is None:
-            value = self._table.get(normalized, 0)
+        cached = self.get(normalized)
+        if cached is not None:
+            return cached
 
-        self[member] = value
+        lookup_key = self._aliases.get(normalized, normalized)
+        if lookup_key not in self._table:
+            return 0
 
+        value = self._table[lookup_key]
+        self[normalized] = value
         return value
 
 
@@ -129,7 +134,7 @@ class PokemonTokenizer:
             return cls(json.load(f))
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=4096)
     def _cached_normalize(s: str) -> str:
         return CLEAN_ID_RE.sub("", s.lower())
 

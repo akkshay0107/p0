@@ -24,10 +24,10 @@ class BCObjective:
     exact_nll: Tensor
     partial_nll: Tensor
     marginal_log_probs: Tensor
-    exact_count: int
-    partial_count: int
-    labeled_count: int
-    loss_weight: float
+    exact_count: Tensor
+    partial_count: Tensor
+    labeled_count: Tensor
+    loss_weight: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +100,7 @@ def _validate_objective_inputs(
         or candidate_offsets.device != loss_mask.device
     ):
         raise ValueError("candidate label-contract tensors must share a device")
+
     if candidate_offsets[0].item() != 0 or candidate_offsets[-1].item() != candidate_count:
         raise ValueError("candidate_offsets must start at zero and end at candidate count")
     if torch.any(candidate_offsets[1:] < candidate_offsets[:-1]):
@@ -111,18 +112,7 @@ def _validate_objective_inputs(
     partial = label_kind == int(LabelKind.PARTIAL)
     unknown = label_kind == int(LabelKind.UNKNOWN)
     labeled = exact | partial
-    _validate_label_rows(candidate_offsets, loss_mask, exact, partial, unknown, labeled)
-    return exact, partial, unknown, labeled
 
-
-def _validate_label_rows(
-    candidate_offsets: Tensor,
-    loss_mask: Tensor,
-    exact: Tensor,
-    partial: Tensor,
-    unknown: Tensor,
-    labeled: Tensor,
-) -> None:
     if torch.any(~(labeled | unknown)):
         raise ValueError("label_kind contains an unsupported label")
 
@@ -137,6 +127,8 @@ def _validate_label_rows(
         raise ValueError("UNKNOWN labels must have a zero loss mask")
     if torch.any(labeled & (loss_mask == 0)):
         raise ValueError("Labeled decisions must have a nonzero loss mask")
+
+    return exact, partial, unknown, labeled
 
 
 def _ragged_logsumexp(candidate_log_probs: Tensor, offsets: Tensor) -> Tensor:
@@ -190,10 +182,10 @@ def compute_bc_objective(
         exact,
         partial,
         labeled,
-        exact_count=int(exact.sum().item()),
-        partial_count=int(partial.sum().item()),
-        labeled_count=int(labeled.sum().item()),
-        loss_weight=float(loss_mask.sum().item()),
+        exact_count=exact.sum(),
+        partial_count=partial.sum(),
+        labeled_count=labeled.sum(),
+        loss_weight=loss_mask.sum(),
     )
 
 
@@ -205,10 +197,10 @@ def _compute_bc_objective_unchecked(
     partial: Tensor,
     labeled: Tensor,
     *,
-    exact_count: int,
-    partial_count: int,
-    labeled_count: int,
-    loss_weight: float,
+    exact_count: Tensor,
+    partial_count: Tensor,
+    labeled_count: Tensor,
+    loss_weight: Tensor,
 ) -> BCObjective:
     """Compute the objective after the batch contract was validated at its boundary."""
     marginal_log_probs = _ragged_logsumexp(candidate_log_probs, candidate_offsets)
@@ -219,11 +211,11 @@ def _compute_bc_objective_unchecked(
         -marginal_log_probs * loss_mask,
         torch.zeros_like(marginal_log_probs),
     )
-    exact_nll = (-marginal_log_probs[exact]).sum() / max(exact_count, 1)
-    partial_nll = (-marginal_log_probs[partial]).sum() / max(partial_count, 1)
+    exact_nll = (-marginal_log_probs[exact]).sum() / exact_count.clamp_min(1)
+    partial_nll = (-marginal_log_probs[partial]).sum() / partial_count.clamp_min(1)
 
     return BCObjective(
-        loss=per_decision_loss.sum() / max(loss_weight, 1.0),
+        loss=per_decision_loss.sum() / loss_weight.clamp_min(1.0),
         exact_nll=exact_nll,
         partial_nll=partial_nll,
         marginal_log_probs=marginal_log_probs,

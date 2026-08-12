@@ -236,8 +236,6 @@ class MultiAggDeepSet(nn.Module):
 
 class FusedTokenEncoder(nn.Module):
     # Buffers registered dynamically by torch need explicit declarations for Pyright.
-    _poke_pos: torch.Tensor
-    _owner_pos: torch.Tensor
     _pokemon_scalar_idx: torch.Tensor
     _event_effect_namespace: torch.Tensor
     _component_ids: torch.Tensor
@@ -387,11 +385,6 @@ class FusedTokenEncoder(nn.Module):
         self.event_pool_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
         self.event_metadata_proj = nn.Linear(EVENT_METADATA_WIDTH, d_model)
         self.empty_event_tokens = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
-
-        # cache fixed sequence-position indices so advanced indexing uses pre-allocated
-        # device tensors rather than constructing a new index tensor on every forward pass.
-        self.register_buffer("_poke_pos", torch.tensor(_POKE_POS, dtype=torch.long))
-        self.register_buffer("_owner_pos", torch.tensor(_OWNER_POS, dtype=torch.long))
 
         self._init_weights()
 
@@ -579,7 +572,7 @@ class FusedTokenEncoder(nn.Module):
         # gets one deterministic computational anchor and is replaced by the
         # learned empty output after pooling.
         has_events = event_mask.any(dim=-1)
-        padding = (~event_mask).clone()
+        padding = ~event_mask
         padding[~has_events, 0] = False
         contextual = self.event_encoder(raw, src_key_padding_mask=padding)
 
@@ -683,23 +676,25 @@ class FusedTokenEncoder(nn.Module):
         )
 
         n_poke = len(_POKE_POS)
-        poke_cats = categorical[:, self._poke_pos, :].flatten(0, 1)
-        poke_nums = numerical[:, self._poke_pos, :].flatten(0, 1)
+        poke_cats = categorical[:, :n_poke, :].flatten(0, 1)
+        poke_nums = numerical[:, :n_poke, :].flatten(0, 1)
         poke_out, all_move_embs = self._embed_pokemon_components(poke_cats, poke_nums)
 
-        x[:, self._poke_pos, :] = poke_out.unflatten(0, (batch_size, n_poke)).to(x.dtype)
+        x[:, :n_poke, :] = poke_out.unflatten(0, (batch_size, n_poke)).to(x.dtype)
         # the two active allies' MoveRecords double as the pointer-head move
         # keys; the records already carry pp/legality state, so no extra patch
         aux_moves = all_move_embs.unflatten(0, (batch_size, n_poke))[:, :2]
 
+        n_owner = len(_OWNER_POS)
+        owner_end = n_poke + n_owner
         # field / ally-side / opponent-side owners: one fused token each, from
         # the owner's typed effects plus its own scalars
-        x[:, self._owner_pos, :] = (
+        x[:, n_poke:owner_end, :] = (
             self._embed_typed_effects(
-                categorical[:, self._owner_pos, :],
-                numerical[:, self._owner_pos, :],
+                categorical[:, n_poke:owner_end, :],
+                numerical[:, n_poke:owner_end, :],
             )
-            + self.owner_scalar_proj(numerical[:, self._owner_pos, :NUM_PROVENANCE_START])
+            + self.owner_scalar_proj(numerical[:, n_poke:owner_end, :NUM_PROVENANCE_START])
         ).to(x.dtype)
 
         out_tokens = (

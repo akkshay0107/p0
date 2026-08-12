@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 from torch.amp import GradScaler, autocast
 
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
@@ -112,10 +113,11 @@ class PPOUpdater:
         )
 
 
-def _kl_exceeds_target(kl_sum: float, steps: int, target_kl: float) -> tuple[bool, float]:
+def _kl_exceeds_target(kl_sum: Tensor, steps: int, target_kl: float) -> tuple[bool, float]:
     """Check if the mean KL divergence exceeds the target early-stopping threshold."""
-    mean_kl = kl_sum / steps if steps > 0 else 0.0
-    return mean_kl > target_kl, mean_kl
+    mean_kl = kl_sum / steps if steps > 0 else kl_sum
+    mean_kl_value = float(mean_kl.detach().item())
+    return mean_kl_value > target_kl, mean_kl_value
 
 
 def _build_memory_inputs(
@@ -224,10 +226,9 @@ def _run_batched_ppo(
     magnet: Magnet,
     config: TrainingConfig,
     device: torch.device,
-    episode: int,
     alpha: float,
     magnet_cache: dict[int, torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, dict[str, float], int]:
+) -> tuple[torch.Tensor, dict[str, Tensor], int]:
     """Evaluate one PPO minibatch with one reducer pass per decision.
 
     Arguments:
@@ -236,20 +237,19 @@ def _run_batched_ppo(
         magnet: Frozen reference policy used for reverse-KL regularization.
         config: PPO optimization settings.
         device: Device hosting the minibatch computation.
-        episode: Current training episode index.
         alpha: Active magnet regularization coefficient.
 
     Returns:
-        Summed loss tensor, summed scalar metrics, and decision count.
+        Summed loss tensor, summed device-resident metrics, and decision count.
     """
     if not episodes:
         return (
             torch.tensor(0.0, device=device),
             {
-                "policy_loss": 0.0,
-                "value_loss": 0.0,
-                "kl_div": 0.0,
-                "clip_frac": 0.0,
+                "policy_loss": torch.zeros((), device=device),
+                "value_loss": torch.zeros((), device=device),
+                "kl_div": torch.zeros((), device=device),
+                "clip_frac": torch.zeros((), device=device),
             },
             0,
         )
@@ -278,9 +278,8 @@ def _run_batched_ppo(
             magnet_cache,
         )
 
-    total_loss = torch.tensor(0.0, device=device)
     # Keep reductions on-device until the update-level aggregation below.
-    metrics: dict[str, Any] = {
+    metrics: dict[str, Tensor] = {
         "policy_loss": torch.tensor(0.0, device=device),
         "value_loss": torch.tensor(0.0, device=device),
         "normalized_entropy": torch.tensor(0.0, device=device),
@@ -320,16 +319,6 @@ def _run_batched_ppo(
         metrics["clip_frac"] = (
             ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high)).float().sum()
         )
-
-    for k in [
-        "policy_loss",
-        "value_loss",
-        "normalized_entropy",
-        "magnet_kl",
-        "kl_div",
-        "clip_frac",
-    ]:
-        metrics[k] = metrics[k].item()
 
     return total_loss, metrics, total_steps
 
@@ -383,13 +372,14 @@ def ppo_update(
             else:
                 explained_var = 0.0
 
-    tot_policy_loss = 0.0
-    tot_value_loss = 0.0
-    tot_normalized_entropy = 0.0
-    tot_magnet_kl = 0.0
-    tot_kl_div = 0.0
-    tot_grad_norm = 0.0
-    tot_clip_frac = 0.0
+    metric_zero = torch.zeros((), device=policy.device)
+    tot_policy_loss = metric_zero.clone()
+    tot_value_loss = metric_zero.clone()
+    tot_normalized_entropy = metric_zero.clone()
+    tot_magnet_kl = metric_zero.clone()
+    tot_kl_div = metric_zero.clone()
+    tot_grad_norm = metric_zero.clone()
+    tot_clip_frac = metric_zero.clone()
     tot_steps = 0
     num_updates = 0
     num_skipped = 0
@@ -406,7 +396,7 @@ def ppo_update(
         random.Random(config.seed + episode * config.ppo_epochs + epoch_idx).shuffle(episodes)
 
         epoch_steps = 0
-        epoch_kl = 0.0
+        epoch_kl = metric_zero.clone()
 
         for batch_start in range(0, len(episodes), effective_batch_size):
             if cancel_requested():
@@ -419,7 +409,7 @@ def ppo_update(
             optimizer.zero_grad(set_to_none=True)
 
             minibatch_steps = 0
-            minibatch_kl = 0.0
+            minibatch_kl = metric_zero.clone()
             expected_minibatch_steps = sum(ep.length for ep in minibatch)
             should_skip = False
             cancelled = False
@@ -439,7 +429,6 @@ def ppo_update(
                     magnet,
                     config,
                     policy.device,
-                    episode,
                     alpha,
                     magnet_cache,
                 )
@@ -455,7 +444,7 @@ def ppo_update(
 
                 if batch_steps > 0:
                     scaled_loss = batch_loss / expected_minibatch_steps
-                    if torch.isfinite(scaled_loss):
+                    if bool(torch.isfinite(scaled_loss).item()):
                         scaler.scale(scaled_loss).backward()
                     else:
                         logging.warning(
@@ -465,7 +454,9 @@ def ppo_update(
                         non_finite_loss = True
                         break
 
-                # Check KL early at the chunk level to save processing remaining chunks
+                # Preserve the original early-stop behavior: once the running
+                # mean KL for this effective minibatch exceeds the target, do
+                # not process any remaining chunks.
                 should_skip, minibatch_mean_kl = _kl_exceeds_target(
                     minibatch_kl, minibatch_steps, config.target_kl
                 )
@@ -495,16 +486,18 @@ def ppo_update(
                         policy.parameters(), config.max_grad_norm
                     )
                     scale_before_update = scaler.get_scale()
-                    if not torch.isfinite(grad_norm):
+                    grad_norm_finite = bool(torch.isfinite(grad_norm).item())
+                    if not grad_norm_finite:
                         logging.warning(
-                            "Non-finite grad norm detected; scaler will skip this step "
+                            "Non-finite grad norm detected; discarding this step "
                             f"(loss scale={scale_before_update:.0f})"
                         )
                     else:
-                        tot_grad_norm += grad_norm.item()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    if torch.isfinite(grad_norm):
+                        tot_grad_norm += grad_norm.detach()
+                    if grad_norm_finite or scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    if grad_norm_finite:
                         num_updates += 1
 
             epoch_steps += minibatch_steps
@@ -532,14 +525,41 @@ def ppo_update(
             "time": time.time() - t0,
         }
 
+    grad_norm = tot_grad_norm / num_updates if num_updates > 0 else metric_zero
+    summary = (
+        torch.stack(
+            (
+                tot_policy_loss / tot_steps,
+                tot_value_loss / tot_steps,
+                tot_normalized_entropy / tot_steps,
+                tot_magnet_kl / tot_steps,
+                tot_kl_div / tot_steps,
+                grad_norm,
+                tot_clip_frac / tot_steps,
+            )
+        )
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    (
+        policy_loss,
+        value_loss,
+        normalized_entropy,
+        magnet_kl,
+        kl_divergence,
+        grad_norm_value,
+        clip_fraction,
+    ) = summary
+
     return {
-        "policy_loss": tot_policy_loss / tot_steps,
-        "value_loss": tot_value_loss / tot_steps,
-        "normalized_entropy": tot_normalized_entropy / tot_steps,
-        "magnet_kl": tot_magnet_kl / tot_steps,
-        "kl_divergence": tot_kl_div / tot_steps,
-        "grad_norm": tot_grad_norm / num_updates if num_updates > 0 else 0.0,
-        "clip_fraction": tot_clip_frac / tot_steps,
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+        "normalized_entropy": normalized_entropy,
+        "magnet_kl": magnet_kl,
+        "kl_divergence": kl_divergence,
+        "grad_norm": grad_norm_value,
+        "clip_fraction": clip_fraction,
         "magnet_alpha": alpha,
         "explained_variance": explained_var,
         "skipped_minibatches": num_skipped,

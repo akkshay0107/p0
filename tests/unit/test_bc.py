@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from p0.battle.actions import encode_team_pair
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_TOKENS_PER_GAME
 from p0.model.config import ModelConfig
@@ -23,7 +24,13 @@ from p0.replays.compile import compile_payloads, compile_to_shards, write_tensor
 from p0.replays.dataset import LazyReplayDataset, ReplayGameChunk, assign_series_splits
 from p0.replays.schema import LabelKind
 from p0.replays.scrape import HttpResponse, ReplayFetcher, ScrapeConfig, load_raw_replay
-from p0.training.bc import BCGameWindow, BCTrainer, collate_bc_batches, compute_bc_objective
+from p0.training.bc import (
+    BCGameWindow,
+    BCTrainer,
+    _expand_team_preview_orbits,
+    collate_bc_batches,
+    compute_bc_objective,
+)
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
 from tests.unit.test_replay import _payload_replay_dataset as _payload
@@ -104,7 +111,7 @@ def test_candidate_objective_preserves_gradients() -> None:
 
 
 @pytest.mark.parametrize(
-    "labels, offsets, mask, message",
+    ("labels", "offsets", "mask", "message"),
     [
         ([int(LabelKind.EXACT)], [0, 2], [1.0], "EXACT"),
         ([int(LabelKind.PARTIAL)], [0, 1], [1.0], "PARTIAL"),
@@ -120,6 +127,25 @@ def test_invalid_label_and_candidate_shapes_are_rejected(labels, offsets, mask, 
             torch.tensor(labels),
             torch.tensor(mask),
         )
+
+
+def test_team_preview_candidates_expand_to_four_orientations() -> None:
+    first = encode_team_pair(0, 1)
+    second = encode_team_pair(2, 3)
+    values, offsets = _expand_team_preview_orbits(
+        torch.tensor([[first, second], [7, 8]]),
+        torch.tensor([0, 1, 2]),
+        torch.tensor([True, False]),
+    )
+
+    assert offsets.tolist() == [0, 4, 5]
+    assert {tuple(value) for value in values[:4].tolist()} == {
+        (first, second),
+        (encode_team_pair(1, 0), second),
+        (first, encode_team_pair(3, 2)),
+        (encode_team_pair(1, 0), encode_team_pair(3, 2)),
+    }
+    assert values[4:].tolist() == [[7, 8]]
 
 
 def test_replay_to_series_bc_checkpoint_smoke(tmp_path) -> None:

@@ -348,6 +348,42 @@ def test_parse_events_distinguishes_failed_and_blocked_moves():
     ]
 
 
+def test_parse_events_resets_last_attacker_at_turn_boundaries() -> None:
+    events = _local_parse_events(
+        [
+            RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
+            RawBattleEvent(("", "turn", "2")),
+            RawBattleEvent(("", "-fail", "p2a: Charizard")),
+        ]
+    )
+
+    assert events[-1].event_type is EventTypeId.FAILED
+    assert events[-1].entity_id == "p2a: Charizard"
+
+
+def test_parse_events_clears_inferred_sources_at_upkeep_boundaries() -> None:
+    events = _local_parse_events(
+        [
+            RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
+            RawBattleEvent(("", "upkeep")),
+            RawBattleEvent(("", "-immune", "p2a: Charizard")),
+            RawBattleEvent(("", "-activate", "p2a: Charizard", "move: Protect")),
+        ]
+    )
+
+    immune, protect = events[-2:]
+    assert (immune.event_type, immune.entity_id, immune.target_id) == (
+        EventTypeId.BLOCKED,
+        None,
+        "p2a: Charizard",
+    )
+    assert (protect.event_type, protect.entity_id, protect.target_id) == (
+        EventTypeId.BLOCKED,
+        None,
+        "p2a: Charizard",
+    )
+
+
 def test_ability_field_and_move_evidence():
     events = _local_parse_events(
         [

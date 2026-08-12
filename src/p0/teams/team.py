@@ -188,7 +188,7 @@ class TeamRecord:
     def to_dict(self) -> dict[str, object]:
         pairs = sorted(
             zip(self.team.members, self.spreads, strict=True),
-            key=lambda pair: pair[0].canonical().species,
+            key=lambda pair: normalize_id(pair[0].species),
         )
         return {
             "team": CanonicalTeam(tuple(member for member, _ in pairs)).to_dict(),
@@ -247,7 +247,7 @@ def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ..
                 spread
                 for _, spread in sorted(
                     zip(variant.team.members, variant.spreads, strict=True),
-                    key=lambda pair: pair[0].canonical().species,
+                    key=lambda pair: normalize_id(pair[0].species),
                 )
             )
 

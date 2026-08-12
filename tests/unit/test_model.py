@@ -4,7 +4,9 @@ from typing import Any, cast
 
 import pytest
 import torch
+from torch.amp import GradScaler
 
+import p0.training.ppo as ppo_module
 from p0.battle.actions import (
     MEGA_MOVE_END,
     MEGA_MOVE_START,
@@ -601,7 +603,7 @@ def test_ppo_updates_all_policy_paths(dummy_obs):
     magnet = Magnet(policy)
 
     loss, _, steps = _run_batched_ppo(
-        [episode], policy, magnet, config, device, episode=0, alpha=config.magnet_alpha
+        [episode], policy, magnet, config, device, alpha=config.magnet_alpha
     )
     assert steps == 1
 
@@ -653,7 +655,6 @@ def test_ppo_caches_magnet_logits_for_repeated_epochs(dummy_obs, monkeypatch):
         magnet,
         config,
         policy.device,
-        episode=0,
         alpha=config.magnet_alpha,
         magnet_cache=cache,
     )
@@ -663,12 +664,68 @@ def test_ppo_caches_magnet_logits_for_repeated_epochs(dummy_obs, monkeypatch):
         magnet,
         config,
         policy.device,
-        episode=0,
         alpha=config.magnet_alpha,
         magnet_cache=cache,
     )
     assert calls == 1
     assert list(cache) == [id(episode)]
+
+
+def test_full_precision_ppo_discards_non_finite_gradients(dummy_obs, monkeypatch):
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
+    magnet = Magnet(policy)
+    parameter = next(policy.parameters())
+    episode = TrajectoryBatch(
+        observations=dummy_obs[0].unsqueeze(0),
+        actions=torch.tensor([[1, 2]], dtype=torch.long),
+        log_probs=torch.zeros(1),
+        advantages=torch.ones(1),
+        returns=torch.ones(1),
+        values=torch.zeros(1),
+        rewards=torch.zeros(1),
+        dones=torch.ones(1),
+        action_masks=torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
+        length=1,
+        explained_variance=0.0,
+    )
+
+    def finite_chunk_with_bad_backward(*args, **kwargs):
+        del args, kwargs
+        zero = torch.zeros((), device=policy.device)
+        metrics = {
+            "policy_loss": zero,
+            "value_loss": zero,
+            "normalized_entropy": zero,
+            "magnet_kl": zero,
+            "kl_div": zero,
+            "clip_frac": zero,
+        }
+        return parameter.sum() * 0.0, metrics, 1
+
+    monkeypatch.setattr(ppo_module, "_run_batched_ppo", finite_chunk_with_bad_backward)
+    gradient_hook = parameter.register_hook(
+        lambda gradient: torch.full_like(gradient, float("inf"))
+    )
+    optimizer = torch.optim.SGD(policy.parameters(), lr=1.0)
+    before = {name: value.detach().clone() for name, value in policy.named_parameters()}
+
+    try:
+        result = ppo_module.ppo_update(
+            [episode],
+            policy,
+            magnet,
+            optimizer,
+            GradScaler(device="cpu", enabled=False),
+            TrainingConfig(batch_size=1, minibatch_size=1, ppo_epochs=1),
+            episode=0,
+            alpha=0.0,
+            cancel_requested=lambda: False,
+        )
+    finally:
+        gradient_hook.remove()
+
+    assert result["grad_norm"] == 0.0
+    assert all(torch.equal(before[name], value) for name, value in policy.named_parameters())
 
 
 if __name__ == "__main__":
@@ -1343,7 +1400,6 @@ def test_ppo_keeps_series_encoder_out_of_the_bo1_graph() -> None:
         Magnet(policy),
         TrainingConfig(enable_optim=False),
         policy.device,
-        episode=1,
         alpha=0.0,
     )
     loss.backward()
