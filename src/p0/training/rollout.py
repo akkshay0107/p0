@@ -7,7 +7,6 @@ import torch
 
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW
-from p0.model.cls_reducer import pack_history_tokens
 from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
@@ -31,32 +30,55 @@ __all__ = [
 
 
 class BattleMemoryBuffer:
-    """Explicit per-battle immutable local-token storage."""
+    """Fixed-capacity per-battle history stored on the policy device."""
 
-    def __init__(self, n_envs: int, d_model: int):
-        self.tokens: list[list[torch.Tensor]] = [[] for _ in range(n_envs)]
+    def __init__(
+        self,
+        n_envs: int,
+        d_model: int,
+        max_steps: int = MAX_TRAJECTORY_STEPS,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        if n_envs <= 0 or d_model <= 0 or max_steps <= 0:
+            raise ValueError("History dimensions must be positive")
+
+        self.tokens = torch.zeros(
+            (n_envs, max_steps, d_model),
+            device=device,
+            dtype=torch.float32,
+        )
+        self.step_counts = torch.zeros(n_envs, dtype=torch.long)
+        self._history_offsets = torch.arange(-HISTORY_WINDOW, 0, device=device)
+        self._history_ages = torch.arange(HISTORY_WINDOW - 1, -1, -1, device=device)
         self.d_model = d_model
+        self.max_steps = max_steps
 
     def append(self, env_ids: torch.Tensor, history_tokens: torch.Tensor) -> None:
         if history_tokens.shape != (env_ids.numel(), self.d_model):
             raise ValueError("history token batch does not match selected environments")
+        if history_tokens.device != self.tokens.device:
+            raise ValueError("history tokens must already be on the history buffer device")
+
+        env_ids_cpu = env_ids.to(device="cpu", dtype=torch.long)
+        steps_cpu = self.step_counts[env_ids_cpu]
+        if bool(torch.any(steps_cpu >= self.max_steps).item()):
+            raise OverflowError(f"Battle history exceeded {self.max_steps} decisions")
+
         # The policy returns the pre-memory local summary here, not the
         # post-memory cls readout. Store detached snapshots so this rollout
         # cache does not connect autograd graphs across environment steps.
-        # The whole battle is retained: the reducer window is the last
-        # The fixed history window entries are retained, but the end-of-game series summary compresses
-        # every decision, the same way behaviour cloning and live play do.
-        for env_id, token in zip(env_ids.tolist(), history_tokens, strict=True):
-            self.tokens[env_id].append(token.detach().to(device="cpu", dtype=torch.float32))
+        env_ids_device = env_ids_cpu.to(self.tokens.device)
+        steps_device = steps_cpu.to(self.tokens.device)
+        self.tokens[env_ids_device, steps_device] = history_tokens.detach().to(torch.float32)
+        self.step_counts[env_ids_cpu] += 1
 
     def reset(self, env_id: int) -> None:
         """Reset one game's history."""
-        self.tokens[env_id].clear()
+        self.step_counts[env_id] = 0
 
     def clear(self) -> None:
         """Reset all per-battle histories at a checkpoint boundary."""
-        for tokens in self.tokens:
-            tokens.clear()
+        self.step_counts.zero_()
 
     def inputs(
         self,
@@ -64,25 +86,32 @@ class BattleMemoryBuffer:
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        history = []
-        masks = []
-        ages = []
-        for env_id in env_ids.tolist():
-            current = self.tokens[env_id][-HISTORY_WINDOW:]
-            values = (
-                torch.stack(current).to(device=device, dtype=dtype).unsqueeze(0)
-                if current
-                else torch.zeros((1, 0, self.d_model), device=device, dtype=dtype)
-            )
-            packed, mask, age = pack_history_tokens(values)
-            history.append(packed[0])
-            masks.append(mask[0])
-            ages.append(age[0])
-        return (
-            torch.stack(history),
-            torch.stack(masks),
-            torch.stack(ages),
+        env_ids_cpu = env_ids.to(device="cpu", dtype=torch.long)
+        env_ids_device = env_ids_cpu.to(self.tokens.device)
+        lengths = self.step_counts[env_ids_cpu].to(self.tokens.device)
+        indices = lengths.unsqueeze(1) + self._history_offsets.unsqueeze(0)
+        mask = indices >= 0
+        history = self.tokens[
+            env_ids_device.unsqueeze(1),
+            indices.clamp_min(0),
+        ].masked_fill(~mask.unsqueeze(-1), 0.0)
+        ages = torch.where(
+            mask,
+            self._history_ages,
+            0,
         )
+        return (
+            history.to(device=device, dtype=dtype),
+            mask.to(device),
+            ages.to(device),
+        )
+
+    def full_values(self, env_id: int) -> torch.Tensor | None:
+        """Return one complete device-resident history before it is reset."""
+        length = int(self.step_counts[env_id].item())
+        if not length:
+            return None
+        return self.tokens[env_id, :length].unsqueeze(0)
 
 
 @torch.inference_mode()
@@ -233,7 +262,7 @@ def collect_rollouts(
                 t_obs = StructuredObservation.cat([term1, term2])
                 dummy_mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool, device=device)
 
-                idx_tensor = torch.tensor([i], dtype=torch.long, device=device)
+                idx_tensor = torch.tensor([i], dtype=torch.long)
                 mem1 = memory1.inputs(idx_tensor, device, torch.float32)
                 mem2 = memory2.inputs(idx_tensor, device, torch.float32)
 
@@ -264,16 +293,14 @@ def collect_rollouts(
 
             # The artificial truncation value sees only the current game. Commit
             # its summary after inference so the game is not represented twice.
-            hist1 = memory1.tokens[i]
-            if hist1:
-                val1 = torch.stack(hist1).unsqueeze(0).to(device)
+            val1 = memory1.full_values(i)
+            if val1 is not None:
                 with torch.no_grad():
                     new_tok1 = policy.series.resample_single_game(val1)[0]
                 series_store1.append(str(series_ids[i]), new_tok1)
 
-            hist2 = memory2.tokens[i]
-            if hist2:
-                val2 = torch.stack(hist2).unsqueeze(0).to(device)
+            val2 = memory2.full_values(i)
+            if val2 is not None:
                 with torch.no_grad():
                     new_tok2 = policy.series.resample_single_game(val2)[0]
                 series_store2.append(str(series_ids[i]), new_tok2)
@@ -311,8 +338,18 @@ class RolloutCollector:
         self.second = TrajectoryStorage.allocate(
             config.n_envs, max_trajectory_steps, policy.d_model
         )
-        self.memory1 = BattleMemoryBuffer(config.n_envs, policy.d_model)
-        self.memory2 = BattleMemoryBuffer(config.n_envs, policy.d_model)
+        self.memory1 = BattleMemoryBuffer(
+            config.n_envs,
+            policy.d_model,
+            max_steps=max_trajectory_steps,
+            device=policy.device,
+        )
+        self.memory2 = BattleMemoryBuffer(
+            config.n_envs,
+            policy.d_model,
+            max_steps=max_trajectory_steps,
+            device=policy.device,
+        )
         self.series_store1 = SeriesTokenStore(policy.d_model)
         self.series_store2 = SeriesTokenStore(policy.d_model)
 

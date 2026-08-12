@@ -23,7 +23,7 @@ from p0.model.policy import ActOutput
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
-from p0.rl_player import RLPlayer
+from p0.rl_player import RLPlayer, _LiveBattleHistory
 from p0.runtime.poke_env_action_adapter import action_to_single_order
 from p0.teams.source import FixedTeamSource
 from p0.training.config import TrainingConfig
@@ -309,8 +309,8 @@ def test_collect_rollouts_records_both_self_play_streams():
     assert all(episode.bootstrap_value == 0.0 for episode in buffer)
     assert trajectories1.step_counts.tolist() == [0, 0, 0]
     assert trajectories2.step_counts.tolist() == [0, 0, 0]
-    assert all(not entries for entries in memory1.tokens)
-    assert all(not entries for entries in memory2.tokens)
+    assert not memory1.step_counts.any()
+    assert not memory2.step_counts.any()
     side_two_actions = [
         actions[f"agent2-{env_id}"] for env_id, actions in enumerate(vec_env.received_actions[0])
     ]
@@ -356,7 +356,7 @@ def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
         memory.append(env_ids, torch.full((1, 1), float(step)))
 
     # The end-of-game series summary compresses every decision.
-    assert len(memory.tokens[0]) == total
+    assert memory.step_counts.tolist() == [total]
 
     history, mask, ages = memory.inputs(env_ids, torch.device("cpu"), torch.float32)
     assert history.shape == (1, HISTORY_WINDOW, 1)
@@ -366,7 +366,40 @@ def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
     assert ages[0, -1].item() == 0
 
 
-def test_live_player_spills_history_in_fixed_windows():
+def test_battle_memory_reports_explicit_overflow():
+    memory = BattleMemoryBuffer(1, d_model=1, max_steps=1)
+    env_ids = torch.tensor([0])
+    memory.append(env_ids, torch.ones((1, 1)))
+
+    with pytest.raises(OverflowError, match="exceeded"):
+        memory.append(env_ids, torch.ones((1, 1)))
+
+
+def test_battle_memory_gathers_independent_environment_windows():
+    memory = BattleMemoryBuffer(2, d_model=1, max_steps=3)
+    memory.append(torch.tensor([0, 1]), torch.tensor([[1.0], [10.0]]))
+    memory.append(torch.tensor([1]), torch.tensor([[11.0]]))
+
+    history, mask, ages = memory.inputs(
+        torch.tensor([0, 1]),
+        torch.device("cpu"),
+        torch.float32,
+    )
+
+    assert mask.sum(dim=1).tolist() == [1, 2]
+    assert history[0, -1, 0].item() == 1.0
+    assert history[1, -2:, 0].tolist() == [10.0, 11.0]
+    assert ages[0, -1].item() == 0
+    assert ages[1, -2:].tolist() == [1, 0]
+
+    memory.reset(0)
+    assert memory.full_values(0) is None
+    second_history = memory.full_values(1)
+    assert second_history is not None
+    assert second_history[0, :, 0].tolist() == [10.0, 11.0]
+
+
+def test_live_player_keeps_cpu_history_in_one_list():
     player = cast(Any, RLPlayer.__new__(RLPlayer))
     player.policy = SimpleNamespace(device=torch.device("cpu"), d_model=1)
     player._memory_model_id = id(player.policy)
@@ -375,36 +408,50 @@ def test_live_player_spills_history_in_fixed_windows():
     player._series_store = SeriesTokenStore(1)
 
     battle = SimpleNamespace(battle_tag="battle-1")
-    capacity = 2 * HISTORY_WINDOW
-    for step in range(capacity):
+    total = 3 * HISTORY_WINDOW + 1
+    for step in range(total):
         player._append_history(battle, torch.tensor([float(step)]))
 
     history = player._battle_histories["battle-1"]
-    assert history.decision_count == capacity
+    assert not history.spill_to_cpu
+    assert history.decision_count == total
     assert not history.cpu_chunks
-    assert len(history.device_tokens) == capacity
-
-    player._append_history(battle, torch.tensor([float(capacity)]))
-
-    total = capacity + 1
-    assert history.decision_count == total
-    assert [chunk.size(0) for chunk in history.cpu_chunks] == [HISTORY_WINDOW]
-    assert len(history.device_tokens) == HISTORY_WINDOW + 1
-    assert history.cpu_chunks[0][:, 0].tolist() == list(range(HISTORY_WINDOW))
-    assert history.device_tokens[0].item() == HISTORY_WINDOW
-    assert history.complete_values(torch.device("cpu"))[0, :, 0].tolist() == list(range(total))
-
-    for step in range(total, 3 * HISTORY_WINDOW + 1):
-        player._append_history(battle, torch.tensor([float(step)]))
-
-    total = 3 * HISTORY_WINDOW + 1
-    assert history.decision_count == total
-    assert [chunk.size(0) for chunk in history.cpu_chunks] == [HISTORY_WINDOW] * 2
-    assert len(history.device_tokens) == HISTORY_WINDOW + 1
+    assert len(history.resident_tokens) == total
     assert history.complete_values(torch.device("cpu"))[0, :, 0].tolist() == list(range(total))
     memory = player._memory_inputs(battle)
     assert memory.history_tokens[0, -1, 0].item() == float(total - 1)
     assert memory.history_tokens[0, 0, 0].item() == float(total - HISTORY_WINDOW)
+
+
+def test_live_player_spills_device_history_in_fixed_windows():
+    history = _LiveBattleHistory(spill_to_cpu=True)
+    device = torch.device("cpu")
+    capacity = 2 * HISTORY_WINDOW
+    for step in range(capacity):
+        history.append(torch.tensor([float(step)]), device)
+
+    assert history.decision_count == capacity
+    assert not history.cpu_chunks
+    assert len(history.resident_tokens) == capacity
+
+    history.append(torch.tensor([float(capacity)]), device)
+
+    total = capacity + 1
+    assert history.decision_count == total
+    assert [chunk.size(0) for chunk in history.cpu_chunks] == [HISTORY_WINDOW]
+    assert len(history.resident_tokens) == HISTORY_WINDOW + 1
+    assert history.cpu_chunks[0][:, 0].tolist() == list(range(HISTORY_WINDOW))
+    assert history.resident_tokens[0].item() == HISTORY_WINDOW
+    assert history.complete_values(torch.device("cpu"))[0, :, 0].tolist() == list(range(total))
+
+    for step in range(total, 3 * HISTORY_WINDOW + 1):
+        history.append(torch.tensor([float(step)]), device)
+
+    total = 3 * HISTORY_WINDOW + 1
+    assert history.decision_count == total
+    assert [chunk.size(0) for chunk in history.cpu_chunks] == [HISTORY_WINDOW] * 2
+    assert len(history.resident_tokens) == HISTORY_WINDOW + 1
+    assert history.complete_values(torch.device("cpu"))[0, :, 0].tolist() == list(range(total))
 
 
 def test_end_of_game_series_summary_sees_every_decision():

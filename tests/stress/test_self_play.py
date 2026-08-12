@@ -117,15 +117,17 @@ def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> Non
     )
     assert first.step_counts.tolist() == [0, 0]
     assert second.step_counts.tolist() == [0, 0]
-    assert all(not tokens for tokens in memory1.tokens + memory2.tokens)
+    assert not memory1.step_counts.any()
+    assert not memory2.step_counts.any()
     assert series1._store == {}
     assert series2._store == {}
 
 
 @pytest.mark.stress
 def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
-    buffer = BattleMemoryBuffer(2, d_model=3)
-    for index in range(stress_repetitions(default=2048)):
+    repetitions = stress_repetitions(default=2048)
+    buffer = BattleMemoryBuffer(2, d_model=3, max_steps=repetitions)
+    for index in range(repetitions):
         buffer.append(torch.tensor([0, 1]), torch.full((2, 3), float(index)))
 
     history, mask, ages = buffer.inputs(torch.tensor([0, 1]), torch.device("cpu"), torch.float32)

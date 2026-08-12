@@ -89,7 +89,7 @@ class TrackedPolicyPlayer(RLPlayer):
         action = super()._get_action(battle)
         assert np.isfinite(action).all()
         self.history_tokens.append(
-            self._battle_histories[self._battle_key(cast(DoubleBattle, battle))].device_tokens[-1]
+            self._battle_histories[self._battle_key(cast(DoubleBattle, battle))].resident_tokens[-1]
         )
         if battle.teampreview:
             self.preview_decisions += 1

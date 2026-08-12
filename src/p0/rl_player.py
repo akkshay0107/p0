@@ -12,7 +12,7 @@ import os
 import random
 import re
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -37,6 +37,44 @@ from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import FileTeamSource, TeamSource
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import load_config
+
+_LIVE_HISTORY_CAPACITY = 2 * HISTORY_WINDOW
+
+
+@dataclass(slots=True)
+class _LiveBattleHistory:
+    """Own one battle's resident history and optional CPU spill archive."""
+
+    spill_to_cpu: bool
+    decision_count: int = 0
+    cpu_chunks: list[torch.Tensor] = field(default_factory=list)
+    resident_tokens: list[torch.Tensor] = field(default_factory=list)
+
+    def append(self, token: torch.Tensor, device: torch.device) -> None:
+        if self.spill_to_cpu and len(self.resident_tokens) == _LIVE_HISTORY_CAPACITY:
+            chunk = torch.stack(self.resident_tokens[:HISTORY_WINDOW]).cpu()
+            self.cpu_chunks.append(chunk)
+            del self.resident_tokens[:HISTORY_WINDOW]
+
+        self.resident_tokens.append(token.detach().to(device=device, dtype=torch.float32))
+        self.decision_count += 1
+
+    def recent_values(self, empty: torch.Tensor) -> torch.Tensor:
+        if not self.resident_tokens:
+            return empty
+        return torch.stack(self.resident_tokens[-HISTORY_WINDOW:]).unsqueeze(0)
+
+    def complete_values(self, device: torch.device) -> torch.Tensor:
+        resident_values = torch.stack(self.resident_tokens)
+        if not self.cpu_chunks:
+            values = resident_values
+        else:
+            cpu_prefix = torch.cat(self.cpu_chunks).to(device)
+            values = torch.cat((cpu_prefix, resident_values))
+
+        if values.size(0) != self.decision_count:
+            raise RuntimeError("Live battle history does not match its decision count")
+        return values.unsqueeze(0)
 
 
 class TeamPlayerMixin:
@@ -109,7 +147,8 @@ class RLPlayer(TeamPlayerMixin, Player):
 
         self.top_p = top_p
         self._memory_model_id = id(policy)
-        self._battle_history: dict[str, list[torch.Tensor]] = {}
+        self._empty_history_tensor = torch.zeros((1, 0, policy.d_model), device=policy.device)
+        self._battle_histories: dict[str, _LiveBattleHistory] = {}
         self._series_store = SeriesTokenStore(policy.d_model)
         self._series_scores: dict[str, list[int]] = {}
 
@@ -129,20 +168,27 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     def invalidate_memory_for_model_reload(self) -> None:
         """Drop per-battle memory when a policy artifact is replaced."""
-        self._battle_history.clear()
+        self._battle_histories.clear()
         self._memory_model_id = id(self.policy)
+        self._empty_history_tensor = torch.zeros(
+            (1, 0, self.policy.d_model), device=self.policy.device
+        )
 
-    def _memory_inputs(self, battle: DoubleBattle):
-        if id(self.policy) != self._memory_model_id:
+    def _memory_inputs(self, battle: DoubleBattle) -> MemoryInputs:
+        if (
+            id(self.policy) != self._memory_model_id
+            or self._empty_history_tensor.device != self.policy.device
+            or self._empty_history_tensor.size(-1) != self.policy.d_model
+        ):
             self.invalidate_memory_for_model_reload()
 
         key = self._battle_key(battle)
-        history = self._battle_history.get(key, [])
-
-        if history:
-            values = torch.stack(history[-HISTORY_WINDOW:]).unsqueeze(0).to(self.policy.device)
-        else:
-            values = torch.zeros((1, 0, self.policy.d_model), device=self.policy.device)
+        history = self._battle_histories.get(key)
+        values = (
+            self._empty_history_tensor
+            if history is None
+            else history.recent_values(self._empty_history_tensor)
+        )
 
         history_tokens, history_mask, history_age_ids = pack_history_tokens(values)
 
@@ -164,8 +210,11 @@ class RLPlayer(TeamPlayerMixin, Player):
         # it detached so the live battle cache is a snapshot of this completed
         # decision rather than a cross-turn autograd graph.
         key = self._battle_key(battle)
-        entries = self._battle_history.setdefault(key, [])
-        entries.append(token.detach().to(torch.float32).cpu())
+        history = self._battle_histories.get(key)
+        if history is None:
+            history = _LiveBattleHistory(spill_to_cpu=self.policy.device.type != "cpu")
+            self._battle_histories[key] = history
+        history.append(token, self.policy.device)
 
     def _get_action(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
@@ -198,7 +247,8 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
-        self._battle_history.pop(self._battle_key(battle), None)
+        key = self._battle_key(battle)
+        self._battle_histories.pop(key, None)
         action = self._get_action(battle)
         order = action_to_order(action, battle)
         return order.message
@@ -207,12 +257,14 @@ class RLPlayer(TeamPlayerMixin, Player):
         if isinstance(battle, DoubleBattle):
             key = self._battle_key(battle)
             base_id = self._base_series_id(key)
-            history = self._battle_history.pop(key, None)
+            history = self._battle_histories.pop(key, None)
 
             if history is not None:
-                values = torch.stack(history).unsqueeze(0).to(self.policy.device)
+                values = history.complete_values(self.policy.device)
                 with torch.no_grad():
                     new_tokens = self.policy.series.resample_single_game(values)[0]
+                # SeriesTokenStore synchronously detaches the completed summary to
+                # CPU, establishing a strict device-memory boundary between games.
                 self._series_store.append(base_id, new_tokens)
 
             if battle.finished:
@@ -336,7 +388,7 @@ def _load_policy(
     return policy
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class RLBotConfig:
     username: str
     password: str | None
