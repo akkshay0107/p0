@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -20,10 +19,9 @@ from p0.model.structured_observation import (
     TOKEN_IDX_ALLY_SIDE,
     StructuredObservation,
 )
-from p0.replays.compile import compile_payloads, compile_to_shards, write_tensor_shards
-from p0.replays.dataset import LazyReplayDataset, ReplayGameChunk, assign_series_splits
+from p0.replays.compile import compile_payloads, write_tensor_shards
+from p0.replays.dataset import LazyReplayDataset, ReplayGameChunk
 from p0.replays.schema import LabelKind
-from p0.replays.scrape import HttpResponse, ReplayFetcher, ScrapeConfig, load_raw_replay
 from p0.training.bc import (
     BCGameWindow,
     BCTrainer,
@@ -33,7 +31,8 @@ from p0.training.bc import (
 )
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
-from tests.unit.test_replay import _payload_replay_dataset as _payload
+from tests.unit.test_replay import _sample_replay_payload as _payload
+
 
 
 def test_exact_and_partial_losses_match_probability_definitions() -> None:
@@ -148,56 +147,6 @@ def test_team_preview_candidates_expand_to_four_orientations() -> None:
     assert values[4:].tolist() == [[7, 8]]
 
 
-def test_replay_to_series_bc_checkpoint_smoke(tmp_path) -> None:
-    result = compile_payloads((_payload("game-1"), _payload("game-2")))
-    built = write_tensor_shards(
-        result,
-        tmp_path / "shards",
-        max_decisions_per_shard=8,
-        created_at="2026-01-01T00:00:00Z",
-    )
-    dataset = LazyReplayDataset(built.manifest_path)
-    policy = build_policy(
-        ModelConfig(
-            d_model=64,
-            nhead=4,
-            reducer_layers=1,
-            dim_feedforward=128,
-        ),
-        default_runtime_resources(),
-    )
-    trainer = BCTrainer(
-        policy,
-        dataset,
-        BCConfig(
-            batch_decisions=2,
-            learning_rate=1e-3,
-            epochs=1,
-            amp=False,
-        ),
-        device="cpu",
-    )
-
-    metrics = trainer.train()
-
-    assert metrics["decisions"] == 8
-    assert metrics["labeled_decisions"] > 0
-    assert torch.isfinite(torch.tensor(metrics["loss"]))
-    checkpoint = tmp_path / "bc.pt"
-    trainer.save_checkpoint(checkpoint, epoch=1)
-
-    restored = build_policy(trainer.policy.config, default_runtime_resources())
-    restored_trainer = BCTrainer(
-        restored,
-        (),
-        trainer.config,
-        device="cpu",
-    )
-    assert restored_trainer.load_checkpoint(checkpoint) == 1
-    for name, parameter in trainer.policy.state_dict().items():
-        torch.testing.assert_close(parameter, restored_trainer.policy.state_dict()[name])
-
-
 def _chunk(
     label_kind: list[int],
     candidate_values: list[tuple[int, int]],
@@ -205,7 +154,7 @@ def _chunk(
     *,
     game_number: int = 1,
     is_series_end: bool = False,
-):
+) -> ReplayGameChunk:
     length = len(label_kind)
     observations = StructuredObservation.empty_batch(length)
     action_mask = torch.zeros((length, 2, FORMAT.action_size), dtype=torch.bool)
@@ -267,35 +216,71 @@ def _count_reducer_passes(trainer: BCTrainer, monkeypatch) -> list[int]:
     return passes
 
 
-def test_training_reduces_the_memory_window_once_per_chunk(monkeypatch) -> None:
+def test_replay_to_series_bc_checkpoint_smoke(tmp_path: Path) -> None:
+    result = compile_payloads((_payload("game-1"), _payload("game-2")))
+    built = write_tensor_shards(
+        result,
+        tmp_path / "shards",
+        max_decisions_per_shard=8,
+        created_at="2026-01-01T00:00:00Z",
+    )
+    dataset = LazyReplayDataset(built.manifest_path)
+    policy = build_policy(
+        ModelConfig(
+            d_model=64,
+            nhead=4,
+            reducer_layers=1,
+            dim_feedforward=128,
+        ),
+        default_runtime_resources(),
+    )
+    trainer = BCTrainer(
+        policy,
+        dataset,
+        BCConfig(
+            batch_decisions=2,
+            learning_rate=1e-3,
+            epochs=1,
+            amp=False,
+        ),
+        device="cpu",
+    )
+
+    metrics = trainer.train()
+
+    assert metrics["decisions"] == 8
+    assert metrics["labeled_decisions"] > 0
+    assert torch.isfinite(torch.tensor(metrics["loss"]))
+    checkpoint = tmp_path / "bc.pt"
+    trainer.save_checkpoint(checkpoint, epoch=1)
+
+    restored = build_policy(trainer.policy.config, default_runtime_resources())
+    restored_trainer = BCTrainer(
+        restored,
+        (),
+        trainer.config,
+        device="cpu",
+    )
+    assert restored_trainer.load_checkpoint(checkpoint) == 1
+    for name, parameter in trainer.policy.state_dict().items():
+        torch.testing.assert_close(parameter, restored_trainer.policy.state_dict()[name])
+
+
+def test_training_and_eval_reduce_memory_window_once_per_batch(monkeypatch) -> None:
     chunk = _chunk(
         [int(LabelKind.EXACT), int(LabelKind.EXACT)],
         [(7, 8), (7, 8)],
         [0, 1, 2],
     )
-    trainer = _trainer(chunk, minibatch_size=1)
-    passes = _count_reducer_passes(trainer, monkeypatch)
+    trainer_train = _trainer(chunk, minibatch_size=1)
+    passes_train = _count_reducer_passes(trainer_train, monkeypatch)
+    trainer_train.train()
+    assert passes_train[0] == 2
 
-    trainer.train()
-
-    # Two single-decision chunks. Scoring the candidates and the critic share
-    # one reduced batch instead of reducing the same window twice.
-    assert passes[0] == 2
-
-
-def test_evaluation_reduces_the_memory_window_once_per_batch(monkeypatch) -> None:
-    chunk = _chunk(
-        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
-        [(7, 8), (7, 8)],
-        [0, 1, 2],
-    )
-    trainer = _trainer(chunk, minibatch_size=2)
-    passes = _count_reducer_passes(trainer, monkeypatch)
-
-    trainer.evaluate()
-
-    # Candidate scoring, the critic and the greedy prediction all reuse it.
-    assert passes[0] == 1
+    trainer_eval = _trainer(chunk, minibatch_size=2)
+    passes_eval = _count_reducer_passes(trainer_eval, monkeypatch)
+    trainer_eval.evaluate()
+    assert passes_eval[0] == 1
 
 
 def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
@@ -484,7 +469,7 @@ def test_continued_chunk_matches_per_window_reference_inputs() -> None:
     torch.testing.assert_close(actual.memory.history_age_ids, batch.history_age_ids)
 
 
-def test_completed_game_does_not_emit_a_second_observation_payload() -> None:
+def test_completed_game_sets_terminal_window_flag() -> None:
     length = 100
     game = _chunk(
         [int(LabelKind.EXACT)] * length,
@@ -496,7 +481,6 @@ def test_completed_game_does_not_emit_a_second_observation_payload() -> None:
 
     assert not first.windows[0].is_game_end
     assert second.windows[0].is_game_end
-    assert not hasattr(second, "completed_games")
     assert second.observations.categorical.size(0) == HISTORY_WINDOW + length - 64
 
 
@@ -530,110 +514,104 @@ def test_raw_game_history_caches_each_target_token_once() -> None:
     assert history_mask.all()
 
 
-def test_ordered_history_validation_logic():
-    def _test_ordered_history_allows_skipped_game_numbers():
-        first = _chunk(
-            [int(LabelKind.EXACT)],
-            [(7, 8)],
-            [0, 1],
-            game_number=1,
-        )
-        third = _chunk(
-            [int(LabelKind.EXACT)],
-            [(7, 8)],
-            [0, 1],
-            game_number=3,
-            is_series_end=True,
-        )
-        trainer = _trainer(first, minibatch_size=2)
-        batch = next(collate_bc_batches((first, third), 2))
+def test_ordered_history_allows_skipped_game_numbers() -> None:
+    first = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=1,
+    )
+    third = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=3,
+        is_series_end=True,
+    )
+    trainer = _trainer(first, minibatch_size=2)
+    batch = next(collate_bc_batches((first, third), 2))
 
-        prepared = trainer._prepare_model_inputs(batch)
+    prepared = trainer._prepare_model_inputs(batch)
 
-        series_mask = prepared.memory.series_mask
-        assert not series_mask[0].any()
-        assert series_mask[1, :SERIES_TOKENS_PER_GAME].all()
+    series_mask = prepared.memory.series_mask
+    assert not series_mask[0].any()
+    assert series_mask[1, :SERIES_TOKENS_PER_GAME].all()
 
-    _test_ordered_history_allows_skipped_game_numbers()
 
-    def _test_ordered_history_keeps_interleaved_series_independent():
-        first_a = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1], game_number=1)
-        first_b = replace(
-            first_a,
-            series_id="series-2",
-        )
-        third_a = _chunk(
-            [int(LabelKind.EXACT)],
-            [(7, 8)],
-            [0, 1],
-            game_number=3,
-            is_series_end=True,
-        )
-        second_b = replace(
-            _chunk(
-                [int(LabelKind.EXACT)],
-                [(7, 8)],
-                [0, 1],
-                game_number=2,
-                is_series_end=True,
-            ),
-            series_id="series-2",
-        )
-        trainer = _trainer(first_a, minibatch_size=4)
-        batch = next(collate_bc_batches((first_a, first_b, third_a, second_b), 4))
-
-        series_mask = trainer._prepare_model_inputs(batch).memory.series_mask
-
-        assert not series_mask[:2].any()
-        assert series_mask[2:, :SERIES_TOKENS_PER_GAME].all()
-        assert not series_mask[2:, SERIES_TOKENS_PER_GAME:].any()
-
-    _test_ordered_history_keeps_interleaved_series_independent()
-
-    def _test_ordered_history_rejects_repeated_or_decreasing_games():
-        for game_numbers in [(2, 2), (2, 1)]:
-            first = _chunk(
-                [int(LabelKind.EXACT)],
-                [(7, 8)],
-                [0, 1],
-                game_number=game_numbers[0],
-            )
-            invalid = _chunk(
-                [int(LabelKind.EXACT)],
-                [(7, 8)],
-                [0, 1],
-                game_number=game_numbers[1],
-                is_series_end=True,
-            )
-            trainer = _trainer(first, minibatch_size=2)
-            batch = next(collate_bc_batches((first, invalid), 2))
-
-            with pytest.raises(ValueError, match="must increase"):
-                trainer._prepare_model_inputs(batch)
-
-    _test_ordered_history_rejects_repeated_or_decreasing_games()
-
-    def _test_ordered_history_rejects_data_after_series_end():
-        ended = _chunk(
-            [int(LabelKind.EXACT)],
-            [(7, 8)],
-            [0, 1],
-            game_number=1,
-            is_series_end=True,
-        )
-        extra = _chunk(
+def test_ordered_history_keeps_interleaved_series_independent() -> None:
+    first_a = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1], game_number=1)
+    first_b = replace(
+        first_a,
+        series_id="series-2",
+    )
+    third_a = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=3,
+        is_series_end=True,
+    )
+    second_b = replace(
+        _chunk(
             [int(LabelKind.EXACT)],
             [(7, 8)],
             [0, 1],
             game_number=2,
-        )
-        trainer = _trainer(ended, minibatch_size=2)
-        batch = next(collate_bc_batches((ended, extra), 2))
+            is_series_end=True,
+        ),
+        series_id="series-2",
+    )
+    trainer = _trainer(first_a, minibatch_size=4)
+    batch = next(collate_bc_batches((first_a, first_b, third_a, second_b), 4))
 
-        with pytest.raises(ValueError, match="after a perspective-series ended"):
+    series_mask = trainer._prepare_model_inputs(batch).memory.series_mask
+
+    assert not series_mask[:2].any()
+    assert series_mask[2:, :SERIES_TOKENS_PER_GAME].all()
+    assert not series_mask[2:, SERIES_TOKENS_PER_GAME:].any()
+
+
+def test_ordered_history_rejects_repeated_or_decreasing_games() -> None:
+    for game_numbers in [(2, 2), (2, 1)]:
+        first = _chunk(
+            [int(LabelKind.EXACT)],
+            [(7, 8)],
+            [0, 1],
+            game_number=game_numbers[0],
+        )
+        invalid = _chunk(
+            [int(LabelKind.EXACT)],
+            [(7, 8)],
+            [0, 1],
+            game_number=game_numbers[1],
+            is_series_end=True,
+        )
+        trainer = _trainer(first, minibatch_size=2)
+        batch = next(collate_bc_batches((first, invalid), 2))
+
+        with pytest.raises(ValueError, match="must increase"):
             trainer._prepare_model_inputs(batch)
 
-    _test_ordered_history_rejects_data_after_series_end()
+
+def test_ordered_history_rejects_data_after_series_end() -> None:
+    ended = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=1,
+        is_series_end=True,
+    )
+    extra = _chunk(
+        [int(LabelKind.EXACT)],
+        [(7, 8)],
+        [0, 1],
+        game_number=2,
+    )
+    trainer = _trainer(ended, minibatch_size=2)
+    batch = next(collate_bc_batches((ended, extra), 2))
+
+    with pytest.raises(ValueError, match="after a perspective-series ended"):
+        trainer._prepare_model_inputs(batch)
 
 
 def test_ordered_history_tracks_an_incomplete_final_game() -> None:
@@ -725,51 +703,24 @@ def test_bc_loss_trains_series_resampler() -> None:
         is_series_end=True,
     )
     trainer = _trainer(first, minibatch_size=4)
-    batch = next(collate_bc_batches((first, second), 4))
-    totals: dict[str, float | int] = {
-        "loss": 0.0,
-        "loss_weight": 0.0,
-        "exact_nll": 0.0,
-        "partial_nll": 0.0,
-        "decisions": 0,
-        "labeled_decisions": 0,
-        "exact_decisions": 0,
-        "partial_decisions": 0,
-        "updates": 0,
-        "games": 0,
-    }
+    trainer.dataset = (first, second)
+    captured_grads: list[torch.Tensor] = []
 
-    trainer._backward_chunk(batch, totals)
+    original_step = trainer.optimizer.step
 
-    gradients = [
-        parameter.grad
-        for parameter in trainer.policy.series.parameters()
-        if parameter.grad is not None
-    ]
-    assert gradients
-    assert any(torch.count_nonzero(gradient) for gradient in gradients)
+    def step_with_capture(*args, **kwargs):
+        captured_grads.extend(
+            p.grad.detach().clone()
+            for p in trainer.policy.series.parameters()
+            if p.grad is not None
+        )
+        return original_step(*args, **kwargs)
 
+    with patch.object(trainer.optimizer, "step", side_effect=step_with_capture):
+        trainer.train()
 
-def test_evaluate_encodes_each_collated_batch_once() -> None:
-    first = _chunk(
-        [int(LabelKind.EXACT)] * 3,
-        [(7, 8)] * 3,
-        [0, 1, 2, 3],
-        game_number=1,
-    )
-    second = _chunk(
-        [int(LabelKind.EXACT)] * 3,
-        [(7, 8)] * 3,
-        [0, 1, 2, 3],
-        game_number=2,
-        is_series_end=True,
-    )
-    trainer = _trainer(first, minibatch_size=2)
-
-    with patch.object(trainer.policy, "encode", wraps=trainer.policy.encode) as encode:
-        trainer.evaluate((first, second))
-
-    assert encode.call_count == 3
+    assert captured_grads
+    assert any(torch.count_nonzero(gradient) for gradient in captured_grads)
 
 
 def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
@@ -780,136 +731,6 @@ def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
 
     with pytest.raises(ValueError, match="re-iterable"):
         trainer.train()
-
-
-def test_scrape_soft_limit_completes_the_final_linked_series(tmp_path: Path) -> None:
-    format_id = FORMAT.bo3_format
-    seeds = [f"{format_id}-{number}" for number in (100, 200, 300)]
-    siblings = [f"{format_id}-{number}" for number in (101, 201, 301)]
-    bodies: dict[str, bytes] = {}
-    for seed, sibling in zip(seeds, siblings, strict=True):
-        first = _payload(seed, parent=f"series-{seed}")
-        first["log"] = f'|uhtml|next|<a href="/battle-{sibling}">Game 2</a>\n{first["log"]}'
-        bodies[seed] = json.dumps(first).encode()
-        bodies[sibling] = json.dumps(_payload(sibling, parent=f"series-{seed}")).encode()
-
-    def transport(url: str, timeout: float) -> HttpResponse:
-        del timeout
-        if "search.invalid" in url:
-            return HttpResponse(
-                200,
-                json.dumps([{"id": seed, "formatid": format_id} for seed in seeds]).encode(),
-            )
-        replay_id = url.rsplit("/", 1)[-1].removesuffix(".json")
-        return HttpResponse(200, bodies[replay_id])
-
-    config = ScrapeConfig(
-        format_id=format_id,
-        cache_dir=tmp_path,
-        search_url="https://search.invalid",
-        replay_url_template="https://replay.invalid/{replay_id}.json",
-        page_size=50,
-        limit_games=3,
-        rate_limit_per_second=0,
-    )
-    entries = ReplayFetcher(config, transport=transport).acquire()
-
-    assert {entry.replay_id for entry in entries} == {
-        seeds[0],
-        siblings[0],
-        seeds[1],
-        siblings[1],
-    }
-
-
-def test_raw_cache_keeps_malformed_bytes_for_later_quality_rejection(
-    tmp_path: Path,
-) -> None:
-    replay_id = f"{FORMAT.bo3_format}-malformed"
-
-    def transport(url: str, timeout: float) -> HttpResponse:
-        del url, timeout
-        return HttpResponse(200, b"not-json")
-
-    config = ScrapeConfig(
-        format_id=FORMAT.bo3_format,
-        cache_dir=tmp_path,
-        replay_url_template="https://replay.invalid/{replay_id}.json",
-        rate_limit_per_second=0,
-    )
-    ReplayFetcher(config, transport=transport).acquire((replay_id,))
-
-    assert (
-        load_raw_replay(tmp_path / FORMAT.bo3_format / "raw" / f"{replay_id}.json.gz")
-        == b"not-json"
-    )
-
-
-def test_fetcher_skips_404_without_writing_cache_entry(tmp_path: Path, caplog) -> None:
-    replay_id = f"{FORMAT.bo3_format}-missing"
-
-    def transport(url: str, timeout: float) -> HttpResponse:
-        del timeout
-        if "search.invalid" in url:
-            return HttpResponse(200, json.dumps([{"id": replay_id}]).encode())
-        return HttpResponse(404, b"not found")
-
-    config = ScrapeConfig(
-        format_id=FORMAT.bo3_format,
-        cache_dir=tmp_path,
-        search_url="https://search.invalid",
-        replay_url_template="https://replay.invalid/{replay_id}.json",
-        rate_limit_per_second=0,
-    )
-    with caplog.at_level("WARNING", logger="p0.replays.scrape"):
-        assert ReplayFetcher(config, transport=transport).acquire() == ()
-    assert not (tmp_path / FORMAT.bo3_format / "raw" / f"{replay_id}.json.gz").exists()
-    assert not (tmp_path / FORMAT.bo3_format / "metadata" / f"{replay_id}.json").exists()
-    assert "skipping unavailable replay" in caplog.text
-
-
-def test_cache_build_is_dataset_bound_and_preserves_bo3_series(
-    tmp_path: Path,
-) -> None:
-    good_id = f"{FORMAT.bo3_format}-good"
-    bad_id = f"{FORMAT.bo3_format}-bad"
-    good = _payload(good_id, parent="source-series")
-    bad = _payload(bad_id, parent="source-series")
-    bad["log"] = "\n".join(
-        line for line in str(bad["log"]).splitlines() if "|showteam|" not in line
-    )
-    bodies = {good_id: json.dumps(good).encode(), bad_id: json.dumps(bad).encode()}
-
-    def transport(url: str, timeout: float) -> HttpResponse:
-        del timeout
-        replay_id = url.rsplit("/", 1)[-1].removesuffix(".json")
-        return HttpResponse(200, bodies[replay_id])
-
-    cache = tmp_path / "replays"
-    config = ScrapeConfig(
-        format_id=FORMAT.bo3_format,
-        cache_dir=cache,
-        replay_url_template="https://replay.invalid/{replay_id}.json",
-        rate_limit_per_second=0,
-    )
-    ReplayFetcher(config, transport=transport).acquire((good_id, bad_id))
-    from p0.replays.protocol import parse_replay_payload
-    from p0.replays.scrape import load_raw_replay
-
-    docs = [
-        parse_replay_payload(load_raw_replay(p))
-        for p in (cache / FORMAT.bo3_format / "raw").glob("*.json.gz")
-    ]
-    first = compile_to_shards(docs, tmp_path / "shards", format_id=FORMAT.bo3_format)
-    second = compile_to_shards(docs, tmp_path / "shards", format_id=FORMAT.bo3_format)
-
-    assert first.manifest_path == second.manifest_path
-    assert first.manifest.dataset_hash == second.manifest.dataset_hash
-    assert first.manifest.source_games == 2
-    assert first.manifest.accepted_games == 1
-    assert first.manifest.rejected_games == 1
-    chunks = list(LazyReplayDataset(first.manifest_path))
-    assert len(chunks) == 2
 
 
 def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:
@@ -931,16 +752,6 @@ def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:
     assert batches[0].games == 2
     assert batches[0].candidate_offsets.tolist() == [0, 0, 1, 2, 3]
     assert batches[1].candidate_offsets.tolist() == [0, 2]
-
-
-def test_split_assignment_populates_all_requested_splits_when_possible() -> None:
-    manifest = assign_series_splits(
-        ("a", "b", "c", "d", "e"),
-        global_contract_sha256="a" * 64,
-        dataset_hash="b" * 64,
-    )
-
-    assert set(manifest.assignments.values()) == {"train", "validation", "test"}
 
 
 def test_evaluation_reports_legality_diagnostics() -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
+import logging
+import random
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -10,33 +10,44 @@ import numpy as np
 import pytest
 import torch
 from poke_env.battle import DoubleBattle
-from poke_env.player.battle_order import PassBattleOrder
+from torch.amp import GradScaler
 
 from p0.battle.actions import ACT_SIZE
 from p0.evaluation.harness import (
     EvaluationHarness,
+    MatchupResult,
+    hashlib_team,
+    wilson_score_interval,
 )
+from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
+from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import ActOutput
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import StructuredObservation
+from p0.model.structured_observation import StructuredObservation, TokenType
 from p0.model.token_store import SeriesTokenStore
 from p0.rl_player import RLPlayer, _LiveBattleHistory
-from p0.runtime.poke_env_action_adapter import action_to_single_order
+from p0.runtime.env import MegaEnv, SimEnv
+from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import FixedTeamSource
+from p0.training import ppo as ppo_module
 from p0.training.config import TrainingConfig
+from p0.training.magnet import Magnet
+from p0.training.ppo import _run_batched_ppo, compute_ppo_objective
 from p0.training.rollout import (
     BattleMemoryBuffer,
     collect_rollouts,
 )
+from p0.training.trainer import PPOTrainer
 from p0.training.trajectory import (
     TrajectoryBatch,
     TrajectoryStorage,
     compute_gae_batch,
     prepare_trajectory_batches,
 )
+from p0.training.utils import amp_enabled
 from p0.training.vector_env import ThreadVecEnv
 
 
@@ -285,8 +296,6 @@ def test_collect_rollouts_records_both_self_play_streams():
     memory1 = BattleMemoryBuffer(config.n_envs, 1)
     memory2 = BattleMemoryBuffer(config.n_envs, 1)
 
-    from p0.model.token_store import SeriesTokenStore
-
     series_store1 = SeriesTokenStore(1)
     series_store2 = SeriesTokenStore(1)
 
@@ -325,8 +334,6 @@ def test_truncated_rollout_bootstraps_instead_of_ending_the_game():
     buffer: list[TrajectoryBatch] = []
     trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
     trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
-
-    from p0.model.token_store import SeriesTokenStore
 
     collect_rollouts(
         cast(Any, vec_env),
@@ -455,8 +462,6 @@ def test_live_player_spills_device_history_in_fixed_windows():
 
 
 def test_end_of_game_series_summary_sees_every_decision():
-    from p0.model.token_store import SeriesTokenStore
-
     vec_env = FakeVecEnv(1, done_status=0)
     policy = FakePolicy(action=7)
     memory1 = BattleMemoryBuffer(1, 1)
@@ -546,56 +551,35 @@ def test_completed_batch_only_moves_ppo_inputs_to_target_device():
     assert result.dones.device.type == "cpu"
 
 
-def test_action_validation_rejects_orders_outside_battle_order_space():
-    valid_order = PassBattleOrder()
-    battle = cast(
-        DoubleBattle,
-        SimpleNamespace(
-            player_username="player",
-            battle_tag="battle",
-            valid_orders=([valid_order], []),
-        ),
-    )
-
-    order = action_to_single_order(
-        0,
-        battle,
-        fake=False,
-        position=0,
-    )
-    assert str(order) == str(valid_order)
-
-    battle.valid_orders[0].clear()
-    with pytest.raises(ValueError, match="not in action space"):
-        action_to_single_order(
-            0,
-            battle,
-            fake=False,
-            position=0,
-        )
-
-
-def test_evaluation_harness_falls_back_without_corpus(tmp_path: Path) -> None:
-    harness = EvaluationHarness(
-        corpus_path=tmp_path / "nonexistent_manifest.json",
-        corpus_hash="nonexistent",
+def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path) -> None:
+    first = EvaluationHarness(
+        corpus_path=tmp_path / "missing.json",
+        corpus_hash="missing",
         episodes_per_matchup=5,
-        seed=123,
+        seed=91,
         smoke_test=True,
     )
-    sources = harness.build_team_sources()
-    assert len(sources) == 3
-    for key, source in sources.items():
+    second = EvaluationHarness(
+        corpus_path=tmp_path / "missing.json",
+        corpus_hash="missing",
+        episodes_per_matchup=5,
+        seed=91,
+        smoke_test=True,
+    )
+    first_sources = first.build_team_sources()
+    second_sources = second.build_team_sources()
+    assert len(first_sources) == 3
+    assert tuple(first_sources) == tuple(second_sources)
+    for key, source in first_sources.items():
         assert isinstance(source, FixedTeamSource)
-        assert harness.category_metadata[key]["fallback"] is True
-        # Sampled team should match the default test team
-        team = source.sample(harness.rng)
-        assert "Pikachu" in team.packed
+        assert first.category_metadata[key]["fallback"] is True
+        first_team = source.sample(first.rng)
+        second_team = second_sources[key].sample(second.rng)
+        assert "Pikachu" in first_team.packed
+        assert first_team.packed == second_team.packed
 
 
 def test_evaluation_confidence_intervals_and_matchup_serialization_are_deterministic() -> None:
-    from p0.evaluation.harness import MatchupResult, hashlib_team, wilson_score_interval
-
     assert wilson_score_interval(0, 0) == (0.0, 0.0)
     lower, upper = wilson_score_interval(3, 5)
     assert 0.0 < lower < 0.6 < upper < 1.0
@@ -618,64 +602,466 @@ def test_evaluation_confidence_intervals_and_matchup_serialization_are_determini
     assert serialized["per_team_results"][team_hash]["games"] == 5
 
 
-def test_evaluation_team_source_fallback_is_repeatable_without_a_corpus(tmp_path) -> None:
-    first = EvaluationHarness(
-        corpus_path=tmp_path / "missing.json",
-        corpus_hash="missing",
-        episodes_per_matchup=5,
-        seed=91,
-        smoke_test=True,
+_OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
+
+
+def _make_test_double_battle() -> DoubleBattle:
+    logger = logging.getLogger("test")
+    logger.setLevel(logging.ERROR)
+    battle = DoubleBattle("tag", "user", logger, 9)
+    battle._player_role = "p1"
+    battle._active_pokemon = {}
+    battle._opponent_active_pokemon = {}
+    battle._team = {}
+    battle._opponent_team = {}
+    battle._teampreview = False
+    battle._available_switches = [[], []]
+    battle._weather = {}
+    battle._fields = {}
+    battle._turn = 0
+    battle._can_mega_evolve = [False, False]
+    battle._side_conditions = {}
+    battle._opponent_side_conditions = {}
+    return battle
+
+
+def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
+    battle = _make_test_double_battle()
+    from p0.runtime import poke_env_battle_adapter
+
+    original_decision_view = poke_env_battle_adapter.decision_view
+    decision_builds = 0
+
+    def counted_decision_view(current_battle):
+        nonlocal decision_builds
+        decision_builds += 1
+        return original_decision_view(current_battle)
+
+    monkeypatch.setattr(poke_env_battle_adapter, "decision_view", counted_decision_view)
+    env = SimEnv.__new__(SimEnv)
+    cast(Any, env).agent1 = SimpleNamespace(username=battle.player_username)
+    cast(Any, env).agent2 = SimpleNamespace(username="other-player")
+    env._observation_builder = _OBSERVATION_BUILDER
+    env._battle_view_factory = battle_view
+    out1 = StructuredObservation.empty_batch(1)[0]
+    out2 = StructuredObservation.empty_batch(1)[0]
+    env.set_observation_targets(out1, out2)
+
+    result = env.embed_battle(battle)
+    mask = env.get_action_mask(battle)
+
+    assert result is out1
+    assert result.token_type_ids[0] == TokenType.POKEMON
+    assert len(mask) == FORMAT.action_size * 2
+    assert decision_builds == 1
+
+
+def test_calc_reward_scores_each_seat_without_touching_the_series():
+    env = SimEnv.__new__(SimEnv)
+    env._series_scores = [0, 0]
+    won = SimpleNamespace(finished=True, won=True, lost=False)
+    lost = SimpleNamespace(finished=True, won=False, lost=True)
+
+    assert SimEnv.calc_reward(env, cast(Any, won)) == 1.0
+    assert SimEnv.calc_reward(env, cast(Any, lost)) == -1.0
+    assert SimEnv.calc_reward(env, cast(Any, SimpleNamespace(finished=False))) == 0.0
+    assert env.series_scores == [0, 0]
+
+
+def _stepping_env(monkeypatch, battle: Any, *, decision_steps: int = 0) -> SimEnv:
+    agents = ("agent1", "agent2")
+    monkeypatch.setattr(
+        MegaEnv,
+        "step",
+        lambda self, actions: (
+            {},
+            dict.fromkeys(agents, 0.0),
+            {agent: bool(battle.finished and battle.wiped) for agent in agents},
+            {agent: bool(battle.finished and not battle.wiped) for agent in agents},
+            {},
+        ),
     )
-    second = EvaluationHarness(
-        corpus_path=tmp_path / "missing.json",
-        corpus_hash="missing",
-        episodes_per_matchup=5,
-        seed=91,
-        smoke_test=True,
+    env = SimEnv.__new__(SimEnv)
+    env._series_scores = [0, 0]
+    env._decision_steps = decision_steps
+    cast(Any, env).battle1 = battle
+    return env
+
+
+@pytest.mark.parametrize("wiped", [True, False])
+def test_step_treats_every_finished_battle_as_terminal(monkeypatch, wiped: bool):
+    battle = SimpleNamespace(finished=True, won=True, lost=False, wiped=wiped)
+    env = _stepping_env(monkeypatch, battle)
+
+    _, _, terminated, truncated, _ = env.step({})
+
+    assert all(terminated.values())
+    assert not any(truncated.values())
+    assert env.series_scores == [1, 0]
+
+
+def test_step_truncates_an_unfinished_game_at_the_decision_cap(monkeypatch):
+    battle = SimpleNamespace(finished=False, won=False, lost=False, wiped=False)
+    env = _stepping_env(monkeypatch, battle, decision_steps=197)
+
+    _, rewards, terminated, truncated, _ = env.step({})
+
+    assert not any(terminated.values())
+    assert all(truncated.values())
+    assert all(reward == 0.0 for reward in rewards.values())
+    assert env.series_scores == [0, 0]
+
+
+def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):
+    monkeypatch.setattr(MegaEnv, "reset", lambda self, seed=None, options=None: "reset")
+    env = SimEnv.__new__(SimEnv)
+    env._series_scores = [0, 0]
+    env._series_games_played = 1
+    env._resume_reset_pending = False
+    env._agent_rng = random.Random(1)
+    env._opponent_rng = random.Random(2)
+    env.series_id = "series-1"
+    battle = SimpleNamespace(finished=True, won=True, lost=False)
+
+    env._record_game_result(cast(Any, battle))
+    env.reset()
+    assert env.series_scores == [1, 0]
+    assert env.series_games_played == 2
+
+    env._record_game_result(cast(Any, battle))
+    assert env.series_scores == [2, 0]
+
+    sampled: list[str] = []
+    cast(Any, env)._agent_team_source = SimpleNamespace(
+        sample=lambda rng: SimpleNamespace(packed="agent-team")
     )
-    first_sources = first.build_team_sources()
-    second_sources = second.build_team_sources()
-    assert tuple(first_sources) == tuple(second_sources)
-    for key in first_sources:
-        assert (
-            first_sources[key].sample(first.rng).packed
-            == second_sources[key].sample(second.rng).packed
+    cast(Any, env)._opponent_team_source = SimpleNamespace(
+        sample=lambda rng: SimpleNamespace(packed="opponent-team")
+    )
+    cast(Any, env).agent1 = SimpleNamespace(update_team=sampled.append)
+    cast(Any, env).agent2 = SimpleNamespace(update_team=sampled.append)
+
+    env.reset()
+    assert env.series_scores == [0, 0]
+    assert env.series_games_played == 1
+    assert env.series_id != "series-1"
+    assert sampled == ["agent-team", "opponent-team"]
+
+
+def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monkeypatch):
+    class TeamBuilder:
+        def __init__(self, packed: str):
+            self.packed = packed
+
+        def yield_team(self) -> str:
+            return self.packed
+
+    class Player:
+        def __init__(self, packed: str):
+            self._team = TeamBuilder(packed)
+
+        def update_team(self, packed: str) -> None:
+            self._team = TeamBuilder(packed)
+
+    env = SimEnv.__new__(SimEnv)
+    env._agent_rng = random.Random(10)
+    env._opponent_rng = random.Random(11)
+    env._series_scores = [1, 0]
+    env._series_games_played = 2
+    env._decision_steps = 17
+    env._resume_reset_pending = False
+    env.series_id = "series-1"
+    cast(Any, env).agent1 = Player("agent-team")
+    cast(Any, env).agent2 = Player("opponent-team")
+
+    state = env.training_state()
+    cast(Any, env).agent1.update_team("wrong-agent-team")
+    cast(Any, env).agent2.update_team("wrong-opponent-team")
+    env._series_scores = [0, 0]
+    env._series_games_played = 0
+
+    env.restore_training_state(state)
+    monkeypatch.setattr(MegaEnv, "reset", lambda self, seed=None, options=None: "reset")
+
+    assert env.reset() == "reset"
+    assert cast(Any, env).agent1._team.yield_team() == "agent-team"
+    assert cast(Any, env).agent2._team.yield_team() == "opponent-team"
+    assert env.series_scores == [1, 0]
+    assert env.series_games_played == 2
+
+    env.reset()
+    assert env.series_games_played == 3
+
+
+def test_pure_ppo_objective_clips_and_weights_team_preview() -> None:
+    config = TrainingConfig(
+        clip_low=0.2,
+        clip_high=0.2,
+        teampreview_loss_mult=2.0,
+        teampreview_alpha_mult=3.0,
+        residual_entropy_coef=0.0,
+    )
+    total, policy, value, ratio, log_ratio = compute_ppo_objective(
+        torch.log(torch.tensor([2.0, 0.5])),
+        torch.tensor([0.0, 1.0]),
+        torch.tensor([0.5, 0.5]),
+        torch.zeros(2),
+        torch.zeros(2),
+        torch.ones(2),
+        torch.ones(2),
+        torch.tensor([True, False]),
+        config,
+        alpha=0.1,
+    )
+    assert total.shape == policy.shape == value.shape == ratio.shape == log_ratio.shape == (2,)
+    assert ratio.tolist() == pytest.approx([2.0, 0.5])
+    # For element 0: ratio=2.0, clipped to 1.2, adv=1.0 -> policy_loss = -1.2
+    # value_loss = (0 - 1)^2 = 1.0 -> total = 0.5 * 1.0 - 1.2 = -0.7 * 2.0 (team preview) = -1.4
+    # For element 1: ratio=0.5, clipped to 0.8, adv=1.0 -> policy_loss = -0.5 (min of unclipped=0.5, clipped=0.8)
+    # value_loss = (1 - 1)^2 = 0.0 -> total = -0.5 (no team preview scaling)
+    assert policy[0].item() == pytest.approx(-1.2)
+    assert policy[1].item() == pytest.approx(-0.5)
+    assert total[0].item() == pytest.approx((config.value_coef * 1.0 - 1.2) * 2.0)
+    assert total[1].item() == pytest.approx(-0.5)
+
+
+def test_ppo_amp_is_cuda_only() -> None:
+    config = TrainingConfig(enable_optim=True)
+
+    assert not amp_enabled(config, torch.device("cpu"))
+    assert amp_enabled(config, torch.device("cuda"))
+    assert not amp_enabled(TrainingConfig(enable_optim=False), torch.device("cuda"))
+
+
+def test_trainer_cancellation_saves_once_before_collecting(tmp_path: Path) -> None:
+    saved = []
+
+    class Store:
+        def save_training_state(self, path, episode, policy, **kwargs):
+            saved.append((path, episode, policy, kwargs))
+
+    collector = SimpleNamespace(vector_env=SimpleNamespace(reset=lambda: None))
+    updater = SimpleNamespace(
+        optimizer=SimpleNamespace(param_groups=[{"lr": 0.0}]),
+        scaler=object(),
+    )
+    trainer = PPOTrainer(
+        policy=cast(Any, object()),
+        policy_store=cast(Any, Store()),
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        collector=cast(Any, collector),
+        updater=cast(Any, updater),
+        magnet=cast(Any, object()),
+        scheduler=cast(Any, object()),
+        training_config=TrainingConfig(
+            num_episodes=9, magnet_refresh_interval=1, ramp_up_phase=0.5
+        ),
+        cancel_requested=lambda: True,
+    )
+    trainer.run()
+    assert [(path, episode) for path, episode, _, _ in saved] == [(tmp_path / "checkpoint.pt", 0)]
+
+
+def test_trainer_saves_final_completed_episode(tmp_path: Path) -> None:
+    saved = []
+
+    class Store:
+        def save_training_state(self, path, episode, policy, **kwargs):
+            saved.append((path, episode))
+
+    collector = SimpleNamespace(vector_env=SimpleNamespace(reset=lambda: None))
+    updater = SimpleNamespace(
+        optimizer=SimpleNamespace(param_groups=[{"lr": 0.0}]),
+        scaler=object(),
+    )
+    trainer = PPOTrainer(
+        policy=cast(Any, object()),
+        policy_store=cast(Any, Store()),
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        collector=cast(Any, collector),
+        updater=cast(Any, updater),
+        magnet=cast(Any, object()),
+        scheduler=cast(Any, object()),
+        training_config=TrainingConfig(
+            num_episodes=9, magnet_refresh_interval=1, ramp_up_phase=0.5
+        ),
+    )
+
+    trainer.run(start_episode=9)
+
+    assert saved == [(tmp_path / "checkpoint.pt", 9)]
+
+
+def test_ppo_updates_all_policy_paths() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources()).to(device)
+    policy.train()
+
+    obs = StructuredObservation.empty_batch(1).to(device)
+    episode = TrajectoryBatch(
+        observations=obs,
+        actions=torch.tensor([[1, 2]], dtype=torch.long, device=device),
+        log_probs=torch.zeros(1, device=device),
+        advantages=torch.ones(1, device=device),
+        returns=torch.ones(1, device=device),
+        values=torch.zeros(1, device=device),
+        rewards=torch.zeros(1, device=device),
+        dones=torch.ones(1, device=device),
+        action_masks=torch.ones((1, 2, ACT_SIZE), dtype=torch.bool, device=device),
+        length=1,
+    )
+    config = TrainingConfig()
+    magnet = Magnet(policy)
+
+    loss, _, steps = _run_batched_ppo(
+        [episode], policy, magnet, config, device, alpha=config.magnet_alpha
+    )
+    assert steps == 1
+
+    policy.zero_grad(set_to_none=True)
+    loss.backward()
+
+    assert any(
+        p.grad is not None and torch.abs(p.grad).sum() > 0 for p in policy.encoder.parameters()
+    )
+    assert any(
+        p.grad is not None and torch.abs(p.grad).sum() > 0 for p in policy.actor.parameters()
+    )
+    assert any(
+        p.grad is not None and not torch.all(p.grad == 0) for p in policy.critic.parameters()
+    )
+
+
+def test_ppo_caches_magnet_logits_for_repeated_epochs(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
+    magnet = Magnet(policy)
+    episode = TrajectoryBatch(
+        observations=StructuredObservation.empty_batch(1),
+        actions=torch.tensor([[1, 2]], dtype=torch.long),
+        log_probs=torch.zeros(1),
+        values=torch.zeros(1),
+        rewards=torch.zeros(1),
+        dones=torch.ones(1),
+        action_masks=torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
+        returns=torch.zeros(1),
+        advantages=torch.ones(1),
+        length=1,
+    )
+
+    calls = 0
+    original_evaluate = magnet.policy.evaluate
+
+    def counted_evaluate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(magnet.policy, "evaluate", counted_evaluate)
+    cache: dict[int, torch.Tensor] = {}
+    config = TrainingConfig(enable_optim=False)
+
+    _run_batched_ppo(
+        [episode],
+        policy,
+        magnet,
+        config,
+        policy.device,
+        alpha=config.magnet_alpha,
+        magnet_cache=cache,
+    )
+    _run_batched_ppo(
+        [episode],
+        policy,
+        magnet,
+        config,
+        policy.device,
+        alpha=config.magnet_alpha,
+        magnet_cache=cache,
+    )
+    assert calls == 1
+    assert list(cache) == [id(episode)]
+
+
+def test_full_precision_ppo_discards_non_finite_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
+    magnet = Magnet(policy)
+    parameter = next(policy.parameters())
+    episode = TrajectoryBatch(
+        observations=StructuredObservation.empty_batch(1),
+        actions=torch.tensor([[1, 2]], dtype=torch.long),
+        log_probs=torch.zeros(1),
+        advantages=torch.ones(1),
+        returns=torch.ones(1),
+        values=torch.zeros(1),
+        rewards=torch.zeros(1),
+        dones=torch.ones(1),
+        action_masks=torch.ones((1, 2, ACT_SIZE), dtype=torch.bool),
+        length=1,
+        explained_variance=0.0,
+    )
+
+    def finite_chunk_with_bad_backward(*args, **kwargs):
+        del args, kwargs
+        zero = torch.zeros((), device=policy.device)
+        metrics = {
+            "policy_loss": zero,
+            "value_loss": zero,
+            "normalized_entropy": zero,
+            "magnet_kl": zero,
+            "kl_div": zero,
+            "clip_frac": zero,
+        }
+        return parameter.sum() * 0.0, metrics, 1
+
+    monkeypatch.setattr(ppo_module, "_run_batched_ppo", finite_chunk_with_bad_backward)
+    gradient_hook = parameter.register_hook(
+        lambda gradient: torch.full_like(gradient, float("inf"))
+    )
+    optimizer = torch.optim.SGD(policy.parameters(), lr=1.0)
+    before = {name: value.detach().clone() for name, value in policy.named_parameters()}
+
+    try:
+        result = ppo_module.ppo_update(
+            [episode],
+            policy,
+            magnet,
+            optimizer,
+            GradScaler(device="cpu", enabled=False),
+            TrainingConfig(batch_size=1, minibatch_size=1, ppo_epochs=1),
+            episode=0,
+            alpha=0.0,
+            cancel_requested=lambda: False,
         )
+    finally:
+        gradient_hook.remove()
+
+    assert result["grad_norm"] == 0.0
+    assert all(torch.equal(before[name], value) for name, value in policy.named_parameters())
 
 
-_SPEC = importlib.util.spec_from_file_location(
-    "benchmark_reducer_depth",
-    Path(__file__).parents[2] / "bench" / "benchmark_reducer_depth.py",
-)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
-BenchmarkConfig = _MODULE.BenchmarkConfig
-run_benchmark = _MODULE.run_benchmark
-
-
-def _benchmark_config(**overrides):
-    values = {
-        "device": "cpu",
-        "dtype": "float32",
-        "seed": 7,
-        "warmup": 1,
-        "iterations": 1,
-        "repeats": 2,
-        "batch_size": 1,
-        "time_steps": 1,
-        "d_model": 8,
-        "nhead": 2,
-        "dim_feedforward": 32,
-        "deep_reducer_layers": 2,
-    }
-    values.update(overrides)
-    return BenchmarkConfig(**values)
-
-
-def _small_policy(reducer_layers: int = 1):
-    return build_policy(
-        ModelConfig(8, 2, reducer_layers, 32),
-        default_runtime_resources(),
+def test_ppo_keeps_series_encoder_out_of_the_bo1_graph() -> None:
+    policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
+    observation = StructuredObservation.empty_batch(1)
+    action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+    episode = TrajectoryBatch(
+        observations=observation,
+        action_masks=action_mask,
+        actions=torch.zeros((1, 2), dtype=torch.long),
+        log_probs=torch.zeros(1),
+        values=torch.zeros(1),
+        rewards=torch.zeros(1),
+        dones=torch.ones(1),
+        length=1,
+        returns=torch.zeros(1),
+        advantages=torch.ones(1),
     )
+    loss, _, _ = _run_batched_ppo(
+        [episode],
+        policy,
+        Magnet(policy),
+        TrainingConfig(enable_optim=False),
+        policy.device,
+        alpha=0.0,
+    )
+    loss.backward()
+    assert all(parameter.grad is None for parameter in policy.series.parameters())
