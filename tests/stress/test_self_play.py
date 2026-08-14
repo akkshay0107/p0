@@ -107,6 +107,13 @@ class _SelfPlayVecEnv:
 
 @pytest.mark.stress
 def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> None:
+    """Stress test self-play rollout collection across vectorized environments.
+    
+    Verifies that:
+    1. Both player perspectives (agent 1 and agent 2) generate trajectories across all environments.
+    2. Total completed trajectory segments equal 2 perspectives * n_envs * rollout_steps.
+    3. Trajectory buffers, battle memory buffers, and series token stores are purged upon match completion.
+    """
     config = TrainingConfig(n_envs=2, rollout_steps=stress_repetitions(default=128))
     vec_env = _SelfPlayVecEnv()
     policy = _SelfPlayPolicy()
@@ -131,11 +138,13 @@ def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> Non
         series2,
     )
 
+    # Validate that both agent perspectives across both envs produced complete trajectory records
     assert len(completed) == 2 * vec_env.n_envs * config.rollout_steps
     assert [batch.length for batch in completed] == [1] * len(completed)
     assert all(
         torch.equal(batch.actions, torch.zeros((1, 2), dtype=torch.long)) for batch in completed
     )
+    # Confirm transient trajectory step counters and memory buffers are fully reset
     assert first.step_counts.tolist() == [0, 0]
     assert second.step_counts.tolist() == [0, 0]
     assert not memory1.step_counts.any()
@@ -146,8 +155,16 @@ def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> Non
 
 @pytest.mark.stress
 def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
+    """Stress test recurrent BattleMemoryBuffer window slicing, overflow handling, and env isolation.
+    
+    Verifies that:
+    1. BattleMemoryBuffer inputs() returns the latest HISTORY_WINDOW steps.
+    2. Appending beyond max_steps raises OverflowError.
+    3. Resetting a specific env slot purges only that environment's history, leaving other slots intact.
+    """
     repetitions = max(HISTORY_WINDOW, stress_repetitions(default=2048))
     buffer = BattleMemoryBuffer(2, d_model=3, max_steps=repetitions)
+    # Fill memory buffer with sequential index values across both environments
     for index in range(repetitions):
         buffer.append(torch.tensor([0, 1]), torch.full((2, 3), float(index)))
 
@@ -155,14 +172,17 @@ def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
     assert history.shape[0] == mask.shape[0] == ages.shape[0] == 2
     assert mask[0].sum().item() == mask[1].sum().item()
     assert torch.equal(history[0], history[1])
+    # The history slice must correspond strictly to the most recent HISTORY_WINDOW turns
     assert torch.equal(
         history[0, -HISTORY_WINDOW:, 0],
         torch.arange(repetitions - HISTORY_WINDOW, repetitions, dtype=torch.float32),
     )
 
+    # Exceeding allocated buffer capacity must raise an explicit OverflowError
     with pytest.raises(OverflowError, match="exceeded"):
         buffer.append(torch.tensor([0, 1]), torch.full((2, 3), float(repetitions)))
 
+    # Reset environment 0 and verify environment 1 is unaffected
     buffer.reset(0)
     empty_history, empty_mask, empty_ages = buffer.inputs(
         torch.tensor([0]), torch.device("cpu"), torch.float32
@@ -175,7 +195,14 @@ def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
 
 @pytest.mark.stress
 def test_self_play_rollout_bootstraps_truncation_and_keeps_open_series() -> None:
+    """Verify truncation bootstrapping and series memory preservation across incomplete match series.
+    
+    When an environment experiences mid-battle truncation (done_status=2), value bootstrapping
+    must be computed from terminal observations. If a series is still ongoing (series_complete=False),
+    its token store memory must be preserved rather than cleared.
+    """
     config = TrainingConfig(n_envs=2, rollout_steps=1)
+    # Env 0: truncated (2) with incomplete series (False); Env 1: terminated (1) with complete series (True)
     vec_env = _SelfPlayVecEnv(done_status=(2, 1), series_complete=(False, True))
     policy = _SelfPlayPolicy()
     completed: list[Any] = []
@@ -199,7 +226,10 @@ def test_self_play_rollout_bootstraps_truncation_and_keeps_open_series() -> None
         series2,
     )
 
+    # Policy act called once for active turn and once for terminal observation value bootstrap
     assert policy.calls == 2
+    # Verify bootstrap values for completed trajectory batches: non-zero for truncated env
     assert [batch.bootstrap_value for batch in completed] == [0.0, 1.0, 0.0, 0.0]
+    # Series 0 is incomplete, so its token store entries must be retained for next game in the series
     assert set(series1._store) == {"series-0"}
     assert set(series2._store) == {"series-0"}

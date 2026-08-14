@@ -16,12 +16,16 @@ from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 
 @pytest.fixture(scope="function")
 def showdown_server():
-    """Start live stress tests only when the checked-out server is runnable."""
+    """Start live stress tests only when the checked-out server is runnable.
+    
+    Dynamically binds an unused loopback port to prevent port collisions between
+    concurrent test workers, launching an isolated Showdown server instance for the test lifecycle.
+    """
     root = Path(DEFAULT_PATHS.showdown_root)
     if not (root / "build").is_file():
         pytest.skip("built pokemon-showdown runtime not available")
 
-    # Allocate per-test so parallel stress jobs cannot cross-connect.
+    # Allocate a fresh ephemeral port per-test so parallel stress jobs cannot cross-connect
     port = allocate_loopback_ports(1)[0]
     server_configuration = ServerConfiguration(
         websocket_url=f"ws://localhost:{port}/showdown/websocket",
@@ -32,6 +36,11 @@ def showdown_server():
 
 
 def _stress_devices() -> tuple[torch.device, ...]:
+    """Parse requested stress test compute devices from P0_STRESS_DEVICES.
+    
+    Filters out CUDA when host hardware lacks GPU support, deduplicates entries,
+    and falls back to CPU.
+    """
     requested = tuple(
         value.strip().lower()
         for value in os.getenv("P0_STRESS_DEVICES", "cpu,cuda").split(",")
@@ -52,13 +61,13 @@ def _stress_devices() -> tuple[torch.device, ...]:
 
 @pytest.fixture(params=_stress_devices(), ids=lambda device: device.type)
 def stress_device(request: pytest.FixtureRequest) -> torch.device:
-    """Run device-sensitive tests on CPU and on CUDA when it is available."""
+    """Parametrize device-sensitive stress tests across CPU and available CUDA accelerators."""
     return request.param
 
 
 @pytest.fixture
 def stress_policy(stress_device: torch.device):
-    """Build a small policy so scaling tests remain practical on CPU-only hosts."""
+    """Build a lightweight Transformer policy for fast multi-step stress workloads on CPU or GPU."""
     policy = build_policy(
         ModelConfig(d_model=32, nhead=2, reducer_layers=1, dim_feedforward=128),
         default_runtime_resources(),

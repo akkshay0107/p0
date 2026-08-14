@@ -19,6 +19,14 @@ def _small_policy() -> PolicyNet:
 
 
 def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path: Path) -> None:
+    """Verify that checkpoint saving captures required schema metadata and strips immutable runtime statics.
+    
+    Verifies that:
+    1. Saved artifact contains global contract SHA-256 and configuration envelopes.
+    2. Static lookup tables (species stats, move stats, mechanic tags) are omitted from state_dict
+       to avoid checkpoint bloat and decouple model weights from static dex data.
+    3. Loading restores matching policy architecture and training step count.
+    """
     path = tmp_path / "policy.pt"
     original = _small_policy()
     DEFAULT_POLICY_STORE.save_training_state(path, 7, original)
@@ -43,6 +51,7 @@ def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path: Pa
     )
     assert DEFAULT_POLICY_STORE.load_policy(path, "cpu").d_model == 32
     state = torch.load(path, weights_only=True)["model_state_dict"]
+    # Verify runtime static buffers are excluded from serialized model state dict
     assert not any(
         name.endswith(
             (
@@ -57,6 +66,7 @@ def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path: Pa
 
 
 def test_series_policy_checkpoint_round_trip(tmp_path: Path) -> None:
+    """Verify that serialized policy restores series encoder weights producing bitwise identical series tokens."""
     path = tmp_path / "policy.pt"
     config = ModelConfig(32, 4, 1, 128)
     original = build_policy(config, default_runtime_resources())
@@ -74,6 +84,7 @@ def test_series_policy_checkpoint_round_trip(tmp_path: Path) -> None:
 
 
 def test_deep_checkpoint_round_trip_is_deterministic(tmp_path: Path) -> None:
+    """Verify deep multi-layer transformer policies restore all layer weights deterministically without alias sharing."""
     path = tmp_path / "policy.pt"
     config = ModelConfig(
         d_model=32,
@@ -88,6 +99,7 @@ def test_deep_checkpoint_round_trip_is_deterministic(tmp_path: Path) -> None:
 
     assert restored.config == config
     assert len(restored.actor.reducer.encoder.layers) == 3
+    # Ensure layers are distinct module instances rather than shared references
     assert restored.actor.reducer.encoder.layers[0] is not restored.actor.reducer.encoder.layers[1]
     for name, parameter in original.state_dict().items():
         torch.testing.assert_close(parameter, restored.state_dict()[name])
@@ -104,6 +116,7 @@ def test_deep_checkpoint_round_trip_is_deterministic(tmp_path: Path) -> None:
 def test_checkpoint_rejects_malformed_model_configuration(
     tmp_path: Path, mutate: Any, message: str
 ) -> None:
+    """Verify that CheckpointStore strictly validates model configuration schema and rejects malformed configs."""
     path = tmp_path / "policy.pt"
     DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
     artifact = torch.load(path, weights_only=False)
@@ -115,6 +128,7 @@ def test_checkpoint_rejects_malformed_model_configuration(
 
 
 def test_training_checkpoint_rejects_state_config_mismatch(tmp_path: Path) -> None:
+    """Verify load_training_state detects architecture mismatch between checkpoint and target model instance."""
     path = tmp_path / "policy.pt"
     DEFAULT_POLICY_STORE.save_training_state(path, 1, _small_policy())
     artifact = torch.load(path, weights_only=False)
@@ -129,26 +143,31 @@ def test_training_checkpoint_rejects_state_config_mismatch(tmp_path: Path) -> No
 def test_atomic_checkpoint_failure_preserves_previous_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Verify that checkpoint writes are atomic; if replace fails, previous file content is left intact."""
     path = tmp_path / "policy.pt"
     path.write_bytes(b"previous")
 
+    # Inject failure during atomic filesystem rename/replace step
     def fail_replace(source: Any, destination: Any) -> None:
         raise OSError("injected replace failure")
 
     monkeypatch.setattr("p0.persistence.os.replace", fail_replace)
     with pytest.raises(OSError, match="injected"):
         DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
+    # The original file must remain untouched
     assert path.read_bytes() == b"previous"
 
 
 def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance(
     tmp_path: Path,
 ) -> None:
+    """Verify that full training checkpoints restore optimizer states, EMA Magnet weights, and step counts."""
     path = tmp_path / "training.pt"
     store = CheckpointStore()
     policy = build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
     optimizer = torch.optim.Adam(policy.parameters(), lr=0.001)
     magnet = Magnet(policy)
+    # Perform a dummy training step to populate Adam momentum and variance state buffers
     loss = torch.stack(tuple(parameter.square().mean() for parameter in policy.parameters())).sum()
     loss.backward()
     optimizer.step()
@@ -179,6 +198,7 @@ def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance
         require_training_state=True,
     )
     assert episode == 17
+    # Confirm learning rate and Adam moment tensors were restored from checkpoint
     assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
     assert restored_optimizer.state
     for name, parameter in restored.state_dict().items():
@@ -188,6 +208,7 @@ def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance
 
 
 def test_checkpoint_rejects_global_contract_tampering(tmp_path: Path) -> None:
+    """Verify checkpoint loading rejects files whose global contract checksum has been altered."""
     path = tmp_path / "policy.pt"
     store = CheckpointStore()
     store.save_policy(path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources()))
@@ -199,6 +220,7 @@ def test_checkpoint_rejects_global_contract_tampering(tmp_path: Path) -> None:
 
 
 def test_checkpoint_rejects_weights_only_resume_when_training_is_required(tmp_path: Path) -> None:
+    """Verify that requiring training state rejects weights-only inference checkpoints."""
     path = tmp_path / "policy.pt"
     store = CheckpointStore()
     store.save_policy(path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources()))

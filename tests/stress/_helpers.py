@@ -57,6 +57,11 @@ def stress_dex_catalog() -> StressDexCatalog:
 
 
 def _random_stat_points(rng: random.Random) -> StatPoints:
+    """Sample random EV point allocations respecting the maximum total EV budget constraint.
+    
+    Generates 6 stat points in [0, 32] such that their sum does not exceed 66 total points
+    (representing the 508 EV cap in Showdown VGC / Singles).
+    """
     while True:
         values = [rng.randrange(33) for _ in range(6)]
         if sum(values) <= 66:
@@ -71,6 +76,7 @@ def _random_stat_points(rng: random.Random) -> StatPoints:
 
 
 def _random_team_members(rng: random.Random) -> tuple[TeamMember, ...]:
+    """Sample 6 valid distinct team members from the format dex with legal moves, abilities, and items."""
     catalog = stress_dex_catalog()
     species = rng.sample(catalog.species, 6)
     items = rng.sample(catalog.items, 6)
@@ -115,12 +121,17 @@ def stress_random_replay_teams(
 
 
 def stress_series_id(parent: str, players: tuple[str, str] = ("Alice", "Bob")) -> str:
-    """Calculate the grouping identity used by the replay compiler."""
+    """Calculate the deterministic grouping identity used by the replay compiler.
+    
+    Hashes the format ID, parent series ID, and casefolded player names to produce
+    a 24-character hexadecimal series identifier.
+    """
     value = "\n".join((FORMAT.bo3_format, parent, *(player.casefold() for player in players)))
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
 def _showteam_json(team: tuple[TeamMember, ...]) -> str:
+    """Serialize team members to Showdown '|showteam|' JSON format."""
     return json.dumps(
         [
             {
@@ -145,7 +156,11 @@ def stress_random_replay_payload(
     winner: str | None = None,
     teams: tuple[tuple[TeamMember, ...], tuple[TeamMember, ...]] | None = None,
 ) -> dict[str, Any]:
-    """Build a replay-shaped payload with random values from the active legal dex."""
+    """Build a replay-shaped payload with random values from the active legal dex.
+    
+    Emits simulated Showdown protocol lines including teampreview, showteam headers,
+    lead switches, double battle moves, and match conclusion.
+    """
     if teams is None:
         teams = stress_random_replay_teams(rng)
     first_team, second_team = teams
@@ -213,12 +228,17 @@ def stress_random_bo3_payloads(
     replay_prefix: str,
     series_prefix: str,
 ) -> tuple[dict[str, Any], ...]:
-    """Build two games per series while preserving each series' team roster."""
+    """Build paired games (game 1 & game 2) per series while preserving each series' team roster.
+    
+    Ensures that both games in a Best-of-3 series share the same team compositions across
+    players, mimicking actual tournament series conditions for replay grouping tests.
+    """
     if series_count < 1:
         raise ValueError(f"series_count must be positive, got {series_count}")
 
     payloads: list[dict[str, Any]] = []
     for index in range(series_count):
+        # Sample shared teams for this BO3 series
         teams = stress_random_replay_teams(rng)
         series_id = f"{series_prefix}-{index}"
         payloads.extend(
@@ -244,14 +264,17 @@ def stress_random_bo3_payloads(
 
 
 def _random_entity(rng: random.Random) -> str:
+    """Generate a random battle slot entity identifier (e.g. 'p1a: Flutter Mane')."""
     return f"{rng.choice(('p1a', 'p1b', 'p2a', 'p2b'))}: {rng.choice(stress_dex_catalog().species)}"
 
 
 def _random_target(rng: random.Random) -> str:
+    """Generate a random move target entity identifier."""
     return _random_entity(rng)
 
 
 def _random_hp_status(rng: random.Random) -> str:
+    """Generate a random Showdown HP status string with optional status condition (e.g. '75/100 par')."""
     value = rng.randrange(1, 101)
     suffix = rng.choice(("", "g", "y"))
     return f"{value}/100{suffix}"
@@ -276,6 +299,7 @@ def _random_raw_event(case: str, rng: random.Random) -> RawBattleEvent:
     field = rng.choice(("Trick Room", "Electric Terrain", "Grassy Terrain"))
     volatile = rng.choice(("Protect", "Substitute", "Destiny Bond"))
 
+    # Map each parser branch to its corresponding raw protocol event tuple
     cases: dict[str, RawBattleEvent] = {
         "move": RawBattleEvent(("", "move", entity, move, target)),
         "unknown_move": RawBattleEvent(("", "move", entity, "not-a-real-move", target)),

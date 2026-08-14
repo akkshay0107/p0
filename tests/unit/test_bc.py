@@ -36,6 +36,13 @@ from tests.unit.test_replay import _sample_replay_payload as _payload
 
 
 def test_exact_and_partial_losses_match_probability_definitions() -> None:
+    """Verify behavior cloning objective calculations for EXACT, PARTIAL, and UNKNOWN label kinds.
+    
+    Mathematical Formulation:
+    - EXACT label: Standard Negative Log Likelihood: NLL = -log(P(action))
+    - PARTIAL label: Marginal Negative Log Likelihood over candidate set: NLL = -log(sum_{c in C} P(c))
+    - UNKNOWN label: loss_mask == 0, excluded from loss (loss == 0.0)
+    """
     log_probs = torch.tensor([math.log(0.25), math.log(0.5), math.log(0.25)])
     offsets = torch.tensor([0, 1, 3, 3], dtype=torch.long)
     labels = torch.tensor([int(LabelKind.EXACT), int(LabelKind.PARTIAL), int(LabelKind.UNKNOWN)])
@@ -44,6 +51,7 @@ def test_exact_and_partial_losses_match_probability_definitions() -> None:
     result = compute_bc_objective(log_probs, offsets, labels, loss_mask)
 
     expected_exact = -math.log(0.25)
+    # Partial candidate set contains probs 0.5 and 0.25 -> sum = 0.75
     expected_partial = -math.log(0.75)
     assert result.exact_count == 1 and result.partial_count == 1
     assert result.labeled_count == 2
@@ -55,6 +63,7 @@ def test_exact_and_partial_losses_match_probability_definitions() -> None:
 
 
 def test_fractional_loss_weights_do_not_change_labeled_counts() -> None:
+    """Verify fractional sample weights scale total loss without distorting discrete labeled count metrics."""
     result = compute_bc_objective(
         torch.log(torch.tensor([0.25, 0.75])),
         torch.tensor([0, 1, 2], dtype=torch.long),
@@ -68,6 +77,7 @@ def test_fractional_loss_weights_do_not_change_labeled_counts() -> None:
 
 
 def test_unknown_steps_have_zero_loss_and_preserve_boundaries() -> None:
+    """Verify UNKNOWN labels produce zero loss and empty gradients without breaking backprop graph."""
     log_probs = torch.empty(0, requires_grad=True)
     offsets = torch.tensor([0, 0, 0], dtype=torch.long)
     labels = torch.tensor([int(LabelKind.UNKNOWN), int(LabelKind.UNKNOWN)])
@@ -80,6 +90,7 @@ def test_unknown_steps_have_zero_loss_and_preserve_boundaries() -> None:
 
 
 def test_partial_loss_is_candidate_order_invariant() -> None:
+    """Verify marginal log-sum-exp over candidate actions is invariant to internal candidate permutation."""
     first = compute_bc_objective(
         torch.log(torch.tensor([0.2, 0.3, 0.5])),
         torch.tensor([0, 3], dtype=torch.long),
@@ -96,6 +107,7 @@ def test_partial_loss_is_candidate_order_invariant() -> None:
 
 
 def test_candidate_objective_preserves_gradients() -> None:
+    """Verify backward gradient flow through marginal candidate loss calculations."""
     probabilities = torch.tensor([0.2, 0.3, 0.5], requires_grad=True)
     log_probs = probabilities.log()
     result = compute_bc_objective(
@@ -119,6 +131,7 @@ def test_candidate_objective_preserves_gradients() -> None:
     ],
 )
 def test_invalid_label_and_candidate_shapes_are_rejected(labels, offsets, mask, message) -> None:
+    """Verify compute_bc_objective detects candidate count and label type mismatches."""
     with pytest.raises(ValueError, match=message):
         compute_bc_objective(
             torch.full((offsets[-1],), math.log(0.5)),
@@ -129,6 +142,7 @@ def test_invalid_label_and_candidate_shapes_are_rejected(labels, offsets, mask, 
 
 
 def test_team_preview_candidates_expand_to_four_orientations() -> None:
+    """Verify _expand_team_preview_orbits expands 1 team preview decision into 4 symmetrical lead permutations."""
     first = encode_team_pair(0, 1)
     second = encode_team_pair(2, 3)
     values, offsets = _expand_team_preview_orbits(
@@ -137,6 +151,7 @@ def test_team_preview_candidates_expand_to_four_orientations() -> None:
         torch.tensor([True, False]),
     )
 
+    # First decision expands into 4 combinations (lead 1 & lead 2 symmetric permutations); second stays 1
     assert offsets.tolist() == [0, 4, 5]
     assert {tuple(value) for value in values[:4].tolist()} == {
         (first, second),
@@ -155,6 +170,7 @@ def _chunk(
     game_number: int = 1,
     is_series_end: bool = False,
 ) -> ReplayGameChunk:
+    """Helper creating a synthetic ReplayGameChunk for BC trainer unit tests."""
     length = len(label_kind)
     observations = StructuredObservation.empty_batch(length)
     action_mask = torch.zeros((length, 2, FORMAT.action_size), dtype=torch.bool)
@@ -183,6 +199,7 @@ def _chunk(
 
 
 def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
+    """Helper building a minimal BCTrainer instance over a single game chunk."""
     policy = build_policy(
         ModelConfig(64, 4, 1, 128),
         default_runtime_resources(),
@@ -217,6 +234,7 @@ def _count_reducer_passes(trainer: BCTrainer, monkeypatch) -> list[int]:
 
 
 def test_replay_to_series_bc_checkpoint_smoke(tmp_path: Path) -> None:
+    """End-to-end smoke test: replay JSON compilation -> tensor shards -> BC training -> checkpoint save/load."""
     result = compile_payloads((_payload("game-1"), _payload("game-2")))
     built = write_tensor_shards(
         result,
@@ -267,6 +285,7 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path: Path) -> None:
 
 
 def test_training_and_eval_reduce_memory_window_once_per_batch(monkeypatch) -> None:
+    """Verify reducer pass counts match batch iteration counts for both training and evaluation passes."""
     chunk = _chunk(
         [int(LabelKind.EXACT), int(LabelKind.EXACT)],
         [(7, 8), (7, 8)],
@@ -275,15 +294,18 @@ def test_training_and_eval_reduce_memory_window_once_per_batch(monkeypatch) -> N
     trainer_train = _trainer(chunk, minibatch_size=1)
     passes_train = _count_reducer_passes(trainer_train, monkeypatch)
     trainer_train.train()
+    # 2 decisions with minibatch_size=1 -> 2 forward reduction passes
     assert passes_train[0] == 2
 
     trainer_eval = _trainer(chunk, minibatch_size=2)
     passes_eval = _count_reducer_passes(trainer_eval, monkeypatch)
     trainer_eval.evaluate()
+    # 2 decisions with minibatch_size=2 -> 1 forward reduction pass
     assert passes_eval[0] == 1
 
 
 def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
+    """Verify BCTrainer updates model parameters on game chunks and records valid training loss and decision accounting."""
     chunk = _chunk(
         [int(LabelKind.EXACT), int(LabelKind.EXACT)],
         [(7, 8), (7, 8)],
@@ -303,6 +325,7 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
     assert metrics["decisions_per_update"] == 2
     assert metrics["games_per_update"] == 1
     assert torch.isfinite(torch.tensor(metrics["loss"]))
+    # Verify policy parameters were modified by optimizer step
     assert any(
         not torch.equal(before[name], parameter)
         for name, parameter in trainer.policy.named_parameters()
@@ -310,6 +333,7 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
 
 
 def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
+    """Verify UNKNOWN decisions are excluded from labeled metrics while preserving full observation history for subsequent turns."""
     chunk = _chunk(
         [int(LabelKind.UNKNOWN), int(LabelKind.EXACT)],
         [(7, 8)],
@@ -322,6 +346,7 @@ def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
 
 
 def test_unknown_only_game_does_not_report_an_optimizer_update() -> None:
+    """Verify a game consisting exclusively of UNKNOWN decisions performs no parameter updates."""
     chunk = _chunk(
         [int(LabelKind.UNKNOWN), int(LabelKind.UNKNOWN)],
         [],
@@ -337,6 +362,7 @@ def test_unknown_only_game_does_not_report_an_optimizer_update() -> None:
 
 
 def test_game_boundary_accumulation_uses_total_loss_weight() -> None:
+    """Verify gradient accumulation across mini-batches scales identically to full-game single-batch optimization."""
     chunk = _chunk(
         [int(LabelKind.EXACT)] * 4,
         [(7, 8)] * 4,
@@ -363,6 +389,7 @@ def test_game_boundary_accumulation_uses_total_loss_weight() -> None:
 
 
 def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
+    """Verify collator truncates intra-game memory history to HISTORY_WINDOW=48 past tokens per decision."""
     length = 52
     chunk = _chunk(
         [int(LabelKind.EXACT)] * length,
@@ -384,6 +411,7 @@ def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
 
 
 def test_collated_context_is_compact_and_never_crosses_game_boundaries() -> None:
+    """Verify batches packed with multiple games preserve strict memory isolation across series/game boundaries."""
     first = _chunk(
         [int(LabelKind.EXACT), int(LabelKind.EXACT)],
         [(7, 8), (7, 8)],
@@ -400,6 +428,7 @@ def test_collated_context_is_compact_and_never_crosses_game_boundaries() -> None
 
     assert all(isinstance(window, BCGameWindow) for window in batch.windows)
     assert batch.target_indices.tolist() == [0, 1, 2, 3]
+    # Decision 2 (start of second game) must not attend to history from first game
     assert not torch.any(batch.history_mask[2])
     assert batch.history_indices[3, -1] == 2
     assert batch.history_mask[3, -1]
@@ -408,6 +437,7 @@ def test_collated_context_is_compact_and_never_crosses_game_boundaries() -> None
 
 
 def test_model_inputs_encode_all_game_windows_once() -> None:
+    """Verify _prepare_model_inputs invokes observation encoder exactly once across all decisions in the batch."""
     first = _chunk(
         [int(LabelKind.EXACT), int(LabelKind.EXACT)],
         [(7, 8), (7, 8)],
@@ -437,6 +467,7 @@ def test_model_inputs_encode_all_game_windows_once() -> None:
 
 
 def test_continued_chunk_matches_per_window_reference_inputs() -> None:
+    """Verify continued chunk tensor slices and history indices match manual reference sliding window slices."""
     length = 100
     game = _chunk(
         [int(LabelKind.EXACT)] * length,
@@ -470,6 +501,7 @@ def test_continued_chunk_matches_per_window_reference_inputs() -> None:
 
 
 def test_completed_game_sets_terminal_window_flag() -> None:
+    """Verify is_game_end flag is set on the terminal batch window of a completed game."""
     length = 100
     game = _chunk(
         [int(LabelKind.EXACT)] * length,
@@ -485,6 +517,7 @@ def test_completed_game_sets_terminal_window_flag() -> None:
 
 
 def test_raw_game_history_caches_each_target_token_once() -> None:
+    """Verify resample_single_game is invoked once per completed game to generate inter-game summary tokens."""
     length = 100
     first = _chunk(
         [int(LabelKind.EXACT)] * length,
@@ -515,6 +548,7 @@ def test_raw_game_history_caches_each_target_token_once() -> None:
 
 
 def test_ordered_history_allows_skipped_game_numbers() -> None:
+    """Verify series history handles skipped game numbers (e.g. game 1 then game 3)."""
     first = _chunk(
         [int(LabelKind.EXACT)],
         [(7, 8)],
@@ -539,6 +573,7 @@ def test_ordered_history_allows_skipped_game_numbers() -> None:
 
 
 def test_ordered_history_keeps_interleaved_series_independent() -> None:
+    """Verify series history buffers keep state strictly partitioned across distinct interleaved series IDs."""
     first_a = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1], game_number=1)
     first_b = replace(
         first_a,
@@ -572,6 +607,7 @@ def test_ordered_history_keeps_interleaved_series_independent() -> None:
 
 
 def test_ordered_history_rejects_repeated_or_decreasing_games() -> None:
+    """Verify series tracking raises ValueError if game numbers within a perspective series are non-increasing."""
     for game_numbers in [(2, 2), (2, 1)]:
         first = _chunk(
             [int(LabelKind.EXACT)],
@@ -594,6 +630,7 @@ def test_ordered_history_rejects_repeated_or_decreasing_games() -> None:
 
 
 def test_ordered_history_rejects_data_after_series_end() -> None:
+    """Verify series tracking raises ValueError if additional chunks arrive after an is_series_end chunk."""
     ended = _chunk(
         [int(LabelKind.EXACT)],
         [(7, 8)],
@@ -615,6 +652,7 @@ def test_ordered_history_rejects_data_after_series_end() -> None:
 
 
 def test_ordered_history_tracks_an_incomplete_final_game() -> None:
+    """Verify series history records partial games when the chunk does not complete the battle."""
     length = 100
     game = _chunk(
         [int(LabelKind.EXACT)] * length,
@@ -631,6 +669,7 @@ def test_ordered_history_tracks_an_incomplete_final_game() -> None:
 
 
 def test_same_batch_next_game_receives_differentiable_series_context() -> None:
+    """Verify that within the same batch, subsequent games receive differentiable series summary tokens with gradient tracking."""
     first = _chunk(
         [int(LabelKind.EXACT)] * 2,
         [(7, 8)] * 2,
@@ -657,6 +696,7 @@ def test_same_batch_next_game_receives_differentiable_series_context() -> None:
 
 
 def test_cross_batch_series_history_truncates_encoder_gradients() -> None:
+    """Verify that across distinct batch boundaries, series history tokens are detached (truncated backprop through time)."""
     first = _chunk(
         [int(LabelKind.EXACT)] * 2,
         [(7, 8)] * 2,
@@ -685,10 +725,12 @@ def test_cross_batch_series_history_truncates_encoder_gradients() -> None:
     second_prepared = trainer._prepare_model_inputs(second_batch)
     second_prepared.memory.series_tokens.sum().backward()
 
+    # Gradients should not propagate into previous batch tokens
     assert first_tokens.grad is None
 
 
 def test_bc_loss_trains_series_resampler() -> None:
+    """Verify BC loss backpropagates into series resampler parameters when multi-game series data is trained."""
     first = _chunk(
         [int(LabelKind.EXACT)] * 2,
         [(7, 8)] * 2,
@@ -724,6 +766,7 @@ def test_bc_loss_trains_series_resampler() -> None:
 
 
 def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
+    """Verify BCTrainer rejects single-pass generators/iterators when multiple training epochs are requested."""
     chunk = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1])
     trainer = _trainer(chunk)
     trainer.dataset = iter((chunk,))
@@ -734,6 +777,7 @@ def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
 
 
 def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:
+    """Verify collate_bc_batches packs multiple games up to minibatch budget and rebases candidate offsets to 0."""
     first = _chunk(
         [int(LabelKind.UNKNOWN), int(LabelKind.EXACT), int(LabelKind.EXACT)],
         [(7, 8), (7, 8)],
@@ -755,6 +799,7 @@ def test_collator_fills_budget_across_games_and_rebases_candidates() -> None:
 
 
 def test_evaluation_reports_legality_diagnostics() -> None:
+    """Verify evaluate() computes illegal probability mass and counts decisions with unproven legality gates."""
     game = _chunk([int(LabelKind.EXACT)] * 2, [(7, 8), (7, 8)], [0, 1, 2])
     gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)
     game.observations.numerical[1, TOKEN_IDX_ALLY_SIDE, gates] = 1.0
@@ -773,6 +818,7 @@ def test_evaluation_reports_legality_diagnostics() -> None:
 
 
 def test_validation_is_deterministic_inference_only_and_reports_all_counts() -> None:
+    """Verify evaluate() is deterministic, does not modify policy parameters, and breaks down metrics by decision type and confidence."""
     game = _chunk(
         [int(LabelKind.UNKNOWN), int(LabelKind.EXACT), int(LabelKind.PARTIAL)],
         [(7, 8), (7, 8), (9, 10)],
@@ -825,6 +871,7 @@ def test_validation_is_deterministic_inference_only_and_reports_all_counts() -> 
 def test_bc_training_state_cannot_resume_ppo_but_policy_weights_can_transfer(
     tmp_path: Path,
 ) -> None:
+    """Verify trainer kind safety: BC checkpoint cannot resume PPO training state directly, but policy weights can transfer."""
     policy = build_policy(
         ModelConfig(d_model=64, nhead=4, reducer_layers=1, dim_feedforward=128),
         default_runtime_resources(),

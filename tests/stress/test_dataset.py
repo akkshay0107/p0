@@ -56,8 +56,15 @@ def _identity_rows(loader: DataLoader) -> list[tuple[Any, ...]]:
 def test_dataset_workers_yield_each_random_perspective_once(
     tmp_path: Path, num_workers: int
 ) -> None:
+    """Verify DataLoader multiprocess sharding yields every series perspective exactly once without duplicates.
+    
+    Each compiled game produces two distinct perspective chunks (player 0 and player 1).
+    When distributing workload across 0, 1, 2, or 4 worker processes, the union of all
+    yielded items must match the full set of (series_id, game_number, player, canonical_player) tuples.
+    """
     count = stress_count("P0_STRESS_DATASET_REPLAYS", 128)
     built = _build_dataset(tmp_path, count)
+    # Expected set contains both player 0 and player 1 perspectives for every game
     expected = {
         (stress_series_id(f"dataset-series-{index}"), 1, player, player)
         for index in range(count)
@@ -75,11 +82,17 @@ def test_dataset_workers_yield_each_random_perspective_once(
     )
     observed = set(loader)
 
+    # Confirm worker sharding partition is lossless and free of duplicate chunks
     assert observed == expected
 
 
 @pytest.mark.stress
 def test_dataset_prefetch_and_repeated_iteration_are_stable(tmp_path) -> None:
+    """Verify that multi-worker prefetching with persistent workers produces consistent epoch iterations.
+    
+    Ensures that background prefetch buffers and persistent worker worker-loop state
+    do not cause order corruption, missed elements, or memory leakage across repeated dataset epochs.
+    """
     built = _build_dataset(tmp_path, stress_count("P0_STRESS_DATASET_PREFETCH_REPLAYS", 64))
     loader = DataLoader(
         LazyReplayDataset(built.manifest_path, verify_hashes=True),
@@ -93,14 +106,21 @@ def test_dataset_prefetch_and_repeated_iteration_are_stable(tmp_path) -> None:
 
     expected = _identity_rows(loader)
     assert expected
+    # Verify every subsequent epoch matches the exact sequence of the initial epoch pass
     for _ in range(stress_count("P0_STRESS_DATASET_ITERATIONS", 8)):
         assert _identity_rows(loader) == expected
 
 
 @pytest.mark.stress
 def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_path) -> None:
+    """Verify that SeriesSplitManifest isolates train and test splits at the series level without leakage.
+    
+    Replays must be partitioned strictly by entire match series rather than individual games or
+    perspectives, preventing data leakage where one player's view or game from a series leaks into test.
+    """
     series_count = stress_count("P0_STRESS_DATASET_SPLIT_SERIES", 64)
     rng = stress_rng()
+    # Construct two disjoint groups of series: one intended for training, one for evaluation
     payloads = stress_random_replay_payloads(
         rng,
         series_count,
@@ -113,6 +133,7 @@ def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_pat
         series_prefix="test-series",
     )
     built = _build_dataset_from_payloads(tmp_path, payloads)
+    # Define explicit series partition manifest mapping series IDs to "train" vs "test"
     split = SeriesSplitManifest(
         global_contract_sha256=built.manifest.global_contract_sha256,
         seed=7,
@@ -125,11 +146,13 @@ def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_pat
 
     train = list(LazyReplayDataset(built.manifest_path, split="train", split_manifest=split))
     test = list(LazyReplayDataset(built.manifest_path, split="test", split_manifest=split))
+    # Validate that train split contains both player 0 and player 1 perspectives of every train series
     assert {(chunk.series_id, chunk.player) for chunk in train} == {
         (stress_series_id(f"train-series-{index}"), player)
         for index in range(series_count)
         for player in (0, 1)
     }
+    # Validate that test split contains both player perspectives of test series and zero train series
     assert {(chunk.series_id, chunk.player) for chunk in test} == {
         (stress_series_id(f"test-series-{index}"), player)
         for index in range(series_count)
@@ -139,6 +162,11 @@ def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_pat
 
 @pytest.mark.stress
 def test_dataset_marks_the_last_game_of_a_series_explicitly(tmp_path) -> None:
+    """Verify that LazyReplayDataset sets `is_series_end` only on the terminal game of a multi-game series.
+    
+    In a Best-of-3 series, game 1 must have is_series_end=False to signal recurrent memory persistence,
+    while game 2 must have is_series_end=True to trigger recurrent state truncation/reset.
+    """
     series_count = stress_count("P0_STRESS_DATASET_BO3_SERIES", 64)
     rng = stress_rng()
     payloads = stress_random_bo3_payloads(
@@ -149,6 +177,7 @@ def test_dataset_marks_the_last_game_of_a_series_explicitly(tmp_path) -> None:
     )
     built = _build_dataset_from_payloads(tmp_path, payloads)
     chunks = list(LazyReplayDataset(built.manifest_path, verify_hashes=True))
+    # Group observations by series ID to inspect the sequence of game numbers and is_series_end flags
     observed = {}
     for chunk in chunks:
         observed.setdefault(chunk.series_id, []).append(
@@ -157,6 +186,7 @@ def test_dataset_marks_the_last_game_of_a_series_explicitly(tmp_path) -> None:
     assert set(observed) == {
         stress_series_id(f"bo3-series-{index}") for index in range(series_count)
     }
+    # For every BO3 series, games 1 must be non-terminal (False) and games 2 must be terminal (True) for both players
     assert all(
         rows == [(1, 0, False), (1, 1, False), (2, 0, True), (2, 1, True)]
         for rows in observed.values()

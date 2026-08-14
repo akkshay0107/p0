@@ -57,11 +57,13 @@ def write_config(tmp_path: Path, contents: str) -> Path:
 
 
 def test_load_config_requires_file(tmp_path: Path) -> None:
+    """Verify load_config raises FileNotFoundError when the specified config file does not exist."""
     with pytest.raises(FileNotFoundError, match="Configuration file not found"):
         load_config(tmp_path / "missing.yaml")
 
 
 def test_load_config_applies_partial_yaml_to_source_defaults(tmp_path: Path) -> None:
+    """Verify that partial YAML overrides selectively update target configuration sections while retaining default values."""
     config = load_config(write_config(tmp_path, "training:\n  n_envs: 8\n  magnet_alpha: 0.05\n"))
 
     assert isinstance(config, GlobalConfig)
@@ -109,11 +111,13 @@ def test_load_config_applies_partial_yaml_to_source_defaults(tmp_path: Path) -> 
 def test_load_config_rejects_invalid_contracts_with_specific_errors(
     tmp_path: Path, label: str, contents: str, message: str
 ) -> None:
+    """Verify load_config detects and rejects schema violations with informative error messages."""
     with pytest.raises(ValueError, match=message):
         load_config(write_config(tmp_path, contents))
 
 
 def test_config_is_immutable(tmp_path: Path) -> None:
+    """Verify GlobalConfig dataclasses are frozen to prevent accidental in-place mutation during execution."""
     config = load_config(write_config(tmp_path, "{}\n"))
 
     with pytest.raises(FrozenInstanceError):
@@ -123,6 +127,7 @@ def test_config_is_immutable(tmp_path: Path) -> None:
 
 
 def test_paths_and_team_source_paths_resolve_once_from_project_root(tmp_path: Path) -> None:
+    """Verify relative paths configured in YAML resolve deterministically against the project root directory."""
     config = load_config(
         write_config(
             tmp_path,
@@ -145,6 +150,7 @@ environment:
 
 
 def test_model_config_is_checkpoint_local_and_validated() -> None:
+    """Verify ModelConfig enforces divisibility requirements (d_model % nhead == 0)."""
     config = ModelConfig.baseline()
     assert config.d_model == 512
     assert config.dim_feedforward == 2048
@@ -166,6 +172,7 @@ def _resources(
 
 
 def test_runtime_manifest_round_trips_one_readable_contract(tmp_path: Path) -> None:
+    """Verify RuntimeManifest serializes and deserializes losslessly while preserving ABI invariants and contract hashes."""
     vocab, dex = _resources(tmp_path)
     manifest = current_manifest(vocab_path=vocab, dex_path=dex)
     restored = RuntimeManifest.from_dict(json.loads(json.dumps(manifest.to_dict())))
@@ -178,6 +185,7 @@ def test_runtime_manifest_round_trips_one_readable_contract(tmp_path: Path) -> N
 
 
 def test_canonical_hash_ignores_object_order_but_not_required_semantics() -> None:
+    """Verify canonical JSON SHA-256 is insensitive to dictionary key ordering but sensitive to value changes."""
     first = {"shape": [31, 10], "dtype": "int64"}
     reordered = {"dtype": "int64", "shape": [31, 10]}
     changed = {"dtype": "int64", "shape": [32, 10]}
@@ -189,24 +197,29 @@ def test_canonical_hash_ignores_object_order_but_not_required_semantics() -> Non
 
 
 def test_vocabulary_expansion_breaks_contract_but_dex_change_does_not(tmp_path: Path) -> None:
+    """Verify that vocabulary alterations modify global contract hash, while minor dex stats updates only alter dex checksum."""
     vocab, dex = _resources(tmp_path, base_power=90)
     original = current_manifest(vocab_path=vocab, dex_path=dex)
 
+    # Modifying dex move basePower changes dex sha256 without breaking tensor shapes or global contract hash
     dex.write_text(json.dumps({"moves": [{"id": "test", "basePower": 80}]}))
     rebalanced = current_manifest(vocab_path=vocab, dex_path=dex)
     assert rebalanced.global_sha256 == original.global_sha256
     assert rebalanced.champions_dex_sha256 != original.champions_dex_sha256
 
+    # Adding new species to vocabulary changes tensor vocab sizes and breaks global contract hash
     vocab, dex = _resources(tmp_path, extra_species=True, base_power=80)
     expanded = current_manifest(vocab_path=vocab, dex_path=dex)
     assert expanded.global_sha256 != original.global_sha256
 
 
 def test_global_contract_freezes_payloads_and_bumps_only_the_required_identity() -> None:
+    """Verify immutable subsystem payloads and version bumping mechanics on active global contract."""
     contract = active_global_contract()
     with pytest.raises(TypeError):
         contract.payload("actions", "major")["action_count"] = 50  # type: ignore[index]
 
+    # Minor subsystem update increments minor version without altering global major contract SHA-256
     changed_minor = contract.with_subsystem_update(
         "resources",
         minor_payload={**contract.payload("resources", "minor"), "showdown_commit": "next"},
@@ -217,6 +230,7 @@ def test_global_contract_freezes_payloads_and_bumps_only_the_required_identity()
         == contract.subsystem("resources").minor_version + 1
     )
 
+    # Major subsystem update alters tensor ABI, bumps major version, and recomputes global SHA-256
     changed_major = contract.with_subsystem_update(
         "model",
         major_payload={**contract.payload("model", "major"), "tensor_abi": "next"},
@@ -227,6 +241,7 @@ def test_global_contract_freezes_payloads_and_bumps_only_the_required_identity()
         == contract.subsystem("model").major_version + 1
     )
 
+    # Major subsystem bump resets minor version counter to 0
     bumped = contract.with_subsystem_update(
         "resources",
         major_payload={**contract.payload("resources", "major"), "resource_feature_abi": "next"},
@@ -236,6 +251,7 @@ def test_global_contract_freezes_payloads_and_bumps_only_the_required_identity()
 
 
 def test_global_contract_rejects_hash_valid_but_malformed_subsystem_payload() -> None:
+    """Verify RuntimeManifest.create validates non-empty payloads for all registered subsystems."""
     contract = active_global_contract()
     contracts = {
         name: {
@@ -250,6 +266,7 @@ def test_global_contract_rejects_hash_valid_but_malformed_subsystem_payload() ->
 
 
 def test_artifact_validation_uses_only_the_active_global_contract() -> None:
+    """Verify validate_artifact_runtime_contract accepts artifacts matching current global contract and rejects mismatches."""
     manifest = active_global_contract()
     artifact = {"global_contract_sha256": manifest.global_sha256}
     assert validate_artifact_runtime_contract(artifact) == manifest
@@ -259,6 +276,7 @@ def test_artifact_validation_uses_only_the_active_global_contract() -> None:
 
 
 def test_model_config_has_only_scaling_fields() -> None:
+    """Verify ModelConfig accepts valid scaling architectures and rejects deprecated or incompatible parameters."""
     config = ModelConfig.baseline()
     assert config.dim_feedforward == 2048
     assert ModelConfig.from_dict(config.to_dict()) == config
@@ -278,6 +296,7 @@ def test_model_config_has_only_scaling_fields() -> None:
 
 
 def test_reserved_config_sections(tmp_path: Path) -> None:
+    """Verify example config sections (bc, corpus, evaluation) load correctly and disallow conflicting objective parameters."""
     config = load_config("config.yaml.example")
     assert config.bc.batch_decisions == 256
     assert config.bc.gamma == config.training.gamma
@@ -302,6 +321,7 @@ def test_reserved_config_sections(tmp_path: Path) -> None:
 
 
 def test_schema_modules_stay_pure() -> None:
+    """Verify intermediate representation modules (p0.replays.schema, p0.battle.series) stay pure without importing torch or runtime."""
     code = (
         "import sys\n"
         "import p0.replays.schema, p0.battle.series\n"
@@ -317,6 +337,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_active_contract_is_reg_m_b_and_manifest_matches_sources() -> None:
+    """Verify default runtime_manifest matches Champions Regulation M-B battle formats and action contract."""
     manifest = RuntimeManifest.from_dict(
         json.loads((ROOT / "data/runtime_manifest.json").read_text())
     )
@@ -329,6 +350,7 @@ def test_active_contract_is_reg_m_b_and_manifest_matches_sources() -> None:
 
 
 def test_runtime_resources_reject_unrecorded_dex_content(tmp_path: Path) -> None:
+    """Verify RuntimeResources rejects champions_dex.json modifications not recorded in runtime_manifest."""
     data = tmp_path / "data"
     data.mkdir()
     for name in ("runtime_manifest.json", "vocab.json", "champions_dex.json"):
@@ -343,6 +365,7 @@ def test_runtime_resources_reject_unrecorded_dex_content(tmp_path: Path) -> None
 
 
 def test_every_legal_content_key_resolves() -> None:
+    """Verify all legal species, items, abilities, and moves in champions_dex resolve to known tokenizer IDs."""
     vocab = json.loads((ROOT / "data/vocab.json").read_text())
     dex = json.loads((ROOT / "data/champions_dex.json").read_text())
     tokenizer_instance = PokemonTokenizer(vocab)
@@ -352,6 +375,7 @@ def test_every_legal_content_key_resolves() -> None:
 
 
 def test_mechanics_tables_cover_the_vocab() -> None:
+    """Verify static mechanics lookup tables match vocabulary sizes (+1 for index 0 unrevealed/padding)."""
     vocab = json.loads((ROOT / "data/vocab.json").read_text())
     resources = default_runtime_resources()
     assert _load_move_statics(resources).shape[0] == len(vocab["moves"]) + 1
@@ -362,6 +386,7 @@ def test_mechanics_tables_cover_the_vocab() -> None:
 
 
 def test_item_and_ability_mechanics_are_wired_into_encoder() -> None:
+    """Verify FusedTokenEncoder projects item and ability mechanic tag tensors into the embedding pipeline."""
     encoder = FusedTokenEncoder(
         d_model=32,
         nhead=4,
@@ -375,6 +400,7 @@ def test_item_and_ability_mechanics_are_wired_into_encoder() -> None:
 
 
 def test_field_namespace_and_coverage_audit_are_present(tmp_path: Path) -> None:
+    """Verify build_vocab produces clean coverage audits with 0 missing legal effects."""
     vocab = json.loads((ROOT / "data/vocab.json").read_text())
     report = build(
         ROOT / "data/champions_dex.json",
@@ -387,6 +413,7 @@ def test_field_namespace_and_coverage_audit_are_present(tmp_path: Path) -> None:
 
 
 def test_reg_mb_legality_inventory_uses_resolved_showdown_rules() -> None:
+    """Verify Regulation M-B format legality whitelist includes legal items/moves and excludes banned content."""
     dex = json.loads((ROOT / "data/champions_dex.json").read_text())
     assert "pikachu" in dex["legality"]["species"]
     assert "protect" in dex["legality"]["moves"]
@@ -395,6 +422,7 @@ def test_reg_mb_legality_inventory_uses_resolved_showdown_rules() -> None:
 
 
 def test_generation_is_deterministic_and_nonlegal_effects_are_reported(tmp_path: Path) -> None:
+    """Verify build_vocab execution is bitwise deterministic and unsupported nonlegal effects are logged in coverage audit."""
     dex = json.loads((ROOT / "data/champions_dex.json").read_text())
     dex["protocolEffects"].append("nonlegaltesteffect")
     dex_path = tmp_path / "dex.json"
@@ -412,6 +440,7 @@ def test_generation_is_deterministic_and_nonlegal_effects_are_reported(tmp_path:
 
 
 def test_unknown_legal_effect_namespace_fails_generation(tmp_path: Path) -> None:
+    """Verify build_vocab fails with ValueError if an unknown effect namespace is introduced into legal effects."""
     dex = deepcopy(json.loads((ROOT / "data/champions_dex.json").read_text()))
     dex["legalProtocolEffects"]["unmapped_family"] = ["reachableeffect"]
     dex_path = tmp_path / "dex.json"
@@ -426,6 +455,7 @@ def test_unknown_legal_effect_namespace_fails_generation(tmp_path: Path) -> None
 
 
 def test_tokenizer_normalization_and_table_resolution() -> None:
+    """Verify PokemonTokenizer normalization and resolution taxonomy: KNOWN, KNOWN_NONE, OOV, UNKNOWN."""
     assert PokemonTokenizer.normalize_id("Charizard-Mega-Y") == "charizardmegay"
     assert PokemonTokenizer.normalize_id("U-turn") == "uturn"
     assert PokemonTokenizer.normalize_id("Leech Seed") == "leechseed"
@@ -448,6 +478,7 @@ def test_tokenizer_normalization_and_table_resolution() -> None:
 
 
 def test_tokenizer_domain_objects_and_missing_values() -> None:
+    """Verify tokenizer extracts vocabulary IDs from poke-env domain objects (Pokemon, Move, Status, PokemonType, Nature)."""
     assert tokenizer.status_id(Status.BRN) == tokenizer.status[Status.BRN]
     assert tokenizer.status_id(Status.SLP) == tokenizer.status[Status.SLP]
     assert tokenizer.status_id(None) == 0
@@ -503,12 +534,14 @@ def test_tokenizer_domain_objects_and_missing_values() -> None:
     p = Pokemon(gen=9, species="pikachu")
     assert tokenizer.nature_id(p) == 0
 
+    # Neutral natures map to 0
     p._nature = "Serious"
     serious_id = tokenizer.nature_id(p)
     assert serious_id == 0
     p._nature = "Bashful"
     assert serious_id == tokenizer.nature_id(p)
 
+    # Non-neutral natures map to positive integers > 0
     p._nature = "Jolly"
     jolly_id = tokenizer.nature_id(p)
     assert jolly_id > 0
@@ -524,6 +557,7 @@ def test_tokenizer_domain_objects_and_missing_values() -> None:
 
 
 def test_token_store_initialization() -> None:
+    """Verify SeriesTokenStore initializes empty storage with specified dimensions."""
     store = SeriesTokenStore(d_model=64, max_games=2)
     assert store.d_model == 64
     assert store.max_games == 2
@@ -531,6 +565,7 @@ def test_token_store_initialization() -> None:
 
 
 def test_token_store_append_and_get() -> None:
+    """Verify SeriesTokenStore appends tokens, pads remaining slots with zeros, and computes active boolean masks."""
     store = SeriesTokenStore(d_model=16, max_games=2)
 
     tokens1 = torch.randn(SERIES_TOKENS_PER_GAME, 16)
@@ -557,6 +592,7 @@ def test_token_store_append_and_get() -> None:
 
 
 def test_token_store_max_games_truncation() -> None:
+    """Verify SeriesTokenStore retains only the most recent max_games=2 entries using FIFO eviction."""
     store = SeriesTokenStore(d_model=16, max_games=2)
 
     tokens1 = torch.randn(SERIES_TOKENS_PER_GAME, 16)
@@ -569,6 +605,7 @@ def test_token_store_max_games_truncation() -> None:
 
     out_tokens, out_mask = store.get_tokens(["series-B"], device=torch.device("cpu"))
 
+    # Oldest tokens (tokens1) must be evicted; tokens2 and tokens3 retained
     assert torch.allclose(out_tokens[0, :SERIES_TOKENS_PER_GAME], tokens2)
     assert torch.allclose(
         out_tokens[0, SERIES_TOKENS_PER_GAME : 2 * SERIES_TOKENS_PER_GAME], tokens3
@@ -576,6 +613,7 @@ def test_token_store_max_games_truncation() -> None:
 
 
 def test_token_store_batching_and_missing() -> None:
+    """Verify SeriesTokenStore returns zero-filled tensors and False masks for unknown series keys."""
     store = SeriesTokenStore(d_model=8)
 
     t1 = torch.randn(SERIES_TOKENS_PER_GAME, 8)
@@ -592,6 +630,7 @@ def test_token_store_batching_and_missing() -> None:
 
 
 def test_token_store_training_state_round_trip() -> None:
+    """Verify SeriesTokenStore state dictionary roundtrips losslessly into a fresh instance."""
     store = SeriesTokenStore(d_model=8)
     first = torch.randn(SERIES_TOKENS_PER_GAME, 8)
     second = torch.randn(SERIES_TOKENS_PER_GAME, 8)
@@ -608,6 +647,7 @@ def test_token_store_training_state_round_trip() -> None:
 
 
 def test_token_store_isolates_canonical_player_perspectives() -> None:
+    """Verify SeriesTokenStore isolates storage between canonical player 0 and player 1 perspectives."""
     from p0.battle.series import SeriesPerspectiveKey
 
     store = SeriesTokenStore(d_model=8)
@@ -627,6 +667,7 @@ def test_token_store_isolates_canonical_player_perspectives() -> None:
 
 
 def test_token_store_drop_and_clear() -> None:
+    """Verify SeriesTokenStore drop() deletes specific series keys and clear() purges all stored tokens."""
     store = SeriesTokenStore(d_model=8)
     store.append("s1", torch.randn(SERIES_TOKENS_PER_GAME, 8))
 
@@ -651,6 +692,7 @@ def _runtime_files(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_runtime_manifest_digest_is_semantic_and_round_trips(tmp_path: Path) -> None:
+    """Verify runtime manifest digest computation is invariant to key reordering in on-disk JSON."""
     vocab, dex = _runtime_files(tmp_path)
     manifest = current_manifest(vocab_path=vocab, dex_path=dex)
     reordered = json.loads(json.dumps(manifest.to_dict()))
@@ -665,6 +707,7 @@ def test_runtime_manifest_digest_is_semantic_and_round_trips(tmp_path: Path) -> 
 
 
 def test_tokenizer_aliases_and_resolution_keep_unknown_zero_distinct_from_known_none() -> None:
+    """Verify tokenizer distinguishes between KNOWN, KNOWN_NONE (valid empty entity), OOV, and UNKNOWN."""
     tokenizer_instance = PokemonTokenizer(
         {
             "weathers": {"raindance": 4},
@@ -682,6 +725,7 @@ def test_tokenizer_aliases_and_resolution_keep_unknown_zero_distinct_from_known_
 
 
 def test_enum_like_tables_lazy_cache_alias_and_missing_member_results() -> None:
+    """Verify lazy alias dictionary caching on enum-like tables (weathers, status)."""
     tokenizer_instance = PokemonTokenizer({"weathers": {"raindance": 4}, "status": {"brn": 5}})
     assert tokenizer_instance.weathers["R-a-i-n"] == 4
     assert tokenizer_instance.weathers["rain"] == 4
@@ -696,6 +740,7 @@ def test_enum_like_tables_lazy_cache_alias_and_missing_member_results() -> None:
 
 
 def test_active_contract_rejects_an_unrecorded_spread_table() -> None:
+    """Verify active global contract checks spread_usage.json checksum."""
     contract = active_global_contract()
     assert contract.spread_usage_sha256 == sha256_file(
         DEFAULT_PATHS.data_root / "spread_usage.json"

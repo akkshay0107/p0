@@ -193,8 +193,11 @@ class StatusEnv(BufferBindingEnv):
 def test_thread_vec_env_reports_a_tri_state_done_status(
     terminated: bool, truncated: bool, expected: int
 ) -> None:
-    # A boolean array here would report truncation as termination, which
-    # silently disables bootstrapping for every game that hits the step cap.
+    """Verify ThreadVecEnv returns a tri-state done status: 0 (running), 1 (terminated), 2 (truncated for bootstrapping).
+    
+    Distinguishing truncation (2) from termination (1) is vital: truncated episodes bootstrap
+    value targets off the next state rather than zeroing out subsequent returns.
+    """
     vec_env = ThreadVecEnv(cast(Any, [StatusEnv(terminated=terminated, truncated=truncated)]))
     try:
         done_status = vec_env.step([{}])[4]
@@ -205,6 +208,7 @@ def test_thread_vec_env_reports_a_tri_state_done_status(
 
 
 def test_thread_vec_env_binds_each_env_to_its_preallocated_rows():
+    """Verify ThreadVecEnv sets memory pointers of worker sub-environments to pre-allocated batch buffer rows."""
     envs = [BufferBindingEnv(), BufferBindingEnv()]
     vec_env = ThreadVecEnv(cast(Any, envs))
     try:
@@ -218,6 +222,7 @@ def test_thread_vec_env_binds_each_env_to_its_preallocated_rows():
 
 
 def test_thread_vec_env_rejects_an_action_count_mismatch():
+    """Verify step() raises ValueError if supplied action list does not match n_envs."""
     vec_env = ThreadVecEnv(cast(Any, [BufferBindingEnv(), BufferBindingEnv()]))
     try:
         with pytest.raises(ValueError, match="Number of actions"):
@@ -227,6 +232,7 @@ def test_thread_vec_env_rejects_an_action_count_mismatch():
 
 
 def test_compute_gae_batch_matches_single_episode_reference():
+    """Verify vectorized compute_gae_batch matches pure-Python sequential GAE calculation for variable episode lengths."""
     def compute_gae_reference(
         rewards: torch.Tensor,
         values: torch.Tensor,
@@ -287,6 +293,7 @@ def test_compute_gae_batch_matches_single_episode_reference():
 
 
 def test_collect_rollouts_records_both_self_play_streams():
+    """Verify collect_rollouts simultaneously records trajectories for agent 1 and agent 2 across parallel environments."""
     config = TrainingConfig(n_envs=3, rollout_steps=1)
     vec_env = FakeVecEnv(config.n_envs)
     policy = FakePolicy(action=7)
@@ -312,6 +319,7 @@ def test_collect_rollouts_records_both_self_play_streams():
         series_store2,
     )
 
+    # 3 environments x 2 agent perspectives = 6 recorded episodes
     assert len(buffer) == 2 * config.n_envs
     assert all(torch.all(episode.actions == 7) for episode in buffer)
     assert all(float(episode.dones[-1]) == 1.0 for episode in buffer)
@@ -328,6 +336,7 @@ def test_collect_rollouts_records_both_self_play_streams():
 
 
 def test_truncated_rollout_bootstraps_instead_of_ending_the_game():
+    """Verify truncated rollouts set terminal done flag to 0.0 and record bootstrap values for non-terminal returns."""
     config = TrainingConfig(n_envs=3, rollout_steps=1)
     vec_env = FakeVecEnv(config.n_envs, done_status=2)
     policy = FakePolicy(action=7)
@@ -356,6 +365,7 @@ def test_truncated_rollout_bootstraps_instead_of_ending_the_game():
 
 
 def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
+    """Verify BattleMemoryBuffer retains all game tokens for series summary while windowing reducer inputs to HISTORY_WINDOW."""
     memory = BattleMemoryBuffer(1, d_model=1)
     env_ids = torch.tensor([0])
     total = HISTORY_WINDOW + 5
@@ -366,6 +376,7 @@ def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
     assert memory.step_counts.tolist() == [total]
 
     history, mask, ages = memory.inputs(env_ids, torch.device("cpu"), torch.float32)
+    # Reducer input shape is restricted to HISTORY_WINDOW
     assert history.shape == (1, HISTORY_WINDOW, 1)
     assert bool(mask.all())
     assert history[0, -1, 0].item() == float(total - 1)
@@ -374,6 +385,7 @@ def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
 
 
 def test_battle_memory_reports_explicit_overflow():
+    """Verify BattleMemoryBuffer raises OverflowError if step count exceeds preallocated max_steps."""
     memory = BattleMemoryBuffer(1, d_model=1, max_steps=1)
     env_ids = torch.tensor([0])
     memory.append(env_ids, torch.ones((1, 1)))
@@ -383,6 +395,7 @@ def test_battle_memory_reports_explicit_overflow():
 
 
 def test_battle_memory_gathers_independent_environment_windows():
+    """Verify BattleMemoryBuffer slices independent variable-length histories across distinct environment rows."""
     memory = BattleMemoryBuffer(2, d_model=1, max_steps=3)
     memory.append(torch.tensor([0, 1]), torch.tensor([[1.0], [10.0]]))
     memory.append(torch.tensor([1]), torch.tensor([[11.0]]))
@@ -407,6 +420,7 @@ def test_battle_memory_gathers_independent_environment_windows():
 
 
 def test_live_player_keeps_cpu_history_in_one_list():
+    """Verify RLPlayer on CPU devices retains full battle history in contiguous memory without splitting."""
     player = cast(Any, RLPlayer.__new__(RLPlayer))
     player.policy = SimpleNamespace(device=torch.device("cpu"), d_model=1)
     player._memory_model_id = id(player.policy)
@@ -431,6 +445,7 @@ def test_live_player_keeps_cpu_history_in_one_list():
 
 
 def test_live_player_spills_device_history_in_fixed_windows():
+    """Verify _LiveBattleHistory spills older GPU tokens to CPU chunks when history exceeds 2 * HISTORY_WINDOW."""
     history = _LiveBattleHistory(spill_to_cpu=True)
     device = torch.device("cpu")
     capacity = 2 * HISTORY_WINDOW
@@ -462,6 +477,7 @@ def test_live_player_spills_device_history_in_fixed_windows():
 
 
 def test_end_of_game_series_summary_sees_every_decision():
+    """Verify series summary tokens compress the complete battle trajectory, not merely the sliding reducer window."""
     vec_env = FakeVecEnv(1, done_status=0)
     policy = FakePolicy(action=7)
     memory1 = BattleMemoryBuffer(1, 1)
@@ -488,11 +504,12 @@ def test_end_of_game_series_summary_sees_every_decision():
     vec_env.done_status = 1
     collect(1)
 
-    # The summary compresses the whole battle, not just the reducer window.
+    # The summary compresses the whole battle (HISTORY_WINDOW + 6), not just the reducer window.
     assert policy.summarized_lengths == [HISTORY_WINDOW + 6, HISTORY_WINDOW + 6]
 
 
 def test_storage_allocates_completes_and_resets_one_environment():
+    """Verify TrajectoryStorage allocation, completion slicing, and reset for a single environment index."""
     storage = TrajectoryStorage.allocate(2, 3, d_model=1)
     storage.step_counts[1] = 2
     storage.actions[1, :2] = 7
@@ -504,6 +521,7 @@ def test_storage_allocates_completes_and_resets_one_environment():
 
 
 def test_storage_reports_explicit_overflow():
+    """Verify TrajectoryStorage raises OverflowError when environment step count exceeds capacity."""
     storage = TrajectoryStorage.allocate(1, 1, d_model=1)
     storage.step_counts[0] = 1
     with pytest.raises(OverflowError, match="exceeded"):
@@ -511,6 +529,7 @@ def test_storage_reports_explicit_overflow():
 
 
 def test_completed_batch_prepares_returns_advantages_and_chunks():
+    """Verify prepare_trajectory_batches calculates returns and GAE advantages on completed trajectory batches."""
     batch = TrajectoryBatch(
         observations=StructuredObservation.empty_batch(3),
         action_masks=torch.ones((3, 2, 49), dtype=torch.bool),
@@ -527,6 +546,7 @@ def test_completed_batch_prepares_returns_advantages_and_chunks():
 
 
 def test_completed_batch_only_moves_ppo_inputs_to_target_device():
+    """Verify device transfer moves only policy gradient computation tensors to GPU while retaining tracking metrics on CPU."""
     batch = TrajectoryBatch(
         observations=StructuredObservation.empty_batch(1),
         action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
@@ -552,6 +572,7 @@ def test_completed_batch_only_moves_ppo_inputs_to_target_device():
 
 
 def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path) -> None:
+    """Verify EvaluationHarness falls back to deterministic built-in team pools when corpus file is missing."""
     first = EvaluationHarness(
         corpus_path=tmp_path / "missing.json",
         corpus_hash="missing",
@@ -580,6 +601,7 @@ def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path)
 
 
 def test_evaluation_confidence_intervals_and_matchup_serialization_are_deterministic() -> None:
+    """Verify Wilson score confidence interval calculation and matchup result serialization."""
     assert wilson_score_interval(0, 0) == (0.0, 0.0)
     lower, upper = wilson_score_interval(3, 5)
     assert 0.0 < lower < 0.6 < upper < 1.0
@@ -626,6 +648,7 @@ def _make_test_double_battle() -> DoubleBattle:
 
 
 def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
+    """Verify SimEnv reuses single decision view across both observation embedding and action mask generation."""
     battle = _make_test_double_battle()
     from p0.runtime import poke_env_battle_adapter
 
@@ -657,6 +680,7 @@ def test_sim_env_embed_and_mask_share_one_decision_view(monkeypatch):
 
 
 def test_calc_reward_scores_each_seat_without_touching_the_series():
+    """Verify calc_reward assigns +1 for win and -1 for loss without mutating series state."""
     env = SimEnv.__new__(SimEnv)
     env._series_scores = [0, 0]
     won = SimpleNamespace(finished=True, won=True, lost=False)
@@ -690,6 +714,7 @@ def _stepping_env(monkeypatch, battle: Any, *, decision_steps: int = 0) -> SimEn
 
 @pytest.mark.parametrize("wiped", [True, False])
 def test_step_treats_every_finished_battle_as_terminal(monkeypatch, wiped: bool):
+    """Verify SimEnv.step marks all completed battles as terminated (not truncated)."""
     battle = SimpleNamespace(finished=True, won=True, lost=False, wiped=wiped)
     env = _stepping_env(monkeypatch, battle)
 
@@ -701,6 +726,7 @@ def test_step_treats_every_finished_battle_as_terminal(monkeypatch, wiped: bool)
 
 
 def test_step_truncates_an_unfinished_game_at_the_decision_cap(monkeypatch):
+    """Verify SimEnv.step flags truncation when decision step count reaches cap."""
     battle = SimpleNamespace(finished=False, won=False, lost=False, wiped=False)
     env = _stepping_env(monkeypatch, battle, decision_steps=197)
 
@@ -713,6 +739,7 @@ def test_step_truncates_an_unfinished_game_at_the_decision_cap(monkeypatch):
 
 
 def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):
+    """Verify Best of 3 series tracks game wins and rotates series identity + teams once a player achieves 2 wins."""
     monkeypatch.setattr(MegaEnv, "reset", lambda self, seed=None, options=None: "reset")
     env = SimEnv.__new__(SimEnv)
     env._series_scores = [0, 0]
@@ -723,11 +750,13 @@ def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):
     env.series_id = "series-1"
     battle = SimpleNamespace(finished=True, won=True, lost=False)
 
+    # Game 1 win -> score [1, 0], advance to game 2
     env._record_game_result(cast(Any, battle))
     env.reset()
     assert env.series_scores == [1, 0]
     assert env.series_games_played == 2
 
+    # Game 2 win -> score [2, 0], series won
     env._record_game_result(cast(Any, battle))
     assert env.series_scores == [2, 0]
 
@@ -741,6 +770,7 @@ def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):
     cast(Any, env).agent1 = SimpleNamespace(update_team=sampled.append)
     cast(Any, env).agent2 = SimpleNamespace(update_team=sampled.append)
 
+    # Reset after series win starts fresh series with new teams
     env.reset()
     assert env.series_scores == [0, 0]
     assert env.series_games_played == 1
@@ -749,12 +779,16 @@ def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):
 
 
 def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monkeypatch):
+    """Verify SimEnv serialization saves and restores team strings, series scores, and game counters."""
     class TeamBuilder:
         def __init__(self, packed: str):
             self.packed = packed
 
         def yield_team(self) -> str:
             return self.packed
+
+        def update_team(self, packed: str) -> None:
+            self.packed = packed
 
     class Player:
         def __init__(self, packed: str):
@@ -794,6 +828,7 @@ def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monke
 
 
 def test_pure_ppo_objective_clips_and_weights_team_preview() -> None:
+    """Verify PPO loss calculations with probability ratio clipping, value loss, and team preview loss multiplier."""
     config = TrainingConfig(
         clip_low=0.2,
         clip_high=0.2,
@@ -826,6 +861,7 @@ def test_pure_ppo_objective_clips_and_weights_team_preview() -> None:
 
 
 def test_ppo_amp_is_cuda_only() -> None:
+    """Verify mixed precision AMP is active only when CUDA devices are present and enabled in TrainingConfig."""
     config = TrainingConfig(enable_optim=True)
 
     assert not amp_enabled(config, torch.device("cpu"))
@@ -834,6 +870,7 @@ def test_ppo_amp_is_cuda_only() -> None:
 
 
 def test_trainer_cancellation_saves_once_before_collecting(tmp_path: Path) -> None:
+    """Verify PPOTrainer saves checkpoint immediately upon cancellation request before collecting new rollouts."""
     saved = []
 
     class Store:
@@ -863,6 +900,7 @@ def test_trainer_cancellation_saves_once_before_collecting(tmp_path: Path) -> No
 
 
 def test_trainer_saves_final_completed_episode(tmp_path: Path) -> None:
+    """Verify PPOTrainer saves final completed episode state upon reaching target num_episodes."""
     saved = []
 
     class Store:
@@ -893,6 +931,7 @@ def test_trainer_saves_final_completed_episode(tmp_path: Path) -> None:
 
 
 def test_ppo_updates_all_policy_paths() -> None:
+    """Verify backward pass on batched PPO loss computes non-zero gradients across encoder, actor, and critic parameter groups."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources()).to(device)
     policy.train()
@@ -933,6 +972,7 @@ def test_ppo_updates_all_policy_paths() -> None:
 
 
 def test_ppo_caches_magnet_logits_for_repeated_epochs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Magnet anchor network evaluation is cached across multiple PPO mini-epochs to eliminate redundant forward passes."""
     policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
     magnet = Magnet(policy)
     episode = TrajectoryBatch(
@@ -983,6 +1023,7 @@ def test_ppo_caches_magnet_logits_for_repeated_epochs(monkeypatch: pytest.Monkey
 
 
 def test_full_precision_ppo_discards_non_finite_gradients(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify PPO optimizer skips gradient step and leaves model weights unmodified when gradients contain inf/NaN values."""
     policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
     magnet = Magnet(policy)
     parameter = next(policy.parameters())
@@ -1040,6 +1081,7 @@ def test_full_precision_ppo_discards_non_finite_gradients(monkeypatch: pytest.Mo
 
 
 def test_ppo_keeps_series_encoder_out_of_the_bo1_graph() -> None:
+    """Verify series encoder parameters receive no gradients during single-game (Bo1) PPO rollouts."""
     policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
     observation = StructuredObservation.empty_batch(1)
     action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)

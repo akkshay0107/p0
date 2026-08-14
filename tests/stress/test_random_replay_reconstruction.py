@@ -121,15 +121,18 @@ _OBSERVATION_EVENT_FIELDS = (
 
 
 def _message_tag(line: str) -> str:
+    """Extract Showdown protocol message identifier (e.g. '|move|' -> 'move')."""
     parts = line.split("|")
     return parts[1] if len(parts) > 1 else ""
 
 
 def _endpoint_role(endpoint: str) -> str:
+    """Extract player role prefix from an entity string (e.g. 'p1a: Pikachu' -> 'p1')."""
     return endpoint.split("a", 1)[0].strip()
 
 
 def _cant_reasons(snapshot: ReconstructedSnapshot, role: int) -> tuple[str, ...]:
+    """Collect all '|cant|' failure reasons recorded in a turn snapshot for a specific player role."""
     reasons: list[str] = []
     for raw_line in snapshot.raw_lines:
         parts = raw_line.split("|")
@@ -156,12 +159,17 @@ def _showteam_offset(document: ReplayDocument) -> tuple[int, int]:
 
 
 def _live_boundary(record: dict[str, Any], splice_index: int, splice_count: int) -> int:
+    """Adjust live replay cursor index to align with spliced replay document protocol lines."""
     cursor = int(record["replay_cursor"])
     return cursor if cursor <= splice_index else cursor + splice_count
 
 
 class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
-    """Random player that saves pre-fusion decisions and completed replay JSON."""
+    """Random player that saves pre-fusion decisions and completed replay JSON.
+    
+    Captures exact raw observation tensors, action decisions, and replay line stream offsets
+    during live battle execution so offline replay reconstruction can be verified 1-to-1 against ground truth.
+    """
 
     def __init__(
         self,
@@ -683,7 +691,18 @@ def _assert_decision_boundaries_partition_the_log(
 async def test_random_local_games_reconstruct_to_valid_tensors(
     showdown_server, tmp_path: Path
 ) -> None:
-    """Play random games, persist replays/captures, and validate round-trip tensors."""
+    """End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
+    
+    Verifies that:
+    1. 100+ random live battles run concurrently against a local Showdown server.
+    2. Spliced replay documents capture all turns with valid terminal line indices.
+    3. Reconstructed observations match ground truth live captured tensors at exact line boundaries.
+    4. Offline reconstructed state machines perfectly agree with poke-env active pokemon/field state.
+    5. Reconstructed action candidates encapsulate the actual live chosen actions.
+    6. Shard compilation produces valid training tensors with correct loss mask semantics:
+       - UNKNOWN label kinds have loss_mask == 0 (excluded from policy gradient / imitation loss)
+       - EXACT and PARTIAL label kinds have loss_mask > 0 (included in loss calculation).
+    """
     seed = int(os.getenv("P0_STRESS_SEED", "20260802"))
     game_count = _stress_game_count()
     concurrency = _stress_concurrency()
@@ -747,6 +766,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(
     assert len(documents) == game_count
     assert all(document.outcome.terminal_line_index is not None for document in documents)
 
+    # For every completed game, verify offline reconstruction against the live recorded ground truth
     for document in documents:
         replay_id = document.metadata.replay_id
         for perspective in _assert_reconstruction_labels(document):
@@ -754,11 +774,16 @@ async def test_random_local_games_reconstruct_to_valid_tensors(
             path = observation_dir / f"{replay_id}-{role}.pt"
             assert path.is_file(), f"Missing live observation capture: {path}"
             artifact = _load_live_artifact(path)
+            # Verify protocol line stream matches what player received over websocket
             _assert_line_stream_fidelity(document, artifact["lines"])
+            # Verify reconstructed decision snapshots form an ordered partition of the log
             _assert_decision_boundaries_partition_the_log(perspective, document)
+            # Verify agreement with poke-env oracle battle state
             _assert_poke_env_state_agreement(perspective, document)
+            # Verify reconstructed structured observations match live pre-fusion observation tensors
             _assert_live_truth(perspective, artifact["records"], document, builder)
 
+    # Compile replay documents into training dataset representation
     compilation = compile_documents(
         documents,
         format_id=FORMAT.battle_format,
@@ -769,6 +794,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(
     assert compilation.metrics.counters["accepted_games"] == game_count
     assert compilation.metrics.counters["rejected_games"] == 0
 
+    # Write out serialized PyTorch tensor shards
     build = write_tensor_shards(
         compilation,
         tmp_path / "tensor-shards",
@@ -779,6 +805,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(
     assert build.manifest.accepted_games == game_count
     assert build.manifest.rejected_games == 0
 
+    # Verify tensor contracts and loss masking across all generated shard files
     for shard in build.manifest.shards:
         artifact = torch.load(
             build.manifest_path.parent / shard.filename,
@@ -790,6 +817,8 @@ async def test_random_local_games_reconstruct_to_valid_tensors(
         tensors = artifact["tensors"]
         label_kind = tensors["label_kind"]
         loss_mask = tensors["loss_mask"]
+        # UNKNOWN labels must never contribute to training loss (loss_mask == 0)
         assert torch.all(loss_mask[label_kind == int(LabelKind.UNKNOWN)] == 0)
+        # EXACT and PARTIAL candidate labels must have active training loss weights
         assert torch.all(loss_mask[label_kind == int(LabelKind.EXACT)] > 0)
         assert torch.all(loss_mask[label_kind == int(LabelKind.PARTIAL)] > 0)

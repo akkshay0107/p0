@@ -184,6 +184,13 @@ def from_battle_into(battle, out, tok=tokenizer, stat_overrides=None):
 
 
 def test_observation_builder_serializes_pokemon_features() -> None:
+    """Verify ObservationBuilder converts Pokemon attributes into correctly scaled and indexed categorical/numerical tensors.
+    
+    Verifies:
+    - Categorical columns: species, ability, item, typing (type 1 & 2), move slots (0..3), status condition, nature.
+    - Numerical columns: HP fraction, base stats (scaled by 160), stat boosts (scaled by 6), move PP ratios, protect counter,
+      weight bracket, status duration counter, move preparation flag, mega evolution availability.
+    """
     builder = _OBSERVATION_BUILDER
 
     mon = make_real_pokemon(
@@ -224,22 +231,23 @@ def test_observation_builder_serializes_pokemon_features() -> None:
 
     # Validate Numericals
     num = obs.numerical[0]
-    assert num[5] == pytest.approx(0.8)  # HP fraction
-    assert abs(num[6] - 78.0 / 160.0) < 1e-5  # Base HP
-    assert abs(num[7] - 84.0 / 160.0) < 1e-5  # Base Atk
-    assert num[12] == 3.0 / 6.0  # Atk Boost
-    assert num[13] == -1.0 / 6.0  # Def Boost
+    assert num[5] == pytest.approx(0.8)  # HP fraction (80 / 100)
+    assert abs(num[6] - 78.0 / 160.0) < 1e-5  # Base HP normalized by 160
+    assert abs(num[7] - 84.0 / 160.0) < 1e-5  # Base Atk normalized by 160
+    assert num[12] == 3.0 / 6.0  # Atk Boost (+3 / 6)
+    assert num[13] == -1.0 / 6.0  # Def Boost (-1 / 6)
     assert num[19] == 4.0 / 8.0  # Move 1 PP ratio (4 / 8 max PP)
     assert num[20] == 8.0 / 16.0  # Move 2 PP ratio (8 / 16 max PP)
-    assert num[23] == 2.0 / 4.0  # Protect counter
-    assert num[24] == 1.0  # First turn
+    assert num[23] == 2.0 / 4.0  # Protect counter normalized by 4
+    assert num[24] == 1.0  # First turn active
     assert num[25] == pytest.approx(0.6)  # Low kick weight bracket for 75kg
-    assert num[36] == 3.0 / 5.0  # Status counter
-    assert num[NUM_IDX_PREPARING] == 1.0  # Preparing move
-    assert num[NUM_IDX_CAN_MEGA] == 1.0  # Can mega
+    assert num[36] == 3.0 / 5.0  # Status counter normalized by 5
+    assert num[NUM_IDX_PREPARING] == 1.0  # Preparing move flag
+    assert num[NUM_IDX_CAN_MEGA] == 1.0  # Can mega evolve flag
 
 
 def test_ordered_pokemon_and_slot_conditions_real() -> None:
+    """Verify Pokemon slot ordering across Team Preview (original roster order) and active battle (active slots first, then bench)."""
     p1 = make_real_pokemon(species="aerodactyl")
     p2 = make_real_pokemon(species="archaludon")
     p3 = make_real_pokemon(species="azumarill")
@@ -288,6 +296,7 @@ def test_ordered_pokemon_and_slot_conditions_real() -> None:
 
 
 def test_global_and_side_field_tokens_include_mega_availability() -> None:
+    """Verify global field and side tokens include turn fraction scaling, team preview indicator, and mega availability."""
     ally_mega = make_real_pokemon(species="charizard", item="charizarditey")
     battle = make_real_battle(
         active_pokemon=[ally_mega, None],
@@ -310,7 +319,7 @@ def test_global_and_side_field_tokens_include_mega_availability() -> None:
 
     # Ally Side Token (index 13)
     assert obs.token_type_ids[TOKEN_IDX_ALLY_SIDE] == TokenType.FIELD
-    assert obs.numerical[TOKEN_IDX_ALLY_SIDE, 4] == 1.0
+    assert obs.numerical[TOKEN_IDX_ALLY_SIDE, 4] == 1.0  # Ally mega available
 
     # Opponent Side Token (index 14)
     assert obs.token_type_ids[TOKEN_IDX_OPPONENT_SIDE] == TokenType.FIELD
@@ -318,6 +327,7 @@ def test_global_and_side_field_tokens_include_mega_availability() -> None:
 
 
 def test_effect_overflow_is_counted_and_enforced() -> None:
+    """Verify effect capacity capping: slots record exact effect count, overflow count, and truncate to MAX_EFFECTS."""
     effects = {
         Effect.TAUNT: 1,
         Effect.LEECH_SEED: 1,
@@ -338,14 +348,15 @@ def test_effect_overflow_is_counted_and_enforced() -> None:
     battle = make_real_battle(active_pokemon=[mon, None], team=[mon])
 
     obs = _OBSERVATION_BUILDER.build(battle_view(battle))
+    # Total effects: 14, overflow over MAX_EFFECTS (12) is 2
     assert obs.numerical[0, NUM_IDX_EFFECT_COUNT] == 14
     assert obs.numerical[0, NUM_IDX_EFFECT_OVERFLOW] == 2.0
     pokemon_effects = obs.categorical[0, CAT_EFFECT_START::EFFECT_CATEGORICAL_WIDTH]
     assert torch.count_nonzero(pokemon_effects) == MAX_EFFECTS
 
 
-
 def test_concurrent_universal_effect_stress_state() -> None:
+    """Verify simultaneous active effects across Pokémon, side conditions, weather, and terrain tokens."""
     mon = make_real_pokemon(
         effects={
             Effect.TAUNT: 1,
@@ -392,6 +403,7 @@ def test_concurrent_universal_effect_stress_state() -> None:
 
 
 def test_events_ground_to_slots_and_are_idempotent() -> None:
+    """Verify raw battle events ground to specific slot/side IDs and subsequent calls on identical turns are idempotent."""
     switched_out = make_real_pokemon(species="charizard")
     switched_in = make_real_pokemon(species="venusaur")
     opponent = make_real_pokemon(species="tyranitar")
@@ -424,10 +436,12 @@ def test_events_ground_to_slots_and_are_idempotent() -> None:
     assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
     assert obs.events_slot_ids[:2].tolist() == [1, 1]
 
+    # Rebuilding without advancing turn produces identical event tensors
     rebuilt_obs = from_battle(battle, tokenizer)
     assert torch.equal(rebuilt_obs.events_cat, obs.events_cat)
     assert torch.equal(rebuilt_obs.events_num, obs.events_num)
 
+    # Advancing request clears event queue
     battle._last_request = {"turn": "next"}
     next_obs = from_battle(battle, tokenizer)
     assert torch.count_nonzero(next_obs.events_cat) == 0
@@ -435,6 +449,7 @@ def test_events_ground_to_slots_and_are_idempotent() -> None:
 
 
 def test_side_events_ground_to_owning_side() -> None:
+    """Verify side-level condition events (-sidestart) ground to the appropriate owning side token."""
     ally = make_real_pokemon(species="charizard")
     opponent = make_real_pokemon(species="venusaur")
     battle = make_real_battle(
@@ -460,6 +475,7 @@ def test_side_events_ground_to_owning_side() -> None:
 
 
 def test_event_order_recompacts() -> None:
+    """Verify that event order tagging re-compacts to 1..EVENT_COUNT when raw events exceed EVENT_COUNT capacity."""
     ally = make_real_pokemon(species="charizard")
     opponent = make_real_pokemon(species="venusaur")
     battle = make_real_battle(
@@ -487,6 +503,7 @@ def test_event_order_recompacts() -> None:
 
 
 def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
+    """Verify from_battle_into performs in-place tensor writing into pre-allocated memory buffers without stale artifact leakage."""
     ally = make_real_pokemon(
         species="charizard",
         moves={"airslash": 10, "protect": 8},
@@ -511,6 +528,7 @@ def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
 
     expected = from_battle(battle, tokenizer)
     out = StructuredObservation.empty_batch(1)[0]
+    # Poison buffer with sentinel 99 values to ensure everything is cleanly overwritten
     out.token_type_ids.fill_(99)
     out.side_ids.fill_(99)
     out.slot_ids.fill_(99)
@@ -535,6 +553,7 @@ def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
     assert not torch.any(out.categorical == 99)
     assert not torch.any(out.numerical == 99)
 
+    # Validate dtype validation rejection
     invalid = StructuredObservation.empty_batch(1)[0]
     invalid.numerical = invalid.numerical.to(torch.float64)
     with pytest.raises(ValueError, match="Invalid numerical"):
@@ -542,12 +561,14 @@ def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
 
 
 def test_stat_resolution_provenance_and_cache_behavior() -> None:
+    """Verify stat resolution provenance tracking (UNKNOWN, IMPUTED from OTS spreads, SELF_KNOWN) and caching."""
     pokemon = make_real_pokemon(species="charizard")
     pokemon._nature = None
     values, provenance = _get_pokemon_level_stats(pokemon, True, None)
     assert values == (0.0,) * 6
     assert provenance == Provenance.UNKNOWN
 
+    # Test OTS-imputed stats
     expected = cast(tuple[int, int, int, int, int, int], tuple((155, 93, 98, 177, 105, 152)))
     values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
     assert values == tuple(float(value) for value in expected)
@@ -559,6 +580,7 @@ def test_stat_resolution_provenance_and_cache_behavior() -> None:
     assert values_self == (153.0, 104.0, 98.0, 177.0, 105.0, 152.0)
     assert provenance_self == Provenance.SELF_KNOWN
 
+    # Verify stat imputation caching
     pokemon = make_real_pokemon(
         species="charizard",
         moves={"heatwave": 10, "solarbeam": 10, "protect": 10, "weatherball": 10},
@@ -572,6 +594,7 @@ def test_stat_resolution_provenance_and_cache_behavior() -> None:
 
 
 def test_observation_overflow_contract_holds_at_capacity_boundaries() -> None:
+    """Verify validate_overflow_contract verifies effect and event overflow totals against metadata counters."""
     observation = StructuredObservation.empty_batch(1)[0]
     observation.numerical[:, NUM_IDX_EFFECT_COUNT] = torch.tensor(
         (0,) * 12 + (MAX_EFFECTS, MAX_EFFECTS + 2, 0),
@@ -628,6 +651,7 @@ def _legality_fixture_view(decision: DecisionView) -> FixtureBattleView:
 
 
 def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
+    """Verify that when decision legality is unknown, legality columns are 0 and unknown legality gate flags are raised (1.0)."""
     builder = ObservationBuilder(default_runtime_resources())
     slot = SlotDecision(switch_slots=(2,), move_targets=((-2, 1), (), (), ()), can_mega=True)
     proven = builder.build(_legality_fixture_view(DecisionView(slots=(slot, slot))))
@@ -642,6 +666,7 @@ def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
     assert not unknown.numerical[:, legality_columns].any()
     assert unknown.numerical[0, NUM_IDX_CAN_MEGA] == 0.0
 
+    # Gate columns must indicate unknown status on active slots
     assert proven.numerical[:, NUM_IDX_LEGALITY_UNKNOWN].tolist() == [0.0] * SEQUENCE_LENGTH
     assert unknown.numerical[:2, NUM_IDX_LEGALITY_UNKNOWN].tolist() == [1.0, 1.0]
     assert unknown.numerical[2:, NUM_IDX_LEGALITY_UNKNOWN].sum() == 0.0
@@ -653,6 +678,7 @@ def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
 
 
 def test_switch_slots_identify_roster_members_not_shared_base_species() -> None:
+    """Verify decision_view distinguishes duplicate base species on team by their specific roster index."""
     active = SimpleNamespace(
         moves={"tackle": SimpleNamespace(id="tackle")},
         fainted=False,
@@ -697,6 +723,7 @@ def test_switch_slots_identify_roster_members_not_shared_base_species() -> None:
 
 
 def test_reconstructed_observations_clear_reused_buffer_state() -> None:
+    """Verify build_into on reconstructed replay snapshots clears and overwrites observation buffer tensors across turns."""
     from p0.replays.protocol import parse_replay_payload
     from p0.replays.reconstruct import reconstruct_both
     from tests.unit.replay_fixtures import golden_replay_payload
@@ -732,6 +759,7 @@ def test_reconstructed_observations_clear_reused_buffer_state() -> None:
 
 
 def test_empty_slot_and_fainted_pokemon_zero_padding() -> None:
+    """Verify empty/unrevealed bench slots write empty slot condition (1.0) and zero out stat/move numerical columns."""
     mon = make_real_pokemon(species="pikachu")
     battle = make_real_battle(active_pokemon=[mon, None], team=[mon])
 
@@ -750,8 +778,8 @@ def test_empty_slot_and_fainted_pokemon_zero_padding() -> None:
         assert not obs.numerical[slot_idx, 5:].any()
 
 
-
 def test_field_and_weather_turn_fraction_scaling() -> None:
+    """Verify turn numbers are scaled by 1/24 on the global field token and all output tensors contain finite numbers."""
     mon = make_real_pokemon(species="charizard")
     battle = make_real_battle(
         active_pokemon=[mon, None],
@@ -762,6 +790,6 @@ def test_field_and_weather_turn_fraction_scaling() -> None:
     )
     obs = _OBSERVATION_BUILDER.build(battle_view(battle))
 
-    # Global field token turn count is normalized by 24
+    # Global field token turn count is normalized by 24 (12 / 24 = 0.5)
     assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, 3].item() == pytest.approx(12.0 / 24.0)
     assert all(torch.isfinite(t).all() for t in obs.tensors())

@@ -44,6 +44,16 @@ from p0.model.tokenizer import tokenizer
 
 
 def test_action_contract_round_trips_ids_and_describes_canonical_ranges() -> None:
+    """Verify that action encoding/decoding round-trips all 49 discrete actions across all canonical ranges.
+    
+    Action Range Taxonomy:
+    - [0, 1): Pass action (ID 0)
+    - [1, 7): Switch actions for slots 0-5 (IDs 1-6)
+    - [7, 27): Standard moves (4 move slots x 5 target options = 20 actions, IDs 7-26)
+    - [27, 47): Mega-evolved moves (4 move slots x 5 targets = 20 actions, IDs 27-46)
+    - [47, 48): Forced move with Mega Evolution (ID 47)
+    - [48, 49): Standard forced move / Struggle (ID 48)
+    """
     assert [encode_action(decode_action(action)) for action in range(ACT_SIZE)] == list(
         range(ACT_SIZE)
     )
@@ -65,6 +75,7 @@ def test_action_contract_round_trips_ids_and_describes_canonical_ranges() -> Non
         "forced_move",
         "forced_move",
     ]
+    # Team preview lead pairs: 6 choose 2 permutations = 30 distinct ordered lead combinations
     actions = {
         encode_team_pair(first, second)
         for first in range(6)
@@ -77,6 +88,7 @@ def test_action_contract_round_trips_ids_and_describes_canonical_ranges() -> Non
 
 
 def test_scalar_joint_constraints_match_policy_vectorization() -> None:
+    """Verify that scalar joint validation (validate_joint_action) matches vectorized second_action_mask."""
     view = DecisionView(
         slots=(
             SlotDecision(
@@ -99,6 +111,7 @@ def test_scalar_joint_constraints_match_policy_vectorization() -> None:
 
 
 def test_series_perspective_key_validation() -> None:
+    """Verify SeriesPerspectiveKey validates non-empty series ID and canonical player index in {0, 1}."""
     key0 = SeriesPerspectiveKey("series-1", 0)
     key1 = SeriesPerspectiveKey("series-1", 1)
     assert key0.series_id == "series-1" and key0.canonical_player == 0
@@ -116,6 +129,7 @@ def test_series_perspective_key_validation() -> None:
 
 
 def test_action_encoding_and_decoding_boundary_errors() -> None:
+    """Verify bounds checks on action ID decoding, switch slots, move slots, and targets."""
     with pytest.raises(ValueError, match=r"must be in \[0, 49\)"):
         decode_action(-1)
     with pytest.raises(ValueError, match=r"must be in \[0, 49\)"):
@@ -143,6 +157,7 @@ def test_action_encoding_and_decoding_boundary_errors() -> None:
 
 
 def test_team_preview_bounds_and_validation_errors() -> None:
+    """Verify team preview lead pair encoding enforces roster bounds and member distinctness."""
     with pytest.raises(ValueError, match="outside the roster"):
         encode_team_pair(-1, 0)
     with pytest.raises(ValueError, match="outside the roster"):
@@ -164,6 +179,10 @@ def test_team_preview_bounds_and_validation_errors() -> None:
 
 
 def test_double_force_switch_with_single_available_switch() -> None:
+    """Verify handling when both slots are forced to switch but only one bench Pokémon is alive.
+    
+    Slot 0 gets the switch (action ID 3) and slot 1 falls back to pass (action ID 0), or vice versa.
+    """
     view = DecisionView(
         slots=(
             SlotDecision(switch_slots=(2,), force_switch=True),
@@ -175,6 +194,7 @@ def test_double_force_switch_with_single_available_switch() -> None:
 
 
 def test_apply_joint_constraints_fallback_and_error_resilience() -> None:
+    """Verify joint constraint filtering eliminates duplicate switch targets across both slots."""
     preview = DecisionView(slots=(SlotDecision(), SlotDecision()), team_preview=True)
     mask = np.ones(ACT_SIZE, dtype=np.bool_)
     apply_joint_constraints(mask, preview, first=-1)
@@ -188,12 +208,14 @@ def test_apply_joint_constraints_fallback_and_error_resilience() -> None:
     )
     slot1_mask = np.zeros(ACT_SIZE, dtype=np.bool_)
     slot1_mask[3] = True
+    # If slot 0 took switch to slot 2 (action 3), slot 1 cannot take switch 3 and falls back to pass (0)
     apply_joint_constraints(slot1_mask, view, first=3)
     assert slot1_mask[0]
     assert not slot1_mask[3]
 
 
 def test_event_resolver_prefix_and_protect_activations() -> None:
+    """Verify effect string prefix normalization and mapping of Protect-family activation to EventTypeId.BLOCKED."""
     assert _resolve_effect(tokenizer, "moves", "move: Taunt") == tokenizer.id_for("moves", "taunt")
     assert _resolve_effect(tokenizer, "moves", "Taunt") == tokenizer.id_for("moves", "taunt")
 
@@ -206,6 +228,7 @@ def test_event_resolver_prefix_and_protect_activations() -> None:
             tokenizer,
         )
         assert len(events) == 2
+        # -activate move: Protect is parsed as BLOCKED attributed to attacker entity and defender target
         assert events[1].event_type is EventTypeId.BLOCKED
         assert events[1].entity_id == "p1a: Pikachu"
         assert events[1].target_id == "p2a: Charizard"
@@ -224,6 +247,7 @@ def _struggle_battle(move_id: str, can_mega: bool) -> DecisionView:
 
 
 def test_struggle_env_roundtrip() -> None:
+    """Verify forced moves map to action 48 (standard forced move) or 47 (mega-forced move)."""
     view = _struggle_battle("struggle", can_mega=False)
     assert list(legal_actions(view, 0)) == [48]
 
@@ -234,6 +258,7 @@ def test_struggle_env_roundtrip() -> None:
 
 
 def test_action_ids_cover_all_boundary_categories() -> None:
+    """Verify exact mapping between specific boundary action integers and semantic SlotAction structures."""
     expected = {
         0: SlotAction(ActionKind.PASS),
         1: SlotAction(ActionKind.SWITCH, switch_slot=0),
@@ -283,6 +308,11 @@ def test_team_preview_pairs_and_joint_constraints_preserve_uniqueness() -> None:
 
 
 def test_unknown_legality_masks_are_supersets_of_the_proven_mask() -> None:
+    """Verify that when slot legality is unknown, the action mask admits all possible actions (conservative superset).
+    
+    When legality is unproven, the model permits pass (0) and forced moves (47, 48) in addition
+    to candidate moves to ensure the policy never gets blocked by incomplete information.
+    """
     proven = SlotDecision(switch_slots=(2,), move_targets=((-2, 1), (), (), ()), can_mega=True)
     unknown = SlotDecision(
         switch_slots=(2,),
@@ -296,6 +326,7 @@ def test_unknown_legality_masks_are_supersets_of_the_proven_mask() -> None:
     proven_mask = action_mask(proven_view)
     unknown_mask = action_mask(unknown_view)
 
+    # Unknown mask must be a superset of the proven mask
     assert np.all(unknown_mask >= proven_mask)
     assert set(legal_actions(unknown_view, 0)) - set(legal_actions(proven_view, 0)) == {0, 47, 48}
 
@@ -305,12 +336,14 @@ def _local_parse_events(raw_events: list[RawBattleEvent]) -> list[BattleEvent]:
 
 
 def test_hp_fraction_accepts_showdown_status_suffixes() -> None:
+    """Verify get_hp_fraction correctly strips Showdown health color suffixes ('g', 'y') and handles fainted ('0 fnt')."""
     assert get_hp_fraction("50/100g") == 0.5
     assert get_hp_fraction("20/100y") == 0.2
     assert get_hp_fraction("0 fnt") == 0.0
 
 
 def test_parse_events_returns_typed_events_in_protocol_order() -> None:
+    """Verify parse_events converts raw protocol lines into typed BattleEvent objects with numeric damage deltas."""
     raw_events = [
         RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
         RawBattleEvent(
@@ -329,6 +362,7 @@ def test_parse_events_returns_typed_events_in_protocol_order() -> None:
     assert len(events) == 8
     assert events[0].event_type == EventTypeId.MOVE
     assert events[1].event_type == EventTypeId.DAMAGE
+    # Damage delta computed as post_hp (0.50) - pre_hp (0.75) = -0.25
     assert events[1].value == pytest.approx(-0.25)
     assert events[2].event_type == EventTypeId.FAINT
     assert events[3].event_type == EventTypeId.SWITCH_IN
@@ -339,6 +373,7 @@ def test_parse_events_returns_typed_events_in_protocol_order() -> None:
 
 
 def test_parse_events_distinguishes_failed_and_blocked_moves() -> None:
+    """Verify distinction between immunity/block (-immune -> BLOCKED) and move execution failure (-fail -> FAILED)."""
     raw_events = [
         RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
         RawBattleEvent(("", "-immune", "p2a: Charizard")),
@@ -353,6 +388,7 @@ def test_parse_events_distinguishes_failed_and_blocked_moves() -> None:
 
 
 def test_parse_events_resets_last_attacker_at_turn_boundaries() -> None:
+    """Verify turn markers reset attacker context so subsequent failures attribute to the acting entity directly."""
     events = _local_parse_events(
         [
             RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
@@ -365,6 +401,7 @@ def test_parse_events_resets_last_attacker_at_turn_boundaries() -> None:
 
 
 def test_parse_events_clears_inferred_sources_at_upkeep_boundaries() -> None:
+    """Verify upkeep boundary clears inferred source Pokémon so residual effects don't falsely attribute to prior moves."""
     events = _local_parse_events(
         [
             RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
@@ -387,6 +424,7 @@ def test_parse_events_clears_inferred_sources_at_upkeep_boundaries() -> None:
 
 
 def test_ability_field_and_move_evidence() -> None:
+    """Verify ability activation, field terrain starts/ends, and move metadata flag extraction."""
     events = _local_parse_events(
         [
             RawBattleEvent(
@@ -409,6 +447,7 @@ def test_ability_field_and_move_evidence() -> None:
 
 
 def test_status_codes_resolve_against_vocab() -> None:
+    """Verify status codes (par, slp, etc.) resolve to positive non-zero tokenizer vocabulary IDs."""
     events = _local_parse_events(
         [
             RawBattleEvent(("", "-status", "p2a: Charizard", "par")),
@@ -420,6 +459,7 @@ def test_status_codes_resolve_against_vocab() -> None:
 
 
 def test_cant_prepare_and_singlemove() -> None:
+    """Verify parsing for cant (flinch/sleep), two-turn move charging (-prepare), and single-turn volatiles (-singlemove)."""
     events = _local_parse_events(
         [
             RawBattleEvent(("", "cant", "p1a: Pikachu", "flinch")),
@@ -443,6 +483,7 @@ def test_cant_prepare_and_singlemove() -> None:
 
 
 def test_boost_manipulation_family() -> None:
+    """Verify parsing across all boost event variants: set, clear, clear-negative, clear-all, swap, invert, copy."""
     events = _local_parse_events(
         [
             RawBattleEvent(
@@ -474,6 +515,7 @@ def test_boost_manipulation_family() -> None:
 
 
 def test_transform_endability_activate_notarget() -> None:
+    """Verify transform, ability suppression, volatile/ability activations, and no-target events."""
     events = _local_parse_events(
         [
             RawBattleEvent(("", "-transform", "p1a: Ditto", "p2a: Dragapult")),
@@ -500,6 +542,7 @@ def test_transform_endability_activate_notarget() -> None:
 
 
 def test_blocked_keeps_both_endpoints() -> None:
+    """Verify blocked events (Protect, immunity, misses) preserve both attacker entity_id and defender target_id."""
     events = _local_parse_events(
         [
             RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
@@ -524,6 +567,7 @@ def test_blocked_keeps_both_endpoints() -> None:
 
 
 def test_weather_upkeep_is_skipped() -> None:
+    """Verify repetitive weather upkeep protocol lines ('[upkeep]') are filtered out."""
     events = _local_parse_events(
         [
             RawBattleEvent(("", "-weather", "SunnyDay")),
@@ -539,6 +583,7 @@ def test_weather_upkeep_is_skipped() -> None:
 
 
 def test_diagnostics_count_oov_and_missing_pre_hp() -> None:
+    """Verify EVENT_DIAGNOSTICS dictionary tracks unknown OOV tokens and missing pre-damage HP values."""
     EVENT_DIAGNOSTICS.clear()
     events = _local_parse_events(
         [
@@ -552,6 +597,7 @@ def test_diagnostics_count_oov_and_missing_pre_hp() -> None:
 
 
 def test_truncation_keeps_structural_events() -> None:
+    """Verify truncate_events prioritizes critical structural events (weather, side conditions, switches, mega) over repetitive damage."""
     events = [BattleEvent(EventTypeId.DAMAGE, "p1a: Pikachu", order=i) for i in range(64)]
     events.extend(
         [
@@ -572,11 +618,13 @@ def test_truncation_keeps_structural_events() -> None:
         EventTypeId.MEGA,
         EventTypeId.EFFECT_START,
     } <= kept_types
+    # Verify events remain in chronological order
     orders = [event.order for event in selected]
     assert orders == sorted(orders)
 
 
 def test_protocol_event_stream_matches_showdown_golden_types() -> None:
+    """Verify parse_events output matches the canonical 42-event GOLDEN_EVENT_TYPES sequence."""
     from tests.unit.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
 
     EVENT_DIAGNOSTICS.clear()
@@ -594,6 +642,7 @@ def test_protocol_event_stream_matches_showdown_golden_types() -> None:
 
 
 def test_event_truncation_keeps_priority_events_and_protocol_order() -> None:
+    """Verify truncate_events preserves chronological sequence sorting and high-priority event types."""
     from tests.unit.replay_fixtures import golden_raw_events
 
     EVENT_DIAGNOSTICS.clear()
@@ -608,6 +657,7 @@ def test_event_truncation_keeps_priority_events_and_protocol_order() -> None:
 
 
 def test_malformed_and_incomplete_protocol_lines_are_diagnosed_without_fabrication() -> None:
+    """Verify parser resilience when handling truncated/malformed protocol messages without fabricating false data."""
     from tests.unit.replay_fixtures import GOLDEN_EVENT_TYPES, golden_raw_events
 
     EVENT_DIAGNOSTICS.clear()
@@ -632,6 +682,7 @@ def test_malformed_and_incomplete_protocol_lines_are_diagnosed_without_fabricati
 
 
 def test_event_truncation_handles_below_equal_and_above_capacity_limits() -> None:
+    """Verify truncate_events behavior when total event count is below, exactly equal, or above limit."""
     from tests.unit.replay_fixtures import golden_raw_events
 
     events = parse_events(list(golden_raw_events()) * 2, tokenizer)
@@ -643,6 +694,7 @@ def test_event_truncation_handles_below_equal_and_above_capacity_limits() -> Non
 
 
 def test_protocol_parser_accepts_an_injected_resource_resolver() -> None:
+    """Verify parse_events accepts a custom resolver implementation for vocabulary ID mapping."""
     resolver = SimpleNamespace(
         resolve=lambda table, name: (
             (17, "exact") if table == "moves" and name == "Tackle" else (0, "exact")

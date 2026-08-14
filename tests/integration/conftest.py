@@ -20,17 +20,27 @@ SHOWDOWN_TEST_PORT = 8120
 
 @pytest.fixture(scope="session")
 def battle_format() -> str:
+    """Canonical battle format identifier (e.g. gen9ou) under test."""
     return FORMAT.battle_format
 
 
 @pytest.fixture(scope="session")
 def sample_team() -> str:
+    """Return a packed team string converted from standard Showdown export text.
+    
+    Packed format is required for direct wire transmission when initializing
+    Showdown player sessions.
+    """
     return ValidatedTeam.from_showdown(DEFAULT_TEST_TEAM).packed
 
 
 @pytest.fixture(scope="function")
 def showdown_server():
-    """Start a local Showdown server for integration tests."""
+    """Start a local ephemeral Showdown server process for live battle integration tests.
+    
+    Skips the test gracefully if the Pokemon-Showdown node repository is not present locally.
+    Yields custom ServerConfiguration targeting the dedicated test port.
+    """
     if not DEFAULT_PATHS.showdown_root.exists():
         pytest.skip("pokemon-showdown directory not found. Skipping live server tests.")
 
@@ -43,6 +53,11 @@ def showdown_server():
 
 
 def _integration_devices() -> tuple[torch.device, ...]:
+    """Parse requested test devices from P0_INTEGRATION_DEVICES environment variable.
+    
+    Defaults to checking both CPU and CUDA (if CUDA is actually available on the host).
+    Deduplicates device entries while preserving order, falling back to CPU if empty.
+    """
     requested = tuple(
         value.strip().lower()
         for value in os.getenv("P0_INTEGRATION_DEVICES", "cpu,cuda").split(",")
@@ -61,13 +76,20 @@ def _integration_devices() -> tuple[torch.device, ...]:
 
 @pytest.fixture(params=_integration_devices(), ids=lambda device: device.type)
 def model_device(request: pytest.FixtureRequest) -> torch.device:
+    """Parametrize tests across available execution devices (e.g., CPU, CUDA)."""
     return request.param
 
 
 @pytest.fixture
 def model_policy(model_device: torch.device):
+    """Instantiate a minimal Transformer policy in eval mode for integration testing.
+    
+    Uses small dimensions (d_model=32, 1 reducer layer) to keep forward pass execution
+    fast while exercising the complete forward pipeline and action masking on the target device.
+    """
     policy = build_policy(
         ModelConfig(d_model=32, nhead=2, reducer_layers=1, dim_feedforward=128),
         default_runtime_resources(),
     )
     return policy.to(model_device).eval()
+

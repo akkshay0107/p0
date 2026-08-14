@@ -11,7 +11,11 @@ from p0.format_config import FORMAT
 
 
 def golden_series_id(parent: str) -> str:
-    """Return the independently calculated series identity for this fixture family."""
+    """Return the independently calculated series identity for this fixture family.
+    
+    Computes a deterministic 24-character SHA-256 hash from format ID, parent series ID,
+    and lowercase player names ('alice', 'bob').
+    """
     value = "\n".join((FORMAT.bo3_format, parent, "alice", "bob"))
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
@@ -25,7 +29,11 @@ def golden_replay_payload(
     players: tuple[str, str] = ("Alice", "Bob"),
     first_move_target: str | None = "p1a: Pikachu",
 ) -> dict[str, Any]:
-    """Return a replay payload with the pinned protocol shape."""
+    """Return a replay payload with the pinned protocol shape.
+    
+    Emits valid Showdown protocol messages including teampreview, showteam JSON rosters,
+    lead switches, turn 1 move execution with optional target specification, and win declaration.
+    """
     p1_team = [
         {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
         {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
@@ -68,7 +76,11 @@ def golden_replay_payload(
 
 
 def golden_raw_events() -> tuple[RawBattleEvent, ...]:
-    """Return Showdown event lines with a documented type order."""
+    """Return Showdown event lines with a documented type order spanning all protocol event variants.
+    
+    Includes 42 discrete events covering moves (standard, unknown, single-move), switches,
+    stat boosts, status effects, items, abilities, weather, terrain, and non-event chat lines.
+    """
     return (
         RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard")),
         RawBattleEvent(("", "move", "p1a: Pikachu", "definitely-not-a-move", "p2a: Charizard")),
@@ -116,6 +128,8 @@ def golden_raw_events() -> tuple[RawBattleEvent, ...]:
     )
 
 
+# 1:1 ground truth mapped EventTypeId sequence corresponding to golden_raw_events()
+# Note: Non-event lines (like 'chat') are discarded during parsing, yielding 42 parsed types.
 GOLDEN_EVENT_TYPES = (
     EventTypeId.MOVE,
     EventTypeId.MOVE,

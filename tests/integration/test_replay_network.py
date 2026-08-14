@@ -15,6 +15,14 @@ PINNED_PUBLIC_CHAMPIONS_BO3_REPLAY = "gen9championsvgc2026regmbbo3-2653729595"
 @pytest.mark.integration
 @pytest.mark.network
 def test_pinned_public_champions_bo3_series_round_trips(tmp_path: Path) -> None:
+    """End-to-end network test: fetch a known public Best-of-3 replay from Showdown, parse, and validate.
+    
+    Verifies that:
+    1. ReplayFetcher downloads the target replay and any sibling games in the series over HTTPS.
+    2. Gzipped raw JSON payload is persisted to cache and parsed correctly into ReplayDocuments.
+    3. ReplayDocument dictionary serialization/deserialization is completely lossless.
+    4. Series grouping correctly associates the games into a completed BO3 series with games 1 and 2.
+    """
     config = ScrapeConfig(
         format_id=FORMAT.bo3_format,
         cache_dir=tmp_path,
@@ -22,6 +30,7 @@ def test_pinned_public_champions_bo3_series_round_trips(tmp_path: Path) -> None:
         retries=2,
         rate_limit_per_second=0,
     )
+    # Fetch the pinned replay; ReplayFetcher automatically resolves sibling matches for BO3 series
     entries = ReplayFetcher(config).acquire((PINNED_PUBLIC_CHAMPIONS_BO3_REPLAY,))
     documents = tuple(
         parse_replay_payload(
@@ -33,12 +42,15 @@ def test_pinned_public_champions_bo3_series_round_trips(tmp_path: Path) -> None:
     )
     series = validated_bo3_series(documents)
 
+    # A 2-0 sweep in BO3 yields exactly 2 replay documents grouped into 1 series
     assert len(entries) == 2
     assert len(series) == 1
     assert all(document.metadata.format_id == config.format_id for document in documents)
     assert all(document.raw_payload for document in documents)
+    # Ensure ReplayDocument serialization to dict and reconstruction from dict is lossless
     assert tuple(
         ReplayDocument.from_dict(document.to_dict()).to_dict() for document in documents
     ) == tuple(document.to_dict() for document in documents)
+    # Validate sequential match ordering and completion status of the series
     assert [membership.game_number for membership in series[0].memberships] == [1, 2]
     assert series[0].record.is_complete

@@ -208,6 +208,7 @@ def _mock_validator(variants: Sequence[TeamRecord], **kwargs: Any) -> tuple[Admi
 
 
 def test_team_hash_ignores_display_and_member_order() -> None:
+    """Verify CanonicalTeam team_hash computation is invariant to member permutation or nickname ordering."""
     first = _mock_team_variant()
     reversed_members = tuple(reversed(first.team.members))
     second = _mock_team_variant(members=reversed_members)
@@ -215,6 +216,7 @@ def test_team_hash_ignores_display_and_member_order() -> None:
 
 
 def test_deduplication_merges_metadata_but_preserves_spread_variants() -> None:
+    """Verify deduplicate_variants merges replay/series metadata for identical teams while preserving distinct EV spread variants."""
     first = _mock_team_variant()
     duplicate = replace(first, metadata=_metadata("series-2", 2))
     alternate = replace(
@@ -229,6 +231,7 @@ def test_deduplication_merges_metadata_but_preserves_spread_variants() -> None:
 
 
 def test_team_record_serialization_round_trip_is_strict() -> None:
+    """Verify TeamRecord and TeamMetadata serialize and deserialize strictly, rejecting unknown fields."""
     variant = _mock_team_variant()
     assert TeamRecord.from_dict(variant.to_dict()) == replace(
         variant, team=variant.team.canonical()
@@ -239,6 +242,7 @@ def test_team_record_serialization_round_trip_is_strict() -> None:
 
 
 def test_corpus_builder_admits_valid_variants() -> None:
+    """Verify build_corpus validates legal variants and generates coverage audit reports."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     v1 = _mock_team_variant("Pikachu", usage_count=5)
     v2 = _mock_team_variant("Charizard", source_series=("series-2",), usage_count=3)
@@ -258,6 +262,7 @@ def test_corpus_builder_admits_valid_variants() -> None:
 
 
 def test_corpus_builder_rejects_oov_species() -> None:
+    """Verify build_corpus filters out team variants containing out-of-vocabulary species."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     v_valid = _mock_team_variant("Pikachu")
     v_oov = _mock_team_variant("Missingno")
@@ -274,6 +279,7 @@ def test_corpus_builder_rejects_oov_species() -> None:
 
 
 def test_corpus_builder_rejects_showdown_invalid() -> None:
+    """Verify build_corpus filters out variants that fail Showdown legality validation."""
     tokenizer = PokemonTokenizer(_mock_vocab())
 
     def failing_validator(
@@ -313,6 +319,7 @@ def test_corpus_builder_rejects_showdown_invalid() -> None:
 
 
 def test_split_assignment_prevents_series_leakage() -> None:
+    """Verify team variants originating from the same series ID are assigned to the same split (train/val/test)."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     v1 = _mock_team_variant("Pikachu", source_series=("shared-series",))
     v2 = _mock_team_variant("Charizard", source_series=("shared-series",))
@@ -328,11 +335,13 @@ def test_split_assignment_prevents_series_leakage() -> None:
     )
     assert len(manifest.entries) == 3
     by_species = {entry.canonical_hash: entry.split for entry in manifest.entries}
+    # Variants from shared-series must occupy identical split partition
     assert by_species[v1.team.team_hash] == by_species[v2.team.team_hash]
     assert by_species[v3.team.team_hash] in {CorpusSplit.TRAIN, CorpusSplit.VALIDATION}
 
 
 def test_audit_corpus_and_coverage() -> None:
+    """Verify audit_corpus accurately aggregates admitted counts, species coverage sets, and split distribution."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     v1 = _mock_team_variant("Pikachu", usage_count=10)
     v2 = _mock_team_variant("Charizard", source_series=("s2",), usage_count=5)
@@ -346,6 +355,7 @@ def test_audit_corpus_and_coverage() -> None:
 
 
 def test_populate_pool_directories(tmp_path: Path) -> None:
+    """Verify populate_pool_directories creates full 'all' and top-usage filtered 'reduced' team pool manifests."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     # Each variant needs a unique species or move so canonical_hash is distinct
     unique_variants = tuple(
@@ -424,6 +434,7 @@ def _write_manifest(
 
 
 def test_corpus_source_implements_protocol_and_describes(tmp_path: Path) -> None:
+    """Verify CorpusTeamSource satisfies the TeamSource protocol and provides accurate metadata descriptions."""
     entries = tuple(_make_entry(i) for i in range(5))
     path, manifest = _write_manifest(tmp_path, entries)
     spec = CorpusSourceSpec(
@@ -450,6 +461,7 @@ def test_corpus_source_implements_protocol_and_describes(tmp_path: Path) -> None
 
 
 def test_corpus_source_validates_spec(tmp_path: Path) -> None:
+    """Verify CorpusTeamSource rejects mismatched corpus hashes and format IDs."""
     entries = tuple(_make_entry(i) for i in range(3))
     path, manifest = _write_manifest(tmp_path, entries)
 
@@ -475,6 +487,7 @@ def test_corpus_source_validates_spec(tmp_path: Path) -> None:
 
 
 def test_corpus_source_rejects_empty_filtered_pool(tmp_path: Path) -> None:
+    """Verify CorpusTeamSource raises ValueError when split filter produces 0 available entries."""
     entries = tuple(_make_entry(i, split=CorpusSplit.TRAIN) for i in range(3))
     path, manifest = _write_manifest(tmp_path, entries)
     spec = CorpusSourceSpec(
@@ -488,6 +501,7 @@ def test_corpus_source_rejects_empty_filtered_pool(tmp_path: Path) -> None:
 
 
 def test_uniform_canonical_sampling(tmp_path: Path) -> None:
+    """Verify uniform canonical sampling equalizes archetype probabilities regardless of variant counts per archetype."""
     # 90 entries for canonical 1, 10 entries for canonical 2
     entries_1 = tuple(_make_entry(i, canonical_index=1, usage_count=100) for i in range(1, 91))
     entries_2 = tuple(_make_entry(i, canonical_index=2, usage_count=100) for i in range(91, 101))
@@ -513,7 +527,7 @@ def test_uniform_canonical_sampling(tmp_path: Path) -> None:
 
 
 def test_uniform_sampling_index(tmp_path: Path) -> None:
-    # Uniform canonical sampling builds its immutable pools at construction time.
+    """Verify immutable canonical sampling pools are precomputed during CorpusTeamSource initialization."""
     e1 = _make_entry(1, canonical_index=1, usage_count=100)
     e2 = _make_entry(2, canonical_index=2, usage_count=100)
     path, manifest = _write_manifest(tmp_path, (e1, e2))
@@ -563,6 +577,7 @@ Modest Nature
 
 
 def test_validate_many_preserves_order_and_parses_diagnostics():
+    """Verify validate_many preserves variant ordering and parses validation results."""
     calls = []
 
     def runner(*args, **kwargs):
@@ -581,11 +596,13 @@ def test_validate_many_preserves_order_and_parses_diagnostics():
 
 
 def test_validated_team_rejects_untrusted_packed_values():
+    """Verify ValidatedTeam verifies SHA-256 hash length and formatting."""
     with pytest.raises(ValueError, match="SHA-256"):
         ValidatedTeam("packed", "short")
 
 
 def test_validate_many_empty_returns_empty_tuple() -> None:
+    """Verify validate_many on empty inputs returns () without invoking subprocess runner."""
     calls: list[Any] = []
 
     def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -598,6 +615,7 @@ def test_validate_many_empty_returns_empty_tuple() -> None:
 
 
 def test_validate_many_batched_splits_chunks_and_preserves_order() -> None:
+    """Verify validate_many_batched breaks variant lists into batch_size chunks and preserves return ordering."""
     calls: list[str] = []
 
     def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -627,6 +645,7 @@ def test_validate_many_batched_splits_chunks_and_preserves_order() -> None:
 
 
 def test_validate_many_delegates_to_batched_runner() -> None:
+    """Verify validate_many seamlessly delegates batch execution to validate_many_batched."""
     calls: list[str] = []
 
     def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -644,6 +663,7 @@ def test_validate_many_delegates_to_batched_runner() -> None:
 
 
 def test_validate_many_batched_handles_process_failure() -> None:
+    """Verify validate_many_batched raises RuntimeError when validation subprocess returns non-zero exit code."""
     def failing_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="Node error")
 
@@ -652,6 +672,7 @@ def test_validate_many_batched_handles_process_failure() -> None:
 
 
 def test_validate_many_batched_handles_timeout() -> None:
+    """Verify validate_many_batched raises RuntimeError upon subprocess timeout expiration."""
     def timeout_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(args[0], 30.0)
 
@@ -660,6 +681,7 @@ def test_validate_many_batched_handles_timeout() -> None:
 
 
 def test_validate_many_batched_handles_malformed_json() -> None:
+    """Verify validate_many_batched raises RuntimeError when subprocess outputs non-JSON payload."""
     def malformed_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args[0], 0, stdout="not json", stderr="")
 
@@ -668,6 +690,7 @@ def test_validate_many_batched_handles_malformed_json() -> None:
 
 
 def test_persistent_showdown_validator_lifecycle_and_validation() -> None:
+    """Verify PersistentShowdownValidator manages daemon subprocess stdin/stdout communication and shutdown."""
     calls: list[str] = []
     closed = [False]
 
@@ -730,6 +753,7 @@ def test_persistent_showdown_validator_lifecycle_and_validation() -> None:
 
 
 def test_single_team_validation_reports_pinned_runner_failures() -> None:
+    """Verify validate_variant raises RuntimeError with stderr output on validation failure."""
     variant = _mock_team_variant()
 
     def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -754,6 +778,7 @@ _BASE_STATS = {"hp": 78, "atk": 65, "def": 68, "spa": 112, "spd": 154, "spe": 75
 
 
 def test_parse_spread_key_rejects_illegal_and_malformed() -> None:
+    """Verify parse_spread_key enforces stat cap of 32, total budget of 66, and 6 stat components."""
     parsed = parse_spread_key("Impish:32/0/21/0/11/2")
     assert parsed is not None
     nature, points = parsed
@@ -768,6 +793,7 @@ def test_parse_spread_key_rejects_illegal_and_malformed() -> None:
 
 
 def test_spread_table_blends_shared_buckets_toward_bo3() -> None:
+    """Verify spread table blends Bo3 and Bo1 distributions according to BO3_BLEND_WEIGHT (0.8/0.2)."""
     only_bo3 = "Timid:2/0/0/32/0/32"
     only_bo1 = "Timid:32/0/0/32/0/2"
     payload = build_spread_table(
@@ -789,6 +815,7 @@ def test_spread_table_blends_shared_buckets_toward_bo3() -> None:
 
 
 def test_spread_table_uses_single_source_when_bucket_is_absent() -> None:
+    """Verify spread table adopts 100% weight when a spread appears in only one format export."""
     payload = build_spread_table(
         _chaos("Sylveon", {"Calm:32/0/0/0/32/2": 5.0}),
         _chaos("Incineroar", {"Impish:32/0/32/0/2/0": 5.0}),
@@ -804,6 +831,7 @@ def test_spread_table_uses_single_source_when_bucket_is_absent() -> None:
 
 
 def test_spread_table_prunes_rare_natures() -> None:
+    """Verify build_spread_table prunes natures below min_nature_share threshold (e.g. 5%)."""
     common = "Timid:2/0/0/32/0/32"
     rare = "Hardy:32/0/32/0/2/0"
     export = _chaos("Gholdengo", {common: 99.0, rare: 1.0})
@@ -825,6 +853,7 @@ def test_spread_table_prunes_rare_natures() -> None:
 
 
 def test_spread_table_truncates_and_renormalizes() -> None:
+    """Verify spread tables truncate entries to max_spreads per bucket and re-normalize probabilities to 1.0."""
     # Each allocation sums to 64, so all twenty are legal and distinct.
     spreads = {f"Jolly:{n}/{32 - n}/0/0/0/32": float(20 - n) for n in range(20)}
     export = _chaos("Garchomp", spreads)
@@ -843,6 +872,7 @@ def test_spread_table_truncates_and_renormalizes() -> None:
 
 
 def test_spread_table_rejects_unsupported_schema() -> None:
+    """Verify load_spread_table rejects invalid or unsupported schema versions."""
     payload = build_spread_table(
         _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
         _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
@@ -855,6 +885,7 @@ def test_spread_table_rejects_unsupported_schema() -> None:
 
 
 def test_spread_table_lookup_normalizes_species_and_nature() -> None:
+    """Verify spread table lookups normalize species names and natures case-insensitively."""
     payload = build_spread_table(
         _chaos("Charizard-Mega-Y", {"Timid:2/0/0/32/0/32": 1.0}),
         _chaos("Charizard-Mega-Y", {"Timid:2/0/0/32/0/32": 1.0}),
@@ -871,6 +902,7 @@ def test_spread_table_lookup_normalizes_species_and_nature() -> None:
 
 
 def test_cosmetic_formes_alias_onto_their_base_species() -> None:
+    """Verify cosmetic forme variations (e.g. Florges colours) automatically alias to base species."""
     dex = _dex(
         {
             "id": "florges",
@@ -889,7 +921,7 @@ def test_cosmetic_formes_alias_onto_their_base_species() -> None:
 
 
 def test_formes_with_distinct_base_stats_are_never_aliased() -> None:
-    """Floette's forme list mixes cosmetic colours with genuinely separate Pokemon."""
+    """Verify forme variations with distinct base stats (e.g. Floette-Eternal) are excluded from cosmetic aliasing."""
     eternal_stats = {"hp": 74, "atk": 65, "def": 67, "spa": 125, "spd": 128, "spe": 92}
     dex = _dex(
         {
@@ -914,7 +946,7 @@ def test_formes_with_distinct_base_stats_are_never_aliased() -> None:
 
 
 def test_aliases_resolve_in_one_hop_without_cycles() -> None:
-    """Variants that all list each other must converge on one canonical target."""
+    """Verify forme aliases resolve cleanly in a single lookup step without alias chaining or cycles."""
     shared = dict(_BASE_STATS)
     dex = _dex(
         *(
@@ -938,6 +970,7 @@ def test_aliases_resolve_in_one_hop_without_cycles() -> None:
 
 
 def test_aliased_forme_shares_the_base_species_bucket() -> None:
+    """Verify aliased cosmetic formes return the identical memory object as their base species."""
     dex = _dex(
         {
             "id": "florges",
@@ -974,15 +1007,14 @@ _ONE_BUCKET = {"real": {"timid": [[2, 0, 0, 32, 0, 32, 1000]]}}
 
 
 def test_load_rejects_bucket_that_is_not_weight_descending() -> None:
-    """best() takes entry zero as the argmax, so unsorted rows would answer wrongly."""
+    """Verify load_spread_table rejects spread buckets that are not strictly sorted in descending weight order."""
     unsorted_rows = {"real": {"timid": [[32, 0, 0, 32, 0, 2, 100], [2, 0, 0, 32, 0, 32, 900]]}}
     with pytest.raises(ValueError, match="weight-descending"):
         load_spread_table(_payload(unsorted_rows))
 
 
 def test_load_rejects_unresolvable_aliases() -> None:
-    # An alias whose target is itself an alias expands against nothing, and one whose
-    # target does not exist expands to nothing; both would serve empty lookups.
+    """Verify load_spread_table rejects missing targets or alias chains."""
     with pytest.raises(ValueError, match="unknown species"):
         load_spread_table(_payload(_ONE_BUCKET, {"ghost": "missing"}))
     with pytest.raises(ValueError, match="unknown species|through another alias"):
@@ -990,14 +1022,13 @@ def test_load_rejects_unresolvable_aliases() -> None:
 
 
 def test_load_accepts_a_single_hop_alias() -> None:
+    """Verify load_spread_table accepts single-hop valid cosmetic aliases."""
     table = load_spread_table(_payload(_ONE_BUCKET, {"cosmetic": "real"}))
     assert table.best("cosmetic", "timid") == table.best("real", "timid")
 
 
 def test_usage_export_url_matches_the_published_layout() -> None:
-    """The artifact can only be rebuilt if this URL keeps matching Smogon's layout."""
-    # The literal is the point: it pins the external layout Smogon publishes, which
-    # no constant in this repo can verify for us.
+    """Verify Smogon stats URL formatter generates valid external chaos data paths."""
     url = USAGE_URL.format(month="2026-07", format_id="gen9championsvgc2026regmb", cutoff=1760)
     assert url == (
         "https://www.smogon.com/stats/2026-07/chaos/gen9championsvgc2026regmb-1760.json.gz"
@@ -1005,7 +1036,7 @@ def test_usage_export_url_matches_the_published_layout() -> None:
 
 
 def test_shipped_spread_table_records_the_exports_it_came_from() -> None:
-    """A stale month must be visible in the committed artifact, not just in the builder."""
+    """Verify committed spread_usage.json records source month, format filenames, and SHA-256 digests."""
     payload = orjson.loads(DEFAULT_SPREAD_TABLE_PATH.read_bytes())
     source = payload["source"]
 
@@ -1018,6 +1049,7 @@ def test_shipped_spread_table_records_the_exports_it_came_from() -> None:
 
 
 def test_first_point_and_nature_truncation_match_showdown():
+    """Verify calculate_stats stat formulas match Showdown Gen 9 stat calculations at level 50."""
     base = BaseStats(100, 100, 100, 100, 100, 100)
     zero = calculate_stats(base, StatPoints(), "adamant")
     one = calculate_stats(base, StatPoints(atk=1), "adamant")
@@ -1033,11 +1065,13 @@ def test_first_point_and_nature_truncation_match_showdown():
     ],
 )
 def test_stat_point_validation(points, error):
+    """Verify StatPoints enforces 0..32 per-stat bounds and 66 total point budget."""
     with pytest.raises(ValueError, match=error):
         StatPoints(**points)
 
 
 def test_fallback_follows_move_category_priority() -> None:
+    """Verify fallback_points allocates 66 points using category priority: physical > special > status."""
     physical = StatPoints(hp=32, atk=32, spe=2)
     special = StatPoints(hp=32, spa=32, spe=2)
     status = StatPoints(hp=32, defense=17, spd=17)
@@ -1057,14 +1091,14 @@ def test_fallback_follows_move_category_priority() -> None:
 
 
 def test_fallback_is_unknown_when_no_category_reaches_two() -> None:
-    # Four moves across three categories always leave one category with two, so this
-    # is only reachable when fewer than four moves are known.
+    """Verify fallback_points returns None when known move categories are insufficient to establish archetype."""
     assert fallback_points(("physical", "special", "status")) is None
     assert fallback_points(()) is None
     assert fallback_points(("physical",)) is None
 
 
 def test_usage_prior_beats_fallback_and_reports_confidence() -> None:
+    """Verify resolve() prioritizes empirical usage table over generic category fallback."""
     table = load_spread_table_file()
     categories = ("physical", "status", "physical", "status")
 
@@ -1086,6 +1120,7 @@ def test_usage_prior_beats_fallback_and_reports_confidence() -> None:
 
 
 def test_usage_prior_resolution_is_deterministic() -> None:
+    """Verify resolve() produces identical StatPoints across multiple invocations."""
     table = load_spread_table_file()
     categories = ("special", "status", "special", "status")
     first = table.resolve("Charizard-Mega-Y", "Timid", categories)
@@ -1116,6 +1151,7 @@ def _corpus_manifest(entries: tuple[CorpusEntry, ...]) -> TeamCorpusManifest:
 
 
 def test_corpus_manifest_contract() -> None:
+    """Verify TeamCorpusManifest serializes losslessly and enforces canonical hash contracts."""
     entries = (_corpus_entry("team-a"), _corpus_entry("team-b"))
     assert entries[0].spread_provenance == "imputed"
     manifest = _corpus_manifest(entries)
@@ -1139,6 +1175,7 @@ def test_corpus_manifest_contract() -> None:
 
 
 def test_corpus_source_spec_validates() -> None:
+    """Verify CorpusSourceSpec validates split parameter."""
     spec = CorpusSourceSpec(
         corpus_path="teams/corpus_manifest.json",
         corpus_hash="a" * 64,
@@ -1156,6 +1193,7 @@ def test_corpus_source_spec_validates() -> None:
 
 
 def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
+    """Verify _team_source instantiates CorpusTeamSource when provided a corpus manifest path."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     contract_hash = current_manifest().global_sha256
     v1 = _mock_team_variant("Pikachu")
@@ -1185,6 +1223,7 @@ def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
 
 
 def test_team_source_composition_falls_back_to_file_source(tmp_path: Path) -> None:
+    """Verify _team_source instantiates FileTeamSource when path points to a raw directory containing text files."""
     pool_dir = tmp_path / "pool"
     pool_dir.mkdir()
     team_text = "\n\n".join(
@@ -1199,6 +1238,7 @@ def test_team_source_composition_falls_back_to_file_source(tmp_path: Path) -> No
 def test_corpus_cli_build_and_audit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Verify corpus CLI subcommands ('build' and 'audit') execute and output valid JSON audit results."""
     monkeypatch.setattr("p0.cli.corpus.current_manifest", lambda: current_manifest())
     monkeypatch.setattr(
         "p0.cli.corpus.PokemonTokenizer.from_file", lambda: PokemonTokenizer(_mock_vocab())
@@ -1252,6 +1292,7 @@ def test_corpus_cli_build_and_audit(
 
 
 def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> None:
+    """Verify _team_source resolves corpus_manifest.json located inside directory path."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     contract_hash = current_manifest().global_sha256
     v1 = _mock_team_variant("Pikachu")
@@ -1275,6 +1316,7 @@ def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> 
 
 
 def test_variants_from_showdown_with_dex() -> None:
+    """Verify _variants_from_showdown extracts EV spreads using dex move category inspection."""
     mock_dex = {
         "species": [
             {
@@ -1300,6 +1342,7 @@ def test_variants_from_showdown_with_dex() -> None:
 
 
 def test_corpus_manifest_hash_is_order_independent_but_packed_content_bound() -> None:
+    """Verify corpus content hash calculation is invariant to entry permutation but sensitive to packed team changes."""
     entries = tuple(
         CorpusEntry(
             canonical_hash=hashlib.sha256(f"canonical-{letter}".encode()).hexdigest(),

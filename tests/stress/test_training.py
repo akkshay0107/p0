@@ -22,12 +22,15 @@ def _reference_gae(
     gamma: float,
     gae_lambda: float,
 ) -> list[float]:
+    """Pure-Python reference implementation of Generalized Advantage Estimation (GAE(gamma, lambda))."""
     next_value = bootstrap
     gae = 0.0
     output = [0.0] * len(rewards)
     for index in reversed(range(len(rewards))):
         nonterminal = 1.0 - dones[index]
+        # Temporal difference residual delta = r_t + gamma * V(s_{t+1}) * (1 - done) - V(s_t)
         delta = rewards[index] + gamma * next_value * nonterminal - values[index]
+        # Exponentially decayed advantage sum
         gae = delta + gamma * gae_lambda * nonterminal * gae
         output[index] = gae
         next_value = values[index]
@@ -36,6 +39,12 @@ def _reference_gae(
 
 @pytest.mark.stress
 def test_gae_matches_independent_reference_for_terminated_and_truncated_batches() -> None:
+    """Verify vectorized compute_gae_batch matches reference GAE across variable-length trajectory batches.
+    
+    Tests batches with varied episode lengths, alternating between terminal episode boundaries
+    (dones=1) and non-terminal truncation requiring value function bootstrapping (bootstraps).
+    Ensures inactive padding elements beyond each trajectory's active length remain strictly zero.
+    """
     batch_size = stress_count("P0_STRESS_GAE_BATCH", 128)
     max_steps = stress_count("P0_STRESS_GAE_STEPS", 64)
     generator = torch.Generator().manual_seed(20260805)
@@ -44,6 +53,7 @@ def test_gae_matches_independent_reference_for_terminated_and_truncated_batches(
     dones = torch.randint(0, 2, (batch_size, max_steps), generator=generator).float()
     lengths = torch.randint(1, max_steps + 1, (batch_size,), generator=generator)
     bootstraps = torch.randn(batch_size, generator=generator)
+    # Configure terminal flags: even index episodes terminate (done=1), odd truncate (done=0, bootstrap used)
     for index, length in enumerate(lengths.tolist()):
         dones[index, length - 1] = float(index % 2 == 0)
     gamma, gae_lambda = 0.97, 0.91
@@ -61,13 +71,22 @@ def test_gae_matches_independent_reference_for_terminated_and_truncated_batches(
                 gae_lambda,
             )
         )
+    # Check numerical closeness between PyTorch vectorized GAE and step-by-step reference
     torch.testing.assert_close(actual, expected)
+    # Ensure zero leak: padding steps beyond trajectory length must be strictly zero
     active = torch.arange(max_steps).expand(batch_size, -1) < lengths.unsqueeze(1)
     assert not actual[~active].any()
 
 
 @pytest.mark.stress
 def test_prepared_training_batches_keep_returns_and_normalize_only_active_steps() -> None:
+    """Verify prepare_trajectory_batches standardizes advantages globally across active steps only.
+    
+    Verifies that:
+    1. Advantage normalization achieves zero mean and unit variance over all concatenated active turns.
+    2. Monte Carlo returns (returns = advantages + values) are correctly populated for every batch.
+    3. Step counts match total trajectory lengths.
+    """
     generator = torch.Generator().manual_seed(20260806)
     trajectory_count = stress_count("P0_STRESS_TRAJECTORIES", 64)
     trajectories = []
@@ -100,6 +119,7 @@ def test_prepared_training_batches_keep_returns_and_normalize_only_active_steps(
         gamma=0.99,
         gae_lambda=0.95,
     )
+    # Flatten all active advantages across batches to check global normalization
     active_advantages = torch.cat(
         [batch.advantages for batch in prepared if batch.advantages is not None]
     )
@@ -114,6 +134,7 @@ def test_prepared_training_batches_keep_returns_and_normalize_only_active_steps(
 
 @pytest.mark.stress
 def test_preparing_no_trajectories_is_a_noop() -> None:
+    """Verify prepare_trajectory_batches handles empty input gracefully."""
     assert (
         prepare_trajectory_batches(
             [],
@@ -127,6 +148,15 @@ def test_preparing_no_trajectories_is_a_noop() -> None:
 
 @pytest.mark.stress
 def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
+    """Verify compute_ppo_objective matches theoretical clipped surrogate loss with team-preview scaling.
+    
+    Checks:
+    1. Importance ratio clipping with asymmetric clip bounds (clip_low vs clip_high).
+    2. Value function mean squared error loss with value_coef.
+    3. KL divergence penalty scaled by teampreview_alpha_mult on preview decisions.
+    4. Entropy regularization subtraction.
+    5. Overall loss multiplier applied on team preview decisions (teampreview_loss_mult).
+    """
     config = TrainingConfig(
         clip_low=0.2,
         clip_high=0.1,
@@ -158,6 +188,7 @@ def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
         config,
         alpha=0.3,
     )
+    # Compute analytical reference terms
     expected_ratio = torch.exp(current_log_probs - old_log_probs)
     expected_clipped = torch.clamp(expected_ratio, 1.0 - config.clip_low, 1.0 + config.clip_high)
     expected_policy = -torch.minimum(

@@ -38,6 +38,7 @@ from p0.runtime.poke_env_battle_adapter import battle_view, current_battle_view,
 
 
 def test_event_parser_import_does_not_install_poke_env_patches() -> None:
+    """Verify that importing event parsing modules does not implicitly mutate poke-env global state."""
     result = subprocess.run(
         [
             sys.executable,
@@ -55,19 +56,23 @@ def test_event_parser_import_does_not_install_poke_env_patches() -> None:
 
 
 def test_patch_installation_is_idempotent_reversible_and_logger_scoped() -> None:
+    """Verify poke-env monkey patches can be installed repeatedly, uninstalled cleanly, and filter logs."""
     poke_env_patches.uninstall_for_tests()
     original = DoubleBattle.parse_message
     original_stop = PSClient.stop_listening
     poke_env_patches.install()
     installed = DoubleBattle.parse_message
+    # Installing again should be a no-op idempotent call
     poke_env_patches.install()
     assert DoubleBattle.parse_message is installed
     assert installed is not original
     assert PSClient.stop_listening is not original_stop
+    # Uninstalling must restore original method references
     poke_env_patches.uninstall_for_tests()
     assert DoubleBattle.parse_message is original
     assert PSClient.stop_listening is original_stop
 
+    # Verify log filtering only suppresses targeted warning messages on the designated logger
     target = logging.getLogger("test.poke-env")
     other = logging.getLogger("test.other")
     poke_env_patches.install(target)
@@ -78,6 +83,7 @@ def test_patch_installation_is_idempotent_reversible_and_logger_scoped() -> None
 
 
 def test_live_adapter_and_pure_fixture_build_identical_observations() -> None:
+    """Verify ObservationBuilder produces bitwise identical tensors from live poke-env adapter and pure fixture views."""
     battle = DoubleBattle("view", "player", logging.getLogger(__name__), 9)
     battle._player_role = "p1"
     ally = Pokemon(gen=9, species="charizard")
@@ -115,11 +121,13 @@ def test_live_adapter_and_pure_fixture_build_identical_observations() -> None:
     builder = ObservationBuilder(default_runtime_resources())
     live = builder.build(battle_view(battle))
     pure = builder.build(fixture)
+    # Validate every structured tensor attribute matches identically across live and fixture views
     for name in live._FIELD_NAMES:
         torch.testing.assert_close(getattr(live, name), getattr(pure, name))
 
 
 def test_raw_event_pre_hp_snapshot() -> None:
+    """Verify build_raw_event captures pre-damage health values from callback for damage delta tracking."""
     def pre_hp_for(identifier: str) -> float | None:
         assert identifier == "p2a: Charizard"
         return 0.75
@@ -133,6 +141,7 @@ def test_raw_event_pre_hp_snapshot() -> None:
 
 
 def test_consume_events_clears_buffer_immediately() -> None:
+    """Verify consume_raw_events drains the battle event queue immediately to prevent double-processing."""
     battle = DoubleBattle("events", "player", logging.getLogger(__name__), 9)
     set_raw_events(
         battle,
@@ -143,6 +152,7 @@ def test_consume_events_clears_buffer_immediately() -> None:
     second = parse_events(consume_raw_events(battle), tokenizer)
 
     assert len(first) == 1
+    # Buffer must be empty on second consumption
     assert second == []
 
 
@@ -151,6 +161,7 @@ class _AdapterBattleState:
 
 
 def _adapter_battle(*, teampreview: bool = False, forced: bool = False) -> DoubleBattle:
+    """Helper creating a lightweight DoubleBattle mock for testing action and decision adapters."""
     active = SimpleNamespace(
         moves={"tackle": SimpleNamespace(id="tackle")},
         fainted=False,
@@ -192,19 +203,24 @@ def _adapter_battle(*, teampreview: bool = False, forced: bool = False) -> Doubl
 
 
 def test_runtime_action_adapters_round_trip_control_move_and_preview_orders() -> None:
+    """Verify bidirectional roundtrip conversion between discrete model actions and Showdown order strings."""
     battle = _adapter_battle()
+    # Test standard move actions
     for action in (0, 7):
         order = action_to_single_order(action, battle, fake=True, position=0)
         assert int(single_order_to_action(order, battle, fake=True, position=0)) == action
+    # Test forced action (action ID 48) when forced move like struggle is required
     forced_battle = _adapter_battle(forced=True)
     forced_order = action_to_single_order(48, forced_battle, fake=True, position=0)
     assert int(single_order_to_action(forced_order, forced_battle, fake=True, position=0)) == 48
+    # Test special control actions: -2 (pass/wait), -1 (default)
     assert np.array_equal(
         order_to_action(action_to_order(np.array([-2, -2]), battle), battle), [-2, -2]
     )
     assert np.array_equal(
         order_to_action(action_to_order(np.array([-1, -1]), battle), battle), [-1, -1]
     )
+    # Test team preview lead selection order mapping
     preview = _adapter_battle(teampreview=True)
     selected = np.array([1, 15], dtype=np.int64)
     preview_order = action_to_order(selected, preview)
@@ -212,6 +228,7 @@ def test_runtime_action_adapters_round_trip_control_move_and_preview_orders() ->
 
 
 def test_action_to_order_composes_two_slot_decisions() -> None:
+    """Verify action_to_order composes joint double-battle commands across slot 0 and slot 1."""
     battle = _adapter_battle()
     active_b = SimpleNamespace(
         moves={"tackle": SimpleNamespace(id="tackle")},
@@ -231,13 +248,16 @@ def test_action_to_order_composes_two_slot_decisions() -> None:
 
 
 def test_battle_view_cache_refreshes_decisions_without_replacing_facade() -> None:
+    """Verify battle_view retains facade instance identity while updating dynamic decision states when battle mutates."""
     battle = _adapter_battle()
     first = current_battle_view(battle)
     first_decision = first.decision
     assert first is current_battle_view(battle)
     assert first_decision is first.decision
+    # Mutate wait state to simulate server request transition
     battle._wait = True
     refreshed = battle_view(battle)
+    # Same view wrapper instance is reused, but its decision snapshot is refreshed
     assert refreshed is first
     assert refreshed.decision is not first_decision
     assert refreshed.decision.wait is True
@@ -245,6 +265,7 @@ def test_battle_view_cache_refreshes_decisions_without_replacing_facade() -> Non
 
 
 def test_runtime_action_adapters_reject_invalid_orders_in_strict_mode() -> None:
+    """Verify action conversion in strict mode rejects out-of-bounds actions and invalid order objects."""
     battle = _adapter_battle()
     with pytest.raises(ValueError):
         action_to_single_order(26, battle, fake=False, position=0)
@@ -267,6 +288,7 @@ def test_runtime_action_adapters_reject_invalid_orders_in_strict_mode() -> None:
 
 
 def test_recharge_is_encoded_as_forced_move() -> None:
+    """Verify that recharge turns map to forced action ID 48."""
     battle = _adapter_battle()
     cast(Any, battle).available_moves = [[SimpleNamespace(id="recharge")], []]
     order = action_to_single_order(48, battle, fake=True, position=0)
@@ -280,17 +302,21 @@ _EV_BEARING_SHEET = (
 
 
 def _teambuilder_mon(packed: str) -> TeambuilderPokemon:
+    """Parse single Pokémon record from packed Showdown team string."""
     return Teambuilder.parse_packed_team(packed)[0]
 
 
 def test_poke_env_drops_the_open_team_sheet_nature_without_the_patch() -> None:
-    """poke-env 0.15 gates nature behind a non-zero EV check, which Champions never trips."""
+    """Demonstrate upstream poke-env bug: unpatched poke-env drops natures on OTS 0-EV Pokémon."""
     assert not poke_env_patches.is_installed()
+    # Unpatched poke-env drops nature when EV string is empty
     assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET)).nature is None
+    # But retains nature when explicit EV values are present
     assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_BEARING_SHEET)).nature == "impish"
 
 
 def test_nature_patch_restores_the_open_team_sheet_nature() -> None:
+    """Verify our poke_env_patches monkeypatch restores nature parsing on 0-EV Open Team Sheet Pokémon."""
     poke_env_patches.install()
     try:
         mon = Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET))
@@ -300,12 +326,14 @@ def test_nature_patch_restores_the_open_team_sheet_nature() -> None:
     finally:
         poke_env_patches.uninstall_for_tests()
 
+    # Confirm clean uninstallation leaves poke-env in original unpatched state
     assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET)).nature is None
 
 
 def test_showdown_group_rolls_back_servers_when_later_start_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Verify start_showdown_servers gracefully shuts down already-started instances if a subsequent server fails."""
     events = []
 
     class FakeServer:
@@ -326,27 +354,32 @@ def test_showdown_group_rolls_back_servers_when_later_start_fails(
     with pytest.raises(RuntimeError, match="failed"):
         with showdown.start_showdown_servers(2, ports=(1, 2)):
             pass
+    # Server 1 must be stopped after Server 2 start raises exception
     assert events == [("start", 1), ("start", 2), ("stop", 1)]
 
 
 def test_showdown_build_failure_has_bounded_diagnostics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Verify build_showdown error output truncates excessively large stderr outputs to avoid flooding logs."""
     def fail(*args, **kwargs):
         raise subprocess.CalledProcessError(1, args[0], stderr="x" * 5000)
 
     monkeypatch.setattr(showdown.subprocess, "run", fail)
     with pytest.raises(RuntimeError) as error:
         showdown.build_showdown(tmp_path)
+    # Output length should be bounded (< 4200 characters)
     assert len(str(error.value)) < 4200
 
 
 @pytest.mark.network
 def test_loopback_port_allocator_returns_distinct_reusable_ports() -> None:
+    """Verify allocate_loopback_ports binds and frees distinct available TCP loopback ports."""
     ports = showdown.allocate_loopback_ports(8)
     assert len(ports) == len(set(ports))
     sockets = [socket.socket() for _ in ports]
     try:
+        # Verify that all allocated ports are immediately bindable by caller
         for port, listener in zip(ports, sockets, strict=True):
             listener.bind(("127.0.0.1", port))
     finally:
@@ -357,6 +390,7 @@ def test_loopback_port_allocator_returns_distinct_reusable_ports() -> None:
 def test_showdown_server_start_stop_owns_process_log_and_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Verify ShowdownServer launches Node with proper CLI arguments, manages log files, and terminates cleanly."""
     commands: list[list[str]] = []
 
     class FakeProcess:
@@ -394,6 +428,7 @@ def test_showdown_server_start_stop_owns_process_log_and_command(
         startup_timeout=1,
     )
     server.start()
+    # Check CLI command shape passed to Popen
     assert commands == [
         [
             "node",
@@ -416,6 +451,7 @@ def test_showdown_server_start_stop_owns_process_log_and_command(
 def test_showdown_server_rejects_double_start_and_invalid_port_groups(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Verify ShowdownServer rejects start() if already running and checks port uniqueness."""
     class FakeProcess:
         returncode = None
 
@@ -449,12 +485,14 @@ def test_showdown_server_rejects_double_start_and_invalid_port_groups(
         server.start()
     server.stop()
 
+    # Reject duplicate port numbers in server group allocation
     with pytest.raises(ValueError, match="unique"):
         with showdown.start_showdown_servers(2, showdown_root=tmp_path, ports=(1, 1)):
             pass
 
 
 def test_showdown_server_kills_process_when_graceful_stop_times_out(tmp_path: Path) -> None:
+    """Verify ShowdownServer escalates to SIGKILL if the process fails to terminate gracefully within stop_timeout."""
     class StuckProcess:
         returncode = None
 
@@ -485,6 +523,7 @@ def test_showdown_server_kills_process_when_graceful_stop_times_out(tmp_path: Pa
 def test_showdown_server_rolls_back_after_child_crash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Verify ShowdownServer cleans up resources and raises RuntimeError if child process crashes during startup."""
     class CrashedProcess:
         returncode = 17
 
@@ -509,6 +548,7 @@ def test_showdown_server_rolls_back_after_child_crash(
 def test_showdown_server_preserves_custom_flags_and_paths(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Verify ShowdownServer accepts custom port numbers and log file destinations."""
     captured_command: list[list[str]] = []
 
     class FakeProcess:

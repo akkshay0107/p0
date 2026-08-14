@@ -15,6 +15,12 @@ from p0.teams.source import FixedTeamSource
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
+    """Verify EvaluationHarness runs a live matchup between baseline random players and tracks stats.
+    
+    Checks that the matchup completes without unhandled exceptions, computes win rates,
+    aggregates results per team archetype, and produces a complete dictionary serialization
+    containing confidence intervals and metadata suitable for logging.
+    """
     parsed = urllib.parse.urlparse(showdown_server.websocket_url)
     assert parsed.port is not None
     poke_env_patches.install()
@@ -52,7 +58,7 @@ async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
     assert stats["wins"] == result.wins_a
     assert stats["win_rate"] == pytest.approx(stats["wins"] / stats["games"])
 
-    # Check dictionary serialization
+    # Verify dictionary serialization schema matches downstream reporting contracts
     dct = result.to_dict()
     assert set(dct) == {
         "policy_a",
@@ -82,8 +88,10 @@ async def test_live_evaluation_runs_model_policy_against_random_opponent(
     model_policy,
     policy_side: str,
 ) -> None:
+    """Verify live evaluation works symmetrically when the neural policy is player A or player B."""
     parsed = urllib.parse.urlparse(showdown_server.websocket_url)
     assert parsed.port is not None
+    # Assign the model policy to the parametrized player side and leave the other as None (RandomPlayer)
     policy_a = model_policy if policy_side == "a" else None
     policy_b = model_policy if policy_side == "b" else None
     name_a = "ModelA" if policy_a is not None else "RandomA"
@@ -120,6 +128,7 @@ async def test_live_evaluation_runs_model_policy_against_random_opponent(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_server) -> None:
+    """Verify multi-game evaluation records and aggregates per-team win/loss statistics correctly."""
     poke_env_patches.install()
     try:
         harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
@@ -138,6 +147,7 @@ async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_ser
     assert result.total_games == 2
     assert result.wins_a + result.wins_b + result.ties == result.total_games
 
+    # Validate accounting consistency across overall per_team, player A per-team, and player B per-team maps
     aggregates = (
         (result.per_team_results, result.wins_a),
         (result.per_team_a_results, result.wins_a),
@@ -146,7 +156,9 @@ async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_ser
     for stats_by_team, expected_wins in aggregates:
         assert stats_by_team
         assert all(set(stats) == {"wins", "games", "win_rate"} for stats in stats_by_team.values())
+        # The sum of games across all team keys must equal the total matchup episode count
         assert sum(stats["games"] for stats in stats_by_team.values()) == result.total_games
+        # The sum of recorded wins across teams must equal the corresponding player's total wins
         assert sum(stats["wins"] for stats in stats_by_team.values()) == expected_wins
         assert all(
             0 <= stats["wins"] <= stats["games"]
