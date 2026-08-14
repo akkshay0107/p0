@@ -2,121 +2,401 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import random
+from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
-from poke_env import AccountConfiguration
-from poke_env.player import RandomPlayer
-from poke_env.player.battle_order import DoubleBattleOrder, SingleBattleOrder
-
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
+from p0.battle.events import RawBattleEvent
 from p0.format_config import FORMAT
-from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import StructuredObservation
-from p0.runtime import poke_env_patches
-from p0.runtime.poke_env_action_adapter import order_to_action, single_order_to_action
-from p0.runtime.poke_env_battle_adapter import battle_view
+from p0.teams.stat_points import StatPoints
+from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 
 
 @dataclass(frozen=True, slots=True)
-class GroundTruthDecision:
-    """One observation and order set captured from a live Showdown request."""
+class StressDexCatalog:
+    """Format-legal display names used by randomized stress inputs."""
 
-    observation: StructuredObservation
-    legal_actions: tuple[tuple[int, ...], tuple[int, ...]]
-    legal_orders: tuple[tuple[str, ...], tuple[str, ...]]
-    legal_joint_actions: tuple[tuple[int, int], ...]
-    chosen_action: tuple[int, int]
-    chosen_order: str
+    species: tuple[str, ...]
+    items: tuple[str, ...]
+    abilities: tuple[str, ...]
+    moves: tuple[str, ...]
+    natures: tuple[str, ...]
 
 
-class _GroundTruthPlayer(RandomPlayer):
-    def __init__(self, *, observation_builder: ObservationBuilder, **kwargs: Any):
-        self.observation_builder = observation_builder
-        self.decisions: list[GroundTruthDecision] = []
-        super().__init__(**kwargs)
+def _legal_display_names(dex: Mapping[str, Any], kind: str) -> tuple[str, ...]:
+    entries = dex[kind]
+    legal_ids = frozenset(str(value) for value in dex["legality"][kind])
+    return tuple(
+        str(entry["name"])
+        for entry in entries
+        if isinstance(entry, Mapping) and str(entry.get("id", "")) in legal_ids
+    )
 
-    def choose_move(self, battle: Any):
-        legal_orders: tuple[tuple[SingleBattleOrder, ...], tuple[SingleBattleOrder, ...]] = (
-            tuple(battle.valid_orders[0]),
-            tuple(battle.valid_orders[1]),
+
+@lru_cache(maxsize=1)
+def stress_dex_catalog() -> StressDexCatalog:
+    """Load the active format's legal dex values once for all stress generators."""
+    dex = default_runtime_resources().dex
+
+    catalog = StressDexCatalog(
+        species=_legal_display_names(dex, "species"),
+        items=_legal_display_names(dex, "items"),
+        abilities=_legal_display_names(dex, "abilities"),
+        moves=_legal_display_names(dex, "moves"),
+        natures=_legal_display_names(dex, "natures"),
+    )
+    if not all((catalog.species, catalog.items, catalog.abilities, catalog.moves, catalog.natures)):
+        raise AssertionError("The active format dex has an empty legal category")
+    return catalog
+
+
+def _random_stat_points(rng: random.Random) -> StatPoints:
+    while True:
+        values = [rng.randrange(33) for _ in range(6)]
+        if sum(values) <= 66:
+            return StatPoints(
+                hp=values[0],
+                atk=values[1],
+                defense=values[2],
+                spa=values[3],
+                spd=values[4],
+                spe=values[5],
+            )
+
+
+def _random_team_members(rng: random.Random) -> tuple[TeamMember, ...]:
+    catalog = stress_dex_catalog()
+    species = rng.sample(catalog.species, 6)
+    items = rng.sample(catalog.items, 6)
+    return tuple(
+        TeamMember(
+            species=species[index],
+            item=items[index],
+            ability=rng.choice(catalog.abilities),
+            moves=tuple(rng.sample(catalog.moves, 4)),
+            nature=rng.choice(catalog.natures),
+            level=50,
         )
-        legal_actions = (
-            tuple(
-                sorted(
-                    {
-                        int(single_order_to_action(order, battle, fake=True, position=0))
-                        for order in legal_orders[0]
-                    }
-                )
-            ),
-            tuple(
-                sorted(
-                    {
-                        int(single_order_to_action(order, battle, fake=True, position=1))
-                        for order in legal_orders[1]
-                    }
-                )
-            ),
+        for index in range(6)
+    )
+
+
+def stress_random_team_record(rng: random.Random, *, label: str = "stress") -> TeamRecord:
+    """Build a team record from values admitted by the active dex contract.
+
+    The combinations are deliberately catalog-bounded rather than hand-picked. These records
+    feed mocked validator transports, so learnset and item-combination admission remains covered
+    by the pinned Showdown validator tests instead of being silently claimed here.
+    """
+    members = _random_team_members(rng)
+    return TeamRecord(
+        team=CanonicalTeam(members),
+        spreads=tuple(_random_stat_points(rng) for _ in members),
+        metadata=TeamMetadata(
+            source_series=(label,),
+            source_replays=(f"{label}-game-1",),
+            first_seen="2026-01-01T00:00:00Z",
+            last_seen="2026-01-01T00:00:00Z",
+        ),
+    )
+
+
+def stress_random_replay_teams(
+    rng: random.Random,
+) -> tuple[tuple[TeamMember, ...], tuple[TeamMember, ...]]:
+    """Return two independent six-member teams for a synthetic replay payload."""
+    return _random_team_members(rng), _random_team_members(rng)
+
+
+def stress_series_id(parent: str, players: tuple[str, str] = ("Alice", "Bob")) -> str:
+    """Calculate the grouping identity used by the replay compiler."""
+    value = "\n".join((FORMAT.bo3_format, parent, *(player.casefold() for player in players)))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def _showteam_json(team: tuple[TeamMember, ...]) -> str:
+    return json.dumps(
+        [
+            {
+                "species": member.species,
+                "item": member.item,
+                "ability": member.ability,
+                "moves": list(member.moves),
+                "nature": member.nature,
+            }
+            for member in team
+        ],
+        separators=(",", ":"),
+    )
+
+
+def stress_random_replay_payload(
+    rng: random.Random,
+    replay_id: str,
+    *,
+    series_id: str,
+    game_number: int = 1,
+    winner: str | None = None,
+    teams: tuple[tuple[TeamMember, ...], tuple[TeamMember, ...]] | None = None,
+) -> dict[str, Any]:
+    """Build a replay-shaped payload with random values from the active legal dex."""
+    if teams is None:
+        teams = stress_random_replay_teams(rng)
+    first_team, second_team = teams
+    players = ("Alice", "Bob")
+    winner = winner or rng.choice(players)
+
+    p1a, p1b = first_team[:2]
+    p2a, p2b = second_team[:2]
+    lines = [
+        "|start",
+        "|teampreview",
+        f"|showteam|p1|{_showteam_json(first_team)}",
+        f"|showteam|p2|{_showteam_json(second_team)}",
+        "|",
+        f"|switch|p1a: {p1a.species}|{p1a.species}, L50|100/100",
+        f"|switch|p1b: {p1b.species}|{p1b.species}, L50|100/100",
+        f"|switch|p2a: {p2a.species}|{p2a.species}, L50|100/100",
+        f"|switch|p2b: {p2b.species}|{p2b.species}, L50|100/100",
+        "|turn|1",
+        "|",
+        f"|move|p1a: {p1a.species}|{p1a.moves[0]}|p2a: {p2a.species}",
+        f"|move|p1b: {p1b.species}|{p1b.moves[0]}|p2b: {p2b.species}",
+        f"|move|p2a: {p2a.species}|{p2a.moves[0]}|p1a: {p1a.species}",
+        f"|move|p2b: {p2b.species}|{p2b.moves[0]}|p1b: {p1b.species}",
+        "|",
+        f"|win|{winner}",
+    ]
+    return {
+        "id": replay_id,
+        "formatid": FORMAT.bo3_format,
+        "p1": players[0],
+        "p2": players[1],
+        "uploadtime": 1_750_000_000 + rng.randrange(1_000_000),
+        "roomid": replay_id,
+        "parent": series_id,
+        "game_number": game_number,
+        "log": "\n".join(lines),
+    }
+
+
+def stress_random_replay_payloads(
+    rng: random.Random,
+    count: int,
+    *,
+    replay_prefix: str,
+    series_prefix: str,
+) -> tuple[dict[str, Any], ...]:
+    """Build independent one-game payloads for scale tests."""
+    if count < 1:
+        raise ValueError(f"count must be positive, got {count}")
+    return tuple(
+        stress_random_replay_payload(
+            rng,
+            f"{replay_prefix}-{index}",
+            series_id=f"{series_prefix}-{index}",
         )
-        legal_joint_actions = tuple(
+        for index in range(count)
+    )
+
+
+def stress_random_bo3_payloads(
+    rng: random.Random,
+    series_count: int,
+    *,
+    replay_prefix: str,
+    series_prefix: str,
+) -> tuple[dict[str, Any], ...]:
+    """Build two games per series while preserving each series' team roster."""
+    if series_count < 1:
+        raise ValueError(f"series_count must be positive, got {series_count}")
+
+    payloads: list[dict[str, Any]] = []
+    for index in range(series_count):
+        teams = stress_random_replay_teams(rng)
+        series_id = f"{series_prefix}-{index}"
+        payloads.extend(
             (
-                int(single_order_to_action(order.first_order, battle, fake=True, position=0)),
-                int(single_order_to_action(order.second_order, battle, fake=True, position=1)),
-            )
-            for order in DoubleBattleOrder.join_orders(list(legal_orders[0]), list(legal_orders[1]))
-        )
-        order = super().choose_move(battle)
-        action = order_to_action(order, battle)
-        self.decisions.append(
-            GroundTruthDecision(
-                observation=self.observation_builder.build(battle_view(battle)).cpu(),
-                legal_actions=legal_actions,
-                legal_orders=(
-                    tuple(sorted(str(order) for order in legal_orders[0])),
-                    tuple(sorted(str(order) for order in legal_orders[1])),
+                stress_random_replay_payload(
+                    rng,
+                    f"{replay_prefix}-{index}-1",
+                    series_id=series_id,
+                    game_number=1,
+                    teams=teams,
                 ),
-                legal_joint_actions=legal_joint_actions,
-                chosen_action=(int(action[0]), int(action[1])),
-                chosen_order=str(order),
+                stress_random_replay_payload(
+                    rng,
+                    f"{replay_prefix}-{index}-2",
+                    series_id=series_id,
+                    game_number=2,
+                    winner="Bob",
+                    teams=teams,
+                ),
             )
         )
-        return order
+    return tuple(payloads)
 
 
-async def capture_showdown_decisions(
-    server_configuration, *, game_count: int = 1, max_concurrent_battles: int = 1
-):
-    """Capture live requests, observations, valid orders, and chosen orders."""
-    builder = ObservationBuilder(default_runtime_resources())
-    player_a = _GroundTruthPlayer(
-        account_configuration=AccountConfiguration("GroundTruthA", None),
-        battle_format=FORMAT.battle_format,
-        server_configuration=server_configuration,
-        team=DEFAULT_TEST_TEAM,
-        accept_open_team_sheet=True,
-        max_concurrent_battles=max_concurrent_battles,
-        observation_builder=builder,
+def _random_entity(rng: random.Random) -> str:
+    return f"{rng.choice(('p1a', 'p1b', 'p2a', 'p2b'))}: {rng.choice(stress_dex_catalog().species)}"
+
+
+def _random_target(rng: random.Random) -> str:
+    return _random_entity(rng)
+
+
+def _random_hp_status(rng: random.Random) -> str:
+    value = rng.randrange(1, 101)
+    suffix = rng.choice(("", "g", "y"))
+    return f"{value}/100{suffix}"
+
+
+def _random_raw_event(case: str, rng: random.Random) -> RawBattleEvent:
+    """Build one valid parser case with fresh identifiers from the active dex."""
+    catalog = stress_dex_catalog()
+    entity = _random_entity(rng)
+    target = _random_target(rng)
+    move = rng.choice(catalog.moves)
+    item = rng.choice(catalog.items)
+    ability = rng.choice(catalog.abilities)
+    species = rng.choice(catalog.species)
+
+    common_boost = (
+        entity,
+        rng.choice(("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")),
+        str(rng.randrange(1, 4)),
     )
-    player_b = RandomPlayer(
-        account_configuration=AccountConfiguration("GroundTruthB", None),
-        battle_format=FORMAT.battle_format,
-        server_configuration=server_configuration,
-        team=DEFAULT_TEST_TEAM,
-        accept_open_team_sheet=True,
-        max_concurrent_battles=max_concurrent_battles,
+    status = rng.choice(("par", "slp", "frz", "brn", "psn", "tox"))
+    field = rng.choice(("Trick Room", "Electric Terrain", "Grassy Terrain"))
+    volatile = rng.choice(("Protect", "Substitute", "Destiny Bond"))
+
+    cases: dict[str, RawBattleEvent] = {
+        "move": RawBattleEvent(("", "move", entity, move, target)),
+        "unknown_move": RawBattleEvent(("", "move", entity, "not-a-real-move", target)),
+        "switch": RawBattleEvent(("", "switch", entity, f"{species}, L50", _random_hp_status(rng))),
+        "drag": RawBattleEvent(("", "drag", entity, f"{species}, L50", _random_hp_status(rng))),
+        "swap": RawBattleEvent(("", "swap", entity, target)),
+        "faint": RawBattleEvent(("", "faint", entity)),
+        "damage": RawBattleEvent(("", "-damage", entity, _random_hp_status(rng)), pre_hp=0.75),
+        "damage_missing_pre_hp": RawBattleEvent(("", "-damage", entity, "50/100")),
+        "heal": RawBattleEvent(("", "-heal", entity, _random_hp_status(rng)), pre_hp=0.25),
+        "boost": RawBattleEvent(("", "-boost", *common_boost)),
+        "unboost": RawBattleEvent(("", "-unboost", *common_boost)),
+        "status": RawBattleEvent(("", "-status", entity, status)),
+        "curestatus": RawBattleEvent(("", "-curestatus", entity, status)),
+        "enditem": RawBattleEvent(("", "-enditem", entity, item)),
+        "item": RawBattleEvent(("", "-item", entity, item)),
+        "item_transfer": RawBattleEvent(("", "-item", entity, item, "[from] move: Trick")),
+        "ability": RawBattleEvent(("", "-ability", entity, ability)),
+        "weather_start": RawBattleEvent(("", "-weather", "RainDance")),
+        "weather_end": RawBattleEvent(("", "-weather", "none")),
+        "weather_upkeep": RawBattleEvent(("", "-weather", "RainDance", "[upkeep]")),
+        "fieldstart": RawBattleEvent(("", "-fieldstart", f"move: {field}")),
+        "fieldend": RawBattleEvent(("", "-fieldend", f"move: {field}")),
+        "sidestart": RawBattleEvent(("", "-sidestart", rng.choice(("p1", "p2")), f"move: {move}")),
+        "sideend": RawBattleEvent(("", "-sideend", rng.choice(("p1", "p2")), f"move: {move}")),
+        "start": RawBattleEvent(("", "-start", entity, f"move: {volatile}")),
+        "end": RawBattleEvent(("", "-end", entity, f"move: {volatile}")),
+        "formechange": RawBattleEvent(("", "-formechange", entity, species)),
+        "detailschange": RawBattleEvent(("", "detailschange", entity, species)),
+        "fail": RawBattleEvent(("", "-fail", entity)),
+        "immune": RawBattleEvent(("", "-immune", entity)),
+        "miss": RawBattleEvent(("", "-miss", entity, target)),
+        "activate_protect": RawBattleEvent(("", "-activate", entity, "move: Protect")),
+        "activate_ability": RawBattleEvent(("", "-activate", entity, f"ability: {ability}")),
+        "activate_item": RawBattleEvent(("", "-activate", entity, f"item: {item}")),
+        "activate_effect": RawBattleEvent(("", "-activate", entity, f"move: {volatile}")),
+        "crit": RawBattleEvent(("", "-crit", entity)),
+        "mega": RawBattleEvent(("", "-mega", entity)),
+        "cant_status": RawBattleEvent(("", "cant", entity, status, move)),
+        "cant_effect": RawBattleEvent(("", "cant", entity, "flinch", move)),
+        "prepare": RawBattleEvent(("", "-prepare", entity, move, target)),
+        "singlemove": RawBattleEvent(("", "-singlemove", entity, f"move: {volatile}")),
+        "setboost": RawBattleEvent(("", "-setboost", *common_boost)),
+        "clearboost": RawBattleEvent(("", "-clearboost", entity)),
+        "clearnegativeboost": RawBattleEvent(("", "-clearnegativeboost", entity)),
+        "clearpositiveboost": RawBattleEvent(("", "-clearpositiveboost", entity)),
+        "clearallboost": RawBattleEvent(("", "-clearallboost")),
+        "swapboost": RawBattleEvent(("", "-swapboost", entity, target, "atk, def")),
+        "invertboost": RawBattleEvent(("", "-invertboost", entity)),
+        "copyboost": RawBattleEvent(("", "-copyboost", entity, target)),
+        "transform": RawBattleEvent(("", "-transform", entity, target)),
+        "endability": RawBattleEvent(("", "-endability", entity, ability)),
+        "fieldactivate": RawBattleEvent(("", "-fieldactivate", f"move: {field}")),
+        "notarget": RawBattleEvent(("", "-notarget", entity)),
+        "ignored": RawBattleEvent(("", "chat", "ignored")),
+    }
+    return cases[case]
+
+
+def stress_random_raw_events(rng: random.Random) -> tuple[RawBattleEvent, ...]:
+    """Create a shuffled event corpus covering every parser branch with dex-wide values."""
+    cases = (
+        "move",
+        "unknown_move",
+        "switch",
+        "drag",
+        "swap",
+        "faint",
+        "damage",
+        "damage_missing_pre_hp",
+        "heal",
+        "boost",
+        "unboost",
+        "status",
+        "curestatus",
+        "enditem",
+        "item",
+        "item_transfer",
+        "ability",
+        "weather_start",
+        "weather_end",
+        "weather_upkeep",
+        "fieldstart",
+        "fieldend",
+        "sidestart",
+        "sideend",
+        "start",
+        "end",
+        "formechange",
+        "detailschange",
+        "fail",
+        "immune",
+        "miss",
+        "activate_protect",
+        "activate_ability",
+        "activate_item",
+        "activate_effect",
+        "crit",
+        "mega",
+        "cant_status",
+        "cant_effect",
+        "prepare",
+        "singlemove",
+        "setboost",
+        "clearboost",
+        "clearnegativeboost",
+        "clearpositiveboost",
+        "clearallboost",
+        "swapboost",
+        "invertboost",
+        "copyboost",
+        "transform",
+        "endability",
+        "fieldactivate",
+        "notarget",
+        "ignored",
     )
-    poke_env_patches.install()
-    try:
-        await player_a.battle_against(player_b, n_battles=game_count)
-    finally:
-        await player_a.ps_client.stop_listening()
-        await player_b.ps_client.stop_listening()
-        poke_env_patches.uninstall_for_tests()
-    return tuple(player_a.decisions)
+    events = [_random_raw_event(case, rng) for case in cases]
+    events.extend(_random_raw_event(rng.choice(cases), rng) for _ in range(rng.randrange(1, 8)))
+    rng.shuffle(events)
+    return tuple(events)
 
 
 def stress_int(name: str, default: int, *, minimum: int = 1) -> int:

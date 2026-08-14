@@ -13,25 +13,30 @@ from tests.stress._helpers import stress_count, stress_repetitions, stress_rng
 @pytest.mark.stress
 def test_normalization_cache_is_stable_across_repeated_protocol_ids() -> None:
     PokemonTokenizer._cached_normalize.cache_clear()
-    rng = stress_rng()
-    values = (
-        "Charizard-Mega-Y",
-        "U-turn",
-        "Leech Seed",
-        "CHARIZARD-MEGA-Y",
-        *(f"Species-{index}-{rng.randrange(1_000_000)}" for index in range(1024)),
-    )
-    expected = tuple(
-        "".join(
-            character.lower() for character in value if character.isascii() and character.isalnum()
+    try:
+        rng = stress_rng()
+        values = (
+            "Charizard-Mega-Y",
+            "U-turn",
+            "Leech Seed",
+            "CHARIZARD-MEGA-Y",
+            *(f"Species-{index}-{rng.randrange(1_000_000)}" for index in range(1024)),
         )
-        for value in values
-    )
-    for _ in range(stress_repetitions(default=1024)):
-        assert tuple(PokemonTokenizer.normalize_id(value) for value in values) == expected
-    info = PokemonTokenizer._cached_normalize.cache_info()
-    assert info.misses == len(values)
-    assert info.hits >= stress_repetitions(default=1024) * len(values) - len(values)
+        expected = tuple(
+            "".join(
+                character.lower()
+                for character in value
+                if character.isascii() and character.isalnum()
+            )
+            for value in values
+        )
+        for _ in range(stress_repetitions(default=1024)):
+            assert tuple(PokemonTokenizer.normalize_id(value) for value in values) == expected
+        info = PokemonTokenizer._cached_normalize.cache_info()
+        assert info.misses == len(values)
+        assert info.hits >= stress_repetitions(default=1024) * len(values) - len(values)
+    finally:
+        PokemonTokenizer._cached_normalize.cache_clear()
 
 
 @pytest.mark.stress
@@ -59,6 +64,11 @@ def test_token_store_append_drop_clear_and_high_cardinality_keys() -> None:
         tokens[:, SERIES_TOKENS_PER_GAME : 2 * SERIES_TOKENS_PER_GAME],
         (game + 2).expand(len(keys), -1, -1),
     )
+    missing_tokens, missing_mask = store.get_tokens(
+        (SeriesPerspectiveKey("missing-series", 0),), torch.device("cpu")
+    )
+    assert missing_tokens.shape == (1, SERIES_TOKENS_PER_GAME * 2, 3)
+    assert not missing_mask.any()
     store.drop(keys[0])
     assert not store.get_tokens((keys[0],), torch.device("cpu"))[1].any()
     store.clear()

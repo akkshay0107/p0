@@ -3,9 +3,14 @@ from __future__ import annotations
 import pytest
 import torch
 
+from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.ppo import compute_ppo_objective
-from p0.training.trajectory import compute_gae_batch, prepare_trajectory_batches
+from p0.training.trajectory import (
+    TrajectoryBatch,
+    compute_gae_batch,
+    prepare_trajectory_batches,
+)
 from tests.stress._helpers import stress_count
 
 
@@ -63,9 +68,6 @@ def test_gae_matches_independent_reference_for_terminated_and_truncated_batches(
 
 @pytest.mark.stress
 def test_prepared_training_batches_keep_returns_and_normalize_only_active_steps() -> None:
-    from p0.model.structured_observation import StructuredObservation
-    from p0.training.trajectory import TrajectoryBatch
-
     generator = torch.Generator().manual_seed(20260806)
     trajectory_count = stress_count("P0_STRESS_TRAJECTORIES", 64)
     trajectories = []
@@ -107,6 +109,19 @@ def test_prepared_training_batches_keep_returns_and_normalize_only_active_steps(
     assert all(batch.length == len(batch.rewards) for batch in prepared)
     assert sum(batch.length for batch in prepared) == sum(
         trajectory.length for trajectory in trajectories
+    )
+
+
+@pytest.mark.stress
+def test_preparing_no_trajectories_is_a_noop() -> None:
+    assert (
+        prepare_trajectory_batches(
+            [],
+            torch.device("cpu"),
+            gamma=0.99,
+            gae_lambda=0.95,
+        )
+        == []
     )
 
 

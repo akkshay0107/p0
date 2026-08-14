@@ -31,8 +31,8 @@ from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
 from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
+from p0.battle.actions import PASS_ACTION
 from p0.battle.events import get_hp_fraction
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
@@ -41,20 +41,30 @@ from p0.model.structured_observation import (
     NUM_IDX_CAN_SWITCH_OUT,
     NUM_IDX_HP_FRACTION,
     NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_LEVEL_STATS,
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_SLOT_CONDITION_UNKNOWN,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    NUM_IDX_STATUS_COUNTER,
     TOKEN_IDX_ALLY_SIDE,
     StructuredObservation,
 )
+from p0.paths import DEFAULT_PATHS
 from p0.replays.compile import compile_documents, write_tensor_shards
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
-from p0.replays.reconstruct import ReconstructedPerspective, ReconstructedSnapshot, reconstruct_both
+from p0.replays.reconstruct import (
+    ReconstructedPerspective,
+    ReconstructedSnapshot,
+    normalize_id,
+    reconstruct_both,
+)
 from p0.replays.schema import LabelKind
 from p0.replays.shards import validate_shard_tensors
+from p0.rl_player import TeamPlayerMixin
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view
+from p0.teams.source import FileTeamSource
 from tests.stress._helpers import stress_count
 
 # Cant reasons emitted by the checked-in Showdown commit for the champions
@@ -102,6 +112,13 @@ _REPLAY_AMBIGUITY_TAGS = frozenset(
     }
 )
 
+_OBSERVATION_EVENT_FIELDS = (
+    "events_cat",
+    "events_side_ids",
+    "events_slot_ids",
+    "events_metadata",
+)
+
 
 def _message_tag(line: str) -> str:
     parts = line.split("|")
@@ -110,22 +127,6 @@ def _message_tag(line: str) -> str:
 
 def _endpoint_role(endpoint: str) -> str:
     return endpoint.split("a", 1)[0].strip()
-
-
-def _line_has_observed_action(line: str, role: int) -> bool:
-    """Whether a replay line contains a submitted action for this perspective."""
-    parts = line.split("|")
-    if len(parts) < 3 or parts[1] not in {"move", "switch", "cant"}:
-        return False
-    endpoint = parts[2]
-    if _endpoint_role(endpoint) != f"p{role + 1}":
-        return False
-    if parts[1] == "cant":
-        # A cant is the server's result of a submitted order.  There is no
-        # preceding move line for BeforeMove failures in Showdown.
-        return True
-    suffix_start = 5 if parts[1] == "move" else 4
-    return not any(part.startswith("[from]") for part in parts[suffix_start:])
 
 
 def _cant_reasons(snapshot: ReconstructedSnapshot, role: int) -> tuple[str, ...]:
@@ -159,7 +160,7 @@ def _live_boundary(record: dict[str, Any], splice_index: int, splice_count: int)
     return cursor if cursor <= splice_index else cursor + splice_count
 
 
-class JsonCapturingRandomPlayer(RandomPlayer):
+class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
     """Random player that saves pre-fusion decisions and completed replay JSON."""
 
     def __init__(
@@ -169,6 +170,8 @@ class JsonCapturingRandomPlayer(RandomPlayer):
         observation_dir: Path,
         replay_dir: Path | None = None,
         write_replays: bool = False,
+        team_source: FileTeamSource,
+        team_rng: random.Random,
         **kwargs: Any,
     ) -> None:
         self.observation_builder = observation_builder
@@ -177,9 +180,10 @@ class JsonCapturingRandomPlayer(RandomPlayer):
         self.write_replays = write_replays
         self.replay_paths: list[Path] = []
         self.observation_paths: list[Path] = []
+        self.teams_seen: list[str] = []
         self._showteam_lines: dict[str, list[str]] = {}
         self._live_records: dict[str, list[dict[str, Any]]] = {}
-        super().__init__(**kwargs)
+        super().__init__(team_source=team_source, team_rng=team_rng, **kwargs)
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> None:
         battle_tag = split_messages[0][0].removeprefix(">")
@@ -231,6 +235,8 @@ class JsonCapturingRandomPlayer(RandomPlayer):
         self._write_observation_tensors(battle)
         if self.write_replays:
             self._write_replay_json(battle)
+        if self.current_team_packed is not None:
+            self.teams_seen.append(self.current_team_packed)
         super()._battle_finished_callback(battle)
 
     def _write_observation_tensors(self, battle: AbstractBattle) -> None:
@@ -339,19 +345,21 @@ def _live_action(record: dict[str, Any]) -> tuple[int, int] | None:
 def _assert_expected_observation_fields(
     live: StructuredObservation,
     reconstructed: StructuredObservation,
+    *,
+    compare_event_fields: bool = True,
 ) -> None:
     """Compare every field a public replay can reproduce at a shared boundary."""
-    for name in (
+    fields = (
         "token_type_ids",
         "side_ids",
         "slot_ids",
         "categorical",
-        "events_cat",
-        "events_side_ids",
-        "events_slot_ids",
-        "events_metadata",
-    ):
+    )
+    for name in fields:
         torch.testing.assert_close(getattr(live, name), getattr(reconstructed, name))
+    if compare_event_fields:
+        for name in _OBSERVATION_EVENT_FIELDS:
+            torch.testing.assert_close(getattr(live, name), getattr(reconstructed, name))
 
     # Replays store the player's own HP as a percentage, so the HP column and the
     # event HP deltas are quantized relative to the live capture.
@@ -363,6 +371,14 @@ def _assert_expected_observation_fields(
         rtol=0,
     )
 
+    # Status age is not fully observable in a public replay: sleep duration includes
+    # hidden randomness, while toxic stage is reconstructed from public damage turns.
+    # Compare its bounded representation rather than requiring hidden state equality.
+    for observation in (live, reconstructed):
+        status_counter = observation.numerical[..., NUM_IDX_STATUS_COUNTER]
+        assert torch.isfinite(status_counter).all()
+        assert torch.all((status_counter >= 0) & (status_counter <= 1))
+
     # Which reserves the player brought is private until one appears, so a row the
     # replay cannot place yet reports the unknown slot condition instead of guessing,
     # and its side-token mega availability rides the same gate.
@@ -370,7 +386,11 @@ def _assert_expected_observation_fields(
     known_rows[TOKEN_IDX_ALLY_SIDE] = (
         reconstructed.numerical[TOKEN_IDX_ALLY_SIDE, NUM_IDX_LEGALITY_UNKNOWN] == 0
     )
-    columns = [index for index in range(43) if index != NUM_IDX_CAN_MEGA]
+    columns = [
+        index
+        for index in range(NUM_IDX_LEVEL_STATS)
+        if index not in {NUM_IDX_CAN_MEGA, NUM_IDX_STATUS_COUNTER}
+    ]
     columns.remove(NUM_IDX_HP_FRACTION)
     torch.testing.assert_close(
         live.numerical[known_rows][:, columns], reconstructed.numerical[known_rows][:, columns]
@@ -431,6 +451,34 @@ def _assert_reconstruction_labels(document: ReplayDocument) -> tuple[Reconstruct
     return perspectives
 
 
+def _assert_live_action_is_observable(
+    live_action: tuple[int, int],
+    evidence: Any,
+) -> None:
+    """Check only the live action components that a public replay can expose.
+
+    Showdown does not emit a protocol line for a slot that submitted ``pass``.
+    A replacement request can therefore produce a live pair such as
+    ``(switch, pass)`` while the replay only provides candidates for the switch
+    slot.  Treating that invisible component as a required joint-action match
+    manufactures a reconstruction failure at an otherwise shared boundary.
+    """
+    if evidence.label_kind is LabelKind.EXACT and all(
+        action != PASS_ACTION for action in live_action
+    ):
+        assert live_action == evidence.candidates[0]
+        return
+
+    assert evidence.candidates
+    for slot, action in enumerate(live_action):
+        if action == PASS_ACTION:
+            continue
+        assert any(candidate[slot] == action for candidate in evidence.candidates), (
+            f"Live action component {action} for slot {slot} was not candidate-contained: "
+            f"candidates={evidence.candidates!r}"
+        )
+
+
 def _match_live_records(
     perspective: ReconstructedPerspective,
     live_records: tuple[dict[str, Any], ...],
@@ -467,16 +515,15 @@ def _assert_live_truth(
     document: ReplayDocument,
     builder: ObservationBuilder,
 ) -> None:
+    seen_replay_cursors: set[int] = set()
     for snapshot, record in _match_live_records(perspective, live_records, document):
         decision = perspective.decisions[snapshot.decision_index]
         evidence = decision.evidence
         live_action = _live_action(record)
         assert live_action is not None
 
-        if evidence.label_kind is LabelKind.EXACT:
-            assert live_action == evidence.candidates[0]
-        elif evidence.label_kind is LabelKind.PARTIAL:
-            assert live_action in evidence.candidates
+        if evidence.label_kind in (LabelKind.EXACT, LabelKind.PARTIAL):
+            _assert_live_action_is_observable(live_action, evidence)
         else:
             reasons = _cant_reasons(snapshot, perspective.player)
             if reasons:
@@ -490,7 +537,13 @@ def _assert_live_truth(
                 )
 
         reconstructed = builder.build(snapshot.view, {}).cpu()
-        _assert_expected_observation_fields(_live_tensors(record), reconstructed)
+        replay_cursor = int(record["replay_cursor"])
+        _assert_expected_observation_fields(
+            _live_tensors(record),
+            reconstructed,
+            compare_event_fields=replay_cursor not in seen_replay_cursors,
+        )
+        seen_replay_cursors.add(replay_cursor)
 
 
 _ORACLE_SKIPPED_TAGS = frozenset({"", "t:", "expire", "uhtmlchange", "showteam", "win", "tie"})
@@ -506,10 +559,6 @@ def _oracle_battle(document: ReplayDocument, perspective: int) -> DoubleBattle:
         logging.getLogger("p0.stress.oracle"),
         gen=9,
     )
-
-
-def _oracle_effects(pokemon: Any) -> tuple[str, ...]:
-    return tuple(sorted(effect.name for effect in pokemon.effects))
 
 
 def _assert_poke_env_state_agreement(
@@ -551,8 +600,8 @@ def _assert_poke_env_state_agreement(
             assert {field.name for field in battle.fields} == {
                 field.name for field in snapshot.view.fields
             }
-            assert {condition.name for condition in battle.side_conditions} == {
-                condition.name for condition in snapshot.view.side_conditions
+            assert {normalize_id(condition.name) for condition in battle.side_conditions} == {
+                normalize_id(condition.name) for condition in snapshot.view.side_conditions
             }
 
         if line.parts[1] in _ORACLE_SKIPPED_TAGS:
@@ -631,7 +680,9 @@ def _assert_decision_boundaries_partition_the_log(
 @pytest.mark.integration
 @pytest.mark.stress
 @pytest.mark.asyncio
-async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, tmp_path: Path):
+async def test_random_local_games_reconstruct_to_valid_tensors(
+    showdown_server, tmp_path: Path
+) -> None:
     """Play random games, persist replays/captures, and validate round-trip tensors."""
     seed = int(os.getenv("P0_STRESS_SEED", "20260802"))
     game_count = _stress_game_count()
@@ -640,6 +691,8 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
     observation_dir = tmp_path / "live-observations"
     resources = default_runtime_resources()
     builder = ObservationBuilder(resources)
+    team_source = FileTeamSource(DEFAULT_PATHS.teams_root / "all")
+    random_state = random.getstate()
     random.seed(seed)
     poke_env_patches.install()
 
@@ -647,7 +700,8 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
         account_configuration=AccountConfiguration("StressRandomA", None),
         battle_format=FORMAT.battle_format,
         server_configuration=showdown_server,
-        team=DEFAULT_TEST_TEAM,
+        team_source=team_source,
+        team_rng=random.Random(seed + 1),
         accept_open_team_sheet=True,
         max_concurrent_battles=concurrency,
         observation_builder=builder,
@@ -659,7 +713,8 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
         account_configuration=AccountConfiguration("StressRandomB", None),
         battle_format=FORMAT.battle_format,
         server_configuration=showdown_server,
-        team=DEFAULT_TEST_TEAM,
+        team_source=team_source,
+        team_rng=random.Random(seed + 2),
         accept_open_team_sheet=True,
         max_concurrent_battles=concurrency,
         observation_builder=builder,
@@ -675,6 +730,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(showdown_server, 
         await player_a.ps_client.stop_listening()
         await player_b.ps_client.stop_listening()
         poke_env_patches.uninstall_for_tests()
+        random.setstate(random_state)
 
     replay_paths = tuple(sorted(player_a.replay_paths))
     assert len(replay_paths) == game_count

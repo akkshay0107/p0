@@ -10,14 +10,13 @@ from poke_env import LocalhostServerConfiguration, ServerConfiguration
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
+from p0.paths import DEFAULT_PATHS
+from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 
 
 @pytest.fixture(scope="function")
 def showdown_server():
     """Start live stress tests only when the checked-out server is runnable."""
-    from p0.paths import DEFAULT_PATHS
-    from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
-
     root = Path(DEFAULT_PATHS.showdown_root)
     if not (root / "build").is_file():
         pytest.skip("built pokemon-showdown runtime not available")

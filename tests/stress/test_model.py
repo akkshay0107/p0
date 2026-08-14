@@ -40,6 +40,21 @@ def _minimal_model_action_mask(batch_size: int, device: torch.device) -> torch.T
     return mask
 
 
+def _random_ids(
+    target: torch.Tensor,
+    upper_bound: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.randint(
+        0,
+        upper_bound,
+        target.shape,
+        generator=generator,
+        dtype=target.dtype,
+    ).to(device)
+
+
 @pytest.mark.stress
 @pytest.mark.parametrize("batch_size", stress_batch_sizes())
 def test_policy_handles_empty_and_maximum_memory_inputs(
@@ -57,49 +72,70 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
         # without depending on a particular vocabulary entry.
         categorical = observation.categorical
 
-        def random_ids(target: torch.Tensor, upper_bound: int) -> torch.Tensor:
-            return torch.randint(
-                0,
-                upper_bound,
-                target.shape,
-                generator=generator,
-                dtype=target.dtype,
-            ).to(stress_device)
-
-        categorical[..., 0] = random_ids(
-            categorical[..., 0], stress_policy.encoder.species_emb.num_embeddings
+        categorical[..., 0] = _random_ids(
+            categorical[..., 0],
+            stress_policy.encoder.species_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., 1] = random_ids(
-            categorical[..., 1], stress_policy.encoder.ability_emb.num_embeddings
+        categorical[..., 1] = _random_ids(
+            categorical[..., 1],
+            stress_policy.encoder.ability_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., 2] = random_ids(
-            categorical[..., 2], stress_policy.encoder.item_emb.num_embeddings
+        categorical[..., 2] = _random_ids(
+            categorical[..., 2],
+            stress_policy.encoder.item_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., 3:5] = random_ids(
-            categorical[..., 3:5], stress_policy.encoder.type_emb.num_embeddings
+        categorical[..., 3:5] = _random_ids(
+            categorical[..., 3:5],
+            stress_policy.encoder.type_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., 5:9] = random_ids(
-            categorical[..., 5:9], stress_policy.encoder.move_emb.num_embeddings
+        categorical[..., 5:9] = _random_ids(
+            categorical[..., 5:9],
+            stress_policy.encoder.move_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., 9:13] = random_ids(
-            categorical[..., 9:13], stress_policy.encoder.type_emb.num_embeddings
+        categorical[..., 9:13] = _random_ids(
+            categorical[..., 9:13],
+            stress_policy.encoder.type_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., 13:17] = random_ids(
-            categorical[..., 13:17], stress_policy.encoder.category_emb.num_embeddings
+        categorical[..., 13:17] = _random_ids(
+            categorical[..., 13:17],
+            stress_policy.encoder.category_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., CAT_IDX_STATUS] = random_ids(
-            categorical[..., CAT_IDX_STATUS], stress_policy.encoder.status_emb.num_embeddings
+        categorical[..., CAT_IDX_STATUS] = _random_ids(
+            categorical[..., CAT_IDX_STATUS],
+            stress_policy.encoder.status_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., CAT_IDX_STATUS_COUNTER_KIND] = random_ids(
+        categorical[..., CAT_IDX_STATUS_COUNTER_KIND] = _random_ids(
             categorical[..., CAT_IDX_STATUS_COUNTER_KIND],
             stress_policy.encoder.counter_kind_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        categorical[..., 24] = random_ids(
-            categorical[..., 24], stress_policy.encoder.nature_emb.num_embeddings
+        categorical[..., 24] = _random_ids(
+            categorical[..., 24],
+            stress_policy.encoder.nature_emb.num_embeddings,
+            generator,
+            stress_device,
         )
-        observation.categorical[
+        knownness = observation.categorical[
             ..., CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
-        ] = 4
+        ]
+        knownness[:] = _random_ids(knownness, 5, generator, stress_device)
 
         empty_memory = _empty_memory(stress_policy, batch_size)
         with torch.inference_mode():
@@ -209,3 +245,27 @@ def test_policy_scores_ragged_candidates_with_empty_decision_rows(
             stress_device
         )
         assert torch.isfinite(log_probs[nonempty_starts]).all()
+
+
+@pytest.mark.stress
+def test_policy_scores_all_empty_candidate_rows(
+    stress_policy,
+    stress_device: torch.device,
+) -> None:
+    batch_size = 4
+    observation = StructuredObservation.empty_batch(batch_size).to(stress_device)
+    action_mask = _minimal_model_action_mask(batch_size, stress_device)
+    memory = _empty_memory(stress_policy, batch_size)
+    candidate_values = torch.empty((0, 2), dtype=torch.long, device=stress_device)
+    candidate_offsets = torch.zeros(batch_size + 1, dtype=torch.long)
+
+    with torch.inference_mode():
+        prepared = stress_policy.prepare(stress_policy.encode(observation, action_mask), memory)
+        log_probs = stress_policy.score_candidates(
+            prepared,
+            action_mask,
+            candidate_values,
+            candidate_offsets,
+        )
+
+    assert log_probs.shape == (0,)
