@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from p0.format_config import FORMAT
 from p0.replays.group import validated_bo3_series
-from p0.replays.protocol import parse_replay_payload
+from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.scrape import ReplayFetcher, ScrapeConfig, load_raw_replay
 
 PINNED_PUBLIC_CHAMPIONS_BO3_REPLAY = "gen9championsvgc2026regmbbo3-2653729595"
@@ -12,7 +14,7 @@ PINNED_PUBLIC_CHAMPIONS_BO3_REPLAY = "gen9championsvgc2026regmbbo3-2653729595"
 
 @pytest.mark.integration
 @pytest.mark.network
-def test_pinned_public_champions_bo3_series_round_trips(tmp_path) -> None:
+def test_pinned_public_champions_bo3_series_round_trips(tmp_path: Path) -> None:
     config = ScrapeConfig(
         format_id=FORMAT.bo3_format,
         cache_dir=tmp_path,
@@ -32,6 +34,11 @@ def test_pinned_public_champions_bo3_series_round_trips(tmp_path) -> None:
     series = validated_bo3_series(documents)
 
     assert len(entries) == 2
+    assert len(series) == 1
     assert all(document.metadata.format_id == config.format_id for document in documents)
+    assert all(document.raw_payload for document in documents)
+    assert tuple(
+        ReplayDocument.from_dict(document.to_dict()).to_dict() for document in documents
+    ) == tuple(document.to_dict() for document in documents)
     assert [membership.game_number for membership in series[0].memberships] == [1, 2]
     assert series[0].record.is_complete

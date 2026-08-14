@@ -11,6 +11,8 @@ from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
+from p0.paths import DEFAULT_PATHS
+from p0.runtime.showdown import start_showdown_servers
 from p0.teams.source import ValidatedTeam
 
 SHOWDOWN_TEST_PORT = 8120
@@ -29,9 +31,6 @@ def sample_team() -> str:
 @pytest.fixture(scope="function")
 def showdown_server():
     """Start a local Showdown server for integration tests."""
-    from p0.paths import DEFAULT_PATHS
-    from p0.runtime.showdown import start_showdown_servers
-
     if not DEFAULT_PATHS.showdown_root.exists():
         pytest.skip("pokemon-showdown directory not found. Skipping live server tests.")
 

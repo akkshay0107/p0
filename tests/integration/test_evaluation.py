@@ -1,30 +1,28 @@
 from __future__ import annotations
 
+import urllib.parse
+
 import pytest
 
 from p0.evaluation.harness import (
     DEFAULT_TEST_TEAM,
     EvaluationHarness,
 )
+from p0.runtime import poke_env_patches
 from p0.teams.source import FixedTeamSource
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
-    from p0.runtime import poke_env_patches
-
-    poke_env_patches.install()
-
-    import urllib.parse
-
     parsed = urllib.parse.urlparse(showdown_server.websocket_url)
-    port = parsed.port or 8120
+    assert parsed.port is not None
+    poke_env_patches.install()
 
     harness = EvaluationHarness(
         episodes_per_matchup=1,
         seed=42,
-        port=port,
+        port=parsed.port,
     )
     fallback = FixedTeamSource(DEFAULT_TEST_TEAM)
 
@@ -56,15 +54,72 @@ async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
 
     # Check dictionary serialization
     dct = result.to_dict()
+    assert set(dct) == {
+        "policy_a",
+        "policy_b",
+        "team_category",
+        "total_games",
+        "wins_a",
+        "wins_b",
+        "ties",
+        "win_rate_a",
+        "confidence_interval_a",
+        "per_team_results",
+        "source_description",
+        "per_team_a_results",
+        "per_team_b_results",
+    }
+    assert dct["confidence_interval_a"] == list(result.confidence_interval_a)
     assert dct["total_games"] == 1
     assert len(dct["per_team_results"]) == 1
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_server) -> None:
-    from p0.runtime import poke_env_patches
+@pytest.mark.parametrize("policy_side", ("a", "b"))
+async def test_live_evaluation_runs_model_policy_against_random_opponent(
+    showdown_server,
+    model_policy,
+    policy_side: str,
+) -> None:
+    parsed = urllib.parse.urlparse(showdown_server.websocket_url)
+    assert parsed.port is not None
+    policy_a = model_policy if policy_side == "a" else None
+    policy_b = model_policy if policy_side == "b" else None
+    name_a = "ModelA" if policy_a is not None else "RandomA"
+    name_b = "ModelB" if policy_b is not None else "RandomB"
 
+    poke_env_patches.install()
+    try:
+        result = await EvaluationHarness(
+            episodes_per_matchup=1,
+            seed=23,
+            port=parsed.port,
+        ).run_matchup(
+            name_a,
+            policy_a,
+            name_b,
+            policy_b,
+            "fallback",
+            FixedTeamSource(DEFAULT_TEST_TEAM),
+            showdown_server,
+        )
+    finally:
+        poke_env_patches.uninstall_for_tests()
+
+    assert (result.policy_a, result.policy_b) == (name_a, name_b)
+    assert result.total_games == 1
+    assert result.wins_a + result.wins_b + result.ties == result.total_games
+    assert result.win_rate_a == pytest.approx(result.wins_a / result.total_games)
+    assert result.per_team_a_results
+    assert result.per_team_b_results
+    assert sum(stats["games"] for stats in result.per_team_a_results.values()) == 1
+    assert sum(stats["games"] for stats in result.per_team_b_results.values()) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_server) -> None:
     poke_env_patches.install()
     try:
         harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
@@ -81,14 +136,20 @@ async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_ser
         poke_env_patches.uninstall_for_tests()
 
     assert result.total_games == 2
-    assert result.wins_a + result.wins_b == result.total_games
-    assert result.ties == 0
-    assert all(
-        set(stats) == {"wins", "games", "win_rate"} for stats in result.per_team_results.values()
+    assert result.wins_a + result.wins_b + result.ties == result.total_games
+
+    aggregates = (
+        (result.per_team_results, result.wins_a),
+        (result.per_team_a_results, result.wins_a),
+        (result.per_team_b_results, result.wins_b),
     )
-    assert sum(stats["games"] for stats in result.per_team_results.values()) == result.total_games
-    assert all(
-        0 <= stats["wins"] <= stats["games"]
-        and stats["win_rate"] == pytest.approx(stats["wins"] / stats["games"])
-        for stats in result.per_team_results.values()
-    )
+    for stats_by_team, expected_wins in aggregates:
+        assert stats_by_team
+        assert all(set(stats) == {"wins", "games", "win_rate"} for stats in stats_by_team.values())
+        assert sum(stats["games"] for stats in stats_by_team.values()) == result.total_games
+        assert sum(stats["wins"] for stats in stats_by_team.values()) == expected_wins
+        assert all(
+            0 <= stats["wins"] <= stats["games"]
+            and stats["win_rate"] == pytest.approx(stats["wins"] / stats["games"])
+            for stats in stats_by_team.values()
+        )

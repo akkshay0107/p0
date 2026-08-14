@@ -5,8 +5,10 @@ from typing import cast
 import numpy as np
 import pytest
 import torch
-from poke_env.battle import DoubleBattle
+from poke_env import AccountConfiguration
+from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
+from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
 from p0.battle.actions import ACT_SIZE
 from p0.format_config import FORMAT
@@ -18,6 +20,7 @@ from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.rl_player import RLPlayer
 from p0.runtime import poke_env_patches
+from p0.runtime.poke_env_action_adapter import order_to_action
 from p0.teams.source import FixedTeamSource
 from tests.integration.helpers import capture_showdown_decisions, integration_count
 
@@ -83,6 +86,8 @@ class TrackedPolicyPlayer(RLPlayer):
         self.preview_decisions = 0
         self.normal_decisions = 0
         self.history_tokens = []
+        self.selected_actions = {}
+        self.round_trips = []
         super().__init__(*args, **kwargs)
 
     def _get_action(self, battle):
@@ -95,7 +100,30 @@ class TrackedPolicyPlayer(RLPlayer):
             self.preview_decisions += 1
         else:
             self.normal_decisions += 1
+        self.selected_actions[self._battle_key(cast(DoubleBattle, battle))] = tuple(
+            int(value) for value in action
+        )
         return action
+
+    def _record_order_round_trip(self, battle: DoubleBattle, order: BattleOrder) -> None:
+        key = self._battle_key(battle)
+        selected = self.selected_actions.pop(key, None)
+        if selected is None:
+            return
+        encoded = tuple(int(value) for value in order_to_action(order, battle))
+        self.round_trips.append((battle.teampreview, selected, encoded))
+
+    def teampreview(self, battle: AbstractBattle) -> str:
+        assert isinstance(battle, DoubleBattle)
+        message = super().teampreview(battle)
+        self._record_order_round_trip(battle, SingleBattleOrder(message))
+        return message
+
+    def choose_move(self, battle: AbstractBattle):
+        assert isinstance(battle, DoubleBattle)
+        order = super().choose_move(battle)
+        self._record_order_round_trip(battle, order)
+        return order
 
 
 @pytest.mark.integration
@@ -154,6 +182,46 @@ async def test_checkpoint_free_policy_completes_live_battle(
         assert second.history_tokens
         assert not second._battle_histories
         assert first.history_tokens[0] is not second.history_tokens[0]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_model_policy_round_trips_live_preview_and_action_orders(
+    showdown_server,
+    model_policy,
+) -> None:
+    torch.manual_seed(19)
+    poke_env_patches.install()
+    first = TrackedPolicyPlayer(
+        policy=model_policy,
+        battle_format=FORMAT.battle_format,
+        server_configuration=showdown_server,
+        team_source=FixedTeamSource(TEAM),
+        team_rng=random.Random(29),
+        account_configuration=AccountConfiguration("RoundTripA", None),
+        observation_builder=ObservationBuilder(model_policy.resources),
+        max_concurrent_battles=1,
+    )
+    second = RandomPlayer(
+        account_configuration=AccountConfiguration("RoundTripB", None),
+        battle_format=FORMAT.battle_format,
+        server_configuration=showdown_server,
+        team=FixedTeamSource(TEAM).sample(random.Random(31)).packed,
+        max_concurrent_battles=1,
+    )
+
+    try:
+        await asyncio.wait_for(first.battle_against(second, n_battles=1), timeout=60.0)
+    finally:
+        await first.ps_client.stop_listening()
+        await second.ps_client.stop_listening()
+        poke_env_patches.uninstall_for_tests()
+
+    assert first.round_trips
+    assert any(is_preview for is_preview, _, _ in first.round_trips)
+    assert any(not is_preview for is_preview, _, _ in first.round_trips)
+    assert all(selected == encoded for _, selected, encoded in first.round_trips)
+    assert not first.selected_actions
 
 
 @pytest.mark.integration

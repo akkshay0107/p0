@@ -1,7 +1,9 @@
 import asyncio
+from typing import Any
 
 import pytest
 import torch
+from poke_env import AccountConfiguration
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
 
@@ -13,57 +15,90 @@ from p0.model.structured_observation import (
     SEQUENCE_LENGTH,
     StructuredObservation,
 )
+from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_battle_adapter import battle_view
 from tests.integration.helpers import capture_showdown_decisions, integration_count
 
 
+def _build_double_observation(
+    battle: AbstractBattle, builder: ObservationBuilder
+) -> StructuredObservation:
+    if not isinstance(battle, DoubleBattle):
+        raise TypeError(f"Expected DoubleBattle, got {type(battle).__name__}")
+    return builder.build(battle_view(battle))
+
+
+class _ObservationCapturePlayer(RandomPlayer):
+    def __init__(
+        self,
+        *,
+        observation_builder: ObservationBuilder,
+        captured_battles: list[tuple[bool, StructuredObservation]],
+        captured_errors: list[str],
+        **kwargs: Any,
+    ) -> None:
+        self.observation_builder = observation_builder
+        self.captured_battles = captured_battles
+        self.captured_errors = captured_errors
+        super().__init__(**kwargs)
+
+    def _capture_observation(self, battle: AbstractBattle, callback: str) -> None:
+        try:
+            self.captured_battles.append(
+                (
+                    battle.teampreview,
+                    _build_double_observation(battle, self.observation_builder),
+                )
+            )
+        except Exception as exc:
+            self.captured_errors.append(f"{callback}: {exc}")
+
+    def teampreview(self, battle: AbstractBattle):
+        self._capture_observation(battle, "teampreview")
+        return super().teampreview(battle)
+
+    def choose_move(self, battle: AbstractBattle):
+        self._capture_observation(battle, "choose_move")
+        return super().choose_move(battle)
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_observation_builder_live(showdown_server, battle_format, sample_team):
+async def test_observation_builder_live(showdown_server, battle_format, sample_team) -> None:
     """Exercise observation construction against the real local Showdown protocol."""
     captured_battles = []
     captured_errors = []
     builder = ObservationBuilder(default_runtime_resources())
-
-    def build_observation(battle: AbstractBattle) -> StructuredObservation:
-        if not isinstance(battle, DoubleBattle):
-            raise TypeError(f"Expected DoubleBattle, got {type(battle).__name__}")
-        return builder.build(battle_view(battle))
-
-    class CapturePlayer(RandomPlayer):
-        def teampreview(self, battle):
-            try:
-                captured_battles.append((battle.teampreview, build_observation(battle)))
-            except Exception as exc:
-                captured_errors.append(f"teampreview: {exc}")
-            return super().teampreview(battle)
-
-        def choose_move(self, battle):
-            try:
-                captured_battles.append((battle.teampreview, build_observation(battle)))
-            except Exception as exc:
-                captured_errors.append(f"choose_move: {exc}")
-            return super().choose_move(battle)
-
-    p1 = CapturePlayer(
+    p1 = _ObservationCapturePlayer(
+        account_configuration=AccountConfiguration("ObservationA", None),
         battle_format=battle_format,
         server_configuration=showdown_server,
         team=sample_team,
         max_concurrent_battles=1,
+        observation_builder=builder,
+        captured_battles=captured_battles,
+        captured_errors=captured_errors,
     )
     p2 = RandomPlayer(
+        account_configuration=AccountConfiguration("ObservationB", None),
         battle_format=battle_format,
         server_configuration=showdown_server,
         team=sample_team,
         max_concurrent_battles=1,
     )
 
+    poke_env_patches.install()
     try:
-        await asyncio.wait_for(p1.battle_against(p2, n_battles=1), timeout=15.0)
-    except asyncio.TimeoutError:
-        pytest.fail(f"Battle timed out. Internal errors: {captured_errors}")
-    except Exception as exc:
-        pytest.fail(f"Battle failed with exception: {exc}. Internal errors: {captured_errors}")
+        try:
+            await asyncio.wait_for(p1.battle_against(p2, n_battles=1), timeout=15.0)
+        except asyncio.TimeoutError:
+            pytest.fail(f"Battle timed out. Internal errors: {captured_errors}")
+        except Exception as exc:
+            pytest.fail(f"Battle failed with exception: {exc}. Internal errors: {captured_errors}")
+    finally:
+        await p1.ps_client.stop_listening()
+        await p2.ps_client.stop_listening()
+        poke_env_patches.uninstall_for_tests()
 
     assert not captured_errors
     assert captured_battles
