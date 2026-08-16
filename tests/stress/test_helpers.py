@@ -47,7 +47,7 @@ def test_stress_int_enforces_the_configured_minimum(monkeypatch: pytest.MonkeyPa
 @pytest.mark.stress
 def test_random_team_records_stay_inside_the_active_dex() -> None:
     """Verify that randomly generated synthetic team records satisfy all dex legality constraints.
-    
+
     Checks that species, items, abilities, natures, and moves belong to the active format catalog,
     and that stat spreads satisfy the 66-point EV budget rule.
     """
@@ -57,9 +57,20 @@ def test_random_team_records_stay_inside_the_active_dex() -> None:
     records = tuple(stress_random_team_record(rng, label=f"helper-{index}") for index in range(32))
     # Ensure random sampling produced diverse distinct teams rather than degenerate repeats
     assert len({record.team.team_hash for record in records}) > 1
+    pools = {pool.species: pool for pool in catalog.species_pools}
     for record in records:
         assert len(record.team.members) == 6
+        assert len({pools[member.species].base_species for member in record.team.members}) == 6
+        assert len({member.item for member in record.team.members}) == 6
         assert {member.species for member in record.team.members} <= set(catalog.species)
+        for member in record.team.members:
+            pool = pools[member.species]
+            assert member.item in pool.items
+            assert member.ability in pool.abilities
+            assert set(member.moves) <= set(pool.moves)
+            assert 1 <= len(member.moves) <= 4
+            if len(pool.moves) >= 2:
+                assert 2 <= len(member.moves) <= min(4, len(pool.moves))
         assert {member.item for member in record.team.members} <= set(catalog.items)
         assert {member.ability for member in record.team.members} <= set(catalog.abilities)
         assert {member.nature for member in record.team.members} <= set(catalog.natures)

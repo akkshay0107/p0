@@ -139,7 +139,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
     opponent_mode,
 ):
     """Verify an untrained baseline policy runs end-to-end against another policy or random player.
-    
+
     Tests that:
     1. Both team preview and active turn actions are generated and accepted by Showdown.
     2. Recurrent memory tokens are allocated and updated during the battle.
@@ -288,7 +288,7 @@ async def test_policy_handles_showdown_captured_batches(
     batch_size: int,
 ) -> None:
     """Verify the full forward pipeline (encode -> prepare -> act -> evaluate) on live battle batches.
-    
+
     Tests that:
     1. Sampled actions strictly respect the action mask (invalid actions have probability 0).
     2. Sampled action pairs are valid double battle combinations in legal_joint_actions.

@@ -63,7 +63,7 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
     batch_size: int,
 ) -> None:
     """Stress test policy forward pass across empty memory and maximum Best-of-3 / turn history contexts.
-    
+
     Verifies that:
     1. Categorical features across all embedding tables (species, moves, items, status, etc.) are handled without index errors.
     2. Zero-memory baseline inference produces valid, masked, finite action decisions.
@@ -213,7 +213,7 @@ def test_policy_scores_ragged_candidates_with_empty_decision_rows(
     stress_device: torch.device,
 ) -> None:
     """Verify candidate scoring handles variable candidate counts per batch item via CSR offset indexing.
-    
+
     In search or imitation workflows, each battle state may have a variable number of legal candidate
     joint action pairs (or zero candidates for non-acting rows). Candidate scoring must correctly
     map ragged flat candidate tensors to batch rows using cumulative offsets without NaNs.

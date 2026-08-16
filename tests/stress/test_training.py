@@ -40,7 +40,7 @@ def _reference_gae(
 @pytest.mark.stress
 def test_gae_matches_independent_reference_for_terminated_and_truncated_batches() -> None:
     """Verify vectorized compute_gae_batch matches reference GAE across variable-length trajectory batches.
-    
+
     Tests batches with varied episode lengths, alternating between terminal episode boundaries
     (dones=1) and non-terminal truncation requiring value function bootstrapping (bootstraps).
     Ensures inactive padding elements beyond each trajectory's active length remain strictly zero.
@@ -81,7 +81,7 @@ def test_gae_matches_independent_reference_for_terminated_and_truncated_batches(
 @pytest.mark.stress
 def test_prepared_training_batches_keep_returns_and_normalize_only_active_steps() -> None:
     """Verify prepare_trajectory_batches standardizes advantages globally across active steps only.
-    
+
     Verifies that:
     1. Advantage normalization achieves zero mean and unit variance over all concatenated active turns.
     2. Monte Carlo returns (returns = advantages + values) are correctly populated for every batch.
@@ -149,7 +149,7 @@ def test_preparing_no_trajectories_is_a_noop() -> None:
 @pytest.mark.stress
 def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
     """Verify compute_ppo_objective matches theoretical clipped surrogate loss with team-preview scaling.
-    
+
     Checks:
     1. Importance ratio clipping with asymmetric clip bounds (clip_low vs clip_high).
     2. Value function mean squared error loss with value_coef.

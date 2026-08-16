@@ -12,10 +12,8 @@ from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.paths import DEFAULT_PATHS
-from p0.runtime.showdown import start_showdown_servers
+from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 from p0.teams.source import ValidatedTeam
-
-SHOWDOWN_TEST_PORT = 8120
 
 
 @pytest.fixture(scope="session")
@@ -27,7 +25,7 @@ def battle_format() -> str:
 @pytest.fixture(scope="session")
 def sample_team() -> str:
     """Return a packed team string converted from standard Showdown export text.
-    
+
     Packed format is required for direct wire transmission when initializing
     Showdown player sessions.
     """
@@ -37,24 +35,25 @@ def sample_team() -> str:
 @pytest.fixture(scope="function")
 def showdown_server():
     """Start a local ephemeral Showdown server process for live battle integration tests.
-    
-    Skips the test gracefully if the Pokemon-Showdown node repository is not present locally.
-    Yields custom ServerConfiguration targeting the dedicated test port.
+
+    Dynamically binds an unused loopback port to prevent port collisions between
+    concurrent test workers, launching an isolated Showdown server instance for the test lifecycle.
     """
     if not DEFAULT_PATHS.showdown_root.exists():
         pytest.skip("pokemon-showdown directory not found. Skipping live server tests.")
 
+    port = allocate_loopback_ports(1)[0]
     server_configuration = ServerConfiguration(
-        websocket_url=f"ws://localhost:{SHOWDOWN_TEST_PORT}/showdown/websocket",
+        websocket_url=f"ws://localhost:{port}/showdown/websocket",
         authentication_url=LocalhostServerConfiguration.authentication_url,
     )
-    with start_showdown_servers(1, ports=(SHOWDOWN_TEST_PORT,)):
+    with start_showdown_servers(1, ports=(port,)):
         yield server_configuration
 
 
 def _integration_devices() -> tuple[torch.device, ...]:
     """Parse requested test devices from P0_INTEGRATION_DEVICES environment variable.
-    
+
     Defaults to checking both CPU and CUDA (if CUDA is actually available on the host).
     Deduplicates device entries while preserving order, falling back to CPU if empty.
     """
@@ -83,7 +82,7 @@ def model_device(request: pytest.FixtureRequest) -> torch.device:
 @pytest.fixture
 def model_policy(model_device: torch.device):
     """Instantiate a minimal Transformer policy in eval mode for integration testing.
-    
+
     Uses small dimensions (d_model=32, 1 reducer layer) to keep forward pass execution
     fast while exercising the complete forward pipeline and action masking on the target device.
     """
@@ -92,4 +91,3 @@ def model_policy(model_device: torch.device):
         default_runtime_resources(),
     )
     return policy.to(model_device).eval()
-

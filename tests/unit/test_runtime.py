@@ -128,6 +128,7 @@ def test_live_adapter_and_pure_fixture_build_identical_observations() -> None:
 
 def test_raw_event_pre_hp_snapshot() -> None:
     """Verify build_raw_event captures pre-damage health values from callback for damage delta tracking."""
+
     def pre_hp_for(identifier: str) -> float | None:
         assert identifier == "p2a: Charizard"
         return 0.75
@@ -362,6 +363,7 @@ def test_showdown_build_failure_has_bounded_diagnostics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Verify build_showdown error output truncates excessively large stderr outputs to avoid flooding logs."""
+
     def fail(*args, **kwargs):
         raise subprocess.CalledProcessError(1, args[0], stderr="x" * 5000)
 
@@ -452,6 +454,7 @@ def test_showdown_server_rejects_double_start_and_invalid_port_groups(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Verify ShowdownServer rejects start() if already running and checks port uniqueness."""
+
     class FakeProcess:
         returncode = None
 
@@ -493,6 +496,7 @@ def test_showdown_server_rejects_double_start_and_invalid_port_groups(
 
 def test_showdown_server_kills_process_when_graceful_stop_times_out(tmp_path: Path) -> None:
     """Verify ShowdownServer escalates to SIGKILL if the process fails to terminate gracefully within stop_timeout."""
+
     class StuckProcess:
         returncode = None
 
@@ -524,6 +528,7 @@ def test_showdown_server_rolls_back_after_child_crash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Verify ShowdownServer cleans up resources and raises RuntimeError if child process crashes during startup."""
+
     class CrashedProcess:
         returncode = 17
 

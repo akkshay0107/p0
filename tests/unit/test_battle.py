@@ -45,7 +45,7 @@ from p0.model.tokenizer import tokenizer
 
 def test_action_contract_round_trips_ids_and_describes_canonical_ranges() -> None:
     """Verify that action encoding/decoding round-trips all 49 discrete actions across all canonical ranges.
-    
+
     Action Range Taxonomy:
     - [0, 1): Pass action (ID 0)
     - [1, 7): Switch actions for slots 0-5 (IDs 1-6)
@@ -180,7 +180,7 @@ def test_team_preview_bounds_and_validation_errors() -> None:
 
 def test_double_force_switch_with_single_available_switch() -> None:
     """Verify handling when both slots are forced to switch but only one bench Pokémon is alive.
-    
+
     Slot 0 gets the switch (action ID 3) and slot 1 falls back to pass (action ID 0), or vice versa.
     """
     view = DecisionView(
@@ -309,7 +309,7 @@ def test_team_preview_pairs_and_joint_constraints_preserve_uniqueness() -> None:
 
 def test_unknown_legality_masks_are_supersets_of_the_proven_mask() -> None:
     """Verify that when slot legality is unknown, the action mask admits all possible actions (conservative superset).
-    
+
     When legality is unproven, the model permits pass (0) and forced moves (47, 48) in addition
     to candidate moves to ensure the policy never gets blocked by incomplete information.
     """

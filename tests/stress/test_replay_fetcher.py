@@ -41,7 +41,7 @@ class _RetryingTransport:
 @pytest.mark.stress
 def test_replay_fetcher_retries_caches_and_resumes_many_ids(tmp_path: Path) -> None:
     """Stress test ReplayFetcher across high concurrency, retry resilience, and cache resumption.
-    
+
     Verifies that:
     1. ReplayFetcher concurrently downloads 1000+ replay payloads.
     2. Transient HTTP 503 failures are automatically retried and succeed without data loss.

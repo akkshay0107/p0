@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from p0.format_config import FORMAT
 from p0.teams.validation import (
     PersistentShowdownValidator,
     showdown_payload,
@@ -105,9 +106,29 @@ class _PersistentValidatorProcessFactory:
 
 
 @pytest.mark.stress
+def test_species_aware_random_teams_are_valid_for_bo3() -> None:
+    """Check generated teams directly against the pinned Bo3 Showdown validator."""
+    count = stress_count("P0_STRESS_LEGAL_TEAM_VARIANTS", 32)
+    rng = stress_rng()
+    variants = tuple(
+        stress_random_team_record(rng, label=f"legal-stress-{index}") for index in range(count)
+    )
+
+    results = validate_many_batched(
+        variants,
+        batch_size=min(32, count),
+        format_id=FORMAT.bo3_format,
+    )
+    failures = [
+        (index, result.problems) for index, result in enumerate(results) if not result.valid
+    ]
+    assert not failures, f"Generated teams were rejected by the Bo3 validator: {failures[:3]}"
+
+
+@pytest.mark.stress
 def test_batched_team_validation_preserves_identity_and_payload_contract() -> None:
     """Stress test batch team validation across 1024+ team variants.
-    
+
     Verifies that:
     1. Validation chunks teams into exact batch_size slices sent to the Node runner.
     2. Team hash identities and individual validation outcomes remain aligned with inputs.
@@ -147,7 +168,7 @@ def test_batched_team_validation_preserves_identity_and_payload_contract() -> No
 @pytest.mark.stress
 def test_persistent_validator_handles_repeated_batches_and_closes_worker() -> None:
     """Stress test PersistentShowdownValidator with streaming IPC and clean shutdown.
-    
+
     Verifies that:
     1. Persistent validator manages partial remainder batches correctly.
     2. Stdin streaming protocol receives appropriately sized batch requests.

@@ -27,7 +27,11 @@ class AdmissionResult(NamedTuple):
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
-def _variant_dict(variant: TeamRecord) -> dict[str, Any]:
+def _variant_dict(
+    variant: TeamRecord,
+    *,
+    format_id: str = FORMAT.battle_format,
+) -> dict[str, Any]:
     canonical_members = variant.team.canonical().members
     if variant.team.members == canonical_members:
         pairs = list(zip(variant.team.members, variant.spreads, strict=True))
@@ -42,7 +46,9 @@ def _variant_dict(variant: TeamRecord) -> dict[str, Any]:
         canon_member = member.canonical()
         team.append(
             {
-                "name": canon_member.species,
+                # An inferred canonical species ID is not a nickname. Sending it
+                # as name makes Showdown reject long form IDs as nicknames.
+                "name": "",
                 "species": canon_member.species,
                 "item": canon_member.item,
                 "ability": canon_member.ability,
@@ -55,11 +61,15 @@ def _variant_dict(variant: TeamRecord) -> dict[str, Any]:
             }
         )
 
-    return {"format": FORMAT.battle_format, "team": team}
+    return {"format": format_id, "team": team}
 
 
-def showdown_payload(variant: TeamRecord) -> str:
-    return orjson.dumps(_variant_dict(variant)).decode("utf-8")
+def showdown_payload(
+    variant: TeamRecord,
+    *,
+    format_id: str = FORMAT.battle_format,
+) -> str:
+    return orjson.dumps(_variant_dict(variant, format_id=format_id)).decode("utf-8")
 
 
 def validate_variant(
@@ -68,12 +78,13 @@ def validate_variant(
     runner: Runner = subprocess.run,
     timeout: float = 30.0,
     repository_root: Path = DEFAULT_PATHS.repository_root,
+    format_id: str = FORMAT.battle_format,
 ) -> AdmissionResult:
     validator = repository_root / "scripts" / "validate_champions_team.js"
     try:
         process = runner(
             ["node", str(validator)],
-            input=showdown_payload(variant),
+            input=showdown_payload(variant, format_id=format_id),
             text=True,
             capture_output=True,
             cwd=repository_root,
@@ -103,6 +114,7 @@ def validate_many_batched(
     runner: Runner = subprocess.run,
     timeout: float = 60.0,
     repository_root: Path = DEFAULT_PATHS.repository_root,
+    format_id: str = FORMAT.battle_format,
 ) -> tuple[AdmissionResult, ...]:
     """Validate multiple team variants using batched Node invocations.
 
@@ -124,7 +136,9 @@ def validate_many_batched(
     results: list[AdmissionResult] = []
     for offset in range(0, len(variants), batch_size):
         chunk = variants[offset : offset + batch_size]
-        payload = orjson.dumps([_variant_dict(variant) for variant in chunk]).decode("utf-8")
+        payload = orjson.dumps(
+            [_variant_dict(variant, format_id=format_id) for variant in chunk]
+        ).decode("utf-8")
         try:
             process = runner(
                 ["node", str(validator)],
@@ -169,6 +183,7 @@ def validate_many(
     runner: Runner = subprocess.run,
     timeout: float = 30.0,
     repository_root: Path = DEFAULT_PATHS.repository_root,
+    format_id: str = FORMAT.battle_format,
 ) -> tuple[AdmissionResult, ...]:
     if not variants:
         return ()
@@ -179,6 +194,7 @@ def validate_many(
                 runner=runner,
                 timeout=timeout,
                 repository_root=repository_root,
+                format_id=format_id,
             ),
         )
     return validate_many_batched(
@@ -186,6 +202,7 @@ def validate_many(
         runner=runner,
         timeout=timeout,
         repository_root=repository_root,
+        format_id=format_id,
     )
 
 
@@ -202,11 +219,13 @@ class PersistentShowdownValidator:
         popen_factory: Callable[..., Any] = subprocess.Popen,
         repository_root: Path = DEFAULT_PATHS.repository_root,
         request_timeout: float = 30.0,
+        format_id: str = FORMAT.battle_format,
     ) -> None:
         self._popen_factory = popen_factory
         self._repository_root = repository_root
         self._process: Any = None
         self._request_timeout = request_timeout
+        self._format_id = format_id
 
     def __enter__(self) -> PersistentShowdownValidator:
         validator = self._repository_root / "scripts" / "validate_champions_batch.js"
@@ -331,9 +350,9 @@ class PersistentShowdownValidator:
             if poll() is not None:
                 raise RuntimeError("Persistent validator exited before completing the request")
             chunk = variants[offset : offset + batch_size]
-            payload = orjson.dumps({"batch": [_variant_dict(variant) for variant in chunk]}).decode(
-                "utf-8"
-            )
+            payload = orjson.dumps(
+                {"batch": [_variant_dict(variant, format_id=self._format_id) for variant in chunk]}
+            ).decode("utf-8")
             try:
                 self._process.stdin.write(payload + "\n")
                 self._process.stdin.flush()

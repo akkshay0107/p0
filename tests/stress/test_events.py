@@ -13,7 +13,7 @@ from tests.stress._helpers import stress_random_raw_events, stress_repetitions, 
 @pytest.mark.stress
 def test_event_parser_preserves_order_under_repeated_showdown_streams() -> None:
     """Stress test the raw Showdown event parser across randomized protocol streams.
-    
+
     Verifies that:
     1. Parsing is strictly deterministic given the same tokenized event sequence.
     2. Parsed events are assigned strictly contiguous 0-indexed sequential order indices.

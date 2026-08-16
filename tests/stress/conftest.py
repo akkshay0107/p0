@@ -17,7 +17,7 @@ from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 @pytest.fixture(scope="function")
 def showdown_server():
     """Start live stress tests only when the checked-out server is runnable.
-    
+
     Dynamically binds an unused loopback port to prevent port collisions between
     concurrent test workers, launching an isolated Showdown server instance for the test lifecycle.
     """
@@ -37,7 +37,7 @@ def showdown_server():
 
 def _stress_devices() -> tuple[torch.device, ...]:
     """Parse requested stress test compute devices from P0_STRESS_DEVICES.
-    
+
     Filters out CUDA when host hardware lacks GPU support, deduplicates entries,
     and falls back to CPU.
     """

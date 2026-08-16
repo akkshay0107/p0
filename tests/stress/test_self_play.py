@@ -108,7 +108,7 @@ class _SelfPlayVecEnv:
 @pytest.mark.stress
 def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> None:
     """Stress test self-play rollout collection across vectorized environments.
-    
+
     Verifies that:
     1. Both player perspectives (agent 1 and agent 2) generate trajectories across all environments.
     2. Total completed trajectory segments equal 2 perspectives * n_envs * rollout_steps.
@@ -156,7 +156,7 @@ def test_self_play_rollout_keeps_two_perspectives_and_clears_game_state() -> Non
 @pytest.mark.stress
 def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
     """Stress test recurrent BattleMemoryBuffer window slicing, overflow handling, and env isolation.
-    
+
     Verifies that:
     1. BattleMemoryBuffer inputs() returns the latest HISTORY_WINDOW steps.
     2. Appending beyond max_steps raises OverflowError.
@@ -196,7 +196,7 @@ def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
 @pytest.mark.stress
 def test_self_play_rollout_bootstraps_truncation_and_keeps_open_series() -> None:
     """Verify truncation bootstrapping and series memory preservation across incomplete match series.
-    
+
     When an environment experiences mid-battle truncation (done_status=2), value bootstrapping
     must be computed from terminal observations. If a series is still ongoing (series_complete=False),
     its token store memory must be preserved rather than cleared.

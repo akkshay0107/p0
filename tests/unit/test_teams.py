@@ -664,6 +664,7 @@ def test_validate_many_delegates_to_batched_runner() -> None:
 
 def test_validate_many_batched_handles_process_failure() -> None:
     """Verify validate_many_batched raises RuntimeError when validation subprocess returns non-zero exit code."""
+
     def failing_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="Node error")
 
@@ -673,6 +674,7 @@ def test_validate_many_batched_handles_process_failure() -> None:
 
 def test_validate_many_batched_handles_timeout() -> None:
     """Verify validate_many_batched raises RuntimeError upon subprocess timeout expiration."""
+
     def timeout_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(args[0], 30.0)
 
@@ -682,6 +684,7 @@ def test_validate_many_batched_handles_timeout() -> None:
 
 def test_validate_many_batched_handles_malformed_json() -> None:
     """Verify validate_many_batched raises RuntimeError when subprocess outputs non-JSON payload."""
+
     def malformed_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args[0], 0, stdout="not json", stderr="")
 

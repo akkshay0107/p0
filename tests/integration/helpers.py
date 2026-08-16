@@ -23,7 +23,7 @@ from p0.runtime.poke_env_battle_adapter import battle_view
 @dataclass(frozen=True, slots=True)
 class GroundTruthDecision:
     """One observation and order set captured from a live Showdown request.
-    
+
     Contains both the high-level featurized StructuredObservation and the low-level
     valid/chosen Showdown protocol order strings alongside their mapped discrete action indices.
     """
@@ -105,7 +105,7 @@ async def capture_showdown_decisions(
     server_configuration, *, game_count: int = 1, max_concurrent_battles: int = 1
 ):
     """Capture live requests, observations, valid orders, and chosen orders from a Showdown server.
-    
+
     Installs necessary poke-env runtime patches during the battle session and ensures
     websockets and monkey patches are cleanly uninstalled/cleaned up on completion or error.
     """

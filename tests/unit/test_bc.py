@@ -34,10 +34,9 @@ from p0.training.config import BCConfig
 from tests.unit.test_replay import _sample_replay_payload as _payload
 
 
-
 def test_exact_and_partial_losses_match_probability_definitions() -> None:
     """Verify behavior cloning objective calculations for EXACT, PARTIAL, and UNKNOWN label kinds.
-    
+
     Mathematical Formulation:
     - EXACT label: Standard Negative Log Likelihood: NLL = -log(P(action))
     - PARTIAL label: Marginal Negative Log Likelihood over candidate set: NLL = -log(sum_{c in C} P(c))

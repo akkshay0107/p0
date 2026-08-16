@@ -16,7 +16,7 @@ PINNED_PUBLIC_CHAMPIONS_BO3_REPLAY = "gen9championsvgc2026regmbbo3-2653729595"
 @pytest.mark.network
 def test_pinned_public_champions_bo3_series_round_trips(tmp_path: Path) -> None:
     """End-to-end network test: fetch a known public Best-of-3 replay from Showdown, parse, and validate.
-    
+
     Verifies that:
     1. ReplayFetcher downloads the target replay and any sibling games in the series over HTTPS.
     2. Gzipped raw JSON payload is persisted to cache and parsed correctly into ReplayDocuments.

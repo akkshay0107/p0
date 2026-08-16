@@ -57,7 +57,7 @@ def test_dataset_workers_yield_each_random_perspective_once(
     tmp_path: Path, num_workers: int
 ) -> None:
     """Verify DataLoader multiprocess sharding yields every series perspective exactly once without duplicates.
-    
+
     Each compiled game produces two distinct perspective chunks (player 0 and player 1).
     When distributing workload across 0, 1, 2, or 4 worker processes, the union of all
     yielded items must match the full set of (series_id, game_number, player, canonical_player) tuples.
@@ -89,7 +89,7 @@ def test_dataset_workers_yield_each_random_perspective_once(
 @pytest.mark.stress
 def test_dataset_prefetch_and_repeated_iteration_are_stable(tmp_path) -> None:
     """Verify that multi-worker prefetching with persistent workers produces consistent epoch iterations.
-    
+
     Ensures that background prefetch buffers and persistent worker worker-loop state
     do not cause order corruption, missed elements, or memory leakage across repeated dataset epochs.
     """
@@ -114,7 +114,7 @@ def test_dataset_prefetch_and_repeated_iteration_are_stable(tmp_path) -> None:
 @pytest.mark.stress
 def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_path) -> None:
     """Verify that SeriesSplitManifest isolates train and test splits at the series level without leakage.
-    
+
     Replays must be partitioned strictly by entire match series rather than individual games or
     perspectives, preventing data leakage where one player's view or game from a series leaks into test.
     """
@@ -162,8 +162,8 @@ def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_pat
 
 @pytest.mark.stress
 def test_dataset_marks_the_last_game_of_a_series_explicitly(tmp_path) -> None:
-    """Verify that LazyReplayDataset sets `is_series_end` only on the terminal game of a multi-game series.
-    
+    """Verify that LazyReplayDataset sets is_series_end only on the terminal game of a multi-game series.
+
     In a Best-of-3 series, game 1 must have is_series_end=False to signal recurrent memory persistence,
     while game 2 must have is_series_end=True to trigger recurrent state truncation/reset.
     """

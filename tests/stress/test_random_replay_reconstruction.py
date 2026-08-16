@@ -49,7 +49,6 @@ from p0.model.structured_observation import (
     TOKEN_IDX_ALLY_SIDE,
     StructuredObservation,
 )
-from p0.paths import DEFAULT_PATHS
 from p0.replays.compile import compile_documents, write_tensor_shards
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.reconstruct import (
@@ -65,7 +64,9 @@ from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import FileTeamSource
-from tests.stress._helpers import stress_count
+from p0.teams.stat_points import StatPoints
+from p0.teams.team import TeamMember
+from tests.stress._helpers import stress_count, stress_random_team_record
 
 # Cant reasons emitted by the checked-in Showdown commit for the champions
 # format.  The source locations are data/conditions.ts, data/abilities.ts,
@@ -166,7 +167,7 @@ def _live_boundary(record: dict[str, Any], splice_index: int, splice_count: int)
 
 class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
     """Random player that saves pre-fusion decisions and completed replay JSON.
-    
+
     Captures exact raw observation tensors, action decisions, and replay line stream offsets
     during live battle execution so offline replay reconstruction can be verified 1-to-1 against ground truth.
     """
@@ -320,6 +321,45 @@ def _stress_timeout(game_count: int) -> float:
     return value
 
 
+def _showdown_team_text(team: tuple[TeamMember, ...], spreads: tuple[StatPoints, ...]) -> str:
+    """Serialize a generated team into the Showdown text format used by FileTeamSource."""
+    stat_names = {
+        "hp": "HP",
+        "atk": "Atk",
+        "def": "Def",
+        "spa": "SpA",
+        "spd": "SpD",
+        "spe": "Spe",
+    }
+    sets = []
+    for member, spread in zip(team, spreads, strict=True):
+        evs = " / ".join(
+            f"{value} {stat_names[name]}" for name, value in spread.as_dict().items() if value
+        )
+        lines = [
+            f"{member.species} @ {member.item}",
+            f"Ability: {member.ability}",
+            f"Level: {member.level}",
+        ]
+        if evs:
+            lines.append(f"EVs: {evs}")
+        lines.extend((f"{member.nature} Nature", *(f"- {move}" for move in member.moves)))
+        sets.append("\n".join(lines))
+    return "\n\n".join(sets) + "\n"
+
+
+def _random_team_source(directory: Path, *, seed: int, count: int) -> FileTeamSource:
+    """Create a temporary FileTeamSource populated only with generated legal teams."""
+    directory.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(seed)
+    for index in range(count):
+        record = stress_random_team_record(rng, label=f"live-random-{index}")
+        (directory / f"random-{index:04d}.txt").write_text(
+            _showdown_team_text(record.team.members, record.spreads), encoding="utf-8"
+        )
+    return FileTeamSource(directory)
+
+
 def _load_live_artifact(path: Path) -> dict[str, Any]:
     artifact = torch.load(path, map_location="cpu", weights_only=True)
     if (
@@ -465,10 +505,10 @@ def _assert_live_action_is_observable(
 ) -> None:
     """Check only the live action components that a public replay can expose.
 
-    Showdown does not emit a protocol line for a slot that submitted ``pass``.
+    Showdown does not emit a protocol line for a slot that submitted pass.
     A replacement request can therefore produce a live pair such as
-    ``(switch, pass)`` while the replay only provides candidates for the switch
-    slot.  Treating that invisible component as a required joint-action match
+    (switch, pass) while the replay only provides candidates for the switch
+    slot. Treating that invisible component as a required joint-action match
     manufactures a reconstruction failure at an otherwise shared boundary.
     """
     if evidence.label_kind is LabelKind.EXACT and all(
@@ -692,7 +732,7 @@ async def test_random_local_games_reconstruct_to_valid_tensors(
     showdown_server, tmp_path: Path
 ) -> None:
     """End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
-    
+
     Verifies that:
     1. 100+ random live battles run concurrently against a local Showdown server.
     2. Spliced replay documents capture all turns with valid terminal line indices.
@@ -710,7 +750,11 @@ async def test_random_local_games_reconstruct_to_valid_tensors(
     observation_dir = tmp_path / "live-observations"
     resources = default_runtime_resources()
     builder = ObservationBuilder(resources)
-    team_source = FileTeamSource(DEFAULT_PATHS.teams_root / "all")
+    team_source = _random_team_source(
+        tmp_path / "random-teams",
+        seed=seed + 1,
+        count=max(32, game_count * 2),
+    )
     random_state = random.getstate()
     random.seed(seed)
     poke_env_patches.install()

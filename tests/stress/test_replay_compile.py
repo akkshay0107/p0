@@ -19,7 +19,7 @@ from tests.stress._helpers import (
 @pytest.mark.stress
 def test_compiler_preserves_random_replay_identity_at_scale(tmp_path) -> None:
     """Verify that replay compilation and tensor sharding accurately preserve all games and metadata at scale.
-    
+
     Checks that:
     1. 128+ randomized replays compile without drops or ID corruption.
     2. Shard writer creates valid tensor files satisfying PyTorch schema and dimension constraints.
@@ -111,7 +111,7 @@ def test_compiler_is_deterministic_for_random_replays(tmp_path) -> None:
 @pytest.mark.stress
 def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> None:
     """Verify that games belonging to the same Best-of-3 series are never split across shard files.
-    
+
     Even when max_decisions_per_shard is set to 1, series atomicity requires all games within
     a single match series to reside within the same shard file for correct recurrent training context.
     """

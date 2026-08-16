@@ -139,7 +139,6 @@ def _sample_replay_payload(
     }
 
 
-
 def _write_dataset_replay_dataset(
     tmp_path: Path, payloads: tuple[dict[str, object], ...]
 ) -> ShardBuildResult:

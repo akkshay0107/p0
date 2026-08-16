@@ -9,6 +9,7 @@ import random
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from p0.battle.events import RawBattleEvent
@@ -19,14 +20,26 @@ from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 
 
 @dataclass(frozen=True, slots=True)
+class StressSpeciesPool:
+    """Validated choices attached to one legal, sendable species form."""
+
+    species: str
+    base_species: str
+    items: tuple[str, ...]
+    abilities: tuple[str, ...]
+    moves: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StressDexCatalog:
-    """Format-legal display names used by randomized stress inputs."""
+    """Format-legal values and species-aware pools used by stress inputs."""
 
     species: tuple[str, ...]
     items: tuple[str, ...]
     abilities: tuple[str, ...]
     moves: tuple[str, ...]
     natures: tuple[str, ...]
+    species_pools: tuple[StressSpeciesPool, ...]
 
 
 def _legal_display_names(dex: Mapping[str, Any], kind: str) -> tuple[str, ...]:
@@ -39,17 +52,81 @@ def _legal_display_names(dex: Mapping[str, Any], kind: str) -> tuple[str, ...]:
     )
 
 
+def _load_species_pools() -> tuple[StressSpeciesPool, ...]:
+    """Load species-specific ability and learnset pools from the stress catalog."""
+    catalog_path = Path(__file__).parent / "stress_team_catalog.json"
+    if not catalog_path.is_file():
+        raise FileNotFoundError(f"Stress team catalog JSON not found: {catalog_path}")
+
+    try:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Stress team catalog contains malformed JSON") from exc
+
+    if not isinstance(payload, Mapping) or payload.get("schemaVersion") != 1:
+        raise RuntimeError("Stress team catalog has an unsupported schema")
+    if payload.get("format") != FORMAT.bo3_format:
+        raise RuntimeError("Stress team catalog was built for the wrong format")
+
+    raw_pools = payload.get("species")
+    if not isinstance(raw_pools, list):
+        raise RuntimeError("Stress team catalog has no species pools")
+
+    pools: list[StressSpeciesPool] = []
+    for raw_pool in raw_pools:
+        if not isinstance(raw_pool, Mapping):
+            raise RuntimeError("Stress team catalog contains a malformed species pool")
+
+        values: dict[str, tuple[str, ...]] = {}
+        for field in ("items", "abilities", "moves"):
+            raw_values = raw_pool.get(field)
+            if not isinstance(raw_values, list) or not all(
+                isinstance(value, str) and value for value in raw_values
+            ):
+                raise RuntimeError(f"Stress team catalog has an invalid {field} pool")
+            values[field] = tuple(raw_values)
+
+        species = raw_pool.get("name")
+        base_species = raw_pool.get("baseSpecies")
+        if not isinstance(species, str) or not species:
+            raise RuntimeError("Stress team catalog has a species without a name")
+        if not isinstance(base_species, str) or not base_species:
+            raise RuntimeError(f"Stress team catalog has no base species for {species}")
+        if len(set(values["items"])) != len(values["items"]):
+            raise RuntimeError(f"Stress team catalog repeats items for {species}")
+        if len(set(values["moves"])) != len(values["moves"]):
+            raise RuntimeError(f"Stress team catalog repeats moves for {species}")
+
+        pools.append(
+            StressSpeciesPool(
+                species=species,
+                base_species=base_species,
+                items=values["items"],
+                abilities=values["abilities"],
+                moves=values["moves"],
+            )
+        )
+
+    if len({pool.species for pool in pools}) != len(pools):
+        raise RuntimeError("Stress team catalog repeats species forms")
+    if len({pool.base_species for pool in pools}) < 6:
+        raise RuntimeError("Stress team catalog has fewer than six base species")
+    return tuple(pools)
+
+
 @lru_cache(maxsize=1)
 def stress_dex_catalog() -> StressDexCatalog:
     """Load the active format's legal dex values once for all stress generators."""
     dex = default_runtime_resources().dex
+    species_pools = _load_species_pools()
 
     catalog = StressDexCatalog(
-        species=_legal_display_names(dex, "species"),
+        species=tuple(pool.species for pool in species_pools),
         items=_legal_display_names(dex, "items"),
         abilities=_legal_display_names(dex, "abilities"),
         moves=_legal_display_names(dex, "moves"),
         natures=_legal_display_names(dex, "natures"),
+        species_pools=species_pools,
     )
     if not all((catalog.species, catalog.items, catalog.abilities, catalog.moves, catalog.natures)):
         raise AssertionError("The active format dex has an empty legal category")
@@ -58,13 +135,13 @@ def stress_dex_catalog() -> StressDexCatalog:
 
 def _random_stat_points(rng: random.Random) -> StatPoints:
     """Sample random EV point allocations respecting the maximum total EV budget constraint.
-    
+
     Generates 6 stat points in [0, 32] such that their sum does not exceed 66 total points
     (representing the 508 EV cap in Showdown VGC / Singles).
     """
     while True:
         values = [rng.randrange(33) for _ in range(6)]
-        if sum(values) <= 66:
+        if sum(values) <= 66 and any(values):
             return StatPoints(
                 hp=values[0],
                 atk=values[1],
@@ -75,31 +152,79 @@ def _random_stat_points(rng: random.Random) -> StatPoints:
             )
 
 
+def _assign_unique_items(
+    rng: random.Random,
+    pools: tuple[StressSpeciesPool, ...],
+) -> tuple[str, ...]:
+    """Find one distinct admitted item for every selected species pool."""
+    if len(pools) != 6:
+        raise ValueError(f"Expected six species pools, got {len(pools)}")
+
+    # Process the most constrained pools first. The augmenting-path assignment
+    # makes item uniqueness a solved constraint, not a reason to discard a team.
+    order = list(range(len(pools)))
+    rng.shuffle(order)
+    order.sort(key=lambda index: len(pools[index].items))
+    item_owner: dict[str, int] = {}
+    assigned: list[str | None] = [None] * len(pools)
+
+    def assign(pool_index: int, seen: set[str]) -> bool:
+        candidates = list(pools[pool_index].items)
+        rng.shuffle(candidates)
+        for item in candidates:
+            if item in seen:
+                continue
+            seen.add(item)
+            previous_owner = item_owner.get(item)
+            if previous_owner is None or assign(previous_owner, seen):
+                item_owner[item] = pool_index
+                assigned[pool_index] = item
+                return True
+        return False
+
+    for pool_index in order:
+        if not assign(pool_index, set()):
+            names = ", ".join(pool.species for pool in pools)
+            raise RuntimeError(f"No six-item matching exists for validated pools: {names}")
+
+    if any(item is None for item in assigned):
+        raise AssertionError("Item matching completed without assigning every team member")
+    return tuple(item for item in assigned if item is not None)
+
+
 def _random_team_members(rng: random.Random) -> tuple[TeamMember, ...]:
-    """Sample 6 valid distinct team members from the format dex with legal moves, abilities, and items."""
+    """Sample six Showdown-valid members from distinct Species Clause groups."""
     catalog = stress_dex_catalog()
-    species = rng.sample(catalog.species, 6)
-    items = rng.sample(catalog.items, 6)
+    by_base_species: dict[str, list[StressSpeciesPool]] = {}
+    for pool in catalog.species_pools:
+        by_base_species.setdefault(pool.base_species, []).append(pool)
+
+    selected_bases = rng.sample(tuple(by_base_species), 6)
+    selected_pools = tuple(
+        rng.choice(by_base_species[base_species]) for base_species in selected_bases
+    )
+    items = _assign_unique_items(rng, selected_pools)
+
     return tuple(
         TeamMember(
-            species=species[index],
+            species=pool.species,
             item=items[index],
-            ability=rng.choice(catalog.abilities),
-            moves=tuple(rng.sample(catalog.moves, 4)),
+            ability=rng.choice(pool.abilities),
+            moves=tuple(
+                rng.sample(
+                    pool.moves,
+                    1 if len(pool.moves) == 1 else rng.randint(2, min(4, len(pool.moves))),
+                )
+            ),
             nature=rng.choice(catalog.natures),
             level=50,
         )
-        for index in range(6)
+        for index, pool in enumerate(selected_pools)
     )
 
 
 def stress_random_team_record(rng: random.Random, *, label: str = "stress") -> TeamRecord:
-    """Build a team record from values admitted by the active dex contract.
-
-    The combinations are deliberately catalog-bounded rather than hand-picked. These records
-    feed mocked validator transports, so learnset and item-combination admission remains covered
-    by the pinned Showdown validator tests instead of being silently claimed here.
-    """
+    """Build a six-member team admitted by the active format's species-aware dex pools."""
     members = _random_team_members(rng)
     return TeamRecord(
         team=CanonicalTeam(members),
@@ -122,7 +247,7 @@ def stress_random_replay_teams(
 
 def stress_series_id(parent: str, players: tuple[str, str] = ("Alice", "Bob")) -> str:
     """Calculate the deterministic grouping identity used by the replay compiler.
-    
+
     Hashes the format ID, parent series ID, and casefolded player names to produce
     a 24-character hexadecimal series identifier.
     """
@@ -157,7 +282,7 @@ def stress_random_replay_payload(
     teams: tuple[tuple[TeamMember, ...], tuple[TeamMember, ...]] | None = None,
 ) -> dict[str, Any]:
     """Build a replay-shaped payload with random values from the active legal dex.
-    
+
     Emits simulated Showdown protocol lines including teampreview, showteam headers,
     lead switches, double battle moves, and match conclusion.
     """
@@ -229,7 +354,7 @@ def stress_random_bo3_payloads(
     series_prefix: str,
 ) -> tuple[dict[str, Any], ...]:
     """Build paired games (game 1 & game 2) per series while preserving each series' team roster.
-    
+
     Ensures that both games in a Best-of-3 series share the same team compositions across
     players, mimicking actual tournament series conditions for replay grouping tests.
     """

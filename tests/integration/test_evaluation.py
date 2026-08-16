@@ -16,7 +16,7 @@ from p0.teams.source import FixedTeamSource
 @pytest.mark.asyncio
 async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
     """Verify EvaluationHarness runs a live matchup between baseline random players and tracks stats.
-    
+
     Checks that the matchup completes without unhandled exceptions, computes win rates,
     aggregates results per team archetype, and produces a complete dictionary serialization
     containing confidence intervals and metadata suitable for logging.
@@ -128,10 +128,11 @@ async def test_live_evaluation_runs_model_policy_against_random_opponent(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_evaluation_matchup_serializes_per_team_outcomes(showdown_server) -> None:
-    """Verify multi-game evaluation records and aggregates per-team win/loss statistics correctly."""
+    parsed = urllib.parse.urlparse(showdown_server.websocket_url)
+    assert parsed.port is not None
     poke_env_patches.install()
     try:
-        harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
+        harness = EvaluationHarness(episodes_per_matchup=2, seed=17, port=parsed.port)
         result = await harness.run_matchup(
             "random-a",
             None,

@@ -13,7 +13,7 @@ from tests.stress._helpers import stress_count, stress_repetitions, stress_rng
 @pytest.mark.stress
 def test_normalization_cache_is_stable_across_repeated_protocol_ids() -> None:
     """Verify that string ID normalization produces deterministic canonical strings and utilizes LRU cache.
-    
+
     Checks that:
     1. PokemonTokenizer.normalize_id strips non-alphanumeric ASCII characters and lowercases.
     2. Repeated lookups over 1024+ unique strings hit the internal LRU cache with exactly N misses initially.
@@ -50,12 +50,12 @@ def test_normalization_cache_is_stable_across_repeated_protocol_ids() -> None:
 @pytest.mark.stress
 def test_token_store_append_drop_clear_and_high_cardinality_keys() -> None:
     """Stress test SeriesTokenStore across high key volumes, FIFO eviction, and masking.
-    
+
     Verifies that:
-    1. Appending more games than `max_games=2` correctly evicts oldest entries (FIFO).
-    2. Batch retrieval (`get_tokens`) returns aligned token tensors and accurate boolean attention masks.
+    1. Appending more games than max_games=2 correctly evicts oldest entries (FIFO).
+    2. Batch retrieval (get_tokens) returns aligned token tensors and accurate boolean attention masks.
     3. Missing or dropped series keys return empty zero-padded tensors with all-False mask bits.
-    4. `drop` and `clear` cleanly deallocate entries without memory leaks.
+    4. drop and clear cleanly deallocate entries without memory leaks.
     """
     store = SeriesTokenStore(d_model=3, max_games=2)
     keys = tuple(

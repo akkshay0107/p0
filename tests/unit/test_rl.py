@@ -194,7 +194,7 @@ def test_thread_vec_env_reports_a_tri_state_done_status(
     terminated: bool, truncated: bool, expected: int
 ) -> None:
     """Verify ThreadVecEnv returns a tri-state done status: 0 (running), 1 (terminated), 2 (truncated for bootstrapping).
-    
+
     Distinguishing truncation (2) from termination (1) is vital: truncated episodes bootstrap
     value targets off the next state rather than zeroing out subsequent returns.
     """
@@ -233,6 +233,7 @@ def test_thread_vec_env_rejects_an_action_count_mismatch():
 
 def test_compute_gae_batch_matches_single_episode_reference():
     """Verify vectorized compute_gae_batch matches pure-Python sequential GAE calculation for variable episode lengths."""
+
     def compute_gae_reference(
         rewards: torch.Tensor,
         values: torch.Tensor,
@@ -780,6 +781,7 @@ def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):
 
 def test_sim_env_training_state_restores_teams_and_preserves_game_boundary(monkeypatch):
     """Verify SimEnv serialization saves and restores team strings, series scores, and game counters."""
+
     class TeamBuilder:
         def __init__(self, packed: str):
             self.packed = packed
