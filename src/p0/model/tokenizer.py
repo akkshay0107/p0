@@ -197,7 +197,14 @@ class PokemonTokenizer:
     def species_id(self, pokemon: PokemonView | None) -> int:
         if pokemon is None:
             return 0
-        species = pokemon.species or pokemon.base_species
+        species = pokemon.species
+        if not species:
+            try:
+                species = pokemon.base_species
+            except (KeyError, AttributeError):
+                species = None
+        if not species:
+            return 0
         return self.species.get(self.normalize_id(species), 0)
 
     def ability_id(self, pokemon: PokemonView | None) -> int:

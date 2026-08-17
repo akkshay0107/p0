@@ -17,12 +17,15 @@ from p0.battle.events import (
     SPATIAL_NUMERICAL_WIDTH,
     SPATIAL_SLOT_COUNT,
 )
-from p0.battle.views import BattleView, MoveView, PokemonView
+from p0.battle.views import BattleView, MoveView, PokemonView, TransformedPokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
+    CAT_IDX_IDENTITY_KNOWNNESS,
+    CAT_IDX_MECHANIC_STATE,
     CAT_IDX_NATURE,
+    CAT_IDX_PRESENCE_STATUS,
+    CAT_IDX_STAT_PROVENANCE,
     CAT_IDX_STATUS_COUNTER_KIND,
-    CAT_KNOWNNESS_START,
     CATEGORICAL_WIDTH,
     MAX_EFFECTS,
     MOVE_SLOTS,
@@ -39,15 +42,16 @@ from p0.model.structured_observation import (
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STAT_PROVENANCE,
     NUM_IDX_STATUS_COUNTER,
-    NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TEAM_SIZE,
     CounterKind,
     EffectNamespace,
-    Knownness,
-    Provenance,
+    IdentityKnownness,
+    MechanicState,
+    PresenceStatus,
     SideId,
+    StatProvenance,
     StructuredObservation,
     TokenType,
     effect_cat_slice,
@@ -98,12 +102,6 @@ _SLOT_LAYOUT = np.asarray(
     ),
     dtype=np.int64,
 )
-
-
-def _knownness(value: object | None, resolved_id: int) -> Knownness:
-    if value is None or value == "":
-        return Knownness.KNOWN_NONE
-    return Knownness.KNOWN if resolved_id else Knownness.OOV
 
 
 def _status_counter_kind(status: object | None) -> CounterKind:
@@ -302,16 +300,16 @@ def _get_pokemon_level_stats(
     pokemon: PokemonView,
     is_opponent: bool,
     precomputed: tuple[int, int, int, int, int, int] | None,
-) -> tuple[tuple[float, ...], Provenance]:
+) -> tuple[tuple[float, ...], StatProvenance]:
     stats = pokemon.stats
     if not is_opponent and stats is not None:
         values = [stats.get(key) for key in ("hp", "atk", "def", "spa", "spd", "spe")]
         if all(value is not None for value in values):
-            return tuple(float(value) for value in values), Provenance.SELF_KNOWN  # type: ignore
+            return tuple(float(value) for value in values), StatProvenance.KNOWN  # type: ignore
 
     if precomputed is not None:
-        return tuple(float(value) for value in precomputed), Provenance.IMPUTED
-    return (0.0,) * 6, Provenance.UNKNOWN
+        return tuple(float(value) for value in precomputed), StatProvenance.IMPUTED
+    return (0.0,) * 6, StatProvenance.UNKNOWN
 
 
 def _resolve_stats(
@@ -448,8 +446,14 @@ def _pokemon_categorical_into(
     tok: PokemonTokenizer,
     move_slots: tuple[MoveView | None, ...],
     row: np.ndarray,
+    cond: int = 0,
+    stat_provenance: StatProvenance = StatProvenance.PAD,
 ) -> None:
     if pokemon is None:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.PAD
+        row[CAT_IDX_STAT_PROVENANCE] = StatProvenance.PAD
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.PAD
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.NORMAL
         return
 
     row[0] = tok.species_id(pokemon)
@@ -465,20 +469,51 @@ def _pokemon_categorical_into(
     row[17] = tok.status_id(pokemon.status)
     row[CAT_IDX_NATURE] = tok.nature_id(pokemon)
     row[CAT_IDX_STATUS_COUNTER_KIND] = _status_counter_kind(pokemon.status)
-    values = (
-        pokemon.species or pokemon.base_species,
-        pokemon.ability,
-        pokemon.item,
-        pokemon.type_1,
-        pokemon.type_2,
-        *move_slots,
-        *(move.type if move is not None else None for move in move_slots),
-        *(move.category if move is not None else None for move in move_slots),
-        pokemon.status,
-    )
-    for index, value in enumerate(values):
-        row[CAT_KNOWNNESS_START + index] = _knownness(value, int(row[index]))
-    row[CAT_KNOWNNESS_START + CAT_IDX_NATURE] = _knownness(pokemon.nature, int(row[CAT_IDX_NATURE]))
+
+    # Distinguish missing species from names the current vocabulary cannot encode.
+    species_name = pokemon.species
+    if not species_name:
+        try:
+            species_name = pokemon.base_species
+        except (KeyError, AttributeError):
+            species_name = None
+
+    if not species_name:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.UNKNOWN
+    elif row[0] > 0:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.KNOWN
+    else:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.OOV
+
+    # Record whether level stats are exact, estimated, or unavailable.
+    row[CAT_IDX_STAT_PROVENANCE] = stat_provenance
+
+    # Summarize what the observer knows about this Pokemon's battle presence.
+    if cond == 1:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.ACTIVE
+    elif cond == -1:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.UNBROUGHT_CONFIRMED
+    elif pokemon.revealed:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.BENCH_REVEALED
+    else:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.RESERVE_UNCONFIRMED
+
+    # Transform is explicit in the view. Illusion is present only while an
+    # Illusion user is still presenting another Pokemon as its base species.
+    try:
+        base_species_id = PokemonTokenizer.normalize_id(pokemon.base_species)
+    except (KeyError, AttributeError):
+        base_species_id = ""
+
+    if isinstance(pokemon, TransformedPokemonView):
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.TRANSFORMED
+    elif (
+        PokemonTokenizer.normalize_id(pokemon.ability or "") == "illusion"
+        and base_species_id != "zoroark"
+    ):
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.ILLUSION_DISGUISED
+    else:
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.NORMAL
 
 
 def _ally_legality(
@@ -511,9 +546,10 @@ def _pokemon_numeric_into(
     orig_idx: int,
     move_slots: tuple[MoveView | None, ...],
     row: np.ndarray,
+    level_stats: tuple[float, ...],
+    stat_provenance: StatProvenance,
     active_idx: int | None = None,
     is_opponent: bool = False,
-    precomputed_stats: tuple[int, int, int, int, int, int] | None = None,
 ) -> None:
     row[cond + 1] = 1.0
 
@@ -586,10 +622,8 @@ def _pokemon_numeric_into(
 
     row[NUM_IDX_PREPARING] = pokemon.preparing
 
-    level_stats, stat_provenance = _get_pokemon_level_stats(pokemon, is_opponent, precomputed_stats)
     row[NUM_IDX_LEVEL_STATS : NUM_IDX_LEVEL_STATS + 6] = [stat / 300.0 for stat in level_stats]
-    row[NUM_IDX_STAT_PROVENANCE] = float(stat_provenance == Provenance.SELF_KNOWN)
-    row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = stat_provenance
+    row[NUM_IDX_STAT_PROVENANCE] = float(stat_provenance == StatProvenance.KNOWN)
 
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
@@ -764,10 +798,15 @@ def _write_observation(
             slot_id = slot_idx + 1
             if mon is not None:
                 pokemon_to_slot[mon] = (side, slot_id)
-            move_slots = _iter_move_slots(mon)
+                precomputed = _resolve_stats(mon, is_opponent, stat_cache, stat_overrides)
+                level_stats, stat_prov = _get_pokemon_level_stats(mon, is_opponent, precomputed)
+            else:
+                level_stats, stat_prov = (0.0,) * 6, StatProvenance.PAD
 
-            _pokemon_categorical_into(mon, tok, move_slots, categorical[idx])
-            precomputed = _resolve_stats(mon, is_opponent, stat_cache, stat_overrides)
+            move_slots = _iter_move_slots(mon)
+            _pokemon_categorical_into(
+                mon, tok, move_slots, categorical[idx], cond=cond, stat_provenance=stat_prov
+            )
             _pokemon_numeric_into(
                 mon,
                 battle,
@@ -775,9 +814,10 @@ def _write_observation(
                 orig_idx,
                 move_slots,
                 numerical[idx],
-                active_idx,
+                level_stats=level_stats,
+                stat_provenance=stat_prov,
+                active_idx=active_idx,
                 is_opponent=is_opponent,
-                precomputed_stats=precomputed,
             )
             _pokemon_effects_into(mon, tok, categorical[idx], numerical[idx])
             idx += 1

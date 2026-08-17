@@ -40,10 +40,12 @@ from p0.model.resources import default_runtime_resources
 from p0.model.series_context import DynamicSeriesResampler
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_IDENTITY_KNOWNNESS,
+    CAT_IDX_MECHANIC_STATE,
     CAT_IDX_NATURE,
+    CAT_IDX_PRESENCE_STATUS,
+    CAT_IDX_STAT_PROVENANCE,
     CAT_IDX_STATUS_COUNTER_KIND,
-    CAT_KNOWNNESS_START,
-    CAT_KNOWNNESS_WIDTH,
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
     EFFECT_NUMERICAL_WIDTH,
@@ -162,9 +164,10 @@ def dummy_obs() -> StructuredObservation:
     categorical[:, 0:12, 13:17] = torch.randint(1, 4, (B, 12, 4))
     categorical[:, 0:12, 17] = torch.randint(1, 7, (B, 12))
     categorical[:, 0:12, CAT_IDX_STATUS_COUNTER_KIND] = torch.randint(0, 5, (B, 12))
-    categorical[:, 0:12, CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH] = (
-        torch.randint(1, 5, (B, 12, CAT_KNOWNNESS_WIDTH))
-    )
+    categorical[:, 0:12, CAT_IDX_IDENTITY_KNOWNNESS] = torch.randint(1, 4, (B, 12))
+    categorical[:, 0:12, CAT_IDX_STAT_PROVENANCE] = torch.randint(1, 4, (B, 12))
+    categorical[:, 0:12, CAT_IDX_PRESENCE_STATUS] = torch.randint(1, 5, (B, 12))
+    categorical[:, 0:12, CAT_IDX_MECHANIC_STATE] = torch.randint(0, 3, (B, 12))
 
     numerical = torch.randn((B, SEQUENCE_LENGTH, NUMERICAL_WIDTH))
     for token_idx in range(15):
@@ -987,8 +990,8 @@ def test_fixed_memory_and_observation_contract() -> None:
     """Verify architecture contract constants (SEQUENCE_LENGTH=15, SPATIAL_SLOT_COUNT=4, HISTORY_WINDOW=48, SERIES_SLOTS=8)."""
     observation = StructuredObservation.empty_batch(2)
     assert SEQUENCE_LENGTH == 15
-    assert CATEGORICAL_WIDTH == 75
-    assert NUMERICAL_WIDTH == 122
+    assert CATEGORICAL_WIDTH == 60
+    assert NUMERICAL_WIDTH == 116
     assert SPATIAL_SLOT_COUNT == 4
     assert observation.token_type_ids.shape == (2, 15)
     assert observation.spatial_cat.shape == (2, 4, SPATIAL_CATEGORICAL_WIDTH)

@@ -37,17 +37,17 @@ SEQUENCE_LENGTH = OBSERVATION_ENTITY_COUNT
 POKEMON_IDENTITY_WIDTH = 19
 CAT_IDX_STATUS = 17
 CAT_IDX_NATURE = 18
-CAT_KNOWNNESS_START = 19
-CAT_KNOWNNESS_WIDTH = POKEMON_IDENTITY_WIDTH
-CAT_IDX_STATUS_COUNTER_KIND = CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
-CAT_EFFECT_START = CAT_IDX_STATUS_COUNTER_KIND + 1
+CAT_IDX_STATUS_COUNTER_KIND = 19
+CAT_IDX_IDENTITY_KNOWNNESS = 20
+CAT_IDX_STAT_PROVENANCE = 21
+CAT_IDX_PRESENCE_STATUS = 22
+CAT_IDX_MECHANIC_STATE = 23
+CAT_EFFECT_START = 24
 EFFECT_CATEGORICAL_WIDTH = 3
 CATEGORICAL_WIDTH = CAT_EFFECT_START + MAX_EFFECTS * EFFECT_CATEGORICAL_WIDTH
 
 NUM_BASE_WIDTH = 54
-NUM_PROVENANCE_START = NUM_BASE_WIDTH
-NUM_PROVENANCE_WIDTH = 6
-NUM_EFFECT_START = NUM_PROVENANCE_START + NUM_PROVENANCE_WIDTH
+NUM_EFFECT_START = NUM_BASE_WIDTH
 EFFECT_NUMERICAL_WIDTH = 5
 NUM_IDX_EFFECT_COUNT = NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
 NUM_IDX_EFFECT_OVERFLOW = NUM_IDX_EFFECT_COUNT + 1
@@ -102,21 +102,32 @@ class SideId(IntEnum):
     OPPONENT = 2
 
 
-class Knownness(IntEnum):
+class IdentityKnownness(IntEnum):
     PAD = 0
     UNKNOWN = 1
-    KNOWN_NONE = 2
+    KNOWN = 2
+    OOV = 3
+
+
+class StatProvenance(IntEnum):
+    PAD = 0
+    UNKNOWN = 1
+    IMPUTED = 2
     KNOWN = 3
-    OOV = 4
 
 
-class Provenance(IntEnum):
+class PresenceStatus(IntEnum):
     PAD = 0
-    UNKNOWN = 1
-    OBSERVED = 2
-    OPEN_TEAM_SHEET = 3
-    SELF_KNOWN = 4
-    IMPUTED = 5
+    ACTIVE = 1
+    BENCH_REVEALED = 2
+    RESERVE_UNCONFIRMED = 3
+    UNBROUGHT_CONFIRMED = 4
+
+
+class MechanicState(IntEnum):
+    NORMAL = 0
+    ILLUSION_DISGUISED = 1
+    TRANSFORMED = 2
 
 
 class EffectNamespace(IntEnum):
@@ -146,17 +157,17 @@ def _observation_layout_descriptor() -> dict[str, object]:
         "categorical": {
             "status": CAT_IDX_STATUS,
             "nature": CAT_IDX_NATURE,
-            "knownness_start": CAT_KNOWNNESS_START,
-            "knownness_width": CAT_KNOWNNESS_WIDTH,
             "status_counter_kind": CAT_IDX_STATUS_COUNTER_KIND,
+            "identity_knownness": CAT_IDX_IDENTITY_KNOWNNESS,
+            "stat_provenance": CAT_IDX_STAT_PROVENANCE,
+            "presence_status": CAT_IDX_PRESENCE_STATUS,
+            "mechanic_state": CAT_IDX_MECHANIC_STATE,
             "effect_start": CAT_EFFECT_START,
             "effect_width": EFFECT_CATEGORICAL_WIDTH,
             "width": CATEGORICAL_WIDTH,
         },
         "numerical": {
             "base_width": NUM_BASE_WIDTH,
-            "provenance_start": NUM_PROVENANCE_START,
-            "provenance_width": NUM_PROVENANCE_WIDTH,
             "effect_start": NUM_EFFECT_START,
             "effect_width": EFFECT_NUMERICAL_WIDTH,
             "effect_count": NUM_IDX_EFFECT_COUNT,
@@ -199,8 +210,12 @@ def _observation_layout_descriptor() -> dict[str, object]:
         "enum_encodings": {
             "token_type": {member.name.lower(): member.value for member in TokenType},
             "side_id": {member.name.lower(): member.value for member in SideId},
-            "knownness": {member.name.lower(): member.value for member in Knownness},
-            "provenance": {member.name.lower(): member.value for member in Provenance},
+            "identity_knownness": {
+                member.name.lower(): member.value for member in IdentityKnownness
+            },
+            "stat_provenance": {member.name.lower(): member.value for member in StatProvenance},
+            "presence_status": {member.name.lower(): member.value for member in PresenceStatus},
+            "mechanic_state": {member.name.lower(): member.value for member in MechanicState},
             "effect_namespace": {member.name.lower(): member.value for member in EffectNamespace},
             "counter_kind": {member.name.lower(): member.value for member in CounterKind},
             "spatial_action_type": {

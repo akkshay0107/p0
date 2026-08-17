@@ -21,16 +21,19 @@ from p0.model.architecture_contract import EVENT_RAW_WIDTH, POOLED_EVENT_COUNT
 from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_IDENTITY_KNOWNNESS,
+    CAT_IDX_MECHANIC_STATE,
     CAT_IDX_NATURE,
+    CAT_IDX_PRESENCE_STATUS,
+    CAT_IDX_STAT_PROVENANCE,
     CAT_IDX_STATUS,
     CAT_IDX_STATUS_COUNTER_KIND,
-    CAT_KNOWNNESS_START,
-    CAT_KNOWNNESS_WIDTH,
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
     EFFECT_NUMERICAL_WIDTH,
     MAX_EFFECTS,
     MOVE_SLOTS,
+    NUM_BASE_WIDTH,
     NUM_EFFECT_START,
     NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_MOVE_LAST,
@@ -38,12 +41,15 @@ from p0.model.structured_observation import (
     NUM_IDX_MOVE_PP,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STATUS_COUNTER,
-    NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
     OWNER_TOKENS,
     POKEMON_TOKENS,
     SEQUENCE_LENGTH,
     TOKEN_IDX_ALLY_SIDE,
+    IdentityKnownness,
+    MechanicState,
+    PresenceStatus,
+    StatProvenance,
     StructuredObservation,
     TokenType,
 )
@@ -254,7 +260,11 @@ class FusedTokenEncoder(nn.Module):
         self.effect_emb = nn.Embedding(effect_vocab_size, d_raw)
         self.counter_kind_emb = nn.Embedding(5, 16)
         self.effect_namespace_emb = nn.Embedding(5, 16)
-        self.knownness_emb = nn.Embedding(5, 16)
+        self.identity_knownness_emb = nn.Embedding(len(IdentityKnownness), 16)
+        self.stat_provenance_emb = nn.Embedding(len(StatProvenance), 16)
+        self.presence_status_emb = nn.Embedding(len(PresenceStatus), 16)
+        self.mechanic_state_emb = nn.Embedding(len(MechanicState), 16)
+        self.provenance_proj = nn.Linear(16 * 4, d_model)
 
         self.species_proj = nn.Linear(d_raw, d_model)
         self.species_static_proj = nn.Linear(SPECIES_STATIC_WIDTH, d_model)
@@ -302,8 +312,6 @@ class FusedTokenEncoder(nn.Module):
             "_pokemon_scalar_idx", torch.tensor(_POKEMON_SCALAR_IDX, dtype=torch.long)
         )
 
-        self.knownness_proj = nn.Linear(CAT_KNOWNNESS_WIDTH * 16, d_model)
-
         # one internal fusion pass over all of the components above
         self.component_emb = nn.Embedding(NUM_COMPONENTS, d_model)
         # cache component ids instead of creating them every forward pass
@@ -319,7 +327,7 @@ class FusedTokenEncoder(nn.Module):
         # field/side-owned scalars (turn, team-preview flag, fainted count,
         # mega availability) fused into the single owner token
         self.owner_scalar_proj = nn.Sequential(
-            nn.Linear(NUM_PROVENANCE_START, d_model),
+            nn.Linear(NUM_BASE_WIDTH, d_model),
             nn.GELU(),
         )
 
@@ -442,10 +450,16 @@ class FusedTokenEncoder(nn.Module):
 
         effects = self._embed_typed_effects(categorical, numerical)
         scalars = self.pokemon_scalar_proj(numerical[..., self._pokemon_scalar_idx])
-        knownness = self.knownness_proj(
-            self.knownness_emb(
-                categorical[..., CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH]
-            ).flatten(-2)
+        provenance = self.provenance_proj(
+            torch.cat(
+                [
+                    self.identity_knownness_emb(categorical[..., CAT_IDX_IDENTITY_KNOWNNESS]),
+                    self.stat_provenance_emb(categorical[..., CAT_IDX_STAT_PROVENANCE]),
+                    self.presence_status_emb(categorical[..., CAT_IDX_PRESENCE_STATUS]),
+                    self.mechanic_state_emb(categorical[..., CAT_IDX_MECHANIC_STATE]),
+                ],
+                dim=-1,
+            )
         )
 
         # combine all components into (N, NUM_COMPONENTS, d_model)
@@ -462,7 +476,7 @@ class FusedTokenEncoder(nn.Module):
                 nature.unsqueeze(-2),
                 effects.unsqueeze(-2),
                 scalars.unsqueeze(-2),
-                knownness.unsqueeze(-2),
+                provenance.unsqueeze(-2),
             ],
             dim=-2,
         )
@@ -632,7 +646,7 @@ class FusedTokenEncoder(nn.Module):
                 categorical[:, n_poke:owner_end, :],
                 numerical[:, n_poke:owner_end, :],
             )
-            + self.owner_scalar_proj(numerical[:, n_poke:owner_end, :NUM_PROVENANCE_START])
+            + self.owner_scalar_proj(numerical[:, n_poke:owner_end, :NUM_BASE_WIDTH])
         ).to(x.dtype)
 
         out_tokens = (

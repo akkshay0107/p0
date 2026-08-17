@@ -36,7 +36,11 @@ from p0.model.observation_builder import (
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_IDENTITY_KNOWNNESS,
+    CAT_IDX_MECHANIC_STATE,
     CAT_IDX_NATURE,
+    CAT_IDX_PRESENCE_STATUS,
+    CAT_IDX_STAT_PROVENANCE,
     EFFECT_CATEGORICAL_WIDTH,
     MAX_EFFECTS,
     NUM_IDX_CAN_MEGA,
@@ -47,14 +51,18 @@ from p0.model.structured_observation import (
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_PREPARING,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    NUM_IDX_STAT_PROVENANCE,
     NUM_IDX_TEAM_PREVIEW,
     SEQUENCE_LENGTH,
     TOKEN_IDX_ALLY_SIDE,
     TOKEN_IDX_GLOBAL_FIELD,
     TOKEN_IDX_OPPONENT_SIDE,
     EffectNamespace,
-    Provenance,
+    IdentityKnownness,
+    MechanicState,
+    PresenceStatus,
     SideId,
+    StatProvenance,
     StructuredObservation,
     TokenType,
 )
@@ -80,9 +88,12 @@ def make_real_pokemon(
     status_counter: int = 0,
     preparing_move: str | None = None,
     last_move_id: str | None = None,
+    nature: str | None = None,
 ) -> Pokemon:
     """Helper to create a real Pokemon object and populate its slots."""
     p = Pokemon(gen=9, species=species)
+    if nature:
+        p._nature = nature
     if ability:
         p._ability = ability
     if item:
@@ -500,19 +511,19 @@ def test_stat_resolution_provenance_and_cache_behavior() -> None:
     pokemon._nature = None
     values, provenance = _get_pokemon_level_stats(pokemon, True, None)
     assert values == (0.0,) * 6
-    assert provenance == Provenance.UNKNOWN
+    assert provenance == StatProvenance.UNKNOWN
 
     # Test OTS-imputed stats
     expected = cast(tuple[int, int, int, int, int, int], tuple((155, 93, 98, 177, 105, 152)))
     values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
     assert values == tuple(float(value) for value in expected)
-    assert provenance == Provenance.IMPUTED
+    assert provenance == StatProvenance.IMPUTED
 
-    # Test our own known Pokemon stats (Provenance.SELF_KNOWN)
+    # Test our own known Pokemon stats (StatProvenance.KNOWN)
     pokemon.stats = {"hp": 153, "atk": 104, "def": 98, "spa": 177, "spd": 105, "spe": 152}
     values_self, provenance_self = _get_pokemon_level_stats(pokemon, False, None)
     assert values_self == (153.0, 104.0, 98.0, 177.0, 105.0, 152.0)
-    assert provenance_self == Provenance.SELF_KNOWN
+    assert provenance_self == StatProvenance.KNOWN
 
     # Verify stat imputation caching
     pokemon = make_real_pokemon(
@@ -525,6 +536,71 @@ def test_stat_resolution_provenance_and_cache_behavior() -> None:
     second = _cached_imputed_stats(pokemon, cache)
     assert first is second
     assert len(cache) == 1
+
+
+def test_observation_builder_identity_knownness_and_stat_provenance() -> None:
+    """Verify IdentityKnownness (KNOWN/OOV/UNKNOWN/PAD) and StatProvenance (KNOWN/IMPUTED/UNKNOWN/PAD)."""
+    builder = ObservationBuilder(default_runtime_resources())
+
+    # 1. Standard valid species (KNOWN)
+    valid_ally = make_real_pokemon(species="charizard")
+    valid_ally.stats = {"hp": 153, "atk": 104, "def": 98, "spa": 177, "spd": 105, "spe": 152}
+
+    # 2. Out-of-vocabulary species (OOV)
+    oov_mon = make_real_pokemon(species="pikachu")
+    oov_mon._species = "nonexistentspecies123"
+
+    # 3. Missing species (UNKNOWN)
+    unknown_mon = make_real_pokemon(species="pikachu")
+    unknown_mon._species = ""
+
+    # 4. Standard valid opponent with imputed stats (IMPUTED)
+    valid_opp = make_real_pokemon(species="pikachu", nature="timid")
+
+    battle = make_real_battle(
+        active_pokemon=[valid_ally, oov_mon],
+        opponent_active_pokemon=[valid_opp, unknown_mon],
+        team=[valid_ally, oov_mon],
+        opponent_team=[valid_opp, unknown_mon],
+    )
+
+    obs = builder.build(battle_view(battle))
+
+    # Token 0: Ally Charizard with exact stats -> KNOWN identity, KNOWN stats, ACTIVE presence, NORMAL mechanic
+    assert obs.categorical[0, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.KNOWN
+    assert obs.categorical[0, CAT_IDX_STAT_PROVENANCE] == StatProvenance.KNOWN
+    assert obs.categorical[0, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
+    assert obs.categorical[0, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
+    assert obs.numerical[0, NUM_IDX_STAT_PROVENANCE] == 1.0
+
+    # Token 1: Ally with OOV species -> OOV identity, UNKNOWN stats, ACTIVE presence
+    assert obs.categorical[1, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.OOV
+    assert obs.categorical[1, CAT_IDX_STAT_PROVENANCE] == StatProvenance.UNKNOWN
+    assert obs.categorical[1, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
+    assert obs.categorical[1, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
+    assert obs.numerical[1, NUM_IDX_STAT_PROVENANCE] == 0.0
+
+    # Token 2..5: Empty ally slots -> PAD
+    for i in range(2, 6):
+        assert obs.categorical[i, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.PAD
+        assert obs.categorical[i, CAT_IDX_STAT_PROVENANCE] == StatProvenance.PAD
+        assert obs.categorical[i, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.PAD
+        assert obs.categorical[i, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
+        assert obs.numerical[i, NUM_IDX_STAT_PROVENANCE] == 0.0
+
+    # Token 6: Opponent Pikachu -> KNOWN identity, IMPUTED stats, ACTIVE presence
+    assert obs.categorical[6, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.KNOWN
+    assert obs.categorical[6, CAT_IDX_STAT_PROVENANCE] == StatProvenance.IMPUTED
+    assert obs.categorical[6, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
+    assert obs.categorical[6, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
+    assert obs.numerical[6, NUM_IDX_STAT_PROVENANCE] == 0.0
+
+    # Token 7: Opponent with missing species -> UNKNOWN identity, UNKNOWN stats, ACTIVE presence
+    assert obs.categorical[7, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.UNKNOWN
+    assert obs.categorical[7, CAT_IDX_STAT_PROVENANCE] == StatProvenance.UNKNOWN
+    assert obs.categorical[7, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
+    assert obs.categorical[7, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
+    assert obs.numerical[7, NUM_IDX_STAT_PROVENANCE] == 0.0
 
 
 def test_observation_overflow_contract_holds_at_capacity_boundaries() -> None:
