@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from p0.battle.actions import PASS_ACTION
-from p0.battle.events import EventTypeId
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
@@ -983,10 +982,9 @@ def test_replay_event_window_is_previous_request_and_is_model_grounded() -> None
     )
     perspective = reconstruct_perspective(parse_replay_payload(payload), perspective=0)
 
-    assert perspective.snapshots[0].events == ()
-    assert perspective.snapshots[1].events
-    assert all(event.event_type.name == "SWITCH_IN" for event in perspective.snapshots[1].events)
-    assert perspective.snapshots[1].view.events == list(perspective.snapshots[1].events)
+    assert len(perspective.snapshots[0].spatial_turn) == 4
+    assert len(perspective.snapshots[1].spatial_turn) == 4
+    assert perspective.snapshots[1].view.spatial_turn == perspective.snapshots[1].spatial_turn
 
 
 def test_reconstruction_resolves_switch_species_not_nicknames() -> None:
@@ -1158,8 +1156,7 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v5_shard(tmp_path: Path
     assert tensors["series_offsets"].tolist() == [0, 4]
     assert len(payload["series_summaries"]) == manifest.games
     assert [item["canonical_player"] for item in payload["series_summaries"]] == [0, 1]
-    assert torch.count_nonzero(tensors["events_cat"]) > 0
-    assert torch.count_nonzero(tensors["events_metadata"]) > 0
+    assert torch.count_nonzero(tensors["spatial_cat"]) > 0
 
 
 def test_shard_bytes_are_deterministic_for_fixed_inputs(tmp_path: Path) -> None:
@@ -1301,16 +1298,6 @@ def test_a_waiting_perspective_omits_the_policy_row_and_preserves_events() -> No
     assert [decision.decision_index for decision in alice.decisions] == list(
         range(len(alice.decisions))
     )
-
-    next_snapshot = next(
-        snapshot
-        for snapshot in alice.snapshots
-        if snapshot.pre_line_index > replacement.pre_line_index
-    )
-    event_types = tuple(event.event_type for event in next_snapshot.events)
-    assert EventTypeId.FAINT in event_types
-    assert EventTypeId.SWITCH_IN in event_types
-    assert event_types.index(EventTypeId.FAINT) < event_types.index(EventTypeId.SWITCH_IN)
 
 
 def test_a_normal_turn_without_an_executed_order_remains_unknown() -> None:

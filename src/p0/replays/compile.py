@@ -233,10 +233,8 @@ def _perspective_tensors(
             precomputed = estimates.get((opponent_side, _normalized(pokemon.species)))
             if precomputed is not None:
                 overrides[pokemon] = precomputed
-        # ReconstructedSnapshot.events is the request-scoped event window.
-        # Keep the handoff explicit so observations cannot silently fall back
-        # to FixtureBattleView's default empty event list.
-        snapshot.view.events = list(snapshot.events)
+        # ReconstructedSnapshot.spatial_turn is the request-scoped spatial interaction records.
+        snapshot.view.spatial_turn = snapshot.spatial_turn
         observation = builder.build(snapshot.view, overrides)
         observation.validate(batch_rank=0)
         observation.validate_overflow_contract()

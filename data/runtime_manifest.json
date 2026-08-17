@@ -1,4 +1,43 @@
 {
+  "manifest_schema": 3,
+  "subsystems": {
+    "actions": {
+      "major_sha256": "cea4d0ef89979d9824b0341b801f3f4d04770dca51b38aa1bb0ae0c08fb610f9",
+      "minor_sha256": "96df4e1af3ad8450887d32ca312d5b4a7dd3860e5f4283fef5e622229ffcac47",
+      "major_version": 1,
+      "minor_version": 0
+    },
+    "checkpoints": {
+      "major_sha256": "6ba650d7a497aec7b528f784d9e98c3b3ec50b1b5bf8e57e86ddd223c778bbf9",
+      "minor_sha256": "b6b01ab583748e30ec268dc7265013bdaddc4e47c781e458fc1f20d8fc651672",
+      "major_version": 1,
+      "minor_version": 0
+    },
+    "model": {
+      "major_sha256": "31d565f1bc8fe903461909dedc687d9c5b7cf53417acdbd70d44f2b1a45b9b9e",
+      "minor_sha256": "593818fed92dbcbfcf5c1f9cf1c9a89aca45a79daaadac98ab7d1aa9ff946f72",
+      "major_version": 2,
+      "minor_version": 0
+    },
+    "replays": {
+      "major_sha256": "4ce38fde85eb4062c8155c58e12790eaea690e2bbe34c6913e68f9b14c0812fc",
+      "minor_sha256": "4bd32cca07f38a6693391605ba34ab7ce5c35ead229aaebbd507d2b5429097cc",
+      "major_version": 2,
+      "minor_version": 0
+    },
+    "resources": {
+      "major_sha256": "a8f003cc0298e8b2eba0c45fb40883177e57ffea9586bb1b68ec868345d58647",
+      "minor_sha256": "d1f9454b6d646c800f16a65cfbdcdf8ea8741bb56c1cbce8d8ffbacdb4d5facd",
+      "major_version": 1,
+      "minor_version": 1
+    },
+    "teams": {
+      "major_sha256": "85885b2d8481db81103b57d7a8829dc0ee6c2b26d341fcc55fe9072f6bd87a90",
+      "minor_sha256": "925f6215846af3685d9385cf38ea9be5837093af4860b4b9126936b5276baf58",
+      "major_version": 3,
+      "minor_version": 0
+    }
+  },
   "contracts": {
     "actions": {
       "major": {
@@ -77,12 +116,12 @@
         "history_window": 48,
         "max_prior_games": 2,
         "observation_entity_count": 15,
-        "observation_layout_sha256": "be2bf9a64f1f8882d07ddc8125fa0b1cd2cf977db7e775510fa028f7939c9fc1",
+        "observation_layout_sha256": "df249a30d69747e6286cf131df4c91f7d519f0799479d86972e35d71fa39c95a",
         "observation_schema_version": 6,
         "owner_count": 3,
         "pokemon_count": 12,
-        "pooled_event_count": 8,
-        "raw_event_count": 64,
+        "pooled_event_count": 4,
+        "raw_event_count": 4,
         "self_target_sentinel": -1,
         "series_tokens_per_game": 4,
         "structured_observation_abi": "structured-observation-layout-v2",
@@ -124,44 +163,5 @@
       "minor": {}
     }
   },
-  "global_sha256": "42c6d896cd46e4af2ad04c2db8cac744efa60f8adb4e331e30953a141ed12892",
-  "manifest_schema": 3,
-  "subsystems": {
-    "actions": {
-      "major_sha256": "cea4d0ef89979d9824b0341b801f3f4d04770dca51b38aa1bb0ae0c08fb610f9",
-      "major_version": 1,
-      "minor_sha256": "96df4e1af3ad8450887d32ca312d5b4a7dd3860e5f4283fef5e622229ffcac47",
-      "minor_version": 0
-    },
-    "checkpoints": {
-      "major_sha256": "6ba650d7a497aec7b528f784d9e98c3b3ec50b1b5bf8e57e86ddd223c778bbf9",
-      "major_version": 1,
-      "minor_sha256": "b6b01ab583748e30ec268dc7265013bdaddc4e47c781e458fc1f20d8fc651672",
-      "minor_version": 0
-    },
-    "model": {
-      "major_sha256": "73a6909aca7b150b0d6cb3b0879bd0e5f1b75440537ff601cbe28e11abc68714",
-      "major_version": 2,
-      "minor_sha256": "fe395615202e77a2bf8fc7c366e1187672a591002bf9cee40b9b70c7c760c205",
-      "minor_version": 0
-    },
-    "replays": {
-      "major_sha256": "4ce38fde85eb4062c8155c58e12790eaea690e2bbe34c6913e68f9b14c0812fc",
-      "major_version": 2,
-      "minor_sha256": "4bd32cca07f38a6693391605ba34ab7ce5c35ead229aaebbd507d2b5429097cc",
-      "minor_version": 0
-    },
-    "resources": {
-      "major_sha256": "a8f003cc0298e8b2eba0c45fb40883177e57ffea9586bb1b68ec868345d58647",
-      "major_version": 1,
-      "minor_sha256": "d1f9454b6d646c800f16a65cfbdcdf8ea8741bb56c1cbce8d8ffbacdb4d5facd",
-      "minor_version": 1
-    },
-    "teams": {
-      "major_sha256": "85885b2d8481db81103b57d7a8829dc0ee6c2b26d341fcc55fe9072f6bd87a90",
-      "major_version": 3,
-      "minor_sha256": "925f6215846af3685d9385cf38ea9be5837093af4860b4b9126936b5276baf58",
-      "minor_version": 0
-    }
-  }
+  "global_sha256": "f9744142e17245de6a324ae32edddc8049a734cfcdcfa2bd203850b4e21c694f"
 }

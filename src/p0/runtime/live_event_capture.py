@@ -2,29 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from poke_env.battle import DoubleBattle, Pokemon
 
-from p0.battle.events import RawBattleEvent, build_raw_event
+from p0.battle.events import SpatialTurnRecorder
+from p0.model.tokenizer import tokenizer
 
 
-def _events_for(battle: DoubleBattle) -> list[RawBattleEvent]:
+def _recorder_for(battle: DoubleBattle) -> SpatialTurnRecorder:
     try:
-        return battle._p0_live_events  # type: ignore[attr-defined]
+        return battle._p0_spatial_recorder  # type: ignore[attr-defined]
     except AttributeError:
-        battle._p0_live_events = []  # type: ignore[attr-defined]
-        return battle._p0_live_events  # type: ignore[attr-defined]
-
-
-def set_raw_events(battle: DoubleBattle, raw_events: list[RawBattleEvent]) -> None:
-    """Set the pending raw event buffer on a live battle instance."""
-    battle._p0_live_events = raw_events  # type: ignore[attr-defined]
-
-
-def consume_raw_events(battle: DoubleBattle) -> list[RawBattleEvent]:
-    """Drain and return the pending raw event buffer for a live battle instance."""
-    events = _events_for(battle)
-    battle._p0_live_events = []  # type: ignore[attr-defined]
-    return events
+        role = getattr(battle, "player_role", "p1") or "p1"
+        recorder = SpatialTurnRecorder(player_role=role)
+        battle._p0_spatial_recorder = recorder  # type: ignore[attr-defined]
+        return recorder
 
 
 def last_move(pokemon: Pokemon) -> str | None:
@@ -33,8 +26,11 @@ def last_move(pokemon: Pokemon) -> str | None:
     return None if move is None else move.id
 
 
-def capture_message(battle: DoubleBattle, split_message: list[str]) -> None:
-    """Capture a raw protocol line from Showdown onto the battle's live event buffer."""
+def capture_message(battle: DoubleBattle, split_message: Sequence[str]) -> None:
+    """Capture a raw protocol line from Showdown onto the battle's live spatial recorder."""
+    if len(split_message) >= 2 and split_message[1] == "turn":
+        recorder = _recorder_for(battle)
+        recorder.reset_turn()
 
     def pre_hp_for(identifier: str) -> float | None:
         try:
@@ -51,4 +47,10 @@ def capture_message(battle: DoubleBattle, split_message: list[str]) -> None:
 
         return None
 
-    _events_for(battle).append(build_raw_event(split_message, pre_hp_for))
+    recorder = _recorder_for(battle)
+    role = getattr(battle, "player_role", None)
+    if role and role != recorder.player_role:
+        recorder.player_role = role
+
+    recorder.apply_line(split_message, tokenizer, pre_hp_for)
+    battle._p0_spatial_turn = recorder.to_records()  # type: ignore[attr-defined]

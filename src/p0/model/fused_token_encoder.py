@@ -10,7 +10,12 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-from p0.battle.events import EVENT_TYPE_COUNT, EventTypeId
+from p0.battle.events import (
+    NUM_ACTION_TYPES,
+    NUM_TARGET_SLOTS,
+    SPATIAL_NUMERICAL_WIDTH,
+    SPATIAL_SLOT_COUNT,
+)
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import EVENT_RAW_WIDTH, POOLED_EVENT_COUNT
 from p0.model.resources import RuntimeResources
@@ -24,9 +29,6 @@ from p0.model.structured_observation import (
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
     EFFECT_NUMERICAL_WIDTH,
-    EVENT_METADATA_WIDTH,
-    EVENT_NUMERICAL_WIDTH,
-    EVENT_ORDER_VOCAB_SIZE,
     MAX_EFFECTS,
     MOVE_SLOTS,
     NUM_EFFECT_START,
@@ -42,7 +44,6 @@ from p0.model.structured_observation import (
     POKEMON_TOKENS,
     SEQUENCE_LENGTH,
     TOKEN_IDX_ALLY_SIDE,
-    EffectNamespace,
     StructuredObservation,
     TokenType,
 )
@@ -105,24 +106,6 @@ _TARGET_CLASS_ALIASES = {
     "any": "selectedpokemon",
 }
 MOVE_STATIC_WIDTH = 7 + len(_TARGET_CLASSES)
-
-# Event effect ids index four independently-numbered vocab tables; the event
-# type determines which one, so the namespace tag is derived from it. This
-# mirrors the state path, which always pairs effect_emb with a namespace term.
-_EVENT_EFFECT_NAMESPACE: dict[EventTypeId, EffectNamespace] = {
-    EventTypeId.WEATHER_START: EffectNamespace.WEATHER,
-    EventTypeId.WEATHER_END: EffectNamespace.WEATHER,
-    EventTypeId.FIELD_START: EffectNamespace.FIELD,
-    EventTypeId.FIELD_END: EffectNamespace.FIELD,
-    EventTypeId.FIELD_ACTIVATE: EffectNamespace.FIELD,
-    EventTypeId.SIDE_START: EffectNamespace.SIDE,
-    EventTypeId.SIDE_END: EffectNamespace.SIDE,
-    EventTypeId.EFFECT_START: EffectNamespace.POKEMON,
-    EventTypeId.EFFECT_END: EffectNamespace.POKEMON,
-    EventTypeId.CANT: EffectNamespace.POKEMON,
-    EventTypeId.SINGLEMOVE: EffectNamespace.POKEMON,
-    EventTypeId.ACTIVATE: EffectNamespace.POKEMON,
-}
 
 
 def _load_vocab_sizes(resources: RuntimeResources) -> dict[str, int]:
@@ -353,38 +336,25 @@ class FusedTokenEncoder(nn.Module):
         # could not prove. Keeps unknown as a distinct state instead of a mask value.
         self.unknown_legality_emb = nn.Parameter(torch.empty(2, d_model))
 
-        # Event records stay in d_raw until the eight learned pooling queries
-        # emit full-width reducer tokens.
-        self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_raw)
-        self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_raw)
-        self.event_flag_emb = nn.Embedding(8, d_raw)
-        self.event_side_emb = nn.Embedding(NUM_SIDES, d_raw)
-        self.event_slot_emb = nn.Embedding(NUM_SLOTS, d_raw)
-        self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_raw)
-        self.event_namespace_proj = nn.Linear(16, d_raw, bias=False)
-        # a learned role transform on the target endpoint keeps the shared
-        # side/slot tables (attention join to the owner token) while breaking
-        # the actor/target swap symmetry of a purely additive tag sum
-        self.target_role_proj = nn.Linear(d_raw, d_raw, bias=False)
-        namespace_by_type = torch.zeros(EVENT_TYPE_COUNT, dtype=torch.long)
-        for event_type, namespace in _EVENT_EFFECT_NAMESPACE.items():
-            namespace_by_type[event_type] = namespace
-        self.register_buffer("_event_effect_namespace", namespace_by_type, persistent=False)
+        # Spatial interaction token builder (4 slots: P1A, P1B, P2A, P2B)
+        self.spatial_action_emb = nn.Embedding(NUM_ACTION_TYPES, d_model)
+        self.spatial_target_emb = nn.Embedding(NUM_TARGET_SLOTS, d_model)
+        self.spatial_move_proj = nn.Linear(d_raw, d_model)
+        self.spatial_num_proj = nn.Linear(SPATIAL_NUMERICAL_WIDTH, d_model)
+        self.spatial_slot_pos_emb = nn.Parameter(torch.empty(SPATIAL_SLOT_COUNT, d_model))
 
-        if d_raw % nhead:
-            raise ValueError(f"Event width {d_raw} must be divisible by nhead {nhead}")
-        self.event_encoder = SwiGLUTransformerEncoder(
-            d_model=d_raw,
-            nhead=nhead,
-            dim_feedforward=max(64, dim_feedforward // 8),
-            num_layers=1,
+        # 4 learned spatial event queries
+        self.spatial_event_queries = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
+
+        # Single-layer cross-attention over the 4 spatial slots
+        self.spatial_cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.spatial_norm1 = nn.LayerNorm(d_model)
+        self.spatial_norm2 = nn.LayerNorm(d_model)
+        self.spatial_ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.SiLU(),
+            nn.Linear(dim_feedforward, d_model),
         )
-        self.event_pool_queries = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
-        self.event_key_proj = nn.Linear(d_raw, d_model)
-        self.event_value_proj = nn.Linear(d_raw, d_model)
-        self.event_pool_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.event_metadata_proj = nn.Linear(EVENT_METADATA_WIDTH, d_model)
-        self.empty_event_tokens = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
 
         self._init_weights()
 
@@ -401,8 +371,8 @@ class FusedTokenEncoder(nn.Module):
         init.normal_(self.mon_fusion_token, std=emb_gain)
         init.normal_(self.action_mask_token, std=emb_gain)
         init.normal_(self.unknown_legality_emb, std=emb_gain)
-        init.normal_(self.event_pool_queries, std=emb_gain)
-        init.normal_(self.empty_event_tokens, std=emb_gain)
+        init.normal_(self.spatial_slot_pos_emb, std=emb_gain)
+        init.normal_(self.spatial_event_queries, std=emb_gain)
 
     def _embed_pokemon_components(
         self, categorical: torch.Tensor, numerical: torch.Tensor
@@ -534,62 +504,30 @@ class FusedTokenEncoder(nn.Module):
         return self.typed_effect_set(features, mask=effect_num[..., 0] > 0.5)
 
     def _encode_events(self, obs: StructuredObservation, device: torch.device) -> torch.Tensor:
-        events_cat = obs.events_cat.long().to(device)
-        events_num = obs.events_num.float().to(device)
-        events_side_ids = obs.events_side_ids.long().to(device)
-        events_slot_ids = obs.events_slot_ids.long().to(device)
-        event_metadata = obs.events_metadata.float().to(device)
+        spatial_cat = obs.spatial_cat.long().to(device)
+        spatial_num = obs.spatial_num.float().to(device)
+        B = spatial_cat.size(0)
 
-        event_types = events_cat[..., 0]
-        event_feats = torch.cat(
-            [
-                self.move_emb(events_cat[..., 1]),
-                self.item_emb(events_cat[..., 2]),
-                self.status_emb(events_cat[..., 3]),
-                self.effect_emb(events_cat[..., 5]),
-                self.ability_emb(events_cat[..., 6]),
-                events_num,
-            ],
-            dim=-1,
-        )
-        what = (
-            self.event_type_emb(event_types)
-            + self.event_namespace_proj(
-                self.effect_namespace_emb(self._event_effect_namespace[event_types])
-            )
-            + self.event_flag_emb(events_cat[..., 7])
-        )
-        actor = self.event_side_emb(events_side_ids) + self.event_slot_emb(events_slot_ids)
-        target = self.target_role_proj(
-            self.event_side_emb(events_cat[..., 8]) + self.event_slot_emb(events_cat[..., 9])
-        )
-        when = self.order_pos_emb(events_cat[..., 4])
-        raw = self.event_proj(event_feats) + what + actor + target + when
-        event_mask = events_cat[..., 0] != 0
-        raw = raw.masked_fill(~event_mask.unsqueeze(-1), 0.0)
+        # Embed raw spatial features per slot
+        action_emb = self.spatial_action_emb(spatial_cat[..., 0])
+        move_emb = self.spatial_move_proj(self.move_emb(spatial_cat[..., 1]))
+        target_emb = self.spatial_target_emb(spatial_cat[..., 2])
+        num_emb = self.spatial_num_proj(spatial_num)
+        slot_emb = self.spatial_slot_pos_emb.unsqueeze(0)
 
-        # Fully masked key sets are undefined for attention. An empty window
-        # gets one deterministic computational anchor and is replaced by the
-        # learned empty output after pooling.
-        has_events = event_mask.any(dim=-1)
-        padding = ~event_mask
-        padding[~has_events, 0] = False
-        contextual = self.event_encoder(raw, src_key_padding_mask=padding)
+        raw_kv = action_emb + move_emb + target_emb + num_emb + slot_emb
 
-        queries = self.event_pool_queries.expand(raw.size(0), -1, -1)
-        pooled, _ = self.event_pool_attn(
-            queries,
-            self.event_key_proj(contextual),
-            self.event_value_proj(contextual),
-            key_padding_mask=padding,
+        # Single-layer cross-attention over the 4 spatial slots
+        queries = self.spatial_event_queries.expand(B, -1, -1)
+        attn_out, _ = self.spatial_cross_attn(
+            query=queries,
+            key=raw_kv,
+            value=raw_kv,
             need_weights=False,
         )
-        pooled = pooled + self.event_metadata_proj(event_metadata).unsqueeze(1)
-        return torch.where(
-            has_events[:, None, None],
-            pooled,
-            self.empty_event_tokens.expand(raw.size(0), -1, -1).to(pooled.dtype),
-        )
+        x = self.spatial_norm1(queries + attn_out)
+        event_tokens = self.spatial_norm2(x + self.spatial_ffn(x))
+        return event_tokens
 
     def _append_action_mask_token(
         self,

@@ -17,17 +17,12 @@ from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
 
-from p0.battle.events import (
-    RawBattleEvent,
-    build_raw_event,
-    parse_events,
-)
+from p0.battle.events import SpatialActionType
 from p0.battle.views import FixtureBattleView
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
-from p0.model.tokenizer import tokenizer
 from p0.runtime import poke_env_patches, showdown
-from p0.runtime.live_event_capture import consume_raw_events, set_raw_events
+from p0.runtime.live_event_capture import capture_message
 from p0.runtime.poke_env_action_adapter import (
     action_to_order,
     action_to_single_order,
@@ -126,35 +121,20 @@ def test_live_adapter_and_pure_fixture_build_identical_observations() -> None:
         torch.testing.assert_close(getattr(live, name), getattr(pure, name))
 
 
-def test_raw_event_pre_hp_snapshot() -> None:
-    """Verify build_raw_event captures pre-damage health values from callback for damage delta tracking."""
-
-    def pre_hp_for(identifier: str) -> float | None:
-        assert identifier == "p2a: Charizard"
-        return 0.75
-
-    damage = build_raw_event(["", "-damage", "p2a: Charizard", "50/100"], pre_hp_for)
-    move = build_raw_event(["", "move", "p1a: Pikachu", "Thunderbolt"], pre_hp_for)
-
-    assert damage.pre_hp == 0.75
-    assert damage.message == ("", "-damage", "p2a: Charizard", "50/100")
-    assert move.pre_hp is None
-
-
-def test_consume_events_clears_buffer_immediately() -> None:
-    """Verify consume_raw_events drains the battle event queue immediately to prevent double-processing."""
+def test_live_spatial_turn_capture() -> None:
+    """Verify capture_message correctly parses live websocket messages into spatial records."""
     battle = DoubleBattle("events", "player", logging.getLogger(__name__), 9)
-    set_raw_events(
-        battle,
-        [RawBattleEvent(("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard"))],
-    )
+    battle._player_role = "p1"
+    capture_message(battle, ["", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard"])
 
-    first = parse_events(consume_raw_events(battle), tokenizer)
-    second = parse_events(consume_raw_events(battle), tokenizer)
+    view = battle_view(battle)
+    records = view.spatial_turn
+    assert len(records) == 4
+    assert records[0].action_type == int(SpatialActionType.MOVE)
 
-    assert len(first) == 1
-    # Buffer must be empty on second consumption
-    assert second == []
+    capture_message(battle, ["", "turn", "2"])
+    records_turn2 = view.spatial_turn
+    assert records_turn2[0].action_type == int(SpatialActionType.NONE)
 
 
 class _AdapterBattleState:

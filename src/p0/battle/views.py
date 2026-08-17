@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
+from p0.battle.events import SpatialSlotRecord
 from p0.battle.legality import DecisionView
-
-if TYPE_CHECKING:
-    from p0.battle.events import BattleEvent
 
 
 class NamedEffectView(Protocol):
@@ -179,9 +177,10 @@ class BattleView(FieldView, Protocol):
     @property
     def stat_cache(self) -> dict[Any, Any]: ...
 
-    def get_pokemon(self, identifier: str) -> Any: ...
+    @property
+    def spatial_turn(self) -> Sequence[SpatialSlotRecord]: ...
 
-    def consume_events(self) -> list[BattleEvent]: ...
+    def get_pokemon(self, identifier: str) -> Any: ...
 
     def last_move(self, pokemon: Any) -> str | None: ...
 
@@ -212,16 +211,13 @@ class FixtureBattleView:
     opponent_used_mega_evolve: bool
     decision: DecisionView
     identifiers: Mapping[str, Any] = field(default_factory=dict)
-    events: list[BattleEvent] = field(default_factory=list)
+    spatial_turn: Sequence[SpatialSlotRecord] = field(
+        default_factory=lambda: tuple(SpatialSlotRecord() for _ in range(4))
+    )
     stat_cache: dict[Any, Any] = field(default_factory=dict)
 
     def get_pokemon(self, identifier: str) -> Any:
         return self.identifiers[identifier]
-
-    def consume_events(self) -> list[BattleEvent]:
-        # Fixture views are per-decision; repeated builds of the same decision
-        # must observe the identical event window (idempotent consume).
-        return self.events
 
     def last_move(self, pokemon: Any) -> str | None:
         move = pokemon.last_move

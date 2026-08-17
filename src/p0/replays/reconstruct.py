@@ -38,12 +38,9 @@ from p0.battle.actions import (
     encode_team_pair,
 )
 from p0.battle.events import (
-    EVENT_DIAGNOSTICS,
-    BattleEvent,
-    RawBattleEvent,
-    build_raw_event,
+    SpatialSlotRecord,
+    SpatialTurnRecorder,
     get_hp_fraction,
-    parse_events,
 )
 from p0.battle.legality import DecisionView, SlotDecision, legal_actions
 from p0.battle.views import FixtureBattleView
@@ -424,14 +421,14 @@ class ReplayPokemon:
 
 @dataclass(frozen=True, slots=True)
 class ReconstructedSnapshot:
-    """Pre-decision state and events produced by the following protocol segment."""
+    """Pre-decision state and spatial interactions produced by the following protocol segment."""
 
     decision_index: int
     turn: int
     pre_line_index: int
     post_line_index: int
     view: FixtureBattleView
-    events: tuple[BattleEvent, ...]
+    spatial_turn: tuple[SpatialSlotRecord, ...]
     raw_lines: tuple[str, ...]
 
 
@@ -2043,23 +2040,6 @@ def _view(
     )
 
 
-def _parse_window(
-    raw_events: Sequence[RawBattleEvent], diagnostics: Counter[str]
-) -> tuple[BattleEvent, ...]:
-    """Tokenize one request's raw-line window with the shared event parser."""
-    before = Counter(EVENT_DIAGNOSTICS)
-    try:
-        events = parse_events(list(raw_events), tokenizer)
-    except (TypeError, ValueError, IndexError):
-        diagnostics["parser_errors"] += 1
-        diagnostics["parse_error_lines"] += len(raw_events)
-        events = []
-    after = Counter(EVENT_DIAGNOSTICS)
-    for key, count in after.items():
-        diagnostics[key] += max(0, count - before[key])
-    return tuple(events)
-
-
 def _implicit_pass_slots(
     observed: Sequence[ObservedAction | None],
     decision_type: DecisionType,
@@ -2089,10 +2069,10 @@ def reconstruct_perspective(
 
     The protocol lines are walked exactly once. At each request this player answered,
     the state machine holds the pre-decision state and the raw lines seen since their
-    previous request form the event window. Opponent-only replacement requests advance
-    state without emitting a snapshot, matching the live policy's wait path. Legality
-    is never guessed: the emitted mask is a superset marked unproven, so no observation
-    cell claims a restriction the replay cannot show.
+    previous request advance the spatial turn recorder. Opponent-only replacement
+    requests advance state without emitting a snapshot, matching the live policy's
+    wait path. Legality is never guessed: the emitted mask is a superset marked
+    unproven, so no observation cell claims a restriction the replay cannot show.
 
     Arguments:
         document: The complete parsed replay document.
@@ -2123,13 +2103,15 @@ def reconstruct_perspective(
     illusion_species_by_line = _illusion_species_by_line(document.protocol_lines)
     decision_blocks = _decision_blocks(document)
 
-    window: list[RawBattleEvent] = []
+    spatial_recorder = SpatialTurnRecorder(player_role=f"p{perspective + 1}")
     cursor = 0
     for start, end, decision_type in decision_blocks:
         # replay everything between the previous request and this one, so the state
-        # machine and the event window advance together over a single line pass
+        # machine and the spatial recorder advance together over a single line pass
         for line in document.protocol_lines[cursor:start]:
-            window.append(build_raw_event(line.parts, state.hp_for))
+            if len(line.parts) >= 2 and line.parts[1] == "turn":
+                spatial_recorder.reset_turn()
+            spatial_recorder.apply_line(line.parts, tokenizer, state.hp_for)
             state.apply(line.parts)
         cursor = start
 
@@ -2165,9 +2147,6 @@ def reconstruct_perspective(
             DecisionType.FORCED_SWITCH,
             DecisionType.PIVOT_SWITCH,
         }:
-            # Live play bypasses the policy while the other player answers a
-            # replacement request. Retain this window so the next real decision
-            # observes the same accumulated events as the live event capture.
             counters["waiting_requests_skipped"] += 1
             continue
 
@@ -2202,8 +2181,7 @@ def reconstruct_perspective(
             effective_species=effective_species,
             forced_move_slots=forced_move_slots,
         )
-        view.events = list(_parse_window(window, counters))
-        window = []
+        view.spatial_turn = spatial_recorder.to_records()
 
         for slot, action in enumerate(observed):
             if action is not None and action.action is not None:
@@ -2241,7 +2219,7 @@ def reconstruct_perspective(
                 pre_line_index=start,
                 post_line_index=end,
                 view=view,
-                events=tuple(view.events),
+                spatial_turn=view.spatial_turn,
                 raw_lines=tuple(line.raw for line in lines),
             )
         )

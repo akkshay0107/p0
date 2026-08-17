@@ -17,8 +17,12 @@ from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
 from p0.battle.events import (
-    EventTypeId,
-    RawBattleEvent,
+    SPATIAL_CATEGORICAL_WIDTH,
+    SPATIAL_NUMERICAL_WIDTH,
+    SPATIAL_SLOT_COUNT,
+    SpatialActionType,
+    SpatialSlotRecord,
+    SpatialTargetSlot,
 )
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.battle.views import FixtureBattleView
@@ -34,7 +38,6 @@ from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CAT_IDX_NATURE,
     EFFECT_CATEGORICAL_WIDTH,
-    EVENT_COUNT,
     MAX_EFFECTS,
     NUM_IDX_CAN_MEGA,
     NUM_IDX_CAN_SWITCH_OUT,
@@ -56,7 +59,6 @@ from p0.model.structured_observation import (
     TokenType,
 )
 from p0.model.tokenizer import tokenizer
-from p0.runtime.live_event_capture import set_raw_events
 from p0.runtime.poke_env_battle_adapter import battle_view, decision_view
 
 
@@ -402,104 +404,40 @@ def test_concurrent_universal_effect_stress_state() -> None:
     assert EffectNamespace.WEATHER in namespaces
 
 
-def test_events_ground_to_slots_and_are_idempotent() -> None:
-    """Verify raw battle events ground to specific slot/side IDs and subsequent calls on identical turns are idempotent."""
-    switched_out = make_real_pokemon(species="charizard")
-    switched_in = make_real_pokemon(species="venusaur")
-    opponent = make_real_pokemon(species="tyranitar")
-    battle = make_real_battle(
-        active_pokemon=[switched_in, None],
-        opponent_active_pokemon=[opponent, None],
-        team=[switched_out, switched_in],
-        opponent_team=[opponent],
+def test_spatial_events_ground_to_slots() -> None:
+    """Verify spatial turn records write to spatial_cat and spatial_num tensors accurately."""
+    turn_records = (
+        SpatialSlotRecord(
+            action_type=int(SpatialActionType.MOVE),
+            move_id=15,
+            target_slot=int(SpatialTargetSlot.OPP_LEFT),
+            order_rank=0.25,
+            damage_dealt=0.55,
+            landed_crit=1.0,
+        ),
+        SpatialSlotRecord(action_type=int(SpatialActionType.SWITCH)),
+        SpatialSlotRecord(
+            action_type=int(SpatialActionType.MOVE),
+            move_id=42,
+            target_slot=int(SpatialTargetSlot.ALLY_LEFT),
+            order_rank=0.50,
+            hp_delta=-0.55,
+            took_crit=1.0,
+        ),
+        SpatialSlotRecord(action_type=int(SpatialActionType.NONE)),
     )
-    battle._team = {
-        "p1: Charizard": switched_out,
-        "p1: Venusaur": switched_in,
-    }
-    battle._opponent_team = {"p2: Tyranitar": opponent}
-    set_raw_events(
-        battle,
-        [
-            RawBattleEvent(("", "switch", "p1a: Venusaur", "Venusaur, L50", "100/100")),
-            RawBattleEvent(("", "move", "p2a: Tyranitar", "Rock Slide", "p1a: Venusaur")),
-        ],
-    )
+    fixture = _legality_fixture_view(DecisionView(slots=(SlotDecision(), SlotDecision())))
+    fixture.spatial_turn = turn_records
+    builder = ObservationBuilder(default_runtime_resources())
+    obs = builder.build(fixture)
 
-    obs = from_battle(battle, tokenizer)
-
-    assert obs.events_cat[:2, 0].tolist() == [
-        EventTypeId.SWITCH_IN,
-        EventTypeId.MOVE,
-    ]
-    assert obs.events_cat[:2, 4].tolist() == [1, 2]
-    assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
-    assert obs.events_slot_ids[:2].tolist() == [1, 1]
-
-    # Rebuilding without advancing turn produces identical event tensors
-    rebuilt_obs = from_battle(battle, tokenizer)
-    assert torch.equal(rebuilt_obs.events_cat, obs.events_cat)
-    assert torch.equal(rebuilt_obs.events_num, obs.events_num)
-
-    # Advancing request clears event queue
-    battle._last_request = {"turn": "next"}
-    next_obs = from_battle(battle, tokenizer)
-    assert torch.count_nonzero(next_obs.events_cat) == 0
-    assert torch.count_nonzero(next_obs.events_num) == 0
-
-
-def test_side_events_ground_to_owning_side() -> None:
-    """Verify side-level condition events (-sidestart) ground to the appropriate owning side token."""
-    ally = make_real_pokemon(species="charizard")
-    opponent = make_real_pokemon(species="venusaur")
-    battle = make_real_battle(
-        active_pokemon=[ally, None],
-        opponent_active_pokemon=[opponent, None],
-        team=[ally],
-        opponent_team=[opponent],
-    )
-    set_raw_events(
-        battle,
-        [
-            RawBattleEvent(("", "-sidestart", "p1: SomeUser", "move: Tailwind")),
-            RawBattleEvent(("", "-sidestart", "p2: OtherUser", "move: Light Screen")),
-        ],
-    )
-
-    obs = from_battle(battle, tokenizer)
-
-    assert obs.events_cat[:2, 0].tolist() == [EventTypeId.SIDE_START, EventTypeId.SIDE_START]
-    assert obs.events_side_ids[:2].tolist() == [SideId.ALLY, SideId.OPPONENT]
-    assert obs.events_slot_ids[:2].tolist() == [0, 0]
-    assert obs.events_cat[0, 5].item() > 0
-
-
-def test_event_order_recompacts() -> None:
-    """Verify that event order tagging re-compacts to 1..EVENT_COUNT when raw events exceed EVENT_COUNT capacity."""
-    ally = make_real_pokemon(species="charizard")
-    opponent = make_real_pokemon(species="venusaur")
-    battle = make_real_battle(
-        active_pokemon=[ally, None],
-        opponent_active_pokemon=[opponent, None],
-        team=[ally],
-        opponent_team=[opponent],
-    )
-    battle._team = {"p1: Charizard": ally}
-    overflow = 6
-    raw_events = [
-        RawBattleEvent(("", "-boost", "p1a: Charizard", "atk", "1"))
-        for _ in range(EVENT_COUNT + overflow - 10)
-    ]
-    raw_events.extend(
-        RawBattleEvent(("", "move", "p1a: Charizard", "Tackle", "p2a: Venusaur")) for _ in range(10)
-    )
-    set_raw_events(battle, raw_events)
-
-    obs = from_battle(battle, tokenizer)
-
-    assert obs.events_cat[:, 4].tolist() == list(range(1, EVENT_COUNT + 1))
-    assert obs.events_num[:, 1].max().item() < 1.0
-    assert obs.events_metadata[1].item() == float(overflow)
+    assert obs.spatial_cat.shape == (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH)
+    assert obs.spatial_num.shape == (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH)
+    assert obs.spatial_cat[0, 0].item() == int(SpatialActionType.MOVE)
+    assert obs.spatial_cat[0, 1].item() == 15
+    assert obs.spatial_cat[0, 2].item() == int(SpatialTargetSlot.OPP_LEFT)
+    assert obs.spatial_num[0, 4].item() == 1.0  # landed_crit
+    assert obs.spatial_num[2, 5].item() == 1.0  # took_crit
 
 
 def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
@@ -534,10 +472,8 @@ def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
     out.slot_ids.fill_(99)
     out.categorical.fill_(99)
     out.numerical.fill_(99.0)
-    out.events_cat.fill_(99)
-    out.events_num.fill_(99.0)
-    out.events_side_ids.fill_(99)
-    out.events_slot_ids.fill_(99)
+    out.spatial_cat.fill_(99)
+    out.spatial_num.fill_(99.0)
 
     from_battle_into(battle, out, tokenizer)
 
@@ -546,10 +482,8 @@ def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
     assert torch.equal(out.slot_ids, expected.slot_ids)
     assert torch.equal(out.categorical, expected.categorical)
     assert torch.equal(out.numerical, expected.numerical)
-    assert torch.equal(out.events_cat, expected.events_cat)
-    assert torch.equal(out.events_num, expected.events_num)
-    assert torch.equal(out.events_side_ids, expected.events_side_ids)
-    assert torch.equal(out.events_slot_ids, expected.events_slot_ids)
+    assert torch.equal(out.spatial_cat, expected.spatial_cat)
+    assert torch.equal(out.spatial_num, expected.spatial_num)
     assert not torch.any(out.categorical == 99)
     assert not torch.any(out.numerical == 99)
 
@@ -594,7 +528,7 @@ def test_stat_resolution_provenance_and_cache_behavior() -> None:
 
 
 def test_observation_overflow_contract_holds_at_capacity_boundaries() -> None:
-    """Verify validate_overflow_contract verifies effect and event overflow totals against metadata counters."""
+    """Verify validate_overflow_contract verifies effect overflow totals."""
     observation = StructuredObservation.empty_batch(1)[0]
     observation.numerical[:, NUM_IDX_EFFECT_COUNT] = torch.tensor(
         (0,) * 12 + (MAX_EFFECTS, MAX_EFFECTS + 2, 0),
@@ -604,12 +538,8 @@ def test_observation_overflow_contract_holds_at_capacity_boundaries() -> None:
         (0.0,) * 12 + (0.0, 2.0, 0.0),
         dtype=torch.float32,
     )
-    observation.events_metadata = torch.tensor(
-        ((EVENT_COUNT - 1, 0), (EVENT_COUNT, 0), (EVENT_COUNT + 3, 3)),
-        dtype=torch.float32,
-    )
     observation.validate_overflow_contract()
-    assert observation.overflow_totals() == (2, 3)
+    assert observation.overflow_totals() == (2, 0)
 
 
 def _legality_fixture_view(decision: DecisionView) -> FixtureBattleView:
@@ -734,22 +664,20 @@ def test_reconstructed_observations_clear_reused_buffer_state() -> None:
     builder = ObservationBuilder(default_runtime_resources())
     output = StructuredObservation.empty_batch(1)[0]
     for snapshot in perspective.snapshots:
-        snapshot.view.events = list(snapshot.events)
+        snapshot.view.spatial_turn = snapshot.spatial_turn
         output.token_type_ids.fill_(99)
         output.categorical.fill_(99)
         output.numerical.fill_(99.0)
-        output.events_cat.fill_(99)
-        output.events_num.fill_(99.0)
-        output.events_side_ids.fill_(99)
-        output.events_slot_ids.fill_(99)
-        output.events_metadata.fill_(99.0)
+        output.spatial_cat.fill_(99)
+        output.spatial_num.fill_(99.0)
         builder.build_into(snapshot.view, output)
         output.validate(batch_rank=0)
         output.validate_overflow_contract()
         assert all(torch.isfinite(tensor).all() for tensor in output.tensors())
-        assert output.events_metadata[0].item() == len(snapshot.events)
-        assert not torch.any(output.events_cat[len(snapshot.events) :, :])
-        assert not torch.any(output.events_num[len(snapshot.events) :, :])
+        assert output.spatial_cat.shape == (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH)
+        assert output.spatial_num.shape == (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH)
+        assert not torch.any(output.spatial_cat == 99)
+        assert not torch.any(output.spatial_num == 99.0)
         assert output.token_type_ids[0].item() == int(TokenType.POKEMON)
         assert output.side_ids[0].item() == int(SideId.ALLY)
         assert tuple(output.slot_ids[:6].tolist()) == (1, 2, 3, 4, 5, 6)

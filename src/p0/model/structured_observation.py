@@ -12,11 +12,17 @@ from typing import ClassVar
 
 import torch
 
+from p0.battle.events import (
+    SPATIAL_CATEGORICAL_WIDTH,
+    SPATIAL_NUMERICAL_WIDTH,
+    SPATIAL_SLOT_COUNT,
+    SpatialActionType,
+    SpatialTargetSlot,
+)
 from p0.format_config import active_global_contract, canonical_json_sha256
 from p0.model.architecture_contract import (
     OBSERVATION_ENTITY_COUNT,
     OBSERVATION_SCHEMA_VERSION,
-    RAW_EVENT_COUNT,
     SELF_TARGET_SENTINEL,
 )
 
@@ -46,12 +52,6 @@ EFFECT_NUMERICAL_WIDTH = 5
 NUM_IDX_EFFECT_COUNT = NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
 NUM_IDX_EFFECT_OVERFLOW = NUM_IDX_EFFECT_COUNT + 1
 NUMERICAL_WIDTH = NUM_IDX_EFFECT_OVERFLOW + 1
-
-EVENT_COUNT = RAW_EVENT_COUNT
-EVENT_CATEGORICAL_WIDTH = 10
-EVENT_NUMERICAL_WIDTH = 2
-EVENT_METADATA_WIDTH = 2
-EVENT_ORDER_VOCAB_SIZE = EVENT_COUNT + 1
 
 TOKEN_IDX_GLOBAL_FIELD = 12
 TOKEN_IDX_ALLY_SIDE = 13
@@ -163,12 +163,10 @@ def _observation_layout_descriptor() -> dict[str, object]:
             "effect_overflow": NUM_IDX_EFFECT_OVERFLOW,
             "width": NUMERICAL_WIDTH,
         },
-        "events": {
-            "count": EVENT_COUNT,
-            "categorical_width": EVENT_CATEGORICAL_WIDTH,
-            "numerical_width": EVENT_NUMERICAL_WIDTH,
-            "metadata_width": EVENT_METADATA_WIDTH,
-            "order_vocab_size": EVENT_ORDER_VOCAB_SIZE,
+        "spatial_events": {
+            "count": SPATIAL_SLOT_COUNT,
+            "categorical_width": SPATIAL_CATEGORICAL_WIDTH,
+            "numerical_width": SPATIAL_NUMERICAL_WIDTH,
         },
         "tokens": {
             "global_field": TOKEN_IDX_GLOBAL_FIELD,
@@ -205,6 +203,12 @@ def _observation_layout_descriptor() -> dict[str, object]:
             "provenance": {member.name.lower(): member.value for member in Provenance},
             "effect_namespace": {member.name.lower(): member.value for member in EffectNamespace},
             "counter_kind": {member.name.lower(): member.value for member in CounterKind},
+            "spatial_action_type": {
+                member.name.lower(): member.value for member in SpatialActionType
+            },
+            "spatial_target_slot": {
+                member.name.lower(): member.value for member in SpatialTargetSlot
+            },
         },
     }
 
@@ -240,11 +244,8 @@ class StructuredObservation:
     slot_ids: torch.Tensor
     categorical: torch.Tensor
     numerical: torch.Tensor
-    events_cat: torch.Tensor
-    events_num: torch.Tensor
-    events_side_ids: torch.Tensor
-    events_slot_ids: torch.Tensor
-    events_metadata: torch.Tensor
+    spatial_cat: torch.Tensor
+    spatial_num: torch.Tensor
 
     _FIELD_NAMES: ClassVar[tuple[str, ...]] = (
         "token_type_ids",
@@ -252,11 +253,8 @@ class StructuredObservation:
         "slot_ids",
         "categorical",
         "numerical",
-        "events_cat",
-        "events_num",
-        "events_side_ids",
-        "events_slot_ids",
-        "events_metadata",
+        "spatial_cat",
+        "spatial_num",
     )
     _FIELD_SPECS: ClassVar[tuple[tuple[str, tuple[int, ...], torch.dtype], ...]] = (
         ("token_type_ids", (SEQUENCE_LENGTH,), torch.long),
@@ -264,11 +262,8 @@ class StructuredObservation:
         ("slot_ids", (SEQUENCE_LENGTH,), torch.long),
         ("categorical", (SEQUENCE_LENGTH, CATEGORICAL_WIDTH), torch.long),
         ("numerical", (SEQUENCE_LENGTH, NUMERICAL_WIDTH), torch.float32),
-        ("events_cat", (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), torch.long),
-        ("events_num", (EVENT_COUNT, EVENT_NUMERICAL_WIDTH), torch.float32),
-        ("events_side_ids", (EVENT_COUNT,), torch.long),
-        ("events_slot_ids", (EVENT_COUNT,), torch.long),
-        ("events_metadata", (EVENT_METADATA_WIDTH,), torch.float32),
+        ("spatial_cat", (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH), torch.long),
+        ("spatial_num", (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH), torch.float32),
     )
 
     @classmethod
@@ -284,37 +279,25 @@ class StructuredObservation:
             self.slot_ids,
             self.categorical,
             self.numerical,
-            self.events_cat,
-            self.events_num,
-            self.events_side_ids,
-            self.events_slot_ids,
-            self.events_metadata,
+            self.spatial_cat,
+            self.spatial_num,
         )
 
     def is_teampreview(self) -> torch.Tensor:
         return is_teampreview(self.numerical)
 
     def overflow_totals(self) -> tuple[int, int]:
-        """Return effect and event overflow counts for telemetry and corpus audits."""
+        """Return effect overflow counts for telemetry and corpus audits."""
         effect_overflow = int(self.numerical[..., NUM_IDX_EFFECT_OVERFLOW].sum().item())
-        event_overflow = int(self.events_metadata[..., 1].amax().item())
-        return effect_overflow, event_overflow
+        return effect_overflow, 0
 
     def validate_overflow_contract(self) -> None:
-        """Reject counts that imply silent effect or event truncation."""
+        """Reject counts that imply silent effect truncation."""
         counts = self.numerical[..., NUM_IDX_EFFECT_COUNT]
         overflow = self.numerical[..., NUM_IDX_EFFECT_OVERFLOW]
         expected = torch.clamp(counts - MAX_EFFECTS, min=0)
         if not torch.equal(overflow, expected):
             raise ValueError("Effect overflow does not match the number of dropped effects")
-        event_total = (self.events_cat[..., 0] != 0).sum(dim=-1)
-        declared_total = self.events_metadata[..., 0].to(event_total.dtype)
-        declared_overflow = self.events_metadata[..., 1].to(event_total.dtype)
-        expected_overflow = torch.clamp(declared_total - EVENT_COUNT, min=0)
-        if torch.any(declared_total < event_total) or not torch.equal(
-            declared_overflow, expected_overflow
-        ):
-            raise ValueError("Event metadata does not match the retained event records")
 
     def clone(self) -> StructuredObservation:
         return self._from_values([tensor.clone() for tensor in self.tensors()])

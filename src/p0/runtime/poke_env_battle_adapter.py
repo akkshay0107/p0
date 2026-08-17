@@ -6,22 +6,18 @@ from weakref import WeakKeyDictionary
 
 from poke_env.battle import DoubleBattle
 
-from p0.battle.events import BattleEvent, parse_events
 from p0.battle.legality import DecisionView, SlotDecision
-from p0.model.tokenizer import tokenizer
-from p0.runtime.live_event_capture import consume_raw_events, last_move
+from p0.runtime.live_event_capture import last_move
 
 
 class PokeEnvBattleView:
     """Cached facade with explicit properties and no copied per-decision graph."""
 
-    __slots__ = ("_battle", "_decision", "_events", "_events_key", "stat_cache")
+    __slots__ = ("_battle", "_decision", "stat_cache")
 
     def __init__(self, battle: DoubleBattle):
         self._battle = battle
         self._decision: DecisionView | None = None
-        self._events: list[BattleEvent] = []
-        self._events_key: tuple[int, int] = (-1, -1)
         self.stat_cache: dict[object, tuple[int, int, int, int, int, int]] = {}
 
     def refresh(self) -> PokeEnvBattleView:
@@ -116,17 +112,17 @@ class PokeEnvBattleView:
             self._decision = decision_view(self._battle)
         return self._decision
 
+    @property
+    def spatial_turn(self):
+        try:
+            return self._battle._p0_spatial_turn  # type: ignore[attr-defined]
+        except AttributeError:
+            from p0.battle.events import SpatialSlotRecord
+
+            return tuple(SpatialSlotRecord() for _ in range(4))
+
     def get_pokemon(self, identifier: str):
         return self._battle.get_pokemon(identifier)
-
-    def consume_events(self):
-        # last_request is a poke-env private attribute; poke-env is pinned to 0.15.0.
-        # It is used as part of a monotonic key to detect when a new request has arrived.
-        key = (self._battle.turn, id(self._battle.last_request))
-        if key != self._events_key:
-            self._events = parse_events(consume_raw_events(self._battle), tokenizer)
-            self._events_key = key
-        return self._events
 
     def last_move(self, pokemon):
         return last_move(pokemon)

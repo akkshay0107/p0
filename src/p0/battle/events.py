@@ -1,198 +1,72 @@
-"""Pure protocol-event values and parser entry point.
+"""
+Spatial battlefield interaction records and turn recorder.
 
-This module defines battle event data structures, event priorities for truncation,
-and high-performance line-by-line parsing of raw Showdown protocol logs into structured
-BattleEvent objects for model consumption.
+This module defines the 4-slot spatial battlefield representation (P1A, P1B, P2A, P2B),
+tracking inter-turn action types, move identifiers, spatial target coordinates, execution
+orders, HP deltas, etc.
 """
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import NamedTuple, Protocol
+from typing import Any
 
 
-class EventTypeId(IntEnum):
+class SpatialActionType(IntEnum):
     NONE = 0
     MOVE = 1
-    SWITCH_IN = 2
-    FAINT = 3
-    DAMAGE = 4
-    HEAL = 5
-    STATUS_SET = 6
-    STATUS_CURE = 7
-    BOOST = 8
-    UNBOOST = 9
-    ITEM_END = 10
-    ITEM_REVEAL = 11
-    WEATHER_START = 12
-    FIELD_START = 13
-    SIDE_START = 14
-    BLOCKED = 15
-    CRIT = 16
-    MEGA = 17
-    FAILED = 18
-    WEATHER_END = 19
-    FIELD_END = 20
-    SIDE_END = 21
-    EFFECT_START = 22
-    EFFECT_END = 23
-    ABILITY = 24
-    ITEM_TRANSFER = 25
-    FORME_CHANGE = 26
-    DRAG = 27
-    SWAP = 28
-    MISS = 29
-    IMMUNE = 30
-    CANT = 31
-    PREPARE = 32
-    SINGLEMOVE = 33
-    BOOST_SET = 34
-    BOOST_CLEAR = 35
-    BOOST_SWAP = 36
-    BOOST_INVERT = 37
-    BOOST_COPY = 38
-    TRANSFORM = 39
-    ABILITY_END = 40
-    ACTIVATE = 41
-    FIELD_ACTIVATE = 42
-    NO_TARGET = 43
+    SWITCH = 2
+    PASS = 3
+    FAINT = 4
+    CANT = 5
 
 
-EVENT_TYPE_COUNT = max(EventTypeId) + 1
-
-# Counters for silent event-pipeline degradations include out of vocabulary ids,
-# missing pre-HP values, and grounding misses. Reset with clear.
-EVENT_DIAGNOSTICS: Counter[str] = Counter()
-
-# Mirrors tokenizer.Resolution.OOV without importing the model layer.
-_RESOLUTION_OOV = "oov"
-
-
-class RawBattleEvent(NamedTuple):
-    message: tuple[str, ...]
-    pre_hp: float | None = None
+class SpatialTargetSlot(IntEnum):
+    SELF = 0
+    ALLY_LEFT = 1
+    ALLY_RIGHT = 2
+    OPP_LEFT = 3
+    OPP_RIGHT = 4
+    ALL = 5
+    NONE = 6
 
 
-class BattleEvent(NamedTuple):
-    event_type: EventTypeId
-    entity_id: str | None
-    target_id: str | None = None
+SPATIAL_SLOT_COUNT = 4
+SPATIAL_CATEGORICAL_WIDTH = 3  # [action_type, move_id, target_slot]
+SPATIAL_NUMERICAL_WIDTH = 8  # [order_rank, hp_delta, damage_dealt, net_boost_delta, landed_crit, took_crit, move_failed, item_consumed]
+NUM_ACTION_TYPES = len(SpatialActionType)
+NUM_TARGET_SLOTS = len(SpatialTargetSlot)
+
+FLAG_LANDED_CRIT = 1
+FLAG_TOOK_CRIT = 2
+FLAG_MOVE_FAILED = 4
+FLAG_ITEM_CONSUMED = 8
+
+
+@dataclass(frozen=True, slots=True)
+class SpatialSlotRecord:
+    """Fixed-layout inter-turn interaction record for one active battlefield slot."""
+
+    action_type: int = int(SpatialActionType.NONE)
     move_id: int = 0
-    item_id: int = 0
-    status_id: int = 0
-    effect_id: int = 0
-    ability_id: int = 0
-    flags: int = 0
-    value: float = 0.0
-    order: int = 0
-
-
-# Structural / state-defining transitions survive truncation first: they are
-# low-frequency and carry information no state token fully reconstructs.
-HIGH_PRIORITY_EVENTS = frozenset(
-    {
-        EventTypeId.MOVE,
-        EventTypeId.SWITCH_IN,
-        EventTypeId.DRAG,
-        EventTypeId.FAINT,
-        EventTypeId.ITEM_END,
-        EventTypeId.ITEM_TRANSFER,
-        EventTypeId.STATUS_SET,
-        EventTypeId.STATUS_CURE,
-        EventTypeId.MEGA,
-        EventTypeId.FORME_CHANGE,
-        EventTypeId.TRANSFORM,
-        EventTypeId.WEATHER_START,
-        EventTypeId.WEATHER_END,
-        EventTypeId.FIELD_START,
-        EventTypeId.FIELD_END,
-        EventTypeId.SIDE_START,
-        EventTypeId.SIDE_END,
-        EventTypeId.EFFECT_START,
-        EventTypeId.EFFECT_END,
-        EventTypeId.ABILITY,
-        EventTypeId.ABILITY_END,
-        EventTypeId.CANT,
-        EventTypeId.SINGLEMOVE,
-        EventTypeId.PREPARE,
-        EventTypeId.BOOST_SET,
-    }
-)
-
-# Routine numeric deltas: informative but partly recoverable from state tokens.
-MEDIUM_PRIORITY_EVENTS = frozenset(
-    {
-        EventTypeId.BOOST,
-        EventTypeId.UNBOOST,
-        EventTypeId.DAMAGE,
-        EventTypeId.HEAL,
-        EventTypeId.BOOST_CLEAR,
-        EventTypeId.BOOST_SWAP,
-        EventTypeId.BOOST_INVERT,
-        EventTypeId.BOOST_COPY,
-        EventTypeId.ACTIVATE,
-        EventTypeId.BLOCKED,
-    }
-)
-
-# Protocol status codes; the status vocab table is keyed by these raw codes.
-STATUS_CODES = frozenset({"brn", "frz", "par", "psn", "slp", "tox"})
-
-PROTECT_EFFECTS = (
-    "move: Protect",
-    "move: Detect",
-    "move: Spiky Shield",
-    "move: Baneful Bunker",
-    "move: King's Shield",
-    "move: Obstruct",
-)
-
-
-class EventResolver(Protocol):
-    """Vocabulary resolution protocol mapping identifiers to integer IDs."""
-
-    def id_for(self, table: str, name: str | None) -> int:
-        """Fetch the exact ID for a name within a vocabulary table."""
-        ...
-
-    def effect_id_for(self, table: str, name: str | None) -> int:
-        """Fetch the effect ID for a name within a vocabulary table."""
-        ...
-
-    def resolve(self, table: str, name: str | None) -> tuple[int, str]:
-        """Resolve a name, returning both the ID and the resolution type."""
-        ...
-
-
-_PRE_HP_TAGS = frozenset({"-damage", "-heal"})
-
-
-def build_raw_event(
-    split_message: Sequence[str],
-    pre_hp_for: Callable[[str], float | None],
-) -> RawBattleEvent:
-    """Shared raw-line producer for live capture and replay reconstruction.
-
-    Both producers must snapshot the entity's HP before the line is applied,
-    so damage/heal deltas are computed against identical baselines in training
-    and replay. Keep every raw-line -> RawBattleEvent rule in this function.
-    """
-    pre_hp = None
-    if len(split_message) > 2 and split_message[1] in _PRE_HP_TAGS:
-        pre_hp = pre_hp_for(split_message[2])
-
-    return RawBattleEvent(tuple(split_message), pre_hp)
+    target_slot: int = int(SpatialTargetSlot.NONE)
+    order_rank: float = 0.0
+    hp_delta: float = 0.0
+    damage_dealt: float = 0.0
+    net_boost_delta: float = 0.0
+    landed_crit: float = 0.0
+    took_crit: float = 0.0
+    move_failed: float = 0.0
+    item_consumed: float = 0.0
 
 
 def get_hp_fraction(hp_status: str) -> float:
     """Extract float HP fraction from a Showdown HP status string."""
     hp_part = hp_status.split(" ", 1)[0]
-
     if "/" not in hp_part:
         return 0.0
-
     try:
         num, den_str = hp_part.split("/")
         den_clean = den_str.strip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ% ")
@@ -201,417 +75,297 @@ def get_hp_fraction(hp_status: str) -> float:
         return 0.0
 
 
-_priority_list = [0] * EVENT_TYPE_COUNT
-for _ev in HIGH_PRIORITY_EVENTS:
-    _priority_list[_ev] = 2
-for _ev in MEDIUM_PRIORITY_EVENTS:
-    _priority_list[_ev] = 1
-_PRIORITY_MAP = tuple(_priority_list)
+def _parse_slot_index(endpoint: str, perspective_role: str) -> int | None:
+    """Map a Showdown entity string (e.g. 'p1a: Pikachu') to perspective slot 0..3."""
+    if len(endpoint) < 3 or endpoint[0] != "p":
+        return None
+    player_num = endpoint[1]
+    slot_letter = endpoint[2].lower()
+    if player_num not in ("1", "2") or slot_letter not in ("a", "b"):
+        return None
+
+    is_ally = f"p{player_num}" == perspective_role
+    slot_offset = 0 if slot_letter == "a" else 1
+    return slot_offset if is_ally else 2 + slot_offset
 
 
-def _sort_priority_key(event: BattleEvent) -> tuple[int, int]:
-    """Provide a sort key to rank high-priority events earlier for truncation."""
-    return (-_PRIORITY_MAP[event.event_type], event.order)
+def _parse_target_slot(endpoint: str, perspective_role: str) -> int:
+    """Map a target endpoint to SpatialTargetSlot enum value."""
+    slot_idx = _parse_slot_index(endpoint, perspective_role)
+    if slot_idx is None:
+        return int(SpatialTargetSlot.NONE)
+    if slot_idx == 0:
+        return int(SpatialTargetSlot.ALLY_LEFT)
+    if slot_idx == 1:
+        return int(SpatialTargetSlot.ALLY_RIGHT)
+    if slot_idx == 2:
+        return int(SpatialTargetSlot.OPP_LEFT)
+    if slot_idx == 3:
+        return int(SpatialTargetSlot.OPP_RIGHT)
+
+    return int(SpatialTargetSlot.NONE)
 
 
-def _sort_order_key(event: BattleEvent) -> int:
-    """Provide a sort key to restore original event order after truncation."""
-    return event.order
+class SpatialTurnRecorder:
+    """Deterministic, pure-protocol recorder for the 4 battlefield active slots."""
 
+    __slots__ = ("player_role", "slots", "_action_order", "_last_attacker")
 
-def truncate_events(events: list[BattleEvent], limit: int = 24) -> list[BattleEvent]:
-    """Truncate event sequence to limit while preserving high-priority events."""
-    if len(events) <= limit:
-        return events
+    def __init__(self, player_role: str = "p1") -> None:
+        self.player_role = player_role
+        self.slots: list[SpatialSlotRecord] = [
+            SpatialSlotRecord() for _ in range(SPATIAL_SLOT_COUNT)
+        ]
+        self._action_order = 0
+        self._last_attacker: int | None = None
 
-    selected = sorted(events, key=_sort_priority_key)[:limit]
-    return sorted(selected, key=_sort_order_key)
+    def reset_turn(self) -> None:
+        self.slots = [SpatialSlotRecord() for _ in range(SPATIAL_SLOT_COUNT)]
+        self._action_order = 0
+        self._last_attacker = None
 
+    def apply_line(
+        self,
+        parts: Sequence[str],
+        resolver: Any | None = None,
+        hp_for: Any | None = None,
+    ) -> None:
+        if len(parts) < 2:
+            return
 
-def _resolve_id(resolver: EventResolver, table: str, name: str | None) -> int:
-    """Resolve an identifier, updating diagnostics upon Out-Of-Vocabulary matches."""
-    resolved_id, resolution = resolver.resolve(table, name)
-    if resolution == _RESOLUTION_OOV:
-        EVENT_DIAGNOSTICS["oov_ids"] += 1
-    return resolved_id
-
-
-def _resolve_effect(resolver: EventResolver, table: str, name: str) -> int:
-    """Strip prefixes from effect names and resolve their identifiers."""
-    _, separator, remainder = name.partition(":")
-    return _resolve_id(resolver, table, remainder if separator else name)
-
-
-def parse_events(
-    raw_events: list[RawBattleEvent],
-    resolver: EventResolver,
-) -> list[BattleEvent]:
-    """Parse raw Showdown protocol event lines into structured BattleEvents.
-
-    Arguments:
-      raw_events: sequence of raw battle event line records to parse
-      resolver: vocabulary event resolver mapping string identifiers to integers
-
-    Returns:
-      list of parsed BattleEvent objects in order of occurrence
-    """
-    events: list[BattleEvent] = []
-    last_attacker: str | None = None
-
-    for raw_event in raw_events:
-        message = raw_event.message
-        if len(message) < 2:
-            continue
-
-        tag = message[1]
-        order = len(events)
+        tag = parts[1]
 
         if tag in ("turn", "upkeep"):
-            last_attacker = None
-            continue
+            self._last_attacker = None
+            return
 
-        if tag == "move" and len(message) >= 4:
-            last_attacker = message[2]
-            generated = any(part.startswith("[from]") for part in message[5:])
-            events.append(
-                BattleEvent(
-                    EventTypeId.MOVE,
-                    last_attacker,
-                    target_id=message[4] if len(message) >= 5 else None,
-                    move_id=_resolve_id(resolver, "moves", message[3]),
-                    flags=4 if generated else 0,
-                    order=order,
+        if tag == "move" and len(parts) >= 4:
+            actor = _parse_slot_index(parts[2], self.player_role)
+            if actor is not None:
+                self._action_order += 1
+                self._last_attacker = actor
+                move_id = 0
+                if resolver is not None:
+                    try:
+                        resolved, _ = resolver.resolve("moves", parts[3])
+                        move_id = resolved
+                    except Exception:
+                        move_id = 0
+                target_slot = (
+                    _parse_target_slot(parts[4], self.player_role)
+                    if len(parts) >= 5
+                    else int(SpatialTargetSlot.NONE)
                 )
-            )
-
-        elif tag in ("switch", "drag") and len(message) >= 5:
-            events.append(
-                BattleEvent(
-                    EventTypeId.DRAG if tag == "drag" else EventTypeId.SWITCH_IN,
-                    message[2],
-                    order=order,
+                prev = self.slots[actor]
+                self.slots[actor] = SpatialSlotRecord(
+                    action_type=int(SpatialActionType.MOVE),
+                    move_id=move_id,
+                    target_slot=target_slot,
+                    order_rank=min(1.0, self._action_order / 4.0),
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=prev.move_failed,
+                    item_consumed=prev.item_consumed,
                 )
-            )
 
-        elif tag == "swap" and len(message) >= 3:
-            events.append(BattleEvent(EventTypeId.SWAP, message[2], order=order))
-
-        elif tag == "faint" and len(message) >= 3:
-            events.append(BattleEvent(EventTypeId.FAINT, message[2], order=order))
-
-        elif tag in ("-damage", "-heal") and len(message) >= 4:
-            new_hp = get_hp_fraction(message[3])
-            if raw_event.pre_hp is None:
-                EVENT_DIAGNOSTICS["missing_pre_hp"] += 1
-            value = 0.0 if raw_event.pre_hp is None else new_hp - raw_event.pre_hp
-            events.append(
-                BattleEvent(
-                    EventTypeId.DAMAGE if tag == "-damage" else EventTypeId.HEAL,
-                    message[2],
-                    value=value,
-                    order=order,
+        elif tag in ("switch", "drag") and len(parts) >= 3:
+            slot = _parse_slot_index(parts[2], self.player_role)
+            if slot is not None:
+                prev = self.slots[slot]
+                self.slots[slot] = SpatialSlotRecord(
+                    action_type=int(SpatialActionType.SWITCH),
+                    move_id=0,
+                    target_slot=int(SpatialTargetSlot.NONE),
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=prev.move_failed,
+                    item_consumed=prev.item_consumed,
                 )
-            )
 
-        elif tag in ("-boost", "-unboost") and len(message) >= 5:
-            amount = int(message[4]) / 6.0
-            events.append(
-                BattleEvent(
-                    EventTypeId.BOOST if tag == "-boost" else EventTypeId.UNBOOST,
-                    message[2],
-                    value=amount if tag == "-boost" else -amount,
-                    order=order,
+        elif tag == "faint" and len(parts) >= 3:
+            slot = _parse_slot_index(parts[2], self.player_role)
+            if slot is not None:
+                prev = self.slots[slot]
+                self.slots[slot] = SpatialSlotRecord(
+                    action_type=int(SpatialActionType.FAINT),
+                    move_id=prev.move_id,
+                    target_slot=prev.target_slot,
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=prev.move_failed,
+                    item_consumed=prev.item_consumed,
                 )
-            )
 
-        elif tag in ("-status", "-curestatus") and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.STATUS_SET if tag == "-status" else EventTypeId.STATUS_CURE,
-                    message[2],
-                    status_id=_resolve_id(resolver, "status", message[3]),
-                    order=order,
+        elif tag == "cant" and len(parts) >= 3:
+            slot = _parse_slot_index(parts[2], self.player_role)
+            if slot is not None:
+                prev = self.slots[slot]
+                self.slots[slot] = SpatialSlotRecord(
+                    action_type=int(SpatialActionType.CANT),
+                    move_id=prev.move_id,
+                    target_slot=prev.target_slot,
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=prev.move_failed,
+                    item_consumed=prev.item_consumed,
                 )
-            )
 
-        elif tag in ("-enditem", "-item") and len(message) >= 4:
-            transferred = tag == "-item" and any(
-                "move: trick" in part.lower() or "move: switcheroo" in part.lower()
-                for part in message[4:]
-            )
-            event_type = (
-                EventTypeId.ITEM_TRANSFER
-                if transferred
-                else EventTypeId.ITEM_END
-                if tag == "-enditem"
-                else EventTypeId.ITEM_REVEAL
-            )
-            events.append(
-                BattleEvent(
-                    event_type,
-                    message[2],
-                    item_id=_resolve_id(resolver, "items", message[3]),
-                    order=order,
+        elif tag in ("-damage", "-heal") and len(parts) >= 4:
+            target = _parse_slot_index(parts[2], self.player_role)
+            if target is not None:
+                new_hp = get_hp_fraction(parts[3])
+                pre_hp = hp_for(parts[2]) if hp_for is not None else None
+                delta = (new_hp - pre_hp) if pre_hp is not None else 0.0
+                prev = self.slots[target]
+                self.slots[target] = SpatialSlotRecord(
+                    action_type=prev.action_type,
+                    move_id=prev.move_id,
+                    target_slot=prev.target_slot,
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta + delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=prev.move_failed,
+                    item_consumed=prev.item_consumed,
                 )
-            )
-
-        elif tag == "-ability" and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.ABILITY,
-                    message[2],
-                    ability_id=_resolve_id(resolver, "abilities", message[3]),
-                    order=order,
-                )
-            )
-
-        elif tag == "-weather" and len(message) >= 3:
-            if any("[upkeep]" in part for part in message[3:]):
-                continue
-            if message[2] == "none":
-                events.append(BattleEvent(EventTypeId.WEATHER_END, None, order=order))
-            else:
-                events.append(
-                    BattleEvent(
-                        EventTypeId.WEATHER_START,
-                        None,
-                        effect_id=_resolve_effect(resolver, "weathers", message[2]),
-                        order=order,
+                if tag == "-damage" and self._last_attacker is not None and delta < 0:
+                    att_prev = self.slots[self._last_attacker]
+                    self.slots[self._last_attacker] = SpatialSlotRecord(
+                        action_type=att_prev.action_type,
+                        move_id=att_prev.move_id,
+                        target_slot=att_prev.target_slot,
+                        order_rank=att_prev.order_rank,
+                        hp_delta=att_prev.hp_delta,
+                        damage_dealt=att_prev.damage_dealt + abs(delta),
+                        net_boost_delta=att_prev.net_boost_delta,
+                        landed_crit=att_prev.landed_crit,
+                        took_crit=att_prev.took_crit,
+                        move_failed=att_prev.move_failed,
+                        item_consumed=att_prev.item_consumed,
                     )
+
+        elif tag == "-crit" and len(parts) >= 3:
+            target = _parse_slot_index(parts[2], self.player_role)
+            if target is not None:
+                prev = self.slots[target]
+                self.slots[target] = SpatialSlotRecord(
+                    action_type=prev.action_type,
+                    move_id=prev.move_id,
+                    target_slot=prev.target_slot,
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=1.0,
+                    move_failed=prev.move_failed,
+                    item_consumed=prev.item_consumed,
+                )
+            if self._last_attacker is not None:
+                att_prev = self.slots[self._last_attacker]
+                self.slots[self._last_attacker] = SpatialSlotRecord(
+                    action_type=att_prev.action_type,
+                    move_id=att_prev.move_id,
+                    target_slot=att_prev.target_slot,
+                    order_rank=att_prev.order_rank,
+                    hp_delta=att_prev.hp_delta,
+                    damage_dealt=att_prev.damage_dealt,
+                    net_boost_delta=att_prev.net_boost_delta,
+                    landed_crit=1.0,
+                    took_crit=att_prev.took_crit,
+                    move_failed=att_prev.move_failed,
+                    item_consumed=att_prev.item_consumed,
                 )
 
-        elif tag in ("-fieldstart", "-fieldend") and len(message) >= 3:
-            events.append(
-                BattleEvent(
-                    EventTypeId.FIELD_START if tag == "-fieldstart" else EventTypeId.FIELD_END,
-                    None,
-                    effect_id=_resolve_effect(resolver, "fields", message[2]),
-                    order=order,
-                )
-            )
-
-        elif tag in ("-sidestart", "-sideend") and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.SIDE_START if tag == "-sidestart" else EventTypeId.SIDE_END,
-                    message[2],
-                    effect_id=_resolve_effect(resolver, "side_conditions", message[3]),
-                    order=order,
-                )
-            )
-
-        elif tag in ("-start", "-end") and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.EFFECT_START if tag == "-start" else EventTypeId.EFFECT_END,
-                    message[2],
-                    effect_id=_resolve_effect(resolver, "volatiles", message[3]),
-                    order=order,
-                )
-            )
-
-        elif tag in ("-formechange", "detailschange") and len(message) >= 4:
-            events.append(BattleEvent(EventTypeId.FORME_CHANGE, message[2], order=order))
-
-        elif tag == "-fail":
-            events.append(
-                BattleEvent(
-                    EventTypeId.FAILED,
-                    last_attacker or (message[2] if len(message) >= 3 else None),
-                    order=order,
-                )
-            )
-
-        elif tag in ("-immune", "-miss"):
-            named = message[2] if len(message) >= 3 else None
-            if tag == "-miss":
-                source = named or last_attacker
-                target = message[3] if len(message) >= 4 else None
-                flags = 2
-            else:
-                source = last_attacker
-                target = named
-                flags = 1
-            events.append(
-                BattleEvent(
-                    EventTypeId.BLOCKED,
-                    source,
-                    target_id=target,
-                    flags=flags,
-                    order=order,
-                )
-            )
-
-        elif tag == "-activate" and len(message) >= 4:
-            effect = message[3]
-            if effect.startswith(PROTECT_EFFECTS):
-                events.append(
-                    BattleEvent(
-                        EventTypeId.BLOCKED,
-                        last_attacker,
-                        target_id=message[2],
-                        order=order,
-                    )
-                )
-            else:
-                kind, separator, name = effect.partition(":")
-                kind = kind.strip().lower() if separator else ""
-                ability_id = 0
-                item_id = 0
-                effect_id = 0
-                if kind == "ability":
-                    ability_id = _resolve_id(resolver, "abilities", name)
-                elif kind == "item":
-                    item_id = _resolve_id(resolver, "items", name)
-                else:
-                    effect_id = _resolve_effect(resolver, "volatiles", effect)
-
-                events.append(
-                    BattleEvent(
-                        EventTypeId.ACTIVATE,
-                        message[2],
-                        ability_id=ability_id,
-                        item_id=item_id,
-                        effect_id=effect_id,
-                        order=order,
-                    )
+        elif tag in ("-boost", "-unboost") and len(parts) >= 5:
+            slot = _parse_slot_index(parts[2], self.player_role)
+            if slot is not None:
+                amount = int(parts[4]) / 6.0
+                delta = amount if tag == "-boost" else -amount
+                prev = self.slots[slot]
+                self.slots[slot] = SpatialSlotRecord(
+                    action_type=prev.action_type,
+                    move_id=prev.move_id,
+                    target_slot=prev.target_slot,
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta + delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=prev.move_failed,
+                    item_consumed=prev.item_consumed,
                 )
 
-        elif tag == "-crit" and len(message) >= 3:
-            events.append(BattleEvent(EventTypeId.CRIT, message[2], order=order))
-
-        elif tag == "-mega" and len(message) >= 3:
-            events.append(BattleEvent(EventTypeId.MEGA, message[2], order=order))
-
-        elif tag == "cant" and len(message) >= 4:
-            reason = message[3]
-            is_status = reason in STATUS_CODES
-            events.append(
-                BattleEvent(
-                    EventTypeId.CANT,
-                    message[2],
-                    status_id=_resolve_id(resolver, "status", reason) if is_status else 0,
-                    effect_id=0 if is_status else _resolve_effect(resolver, "volatiles", reason),
-                    move_id=_resolve_id(resolver, "moves", message[4]) if len(message) >= 5 else 0,
-                    order=order,
+        elif tag in ("-fail", "-miss", "-immune"):
+            if self._last_attacker is not None:
+                prev = self.slots[self._last_attacker]
+                self.slots[self._last_attacker] = SpatialSlotRecord(
+                    action_type=prev.action_type,
+                    move_id=prev.move_id,
+                    target_slot=prev.target_slot,
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=1.0,
+                    item_consumed=prev.item_consumed,
                 )
-            )
 
-        elif tag == "-prepare" and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.PREPARE,
-                    message[2],
-                    target_id=message[4] if len(message) >= 5 else None,
-                    move_id=_resolve_id(resolver, "moves", message[3]),
-                    order=order,
+        elif tag in ("-enditem", "-item") and len(parts) >= 3:
+            slot = _parse_slot_index(parts[2], self.player_role)
+            if slot is not None:
+                prev = self.slots[slot]
+                self.slots[slot] = SpatialSlotRecord(
+                    action_type=prev.action_type,
+                    move_id=prev.move_id,
+                    target_slot=prev.target_slot,
+                    order_rank=prev.order_rank,
+                    hp_delta=prev.hp_delta,
+                    damage_dealt=prev.damage_dealt,
+                    net_boost_delta=prev.net_boost_delta,
+                    landed_crit=prev.landed_crit,
+                    took_crit=prev.took_crit,
+                    move_failed=prev.move_failed,
+                    item_consumed=1.0,
                 )
-            )
 
-        elif tag == "-singlemove" and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.SINGLEMOVE,
-                    message[2],
-                    effect_id=_resolve_effect(resolver, "volatiles", message[3]),
-                    order=order,
-                )
-            )
-
-        elif tag == "-setboost" and len(message) >= 5:
-            events.append(
-                BattleEvent(
-                    EventTypeId.BOOST_SET,
-                    message[2],
-                    value=int(message[4]) / 6.0,
-                    order=order,
-                )
-            )
-
-        elif tag in ("-clearboost", "-clearnegativeboost", "-clearallboost"):
-            events.append(
-                BattleEvent(
-                    EventTypeId.BOOST_CLEAR,
-                    message[2] if len(message) >= 3 else None,
-                    flags=1 if tag == "-clearnegativeboost" else 0,
-                    order=order,
-                )
-            )
-
-        elif tag == "-swapboost" and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.BOOST_SWAP,
-                    message[2],
-                    target_id=message[3],
-                    order=order,
-                )
-            )
-
-        elif tag == "-invertboost" and len(message) >= 3:
-            events.append(BattleEvent(EventTypeId.BOOST_INVERT, message[2], order=order))
-
-        elif tag == "-copyboost" and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.BOOST_COPY,
-                    message[2],
-                    target_id=message[3],
-                    order=order,
-                )
-            )
-
-        elif tag == "-transform" and len(message) >= 4:
-            events.append(
-                BattleEvent(
-                    EventTypeId.TRANSFORM,
-                    message[2],
-                    target_id=message[3],
-                    order=order,
-                )
-            )
-
-        elif tag == "-endability" and len(message) >= 3:
-            events.append(
-                BattleEvent(
-                    EventTypeId.ABILITY_END,
-                    message[2],
-                    ability_id=_resolve_id(resolver, "abilities", message[3])
-                    if len(message) >= 4
-                    else 0,
-                    order=order,
-                )
-            )
-
-        elif tag == "-fieldactivate" and len(message) >= 3:
-            events.append(
-                BattleEvent(
-                    EventTypeId.FIELD_ACTIVATE,
-                    None,
-                    effect_id=_resolve_effect(resolver, "fields", message[2]),
-                    order=order,
-                )
-            )
-
-        elif tag == "-notarget":
-            events.append(
-                BattleEvent(
-                    EventTypeId.NO_TARGET,
-                    message[2] if len(message) >= 3 else last_attacker,
-                    order=order,
-                )
-            )
-
-    return events
+    def to_records(self) -> tuple[SpatialSlotRecord, ...]:
+        return tuple(self.slots)
 
 
 __all__ = [
-    "EVENT_DIAGNOSTICS",
-    "EVENT_TYPE_COUNT",
-    "BattleEvent",
-    "EventTypeId",
-    "RawBattleEvent",
-    "build_raw_event",
-    "parse_events",
-    "truncate_events",
+    "FLAG_ITEM_CONSUMED",
+    "FLAG_LANDED_CRIT",
+    "FLAG_MOVE_FAILED",
+    "FLAG_TOOK_CRIT",
+    "NUM_ACTION_TYPES",
+    "NUM_TARGET_SLOTS",
+    "SPATIAL_CATEGORICAL_WIDTH",
+    "SPATIAL_NUMERICAL_WIDTH",
+    "SPATIAL_SLOT_COUNT",
+    "SpatialActionType",
+    "SpatialSlotRecord",
+    "SpatialTargetSlot",
+    "SpatialTurnRecorder",
+    "get_hp_fraction",
 ]

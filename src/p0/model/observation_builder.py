@@ -12,7 +12,11 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from p0.battle.events import EVENT_DIAGNOSTICS, BattleEvent, truncate_events
+from p0.battle.events import (
+    SPATIAL_CATEGORICAL_WIDTH,
+    SPATIAL_NUMERICAL_WIDTH,
+    SPATIAL_SLOT_COUNT,
+)
 from p0.battle.views import BattleView, MoveView, PokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
@@ -20,10 +24,6 @@ from p0.model.structured_observation import (
     CAT_IDX_STATUS_COUNTER_KIND,
     CAT_KNOWNNESS_START,
     CATEGORICAL_WIDTH,
-    EVENT_CATEGORICAL_WIDTH,
-    EVENT_COUNT,
-    EVENT_METADATA_WIDTH,
-    EVENT_NUMERICAL_WIDTH,
     MAX_EFFECTS,
     MOVE_SLOTS,
     NUM_IDX_CAN_MEGA,
@@ -678,94 +678,35 @@ def _side_token_into(
     num[4] = float(mega_available)
 
 
-def _ground_identifier(
-    battle: BattleView,
-    entity_id: str,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
-) -> tuple[SideId, int]:
-    # Side identifiers arrive as bare p1 or p2, or p1 followed by a username.
-    # Pokemon identifiers carry a position letter, so the third
-    # character distinguishes the two without a lookup.
-    if len(entity_id) >= 2 and (len(entity_id) == 2 or entity_id[2] == ":"):
-        prefix = entity_id[:2]
-        if prefix in ("p1", "p2"):
-            side = SideId.ALLY if prefix == battle.player_role else SideId.OPPONENT
-            return side, 0
-
-    try:
-        pokemon = battle.get_pokemon(entity_id)
-    except (AssertionError, IndexError, KeyError, ValueError):
-        EVENT_DIAGNOSTICS["grounding_misses"] += 1
-        return SideId.NONE, 0
-    location = pokemon_to_slot.get(pokemon)
-    if location is None:
-        EVENT_DIAGNOSTICS["grounding_misses"] += 1
-        return SideId.NONE, 0
-    return location
-
-
-def _event_location(
-    battle: BattleView,
-    event: BattleEvent,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
-) -> tuple[SideId, int]:
-    if event.entity_id is None:
-        return SideId.NONE, 0
-    return _ground_identifier(battle, event.entity_id, pokemon_to_slot)
-
-
-def _event_target_location(
-    battle: BattleView,
-    event: BattleEvent,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
-) -> tuple[SideId, int]:
-    if event.target_id is None:
-        return SideId.NONE, 0
-    return _ground_identifier(battle, event.target_id, pokemon_to_slot)
-
-
-def _write_events(
+def _write_spatial_events(
     battle: BattleView,
     out: StructuredObservation,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
 ) -> None:
-    untruncated_events = battle.consume_events()
-    event_overflow = max(0, len(untruncated_events) - EVENT_COUNT)
-    events = truncate_events(untruncated_events, limit=EVENT_COUNT)
-    events_cat = out.events_cat.numpy()
-    events_num = out.events_num.numpy()
-    events_side_ids = out.events_side_ids.numpy()
-    events_slot_ids = out.events_slot_ids.numpy()
-    events_metadata = out.events_metadata.numpy()
-    events_cat.fill(0)
-    events_num.fill(0)
-    events_side_ids.fill(0)
-    events_slot_ids.fill(0)
-    events_metadata.fill(0)
-    events_metadata[:] = (len(untruncated_events), event_overflow)
-    for event_idx, event in enumerate(events):
-        side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
-        target_side_id, target_slot_id = _event_target_location(battle, event, pokemon_to_slot)
-        # Order is re-compacted to the post-truncation index so the positional
-        # vocabulary never saturates and the order scalar stays inside [0, 1).
-        events_cat[event_idx] = (
-            event.event_type,
-            event.move_id,
-            event.item_id,
-            event.status_id,
-            event_idx + 1,
-            event.effect_id,
-            event.ability_id,
-            event.flags,
-            target_side_id,
-            target_slot_id,
+    spatial_cat = out.spatial_cat.numpy()
+    spatial_num = out.spatial_num.numpy()
+    spatial_cat.fill(0)
+    spatial_num.fill(0)
+
+    turn_records = getattr(battle, "spatial_turn", None)
+    if turn_records is None:
+        return
+
+    for slot_idx, record in enumerate(turn_records[:SPATIAL_SLOT_COUNT]):
+        spatial_cat[slot_idx] = (
+            record.action_type,
+            record.move_id,
+            record.target_slot,
         )
-        events_num[event_idx] = (
-            event.value,
-            event_idx / float(EVENT_COUNT),
+        spatial_num[slot_idx] = (
+            record.order_rank,
+            record.hp_delta,
+            record.damage_dealt,
+            record.net_boost_delta,
+            record.landed_crit,
+            record.took_crit,
+            record.move_failed,
+            record.item_consumed,
         )
-        events_side_ids[event_idx] = side_id
-        events_slot_ids[event_idx] = slot_id
 
 
 def _write_observation(
@@ -885,7 +826,7 @@ def _write_observation(
     if idx != SEQUENCE_LENGTH:
         raise RuntimeError(f"Structured observation length drifted to {idx}")
 
-    _write_events(battle, out, pokemon_to_slot)
+    _write_spatial_events(battle, out)
 
 
 def _validate_output(out: StructuredObservation) -> None:
@@ -906,20 +847,17 @@ def _validate_output(out: StructuredObservation) -> None:
             torch.float32,
         ),
         (
-            "events_cat",
-            out.events_cat,
-            (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH),
+            "spatial_cat",
+            out.spatial_cat,
+            (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH),
             torch.long,
         ),
         (
-            "events_num",
-            out.events_num,
-            (EVENT_COUNT, EVENT_NUMERICAL_WIDTH),
+            "spatial_num",
+            out.spatial_num,
+            (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH),
             torch.float32,
         ),
-        ("events_side_ids", out.events_side_ids, (EVENT_COUNT,), torch.long),
-        ("events_slot_ids", out.events_slot_ids, (EVENT_COUNT,), torch.long),
-        ("events_metadata", out.events_metadata, (EVENT_METADATA_WIDTH,), torch.float32),
     )
     for name, tensor, shape, dtype in expected:
         if tensor.device.type != "cpu":
