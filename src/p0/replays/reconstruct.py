@@ -1030,6 +1030,28 @@ class _ReplayState:
         if tag == "move":
             self._apply_move(parts)
             return
+        if tag == "-transform" and len(parts) >= 4:
+            endpoint = self._endpoint(parts[2])
+            target_endpoint = self._endpoint(parts[3])
+            if endpoint is not None and target_endpoint is not None:
+                side, slot = endpoint
+                target_side, target_slot = target_endpoint
+                pokemon = self.active[side][slot]
+                target = self.active[target_side][target_slot]
+                if pokemon is not None and target is not None:
+                    changes = self._species_changes(target.species or target.base_species)
+                    transformed_moves = {
+                        k: replace(v, current_pp=5, max_pp=5) for k, v in target.moves.items()
+                    }
+                    updated = replace(
+                        pokemon,
+                        **changes,
+                        moves=transformed_moves,
+                        boosts=dict(target.boosts),
+                    )
+                    self.active[side][slot] = updated
+                    self.identifiers[parts[2]] = updated
+            return
         if tag == "cant" and len(parts) >= 3:
             located = self._active_for(parts[2])
             if located is not None:

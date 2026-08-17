@@ -108,6 +108,146 @@ class PokemonView(Protocol):
     def level(self) -> int | None: ...
 
 
+class TransformedMoveView:
+    def __init__(self, base_move: MoveView):
+        self._base = base_move
+
+    @property
+    def id(self) -> str:
+        return self._base.id
+
+    @property
+    def type(self) -> Any:
+        return self._base.type
+
+    @property
+    def category(self) -> Any:
+        return self._base.category
+
+    @property
+    def current_pp(self) -> int | None:
+        return 5
+
+    @property
+    def max_pp(self) -> int | None:
+        return 5
+
+
+class TransformedPokemonView:
+    def __init__(
+        self,
+        base: PokemonView,
+        target: PokemonView,
+        moves: Mapping[str, Any] | None = None,
+    ):
+        self._base = base
+        self._target = target
+        source_moves = moves if moves is not None else target.moves
+        self._transformed_moves = {k: TransformedMoveView(v) for k, v in source_moves.items()}
+
+    def __hash__(self) -> int:
+        return hash(self._base)
+
+    def __eq__(self, other: Any) -> bool:
+        return self._base == other or self is other
+
+    @property
+    def species(self) -> str | None:
+        return self._target.species
+
+    @property
+    def base_species(self) -> str:
+        return self._target.base_species
+
+    @property
+    def ability(self) -> str | None:
+        return self._target.ability
+
+    @property
+    def item(self) -> str | None:
+        return self._base.item
+
+    @property
+    def nature(self) -> str | None:
+        return self._base.nature
+
+    @property
+    def moves(self) -> Mapping[str, Any]:
+        return self._transformed_moves
+
+    @property
+    def type_1(self) -> Any:
+        return self._target.type_1
+
+    @property
+    def type_2(self) -> Any:
+        return self._target.type_2
+
+    @property
+    def status(self) -> Any:
+        return self._base.status
+
+    @property
+    def base_stats(self) -> Mapping[str, int]:
+        return self._target.base_stats
+
+    @property
+    def stats(self) -> Mapping[str, int | None] | None:
+        return self._target.stats
+
+    @property
+    def boosts(self) -> Mapping[str, int]:
+        return self._base.boosts
+
+    @property
+    def current_hp_fraction(self) -> float:
+        return self._base.current_hp_fraction
+
+    @property
+    def protect_counter(self) -> int:
+        return self._base.protect_counter
+
+    @property
+    def first_turn(self) -> bool:
+        return self._base.first_turn
+
+    @property
+    def weight(self) -> float:
+        return self._target.weight
+
+    @property
+    def fainted(self) -> bool:
+        return self._base.fainted
+
+    @property
+    def revealed(self) -> bool:
+        return self._base.revealed
+
+    @property
+    def selected_in_teampreview(self) -> bool | None:
+        return self._base.selected_in_teampreview
+
+    @property
+    def effects(self) -> Mapping[Any, int]:
+        return self._base.effects
+
+    @property
+    def status_counter(self) -> int:
+        return self._base.status_counter
+
+    @property
+    def preparing(self) -> Any:
+        return self._base.preparing
+
+    @property
+    def last_move(self) -> MoveView | None:
+        return self._base.last_move
+
+    @property
+    def level(self) -> int | None:
+        return self._base.level
+
+
 class FieldView(Protocol):
     @property
     def weather(self) -> Mapping[Any, int]: ...

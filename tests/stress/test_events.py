@@ -1,43 +1,38 @@
+"""Stress tests for spatial turn recorder."""
+
 from __future__ import annotations
 
 import pytest
 
 from p0.battle.events import (
-    EVENT_DIAGNOSTICS,
-    parse_events,
+    SPATIAL_SLOT_COUNT,
+    SpatialActionType,
+    SpatialTurnRecorder,
 )
 from p0.model.tokenizer import tokenizer
-from tests.stress._helpers import stress_random_raw_events, stress_repetitions, stress_rng
+from tests.stress._helpers import stress_repetitions, stress_rng
 
 
 @pytest.mark.stress
-def test_event_parser_preserves_order_under_repeated_showdown_streams() -> None:
-    """Stress test the raw Showdown event parser across randomized protocol streams.
+def test_spatial_turn_recorder_under_repeated_random_streams() -> None:
+    """Stress test the spatial turn recorder across randomized battle turns."""
+    rng = stress_rng()
+    iterations = stress_repetitions(default=1000)
+    recorder = SpatialTurnRecorder(player_role="p1")
 
-    Verifies that:
-    1. Parsing is strictly deterministic given the same tokenized event sequence.
-    2. Parsed events are assigned strictly contiguous 0-indexed sequential order indices.
-    3. Non-event lines (such as chat) are safely filtered without breaking sequence indexing.
-    4. Parser diagnostics accurately track telemetry for edge cases (missing pre-HP and OOV tokens).
-    """
-    EVENT_DIAGNOSTICS.clear()
-    try:
-        rng = stress_rng()
-        iterations = stress_repetitions(default=1000)
+    for _ in range(iterations):
+        recorder.reset_turn()
+        actor = rng.choice(("p1a", "p1b", "p2a", "p2b"))
+        target = rng.choice(("p1a", "p1b", "p2a", "p2b"))
+        recorder.apply_line(
+            ["", "move", f"{actor}: Pokemon", "Thunderbolt", f"{target}: Opponent"], tokenizer
+        )
+        recorder.apply_line(["", "-damage", f"{target}: Opponent", "45/100"], tokenizer)
+        if rng.random() > 0.5:
+            recorder.apply_line(["", "-crit", f"{target}: Opponent"], tokenizer)
+        if rng.random() > 0.8:
+            recorder.apply_line(["", "-fail", f"{actor}: Pokemon"], tokenizer)
 
-        for _ in range(iterations):
-            raw_events = list(stress_random_raw_events(rng))
-            first = parse_events(raw_events, tokenizer)
-            second = parse_events(raw_events, tokenizer)
-            # Re-parsing the same stream must produce identical structured output
-            assert second == first
-            # Parsed events must receive strictly contiguous 0-indexed order values
-            assert [event.order for event in first] == list(range(len(first)))
-            # Length should be at most raw length (ignorable messages like chat are dropped)
-            assert len(first) <= len(raw_events)
-            assert first
-        # Verify that error/fallback branches were actively exercised during the stress run
-        assert EVENT_DIAGNOSTICS["missing_pre_hp"] >= iterations
-        assert EVENT_DIAGNOSTICS["oov_ids"] > 0
-    finally:
-        EVENT_DIAGNOSTICS.clear()
+        records = recorder.to_records()
+        assert len(records) == SPATIAL_SLOT_COUNT
+        assert all(0 <= r.action_type < len(SpatialActionType) for r in records)

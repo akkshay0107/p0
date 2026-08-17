@@ -113,12 +113,7 @@ _REPLAY_AMBIGUITY_TAGS = frozenset(
     }
 )
 
-_OBSERVATION_EVENT_FIELDS = (
-    "events_cat",
-    "events_side_ids",
-    "events_slot_ids",
-    "events_metadata",
-)
+_OBSERVATION_EVENT_FIELDS = ("spatial_cat",)
 
 
 def _message_tag(line: str) -> str:
@@ -411,7 +406,7 @@ def _assert_expected_observation_fields(
 
     # Replays store the player's own HP as a percentage, so the HP column and the
     # event HP deltas are quantized relative to the live capture.
-    torch.testing.assert_close(live.events_num, reconstructed.events_num, atol=0.02, rtol=0)
+    torch.testing.assert_close(live.spatial_num, reconstructed.spatial_num, atol=0.02, rtol=0)
     torch.testing.assert_close(
         live.numerical[:, NUM_IDX_HP_FRACTION],
         reconstructed.numerical[:, NUM_IDX_HP_FRACTION],

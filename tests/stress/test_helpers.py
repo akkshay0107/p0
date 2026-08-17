@@ -7,7 +7,6 @@ from tests.stress._helpers import (
     stress_batch_sizes,
     stress_dex_catalog,
     stress_int,
-    stress_random_raw_events,
     stress_random_replay_payloads,
     stress_random_team_record,
     stress_rng,
@@ -77,22 +76,6 @@ def test_random_team_records_stay_inside_the_active_dex() -> None:
         assert all(set(member.moves) <= set(catalog.moves) for member in record.team.members)
         # Sum of 6 stat points (HP, Atk, Def, SpA, SpD, Spe) must not exceed total EV point allowance
         assert all(sum(spread.as_dict().values()) <= 66 for spread in record.spreads)
-
-
-@pytest.mark.stress
-def test_random_event_corpus_covers_parser_shapes_without_golden_reuse() -> None:
-    """Verify that generated synthetic event corpus exercises critical parser tags and edge cases."""
-    events = stress_random_raw_events(stress_rng())
-    tags = {event.message[1] for event in events}
-
-    # Ensure essential battle event verbs are present in the randomized corpus
-    assert {"move", "switch", "drag", "-damage", "-heal", "-activate", "cant"} <= tags
-    # Ensure unmapped/OOV fallback move test case is present
-    assert any(
-        event.message[3] == "not-a-real-move" for event in events if event.message[1] == "move"
-    )
-    # Ensure missing pre-HP damage edge case is generated
-    assert any(event.pre_hp is None for event in events if event.message[1] == "-damage")
 
 
 @pytest.mark.stress

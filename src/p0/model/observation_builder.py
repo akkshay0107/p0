@@ -280,13 +280,14 @@ def _imputed_stats(pokemon: PokemonView) -> tuple[int, int, int, int, int, int] 
 def _cached_imputed_stats(
     pokemon: PokemonView, cache: dict[Any, tuple[int, int, int, int, int, int]]
 ) -> tuple[int, int, int, int, int, int] | None:
-    result = cache.get(pokemon)
+    cache_key = (id(pokemon), getattr(pokemon, "species", None))
+    result = cache.get(cache_key)
     if result is not None:
         return result
     result = _imputed_stats(pokemon)
     if result is None:
         return None
-    cache[pokemon] = result
+    cache[cache_key] = result
     return result
 
 

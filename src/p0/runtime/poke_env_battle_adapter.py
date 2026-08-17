@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
 from weakref import WeakKeyDictionary
 
 from poke_env.battle import DoubleBattle
 
 from p0.battle.legality import DecisionView, SlotDecision
+from p0.battle.views import TransformedPokemonView
 from p0.runtime.live_event_capture import last_move
 
 
@@ -34,11 +36,32 @@ class PokeEnvBattleView:
 
     @property
     def active_pokemon(self):
-        return self._battle.active_pokemon
+        from typing import Any, cast
+
+        active_list = cast(list[Any], list(self._battle.active_pokemon))
+        targets = getattr(self._battle, "_p0_transform_targets", {})
+        available = getattr(self._battle, "available_moves", [])
+        for i, mon in enumerate(active_list):
+            if mon is not None and id(mon) in targets:
+                target_mon = targets[id(mon)]
+                moves = dict(target_mon.moves)
+                if i < len(available) and available[i]:
+                    for move in available[i]:
+                        if move.id not in moves:
+                            moves[move.id] = move
+                active_list[i] = TransformedPokemonView(mon, target_mon, moves=moves)
+        return active_list
 
     @property
     def opponent_active_pokemon(self):
-        return self._battle.opponent_active_pokemon
+        from typing import Any, cast
+
+        active_list = cast(list[Any], list(self._battle.opponent_active_pokemon))
+        targets = getattr(self._battle, "_p0_transform_targets", {})
+        for i, mon in enumerate(active_list):
+            if mon is not None and id(mon) in targets:
+                active_list[i] = TransformedPokemonView(mon, targets[id(mon)])
+        return active_list
 
     @property
     def available_moves(self):
@@ -148,8 +171,19 @@ def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
 
 def decision_view(battle: DoubleBattle) -> DecisionView:
     """Extract a lightweight DecisionView from live battle state."""
-    active_pokemon = battle.active_pokemon
+    targets = getattr(battle, "_p0_transform_targets", {})
     available_moves = battle.available_moves
+    active_pokemon = cast(list[Any], list(battle.active_pokemon))
+    for i, mon in enumerate(active_pokemon):
+        if mon is not None and id(mon) in targets:
+            target_mon = targets[id(mon)]
+            moves = dict(target_mon.moves)
+            if i < len(available_moves) and available_moves[i]:
+                for move in available_moves[i]:
+                    if move.id not in moves:
+                        moves[move.id] = move
+            active_pokemon[i] = TransformedPokemonView(mon, target_mon, moves=moves)
+
     available_switches = battle.available_switches
     team = tuple(battle.team.values())
     trapped = battle.trapped
