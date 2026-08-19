@@ -46,11 +46,10 @@ environment:
 
 bot:
   username: Bot
-  battle_format: gen9championsvgc2026regmb
+  battle_format: gen9championsvgc2026regmbbo3
   top_p: 0.9
   max_concurrent_battles: 10
   challenge_limit: 1000000
-  accept_open_team_sheet: true
   allow_random_init: false
   log_level: INFO
 

@@ -137,7 +137,7 @@ class EnvironmentConfig:
 class BotConfig:
     username: str = "Bot"
     password: str | None = None
-    battle_format: str = FORMAT.battle_format
+    battle_format: str = FORMAT.bo3_format
     websocket_url: str | None = None
     authentication_url: str | None = None
     checkpoint_path: Path | None = None
@@ -146,15 +146,12 @@ class BotConfig:
     max_concurrent_battles: int = 10
     challenge_limit: int = 1_000_000
     opponent: str | None = None
-    accept_open_team_sheet: bool = True
     allow_random_init: bool = False
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
-        if self.battle_format != FORMAT.battle_format:
-            raise ValueError(
-                f"bot.battle_format must match configured format {FORMAT.battle_format!r}"
-            )
+        if self.battle_format != FORMAT.bo3_format:
+            raise ValueError(f"bot.battle_format must be the Bo3 format {FORMAT.bo3_format!r}")
 
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError("bot.top_p must be in (0, 1]")

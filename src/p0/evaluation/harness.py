@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from poke_env import AccountConfiguration
-from poke_env.battle import AbstractBattle
+from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
 
 from p0.format_config import FORMAT
@@ -109,20 +110,56 @@ def wilson_score_interval(wins: int, total: int) -> tuple[float, float]:
     return max(0.0, lower), min(1.0, upper)
 
 
+@dataclass(slots=True)
+class _EvaluationSeriesState:
+    """Track child-game results until one Bo3 series is complete."""
+
+    games_played: int = 0
+    wins: int = 0
+    losses: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return self.wins >= 2 or self.losses >= 2 or self.games_played >= 3
+
+
 class EvalPlayerMixin:
-    """Mixin to track win/loss history during evaluation."""
+    """Track one result per completed Bo3 series during evaluation."""
 
     history: list[tuple[str | None, bool]]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.history = []
+        self._evaluation_series: dict[str, _EvaluationSeriesState] = {}
+        self._evaluation_resample_team = True
         if getattr(self, "current_team_packed", None) is None:
             raise ValueError("EvalPlayer requires either team_source or a team in kwargs")
 
+    def _should_resample_team_after_battle(self, battle: AbstractBattle) -> bool:
+        del battle
+        return self._evaluation_resample_team
+
     def _battle_finished_callback(self, battle: AbstractBattle) -> None:
-        won = battle.won if battle.won is not None else False
-        self.history.append((getattr(self, "current_team_packed", None), won))
+        if not isinstance(battle, DoubleBattle):
+            raise TypeError(f"Evaluation requires DoubleBattle, got {type(battle).__name__}")
+
+        opponent = battle.opponent_username
+        if not opponent or not opponent.strip():
+            raise ValueError("Evaluation battle has no opponent identity")
+        opponent_id = opponent.strip().casefold()
+        state = self._evaluation_series.setdefault(opponent_id, _EvaluationSeriesState())
+        state.games_played += 1
+        if battle.won:
+            state.wins += 1
+        elif battle.lost:
+            state.losses += 1
+
+        self._evaluation_resample_team = state.complete
+        if state.complete:
+            self.history.append((getattr(self, "current_team_packed", None), state.wins >= 2))
+            self._evaluation_series.pop(opponent_id, None)
+
         super()._battle_finished_callback(battle)  # type: ignore
 
 
@@ -136,6 +173,7 @@ class EvalRandomPlayer(EvalPlayerMixin, TeamPlayerMixin, RandomPlayer):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         poke_env_patches.install(self.logger)
+        setattr(self.ps_client, "_p0_force_open_team_sheet", True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,12 +218,17 @@ class EvaluationHarness:
         *,
         corpus_path: Path | None = None,
         corpus_hash: str = "",
-        format_id: str = FORMAT.battle_format,
+        format_id: str = FORMAT.bo3_format,
         episodes_per_matchup: int = 20,
         seed: int = 0,
         port: int = 8120,
         smoke_test: bool = False,
     ) -> None:
+        if format_id != FORMAT.bo3_format:
+            raise ValueError(
+                f"EvaluationHarness only supports the Bo3 format {FORMAT.bo3_format!r}; "
+                f"got {format_id!r}"
+            )
         self.corpus_path = corpus_path
         self.corpus_hash = corpus_hash
         self.format_id = format_id
@@ -336,7 +379,14 @@ class EvaluationHarness:
             )
 
         try:
-            await player_a.battle_against(player_b, n_battles=self.episodes_per_matchup)
+            for _ in range(self.episodes_per_matchup):
+                expected_series_count = len(player_a.history) + 1
+                await player_a.battle_against(player_b, n_battles=1)
+                await self._wait_for_series_completion(
+                    player_a,
+                    player_b,
+                    expected_series_count,
+                )
         finally:
             await player_a.ps_client.stop_listening()
             await player_b.ps_client.stop_listening()
@@ -407,6 +457,26 @@ class EvaluationHarness:
             per_team_a_results=_finalize_team_results(per_team_a),
             per_team_b_results=_finalize_team_results(per_team_b),
         )
+
+    @staticmethod
+    async def _wait_for_series_completion(
+        player_a: EvalPlayerMixin,
+        player_b: EvalPlayerMixin,
+        expected_series_count: int,
+        timeout: float = 120.0,
+    ) -> None:
+        """Wait until both evaluation players report the requested complete series."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while (
+            len(player_a.history) < expected_series_count
+            or len(player_b.history) < expected_series_count
+        ):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for the live Bo3 series to complete "
+                    f"after {timeout:.0f} seconds"
+                )
+            await asyncio.sleep(0.05)
 
 
 def hashlib_team(team_packed: str) -> str:

@@ -1,4 +1,4 @@
-"""Bo1 policy player, command-line configuration, and Showdown listener lifecycle.
+"""Live policy player, command-line configuration, and Showdown listener lifecycle.
 
 This module provides the core RLPlayer agent integrating neural network policy inference,
 history token management, series token persistence, team sampling, and CLI configuration
@@ -10,7 +10,6 @@ import asyncio
 import logging
 import os
 import random
-import re
 import signal
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +38,7 @@ from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import load_config
 
 _LIVE_HISTORY_CAPACITY = 2 * HISTORY_WINDOW
+DEFAULT_BATTLE_FORMAT = FORMAT.bo3_format
 
 
 @dataclass(slots=True)
@@ -77,6 +77,26 @@ class _LiveBattleHistory:
         return values.unsqueeze(0)
 
 
+@dataclass(slots=True)
+class _LiveSeriesState:
+    """Local identity and score for one live Showdown Bo3 series.
+
+    Showdown creates a parent BestOfGame room and a separate child battle room
+    for each game. poke-env only exposes the child battle tag, so the live player
+    keeps the parent-equivalent identity locally for the lifetime of the series.
+    """
+
+    key: str
+    opponent_id: str
+    games_played: int = 0
+    wins: int = 0
+    losses: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return self.wins >= 2 or self.losses >= 2 or self.games_played >= 3
+
+
 class TeamPlayerMixin:
     """Mixin adding team sampling and resampling from a TeamSource to any Player."""
 
@@ -112,16 +132,27 @@ class TeamPlayerMixin:
         elif hasattr(team, "yield_team"):
             self.current_team_packed = team.yield_team()
 
-    def _battle_finished_callback(self, battle: AbstractBattle):
+    def _finish_team_battle(self, battle: AbstractBattle, *, resample_team: bool) -> None:
+        """Finish the underlying battle and optionally prepare the next team."""
         super()._battle_finished_callback(battle)  # pyright: ignore[reportAttributeAccessIssue]
 
-        if self.team_source is not None:
+        if resample_team and self.team_source is not None:
             self.update_team(self.team_source.sample(self.team_rng).packed)
 
         battle_id = getattr(battle, "battle_tag", None) or getattr(battle, "tag", None)
         battles = getattr(self, "_battles", None)
         if battle_id and battles is not None:
             battles.pop(battle_id, None)
+
+    def _should_resample_team_after_battle(self, battle: AbstractBattle) -> bool:
+        del battle
+        return True
+
+    def _battle_finished_callback(self, battle: AbstractBattle):
+        self._finish_team_battle(
+            battle,
+            resample_team=self._should_resample_team_after_battle(battle),
+        )
 
 
 class RLPlayer(TeamPlayerMixin, Player):
@@ -130,15 +161,29 @@ class RLPlayer(TeamPlayerMixin, Player):
     def __init__(
         self,
         policy: PolicyNet,
-        top_p: float = 0.9,
-        *args,
+        *,
         observation_builder: ObservationBuilder,
         team_rng: random.Random,
         team_source: TeamSource | None = None,
+        top_p: float = 0.9,
+        battle_format: str = DEFAULT_BATTLE_FORMAT,
         **kwargs,
     ):
-        super().__init__(*args, team_rng=team_rng, team_source=team_source, **kwargs)
+        if battle_format != DEFAULT_BATTLE_FORMAT:
+            raise ValueError(
+                f"RLPlayer only supports the configured Bo3 format {DEFAULT_BATTLE_FORMAT!r}; "
+                f"got {battle_format!r}"
+            )
+
+        kwargs["battle_format"] = DEFAULT_BATTLE_FORMAT
+        # The Bo3 format forces open sheets server-side; poke-env must neither
+        # negotiate nor wait for a negotiation response.
+        kwargs["accept_open_team_sheet"] = False
+        super().__init__(team_rng=team_rng, team_source=team_source, **kwargs)
         poke_env_patches.install(self.logger)
+        # Showdown's configured Bo3 format uses Force Open Team Sheets, so there
+        # is no accept/reject command to send during battle creation.
+        setattr(self.ps_client, "_p0_force_open_team_sheet", True)
         self.policy = policy
         self.observation_builder = observation_builder
 
@@ -150,7 +195,9 @@ class RLPlayer(TeamPlayerMixin, Player):
         self._empty_history_tensor = torch.zeros((1, 0, policy.d_model), device=policy.device)
         self._battle_histories: dict[str, _LiveBattleHistory] = {}
         self._series_store = SeriesTokenStore(policy.d_model)
-        self._series_scores: dict[str, list[int]] = {}
+        self._series_by_opponent: dict[str, _LiveSeriesState] = {}
+        self._series_by_battle: dict[str, _LiveSeriesState] = {}
+        self._series_sequence = 0
 
     @staticmethod
     def _battle_key(battle: DoubleBattle) -> str:
@@ -160,15 +207,49 @@ class RLPlayer(TeamPlayerMixin, Player):
         return str(key)
 
     @staticmethod
-    def _base_series_id(battle_tag: str) -> str:
-        match = re.match(r"^(.*?)(?:-game(?:-\d+)?)$", battle_tag)
-        if match:
-            return match.group(1)
-        return battle_tag
+    def _opponent_id(battle: DoubleBattle) -> str:
+        opponent = battle.opponent_username
+        if not opponent or not opponent.strip():
+            raise ValueError("Live Bo3 battle has no opponent identity")
+        return opponent.strip().casefold()
+
+    def _series_for_battle(self, battle: DoubleBattle) -> _LiveSeriesState:
+        """Return the parent-series state associated with a child battle.
+
+        Showdown's child battle room IDs are intentionally game-scoped.  The
+        opponent identity is stable across the child rooms in a Bo3, while the
+        local sequence disambiguates a later Bo3 against the same opponent.
+        """
+        battle_key = self._battle_key(battle)
+        state = self._series_by_battle.get(battle_key)
+        if state is not None:
+            return state
+
+        opponent_id = self._opponent_id(battle)
+        state = self._series_by_opponent.get(opponent_id)
+        if state is None:
+            self._series_sequence += 1
+            state = _LiveSeriesState(
+                key=f"bo3:{opponent_id}:{self._series_sequence}",
+                opponent_id=opponent_id,
+            )
+            self._series_by_opponent[opponent_id] = state
+
+        self._series_by_battle[battle_key] = state
+        return state
+
+    def _drop_series(self, state: _LiveSeriesState) -> None:
+        self._series_store.drop(state.key)
+        current = self._series_by_opponent.get(state.opponent_id)
+        if current is state:
+            self._series_by_opponent.pop(state.opponent_id, None)
 
     def invalidate_memory_for_model_reload(self) -> None:
         """Drop per-battle memory when a policy artifact is replaced."""
         self._battle_histories.clear()
+        self._series_store.clear()
+        self._series_by_opponent.clear()
+        self._series_by_battle.clear()
         self._memory_model_id = id(self.policy)
         self._empty_history_tensor = torch.zeros(
             (1, 0, self.policy.d_model), device=self.policy.device
@@ -192,9 +273,9 @@ class RLPlayer(TeamPlayerMixin, Player):
 
         history_tokens, history_mask, history_age_ids = pack_history_tokens(values)
 
-        base_id = self._base_series_id(key)
+        series_key = self._series_for_battle(battle).key
         series_tokens, series_mask = self._series_store.get_tokens(
-            [base_id], device=self.policy.device
+            [series_key], device=self.policy.device
         )
         return MemoryInputs(
             series_tokens=series_tokens,
@@ -237,7 +318,11 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     def choose_move(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
-        if battle_view(battle).wait:
+        view = battle_view(battle)
+        # Forced-open Bo3 team sheets arrive as a showteam notification before
+        # the actual teampreview request; there are no active slots to choose for
+        # that intermediate callback.
+        if view.wait or (not battle.teampreview and not any(battle.active_pokemon)):
             return DefaultBattleOrder()
         return action_to_order(self._get_action(battle), battle)
 
@@ -254,35 +339,43 @@ class RLPlayer(TeamPlayerMixin, Player):
         return order.message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
-        if isinstance(battle, DoubleBattle):
-            key = self._battle_key(battle)
-            base_id = self._base_series_id(key)
-            history = self._battle_histories.pop(key, None)
+        if not isinstance(battle, DoubleBattle):
+            raise TypeError(f"RLPlayer requires DoubleBattle, got {type(battle).__name__}")
 
-            if history is not None:
-                values = history.complete_values(self.policy.device)
-                with torch.no_grad():
-                    new_tokens = self.policy.series.resample_single_game(values)[0]
-                # SeriesTokenStore synchronously detaches the completed summary to
-                # CPU, establishing a strict device-memory boundary between games.
-                self._series_store.append(base_id, new_tokens)
+        battle_key = self._battle_key(battle)
+        state = self._series_by_battle.pop(battle_key, None)
+        if state is None:
+            raise RuntimeError(f"No Bo3 series state exists for battle {battle_key!r}")
+        if not battle.finished:
+            raise RuntimeError(f"Bo3 callback received unfinished battle {battle_key!r}")
 
-            if battle.finished:
-                score = self._series_scores.setdefault(base_id, [0, 0])
-                if battle.won:
-                    score[0] += 1
-                elif battle.lost:
-                    score[1] += 1
+        history = self._battle_histories.pop(battle_key, None)
+        if history is not None:
+            values = history.complete_values(self.policy.device)
+            with torch.no_grad():
+                new_tokens = self.policy.series.resample_single_game(values)[0]
+            # SeriesTokenStore synchronously detaches the completed summary to
+            # CPU, establishing a strict device-memory boundary between games.
+            self._series_store.append(state.key, new_tokens)
 
-                if max(score) >= 2:
-                    self._series_store.drop(base_id)
-                    self._series_scores.pop(base_id, None)
+        state.games_played += 1
+        if battle.won:
+            state.wins += 1
+        elif battle.lost:
+            state.losses += 1
 
-        super()._battle_finished_callback(battle)
+        series_complete = state.complete
+        if series_complete:
+            self._drop_series(state)
+
+        TeamPlayerMixin._finish_team_battle(
+            self,
+            battle,
+            resample_team=series_complete,
+        )
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_BATTLE_FORMAT = FORMAT.battle_format
 DEFAULT_CHALLENGE_LIMIT = 1_000_000
 DEFAULT_CHECKPOINT_CANDIDATES = (Path("artifacts/checkpoints/ppo_checkpoint.pt"),)
 
@@ -402,7 +495,6 @@ class RLBotConfig:
     max_concurrent_battles: int
     challenge_limit: int
     opponent: str | None
-    accept_open_team_sheet: bool
     allow_random_init: bool
     log_level: str
 
@@ -455,7 +547,7 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         "--format",
         dest="battle_format",
         default=os.getenv("SHOWDOWN_BATTLE_FORMAT", bot_defaults.battle_format),
-        help="Battle format to queue for and accept challenges in.",
+        help="Bo3 format to queue for and accept challenges in.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -505,12 +597,6 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         help="Only accept challenges from this opponent username.",
     )
     parser.add_argument(
-        "--accept-open-team-sheet",
-        action=argparse.BooleanOptionalAction,
-        default=_env_flag("SHOWDOWN_ACCEPT_OPEN_TEAM_SHEET", bot_defaults.accept_open_team_sheet),
-        help="Whether the bot accepts open team sheet battles.",
-    )
-    parser.add_argument(
         "--allow-random-init",
         action=argparse.BooleanOptionalAction,
         default=_env_flag("SHOWDOWN_ALLOW_RANDOM_INIT", bot_defaults.allow_random_init),
@@ -538,10 +624,8 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     if not 0.0 < args.top_p <= 1.0:
         raise ValueError("--top-p must be in (0.0, 1.0].")
 
-    if args.battle_format != FORMAT.battle_format:
-        raise ValueError(
-            f"--format must match the configured battle format {FORMAT.battle_format!r}."
-        )
+    if args.battle_format != DEFAULT_BATTLE_FORMAT:
+        raise ValueError(f"--format must match the RLPlayer Bo3 format {DEFAULT_BATTLE_FORMAT!r}.")
 
     if args.max_concurrent_battles < 1:
         raise ValueError("--max-concurrent-battles must be at least 1.")
@@ -562,7 +646,6 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         max_concurrent_battles=args.max_concurrent_battles,
         challenge_limit=args.challenge_limit,
         opponent=args.opponent,
-        accept_open_team_sheet=args.accept_open_team_sheet,
         allow_random_init=args.allow_random_init,
         log_level=args.log_level.upper(),
     )
@@ -618,7 +701,6 @@ async def run_bot(
         battle_format=config.battle_format,
         server_configuration=server_configuration,
         team_source=team_source,
-        accept_open_team_sheet=config.accept_open_team_sheet,
         max_concurrent_battles=config.max_concurrent_battles,
     )
 

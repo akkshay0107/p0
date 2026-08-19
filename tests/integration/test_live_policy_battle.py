@@ -153,7 +153,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
     second_source = FixedTeamSource(TEAM)
     first = TrackedPolicyPlayer(
         policy=policy,
-        battle_format=FORMAT.battle_format,
+        battle_format=FORMAT.bo3_format,
         server_configuration=showdown_server,
         team_source=first_source,
         team_rng=random.Random(11),
@@ -163,7 +163,7 @@ async def test_checkpoint_free_policy_completes_live_battle(
     if opponent_mode == "self_policy":
         second = TrackedPolicyPlayer(
             policy=policy,
-            battle_format=FORMAT.battle_format,
+            battle_format=FORMAT.bo3_format,
             server_configuration=showdown_server,
             team_source=second_source,
             team_rng=random.Random(13),
@@ -172,11 +172,12 @@ async def test_checkpoint_free_policy_completes_live_battle(
         )
     else:
         second = RandomPlayer(
-            battle_format=FORMAT.battle_format,
+            battle_format=FORMAT.bo3_format,
             server_configuration=showdown_server,
             team=second_source.sample(random.Random(13)).packed,
             max_concurrent_battles=1,
         )
+        setattr(second.ps_client, "_p0_force_open_team_sheet", True)
     try:
         await asyncio.wait_for(first.battle_against(second, n_battles=1), timeout=60.0)
     finally:
@@ -209,7 +210,7 @@ async def test_model_policy_round_trips_live_preview_and_action_orders(
     poke_env_patches.install()
     first = TrackedPolicyPlayer(
         policy=model_policy,
-        battle_format=FORMAT.battle_format,
+        battle_format=FORMAT.bo3_format,
         server_configuration=showdown_server,
         team_source=FixedTeamSource(TEAM),
         team_rng=random.Random(29),
@@ -219,11 +220,12 @@ async def test_model_policy_round_trips_live_preview_and_action_orders(
     )
     second = RandomPlayer(
         account_configuration=AccountConfiguration("RoundTripB", None),
-        battle_format=FORMAT.battle_format,
+        battle_format=FORMAT.bo3_format,
         server_configuration=showdown_server,
         team=FixedTeamSource(TEAM).sample(random.Random(31)).packed,
         max_concurrent_battles=1,
     )
+    setattr(second.ps_client, "_p0_force_open_team_sheet", True)
 
     try:
         await asyncio.wait_for(first.battle_against(second, n_battles=1), timeout=60.0)

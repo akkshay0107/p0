@@ -362,13 +362,6 @@ class ReplayPokemon:
     last_move_data: str | None = None
 
     @property
-    def hp_provenance(self) -> int:
-        # Replay HP may be quantized to the uploader's public percentage.
-        from p0.model.structured_observation import Provenance
-
-        return int(Provenance.OBSERVED)
-
-    @property
     def base_species(self) -> str:
         return self.species
 

@@ -11,7 +11,7 @@ from typing import Any, cast
 import numpy as np
 import pytest
 import torch
-from poke_env.battle import DoubleBattle, Pokemon
+from poke_env.battle import DoubleBattle, Move, Pokemon
 from poke_env.player.battle_order import PassBattleOrder
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import TeambuilderPokemon
@@ -119,6 +119,30 @@ def test_live_adapter_and_pure_fixture_build_identical_observations() -> None:
     # Validate every structured tensor attribute matches identically across live and fixture views
     for name in live._FIELD_NAMES:
         torch.testing.assert_close(getattr(live, name), getattr(pure, name))
+
+
+def test_transformed_pokemon_view_supports_poke_env_target_resolution() -> None:
+    """Verify a transformed active wrapper satisfies poke-env's target resolver contract."""
+    battle = DoubleBattle("transform-targets", "player", logging.getLogger(__name__), 9)
+    battle._player_role = "p1"
+    transformed = Pokemon(gen=9, species="ditto")
+    target = Pokemon(gen=9, species="charizard")
+    transformed._active = True
+    target._active = True
+    move = Move("heatwave", gen=9)
+    target._moves[move.id] = move
+    battle._team = {"p1: Ditto": transformed}
+    battle._opponent_team = {"p2: Charizard": target}
+    battle._active_pokemon = {"p1a": transformed}
+    battle._opponent_active_pokemon = {"p2a": target}
+    battle._available_moves = [[move], []]
+    setattr(battle, "_p0_transform_targets", {id(transformed): target})
+
+    decision = decision_view(battle)
+
+    # This calls the pinned poke-env DoubleBattle.get_possible_showdown_targets,
+    # which reads the extra runtime fields absent from the old wrapper.
+    assert decision.slots[0].move_targets == ((0,),)
 
 
 def test_live_spatial_turn_capture() -> None:

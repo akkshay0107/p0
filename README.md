@@ -90,7 +90,7 @@ cd pokemon-showdown && npm install && cd ..
 
 ### 2. PPO Training Loop
 
-The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.yaml.example` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.path` and `environment.opponent_team_source.path` independently. Relative paths are resolved under `paths.teams_root`.
+The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.example.yaml` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.path` and `environment.opponent_team_source.path` independently. Relative paths are resolved under `paths.teams_root`.
 
 Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins all-self-play with magnetic regularization.
 
@@ -139,7 +139,7 @@ You would have to move the trained model to a specific location and have the inf
 - **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
 - **`export_training.py`**: Exports the current training artifacts, runtime contracts, and active `config.yaml` snapshot into a `tar.gz` archive.
 
-The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.yaml.example`.
+The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.example.yaml`.
 
 ### Runtime compatibility
 

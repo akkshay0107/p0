@@ -16,6 +16,8 @@ from p0.runtime.live_event_capture import capture_message
 
 _ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
 _ORIGINAL_STOP_LISTENING = PSClient.stop_listening
+_ORIGINAL_HANDLE_MESSAGE = PSClient._handle_message
+_ORIGINAL_SEND_MESSAGE = PSClient.send_message
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
 _ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
@@ -64,8 +66,35 @@ async def _wait_for_login(self: PSClient, checking_interval: float = 0.1, wait_f
 
 
 def _parse_message(self: DoubleBattle, split_message: list[str]):
+    # Best-of rooms send this UI-only notification to the child battle room.
+    # It is not a battle event and poke-env 0.15 raises NotImplementedError for it.
+    if len(split_message) >= 2 and split_message[1] in {"tempnotify", "tempnotifyoff"}:
+        return None
     capture_message(self, split_message)
     return _ORIGINAL_PARSE_MESSAGE(self, split_message)
+
+
+async def _handle_message(self: PSClient, message: str):
+    # Showdown sends the Bo3 parent room as >game-bestof..., while poke-env only
+    # understands >battle rooms and otherwise indexes a non-existent protocol field.
+    if message.startswith(">game-"):
+        if "I'm ready!</button>" in message:
+            parent_room = message.split("\n", 1)[0][1:]
+            await self.send_message(f"/msgroom {parent_room},/confirmready")
+        return None
+    return await _ORIGINAL_HANDLE_MESSAGE(self, message)
+
+
+async def _send_message(self: PSClient, message: str, room: str = "", message_2=None):
+    # A Bo3 format with Force Open Team Sheets has no accept/reject negotiation.
+    # The pinned client unconditionally sends one of those commands for every VGC
+    # battle, which Showdown rejects before the first request is processed.
+    if getattr(self, "_p0_force_open_team_sheet", False) and message in {
+        "/acceptopenteamsheets",
+        "/rejectopenteamsheets",
+    }:
+        return None
+    return await _ORIGINAL_SEND_MESSAGE(self, message, room, message_2)
 
 
 def _forme_change(self: Pokemon, species: str) -> None:
@@ -128,6 +157,8 @@ def install(logger: logging.Logger | None = None) -> None:
 
     PSClient.wait_for_login = _wait_for_login
     PSClient.stop_listening = _stop_listening_cleanly
+    PSClient._handle_message = _handle_message
+    PSClient.send_message = _send_message
     DoubleBattle.parse_message = _parse_message
     Pokemon.forme_change = _forme_change
     Pokemon._update_from_teambuilder = _update_from_teambuilder
@@ -144,6 +175,8 @@ def uninstall_for_tests() -> None:
     if _installed:
         PSClient.wait_for_login = _ORIGINAL_WAIT_FOR_LOGIN
         PSClient.stop_listening = _ORIGINAL_STOP_LISTENING
+        PSClient._handle_message = _ORIGINAL_HANDLE_MESSAGE
+        PSClient.send_message = _ORIGINAL_SEND_MESSAGE
         DoubleBattle.parse_message = _ORIGINAL_PARSE_MESSAGE
         Pokemon.forme_change = _ORIGINAL_FORME_CHANGE
         Pokemon._update_from_teambuilder = _ORIGINAL_UPDATE_FROM_TEAMBUILDER

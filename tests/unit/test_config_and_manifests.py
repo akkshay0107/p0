@@ -44,6 +44,7 @@ from p0.model.tokenizer import PokemonTokenizer, Resolution, tokenizer
 from p0.paths import DEFAULT_PATHS
 from p0.training.config import (
     BCConfig,
+    BotConfig,
     GlobalConfig,
     TrainingConfig,
     load_config,
@@ -114,6 +115,19 @@ def test_load_config_rejects_invalid_contracts_with_specific_errors(
     """Verify load_config detects and rejects schema violations with informative error messages."""
     with pytest.raises(ValueError, match=message):
         load_config(write_config(tmp_path, contents))
+
+
+def test_bot_config_accepts_configured_bo3_format() -> None:
+    """Verify live bot configuration exposes the checked-in Bo3 format."""
+    config = BotConfig()
+
+    assert config.battle_format == FORMAT.bo3_format
+
+
+def test_bot_config_rejects_bo1_format() -> None:
+    """Verify the live bot configuration rejects formats unsupported by RLPlayer."""
+    with pytest.raises(ValueError, match="must be the Bo3 format"):
+        BotConfig(battle_format=FORMAT.battle_format)
 
 
 def test_config_is_immutable(tmp_path: Path) -> None:
@@ -297,7 +311,7 @@ def test_model_config_has_only_scaling_fields() -> None:
 
 def test_reserved_config_sections(tmp_path: Path) -> None:
     """Verify example config sections (bc, corpus, evaluation) load correctly and disallow conflicting objective parameters."""
-    config = load_config("config.yaml.example")
+    config = load_config("config.example.yaml")
     assert config.bc.batch_decisions == 256
     assert config.bc.gamma == config.training.gamma
     assert config.bc.value_coef == config.training.value_coef

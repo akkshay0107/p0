@@ -33,6 +33,12 @@ class MoveView(Protocol):
     @property
     def max_pp(self) -> int | None: ...
 
+    @property
+    def non_ghost_target(self) -> bool: ...
+
+    @property
+    def deduced_target(self) -> Any: ...
+
 
 class PokemonView(Protocol):
     @property
@@ -107,6 +113,18 @@ class PokemonView(Protocol):
     @property
     def level(self) -> int | None: ...
 
+    @property
+    def is_dynamaxed(self) -> bool: ...
+
+    @property
+    def is_terastallized(self) -> bool: ...
+
+    @property
+    def tera_type(self) -> Any: ...
+
+    @property
+    def types(self) -> Sequence[Any]: ...
+
 
 class TransformedMoveView:
     def __init__(self, base_move: MoveView):
@@ -131,6 +149,14 @@ class TransformedMoveView:
     @property
     def max_pp(self) -> int | None:
         return 5
+
+    @property
+    def non_ghost_target(self) -> bool:
+        return self._base.non_ghost_target
+
+    @property
+    def deduced_target(self) -> Any:
+        return self._base.deduced_target
 
 
 class TransformedPokemonView:
@@ -246,6 +272,25 @@ class TransformedPokemonView:
     @property
     def level(self) -> int | None:
         return self._base.level
+
+    @property
+    def is_dynamaxed(self) -> bool:
+        """Dynamax belongs to the actual active Pokémon, not its copied target."""
+        return self._base.is_dynamaxed
+
+    @property
+    def is_terastallized(self) -> bool:
+        """Terastallization belongs to the actual active Pokémon."""
+        return self._base.is_terastallized
+
+    @property
+    def tera_type(self) -> Any:
+        return self._base.tera_type
+
+    @property
+    def types(self) -> Sequence[Any]:
+        """Expose the transformed target's effective types to move-target logic."""
+        return self._target.types
 
 
 class FieldView(Protocol):

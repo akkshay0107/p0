@@ -428,8 +428,11 @@ def test_live_player_keeps_cpu_history_in_one_list():
     player._empty_history_tensor = torch.zeros((1, 0, 1))
     player._battle_histories = {}
     player._series_store = SeriesTokenStore(1)
+    player._series_by_opponent = {}
+    player._series_by_battle = {}
+    player._series_sequence = 0
 
-    battle = SimpleNamespace(battle_tag="battle-1")
+    battle = SimpleNamespace(battle_tag="battle-1", opponent_username="Opponent")
     total = 3 * HISTORY_WINDOW + 1
     for step in range(total):
         player._append_history(battle, torch.tensor([float(step)]))
