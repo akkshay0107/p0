@@ -82,15 +82,23 @@ class ThreadVecEnv:
             series_complete = max(env.series_scores) >= 2 or env.series_games_played >= 3
             terminal_obs1 = None
             terminal_obs2 = None
+            terminal_mask1 = None
+            terminal_mask2 = None
             if is_truncated:
                 terminal_obs1 = self.obs1_buffers[env_id].clone()
                 terminal_obs2 = self.obs2_buffers[env_id].clone()
+                # Preserve the mask paired with the terminal observations before the
+                # automatic reset replaces the current observation state.
+                terminal_mask1 = mask1.copy()
+                terminal_mask2 = mask2.copy()
 
             mask1, mask2, _ = self._reset_env(env_id, env)
             info["series_id"] = env.series_id  # type: ignore
             info["series_complete"] = series_complete  # type: ignore
             info["terminal_observation1"] = terminal_obs1  # type: ignore
             info["terminal_observation2"] = terminal_obs2  # type: ignore
+            info["terminal_action_mask1"] = terminal_mask1  # type: ignore
+            info["terminal_action_mask2"] = terminal_mask2  # type: ignore
             return mask1, mask2, reward1, reward2, done_status, info
 
         info["series_id"] = env.series_id  # type: ignore

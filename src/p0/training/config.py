@@ -139,7 +139,7 @@ class BotConfig:
     checkpoint_path: Path | None = None
     team_files: tuple[Path, ...] = ()
     top_p: float = 0.9
-    max_concurrent_battles: int = 10
+    max_concurrent_battles: int = 1
     challenge_limit: int = 1_000_000
     opponent: str | None = None
     allow_random_init: bool = False
@@ -151,6 +151,9 @@ class BotConfig:
 
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError("bot.top_p must be in (0, 1]")
+
+        if type(self.max_concurrent_battles) is not int or self.max_concurrent_battles != 1:
+            raise ValueError("bot.max_concurrent_battles is fixed at 1 for live Bo3 play")
 
 
 # The bc and evaluation sections are reserved here so their workstreams only

@@ -46,7 +46,7 @@ bot:
   username: Bot
   battle_format: gen9championsvgc2026regmbbo3
   top_p: 0.9
-  max_concurrent_battles: 10
+  max_concurrent_battles: 1
   challenge_limit: 1000000
   allow_random_init: false
   log_level: INFO

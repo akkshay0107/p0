@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 import torch
 from poke_env.battle import DoubleBattle
@@ -38,7 +39,7 @@ from p0.training import ppo as ppo_module
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import _run_batched_ppo, compute_ppo_objective
-from p0.training.rollout import BattleMemoryBuffer
+from p0.training.rollout import BattleMemoryBuffer, _terminal_action_mask
 from p0.training.trainer import PPO_BOARD_METRICS, PPOTrainer, _rollout_metrics
 from p0.training.trajectory import (
     TrajectoryBatch,
@@ -47,6 +48,7 @@ from p0.training.trajectory import (
     prepare_trajectory_batches,
 )
 from p0.training.utils import amp_enabled
+from p0.training.vector_env import ThreadVecEnv
 
 
 def test_compute_gae_batch_matches_single_episode_reference():
@@ -494,6 +496,68 @@ def test_step_truncates_an_unfinished_game_at_the_decision_cap(monkeypatch):
     assert all(truncated.values())
     assert all(reward == 0.0 for reward in rewards.values())
     assert env.series_scores == [0, 0]
+
+
+def test_thread_vec_env_preserves_truncation_masks_before_reset():
+    """Terminal observations must retain their masks instead of reset-game masks."""
+
+    terminal_mask1 = np.zeros((2, ACT_SIZE), dtype=np.int64)
+    terminal_mask1[0, 7] = 1
+    terminal_mask1[1, 8] = 1
+    terminal_mask2 = np.zeros((2, ACT_SIZE), dtype=np.int64)
+    terminal_mask2[0, 9] = 1
+    terminal_mask2[1, 10] = 1
+    reset_mask = np.ones((2, ACT_SIZE), dtype=np.int64)
+
+    class FakeEnv:
+        agent1 = SimpleNamespace(username="agent1")
+        agent2 = SimpleNamespace(username="agent2")
+        series_scores = [0, 0]
+        series_games_played = 1
+        series_id = "series-after-reset"
+
+        def step(self, _action):
+            next_obs = {
+                "agent1": {"action_mask": terminal_mask1.reshape(-1)},
+                "agent2": {"action_mask": terminal_mask2.reshape(-1)},
+            }
+            rewards = {"agent1": 0.0, "agent2": 0.0}
+            terminated = {"agent1": False, "agent2": False}
+            truncated = {"agent1": True, "agent2": True}
+            return next_obs, rewards, terminated, truncated, {}
+
+        def reset(self):
+            obs = {
+                "agent1": {"action_mask": reset_mask.reshape(-1)},
+                "agent2": {"action_mask": reset_mask.reshape(-1)},
+            }
+            return obs, {}
+
+    vector_env = ThreadVecEnv.__new__(ThreadVecEnv)
+    vector_env.obs1_buffers = StructuredObservation.empty_batch(1)
+    vector_env.obs2_buffers = StructuredObservation.empty_batch(1)
+
+    result = ThreadVecEnv._step_env(vector_env, 0, cast(Any, FakeEnv()), {})
+    next_mask1 = cast(np.ndarray, result[0])
+    next_mask2 = cast(np.ndarray, result[1])
+    done_status = cast(int, result[4])
+    info = cast(dict[str, Any], result[5])
+
+    assert done_status == 2
+    assert np.array_equal(next_mask1, reset_mask)
+    assert np.array_equal(next_mask2, reset_mask)
+    assert np.array_equal(info["terminal_action_mask1"], terminal_mask1)
+    assert np.array_equal(info["terminal_action_mask2"], terminal_mask2)
+
+
+def test_terminal_action_mask_validates_shape():
+    """Rollout bootstrap rejects malformed terminal mask metadata."""
+    with pytest.raises(ValueError, match="terminal_action_mask1"):
+        _terminal_action_mask(
+            {"terminal_action_mask1": torch.ones((ACT_SIZE,), dtype=torch.bool)},
+            "terminal_action_mask1",
+            torch.device("cpu"),
+        )
 
 
 def test_a_best_of_three_series_resets_once_a_side_wins_twice(monkeypatch):

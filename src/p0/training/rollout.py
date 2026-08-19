@@ -29,6 +29,22 @@ __all__ = [
 ]
 
 
+def _terminal_action_mask(
+    info: Mapping[str, object], key: str, device: torch.device
+) -> torch.Tensor:
+    """Return one validated two-slot mask saved before a vector-env reset."""
+    raw_mask = info.get(key)
+    if raw_mask is None:
+        raise RuntimeError(f"Truncated rollout info is missing {key}")
+
+    mask = torch.as_tensor(raw_mask, device=device, dtype=torch.bool)
+    if mask.shape != (2, ACT_SIZE):
+        raise ValueError(
+            f"Expected {key} to have shape (2, {ACT_SIZE}), got {tuple(mask.shape)}"
+        )
+    return mask
+
+
 class BattleMemoryBuffer:
     """Fixed-capacity per-battle history stored on the policy device."""
 
@@ -260,7 +276,13 @@ def collect_rollouts(
                 term1 = term1.unsqueeze(0).to(device)
                 term2 = term2.unsqueeze(0).to(device)
                 t_obs = StructuredObservation.cat([term1, term2])
-                dummy_mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool, device=device)
+                terminal_mask = torch.stack(
+                    (
+                        _terminal_action_mask(info, "terminal_action_mask1", device),
+                        _terminal_action_mask(info, "terminal_action_mask2", device),
+                    ),
+                    dim=0,
+                )
 
                 idx_tensor = torch.tensor([i], dtype=torch.long)
                 mem1 = memory1.inputs(idx_tensor, device, torch.float32)
@@ -285,8 +307,8 @@ def collect_rollouts(
                         history_age_ids=torch.cat([mem1[2], mem2[2]], dim=0),
                     )
                     t_out = policy.act(
-                        policy.prepare(policy.encode(t_obs, dummy_mask), t_memory),
-                        dummy_mask,
+                        policy.prepare(policy.encode(t_obs, terminal_mask), t_memory),
+                        terminal_mask,
                     )
                     bootstrap_value1 = t_out.value[0].item()
                     bootstrap_value2 = t_out.value[1].item()

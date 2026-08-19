@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
@@ -13,6 +12,7 @@ from typing import Any
 from p0.format_config import FORMAT, current_manifest
 from p0.model.tokenizer import PokemonTokenizer, Resolution
 from p0.paths import DEFAULT_PATHS
+from p0.persistence import atomic_json_save
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
@@ -355,8 +355,5 @@ def write_corpus_manifest(manifest: TeamCorpusManifest, output_dir: Path | str) 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "corpus_manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    atomic_json_save(manifest_path, manifest.to_dict())
     return manifest_path

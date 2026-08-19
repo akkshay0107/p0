@@ -121,6 +121,12 @@ def test_bot_config_rejects_bo1_format() -> None:
         BotConfig(battle_format=FORMAT.battle_format)
 
 
+def test_bot_config_rejects_live_concurrency_above_one() -> None:
+    """Live Bo3 series tracking is intentionally single-battle for now."""
+    with pytest.raises(ValueError, match="fixed at 1"):
+        BotConfig(max_concurrent_battles=2)
+
+
 def test_config_is_immutable(tmp_path: Path) -> None:
     """Verify GlobalConfig dataclasses are frozen to prevent accidental in-place mutation during execution."""
     config = load_config(write_config(tmp_path, "{}\n"))

@@ -499,6 +499,10 @@ class RLBotConfig:
     allow_random_init: bool
     log_level: str
 
+    def __post_init__(self) -> None:
+        if type(self.max_concurrent_battles) is not int or self.max_concurrent_battles != 1:
+            raise ValueError("RLPlayer max_concurrent_battles is fixed at 1 for live Bo3 play")
+
 
 def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     """Parse command line arguments and return structured bot configuration.
@@ -582,7 +586,7 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
         default=int(
             os.getenv("SHOWDOWN_MAX_CONCURRENT_BATTLES", str(bot_defaults.max_concurrent_battles))
         ),
-        help="Maximum simultaneous battles.",
+        help="Maximum simultaneous battles; live Bo3 play is fixed at 1.",
     )
     parser.add_argument(
         "--challenge-limit",
@@ -626,8 +630,8 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     if args.battle_format != DEFAULT_BATTLE_FORMAT:
         raise ValueError(f"--format must match the RLPlayer Bo3 format {DEFAULT_BATTLE_FORMAT!r}.")
 
-    if args.max_concurrent_battles < 1:
-        raise ValueError("--max-concurrent-battles must be at least 1.")
+    if args.max_concurrent_battles != 1:
+        raise ValueError("--max-concurrent-battles is fixed at 1 for live Bo3 play.")
 
     if args.challenge_limit < 1:
         raise ValueError("--challenge-limit must be at least 1.")
