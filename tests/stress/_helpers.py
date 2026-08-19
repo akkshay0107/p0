@@ -387,23 +387,6 @@ def stress_random_bo3_payloads(
     return tuple(payloads)
 
 
-def _random_entity(rng: random.Random) -> str:
-    """Generate a random battle slot entity identifier (e.g. 'p1a: Flutter Mane')."""
-    return f"{rng.choice(('p1a', 'p1b', 'p2a', 'p2b'))}: {rng.choice(stress_dex_catalog().species)}"
-
-
-def _random_target(rng: random.Random) -> str:
-    """Generate a random move target entity identifier."""
-    return _random_entity(rng)
-
-
-def _random_hp_status(rng: random.Random) -> str:
-    """Generate a random Showdown HP status string with optional status condition (e.g. '75/100 par')."""
-    value = rng.randrange(1, 101)
-    suffix = rng.choice(("", "g", "y"))
-    return f"{value}/100{suffix}"
-
-
 def stress_int(name: str, default: int, *, minimum: int = 1) -> int:
     """Read a positive integer stress-test control from the environment."""
     value = int(os.getenv(name, str(default)))

@@ -871,6 +871,23 @@ def test_candidate_scoring_rejects_malformed_ragged_inputs(policy: PolicyNet) ->
         )
 
 
+def test_policy_scores_all_empty_candidate_rows(policy: PolicyNet) -> None:
+    """Verify score_candidates returns an empty tensor when every batch row has no candidates."""
+    encoded, action_mask, memory = _inputs(policy, batch_size=4)
+    candidate_values = torch.empty((0, 2), dtype=torch.long)
+    candidate_offsets = torch.zeros(5, dtype=torch.long)
+
+    with torch.inference_mode():
+        log_probs = policy.score_candidates(
+            policy.prepare(encoded, memory),
+            action_mask,
+            candidate_values,
+            candidate_offsets,
+        )
+
+    assert log_probs.shape == (0,)
+
+
 def test_magnet_params_are_frozen() -> None:
     """Verify Magnet anchor network parameters are set to requires_grad=False."""
     policy = _tiny_policy()

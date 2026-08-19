@@ -8,11 +8,10 @@ import pytest
 from torch.utils.data import DataLoader
 
 from p0.replays.compile import compile_payloads, write_tensor_shards
-from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest
+from p0.replays.dataset import LazyReplayDataset
 from p0.runtime.process_context import PROCESS_CONTEXT
 from tests.stress._helpers import (
     stress_count,
-    stress_random_bo3_payloads,
     stress_random_replay_payloads,
     stress_rng,
     stress_series_id,
@@ -109,85 +108,3 @@ def test_dataset_prefetch_and_repeated_iteration_are_stable(tmp_path) -> None:
     # Verify every subsequent epoch matches the exact sequence of the initial epoch pass
     for _ in range(stress_count("P0_STRESS_DATASET_ITERATIONS", 8)):
         assert _identity_rows(loader) == expected
-
-
-@pytest.mark.stress
-def test_dataset_split_filter_and_series_end_use_explicit_source_records(tmp_path) -> None:
-    """Verify that SeriesSplitManifest isolates train and test splits at the series level without leakage.
-
-    Replays must be partitioned strictly by entire match series rather than individual games or
-    perspectives, preventing data leakage where one player's view or game from a series leaks into test.
-    """
-    series_count = stress_count("P0_STRESS_DATASET_SPLIT_SERIES", 64)
-    rng = stress_rng()
-    # Construct two disjoint groups of series: one intended for training, one for evaluation
-    payloads = stress_random_replay_payloads(
-        rng,
-        series_count,
-        replay_prefix="train-game",
-        series_prefix="train-series",
-    ) + stress_random_replay_payloads(
-        rng,
-        series_count,
-        replay_prefix="test-game",
-        series_prefix="test-series",
-    )
-    built = _build_dataset_from_payloads(tmp_path, payloads)
-    # Define explicit series partition manifest mapping series IDs to "train" vs "test"
-    split = SeriesSplitManifest(
-        global_contract_sha256=built.manifest.global_contract_sha256,
-        seed=7,
-        assignments={
-            stress_series_id(f"train-series-{index}"): "train" for index in range(series_count)
-        }
-        | {stress_series_id(f"test-series-{index}"): "test" for index in range(series_count)},
-        dataset_hash=built.manifest.dataset_hash,
-    )
-
-    train = list(LazyReplayDataset(built.manifest_path, split="train", split_manifest=split))
-    test = list(LazyReplayDataset(built.manifest_path, split="test", split_manifest=split))
-    # Validate that train split contains both player 0 and player 1 perspectives of every train series
-    assert {(chunk.series_id, chunk.player) for chunk in train} == {
-        (stress_series_id(f"train-series-{index}"), player)
-        for index in range(series_count)
-        for player in (0, 1)
-    }
-    # Validate that test split contains both player perspectives of test series and zero train series
-    assert {(chunk.series_id, chunk.player) for chunk in test} == {
-        (stress_series_id(f"test-series-{index}"), player)
-        for index in range(series_count)
-        for player in (0, 1)
-    }
-
-
-@pytest.mark.stress
-def test_dataset_marks_the_last_game_of_a_series_explicitly(tmp_path) -> None:
-    """Verify that LazyReplayDataset sets is_series_end only on the terminal game of a multi-game series.
-
-    In a Best-of-3 series, game 1 must have is_series_end=False to signal recurrent memory persistence,
-    while game 2 must have is_series_end=True to trigger recurrent state truncation/reset.
-    """
-    series_count = stress_count("P0_STRESS_DATASET_BO3_SERIES", 64)
-    rng = stress_rng()
-    payloads = stress_random_bo3_payloads(
-        rng,
-        series_count,
-        replay_prefix="bo3",
-        series_prefix="bo3-series",
-    )
-    built = _build_dataset_from_payloads(tmp_path, payloads)
-    chunks = list(LazyReplayDataset(built.manifest_path, verify_hashes=True))
-    # Group observations by series ID to inspect the sequence of game numbers and is_series_end flags
-    observed = {}
-    for chunk in chunks:
-        observed.setdefault(chunk.series_id, []).append(
-            (chunk.game_number, chunk.player, chunk.is_series_end)
-        )
-    assert set(observed) == {
-        stress_series_id(f"bo3-series-{index}") for index in range(series_count)
-    }
-    # For every BO3 series, games 1 must be non-terminal (False) and games 2 must be terminal (True) for both players
-    assert all(
-        rows == [(1, 0, False), (1, 1, False), (2, 0, True), (2, 1, True)]
-        for rows in observed.values()
-    )

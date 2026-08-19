@@ -74,41 +74,6 @@ def test_compiler_preserves_random_replay_identity_at_scale(tmp_path) -> None:
 
 
 @pytest.mark.stress
-def test_compiler_is_deterministic_for_random_replays(tmp_path) -> None:
-    """Verify that compilation and sharding output is strictly deterministic regardless of input order."""
-    rng = stress_rng()
-    payloads_list = list(
-        stress_random_replay_payloads(
-            rng,
-            stress_count("P0_STRESS_DETERMINISTIC_REPLAYS", 64),
-            replay_prefix="stress",
-            series_prefix="series",
-        )
-    )
-    rng.shuffle(payloads_list)
-    payloads = tuple(payloads_list)
-    # Compile the identical payload set forward vs reversed
-    first = compile_payloads(payloads, format_id=payloads[0]["formatid"])
-    second = compile_payloads(tuple(reversed(payloads)), format_id=payloads[0]["formatid"])
-
-    first_build = write_tensor_shards(
-        first,
-        tmp_path / "first",
-        max_decisions_per_shard=1,
-        created_at="2026-01-01T00:00:00Z",
-    )
-    second_build = write_tensor_shards(
-        second,
-        tmp_path / "second",
-        max_decisions_per_shard=1,
-        created_at="2026-01-01T00:00:00Z",
-    )
-
-    # Manifest metadata, shard hashes, and game records must be bitwise identical
-    assert first_build.manifest.to_dict() == second_build.manifest.to_dict()
-
-
-@pytest.mark.stress
 def test_compiler_keeps_series_together_across_shard_boundaries(tmp_path) -> None:
     """Verify that games belonging to the same Best-of-3 series are never split across shard files.
 

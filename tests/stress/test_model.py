@@ -8,10 +8,10 @@ from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.policy import MemoryInputs
 from p0.model.structured_observation import (
+    CAT_IDX_IDENTITY_KNOWNNESS,
+    CAT_IDX_NATURE,
     CAT_IDX_STATUS,
     CAT_IDX_STATUS_COUNTER_KIND,
-    CAT_KNOWNNESS_START,
-    CAT_KNOWNNESS_WIDTH,
     StructuredObservation,
 )
 from tests.stress._helpers import (
@@ -133,16 +133,18 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
             generator,
             stress_device,
         )
-        categorical[..., 24] = _random_ids(
-            categorical[..., 24],
+        categorical[..., CAT_IDX_NATURE] = _random_ids(
+            categorical[..., CAT_IDX_NATURE],
             stress_policy.encoder.nature_emb.num_embeddings,
             generator,
             stress_device,
         )
-        knownness = observation.categorical[
-            ..., CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
-        ]
-        knownness[:] = _random_ids(knownness, 5, generator, stress_device)
+        categorical[..., CAT_IDX_IDENTITY_KNOWNNESS] = _random_ids(
+            categorical[..., CAT_IDX_IDENTITY_KNOWNNESS],
+            stress_policy.encoder.identity_knownness_emb.num_embeddings,
+            generator,
+            stress_device,
+        )
 
         empty_memory = _empty_memory(stress_policy, batch_size)
         with torch.inference_mode():
@@ -263,28 +265,3 @@ def test_policy_scores_ragged_candidates_with_empty_decision_rows(
         )
         # Guaranteed valid moves at non-empty starts must have finite log-probabilities
         assert torch.isfinite(log_probs[nonempty_starts]).all()
-
-
-@pytest.mark.stress
-def test_policy_scores_all_empty_candidate_rows(
-    stress_policy,
-    stress_device: torch.device,
-) -> None:
-    """Verify that score_candidates returns an empty 1D tensor when total candidate count is zero."""
-    batch_size = 4
-    observation = StructuredObservation.empty_batch(batch_size).to(stress_device)
-    action_mask = _minimal_model_action_mask(batch_size, stress_device)
-    memory = _empty_memory(stress_policy, batch_size)
-    candidate_values = torch.empty((0, 2), dtype=torch.long, device=stress_device)
-    candidate_offsets = torch.zeros(batch_size + 1, dtype=torch.long)
-
-    with torch.inference_mode():
-        prepared = stress_policy.prepare(stress_policy.encode(observation, action_mask), memory)
-        log_probs = stress_policy.score_candidates(
-            prepared,
-            action_mask,
-            candidate_values,
-            candidate_offsets,
-        )
-
-    assert log_probs.shape == (0,)

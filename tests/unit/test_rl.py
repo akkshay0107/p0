@@ -575,6 +575,19 @@ def test_completed_batch_only_moves_ppo_inputs_to_target_device():
     assert result.dones.device.type == "cpu"
 
 
+def test_preparing_no_trajectories_is_a_noop() -> None:
+    """Verify prepare_trajectory_batches handles empty input gracefully."""
+    assert (
+        prepare_trajectory_batches(
+            [],
+            torch.device("cpu"),
+            gamma=0.99,
+            gae_lambda=0.95,
+        )
+        == []
+    )
+
+
 def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path) -> None:
     """Verify EvaluationHarness falls back to deterministic built-in team pools when corpus file is missing."""
     first = EvaluationHarness(
@@ -863,6 +876,65 @@ def test_pure_ppo_objective_clips_and_weights_team_preview() -> None:
     assert policy[1].item() == pytest.approx(-0.5)
     assert total[0].item() == pytest.approx((config.value_coef * 1.0 - 1.2) * 2.0)
     assert total[1].item() == pytest.approx(-0.5)
+
+
+def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
+    """Verify PPO objective clipping, value loss, KL penalty, entropy, and preview scaling."""
+    config = TrainingConfig(
+        clip_low=0.2,
+        clip_high=0.1,
+        value_coef=0.5,
+        teampreview_loss_mult=3.0,
+        teampreview_alpha_mult=4.0,
+        residual_entropy_coef=0.2,
+    )
+    batch_size = 64
+    generator = torch.Generator().manual_seed(20260807)
+    current_log_probs = torch.randn(batch_size, generator=generator)
+    old_log_probs = torch.randn(batch_size, generator=generator)
+    advantages = torch.randn(batch_size, generator=generator)
+    values = torch.randn(batch_size, generator=generator)
+    returns = torch.randn(batch_size, generator=generator)
+    entropy = torch.rand(batch_size, generator=generator)
+    kl = torch.rand(batch_size, generator=generator)
+    preview = torch.rand(batch_size, generator=generator) > 0.75
+
+    total, policy, value, ratio, log_ratio = compute_ppo_objective(
+        current_log_probs,
+        values,
+        entropy,
+        kl,
+        old_log_probs,
+        advantages,
+        returns,
+        preview,
+        config,
+        alpha=0.3,
+    )
+    expected_ratio = torch.exp(current_log_probs - old_log_probs)
+    expected_clipped = torch.clamp(expected_ratio, 1.0 - config.clip_low, 1.0 + config.clip_high)
+    expected_policy = -torch.minimum(
+        expected_ratio * advantages,
+        expected_clipped * advantages,
+    )
+    expected_value = (values - returns).square()
+    expected_total = config.value_coef * expected_value
+    expected_total = (
+        expected_total
+        + expected_policy
+        + 0.3 * torch.where(preview, config.teampreview_alpha_mult, 1.0) * kl
+    )
+    expected_total = expected_total - config.residual_entropy_coef * entropy
+    expected_total = torch.where(
+        preview,
+        expected_total * config.teampreview_loss_mult,
+        expected_total,
+    )
+    torch.testing.assert_close(ratio, expected_ratio)
+    torch.testing.assert_close(log_ratio, current_log_probs - old_log_probs)
+    torch.testing.assert_close(policy, expected_policy)
+    torch.testing.assert_close(value, expected_value)
+    torch.testing.assert_close(total, expected_total)
 
 
 def test_ppo_amp_is_cuda_only() -> None:

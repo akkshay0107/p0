@@ -491,6 +491,33 @@ def test_tokenizer_normalization_and_table_resolution() -> None:
     assert species.resolve("species", "pikachu") == (1, Resolution.KNOWN)
 
 
+def test_tokenizer_normalization_cache_is_stable_across_repeated_protocol_ids() -> None:
+    """Verify normalization is deterministic and repeated IDs use the LRU cache."""
+    PokemonTokenizer._cached_normalize.cache_clear()
+    values = (
+        "Charizard-Mega-Y",
+        "U-turn",
+        "Leech Seed",
+        "CHARIZARD-MEGA-Y",
+        "Species-1",
+        "Species-2",
+    )
+    expected = tuple(
+        "".join(
+            character.lower() for character in value if character.isascii() and character.isalnum()
+        )
+        for value in values
+    )
+    try:
+        for _ in range(4):
+            assert tuple(PokemonTokenizer.normalize_id(value) for value in values) == expected
+        info = PokemonTokenizer._cached_normalize.cache_info()
+        assert info.misses == len(values)
+        assert info.hits == 3 * len(values)
+    finally:
+        PokemonTokenizer._cached_normalize.cache_clear()
+
+
 def test_tokenizer_domain_objects_and_missing_values() -> None:
     """Verify tokenizer extracts vocabulary IDs from poke-env domain objects (Pokemon, Move, Status, PokemonType, Nature)."""
     assert tokenizer.status_id(Status.BRN) == tokenizer.status[Status.BRN]

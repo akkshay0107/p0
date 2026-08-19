@@ -4,8 +4,6 @@ import pytest
 import torch
 
 from p0.model.structured_observation import StructuredObservation
-from p0.training.config import TrainingConfig
-from p0.training.ppo import compute_ppo_objective
 from p0.training.trajectory import (
     TrajectoryBatch,
     compute_gae_batch,
@@ -130,86 +128,3 @@ def test_prepared_training_batches_keep_returns_and_normalize_only_active_steps(
     assert sum(batch.length for batch in prepared) == sum(
         trajectory.length for trajectory in trajectories
     )
-
-
-@pytest.mark.stress
-def test_preparing_no_trajectories_is_a_noop() -> None:
-    """Verify prepare_trajectory_batches handles empty input gracefully."""
-    assert (
-        prepare_trajectory_batches(
-            [],
-            torch.device("cpu"),
-            gamma=0.99,
-            gae_lambda=0.95,
-        )
-        == []
-    )
-
-
-@pytest.mark.stress
-def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
-    """Verify compute_ppo_objective matches theoretical clipped surrogate loss with team-preview scaling.
-
-    Checks:
-    1. Importance ratio clipping with asymmetric clip bounds (clip_low vs clip_high).
-    2. Value function mean squared error loss with value_coef.
-    3. KL divergence penalty scaled by teampreview_alpha_mult on preview decisions.
-    4. Entropy regularization subtraction.
-    5. Overall loss multiplier applied on team preview decisions (teampreview_loss_mult).
-    """
-    config = TrainingConfig(
-        clip_low=0.2,
-        clip_high=0.1,
-        value_coef=0.5,
-        teampreview_loss_mult=3.0,
-        teampreview_alpha_mult=4.0,
-        residual_entropy_coef=0.2,
-    )
-    batch_size = stress_count("P0_STRESS_PPO_STEPS", 4096)
-    generator = torch.Generator().manual_seed(20260807)
-    current_log_probs = torch.randn(batch_size, generator=generator)
-    old_log_probs = torch.randn(batch_size, generator=generator)
-    advantages = torch.randn(batch_size, generator=generator)
-    values = torch.randn(batch_size, generator=generator)
-    returns = torch.randn(batch_size, generator=generator)
-    entropy = torch.rand(batch_size, generator=generator)
-    kl = torch.rand(batch_size, generator=generator)
-    preview = torch.rand(batch_size, generator=generator) > 0.75
-
-    total, policy, value, ratio, log_ratio = compute_ppo_objective(
-        current_log_probs,
-        values,
-        entropy,
-        kl,
-        old_log_probs,
-        advantages,
-        returns,
-        preview,
-        config,
-        alpha=0.3,
-    )
-    # Compute analytical reference terms
-    expected_ratio = torch.exp(current_log_probs - old_log_probs)
-    expected_clipped = torch.clamp(expected_ratio, 1.0 - config.clip_low, 1.0 + config.clip_high)
-    expected_policy = -torch.minimum(
-        expected_ratio * advantages,
-        expected_clipped * advantages,
-    )
-    expected_value = (values - returns).square()
-    expected_total = config.value_coef * expected_value
-    expected_total = (
-        expected_total
-        + expected_policy
-        + 0.3 * torch.where(preview, config.teampreview_alpha_mult, 1.0) * kl
-    )
-    expected_total = expected_total - config.residual_entropy_coef * entropy
-    expected_total = torch.where(
-        preview,
-        expected_total * config.teampreview_loss_mult,
-        expected_total,
-    )
-    torch.testing.assert_close(ratio, expected_ratio)
-    torch.testing.assert_close(log_ratio, current_log_probs - old_log_probs)
-    torch.testing.assert_close(policy, expected_policy)
-    torch.testing.assert_close(value, expected_value)
-    torch.testing.assert_close(total, expected_total)
