@@ -97,16 +97,11 @@ def _empty_training_totals() -> dict[str, Any]:
     return {
         "loss": 0.0,
         "loss_weight": 0.0,
-        "exact_nll": 0.0,
-        "partial_nll": 0.0,
         "decisions": 0,
-        "labeled_decisions": 0,
-        "exact_decisions": 0,
-        "partial_decisions": 0,
         "updates": 0,
         "games": 0,
-        "value_loss": 0.0,
-        "value_decisions": 0,
+        "grad_norm_sum": 0.0,
+        "grad_norm_count": 0,
     }
 
 
@@ -169,8 +164,6 @@ class BCTrainer:
     def _train_epoch_totals(self) -> dict[str, Any]:
         self.policy.train()
         self._series_history.clear()
-        if self.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self.device)
 
         totals = _empty_training_totals()
         accumulated_decisions = 0
@@ -199,41 +192,37 @@ class BCTrainer:
                 and not self._series_history.has_partial_games
             ):
                 if accumulated_loss_weight > 0:
-                    totals["updates"] += int(self._step_optimizer(accumulated_loss_weight))
+                    updated, grad_norm = self._step_optimizer(accumulated_loss_weight)
+                    if updated:
+                        totals["updates"] += 1
+                        totals["grad_norm_sum"] += grad_norm
+                        totals["grad_norm_count"] += 1
                 accumulated_decisions = 0
                 accumulated_loss_weight = 0.0
 
         if self._series_history.has_partial_games:
             raise ValueError("BC dataset ended with an incomplete perspective-game")
         if accumulated_loss_weight > 0:
-            totals["updates"] += int(self._step_optimizer(accumulated_loss_weight))
+            updated, grad_norm = self._step_optimizer(accumulated_loss_weight)
+            if updated:
+                totals["updates"] += 1
+                totals["grad_norm_sum"] += grad_norm
+                totals["grad_norm_count"] += 1
         self._series_history.clear()
         return totals
 
     def _metrics(self, totals: dict[str, Any]) -> dict[str, float | int]:
-        peak_memory = (
-            torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
-        )
         updates = int(totals["updates"])
-        games = int(totals["games"])
-        decisions = int(totals["decisions"])
+        grad_norm_count = int(totals["grad_norm_count"])
         return {
-            "loss": float(totals["loss"]) / max(float(totals["loss_weight"]), 1.0),
-            "exact_nll": float(totals["exact_nll"]) / max(int(totals["exact_decisions"]), 1),
-            "partial_nll": float(totals["partial_nll"]) / max(int(totals["partial_decisions"]), 1),
-            "decisions": decisions,
-            "labeled_decisions": int(totals["labeled_decisions"]),
-            "exact_decisions": int(totals["exact_decisions"]),
-            "partial_decisions": int(totals["partial_decisions"]),
+            "overall_nll": float(totals["loss"]) / max(float(totals["loss_weight"]), 1.0),
+            "grad_norm": (
+                float(totals["grad_norm_sum"]) / grad_norm_count if grad_norm_count else 0.0
+            ),
+            "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
             "updates": updates,
-            "games": games,
-            "decisions_per_update": decisions / updates if updates else 0.0,
-            "games_per_update": games / updates if updates else 0.0,
-            "peak_memory_bytes": peak_memory,
-            # This is mean squared error against the discounted terminal-
-            # outcome target, over decisions with verified outcomes.
-            "value_loss": float(totals["value_loss"]) / max(int(totals["value_decisions"]), 1),
-            "value_decisions": int(totals["value_decisions"]),
+            "games": int(totals["games"]),
+            "decisions": int(totals["decisions"]),
         }
 
     def save_checkpoint(
@@ -338,7 +327,7 @@ class BCTrainer:
             prepared.candidate_offsets,
         )
 
-    def _step_optimizer(self, loss_weight: float) -> bool:
+    def _step_optimizer(self, loss_weight: float) -> tuple[bool, float]:
         if loss_weight <= 0:
             raise ValueError("loss_weight must be positive before an optimizer step")
         self.scaler.unscale_(self.optimizer)
@@ -359,11 +348,12 @@ class BCTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-            return False
+            return False, 0.0
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
-        return self.scaler.get_scale() >= previous_scale
+        updated = self.scaler.get_scale() >= previous_scale
+        return updated, float(grad_norm.item())
 
     def _backward_chunk(
         self,
@@ -449,17 +439,8 @@ class BCTrainer:
         # the optimizer still receives their weighted sum above.
         totals["loss"] += policy_sum.detach()
         totals["loss_weight"] += objective.loss_weight
-        totals["exact_nll"] += objective.exact_nll.detach() * objective.exact_count
-        totals["partial_nll"] += objective.partial_nll.detach() * objective.partial_count
         totals["decisions"] += batch.decisions
-        totals["labeled_decisions"] += objective.labeled_count
-        totals["exact_decisions"] += objective.exact_count
-        totals["partial_decisions"] += objective.partial_count
         totals["games"] += batch.completed_game_count
-        totals.setdefault("value_loss", 0.0)
-        totals.setdefault("value_decisions", 0)
-        totals["value_loss"] += value_loss.detach() * value_count
-        totals["value_decisions"] += value_count
         return loss_weight
 
     @torch.inference_mode()
@@ -517,8 +498,7 @@ class BCTrainer:
             greedy = self.policy.act(prepared.prepared, action_mask, deterministic=True)
             predicted, best_scores = greedy.actions, greedy.log_probs
             accumulator.add(
-                batch,
-                candidate_offsets=batch.candidate_offsets.to(self.device),
+                exact_actions=batch.exact_action.to(self.device),
                 masks=masks,  # pyright: ignore[reportArgumentType]
                 marginal_nll=marginal_nll,
                 safe_nll=safe_nll,

@@ -3,19 +3,46 @@
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from p0.model.policy import PolicyNet
+from p0.persistence import atomic_json_save
 from p0.training.checkpoint import PolicyStore
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import PPOUpdater
 from p0.training.rollout import RolloutCollector
+from p0.training.trajectory import TrajectoryBatch
 from p0.training.utils import PPOScheduler
 
 MetricSink = Callable[[Mapping[str, float], int, str], None]
+
+PPO_BOARD_METRICS = (
+    "policy_loss",
+    "value_loss",
+    "kl_divergence",
+    "clip_fraction",
+    "normalized_entropy",
+    "explained_variance",
+    "magnet_kl",
+    "grad_norm",
+    "mean_game_length",
+    "timeout_or_truncation_rate",
+)
+
+
+def _rollout_metrics(trajectories: list[TrajectoryBatch]) -> dict[str, float]:
+    """Summarize completed self-play games for the PPO board."""
+    if not trajectories:
+        raise ValueError("Cannot summarize an empty PPO rollout")
+
+    lengths = [int(trajectory.length) for trajectory in trajectories]
+    truncated = sum(not bool(trajectory.dones[-1].item()) for trajectory in trajectories)
+    return {
+        "mean_game_length": sum(lengths) / len(lengths),
+        "timeout_or_truncation_rate": truncated / len(lengths),
+    }
 
 
 class PPOTrainer:
@@ -30,6 +57,7 @@ class PPOTrainer:
         magnet: Magnet,
         scheduler: PPOScheduler,
         training_config: TrainingConfig,
+        metrics_path: Path | None = None,
         metric_sink: MetricSink = lambda metrics, step, phase: None,
         cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
@@ -41,8 +69,10 @@ class PPOTrainer:
         self.magnet = magnet
         self.scheduler = scheduler
         self.training_config = training_config
+        self.metrics_path = metrics_path
         self.metric_sink = metric_sink
         self.cancel_requested = cancel_requested
+        self._json_metrics: list[dict[str, float | int]] = []
 
     def run(self, start_episode: int = 0) -> None:
         self.collector.vector_env.reset()
@@ -57,15 +87,14 @@ class PPOTrainer:
             alpha = self.scheduler.alpha(episode)
             self.collector.reset_completed()
             self.policy.eval()
-            started = time.monotonic()
             self.collector.collect()
-            rollout_seconds = time.monotonic() - started
             trajectories = self.collector.get_batches(self.policy.device)
             if not trajectories:
                 logging.warning("No trajectories collected, skipping update")
                 completed_episode = episode + 1
                 continue
             trajectory_count = len(trajectories)
+            rollout_metrics = _rollout_metrics(trajectories)
             try:
                 stats = self.updater.update(trajectories, episode, alpha)
             finally:
@@ -75,13 +104,15 @@ class PPOTrainer:
                 self.magnet.refresh(self.policy)
                 logging.info(f"Refreshed magnet at episode {episode + 1}")
             metrics = {
-                key: float(value) for key, value in stats.items() if isinstance(value, (int, float))
+                name: float(stats[name])
+                for name in PPO_BOARD_METRICS
+                if name in stats
             }
-            metrics.update(
+            metrics.update(rollout_metrics)
+            self._json_metrics.append(
                 {
-                    "rollout_seconds": rollout_seconds,
-                    "learning_rate": float(self.updater.optimizer.param_groups[0]["lr"]),
-                    "trajectory_count": float(trajectory_count),
+                    "episode": episode + 1,
+                    "trajectory_count": trajectory_count,
                 }
             )
             self.metric_sink(metrics, episode + 1, "train")
@@ -117,3 +148,11 @@ class PPOTrainer:
             metadata=metadata,
             trainer_kind="ppo",
         )
+        if self.metrics_path is not None:
+            atomic_json_save(
+                self.metrics_path,
+                {
+                    "completed_episode": episode,
+                    "metrics": self._json_metrics,
+                },
+            )

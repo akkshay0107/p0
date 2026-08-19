@@ -39,7 +39,7 @@ from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import _run_batched_ppo, compute_ppo_objective
 from p0.training.rollout import BattleMemoryBuffer
-from p0.training.trainer import PPOTrainer
+from p0.training.trainer import PPO_BOARD_METRICS, PPOTrainer, _rollout_metrics
 from p0.training.trajectory import (
     TrajectoryBatch,
     TrajectoryStorage,
@@ -896,6 +896,28 @@ def test_full_precision_ppo_discards_non_finite_gradients(monkeypatch: pytest.Mo
 
     assert result["grad_norm"] == 0.0
     assert all(torch.equal(before[name], value) for name, value in policy.named_parameters())
+
+
+def test_ppo_rollout_metrics_report_length_and_truncation_rate() -> None:
+    def trajectory(length: int, terminated: bool) -> TrajectoryBatch:
+        return TrajectoryBatch(
+            observations=StructuredObservation.empty_batch(length),
+            actions=torch.zeros((length, 2), dtype=torch.long),
+            log_probs=torch.zeros(length),
+            values=torch.zeros(length),
+            rewards=torch.zeros(length),
+            dones=torch.tensor([0.0] * (length - 1) + [float(terminated)]),
+            action_masks=torch.ones((length, 2, ACT_SIZE), dtype=torch.bool),
+            length=length,
+        )
+
+    metrics = _rollout_metrics([trajectory(2, True), trajectory(4, False)])
+
+    assert metrics == {
+        "mean_game_length": 3.0,
+        "timeout_or_truncation_rate": 0.5,
+    }
+    assert "grad_norm" in PPO_BOARD_METRICS
 
 
 def test_ppo_keeps_series_encoder_out_of_the_bo1_graph() -> None:

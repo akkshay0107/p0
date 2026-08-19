@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import random
-import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -348,10 +347,9 @@ def ppo_update(
         cancel_requested: Callback polled for cooperative cancellation.
 
     Returns:
-        Scalar optimization, stability, and timing metrics.
+        Scalar optimization and stability metrics.
     """
     policy.train()
-    t0 = time.time()
 
     explained_variances = {
         episode.explained_variance for episode in episodes if episode.explained_variance is not None
@@ -382,7 +380,6 @@ def ppo_update(
     tot_clip_frac = metric_zero.clone()
     tot_steps = 0
     num_updates = 0
-    num_skipped = 0
     epochs_done = 0
     magnet_cache: dict[int, torch.Tensor] = {}
 
@@ -479,7 +476,6 @@ def ppo_update(
                         f"({reason})"
                     )
                     optimizer.zero_grad(set_to_none=True)
-                    num_skipped += 1
                 else:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -519,10 +515,7 @@ def ppo_update(
             "kl_divergence": 0.0,
             "grad_norm": 0.0,
             "clip_fraction": 0.0,
-            "magnet_alpha": alpha,
             "explained_variance": 0.0,
-            "skipped_minibatches": num_skipped,
-            "time": time.time() - t0,
         }
 
     grad_norm = tot_grad_norm / num_updates if num_updates > 0 else metric_zero
@@ -560,8 +553,5 @@ def ppo_update(
         "kl_divergence": kl_divergence,
         "grad_norm": grad_norm_value,
         "clip_fraction": clip_fraction,
-        "magnet_alpha": alpha,
         "explained_variance": explained_var,
-        "skipped_minibatches": num_skipped,
-        "time": time.time() - t0,
     }

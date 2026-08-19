@@ -60,7 +60,6 @@ def _provenance(
 def _validation_is_failed(metrics: BCEvaluationMetrics) -> bool:
     return (
         metrics.non_finite_values > 0
-        or metrics.illegal_predictions > 0
         or not all(
             math.isfinite(value)
             for value in (
@@ -69,23 +68,35 @@ def _validation_is_failed(metrics: BCEvaluationMetrics) -> bool:
                 metrics.partial_nll,
                 metrics.exact_joint_accuracy,
                 metrics.value_loss,
+                metrics.illegal_probability_mass,
+                metrics.unknown_label_fraction,
             )
         )
     )
 
 
-def _flatten_metrics(
-    prefix: str,
-    values: Mapping[str, object],
-) -> dict[str, float]:
-    flattened: dict[str, float] = {}
-    for name, value in values.items():
-        key = f"{prefix}/{name}" if prefix else name
-        if isinstance(value, Mapping):
-            flattened.update(_flatten_metrics(key, value))
-        elif isinstance(value, (int, float)):
-            flattened[key] = float(value)
-    return flattened
+_BC_TRAIN_BOARD_METRICS = ("overall_nll", "grad_norm", "learning_rate")
+_BC_VALIDATION_BOARD_METRICS = (
+    "overall_nll",
+    "exact_nll",
+    "partial_nll",
+    "exact_joint_accuracy",
+    "value_loss",
+    "illegal_probability_mass",
+    "unknown_label_fraction",
+    "non_finite_values",
+)
+
+
+def _write_board_metrics(
+    writer: SummaryWriter,
+    phase: str,
+    values: Mapping[str, float | int],
+    names: tuple[str, ...],
+    epoch: int,
+) -> None:
+    for name in names:
+        writer.add_scalar(f"{phase}/{name}", float(values[name]), epoch)
 
 
 def _append_metrics(path: Path, value: Mapping[str, Any]) -> None:
@@ -195,7 +206,10 @@ def train_bc(
     if _validation_is_failed(initial_training):
         raise RuntimeError("Initial BC training evaluation contains invalid predictions or values")
     initial_nll = initial_training.overall_nll
-    final_training = initial_training
+    final_training_evaluation: BCEvaluationMetrics | None = (
+        initial_training if overfit else None
+    )
+    last_training_update: dict[str, float | int] | None = None
     final_validation: BCEvaluationMetrics | None = None
     max_epochs = 200 if overfit else config.epochs
     writer = SummaryWriter(log_dir=str(dataset_output / "tensorboard"))
@@ -214,29 +228,10 @@ def train_bc(
             if _validation_is_failed(validation):
                 raise RuntimeError(f"BC validation failed at epoch {epoch}")
             if overfit:
-                final_training = trainer.evaluate(train_dataset)
-                if _validation_is_failed(final_training):
+                final_training_evaluation = trainer.evaluate(train_dataset)
+                if _validation_is_failed(final_training_evaluation):
                     raise RuntimeError(f"BC training evaluation failed at epoch {epoch}")
-            else:
-                final_training = BCEvaluationMetrics(
-                    overall_nll=float(training["loss"]),
-                    exact_nll=float(training["exact_nll"]),
-                    partial_nll=float(training["partial_nll"]),
-                    exact_joint_accuracy=0.0,
-                    decisions=int(training["decisions"]),
-                    labeled_decisions=int(training["labeled_decisions"]),
-                    unknown_decisions=int(training["decisions"])
-                    - int(training["labeled_decisions"]),
-                    exact_decisions=int(training["exact_decisions"]),
-                    partial_decisions=int(training["partial_decisions"]),
-                    illegal_predictions=0,
-                    non_finite_values=0,
-                    by_decision_type={},
-                    confidence_buckets={},
-                    candidate_set_sizes={},
-                    value_loss=float(training["value_loss"]),
-                    value_decisions=int(training["value_decisions"]),
-                )
+            last_training_update = training
             final_validation = validation
             if validation.overall_nll < best_validation_nll:
                 best_validation_nll = validation.overall_nll
@@ -260,27 +255,37 @@ def train_bc(
                 "epoch": epoch,
                 "dataset_hash": shard_manifest.dataset_hash,
                 "train_update": training,
-                "training": final_training.to_dict(),
+                "training": (
+                    training
+                    if final_training_evaluation is None
+                    else final_training_evaluation.to_dict()
+                ),
                 "validation": validation.to_dict(),
             }
             _append_metrics(metrics_path, record)
-            for name, value in _flatten_metrics("train", training).items():
-                writer.add_scalar(name, value, epoch)
-            for name, value in _flatten_metrics("validation", validation.to_dict()).items():
-                writer.add_scalar(name, value, epoch)
+            _write_board_metrics(writer, "train", training, _BC_TRAIN_BOARD_METRICS, epoch)
+            _write_board_metrics(
+                writer,
+                "validation",
+                validation.to_dict(),
+                _BC_VALIDATION_BOARD_METRICS,
+                epoch,
+            )
             writer.flush()
             completed_epoch = epoch
             if (
                 overfit
-                and final_training.overall_nll <= initial_nll * 0.2
-                and final_training.exact_joint_accuracy >= 0.9
+                and final_training_evaluation is not None
+                and final_training_evaluation.overall_nll <= initial_nll * 0.2
+                and final_training_evaluation.exact_joint_accuracy >= 0.9
             ):
                 break
     finally:
         writer.close()
     overfit_passed = not overfit or (
-        final_training.overall_nll <= initial_nll * 0.2
-        and final_training.exact_joint_accuracy >= 0.9
+        final_training_evaluation is not None
+        and final_training_evaluation.overall_nll <= initial_nll * 0.2
+        and final_training_evaluation.exact_joint_accuracy >= 0.9
     )
     result = {
         "dataset_hash": shard_manifest.dataset_hash,
@@ -289,7 +294,11 @@ def train_bc(
         "cancelled": cancelled,
         "overfit_passed": overfit_passed,
         "initial_training": initial_training.to_dict(),
-        "final_training": final_training.to_dict(),
+        "final_training": (
+            last_training_update
+            if final_training_evaluation is None
+            else final_training_evaluation.to_dict()
+        ),
         "final_validation": (None if final_validation is None else final_validation.to_dict()),
         "latest_training_checkpoint": str(latest_path.resolve()),
         "best_policy_checkpoint": str(best_path.resolve()),

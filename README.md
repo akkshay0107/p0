@@ -112,7 +112,11 @@ Set `paths.resume_checkpoint` to restore PPO training state, or set
 episode zero. The two settings are mutually exclusive. A BC
 `bc_best_policy.pt` is the supported weights-only handoff into PPO.
 
-_Note: Training metrics (magnet KL, PPO KL, explained variance, normalized entropy, and gradient diagnostics) are exported to TensorBoard. You can view them by running `tensorboard --logdir ./artifacts/runs/ppo_training/`._
+PPO TensorBoard tracks policy loss, value loss, KL divergence, clipping, normalized
+entropy, explained variance, MAGNET KL, gradient norm, mean game length, and the
+timeout/truncation rate. Rollout trajectory counts are written to
+`artifacts/runs/ppo_training/metrics.json`. View the board with
+`tensorboard --logdir ./artifacts/runs/ppo_training/`.
 
 ### Replay BC pilot
 
@@ -192,6 +196,9 @@ The BC `batch_decisions` setting is an explicit target-window budget. Each windo
 recomputes its local context under current weights before updating, while retaining
 past-only context and the fixed 48-decision cap. BC, PPO, evaluation, and play use
 Bo3 series orchestration and keep each canonical player's prior-game state isolated.
+BC TensorBoard logs the selected NLL, validation, legality, label-quality, value,
+gradient, and learning-rate metrics. Its update, game, and decision counts remain
+in the JSON metrics artifacts rather than the board.
 
 Run the memory-channel performance baseline with:
 

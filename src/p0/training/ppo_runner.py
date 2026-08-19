@@ -209,6 +209,7 @@ def run_training(
                 magnet=magnet,
                 scheduler=scheduler,
                 training_config=training,
+                metrics_path=paths.runs_dir / "ppo_training" / "metrics.json",
                 metric_sink=_tensorboard_sink(writer),
                 cancel_requested=cancel_requested,
             )

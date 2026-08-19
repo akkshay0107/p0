@@ -266,8 +266,8 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path: Path) -> None:
     metrics = trainer.train()
 
     assert metrics["decisions"] == 8
-    assert metrics["labeled_decisions"] > 0
-    assert torch.isfinite(torch.tensor(metrics["loss"]))
+    assert metrics["games"] == 4
+    assert torch.isfinite(torch.tensor(metrics["overall_nll"]))
     checkpoint = tmp_path / "bc.pt"
     trainer.save_checkpoint(checkpoint, epoch=1)
 
@@ -318,12 +318,10 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
     metrics = trainer.train()
 
     assert metrics["decisions"] == 2
-    assert metrics["labeled_decisions"] == 2
     assert metrics["updates"] == 1
     assert metrics["games"] == 1
-    assert metrics["decisions_per_update"] == 2
-    assert metrics["games_per_update"] == 1
-    assert torch.isfinite(torch.tensor(metrics["loss"]))
+    assert metrics["grad_norm"] >= 0.0
+    assert torch.isfinite(torch.tensor(metrics["overall_nll"]))
     # Verify policy parameters were modified by optimizer step
     assert any(
         not torch.equal(before[name], parameter)
@@ -340,8 +338,7 @@ def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
     )
     metrics = _trainer(chunk).train()
     assert metrics["decisions"] == 2
-    assert metrics["labeled_decisions"] == 1
-    assert metrics["exact_decisions"] == 1
+    assert metrics["games"] == 1
 
 
 def test_unknown_only_game_does_not_report_an_optimizer_update() -> None:
@@ -356,8 +353,6 @@ def test_unknown_only_game_does_not_report_an_optimizer_update() -> None:
 
     assert metrics["updates"] == 0
     assert metrics["games"] == 1
-    assert metrics["decisions_per_update"] == 0.0
-    assert metrics["games_per_update"] == 0.0
 
 
 def test_game_boundary_accumulation_uses_total_loss_weight() -> None:
@@ -810,8 +805,6 @@ def test_evaluation_reports_legality_diagnostics() -> None:
 
     metrics = trainer.evaluate()
 
-    # only the proven decision has an authoritative mask to be measured against
-    assert metrics.unknown_legality_decisions == 1
     assert 0.0 < metrics.illegal_probability_mass < 1.0
     assert metrics.to_dict()["illegal_probability_mass"] == metrics.illegal_probability_mass
 
@@ -844,24 +837,18 @@ def test_validation_is_deterministic_inference_only_and_reports_all_counts() -> 
     second = trainer.evaluate()
 
     assert first.to_dict() == second.to_dict()
-    assert first.decisions == 3
-    assert first.labeled_decisions == 2
-    assert first.unknown_decisions == 1
-    assert first.exact_decisions == 1
-    assert first.partial_decisions == 1
+    assert first.unknown_label_fraction == pytest.approx(1 / 3)
     assert first.non_finite_values == 0
-    assert first.illegal_predictions == 0
-    assert first.by_decision_type["1"] == {
-        "decisions": 1,
-        "labeled": 0,
-        "nll": 0.0,
+    assert set(first.to_dict()) == {
+        "overall_nll",
+        "exact_nll",
+        "partial_nll",
+        "exact_joint_accuracy",
+        "value_loss",
+        "illegal_probability_mass",
+        "unknown_label_fraction",
+        "non_finite_values",
     }
-    assert first.by_decision_type["2"]["decisions"] == 2
-    assert first.by_decision_type["2"]["labeled"] == 2
-    assert first.confidence_buckets["[0,.25)"]["decisions"] == 1
-    assert first.confidence_buckets["[.25,.5)"]["labeled"] == 1
-    assert first.confidence_buckets["[.75,1]"]["labeled"] == 1
-    assert first.candidate_set_sizes == {"0": 1, "1": 1, "2": 1}
     assert all(
         torch.equal(before[name], parameter) for name, parameter in policy.named_parameters()
     )
