@@ -40,7 +40,6 @@ from p0.replays.dataset import (
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.group import group_replays, individual_games, validated_bo3_series
 from p0.replays.identity import linked_replay_ids
-from p0.replays.oracle import OracleCase, OracleExpectation, validate_oracle
 from p0.replays.protocol import ReplayParseError, parse_replay_payload
 from p0.replays.reconstruct import (
     _decision_blocks,
@@ -81,6 +80,7 @@ from p0.replays.shards import (
     ShardManifest,
     load_shard_manifest,
     observation_field_specs,
+    validate_shard_tensors,
 )
 from p0.teams.stat_points import BaseStats, StatPoints, calculate_stats
 from tests.unit.replay_fixtures import golden_replay_payload
@@ -1008,18 +1008,16 @@ def test_reconstruction_resolves_switch_species_not_nicknames() -> None:
     assert all(perspective.decisions for perspective in perspectives)
 
 
-def test_controlled_oracle_requires_candidate_containment() -> None:
-    """Verify OracleCase validation confirms expected actions are contained within reconstructed candidate sets."""
-    case = OracleCase(
-        "normal-move",
-        _sample_replay_payload("oracle"),
-        (
-            OracleExpectation(0, 1, (9, 11)),
-            OracleExpectation(1, 1, (9, 11)),
-        ),
-    )
-    result = validate_oracle(case)
-    assert result.passed and result.checked == 2
+def test_reconstruction_preserves_expected_candidate_actions() -> None:
+    """Verify reconstructed candidate sets contain the expected normal-turn actions."""
+    document = parse_replay_payload(_sample_replay_payload("oracle"))
+    perspectives = reconstruct_both(document)
+
+    for perspective in perspectives:
+        assert len(perspective.decisions) > 1
+        decision = perspective.decisions[1]
+        assert decision.post_line_index <= len(document.protocol_lines)
+        assert (9, 11) in decision.evidence.candidates
 
 
 def test_fetcher_retries_and_writes_immutable_raw_cache(tmp_path) -> None:
@@ -1157,6 +1155,12 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v5_shard(tmp_path: Path
     assert len(payload["series_summaries"]) == manifest.games
     assert [item["canonical_player"] for item in payload["series_summaries"]] == [0, 1]
     assert torch.count_nonzero(tensors["spatial_cat"]) > 0
+
+    stale_provenance = tensors["mask_provenance"].clone()
+    stale_provenance[0] = 2
+    tensors["mask_provenance"] = stale_provenance
+    with pytest.raises(ValueError, match="unsupported value"):
+        validate_shard_tensors(tensors)
 
 
 def test_shard_bytes_are_deterministic_for_fixed_inputs(tmp_path: Path) -> None:
@@ -1893,15 +1897,35 @@ def test_evidence_shapes() -> None:
     with pytest.raises(ValueError, match="only defined for EXACT"):
         _evidence(LabelKind.PARTIAL).exact_action
     with pytest.raises(ValueError, match="exactly one candidate"):
-        ActionEvidence(LabelKind.EXACT, (), 1.0, MaskProvenance.ORACLE_REQUEST)
+        ActionEvidence(LabelKind.EXACT, (), 1.0, MaskProvenance.CONSERVATIVE_RECONSTRUCTED)
     with pytest.raises(ValueError, match="two or more"):
-        ActionEvidence(LabelKind.PARTIAL, ((7, 1),), 0.5, MaskProvenance.ORACLE_REQUEST)
+        ActionEvidence(
+            LabelKind.PARTIAL,
+            ((7, 1),),
+            0.5,
+            MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
+        )
     with pytest.raises(ValueError, match="no candidates"):
-        ActionEvidence(LabelKind.UNKNOWN, ((7, 1),), 0.0, MaskProvenance.ORACLE_REQUEST)
+        ActionEvidence(
+            LabelKind.UNKNOWN,
+            ((7, 1),),
+            0.0,
+            MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
+        )
     with pytest.raises(ValueError, match="outside"):
-        ActionEvidence(LabelKind.EXACT, ((49, 0),), 1.0, MaskProvenance.ORACLE_REQUEST)
+        ActionEvidence(
+            LabelKind.EXACT,
+            ((49, 0),),
+            1.0,
+            MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
+        )
     with pytest.raises(ValueError, match="Duplicate"):
-        ActionEvidence(LabelKind.PARTIAL, ((7, 1), (7, 1)), 0.5, MaskProvenance.ORACLE_REQUEST)
+        ActionEvidence(
+            LabelKind.PARTIAL,
+            ((7, 1), (7, 1)),
+            0.5,
+            MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
+        )
 
 
 def test_ir_round_trips() -> None:

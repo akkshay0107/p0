@@ -156,12 +156,14 @@ def start_showdown_servers(
     *,
     showdown_root: Path = DEFAULT_PATHS.showdown_root,
     ports: Sequence[int] | None = None,
+    build_assets: bool = True,
 ) -> Iterator[tuple[ShowdownServer, ...]]:
     selected_ports = allocate_loopback_ports(count) if ports is None else tuple(ports)
     if len(selected_ports) != count or len(set(selected_ports)) != count:
         raise ValueError("Showdown ports must be unique and match the requested server count")
 
-    build_showdown(showdown_root)
+    if build_assets:
+        build_showdown(showdown_root)
     with contextlib.ExitStack() as stack:
         servers = tuple(
             stack.enter_context(ShowdownServer(port, showdown_root=showdown_root))

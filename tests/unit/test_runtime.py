@@ -363,6 +363,35 @@ def test_showdown_group_rolls_back_servers_when_later_start_fails(
     assert events == [("start", 1), ("start", 2), ("stop", 1)]
 
 
+def test_showdown_group_can_reuse_prebuilt_assets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify server groups can skip a build after session-level preparation."""
+    events = []
+
+    class FakeServer:
+        def __init__(self, port, **kwargs):
+            del kwargs
+            self.port = port
+
+        def __enter__(self):
+            events.append(("start", self.port))
+            return self
+
+        def __exit__(self, *args):
+            del args
+            events.append(("stop", self.port))
+
+    def unexpected_build(root):
+        del root
+        raise AssertionError("prebuilt Showdown assets were rebuilt")
+
+    monkeypatch.setattr(showdown, "ShowdownServer", FakeServer)
+    monkeypatch.setattr(showdown, "build_showdown", unexpected_build)
+    with showdown.start_showdown_servers(1, ports=(1,), build_assets=False):
+        pass
+
+    assert events == [("start", 1), ("stop", 1)]
+
+
 def test_showdown_build_failure_has_bounded_diagnostics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

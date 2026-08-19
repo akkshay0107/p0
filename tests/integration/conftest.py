@@ -11,7 +11,6 @@ from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.paths import DEFAULT_PATHS
 from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 from p0.teams.source import ValidatedTeam
 
@@ -33,21 +32,20 @@ def sample_team() -> str:
 
 
 @pytest.fixture(scope="function")
-def showdown_server():
+def showdown_server(showdown_assets):
     """Start a local ephemeral Showdown server process for live battle integration tests.
 
     Dynamically binds an unused loopback port to prevent port collisions between
     concurrent test workers, launching an isolated Showdown server instance for the test lifecycle.
     """
-    if not DEFAULT_PATHS.showdown_root.exists():
-        pytest.skip("pokemon-showdown directory not found. Skipping live server tests.")
+    del showdown_assets
 
     port = allocate_loopback_ports(1)[0]
     server_configuration = ServerConfiguration(
         websocket_url=f"ws://localhost:{port}/showdown/websocket",
         authentication_url=LocalhostServerConfiguration.authentication_url,
     )
-    with start_showdown_servers(1, ports=(port,)):
+    with start_showdown_servers(1, ports=(port,), build_assets=False):
         yield server_configuration
 
 

@@ -62,7 +62,6 @@ class LabelKind(IntEnum):
 class MaskProvenance(IntEnum):
     UNSPECIFIED = 0
     CONSERVATIVE_RECONSTRUCTED = 1
-    ORACLE_REQUEST = 2
 
 
 @dataclass(frozen=True, slots=True)

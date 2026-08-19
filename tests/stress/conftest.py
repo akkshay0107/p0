@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 import torch
@@ -10,20 +9,17 @@ from poke_env import LocalhostServerConfiguration, ServerConfiguration
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.paths import DEFAULT_PATHS
 from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 
 
 @pytest.fixture(scope="function")
-def showdown_server():
+def showdown_server(showdown_assets):
     """Start live stress tests only when the checked-out server is runnable.
 
     Dynamically binds an unused loopback port to prevent port collisions between
     concurrent test workers, launching an isolated Showdown server instance for the test lifecycle.
     """
-    root = Path(DEFAULT_PATHS.showdown_root)
-    if not (root / "build").is_file():
-        pytest.skip("built pokemon-showdown runtime not available")
+    del showdown_assets
 
     # Allocate a fresh ephemeral port per-test so parallel stress jobs cannot cross-connect
     port = allocate_loopback_ports(1)[0]
@@ -31,7 +27,7 @@ def showdown_server():
         websocket_url=f"ws://localhost:{port}/showdown/websocket",
         authentication_url=LocalhostServerConfiguration.authentication_url,
     )
-    with start_showdown_servers(1, ports=(port,)):
+    with start_showdown_servers(1, ports=(port,), build_assets=False):
         yield server_configuration
 
 

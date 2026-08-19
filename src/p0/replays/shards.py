@@ -26,9 +26,7 @@ from p0.format_config import (
     validate_artifact_runtime_contract,
 )
 from p0.model.structured_observation import (
-    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     OBSERVATION_SCHEMA_VERSION,
-    TOKEN_IDX_ALLY_SIDE,
     StructuredObservation,
 )
 from p0.replays.schema import (
@@ -436,17 +434,8 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
     if torch.any(~action_mask.any(dim=-1)):
         raise ValueError("Every action slot must contain at least one legal action")
 
-    # The corpus-level provenance and the observation-level legality gates describe the
-    # same fact for the same decision; a shard where they disagree would train the model
-    # to trust a mask its own annotation calls reconstructed.
-    slot_unknown = tensors["numerical"][
-        :,
-        TOKEN_IDX_ALLY_SIDE,
-        NUM_IDX_SLOT_LEGALITY_UNKNOWN : NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2,
-    ].gt(0)
-    oracle = tensors["mask_provenance"] == int(MaskProvenance.ORACLE_REQUEST)
-    if torch.any(oracle & slot_unknown.any(dim=-1)):
-        raise ValueError("Oracle-request decisions must not carry unproven legality gates")
+    if torch.any(tensors["mask_provenance"] != int(MaskProvenance.CONSERVATIVE_RECONSTRUCTED)):
+        raise ValueError("Shard mask_provenance contains an unsupported value")
 
     label_kind = tensors["label_kind"]
     counts = candidate_offsets[1:] - candidate_offsets[:-1]
