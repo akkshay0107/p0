@@ -38,11 +38,9 @@ paths:
   backups_dir: artifacts/backups
   log_path: artifacts/training.log
 
-environment:
-  agent_team_source:
-    path: all
-  opponent_team_source:
-    path: all
+teams:
+  all: all
+  reduced: reduced
 
 bot:
   username: Bot
@@ -65,10 +63,6 @@ bc:
   split_manifest: artifacts/shards/splits.json
   output_dir: artifacts/checkpoints/bc
   resume_checkpoint: null
-
-corpus:
-  manifest_path: teams/corpus_manifest.json
-  agent_split: train
 
 evaluation:
   episodes_per_matchup: 20

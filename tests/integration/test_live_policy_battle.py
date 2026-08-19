@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
+import json
 import random
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -11,17 +14,20 @@ from poke_env.player import RandomPlayer
 from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
 from p0.battle.actions import ACT_SIZE
-from p0.format_config import FORMAT
+from p0.format_config import FORMAT, current_manifest
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import MemoryInputs
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
-from p0.rl_player import RLPlayer
+from p0.rl_player import RLBotConfig, RLPlayer, run_bot
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import order_to_action
+from p0.teams.corpus import CorpusEntry, CorpusSplit, TeamCorpusManifest, corpus_content_hash
+from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FixedTeamSource
+from p0.training.config import GlobalConfig, TeamsConfig
 from tests.integration.helpers import capture_showdown_decisions, integration_count
 
 TEAM = """
@@ -81,6 +87,30 @@ Modest Nature
 """
 
 
+def _write_live_corpus_pool(pool_dir: Path, packed: str) -> TeamCorpusManifest:
+    entry = CorpusEntry(
+        canonical_hash=hashlib.sha256(b"live-corpus-team").hexdigest(),
+        packed=packed,
+        packed_sha256=hashlib.sha256(packed.encode()).hexdigest(),
+        split=CorpusSplit.TRAIN,
+        usage_count=1,
+    )
+    manifest = TeamCorpusManifest(
+        global_contract_sha256=current_manifest().global_sha256,
+        format_id=FORMAT.bo3_format,
+        corpus_hash=corpus_content_hash((entry,)),
+        entries=(entry,),
+        created_at="2026-08-19T00:00:00Z",
+        sampling_metadata={"pool_kind": "all"},
+    )
+    pool_dir.mkdir(parents=True)
+    (pool_dir / "corpus_manifest.json").write_text(
+        json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
 class TrackedPolicyPlayer(RLPlayer):
     """Instrumented RLPlayer that logs turn lifecycle, recurrent memory tokens, and action roundtrips."""
 
@@ -129,6 +159,76 @@ class TrackedPolicyPlayer(RLPlayer):
         order = super().choose_move(battle)
         self._record_order_round_trip(battle, order)
         return order
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_run_bot_uses_corpus_team_source(
+    showdown_server,
+    sample_team: str,
+    model_policy,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the live bot composes a CorpusTeamSource from the configured pool manifest."""
+    pool_dir = tmp_path / "teams" / "all"
+    manifest = _write_live_corpus_pool(pool_dir, sample_team)
+    monkeypatch.setattr(
+        "p0.rl_player.load_config",
+        lambda: GlobalConfig(teams=TeamsConfig(all=pool_dir, reduced=pool_dir)),
+    )
+    monkeypatch.setattr("p0.rl_player._load_policy", lambda *args, **kwargs: model_policy)
+
+    captured: dict[str, object] = {}
+
+    class TrackingRLPlayer(RLPlayer):
+        def __init__(self, *args, **kwargs):
+            captured["team_source"] = kwargs["team_source"]
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("p0.rl_player.RLPlayer", TrackingRLPlayer)
+    bot_config = RLBotConfig(
+        username="CorpusBot",
+        password=None,
+        battle_format=FORMAT.bo3_format,
+        websocket_url=showdown_server.websocket_url,
+        authentication_url=showdown_server.authentication_url,
+        checkpoint_path=None,
+        team_files=[],
+        team_pool="all",
+        top_p=0.9,
+        max_concurrent_battles=1,
+        challenge_limit=1,
+        opponent="CorpusChallenger",
+        allow_random_init=True,
+        log_level="INFO",
+    )
+    challenger = RandomPlayer(
+        account_configuration=AccountConfiguration("CorpusChallenger", None),
+        battle_format=FORMAT.bo3_format,
+        server_configuration=showdown_server,
+        team=sample_team,
+        max_concurrent_battles=1,
+    )
+    bot_task = asyncio.create_task(run_bot(bot_config))
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                challenger.send_challenges("CorpusBot", 1),
+                bot_task,
+            ),
+            timeout=90.0,
+        )
+    finally:
+        if not bot_task.done():
+            bot_task.cancel()
+            await asyncio.gather(bot_task, return_exceptions=True)
+        await challenger.ps_client.stop_listening()
+        poke_env_patches.uninstall_for_tests()
+
+    source = captured["team_source"]
+    assert isinstance(source, CorpusTeamSource)
+    assert source.describe()["corpus_hash"] == manifest.corpus_hash
 
 
 @pytest.mark.integration

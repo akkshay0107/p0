@@ -232,13 +232,7 @@ def load_corpus_manifest(
 
 @dataclass(frozen=True, slots=True)
 class CorpusSourceSpec:
-    """Pinned constructor input for the corpus-backed TeamSource.
-
-    The corpus workstream implements CorpusTeamSource(spec) satisfying the
-    existing TeamSource protocol in teams/corpus_source.py; this spec is the
-    agreed seam so environment configuration and the implementation can land
-    independently.
-    """
+    """Pinned constructor input for a corpus-backed TeamSource."""
 
     corpus_path: str
     corpus_hash: str

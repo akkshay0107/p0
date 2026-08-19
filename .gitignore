@@ -30,3 +30,6 @@ data/*.tmp
 data/champions_coverage.json
 teams/**/*.txt
 teams/*.txt
+
+# Generated corpus manifests
+teams/**/corpus_manifest.json

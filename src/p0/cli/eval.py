@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import json
 import logging
 import sys
 from datetime import UTC, datetime
@@ -31,10 +30,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Optional opponent policy checkpoint (omitted runs against RandomPlayer).",
     )
     parser.add_argument(
-        "--corpus-manifest",
+        "--teams-path",
         type=Path,
         default=None,
-        help="Path to the team corpus manifest.",
+        help="Team pool directory or corpus manifest path.",
     )
     parser.add_argument("--episodes", type=int, help="Number of episodes per matchup.")
     parser.add_argument("--seed", type=int, help="Random seed for evaluations.")
@@ -112,24 +111,11 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("Failed to load policy checkpoint B: %s", exc)
             return 1
 
-    corpus_manifest = (
-        args.corpus_manifest if args.corpus_manifest is not None else config.corpus.manifest_path
-    )
-    corpus_hash = ""
-    format_id = config.bot.battle_format
-    if corpus_manifest.is_file():
-        try:
-            raw = json.loads(corpus_manifest.read_text(encoding="utf-8"))
-            corpus_hash = raw.get("corpus_hash", "")
-            format_id = raw.get("format_id", format_id)
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            logger.error("Could not read corpus manifest headers: %s", exc)
-            return 1
+    teams_path = args.teams_path if args.teams_path is not None else config.teams.all
 
     harness = EvaluationHarness(
-        corpus_path=corpus_manifest if corpus_manifest.is_file() else None,
-        corpus_hash=corpus_hash,
-        format_id=format_id,
+        teams_path=teams_path,
+        format_id=config.bot.battle_format,
         episodes_per_matchup=episodes,
         seed=seed,
         port=args.port,
@@ -142,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("Evaluation corpus is incomplete: %s", exc)
         return 1
     matchup_results = []
+    corpus_hash = str(harness.category_metadata.get("seen", {}).get("corpus_hash", ""))
 
     async def run_all() -> None:
         from p0.runtime.showdown import start_showdown_servers
@@ -182,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             bool(metadata.get("fallback")) for metadata in harness.category_metadata.values()
         ),
         "corpus": {
-            "path": str(corpus_manifest.resolve()),
+            "path": str(teams_path.resolve()),
             "hash": corpus_hash,
             "categories": harness.category_metadata,
         },

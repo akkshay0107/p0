@@ -90,13 +90,22 @@ cd pokemon-showdown && npm install && cd ..
 
 ### 2. PPO Training Loop
 
-The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Copy `config.example.yaml` to the ignored, machine-local `config.yaml`, then set `environment.agent_team_source.path` and `environment.opponent_team_source.path` independently. Relative paths are resolved under `paths.teams_root`.
+The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Each pool contains its own `corpus_manifest.json`. Copy `config.example.yaml` to the ignored, machine-local `config.yaml`, then set `teams.all` and `teams.reduced` as needed. Relative paths are resolved under `paths.teams_root`.
+
+Build each pool manifest from the team files in that pool. The reduced pool is independent; it is never inferred from `teams/all/`, and building an empty pool fails.
+
+```bash
+uv run p0-corpus build --input teams/all
+uv run p0-corpus build --input teams/reduced
+```
 
 Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins all-self-play with magnetic regularization.
 
 ```bash
 uv run p0-train
 ```
+
+Use `uv run p0-train --agent-team-source reduced` to train the agent from the focused pool; the default is `all`, and the opponent continues to use the all-team pool.
 
 Set `paths.resume_checkpoint` to restore PPO training state, or set
 `paths.initial_policy_checkpoint` to import policy weights with a fresh optimizer and

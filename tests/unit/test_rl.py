@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import random
 from pathlib import Path
@@ -19,7 +21,7 @@ from p0.evaluation.harness import (
     hashlib_team,
     wilson_score_interval,
 )
-from p0.format_config import FORMAT
+from p0.format_config import FORMAT, current_manifest
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
@@ -31,6 +33,7 @@ from p0.model.token_store import SeriesTokenStore
 from p0.rl_player import RLPlayer, _LiveBattleHistory
 from p0.runtime.env import MegaEnv, SimEnv
 from p0.runtime.poke_env_battle_adapter import battle_view
+from p0.teams.corpus import CorpusEntry, CorpusSplit, TeamCorpusManifest, corpus_content_hash
 from p0.teams.source import FixedTeamSource
 from p0.training import ppo as ppo_module
 from p0.training.config import TrainingConfig
@@ -591,15 +594,13 @@ def test_preparing_no_trajectories_is_a_noop() -> None:
 def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path) -> None:
     """Verify EvaluationHarness falls back to deterministic built-in team pools when corpus file is missing."""
     first = EvaluationHarness(
-        corpus_path=tmp_path / "missing.json",
-        corpus_hash="missing",
+        teams_path=tmp_path / "missing",
         episodes_per_matchup=5,
         seed=91,
         smoke_test=True,
     )
     second = EvaluationHarness(
-        corpus_path=tmp_path / "missing.json",
-        corpus_hash="missing",
+        teams_path=tmp_path / "missing",
         episodes_per_matchup=5,
         seed=91,
         smoke_test=True,
@@ -615,6 +616,34 @@ def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path)
         second_team = second_sources[key].sample(second.rng)
         assert "Pikachu" in first_team.packed
         assert first_team.packed == second_team.packed
+
+
+def test_evaluation_harness_rejects_manifest_with_wrong_format(tmp_path: Path) -> None:
+    entries = tuple(
+        CorpusEntry(
+            canonical_hash=hashlib.sha256(f"canonical-{split}".encode()).hexdigest(),
+            packed=f"packed-team-{split}",
+            packed_sha256=hashlib.sha256(f"packed-team-{split}".encode()).hexdigest(),
+            split=split,
+            usage_count=1,
+        )
+        for split in (CorpusSplit.TRAIN, CorpusSplit.VALIDATION, CorpusSplit.TEST)
+    )
+    manifest = TeamCorpusManifest(
+        global_contract_sha256=current_manifest().global_sha256,
+        format_id=FORMAT.battle_format,
+        corpus_hash=corpus_content_hash(entries),
+        entries=entries,
+        created_at="2026-08-19T00:00:00Z",
+        sampling_metadata={},
+    )
+    pool_dir = tmp_path / "all"
+    pool_dir.mkdir()
+    (pool_dir / "corpus_manifest.json").write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+
+    harness = EvaluationHarness(teams_path=pool_dir, format_id=FORMAT.bo3_format)
+    with pytest.raises(ValueError, match="Corpus format mismatch"):
+        harness.build_team_sources()
 
 
 def test_evaluation_confidence_intervals_and_matchup_serialization_are_deterministic() -> None:

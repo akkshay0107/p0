@@ -9,11 +9,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from p0.teams.corpus_build import build_corpus
     from p0.teams.corpus_source import CorpusTeamSource
+    from p0.teams.factory import build_team_source
     from p0.teams.source import FileTeamSource, FixedTeamSource, TeamSource, ValidatedTeam
 
 __all__ = [
     "build_corpus",
     "CorpusTeamSource",
+    "build_team_source",
     "FileTeamSource",
     "FixedTeamSource",
     "TeamSource",
@@ -31,6 +33,11 @@ def __getattr__(name: str) -> object:
         from p0.teams.corpus_source import CorpusTeamSource
 
         return CorpusTeamSource
+
+    if name == "build_team_source":
+        from p0.teams.factory import build_team_source
+
+        return build_team_source
 
     if name in ("FileTeamSource", "FixedTeamSource", "TeamSource", "ValidatedTeam"):
         import p0.teams.source as source_module

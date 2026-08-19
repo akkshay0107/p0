@@ -28,9 +28,10 @@ from p0.teams.corpus import (
 from p0.teams.corpus_build import (
     audit_corpus,
     build_corpus,
-    populate_pool_directories,
+    write_corpus_manifest,
 )
 from p0.teams.corpus_source import CorpusTeamSource
+from p0.teams.factory import build_team_source
 from p0.teams.source import FileTeamSource, ValidatedTeam
 from p0.teams.spread_usage import (
     BO3_BLEND_WEIGHT,
@@ -59,8 +60,6 @@ from p0.teams.validation import (
     validate_many_batched,
     validate_variant,
 )
-from p0.training.config import CorpusConfig, TeamSourceConfig
-from p0.training.ppo_runner import _team_source
 
 
 def _metadata(source="series-1", usage=1) -> TeamMetadata:
@@ -354,8 +353,8 @@ def test_audit_corpus_and_coverage() -> None:
     assert sum(re_audit["split_counts"].values()) == 2
 
 
-def test_populate_pool_directories(tmp_path: Path) -> None:
-    """Verify populate_pool_directories creates full 'all' and top-usage filtered 'reduced' team pool manifests."""
+def test_write_corpus_manifest(tmp_path: Path) -> None:
+    """Verify each pool gets only the manifest built from its own input directory."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     # Each variant needs a unique species or move so canonical_hash is distinct
     unique_variants = tuple(
@@ -373,23 +372,15 @@ def test_populate_pool_directories(tmp_path: Path) -> None:
         validator=_mock_validator,
         global_contract_sha256="c" * 64,
     )
-    populate_pool_directories(manifest, output_root=tmp_path, reduced_limit=2)
+    all_dir = tmp_path / "all"
+    manifest_path = write_corpus_manifest(manifest, all_dir)
 
-    all_path = tmp_path / "all" / "corpus_manifest.json"
-    reduced_path = tmp_path / "reduced" / "corpus_manifest.json"
-    assert all_path.is_file()
-    assert reduced_path.is_file()
+    assert manifest_path == all_dir / "corpus_manifest.json"
+    assert manifest_path.is_file()
 
-    manifest_all = TeamCorpusManifest.from_dict(json.loads(all_path.read_text()))
-    manifest_reduced = TeamCorpusManifest.from_dict(json.loads(reduced_path.read_text()))
+    manifest_all = TeamCorpusManifest.from_dict(json.loads(manifest_path.read_text()))
 
     assert len(manifest_all.entries) == len(manifest.entries)
-    assert len(manifest_reduced.entries) <= 2
-    assert all(entry in manifest_all.entries for entry in manifest_reduced.entries)
-    # Ensure reduced manifest entries are sorted top usage
-    assert sorted((e.usage_count for e in manifest_reduced.entries), reverse=True) == [
-        e.usage_count for e in manifest_reduced.entries
-    ]
 
 
 def _make_entry(
@@ -1195,8 +1186,8 @@ def test_corpus_source_spec_validates() -> None:
         )
 
 
-def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
-    """Verify _team_source instantiates CorpusTeamSource when provided a corpus manifest path."""
+def test_build_team_source_resolves_corpus_manifest(tmp_path: Path) -> None:
+    """Verify the team-source factory instantiates CorpusTeamSource for a manifest path."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     contract_hash = current_manifest().global_sha256
     v1 = _mock_team_variant("Pikachu")
@@ -1210,13 +1201,7 @@ def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
     manifest_path = tmp_path / "corpus_manifest.json"
     manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
 
-    source = _team_source(
-        TeamSourceConfig(path=manifest_path),
-        corpus_config=CorpusConfig(
-            agent_split="train",
-        ),
-        is_agent=True,
-    )
+    source = build_team_source(manifest_path)
     assert isinstance(source, CorpusTeamSource)
     desc = source.describe()
     assert desc["kind"] == "corpus"
@@ -1225,8 +1210,19 @@ def test_team_source_composition_resolves_corpus(tmp_path: Path) -> None:
     assert desc["sampling"] == "uniform_canonical"
 
 
-def test_team_source_composition_falls_back_to_file_source(tmp_path: Path) -> None:
-    """Verify _team_source instantiates FileTeamSource when path points to a raw directory containing text files."""
+def test_build_team_source_rejects_unexpected_manifest_format(tmp_path: Path) -> None:
+    """Verify callers can enforce the runtime format against manifest metadata."""
+    path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+
+    with pytest.raises(ValueError, match="Corpus format mismatch"):
+        build_team_source(path, expected_format_id=FORMAT.bo3_format)
+
+    source = build_team_source(path, expected_format_id=manifest.format_id)
+    assert isinstance(source, CorpusTeamSource)
+
+
+def test_build_team_source_falls_back_to_file_source(tmp_path: Path) -> None:
+    """Verify the team-source factory falls back for a raw team directory."""
     pool_dir = tmp_path / "pool"
     pool_dir.mkdir()
     team_text = "\n\n".join(
@@ -1234,8 +1230,18 @@ def test_team_source_composition_falls_back_to_file_source(tmp_path: Path) -> No
         for i in range(1, 7)
     )
     (pool_dir / "team.txt").write_text(team_text, encoding="utf-8")
-    source = _team_source(TeamSourceConfig(path=pool_dir))
+    source = build_team_source(pool_dir)
     assert isinstance(source, FileTeamSource)
+
+
+def test_build_team_source_rejects_invalid_manifest(tmp_path: Path) -> None:
+    """Verify a present manifest is authoritative and malformed content raises."""
+    pool_dir = tmp_path / "pool"
+    pool_dir.mkdir()
+    (pool_dir / "corpus_manifest.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid corpus manifest"):
+        build_team_source(pool_dir)
 
 
 def test_corpus_cli_build_and_audit(
@@ -1261,32 +1267,28 @@ def test_corpus_cli_build_and_audit(
     (input_dir / "v1.txt").write_text(team_text_1, encoding="utf-8")
     (input_dir / "v2.txt").write_text(team_text_2, encoding="utf-8")
 
-    output_manifest = tmp_path / "output" / "corpus_manifest.json"
-    pool_dir = tmp_path / "pools"
+    all_dir = tmp_path / "pools" / "all"
 
     corpus_main(
         [
             "build",
             "--input",
             str(input_dir),
-            "--output",
-            str(output_manifest),
-            "--pool-dir",
-            str(pool_dir),
+            "--output-dir",
+            str(all_dir),
             "--format-id",
             FORMAT.battle_format,
         ]
     )
 
-    assert output_manifest.is_file()
-    assert (pool_dir / "all" / "corpus_manifest.json").is_file()
+    assert (all_dir / "corpus_manifest.json").is_file()
 
     captured = capsys.readouterr()
     audit_data = json.loads(captured.out.split("\n")[-2]) if captured.out.strip() else {}
     assert audit_data["admitted_count"] == 2
     assert audit_data["rejected_count"] == 0
 
-    corpus_main(["audit", "--manifest", str(output_manifest)])
+    corpus_main(["audit", "--path", str(all_dir)])
     audit_captured = capsys.readouterr()
     re_audit_data = (
         json.loads(audit_captured.out.split("\n")[-2]) if audit_captured.out.strip() else {}
@@ -1294,8 +1296,8 @@ def test_corpus_cli_build_and_audit(
     assert re_audit_data["admitted_count"] == 2
 
 
-def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> None:
-    """Verify _team_source resolves corpus_manifest.json located inside directory path."""
+def test_build_team_source_resolves_directory_manifest(tmp_path: Path) -> None:
+    """Verify the team-source factory resolves a manifest inside a pool directory."""
     tokenizer = PokemonTokenizer(_mock_vocab())
     contract_hash = current_manifest().global_sha256
     v1 = _mock_team_variant("Pikachu")
@@ -1309,12 +1311,9 @@ def test_team_source_composition_resolves_directory_manifest(tmp_path: Path) -> 
     pool_dir = tmp_path / "pool_all"
     pool_dir.mkdir(parents=True, exist_ok=True)
     (pool_dir / "corpus_manifest.json").write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    (pool_dir / "invalid-team.txt").write_text("not a team", encoding="utf-8")
 
-    source = _team_source(
-        TeamSourceConfig(path=pool_dir),
-        corpus_config=CorpusConfig(agent_split="train"),
-        is_agent=True,
-    )
+    source = build_team_source(pool_dir)
     assert isinstance(source, CorpusTeamSource)
 
 

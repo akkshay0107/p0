@@ -17,8 +17,9 @@ from p0.teams.corpus import TeamCorpusManifest
 from p0.teams.corpus_build import (
     audit_corpus,
     build_corpus,
-    populate_pool_directories,
+    write_corpus_manifest,
 )
+from p0.teams.factory import corpus_manifest_path
 from p0.teams.spread_usage import load_spread_table_file
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord, normalize_id
@@ -179,22 +180,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Input file or directory containing team definitions or export strings",
     )
     build_parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Output manifest file path",
-    )
-    build_parser.add_argument(
-        "--pool-dir",
+        "--output-dir",
         type=Path,
         default=None,
-        help="Optional directory to populate split pools",
-    )
-    build_parser.add_argument(
-        "--reduced-limit",
-        type=int,
-        default=64,
-        help="Number of top usage entries to retain in the reduced pool",
+        help="Pool directory for the manifest; defaults to the input directory",
     )
     build_parser.add_argument(
         "--format-id",
@@ -222,10 +211,10 @@ def _parser() -> argparse.ArgumentParser:
 
     audit_parser = subparsers.add_parser("audit")
     audit_parser.add_argument(
-        "--manifest",
+        "--path",
         type=Path,
         required=True,
-        help="Corpus manifest file path",
+        help="Team pool directory or corpus manifest path",
     )
     return parser
 
@@ -250,18 +239,18 @@ def main(argv: list[str] | None = None) -> None:
             ratio_val=args.val_ratio,
             ratio_test=args.test_ratio,
         )
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        if args.pool_dir is not None:
-            populate_pool_directories(manifest, args.pool_dir, reduced_limit=args.reduced_limit)
+        if not manifest.entries:
+            raise ValueError(f"No admitted teams found in input path: {args.input}")
+        output_dir = args.output_dir
+        if output_dir is None:
+            output_dir = args.input if args.input.is_dir() else args.input.parent
+        write_corpus_manifest(manifest, output_dir)
         print(json.dumps(audit, sort_keys=True))
         return
 
     if args.command == "audit":
-        raw = json.loads(args.manifest.read_text(encoding="utf-8"))
+        manifest_path = corpus_manifest_path(args.path)
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest = TeamCorpusManifest.from_dict(raw)
 
         audit = audit_corpus(manifest)

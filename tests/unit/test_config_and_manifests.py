@@ -17,6 +17,7 @@ from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.status import Status
 
 from p0.cli.build_vocab import build
+from p0.cli.train import _parser as train_parser
 from p0.format_config import (
     ACTION_CONTRACT,
     FORMAT,
@@ -88,19 +89,9 @@ def test_load_config_applies_partial_yaml_to_source_defaults(tmp_path: Path) -> 
             "magnet_refresh_interval",
         ),
         (
-            "removed team-source kind",
-            "environment:\n  agent_team_source:\n    kind: directory_magic\n",
-            "unknown TeamSourceConfig field",
-        ),
-        (
             "mismatched bot format",
             "bot:\n  battle_format: gen9anythinggoes\n",
             "battle_format",
-        ),
-        (
-            "invalid corpus sampling policy",
-            "corpus:\n  sampling_policy: made_up\n",
-            "sampling_policy",
         ),
         (
             "removed bo3 switch",
@@ -140,7 +131,7 @@ def test_config_is_immutable(tmp_path: Path) -> None:
         setattr(config.training, "n_envs", 1)
 
 
-def test_paths_and_team_source_paths_resolve_once_from_project_root(tmp_path: Path) -> None:
+def test_paths_and_team_pool_paths_resolve_once_from_project_root(tmp_path: Path) -> None:
     """Verify relative paths configured in YAML resolve deterministically against the project root directory."""
     config = load_config(
         write_config(
@@ -148,19 +139,17 @@ def test_paths_and_team_source_paths_resolve_once_from_project_root(tmp_path: Pa
             """
 paths:
   data_root: relative-data
-environment:
-  agent_team_source:
-    path: team-pool
+teams:
+  all: team-pool
+  reduced: reduced-pool
 """,
         )
     )
 
     assert config.paths.repository_root.is_absolute()
     assert config.paths.data_root == (Path(__file__).parents[2] / "relative-data").resolve()
-    assert (
-        config.environment.agent_team_source.path
-        == (Path(__file__).parents[2] / "teams" / "team-pool").resolve()
-    )
+    assert config.teams.all == (Path(__file__).parents[2] / "teams" / "team-pool").resolve()
+    assert config.teams.reduced == (Path(__file__).parents[2] / "teams" / "reduced-pool").resolve()
 
 
 def test_model_config_is_checkpoint_local_and_validated() -> None:
@@ -309,13 +298,14 @@ def test_model_config_has_only_scaling_fields() -> None:
         ModelConfig(d_model=96, nhead=3, reducer_layers=1, dim_feedforward=128)
 
 
-def test_reserved_config_sections(tmp_path: Path) -> None:
-    """Verify example config sections (bc, corpus, evaluation) load correctly and disallow conflicting objective parameters."""
+def test_config_sections(tmp_path: Path) -> None:
+    """Verify current config sections load correctly and disallow conflicting objective parameters."""
     config = load_config("config.example.yaml")
     assert config.bc.batch_decisions == 256
     assert config.bc.gamma == config.training.gamma
     assert config.bc.value_coef == config.training.value_coef
-    assert config.corpus.agent_split == "train"
+    assert config.teams.all == (ROOT / "teams" / "all").resolve()
+    assert config.teams.reduced == (ROOT / "teams" / "reduced").resolve()
     assert config.evaluation.episodes_per_matchup == 20
     bad = tmp_path / "config.yaml"
     bad.write_text("bc:\n  bogus: 1\n", encoding="utf-8")
@@ -332,6 +322,13 @@ def test_reserved_config_sections(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="bc.gamma must match training.gamma"):
         GlobalConfig(training=TrainingConfig(gamma=0.95), bc=BCConfig(gamma=0.9))
+
+
+def test_train_cli_selects_agent_team_source() -> None:
+    assert train_parser().parse_args([]).agent_team_source == "all"
+    assert (
+        train_parser().parse_args(["--agent-team-source", "reduced"]).agent_team_source == "reduced"
+    )
 
 
 def test_schema_modules_stay_pure() -> None:

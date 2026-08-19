@@ -119,18 +119,14 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class TeamSourceConfig:
-    path: Path = Path("all")
+class TeamsConfig:
+    all: Path = Path("all")
+    reduced: Path = Path("reduced")
 
     def __post_init__(self) -> None:
-        if not str(self.path).strip():
-            raise ValueError("TeamSourceConfig.path must not be empty")
-
-
-@dataclass(frozen=True, slots=True)
-class EnvironmentConfig:
-    agent_team_source: TeamSourceConfig = TeamSourceConfig()
-    opponent_team_source: TeamSourceConfig = TeamSourceConfig()
+        for name, path in (("all", self.all), ("reduced", self.reduced)):
+            if not str(path).strip():
+                raise ValueError(f"teams.{name} must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,9 +153,9 @@ class BotConfig:
             raise ValueError("bot.top_p must be in (0, 1]")
 
 
-# The bc, corpus, and evaluation sections are reserved here so their
-# workstreams only ever touch their own dataclass's field list; adding a new
-# root section requires editing GlobalConfig and load_config in one place.
+# The bc and evaluation sections are reserved here so their workstreams only
+# ever touch their own dataclass's field list; adding a new root section
+# requires editing GlobalConfig and load_config in one place.
 @dataclass(frozen=True, slots=True)
 class BCConfig:
     batch_decisions: int = 256
@@ -221,23 +217,6 @@ class BCConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class CorpusConfig:
-    manifest_path: Path = Path("teams/corpus_manifest.json")
-    agent_split: str = "train"
-
-    def __post_init__(self) -> None:
-        for name, value in (
-            ("manifest_path", str(self.manifest_path)),
-            ("agent_split", self.agent_split),
-        ):
-            if not value.strip():
-                raise ValueError(f"corpus.{name} must not be empty")
-
-        if self.agent_split.upper() not in {"TRAIN", "VALIDATION", "TEST"}:
-            raise ValueError("corpus.agent_split must be train, validation, or test")
-
-
-@dataclass(frozen=True, slots=True)
 class EvalConfig:
     episodes_per_matchup: int = 20
     seed: int = 0
@@ -255,10 +234,9 @@ class EvalConfig:
 class GlobalConfig:
     training: TrainingConfig = TrainingConfig()
     paths: ProjectPaths = DEFAULT_PATHS
-    environment: EnvironmentConfig = EnvironmentConfig()
+    teams: TeamsConfig = TeamsConfig()
     bot: BotConfig = BotConfig()
     bc: BCConfig = BCConfig()
-    corpus: CorpusConfig = CorpusConfig()
     evaluation: EvalConfig = EvalConfig()
 
     def __post_init__(self) -> None:
@@ -308,16 +286,10 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
         ),
         team_files=tuple(_resolve_path(path, repository_root) for path in config.bot.team_files),
     )
-    environment = replace(
-        config.environment,
-        agent_team_source=replace(
-            config.environment.agent_team_source,
-            path=_resolve_path(config.environment.agent_team_source.path, paths.teams_root),
-        ),
-        opponent_team_source=replace(
-            config.environment.opponent_team_source,
-            path=_resolve_path(config.environment.opponent_team_source.path, paths.teams_root),
-        ),
+    teams = replace(
+        config.teams,
+        all=_resolve_path(config.teams.all, paths.teams_root),
+        reduced=_resolve_path(config.teams.reduced, paths.teams_root),
     )
     bc = replace(
         config.bc,
@@ -330,10 +302,6 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
             else _resolve_path(config.bc.resume_checkpoint, repository_root)
         ),
     )
-    corpus = replace(
-        config.corpus,
-        manifest_path=_resolve_path(config.corpus.manifest_path, repository_root),
-    )
     evaluation = replace(
         config.evaluation,
         report_dir=_resolve_path(config.evaluation.report_dir, repository_root),
@@ -343,9 +311,8 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
         config,
         paths=paths,
         bot=bot,
-        environment=environment,
+        teams=teams,
         bc=bc,
-        corpus=corpus,
         evaluation=evaluation,
     )
 
@@ -365,21 +332,6 @@ def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
         values["team_files"] = tuple(values["team_files"])
 
     return cls(**values)
-
-
-def _build_environment(values: Any) -> EnvironmentConfig:
-    if not isinstance(values, Mapping):
-        raise ValueError("EnvironmentConfig must be a mapping")
-
-    names = {field.name for field in fields(EnvironmentConfig)}
-    unknown = set(values) - names
-    if unknown:
-        raise ValueError(f"unknown EnvironmentConfig field(s): {', '.join(sorted(unknown))}")
-
-    return EnvironmentConfig(
-        agent_team_source=_build_section(TeamSourceConfig, values["agent_team_source"]),
-        opponent_team_source=_build_section(TeamSourceConfig, values["opponent_team_source"]),
-    )
 
 
 def load_config(config_path: str | Path | None = None) -> GlobalConfig:
@@ -426,10 +378,9 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
         config = GlobalConfig(
             training=training,
             paths=_build_section(ProjectPaths, values["paths"]),
-            environment=_build_environment(values["environment"]),
+            teams=_build_section(TeamsConfig, values["teams"]),
             bot=_build_section(BotConfig, values["bot"], bot=True),
             bc=_build_section(BCConfig, bc_values),
-            corpus=_build_section(CorpusConfig, values["corpus"]),
             evaluation=_build_section(EvalConfig, values["evaluation"]),
         )
         return _resolve_paths(config)

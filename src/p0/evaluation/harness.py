@@ -21,8 +21,9 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.rl_player import RLPlayer, TeamPlayerMixin
 from p0.runtime import poke_env_patches
-from p0.teams.corpus import CorpusSourceSpec, CorpusSplit
-from p0.teams.corpus_source import CorpusTeamPool, CorpusTeamSource
+from p0.teams.corpus import CorpusSplit
+from p0.teams.corpus_source import CorpusTeamSource
+from p0.teams.factory import build_team_source
 from p0.teams.source import FixedTeamSource, TeamSource
 
 # Default Pikachu/Charizard test team used as fallback when no corpus is available
@@ -216,8 +217,7 @@ class EvaluationHarness:
     def __init__(
         self,
         *,
-        corpus_path: Path | None = None,
-        corpus_hash: str = "",
+        teams_path: Path | None = None,
         format_id: str = FORMAT.bo3_format,
         episodes_per_matchup: int = 20,
         seed: int = 0,
@@ -229,8 +229,7 @@ class EvaluationHarness:
                 f"EvaluationHarness only supports the Bo3 format {FORMAT.bo3_format!r}; "
                 f"got {format_id!r}"
             )
-        self.corpus_path = corpus_path
-        self.corpus_hash = corpus_hash
+        self.teams_path = teams_path
         self.format_id = format_id
         self.episodes_per_matchup = episodes_per_matchup
         self.seed = seed
@@ -248,35 +247,25 @@ class EvaluationHarness:
             "test_unseen_canonical": CorpusSplit.TEST,
         }
         failures: dict[str, str] = {}
-        if self.corpus_path is not None and self.corpus_path.exists() and self.corpus_hash:
-            logger.info("Loading team splits from corpus manifest: %s", self.corpus_path)
-            base_spec = CorpusSourceSpec(
-                corpus_path=str(self.corpus_path),
-                corpus_hash=self.corpus_hash,
-                format_id=self.format_id,
-                split=CorpusSplit.TRAIN,
-            )
-            try:
-                pool = CorpusTeamPool.from_spec(base_spec)
-            except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
-                failures = {key: str(exc) for key in categories}
-            else:
-                for key, split in categories.items():
-                    spec = CorpusSourceSpec(
-                        corpus_path=str(self.corpus_path),
-                        corpus_hash=self.corpus_hash,
-                        format_id=self.format_id,
+        if self.teams_path is not None:
+            logger.info("Loading team splits from team pool: %s", self.teams_path)
+            for key, split in categories.items():
+                try:
+                    source = build_team_source(
+                        self.teams_path,
                         split=split,
+                        expected_format_id=self.format_id,
                     )
-                    try:
-                        sources[key] = CorpusTeamSource(spec, pool=pool)
-                        self.category_metadata[key] = {
-                            **dict(sources[key].describe()),
-                            "status": "ready",
-                            "fallback": False,
-                        }
-                    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
-                        failures[key] = str(exc)
+                    if not isinstance(source, CorpusTeamSource):
+                        raise ValueError("team pool does not contain a corpus manifest")
+                    sources[key] = source
+                    self.category_metadata[key] = {
+                        **dict(source.describe()),
+                        "status": "ready",
+                        "fallback": False,
+                    }
+                except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+                    failures[key] = str(exc)
 
         else:
             failures = {key: "corpus manifest is unavailable" for key in categories}

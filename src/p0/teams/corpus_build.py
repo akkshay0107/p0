@@ -350,49 +350,13 @@ def build_corpus(
     return manifest, audit
 
 
-def populate_pool_directories(
-    manifest: TeamCorpusManifest,
-    output_root: Path | str,
-    reduced_limit: int = 64,
-) -> None:
-    """Populate durable teams/all and teams/reduced pool directories."""
-    if reduced_limit < 1:
-        raise ValueError("reduced_limit must be a positive integer")
-    root = Path(output_root)
-    all_dir = root / "all"
-    reduced_dir = root / "reduced"
-    all_dir.mkdir(parents=True, exist_ok=True)
-    reduced_dir.mkdir(parents=True, exist_ok=True)
-
-    all_manifest_path = all_dir / "corpus_manifest.json"
-    all_manifest_path.write_text(
+def write_corpus_manifest(manifest: TeamCorpusManifest, output_dir: Path | str) -> Path:
+    """Write one corpus manifest into its pool directory."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "corpus_manifest.json"
+    manifest_path.write_text(
         json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-
-    ordered_reduced = tuple(
-        sorted(
-            manifest.entries,
-            key=lambda entry: (-entry.usage_count, entry.canonical_hash, entry.packed_sha256),
-        )[:reduced_limit]
-    )
-
-    reduced_manifest = TeamCorpusManifest(
-        artifact_schema=manifest.artifact_schema,
-        global_contract_sha256=manifest.global_contract_sha256,
-        format_id=manifest.format_id,
-        corpus_hash=corpus_content_hash(ordered_reduced),
-        entries=ordered_reduced,
-        created_at=manifest.created_at,
-        sampling_metadata={
-            **dict(manifest.sampling_metadata),
-            "pool_kind": "reduced",
-            "reduced_limit": reduced_limit,
-        },
-    )
-
-    reduced_manifest_path = reduced_dir / "corpus_manifest.json"
-    reduced_manifest_path.write_text(
-        json.dumps(reduced_manifest.to_dict(), sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    return manifest_path

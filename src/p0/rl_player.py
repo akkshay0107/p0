@@ -33,6 +33,7 @@ from p0.model.token_store import SeriesTokenStore
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
+from p0.teams.factory import build_team_source
 from p0.teams.source import FileTeamSource, TeamSource
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import load_config
@@ -566,9 +567,7 @@ def parse_args(argv: list[str] | None = None) -> RLBotConfig:
     parser.add_argument(
         "--team-pool",
         choices=("all", "reduced"),
-        default=os.getenv(
-            "SHOWDOWN_TEAM_POOL", str(app_defaults.environment.agent_team_source.path)
-        ),
+        default=os.getenv("SHOWDOWN_TEAM_POOL", "all"),
         help="Named team pool under the teams directory.",
     )
     parser.add_argument(
@@ -672,12 +671,14 @@ async def run_bot(
       None
     """
     poke_env_patches.install()
-    root_dir = load_config().paths.repository_root
+    app_config = load_config()
 
     team_source = (
         FileTeamSource.from_files(config.team_files)
         if config.team_files
-        else FileTeamSource(root_dir / "teams" / config.team_pool)
+        else build_team_source(
+            app_config.teams.all if config.team_pool == "all" else app_config.teams.reduced
+        )
     )
     checkpoint_path = config.checkpoint_path
 
