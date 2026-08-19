@@ -6,6 +6,7 @@ from pathlib import Path
 
 import orjson
 
+from p0.format_config import is_corpus_format_compatible
 from p0.teams.corpus import CorpusSourceSpec, CorpusSplit, load_corpus_manifest
 from p0.teams.corpus_source import CorpusTeamPool, CorpusTeamSource
 from p0.teams.source import FileTeamSource, TeamSource
@@ -58,7 +59,9 @@ def _build_corpus_source(
     except (OSError, UnicodeError, orjson.JSONDecodeError, TypeError, ValueError) as exc:
         raise ValueError(f"Invalid corpus manifest: {manifest_path}") from exc
 
-    if expected_format_id is not None and manifest.format_id != expected_format_id:
+    if expected_format_id is not None and not is_corpus_format_compatible(
+        expected_format_id, manifest.format_id
+    ):
         raise ValueError(
             f"Corpus format mismatch: manifest={manifest.format_id!r}, "
             f"expected={expected_format_id!r}"

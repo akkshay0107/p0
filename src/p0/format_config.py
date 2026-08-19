@@ -809,3 +809,10 @@ RESOURCE_FEATURE_ABI = active_global_contract().payload("resources", "major")[
     "resource_feature_abi"
 ]
 ACTION_CONTRACT = dict(active_global_contract().payload("actions", "major"))
+
+
+def is_corpus_format_compatible(model_format_id: str, corpus_format_id: str) -> bool:
+    """Return whether a corpus format can provide teams to a model format."""
+    return corpus_format_id == model_format_id or (
+        model_format_id == FORMAT.bo3_format and corpus_format_id == FORMAT.battle_format
+    )

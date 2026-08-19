@@ -1210,15 +1210,23 @@ def test_build_team_source_resolves_corpus_manifest(tmp_path: Path) -> None:
     assert desc["sampling"] == "uniform_canonical"
 
 
-def test_build_team_source_rejects_unexpected_manifest_format(tmp_path: Path) -> None:
-    """Verify callers can enforce the runtime format against manifest metadata."""
+def test_build_team_source_accepts_regular_manifest_for_bo3(tmp_path: Path) -> None:
+    """Verify a regular-format corpus can feed a Bo3 model."""
     path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+
+    source = build_team_source(path, expected_format_id=FORMAT.bo3_format)
+    assert isinstance(source, CorpusTeamSource)
+    assert source.describe()["format_id"] == manifest.format_id
+
+
+def test_build_team_source_rejects_incompatible_manifest_format(tmp_path: Path) -> None:
+    """Verify unsupported corpus and model format pairs fail loudly."""
+    path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+    incompatible = replace(manifest, format_id="unsupported-format")
+    path.write_text(json.dumps(incompatible.to_dict()), encoding="utf-8")
 
     with pytest.raises(ValueError, match="Corpus format mismatch"):
         build_team_source(path, expected_format_id=FORMAT.bo3_format)
-
-    source = build_team_source(path, expected_format_id=manifest.format_id)
-    assert isinstance(source, CorpusTeamSource)
 
 
 def test_build_team_source_falls_back_to_file_source(tmp_path: Path) -> None:

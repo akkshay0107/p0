@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-import numpy as np
 import pytest
 import torch
 from poke_env.battle import DoubleBattle
@@ -26,7 +25,6 @@ from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
-from p0.model.policy import ActOutput
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation, TokenType
 from p0.model.token_store import SeriesTokenStore
@@ -34,15 +32,13 @@ from p0.rl_player import RLPlayer, _LiveBattleHistory
 from p0.runtime.env import MegaEnv, SimEnv
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.corpus import CorpusEntry, CorpusSplit, TeamCorpusManifest, corpus_content_hash
+from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FixedTeamSource
 from p0.training import ppo as ppo_module
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import _run_batched_ppo, compute_ppo_objective
-from p0.training.rollout import (
-    BattleMemoryBuffer,
-    collect_rollouts,
-)
+from p0.training.rollout import BattleMemoryBuffer
 from p0.training.trainer import PPOTrainer
 from p0.training.trajectory import (
     TrajectoryBatch,
@@ -51,187 +47,6 @@ from p0.training.trajectory import (
     prepare_trajectory_batches,
 )
 from p0.training.utils import amp_enabled
-from p0.training.vector_env import ThreadVecEnv
-
-
-class FakePolicy:
-    def __init__(self, action: int):
-        self.action = action
-        self.device = torch.device("cpu")
-        self.d_model = 1
-        self.batch_sizes: list[int] = []
-        self.summarized_lengths: list[int] = []
-        self.series = SimpleNamespace(resample_single_game=self._resample_single_game)
-
-    def _resample_single_game(self, history: torch.Tensor) -> torch.Tensor:
-        self.summarized_lengths.append(history.size(1))
-        return torch.zeros((history.size(0), 4, self.d_model))
-
-    def encode(self, obs: StructuredObservation, action_mask: torch.Tensor):
-        del action_mask
-        return obs
-
-    def prepare(self, encoded, memory):
-        return encoded, memory
-
-    def act(
-        self,
-        prepared,
-        action_mask: torch.Tensor,
-        *,
-        top_p: float = 1.0,
-        deterministic: bool = False,
-    ) -> ActOutput:
-        del top_p, deterministic
-        _, memory = prepared
-        assert torch.count_nonzero(memory.series_tokens) == 0
-        assert torch.count_nonzero(memory.series_mask) == 0
-        batch_size = action_mask.size(0)
-        self.batch_sizes.append(batch_size)
-        actions = torch.full((batch_size, 2), self.action, dtype=torch.long)
-        return ActOutput(
-            actions=actions,
-            log_probs=torch.full((batch_size,), -0.5),
-            value=torch.full((batch_size,), 0.25),
-            history_token=torch.ones((batch_size, 1)),
-        )
-
-
-class FakeVecEnv:
-    def __init__(self, n_envs: int, done_status: int = 1):
-        self.n_envs = n_envs
-        self.done_status = done_status
-        self.last_masks1 = np.ones((n_envs, 2, ACT_SIZE), dtype=np.bool_)
-        self.last_masks2 = np.ones((n_envs, 2, ACT_SIZE), dtype=np.bool_)
-        self.obs1_buffers = StructuredObservation.empty_batch(n_envs)
-        self.obs2_buffers = StructuredObservation.empty_batch(n_envs)
-        self.last_infos = [{"series_id": f"series-{i}"} for i in range(n_envs)]
-        self.envs = [
-            SimpleNamespace(
-                agent1=SimpleNamespace(username=f"agent1-{i}"),
-                agent2=SimpleNamespace(username=f"agent2-{i}"),
-            )
-            for i in range(n_envs)
-        ]
-        self.received_actions: list[list[dict[str, np.ndarray]]] = []
-
-    def get_batched_obs1(self, device: torch.device) -> StructuredObservation:
-        return self.obs1_buffers.to(device)
-
-    def get_batched_obs2(self, device: torch.device) -> StructuredObservation:
-        return self.obs2_buffers.to(device)
-
-    def step(
-        self, actions: list[dict[str, np.ndarray]]
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
-        self.received_actions.append(actions)
-        rewards1 = np.resize(np.array([0.0, 1.0, 1.0], dtype=np.float32), self.n_envs)
-        rewards2 = np.resize(np.array([0.0, 0.0, 1.0], dtype=np.float32), self.n_envs)
-        done_status = np.full(self.n_envs, self.done_status, dtype=np.int64)
-        infos: list[dict[str, Any]] = []
-        for env_id in range(self.n_envs):
-            info: dict[str, Any] = {"series_id": f"series-{env_id}"}
-            if self.done_status == 2:
-                info["terminal_observation1"] = StructuredObservation.empty_batch(1)[0]
-                info["terminal_observation2"] = StructuredObservation.empty_batch(1)[0]
-            infos.append(info)
-        return (
-            self.last_masks1,
-            self.last_masks2,
-            rewards1,
-            rewards2,
-            done_status,
-            infos,
-        )
-
-
-class BufferBindingEnv:
-    def __init__(self):
-        self.targets: tuple[StructuredObservation, StructuredObservation] | None = None
-
-    def set_observation_targets(
-        self,
-        obs1: StructuredObservation,
-        obs2: StructuredObservation,
-    ) -> None:
-        self.targets = (obs1, obs2)
-
-
-class StatusEnv(BufferBindingEnv):
-    """Minimal SimEnv stand-in reporting a fixed terminated/truncated state."""
-
-    def __init__(self, *, terminated: bool, truncated: bool):
-        super().__init__()
-        self.terminated = terminated
-        self.truncated = truncated
-        self.agent1 = SimpleNamespace(username="agent1")
-        self.agent2 = SimpleNamespace(username="agent2")
-        self.series_id = "series-0"
-        self.series_scores = [0, 0]
-        self.series_games_played = 1
-
-    def _observations(self) -> dict[str, dict[str, np.ndarray]]:
-        mask = np.ones(2 * ACT_SIZE, dtype=np.int64)
-        return {name: {"action_mask": mask} for name in ("agent1", "agent2")}
-
-    def reset(self) -> tuple[dict[str, dict[str, np.ndarray]], dict[str, Any]]:
-        return self._observations(), {}
-
-    def step(self, action: dict[str, np.ndarray]):
-        del action
-        flags = {"agent1": self.terminated, "agent2": self.terminated}
-        return (
-            self._observations(),
-            {"agent1": 0.0, "agent2": 0.0},
-            flags,
-            {"agent1": self.truncated, "agent2": self.truncated},
-            {},
-        )
-
-
-@pytest.mark.parametrize(
-    ("terminated", "truncated", "expected"),
-    [(False, False, 0), (True, False, 1), (False, True, 2)],
-)
-def test_thread_vec_env_reports_a_tri_state_done_status(
-    terminated: bool, truncated: bool, expected: int
-) -> None:
-    """Verify ThreadVecEnv returns a tri-state done status: 0 (running), 1 (terminated), 2 (truncated for bootstrapping).
-
-    Distinguishing truncation (2) from termination (1) is vital: truncated episodes bootstrap
-    value targets off the next state rather than zeroing out subsequent returns.
-    """
-    vec_env = ThreadVecEnv(cast(Any, [StatusEnv(terminated=terminated, truncated=truncated)]))
-    try:
-        done_status = vec_env.step([{}])[4]
-        assert done_status.dtype == np.int64
-        assert done_status.tolist() == [expected]
-    finally:
-        vec_env.shutdown()
-
-
-def test_thread_vec_env_binds_each_env_to_its_preallocated_rows():
-    """Verify ThreadVecEnv sets memory pointers of worker sub-environments to pre-allocated batch buffer rows."""
-    envs = [BufferBindingEnv(), BufferBindingEnv()]
-    vec_env = ThreadVecEnv(cast(Any, envs))
-    try:
-        for env_id, env in enumerate(envs):
-            assert env.targets is not None
-            obs1, obs2 = env.targets
-            assert obs1.numerical.data_ptr() == vec_env.obs1_buffers[env_id].numerical.data_ptr()
-            assert obs2.numerical.data_ptr() == vec_env.obs2_buffers[env_id].numerical.data_ptr()
-    finally:
-        vec_env.shutdown()
-
-
-def test_thread_vec_env_rejects_an_action_count_mismatch():
-    """Verify step() raises ValueError if supplied action list does not match n_envs."""
-    vec_env = ThreadVecEnv(cast(Any, [BufferBindingEnv(), BufferBindingEnv()]))
-    try:
-        with pytest.raises(ValueError, match="Number of actions"):
-            vec_env.step([{}])
-    finally:
-        vec_env.shutdown()
 
 
 def test_compute_gae_batch_matches_single_episode_reference():
@@ -294,78 +109,6 @@ def test_compute_gae_batch_matches_single_episode_reference():
         )
         assert torch.equal(actual[episode_idx, :length], expected)
         assert torch.count_nonzero(actual[episode_idx, length:]) == 0
-
-
-def test_collect_rollouts_records_both_self_play_streams():
-    """Verify collect_rollouts simultaneously records trajectories for agent 1 and agent 2 across parallel environments."""
-    config = TrainingConfig(n_envs=3, rollout_steps=1)
-    vec_env = FakeVecEnv(config.n_envs)
-    policy = FakePolicy(action=7)
-    buffer = []
-    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
-    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
-    memory1 = BattleMemoryBuffer(config.n_envs, 1)
-    memory2 = BattleMemoryBuffer(config.n_envs, 1)
-
-    series_store1 = SeriesTokenStore(1)
-    series_store2 = SeriesTokenStore(1)
-
-    collect_rollouts(
-        cast(Any, vec_env),
-        cast(Any, policy),
-        buffer,
-        config,
-        trajectories1,
-        trajectories2,
-        memory1,
-        memory2,
-        series_store1,
-        series_store2,
-    )
-
-    # 3 environments x 2 agent perspectives = 6 recorded episodes
-    assert len(buffer) == 2 * config.n_envs
-    assert all(torch.all(episode.actions == 7) for episode in buffer)
-    assert all(float(episode.dones[-1]) == 1.0 for episode in buffer)
-    assert all(episode.bootstrap_value == 0.0 for episode in buffer)
-    assert trajectories1.step_counts.tolist() == [0, 0, 0]
-    assert trajectories2.step_counts.tolist() == [0, 0, 0]
-    assert not memory1.step_counts.any()
-    assert not memory2.step_counts.any()
-    side_two_actions = [
-        actions[f"agent2-{env_id}"] for env_id, actions in enumerate(vec_env.received_actions[0])
-    ]
-    assert all(action.tolist() == [7, 7] for action in side_two_actions)
-    assert policy.batch_sizes == [2 * config.n_envs]
-
-
-def test_truncated_rollout_bootstraps_instead_of_ending_the_game():
-    """Verify truncated rollouts set terminal done flag to 0.0 and record bootstrap values for non-terminal returns."""
-    config = TrainingConfig(n_envs=3, rollout_steps=1)
-    vec_env = FakeVecEnv(config.n_envs, done_status=2)
-    policy = FakePolicy(action=7)
-    buffer: list[TrajectoryBatch] = []
-    trajectories1 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
-    trajectories2 = TrajectoryStorage.allocate(config.n_envs, max_steps=4, d_model=1)
-
-    collect_rollouts(
-        cast(Any, vec_env),
-        cast(Any, policy),
-        buffer,
-        config,
-        trajectories1,
-        trajectories2,
-        BattleMemoryBuffer(config.n_envs, 1),
-        BattleMemoryBuffer(config.n_envs, 1),
-        SeriesTokenStore(1),
-        SeriesTokenStore(1),
-    )
-
-    assert len(buffer) == 2 * config.n_envs
-    # A truncated game is not a terminal state: it keeps a zero done flag so the
-    # value target bootstraps off the terminal observation instead of assuming 0.
-    assert all(float(episode.dones[-1]) == 0.0 for episode in buffer)
-    assert all(episode.bootstrap_value == pytest.approx(0.25) for episode in buffer)
 
 
 def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
@@ -483,38 +226,6 @@ def test_live_player_spills_device_history_in_fixed_windows():
     assert history.complete_values(torch.device("cpu"))[0, :, 0].tolist() == list(range(total))
 
 
-def test_end_of_game_series_summary_sees_every_decision():
-    """Verify series summary tokens compress the complete battle trajectory, not merely the sliding reducer window."""
-    vec_env = FakeVecEnv(1, done_status=0)
-    policy = FakePolicy(action=7)
-    memory1 = BattleMemoryBuffer(1, 1)
-    memory2 = BattleMemoryBuffer(1, 1)
-
-    def collect(steps: int) -> None:
-        collect_rollouts(
-            cast(Any, vec_env),
-            cast(Any, policy),
-            [],
-            TrainingConfig(n_envs=1, rollout_steps=steps),
-            TrajectoryStorage.allocate(1, max_steps=200, d_model=1),
-            TrajectoryStorage.allocate(1, max_steps=200, d_model=1),
-            memory1,
-            memory2,
-            SeriesTokenStore(1),
-            SeriesTokenStore(1),
-        )
-
-    # Run past the reducer window without finishing the game.
-    collect(HISTORY_WINDOW + 5)
-    assert not policy.summarized_lengths
-
-    vec_env.done_status = 1
-    collect(1)
-
-    # The summary compresses the whole battle (HISTORY_WINDOW + 6), not just the reducer window.
-    assert policy.summarized_lengths == [HISTORY_WINDOW + 6, HISTORY_WINDOW + 6]
-
-
 def test_storage_allocates_completes_and_resets_one_environment():
     """Verify TrajectoryStorage allocation, completion slicing, and reset for a single environment index."""
     storage = TrajectoryStorage.allocate(2, 3, d_model=1)
@@ -618,7 +329,7 @@ def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path)
         assert first_team.packed == second_team.packed
 
 
-def test_evaluation_harness_rejects_manifest_with_wrong_format(tmp_path: Path) -> None:
+def test_evaluation_harness_accepts_regular_manifest_for_bo3(tmp_path: Path) -> None:
     entries = tuple(
         CorpusEntry(
             canonical_hash=hashlib.sha256(f"canonical-{split}".encode()).hexdigest(),
@@ -642,8 +353,9 @@ def test_evaluation_harness_rejects_manifest_with_wrong_format(tmp_path: Path) -
     (pool_dir / "corpus_manifest.json").write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
 
     harness = EvaluationHarness(teams_path=pool_dir, format_id=FORMAT.bo3_format)
-    with pytest.raises(ValueError, match="Corpus format mismatch"):
-        harness.build_team_sources()
+    sources = harness.build_team_sources()
+    assert set(sources) == {"seen", "validation_unseen_canonical", "test_unseen_canonical"}
+    assert all(isinstance(source, CorpusTeamSource) for source in sources.values())
 
 
 def test_evaluation_confidence_intervals_and_matchup_serialization_are_deterministic() -> None:

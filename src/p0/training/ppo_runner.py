@@ -154,8 +154,10 @@ def run_training(
         resume_collector_state = resume_metadata.get("collector_state")
     policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
 
-    agent_source = build_team_source(agent_team_path)
-    opponent_source = build_team_source(config.teams.all)
+    agent_source = build_team_source(agent_team_path, expected_format_id=config.bot.battle_format)
+    opponent_source = build_team_source(
+        config.teams.all, expected_format_id=config.bot.battle_format
+    )
 
     with start_showdown_servers(
         training.n_envs,

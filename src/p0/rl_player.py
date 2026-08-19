@@ -677,7 +677,8 @@ async def run_bot(
         FileTeamSource.from_files(config.team_files)
         if config.team_files
         else build_team_source(
-            app_config.teams.all if config.team_pool == "all" else app_config.teams.reduced
+            app_config.teams.all if config.team_pool == "all" else app_config.teams.reduced,
+            expected_format_id=config.battle_format,
         )
     )
     checkpoint_path = config.checkpoint_path
