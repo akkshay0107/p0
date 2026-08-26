@@ -2264,9 +2264,6 @@ def reconstruct_both(
     )
 
 
-reconstruct_game = reconstruct_perspective
-
-
 __all__ = [
     "ReplayMove",
     "ReplayName",
@@ -2274,6 +2271,5 @@ __all__ = [
     "ReconstructedPerspective",
     "ReconstructedSnapshot",
     "reconstruct_both",
-    "reconstruct_game",
     "reconstruct_perspective",
 ]
