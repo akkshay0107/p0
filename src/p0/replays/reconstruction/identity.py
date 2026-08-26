@@ -4,33 +4,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from enum import StrEnum
 
-
-class ReplaySide(StrEnum):
-    """A stable side in the replay rather than a player-relative role."""
-
-    P1 = "p1"
-    P2 = "p2"
-
-    @property
-    def side_index(self) -> int:
-        """Return the zero-based side index."""
-        return 0 if self is ReplaySide.P1 else 1
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class ReplayMemberId:
-    """Stable identity of one member in an ordered open team sheet."""
-
-    side: ReplaySide
-    roster_index: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.side, ReplaySide):
-            raise TypeError("ReplayMemberId.side must be a ReplaySide")
-        if type(self.roster_index) is not int or not 0 <= self.roster_index < 6:
-            raise ValueError("ReplayMemberId.roster_index must be in [0, 6)")
+from p0.replays.identity import ReplayMemberId, ReplaySide
 
 
 @dataclass(frozen=True, slots=True)

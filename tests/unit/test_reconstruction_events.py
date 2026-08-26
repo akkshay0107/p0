@@ -137,6 +137,10 @@ def test_local_golden_replay_is_classified_once_without_rejections() -> None:
     document = parse_replay_payload(_GOLDEN_REPLAY.read_bytes())
     result = parse_protocol_events(document.metadata.replay_id, document.protocol_lines)
 
+    assert all(ots.is_complete for ots in document.ots)
+    assert tuple(member.member_id for member in document.ots[0].members) == tuple(
+        ReplayMemberId(ReplaySide.P1, index) for index in range(6)
+    )
     assert len(result.events) == len(document.protocol_lines) == 186
     assert tuple(event.line_index for event in result.events) == tuple(range(186))
     assert result.diagnostics == ()

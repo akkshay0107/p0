@@ -28,10 +28,18 @@ def golden_replay_payload(
     p1_team = [
         {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
         {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Raichu", "moves": ["Protect", "Thunderbolt"]},
+        {"species": "Jolteon", "moves": ["Protect", "Thunderbolt"]},
+        {"species": "Vaporeon", "moves": ["Protect", "Surf"]},
+        {"species": "Flareon", "moves": ["Protect", "Flare Blitz"]},
     ]
     p2_team = [
         {"species": "Bulbasaur", "moves": ["Protect", "Tackle"]},
         {"species": "Charmander", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Squirtle", "moves": ["Protect", "Water Gun"]},
+        {"species": "Ivysaur", "moves": ["Protect", "Tackle"]},
+        {"species": "Charmeleon", "moves": ["Protect", "Ember"]},
+        {"species": "Wartortle", "moves": ["Protect", "Water Gun"]},
     ]
     lines = [
         "|start",

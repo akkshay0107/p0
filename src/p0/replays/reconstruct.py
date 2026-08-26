@@ -529,8 +529,8 @@ def impute_stat_points(
     }
     estimates: list[StatPointEstimate] = []
     for side, ots in enumerate(document.ots):
-        for index, species in enumerate(ots.revealed_species):
-            details = ots.revealed_details.get(species, {})
+        for member in ots.members:
+            species = member.species
             entry = by_id.get(normalize_id(species).casefold())
             base_mapping = entry.get("baseStats") if isinstance(entry, Mapping) else None
             if not isinstance(base_mapping, Mapping):
@@ -538,21 +538,12 @@ def impute_stat_points(
                     StatPointEstimate(side, species, "UNKNOWN", StatPoints(), None, 0.0)
                 )
                 continue
-            moves = tuple(str(move) for move in details.get("moves", ()) if isinstance(move, str))
+            moves = member.moves
             categories = tuple(
                 move_categories.get(normalize_id(move).casefold(), "") for move in moves
             )
-            level_value = details.get("level", 50)
-            if isinstance(level_value, str):
-                level_value = level_value.lstrip("L")
-            try:
-                level = int(level_value)
-            except (TypeError, ValueError):
-                estimates.append(
-                    StatPointEstimate(side, species, "UNKNOWN", StatPoints(), None, 0.0)
-                )
-                continue
-            nature = str(details.get("nature", "serious"))
+            level = member.level
+            nature = member.nature or "serious"
             estimate = table.resolve(species, nature, categories)
             if estimate is None:
                 estimates.append(
@@ -652,21 +643,17 @@ class _ReplayState:
         self.teams: list[list[ReplayPokemon]] = []
         for side in (0, 1):
             side_teams = []
-            for species in document.ots[side].revealed_species:
-                details = document.ots[side].revealed_details.get(species, {})
-                moves_tuple = tuple(
-                    str(move) for move in details.get("moves", ()) if isinstance(move, str)
-                )
-                ability = str(details.get("ability", "")) or None
-                item = str(details.get("item", "")) or None
+            for member in document.ots[side].members:
+                species = member.species
+                moves_tuple = member.moves
+                ability = member.ability or None
+                item = member.item or None
                 # Live battles only ever receive the opponent's sheet: poke-env skips
                 # our own role when handling |showteam| and does not attach the team we
                 # submitted to our battle Pokemon. Mirroring that asymmetry keeps replay
                 # tensors byte-identical to live ones, which the reconstruction stress
                 # test asserts. Our own stats are exact anyway, so nothing is lost.
-                nature = (
-                    str(details.get("nature", "")) or None if side != knowledge.player else None
-                )
+                nature = member.nature or None if side != knowledge.player else None
                 pokemon = _make_replay_pokemon(
                     species=species,
                     species_data_index=self.species_data_index,
@@ -1598,7 +1585,7 @@ def _perspective_knowledge(
 ) -> PerspectiveKnowledge:
     """Recover private team selection without backfilling opponent knowledge."""
     player_id = f"p{perspective + 1}"
-    roster = document.ots[perspective].revealed_species
+    roster = tuple(member.species for member in document.ots[perspective].members)
     roster_by_identity: dict[str, str] = {}
     species_identities = _species_identity_index(dex)
     for species in roster:

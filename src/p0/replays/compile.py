@@ -687,9 +687,7 @@ def _quality_reasons(
     game: CompiledGame,
 ) -> tuple[str, ...]:
     reasons: set[str] = set()
-    if any(
-        not ots.raw_payload.strip() or len(ots.revealed_species) < 2 for ots in game.document.ots
-    ):
+    if any(not ots.is_complete for ots in game.document.ots):
         reasons.add("missing_or_unusable_ots")
 
     for perspective in game.perspectives:

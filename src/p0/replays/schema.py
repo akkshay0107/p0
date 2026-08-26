@@ -24,6 +24,7 @@ from typing import Any, Mapping
 
 from p0.battle.actions import ACT_SIZE
 from p0.format_config import active_global_contract
+from p0.replays.identity import ReplayMemberId, ReplaySide
 
 REPLAY_IR_SCHEMA_VERSION = active_global_contract().payload("replays", "major")[
     "replay_ir_schema_version"
@@ -205,46 +206,177 @@ class ReplayMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class OTSData:
-    """One open-team-sheet payload and the members parsed from it."""
+class OTSMember:
+    """One ordered member and its permanent open-team-sheet facts."""
 
-    player: str
-    raw_payload: str
-    revealed_species: tuple[str, ...]
-    revealed_details: Mapping[str, Mapping[str, Any]]
+    member_id: ReplayMemberId
+    nickname: str
+    species: str
+    item: str
+    ability: str
+    moves: tuple[str, ...]
+    nature: str
+    gender: str
+    level: int
+    evs: str
+    raw_packed_set: str
 
-    _FIELDS = frozenset({"player", "raw_payload", "revealed_species", "revealed_details"})
+    _FIELDS = frozenset(
+        {
+            "member_id",
+            "nickname",
+            "species",
+            "item",
+            "ability",
+            "moves",
+            "nature",
+            "gender",
+            "level",
+            "evs",
+            "raw_packed_set",
+        }
+    )
 
     def __post_init__(self) -> None:
-        if not self.player:
-            raise ValueError("OTSData requires a player")
-        if len(set(self.revealed_species)) != len(self.revealed_species):
-            raise ValueError("OTSData.revealed_species must not contain duplicates")
-        if set(self.revealed_details) - set(self.revealed_species):
-            raise ValueError("OTSData.revealed_details cannot contain unrevealed species")
+        if not isinstance(self.member_id, ReplayMemberId):
+            raise TypeError("OTSMember.member_id must be a ReplayMemberId")
+        for name, value in (
+            ("nickname", self.nickname),
+            ("species", self.species),
+            ("item", self.item),
+            ("ability", self.ability),
+            ("nature", self.nature),
+            ("gender", self.gender),
+            ("evs", self.evs),
+            ("raw_packed_set", self.raw_packed_set),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"OTSMember.{name} must be a string")
+        if not self.species:
+            raise ValueError("OTSMember.species must not be empty")
+        if not self.nickname:
+            raise ValueError("OTSMember.nickname must not be empty")
+        if not isinstance(self.moves, tuple) or not all(
+            isinstance(move, str) and move for move in self.moves
+        ):
+            raise ValueError("OTSMember.moves must contain nonempty strings")
+        if type(self.level) is not int or not 1 <= self.level <= 100:
+            raise ValueError("OTSMember.level must be in [1, 100]")
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize one member while preserving its roster position."""
         return {
-            "player": self.player,
+            "member_id": self.member_id.to_dict(),
+            "nickname": self.nickname,
+            "species": self.species,
+            "item": self.item,
+            "ability": self.ability,
+            "moves": list(self.moves),
+            "nature": self.nature,
+            "gender": self.gender,
+            "level": self.level,
+            "evs": self.evs,
+            "raw_packed_set": self.raw_packed_set,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> OTSMember:
+        """Deserialize one strict ordered member record."""
+        _require_fields(value, cls._FIELDS, "OTSMember")
+        member_id = value["member_id"]
+        if not isinstance(member_id, Mapping):
+            raise ValueError("OTSMember.member_id must be an object")
+        moves = value["moves"]
+        if not isinstance(moves, (list, tuple)) or not all(isinstance(move, str) for move in moves):
+            raise ValueError("OTSMember.moves must be a string array")
+        level = value["level"]
+        if type(level) is not int:
+            raise ValueError("OTSMember.level must be an integer")
+        string_fields = (
+            "nickname",
+            "species",
+            "item",
+            "ability",
+            "nature",
+            "gender",
+            "evs",
+            "raw_packed_set",
+        )
+        if any(not isinstance(value[field], str) for field in string_fields):
+            raise ValueError("OTSMember string fields must contain strings")
+        return cls(
+            member_id=ReplayMemberId.from_dict(member_id),
+            nickname=value["nickname"],
+            species=value["species"],
+            item=value["item"],
+            ability=value["ability"],
+            moves=tuple(moves),
+            nature=value["nature"],
+            gender=value["gender"],
+            level=level,
+            evs=value["evs"],
+            raw_packed_set=value["raw_packed_set"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OTSData:
+    """One side's raw sheet and its members in stable roster order."""
+
+    side: ReplaySide
+    raw_payload: str
+    members: tuple[OTSMember, ...]
+
+    _FIELDS = frozenset({"side", "raw_payload", "members"})
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.side, ReplaySide):
+            raise TypeError("OTSData.side must be a ReplaySide")
+        if not isinstance(self.raw_payload, str):
+            raise TypeError("OTSData.raw_payload must be a string")
+        if not isinstance(self.members, tuple) or not all(
+            isinstance(member, OTSMember) for member in self.members
+        ):
+            raise TypeError("OTSData.members must be an OTSMember tuple")
+        if len(self.members) > 6:
+            raise ValueError("OTSData cannot contain more than six members")
+        expected_ids = tuple(ReplayMemberId(self.side, index) for index in range(len(self.members)))
+        actual_ids = tuple(member.member_id for member in self.members)
+        if actual_ids != expected_ids:
+            raise ValueError("OTSData members must have contiguous ordered IDs for its side")
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether the sheet contains all six Champions roster members."""
+        return len(self.members) == 6 and bool(self.raw_payload.strip())
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the sheet without converting members to a species mapping."""
+        return {
+            "side": self.side.value,
             "raw_payload": self.raw_payload,
-            "revealed_species": list(self.revealed_species),
-            "revealed_details": {
-                species: dict(self.revealed_details[species])
-                for species in sorted(self.revealed_details)
-            },
+            "members": [member.to_dict() for member in self.members],
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> OTSData:
+        """Deserialize one ordered side sheet."""
         _require_fields(value, cls._FIELDS, "OTSData")
-        details = value["revealed_details"]
-        if not isinstance(details, Mapping):
-            raise ValueError("OTSData.revealed_details must be an object")
+        side = value["side"]
+        members = value["members"]
+        if not isinstance(side, str):
+            raise ValueError("OTSData.side must be a string")
+        raw_payload = value["raw_payload"]
+        if not isinstance(raw_payload, str):
+            raise ValueError("OTSData.raw_payload must be a string")
+        if not isinstance(members, (list, tuple)) or not all(
+            isinstance(member, Mapping) for member in members
+        ):
+            raise ValueError("OTSData.members must be an object array")
         return cls(
-            player=str(value["player"]),
-            raw_payload=str(value["raw_payload"]),
-            revealed_species=tuple(str(species) for species in value["revealed_species"]),
-            revealed_details={str(species): dict(payload) for species, payload in details.items()},
+            side=ReplaySide(side),
+            raw_payload=raw_payload,
+            members=tuple(OTSMember.from_dict(member) for member in members),
         )
 
 

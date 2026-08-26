@@ -4,12 +4,55 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 
 import orjson
 
 _HREF_PATTERN = re.compile(r"""href=["']([^"']+)["']""", flags=re.IGNORECASE)
+
+
+class ReplaySide(StrEnum):
+    """A stable side in a replay rather than a player-relative role."""
+
+    P1 = "p1"
+    P2 = "p2"
+
+    @property
+    def side_index(self) -> int:
+        """Return the zero-based side index."""
+        return 0 if self is ReplaySide.P1 else 1
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class ReplayMemberId:
+    """Stable identity of one member in an ordered open team sheet."""
+
+    side: ReplaySide
+    roster_index: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.side, ReplaySide):
+            raise TypeError("ReplayMemberId.side must be a ReplaySide")
+        if type(self.roster_index) is not int or not 0 <= self.roster_index < 6:
+            raise ValueError("ReplayMemberId.roster_index must be in [0, 6)")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the member identity without losing its side."""
+        return {"side": self.side.value, "roster_index": self.roster_index}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ReplayMemberId:
+        """Deserialize a strict member identity record."""
+        if len(value) != 2 or "side" not in value or "roster_index" not in value:
+            raise ValueError("Invalid ReplayMemberId fields")
+        side = value["side"]
+        roster_index = value["roster_index"]
+        if not isinstance(side, str) or type(roster_index) is not int:
+            raise ValueError("ReplayMemberId fields have invalid types")
+        return cls(ReplaySide(side), roster_index)
 
 
 def normalize_showdown_id(value: str) -> str:
@@ -82,6 +125,8 @@ def _replay_id_matches(replay_id: str, expected: str) -> bool:
 
 
 __all__ = [
+    "ReplayMemberId",
+    "ReplaySide",
     "canonical_format_id",
     "linked_replay_ids",
     "normalize_showdown_id",

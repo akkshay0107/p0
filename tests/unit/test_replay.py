@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,7 @@ from p0.replays.dataset import (
 )
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.group import group_replays, individual_games, validated_bo3_series
-from p0.replays.identity import linked_replay_ids
+from p0.replays.identity import ReplayMemberId, ReplaySide, linked_replay_ids
 from p0.replays.protocol import ReplayParseError, parse_replay_payload
 from p0.replays.reconstruct import (
     _decision_blocks,
@@ -59,6 +60,7 @@ from p0.replays.schema import (
     LabelKind,
     MaskProvenance,
     OTSData,
+    OTSMember,
     ProtocolLine,
     ReplayDiagnostics,
     ReplayMetadata,
@@ -98,10 +100,18 @@ def _sample_replay_payload(
         "p1": [
             {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
             {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
+            {"species": "Raichu", "moves": ["Protect", "Thunderbolt"]},
+            {"species": "Jolteon", "moves": ["Protect", "Thunderbolt"]},
+            {"species": "Vaporeon", "moves": ["Protect", "Surf"]},
+            {"species": "Flareon", "moves": ["Protect", "Flare Blitz"]},
         ],
         "p2": [
             {"species": "Bulbasaur", "moves": ["Protect", "Tackle"]},
             {"species": "Charmander", "moves": ["Tackle", "Helping Hand"]},
+            {"species": "Squirtle", "moves": ["Protect", "Water Gun"]},
+            {"species": "Ivysaur", "moves": ["Protect", "Tackle"]},
+            {"species": "Charmeleon", "moves": ["Protect", "Ember"]},
+            {"species": "Wartortle", "moves": ["Protect", "Water Gun"]},
         ],
     }
     lines = [
@@ -189,7 +199,7 @@ def test_lazy_dataset_yields_canonical_bo3_game_perspectives(
     assert [chunk.canonical_player for chunk in chunks] == [0, 1, 0, 1]
     assert [chunk.is_series_end for chunk in chunks] == [False, False, True, True]
     assert all(chunk.length == 2 for chunk in chunks)
-    assert chunks[2].candidate_offsets.tolist() == [0, 0, 4]
+    assert chunks[2].candidate_offsets.tolist() == [0, 12, 16]
 
 
 def test_canonical_player_identity_survives_replay_side_swap(tmp_path: Path) -> None:
@@ -274,13 +284,18 @@ def torch_summaries(built) -> list[dict[str, object]]:
 
 
 def test_protocol_records_are_strict_and_ordered() -> None:
-    """Verify parse_replay_payload extracts structured ProtocolLine records, OTS species/moves, and outcome."""
+    """Verify protocol and ordered OTS records retain their exact sequence."""
     document = parse_replay_payload(_sample_replay_payload("g1"))
     assert [line.index for line in document.protocol_lines] == list(
         range(len(document.protocol_lines))
     )
-    assert document.ots[0].revealed_species == ("Pikachu", "Eevee")
-    assert document.ots[0].revealed_details["Pikachu"]["moves"] == ["Protect", "Tackle"]
+    assert tuple(member.species for member in document.ots[0].members[:2]) == (
+        "Pikachu",
+        "Eevee",
+    )
+    assert document.ots[0].members[0].moves == ("Protect", "Tackle")
+    assert document.ots[0].members[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+    assert document.ots[0].is_complete
     assert document.outcome.winner == 0
     assert ReplayMetadata.from_dict(document.metadata.to_dict()) == document.metadata
     assert (
@@ -290,6 +305,62 @@ def test_protocol_records_are_strict_and_ordered() -> None:
         ProtocolLine.from_dict({**document.protocol_lines[0].to_dict(), "unknown": 1})
     with pytest.raises(ReplayParseError, match="Malformed protocol line"):
         parse_replay_payload({**_sample_replay_payload("bad"), "log": "not a protocol line"})
+
+
+def test_ots_preserves_duplicate_species_as_distinct_ordered_members() -> None:
+    payload = _sample_replay_payload("duplicate-species")
+    duplicate_roster = [
+        {"name": "First", "species": "Pikachu", "moves": ["Protect"]},
+        {"name": "Second", "species": "Pikachu", "moves": ["Tackle"]},
+    ]
+    lines = [
+        (
+            f"|showteam|p1|{json.dumps(duplicate_roster, separators=(',', ':'))}"
+            if line.startswith("|showteam|p1|")
+            else line
+        )
+        for line in str(payload["log"]).splitlines()
+    ]
+    payload["log"] = "\n".join(lines)
+
+    document = parse_replay_payload(payload)
+    members = document.ots[0].members
+
+    assert tuple(member.species for member in members) == ("Pikachu", "Pikachu")
+    assert tuple(member.nickname for member in members) == ("First", "Second")
+    assert tuple(member.member_id for member in members) == (
+        ReplayMemberId(ReplaySide.P1, 0),
+        ReplayMemberId(ReplaySide.P1, 1),
+    )
+    assert OTSData.from_dict(document.ots[0].to_dict()) == document.ots[0]
+
+
+def test_ots_rejects_noncontiguous_and_cross_side_member_ids() -> None:
+    member = parse_replay_payload(_sample_replay_payload("member-ids")).ots[0].members[0]
+
+    with pytest.raises(ValueError, match="contiguous ordered IDs"):
+        OTSData(
+            ReplaySide.P1,
+            "payload",
+            (replace(member, member_id=ReplayMemberId(ReplaySide.P1, 1)),),
+        )
+    with pytest.raises(ValueError, match="contiguous ordered IDs"):
+        OTSData(
+            ReplaySide.P1,
+            "payload",
+            (replace(member, member_id=ReplayMemberId(ReplaySide.P2, 0)),),
+        )
+
+
+def test_protocol_rejects_repeated_showteam_payloads() -> None:
+    payload = _sample_replay_payload("repeated-showteam")
+    p1_showteam = next(
+        line for line in str(payload["log"]).splitlines() if line.startswith("|showteam|p1|")
+    )
+    payload["log"] = f"{payload['log']}\n{p1_showteam}"
+
+    with pytest.raises(ReplayParseError, match="repeated showteam payloads for p1"):
+        parse_replay_payload(payload)
 
 
 def test_protocol_ignores_chat_and_multiline_chat_responses() -> None:
@@ -398,7 +469,7 @@ def test_packed_open_team_sheet_imputation_is_deterministic() -> None:
         ]
     )
     document = parse_replay_payload(payload)
-    assert document.ots[0].revealed_details["Pikachu"]["moves"] == ("protect", "tackle")
+    assert document.ots[0].members[0].moves == ("protect", "tackle")
     dex = {
         "species": [
             {
@@ -439,8 +510,29 @@ def test_new_schema_records_round_trip() -> None:
         elapsed_ms=12,
     )
     assert FetchMetadata.from_dict(fetch.to_dict()) == fetch
-    ots = OTSData("p1", "", ("pikachu",), {})
+    member = OTSMember(
+        member_id=ReplayMemberId(ReplaySide.P1, 0),
+        nickname="Pikachu",
+        species="Pikachu",
+        item="Light Ball",
+        ability="Static",
+        moves=("Protect", "Thunderbolt"),
+        nature="Timid",
+        gender="M",
+        level=50,
+        evs="0,0,0,252,4,252",
+        raw_packed_set="Pikachu|Pikachu|LightBall|Static|Protect,Thunderbolt",
+    )
+    ots = OTSData(ReplaySide.P1, member.raw_packed_set, (member,))
     assert OTSData.from_dict(ots.to_dict()) == ots
+    malformed_member = member.to_dict()
+    malformed_member["item"] = 1
+    with pytest.raises(ValueError, match="string fields"):
+        OTSMember.from_dict(malformed_member)
+    malformed_ots = ots.to_dict()
+    malformed_ots["raw_payload"] = {"team": []}
+    with pytest.raises(ValueError, match="raw_payload"):
+        OTSData.from_dict(malformed_ots)
     outcome = ReplayOutcome(0, GameEndReason.NORMAL, 1, 4)
     assert ReplayOutcome.from_dict(outcome.to_dict()) == outcome
 
@@ -570,7 +662,7 @@ def test_reconstruction_is_causal_symmetric_and_compilable() -> None:
     game = result.games[0]
     left, right = game.perspectives
     assert left.player == 0 and right.player == 1
-    assert left.decisions[0].evidence.label_kind.name == "UNKNOWN"
+    assert left.decisions[0].evidence.label_kind is LabelKind.PARTIAL
     assert left.decisions[1].evidence.label_kind is LabelKind.PARTIAL
     assert right.decisions[1].evidence.label_kind is LabelKind.PARTIAL
     assert (9, 11) in left.decisions[1].evidence.candidates
@@ -1139,7 +1231,7 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v5_shard(tmp_path: Path
     assert manifest.decisions == 4
     assert manifest.games == 2
     assert manifest.series == 1
-    assert manifest.diagnostics["label_unknown"] == 2
+    assert manifest.diagnostics["label_unknown"] == 0
 
     shard_path = built.manifest_path.parent / manifest.shards[0].filename
     payload = torch.load(shard_path, weights_only=True, map_location="cpu")
@@ -1149,7 +1241,7 @@ def test_replay_fixture_compiles_to_runtime_bound_schema_v5_shard(tmp_path: Path
     )
     assert tensors["categorical"].shape[0] == manifest.decisions
     assert tensors["action_mask"].shape == (4, 2, 49)
-    assert tensors["candidate_offsets"].tolist() == [0, 0, 4, 4, 8]
+    assert tensors["candidate_offsets"].tolist() == [0, 12, 16, 28, 32]
     assert tensors["game_offsets"].tolist() == [0, 2, 4]
     assert tensors["series_offsets"].tolist() == [0, 4]
     assert len(payload["series_summaries"]) == manifest.games
@@ -1428,8 +1520,8 @@ def test_compiler_retains_exact_partial_unknown_and_rejected_labels() -> None:
     counters = result.metrics.counters
     assert counters["accepted_games"] == 2
     assert counters["label_exact"] == 0
-    assert counters["label_partial"] == 4
-    assert counters["label_unknown"] == 4
+    assert counters["label_partial"] == 8
+    assert counters["label_unknown"] == 0
 
     capped = compile_payloads((partial,), format_id=partial["formatid"], max_candidates=1)
     assert capped.metrics.counters["label_partial"] == 0
@@ -1552,7 +1644,7 @@ def test_reconstructed_views_carry_the_opponent_open_team_sheet_nature() -> None
             head, _, body = line.rpartition("|")
             roster = json.loads(body)
             for mon in roster:
-                mon["nature"] = natures[mon["species"]]
+                mon["nature"] = natures.get(mon["species"], "Serious")
             line = f"{head}|{json.dumps(roster, separators=(',', ':'))}"
         lines.append(line)
     payload["log"] = "\n".join(lines)
@@ -1570,7 +1662,7 @@ def test_reconstructed_views_carry_the_opponent_open_team_sheet_nature() -> None
 
     # The opponent's sheet is what |showteam| delivers live, so it must survive here.
     assert opponent and None not in opponent
-    assert opponent <= set(natures.values())
+    assert opponent <= {*natures.values(), "Serious"}
 
     # Our own team's nature is never attached to live battle Pokemon, so a replay
     # must not invent one or reconstructed tensors would diverge from live capture.
@@ -1587,7 +1679,7 @@ def _payload_with_ots_natures(replay_id: str) -> dict[str, object]:
             head, _, body = line.rpartition("|")
             roster = json.loads(body)
             for mon in roster:
-                mon["nature"] = natures[mon["species"]]
+                mon["nature"] = natures.get(mon["species"], "Serious")
             line = f"{head}|{json.dumps(roster, separators=(',', ':'))}"
         lines.append(line)
     payload["log"] = "\n".join(lines)
@@ -1949,7 +2041,7 @@ def test_ir_round_trips() -> None:
 def test_ir_rejects_bad_serializations() -> None:
     """Verify IR deserialization raises ValueError on schema version mismatch or missing/unknown fields."""
     payload = _game_record().to_dict()
-    payload["ir_schema"] = 2
+    payload["ir_schema"] = 1
     with pytest.raises(ValueError, match="ir_schema"):
         GameRecord.from_dict(payload)
     payload = _series_record().to_dict()
