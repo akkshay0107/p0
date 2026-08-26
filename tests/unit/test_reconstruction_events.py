@@ -16,7 +16,11 @@ from p0.replays.reconstruction.identity import (
     ReplaySide,
     parse_protocol_pokemon_reference,
 )
-from p0.replays.schema import ProtocolLine
+from p0.replays.reconstruction.resolution import (
+    resolve_protocol_events,
+    resolve_replay_events,
+)
+from p0.replays.schema import OTSData, OTSMember, ProtocolLine
 
 _GOLDEN_REPLAY = (
     Path(__file__).parents[2]
@@ -27,6 +31,36 @@ _GOLDEN_REPLAY = (
 
 def _line(raw: str, *, index: int = 0, turn: int | None = None) -> ProtocolLine:
     return ProtocolLine(index, raw, tuple(raw.split("|")), turn)
+
+
+def _complete_ots(
+    side: ReplaySide,
+    species: tuple[str, str, str, str, str, str],
+) -> OTSData:
+    members = tuple(
+        OTSMember(
+            member_id=ReplayMemberId(side, index),
+            nickname=name,
+            species=name,
+            item="",
+            ability="Ability",
+            moves=("Protect",),
+            nature="Serious",
+            gender="",
+            level=50,
+            evs="",
+            raw_packed_set=name,
+        )
+        for index, name in enumerate(species)
+    )
+    return OTSData(side, "]".join(species), members)
+
+
+def _test_ots() -> tuple[OTSData, OTSData]:
+    return (
+        _complete_ots(ReplaySide.P1, ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")),
+        _complete_ots(ReplaySide.P2, ("Golf", "Hotel", "India", "Juliet", "Kilo", "Lima")),
+    )
 
 
 def test_member_ids_and_protocol_pokemon_refs_are_distinct_contracts() -> None:
@@ -132,6 +166,68 @@ def test_unknown_tag_is_unsupported_state_instead_of_a_silent_noop() -> None:
     assert event.diagnostic.normalized_cause == ""
 
 
+def test_identity_resolution_tracks_slots_and_keeps_side_references_memberless() -> None:
+    lines = tuple(
+        _line(raw, index=index)
+        for index, raw in enumerate(
+            (
+                "|switch|p1a: Alpha|Alpha, L50|100/100",
+                "|switch|p1b: Bravo|Bravo, L50|100/100",
+                "|swap|p1a: Alpha|1",
+                "|-damage|p1a: Bravo|50/100",
+                "|-sidestart|p1: Player|move: Tailwind",
+                "|faint|p1b: Alpha",
+                "|switch|p1b: Charlie|Charlie, L50|100/100",
+            )
+        )
+    )
+    parsed = parse_protocol_events("replay-1", lines)
+    result = resolve_protocol_events("replay-1", _test_ots(), parsed.events)
+    events = result.require_accepted()
+
+    assert events[0].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+    assert events[2].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+    assert events[3].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+    assert events[4].pokemon_refs[0].member_id is None
+    assert events[4].pokemon_refs[0].pokemon_ref.side is ReplaySide.P1
+    assert events[6].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 2)
+
+
+def test_identity_resolution_rejects_unbound_ambiguous_and_illusion_references() -> None:
+    unbound = parse_protocol_events("unbound", (_line("|-damage|p1a: Alpha|50/100"),))
+    result = resolve_protocol_events("unbound", _test_ots(), unbound.events)
+    with pytest.raises(ReplayEventParseError, match="no active member"):
+        result.require_accepted()
+    assert result.events == ()
+
+    duplicate_ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Ditto", "Ditto", "Charlie", "Delta", "Echo", "Foxtrot"),
+        ),
+        _test_ots()[1],
+    )
+    ambiguous = parse_protocol_events(
+        "ambiguous",
+        (_line("|switch|p1a: Ditto|Ditto, L50|100/100"),),
+    )
+    result = resolve_protocol_events("ambiguous", duplicate_ots, ambiguous.events)
+    with pytest.raises(ReplayEventParseError, match="2 available roster members"):
+        result.require_accepted()
+
+    illusion = parse_protocol_events(
+        "illusion",
+        (
+            _line("|switch|p1a: Alpha|Alpha, L50|100/100", index=0),
+            _line("|replace|p1a: Charlie|Charlie, L50|100/100", index=1),
+        ),
+    )
+    result = resolve_protocol_events("illusion", _test_ots(), illusion.events)
+    with pytest.raises(ReplayEventParseError, match="Illusion resolution"):
+        result.require_accepted()
+    assert result.events == ()
+
+
 @pytest.mark.skipif(not _GOLDEN_REPLAY.is_file(), reason="local golden replay is not present")
 def test_local_golden_replay_is_classified_once_without_rejections() -> None:
     document = parse_replay_payload(_GOLDEN_REPLAY.read_bytes())
@@ -150,3 +246,8 @@ def test_local_golden_replay_is_classified_once_without_rejections() -> None:
         EventClassification.ACTION_EXECUTION: 34,
         EventClassification.BOUNDARY_SIGNAL: 27,
     }
+
+    resolved = resolve_replay_events(document).require_accepted()
+    first_switch = next(event for event in resolved if event.event.tag == "switch")
+    assert first_switch.pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 3)
+    assert len(resolved) == 186

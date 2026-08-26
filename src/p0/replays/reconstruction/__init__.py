@@ -17,6 +17,13 @@ from p0.replays.reconstruction.identity import (
     looks_like_protocol_pokemon_reference,
     parse_protocol_pokemon_reference,
 )
+from p0.replays.reconstruction.resolution import (
+    ResolvedPokemonRefArgument,
+    ResolvedProtocolEvent,
+    ResolvedReplayEvents,
+    resolve_protocol_events,
+    resolve_replay_events,
+)
 
 __all__ = [
     "EventClassification",
@@ -28,9 +35,14 @@ __all__ = [
     "ReplayEventParseError",
     "ReplayMemberId",
     "ReplaySide",
+    "ResolvedPokemonRefArgument",
+    "ResolvedProtocolEvent",
+    "ResolvedReplayEvents",
     "looks_like_protocol_pokemon_reference",
     "parse_protocol_event",
     "parse_protocol_events",
     "parse_protocol_pokemon_reference",
     "parse_replay_events",
+    "resolve_protocol_events",
+    "resolve_replay_events",
 ]
