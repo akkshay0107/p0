@@ -13,11 +13,10 @@ from p0.replays.reconstruction.resolution import resolve_protocol_events
 from p0.replays.reconstruction.state import reconstruct_replay_state, reduce_replay_state
 from p0.replays.schema import OTSData, OTSMember, ProtocolLine
 
-_GOLDEN_REPLAY = (
-    Path(__file__).parents[2]
-    / "src/p0/replays/reconstruction/golden_replays"
-    / "gen9championsvgc2026regmbbo3-2641278886.json"
+_GOLDEN_REPLAY_DIRECTORY = (
+    Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
 )
+_GOLDEN_REPLAYS = tuple(sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")))
 _P1_SPECIES = ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")
 _P2_SPECIES = ("Golf", "Hotel", "India", "Juliet", "Kilo", "Lima")
 
@@ -74,14 +73,19 @@ def _dex() -> dict[str, object]:
     }
 
 
-def _ots(side: ReplaySide, names: tuple[str, ...]) -> OTSData:
+def _ots(
+    side: ReplaySide,
+    names: tuple[str, ...],
+    *,
+    illusion_member: str | None = None,
+) -> OTSData:
     members = tuple(
         OTSMember(
             member_id=ReplayMemberId(side, index),
             nickname=name,
             species=name,
             item=f"Item {name}",
-            ability=f"Ability {name}",
+            ability="Illusion" if name == illusion_member else f"Ability {name}",
             moves=("Protect", "Tackle") if side is ReplaySide.P2 else ("Protect", "Mimic"),
             nature="Serious",
             gender="",
@@ -94,16 +98,23 @@ def _ots(side: ReplaySide, names: tuple[str, ...]) -> OTSData:
     return OTSData(side, "]".join(names), members)
 
 
-def _complete_ots() -> tuple[OTSData, OTSData]:
-    return _ots(ReplaySide.P1, _P1_SPECIES), _ots(ReplaySide.P2, _P2_SPECIES)
+def _complete_ots(*, illusion_member: str | None = None) -> tuple[OTSData, OTSData]:
+    return (
+        _ots(ReplaySide.P1, _P1_SPECIES, illusion_member=illusion_member),
+        _ots(ReplaySide.P2, _P2_SPECIES),
+    )
 
 
-def _resolved(*raw_lines: str):
+def _resolved(
+    *raw_lines: str,
+    ots: tuple[OTSData, OTSData] | None = None,
+):
     lines = tuple(
         ProtocolLine(index, raw, tuple(raw.split("|")), None) for index, raw in enumerate(raw_lines)
     )
     parsed = parse_protocol_events("state-test", lines)
-    return resolve_protocol_events("state-test", _complete_ots(), parsed.events).require_accepted()
+    sheets = _complete_ots() if ots is None else ots
+    return resolve_protocol_events("state-test", sheets, parsed.events).require_accepted()
 
 
 def test_switch_cleanup_preserves_persistent_state_and_old_snapshots() -> None:
@@ -213,6 +224,123 @@ def test_endability_preserves_ability_and_records_gastro_acid() -> None:
     assert dict(member.effects) == {"gastroacid": 0}
 
 
+def test_perish_countdown_updates_one_effect_and_clears_on_switch() -> None:
+    events = _resolved(
+        "|switch|p1a: Alpha|Alpha, L50|100/100",
+        "|-start|p1a: Alpha|perish3",
+        "|-start|p1a: Alpha|perish2",
+        "|-start|p1a: Alpha|perish1",
+        "|-start|p1a: Alpha|perish0",
+        "|switch|p1a: Bravo|Bravo, L50|100/100",
+    )
+
+    snapshots = reduce_replay_state(
+        "state-test", _complete_ots(), events, dex=_dex()
+    ).require_accepted()
+    alpha_id = ReplayMemberId(ReplaySide.P1, 0)
+
+    assert tuple(snapshot.member(alpha_id).perish_count for snapshot in snapshots[1:5]) == (
+        3,
+        2,
+        1,
+        0,
+    )
+    assert dict(snapshots[4].member(alpha_id).effects) == {"perishsong": 0}
+    assert snapshots[5].member(alpha_id).perish_count is None
+    assert dict(snapshots[5].member(alpha_id).effects) == {}
+
+
+def test_invalid_perish_count_is_rejected_without_partial_snapshots() -> None:
+    events = _resolved(
+        "|switch|p1a: Alpha|Alpha, L50|100/100",
+        "|-start|p1a: Alpha|perish4",
+    )
+    dex = _dex()
+    dex["legalProtocolEffects"] = {"effect": ["perishsong"]}
+
+    result = reduce_replay_state("state-test", _complete_ots(), events, dex=dex)
+
+    assert result.snapshots == ()
+    assert result.diagnostics[0].reason == "unsupported effect effect variant 'perish4'"
+
+
+def test_illusion_reveal_preserves_actual_state_and_causal_display_history() -> None:
+    ots = _complete_ots(illusion_member="Bravo")
+    events = _resolved(
+        "|switch|p1a: Alpha|Alpha, L50|100/100",
+        "|switch|p1b: Charlie|Charlie, L50|100/100",
+        "|-damage|p1a: Alpha|25/100",
+        "|-boost|p1a: Alpha|atk|2",
+        "|replace|p1a: Bravo|Bravo, L50",
+        "|-end|p1a: Bravo|Illusion",
+        ots=ots,
+    )
+
+    snapshots = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()
+    alpha_id = ReplayMemberId(ReplaySide.P1, 0)
+    bravo_id = ReplayMemberId(ReplaySide.P1, 1)
+
+    disguised = snapshots[0].member(bravo_id)
+    damaged = snapshots[2].member(bravo_id)
+    revealed = snapshots[4].member(bravo_id)
+    assert snapshots[0].sides[0].active[0] == bravo_id
+    assert disguised.displayed_species == "Alpha"
+    assert not disguised.revealed
+    assert dict(disguised.effects) == {"illusion": 0}
+    assert damaged.hp_fraction == 0.25
+    assert snapshots[2].member(alpha_id).hp_fraction is None
+    assert revealed.displayed_species == "Bravo"
+    assert revealed.revealed
+    assert revealed.hp_fraction == 0.25
+    assert dict(revealed.boosts)["atk"] == 2
+    assert "illusion" not in dict(revealed.effects)
+    assert snapshots[0].member(bravo_id).displayed_species == "Alpha"
+
+
+def test_duplicate_illusion_display_does_not_mutate_the_disguise_target() -> None:
+    ots = _complete_ots(illusion_member="Bravo")
+    events = _resolved(
+        "|switch|p1a: Alpha|Alpha, L50|100/100",
+        "|switch|p1b: Alpha|Alpha, L50|100/100",
+        "|-damage|p1b: Alpha|50/100",
+        "|replace|p1b: Bravo|Bravo, L50",
+        "|-end|p1b: Bravo|Illusion",
+        ots=ots,
+    )
+
+    snapshots = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()
+    alpha_id = ReplayMemberId(ReplaySide.P1, 0)
+    bravo_id = ReplayMemberId(ReplaySide.P1, 1)
+    final = snapshots[-1]
+
+    assert final.sides[0].active == (alpha_id, bravo_id)
+    assert final.member(alpha_id).hp_fraction == 1.0
+    assert final.member(bravo_id).hp_fraction == 0.5
+    assert final.member(alpha_id).displayed_species == "Alpha"
+    assert final.member(bravo_id).displayed_species == "Bravo"
+
+
+def test_faint_before_illusion_reveal_updates_only_the_actual_member() -> None:
+    ots = _complete_ots(illusion_member="Bravo")
+    events = _resolved(
+        "|switch|p1a: Alpha|Alpha, L50|100/100",
+        "|-damage|p1a: Alpha|0 fnt",
+        "|faint|p1a: Alpha",
+        "|switch|p1a: Alpha|Alpha, L50|100/100",
+        ots=ots,
+    )
+
+    final = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()[-1]
+    alpha_id = ReplayMemberId(ReplaySide.P1, 0)
+    bravo_id = ReplayMemberId(ReplaySide.P1, 1)
+
+    assert final.sides[0].active[0] == alpha_id
+    assert final.member(alpha_id).hp_fraction == 1.0
+    assert not final.member(alpha_id).fainted
+    assert final.member(bravo_id).hp_fraction == 0.0
+    assert final.member(bravo_id).fainted
+
+
 def test_unsupported_reducer_transition_discards_all_snapshots() -> None:
     events = _resolved(
         "|switch|p1a: Alpha|Alpha, L50|100/100",
@@ -227,11 +355,14 @@ def test_unsupported_reducer_transition_discards_all_snapshots() -> None:
     assert "not implemented" in result.diagnostics[0].reason
 
 
-@pytest.mark.skipif(not _GOLDEN_REPLAY.is_file(), reason="local golden replay is not present")
-def test_local_golden_replay_reduces_to_one_snapshot_per_line() -> None:
-    document = parse_replay_payload(_GOLDEN_REPLAY.read_bytes())
+@pytest.mark.skipif(not _GOLDEN_REPLAYS, reason="local golden replays are not present")
+@pytest.mark.parametrize("replay_path", _GOLDEN_REPLAYS, ids=lambda path: path.stem)
+def test_local_golden_replay_reduces_to_one_snapshot_per_line(replay_path: Path) -> None:
+    document = parse_replay_payload(replay_path.read_bytes())
 
     snapshots = reconstruct_replay_state(document).require_accepted()
 
-    assert len(snapshots) == len(document.protocol_lines) == 186
-    assert tuple(snapshot.line_index for snapshot in snapshots) == tuple(range(186))
+    assert len(snapshots) == len(document.protocol_lines)
+    assert tuple(snapshot.line_index for snapshot in snapshots) == tuple(
+        range(len(document.protocol_lines))
+    )

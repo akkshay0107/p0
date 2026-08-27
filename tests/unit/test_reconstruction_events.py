@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,8 @@ def _line(raw: str, *, index: int = 0, turn: int | None = None) -> ProtocolLine:
 def _complete_ots(
     side: ReplaySide,
     species: tuple[str, str, str, str, str, str],
+    *,
+    illusion_species: str | None = None,
 ) -> OTSData:
     members = tuple(
         OTSMember(
@@ -43,7 +46,7 @@ def _complete_ots(
             nickname=name,
             species=name,
             item="",
-            ability="Ability",
+            ability="Illusion" if name == illusion_species else "Ability",
             moves=("Protect",),
             nature="Serious",
             gender="",
@@ -93,6 +96,28 @@ def test_team_preview_accepts_standard_and_selected_team_shapes(raw: str) -> Non
     event = parse_protocol_event("replay-1", _line(raw))
 
     assert event.classification is EventClassification.BOUNDARY_SIGNAL
+
+
+def test_replace_accepts_the_pinned_showdown_shape_only() -> None:
+    event = parse_protocol_event(
+        "replay-1",
+        _line("|replace|p1a: Zoroark|Zoroark-Hisui, L50"),
+    )
+    extra_hp = parse_protocol_event(
+        "replay-1",
+        _line("|replace|p1a: Zoroark|Zoroark-Hisui, L50|50/100"),
+    )
+
+    assert event.classification is EventClassification.ACTION_EXECUTION
+    assert event.arguments == ("p1a: Zoroark", "Zoroark-Hisui, L50")
+    assert extra_hp.classification is EventClassification.MALFORMED
+
+
+def test_player_departure_accepts_an_empty_username() -> None:
+    event = parse_protocol_event("replay-1", _line("|player|p2|"))
+
+    assert event.classification is EventClassification.PUBLIC_STATE
+    assert event.arguments == ("p2", "")
 
 
 def test_event_parsing_extracts_effect_cause_and_annotated_pokemon_ref() -> None:
@@ -193,7 +218,60 @@ def test_identity_resolution_tracks_slots_and_keeps_side_references_memberless()
     assert events[6].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 2)
 
 
-def test_identity_resolution_rejects_unbound_ambiguous_and_illusion_references() -> None:
+def test_switch_details_are_authoritative_when_a_nickname_matches_another_member() -> None:
+    p1 = _complete_ots(
+        ReplaySide.P1,
+        ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"),
+    )
+    members = list(p1.members)
+    members[1] = replace(members[1], nickname="Alpha")
+    ots = (OTSData(ReplaySide.P1, p1.raw_payload, tuple(members)), _test_ots()[1])
+    parsed = parse_protocol_events(
+        "nickname-conflict",
+        (_line("|switch|p1a: Alpha|Bravo, L50|100/100"),),
+    )
+
+    event = resolve_protocol_events("nickname-conflict", ots, parsed.events).require_accepted()[0]
+
+    assert event.pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+
+
+def test_mega_form_reentry_resolves_to_the_base_roster_member() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Greninja", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"),
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "mega-reentry",
+        (
+            _line("|switch|p1a: Iku Z|Greninja, L50|100/100", index=0),
+            _line("|detailschange|p1a: Iku Z|Greninja-Mega, L50", index=1),
+            _line("|switch|p1a: Bravo|Bravo, L50|100/100", index=2),
+            _line("|switch|p1a: Iku Z|Greninja-Mega, L50|50/100", index=3),
+        ),
+    )
+    dex = {
+        "species": (
+            {"id": "greninja", "name": "Greninja"},
+            {
+                "id": "greninjamega",
+                "name": "Greninja-Mega",
+                "baseSpecies": "Greninja",
+            },
+        )
+    }
+
+    events = resolve_protocol_events("mega-reentry", ots, parsed.events, dex=dex).require_accepted()
+
+    greninja = ReplayMemberId(ReplaySide.P1, 0)
+    assert events[0].pokemon_refs[0].member_id == greninja
+    assert events[3].pokemon_refs[0].member_id == greninja
+
+
+def test_identity_resolution_rejects_unbound_ambiguous_and_impossible_references() -> None:
     unbound = parse_protocol_events("unbound", (_line("|-damage|p1a: Alpha|50/100"),))
     result = resolve_protocol_events("unbound", _test_ots(), unbound.events)
     with pytest.raises(ReplayEventParseError, match="no active member"):
@@ -219,13 +297,216 @@ def test_identity_resolution_rejects_unbound_ambiguous_and_illusion_references()
         "illusion",
         (
             _line("|switch|p1a: Alpha|Alpha, L50|100/100", index=0),
-            _line("|replace|p1a: Charlie|Charlie, L50|100/100", index=1),
+            _line("|replace|p1a: Charlie|Charlie, L50", index=1),
         ),
     )
     result = resolve_protocol_events("illusion", _test_ots(), illusion.events)
-    with pytest.raises(ReplayEventParseError, match="Illusion resolution"):
+    with pytest.raises(ReplayEventParseError, match="no valid roster assignment"):
         result.require_accepted()
     assert result.events == ()
+    assert result.diagnostics[0].line_index == 1
+
+
+def test_illusion_reveal_resolves_the_complete_active_history() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Alpha", "Zoroark", "Charlie", "Delta", "Echo", "Foxtrot"),
+            illusion_species="Zoroark",
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "illusion-reveal",
+        tuple(
+            _line(raw, index=index)
+            for index, raw in enumerate(
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|switch|p1b: Charlie|Charlie, L50|100/100",
+                    "|-damage|p1a: Alpha|50/100",
+                    "|replace|p1a: Zoroark|Zoroark, L50",
+                    "|-end|p1a: Zoroark|Illusion",
+                )
+            )
+        ),
+    )
+
+    events = resolve_protocol_events("illusion-reveal", ots, parsed.events).require_accepted()
+    zoroark = ReplayMemberId(ReplaySide.P1, 1)
+
+    assert events[0].pokemon_refs[0].member_id == zoroark
+    assert events[2].pokemon_refs[0].member_id == zoroark
+    assert events[3].pokemon_refs[0].member_id == zoroark
+    assert events[4].pokemon_refs[0].member_id == zoroark
+
+
+def test_reserve_illusion_reveal_resolves_only_the_new_history() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Alpha", "Zoroark", "Charlie", "Delta", "Echo", "Foxtrot"),
+            illusion_species="Zoroark",
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "reserve-illusion",
+        tuple(
+            _line(raw, index=index)
+            for index, raw in enumerate(
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|switch|p1b: Charlie|Charlie, L50|100/100",
+                    "|faint|p1a: Alpha",
+                    "|switch|p1a: Delta|Delta, L50|100/100",
+                    "|replace|p1a: Zoroark|Zoroark, L50",
+                )
+            )
+        ),
+    )
+
+    events = resolve_protocol_events("reserve-illusion", ots, parsed.events).require_accepted()
+
+    assert events[0].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+    assert events[1].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 2)
+    assert events[3].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+    assert events[4].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+
+
+def test_illusion_resolution_uses_overlap_faint_and_swap_constraints() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Alpha", "Zoroark", "Charlie", "Delta", "Echo", "Foxtrot"),
+            illusion_species="Zoroark",
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "illusion-constraints",
+        tuple(
+            _line(raw, index=index)
+            for index, raw in enumerate(
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|switch|p1b: Alpha|Alpha, L50|100/100",
+                    "|swap|p1b: Alpha|0",
+                    "|replace|p1a: Zoroark|Zoroark, L50",
+                    "|faint|p1a: Zoroark",
+                )
+            )
+        ),
+    )
+
+    events = resolve_protocol_events("illusion-constraints", ots, parsed.events).require_accepted()
+    alpha = ReplayMemberId(ReplaySide.P1, 0)
+    zoroark = ReplayMemberId(ReplaySide.P1, 1)
+
+    assert events[0].pokemon_refs[0].member_id == alpha
+    assert events[1].pokemon_refs[0].member_id == zoroark
+    assert events[2].pokemon_refs[0].member_id == zoroark
+    assert events[3].pokemon_refs[0].member_id == zoroark
+
+
+def test_faint_before_reveal_can_resolve_an_illusion_history() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Alpha", "Zoroark", "Charlie", "Delta", "Echo", "Foxtrot"),
+            illusion_species="Zoroark",
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "illusion-faint",
+        tuple(
+            _line(raw, index=index)
+            for index, raw in enumerate(
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|faint|p1a: Alpha",
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                )
+            )
+        ),
+    )
+
+    events = resolve_protocol_events("illusion-faint", ots, parsed.events).require_accepted()
+
+    assert events[0].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+    assert events[1].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+    assert events[2].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+
+
+def test_replacement_switch_cannot_reuse_the_outgoing_actual_member() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Alpha", "Zoroark", "Charlie", "Delta", "Echo", "Foxtrot"),
+            illusion_species="Zoroark",
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "illusion-predecessor",
+        (
+            _line("|switch|p1a: Alpha|Alpha, L50|100/100", index=0),
+            _line("|switch|p1a: Alpha|Alpha, L50|100/100", index=1),
+            _line("|replace|p1a: Zoroark|Zoroark, L50", index=2),
+        ),
+    )
+
+    events = resolve_protocol_events("illusion-predecessor", ots, parsed.events).require_accepted()
+
+    assert events[0].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+    assert events[1].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+    assert events[2].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 1)
+
+
+def test_unrevealed_illusion_ambiguity_rejects_without_partial_events() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Alpha", "Zoroark", "Charlie", "Delta", "Echo", "Foxtrot"),
+            illusion_species="Zoroark",
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "unresolved-illusion",
+        (_line("|switch|p1a: Alpha|Alpha, L50|100/100"),),
+    )
+
+    result = resolve_protocol_events("unresolved-illusion", ots, parsed.events)
+
+    assert result.events == ()
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].line_index == 0
+    assert result.diagnostics[0].reason.startswith("unresolved_illusion:")
+
+
+def test_switch_out_before_reveal_remains_unresolved() -> None:
+    ots = (
+        _complete_ots(
+            ReplaySide.P1,
+            ("Alpha", "Zoroark", "Charlie", "Delta", "Echo", "Foxtrot"),
+            illusion_species="Zoroark",
+        ),
+        _test_ots()[1],
+    )
+    parsed = parse_protocol_events(
+        "illusion-switch-out",
+        (
+            _line("|switch|p1a: Alpha|Alpha, L50|100/100", index=0),
+            _line("|switch|p1a: Charlie|Charlie, L50|100/100", index=1),
+        ),
+    )
+
+    result = resolve_protocol_events("illusion-switch-out", ots, parsed.events)
+
+    assert result.events == ()
+    assert result.diagnostics[0].reason.startswith("unresolved_illusion:")
 
 
 @pytest.mark.skipif(not _GOLDEN_REPLAY.is_file(), reason="local golden replay is not present")

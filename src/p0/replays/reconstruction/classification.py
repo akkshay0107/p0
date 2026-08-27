@@ -152,7 +152,7 @@ _RULES = {
     "tie": _boundary(0, 0),
     "forfeit": _boundary(1, 1, required=(0,)),
     # Public initialization and roster facts.
-    "player": _state(4, 4, required=(0, 1)),
+    "player": _state(2, 4, required=(0,)),
     "clearpoke": _state(0, 0),
     "poke": _state(2, 3, required=(0, 1)),
     "showteam": _state(2, None, required=(0, 1)),
@@ -162,7 +162,7 @@ _RULES = {
     "move": _action(3, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)),
     "switch": _action(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
     "drag": _action(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
-    "replace": _action(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
+    "replace": _action(2, 2, required=(0, 1), pokemon_refs=(0,)),
     "cant": _action(2, None, required=(0, 1), pokemon_refs=(0,), effect=1),
     "-anim": _action(3, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)),
     "-prepare": _action(2, None, required=(0, 1), pokemon_refs=(0,), effect=1),

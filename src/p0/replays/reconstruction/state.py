@@ -130,6 +130,7 @@ class ReplayPokemonState:
     moves: tuple[MoveState, ...]
     boosts: tuple[tuple[str, int], ...]
     effects: tuple[tuple[str, int], ...]
+    perish_count: int | None
     tera_type: str | None
     terastallized: bool
     transform: TransformSnapshot | None
@@ -151,6 +152,12 @@ class ReplayPokemonState:
             raise ValueError("ReplayPokemonState fainted and HP state disagree")
         if tuple(name for name, _ in self.boosts) != _BOOST_NAMES:
             raise ValueError("ReplayPokemonState.boosts must use canonical stat order")
+        if self.perish_count is not None and not 0 <= self.perish_count <= 3:
+            raise ValueError("ReplayPokemonState.perish_count must be in [0, 3]")
+        if self.perish_count is not None and not any(
+            effect == "perishsong" for effect, _ in self.effects
+        ):
+            raise ValueError("A Perish count requires the canonical Perish Song effect")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +283,7 @@ class _MutablePokemon:
     mimic_move: _MutableMove | None = None
     boosts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(_BOOST_NAMES, 0))
     effects: dict[str, int] = field(default_factory=dict)
+    perish_count: int | None = None
     single_turn_effects: set[str] = field(default_factory=set)
     single_move_effects: set[str] = field(default_factory=set)
     tera_type: str | None = None
@@ -321,6 +329,7 @@ class _MutablePokemon:
             moves=self.move_snapshots(),
             boosts=tuple((name, self.boosts[name]) for name in _BOOST_NAMES),
             effects=tuple(sorted(self.effects.items())),
+            perish_count=self.perish_count,
             tera_type=self.tera_type,
             terastallized=self.terastallized,
             transform=self.transform,
@@ -367,6 +376,7 @@ class _StateReducer:
         self._handlers: dict[str, Callable[[ResolvedProtocolEvent], None]] = {
             "switch": self._handle_switch,
             "drag": self._handle_drag,
+            "replace": self._handle_replace,
             "swap": self._handle_swap,
             "faint": self._handle_faint,
             "move": self._handle_move,
@@ -533,21 +543,43 @@ class _StateReducer:
         details_species = _details_species(resolved.event.arguments[1])
         details_data = self._species_data(details_species)
         original_data = self._species_data(member.original_species)
-        if normalize_showdown_id(details_data.base_species) != normalize_showdown_id(
+        disguised = normalize_showdown_id(details_data.base_species) != normalize_showdown_id(
             original_data.base_species
-        ):
-            raise _StateTransitionError(
-                "switch details do not match the resolved roster member; Illusion is unresolved"
-            )
+        )
+        if disguised:
+            if normalize_showdown_id(member.ability.current) != "illusion":
+                raise _StateTransitionError(
+                    "disguised switch resolved to a member without Illusion"
+                )
+            member.displayed_species = details_species
+            member.effects["illusion"] = self.turn
+        else:
+            self._set_form(member, details_species)
+            member.effects.pop("illusion", None)
         hp_fraction, status = _parse_hp_status(resolved.event.arguments[2])
-        self._set_form(member, details_species)
         member.hp_fraction = hp_fraction
         member.status = status
         member.fainted = hp_fraction == 0.0
-        member.revealed = True
+        member.revealed = not disguised
         member.selected = True
         member.active_turns = 0
         self.active[key] = member_id
+
+    def _handle_replace(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        revealed_species = _details_species(resolved.event.arguments[1])
+        revealed_data = self._species_data(revealed_species)
+        original_data = self._species_data(member.original_species)
+        if normalize_showdown_id(revealed_data.base_species) != normalize_showdown_id(
+            original_data.base_species
+        ):
+            raise _StateTransitionError("Illusion reveal does not match the active member")
+        if "illusion" not in member.effects:
+            raise _StateTransitionError("replace requires an active Illusion history")
+
+        member.displayed_species = revealed_species
+        member.revealed = True
+        member.effects.pop("illusion")
 
     def _handle_swap(self, resolved: ResolvedProtocolEvent) -> None:
         reference = _resolved_reference(resolved, 0)
@@ -840,6 +872,11 @@ class _StateReducer:
     def _handle_minus_start(self, resolved: ResolvedProtocolEvent) -> None:
         member = self._member_for(resolved, 0)
         effect = _required_effect(resolved)
+        perish_count = _perish_count(effect.normalized)
+        if perish_count is not None:
+            member.effects.setdefault("perishsong", self.turn)
+            member.perish_count = perish_count
+            return
         self._validate_effect(effect.normalized, "effect")
         if effect.normalized == "typechange":
             if len(resolved.event.arguments) < 3:
@@ -860,6 +897,8 @@ class _StateReducer:
         effect = _required_effect(resolved)
         self._validate_effect(effect.normalized, "effect")
         member.effects.pop(effect.normalized, None)
+        if effect.normalized == "perishsong":
+            member.perish_count = None
         if effect.normalized == "typechange" and not member.terastallized:
             member.current_types = self._species_data(member.current_form).types
         elif effect.normalized == "mimic":
@@ -982,7 +1021,7 @@ class _StateReducer:
         return self.members[_required_member(_resolved_reference(resolved, argument_index))]
 
     def _validate_effect(self, effect: str, category: str) -> None:
-        if category == "effect" and effect in {"mimic", "typechange"}:
+        if category == "effect" and effect in {"illusion", "mimic", "typechange"}:
             return
         allowed = self._legal_effects.get(category)
         if allowed is not None and effect not in allowed:
@@ -1005,6 +1044,7 @@ class _StateReducer:
         member.ability = AbilityState(member.ability.base, member.ability.forme)
         member.boosts = dict.fromkeys(_BOOST_NAMES, 0)
         member.effects.clear()
+        member.perish_count = None
         member.single_turn_effects.clear()
         member.single_move_effects.clear()
         member.active_turns = 0
@@ -1161,6 +1201,12 @@ def _required_effect(resolved: ResolvedProtocolEvent) -> EffectReference:
     return resolved.event.effect
 
 
+def _perish_count(effect: str) -> int | None:
+    if len(effect) == 7 and effect.startswith("perish") and effect[-1] in "0123":
+        return int(effect[-1])
+    return None
+
+
 def _details_species(details: str) -> str:
     species = details.split(",", 1)[0].strip()
     if not species:
@@ -1295,13 +1341,13 @@ def reconstruct_replay_state(
     dex: Mapping[str, Any] | None = None,
 ) -> ReconstructedReplayState:
     """Resolve and reduce one normalized replay document without legacy battle objects."""
-    resolved = resolve_replay_events(document)
-    if resolved.diagnostics:
-        return ReconstructedReplayState(document.metadata.replay_id, (), resolved.diagnostics)
     if dex is None:
         from p0.model.resources import default_runtime_resources
 
         dex = default_runtime_resources().dex
+    resolved = resolve_replay_events(document, dex=dex)
+    if resolved.diagnostics:
+        return ReconstructedReplayState(document.metadata.replay_id, (), resolved.diagnostics)
     return reduce_replay_state(
         document.metadata.replay_id,
         document.ots,
