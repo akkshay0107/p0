@@ -219,11 +219,30 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
 
     def _record_decision(self, battle: DoubleBattle, action: tuple[int, int]) -> None:
         observation = self.observation_builder.build(battle_view(battle)).cpu()
+        forced_switch_slots = tuple(
+            index for index, forced in enumerate(battle.force_switch) if forced
+        )
+        if battle.teampreview:
+            request_type = "teampreview"
+        elif forced_switch_slots:
+            request_type = "forced_switch"
+        elif bool(getattr(battle, "_wait", False)):
+            request_type = "wait"
+        else:
+            request_type = "turn"
+        active_members = tuple(
+            None if pokemon is None else str(getattr(pokemon, "species", ""))
+            for pokemon in battle.active_pokemon
+        )
         self._live_records.setdefault(battle.battle_tag, []).append(
             {
                 "turn": int(battle.turn),
                 "teampreview": bool(battle.teampreview),
                 "player_role": str(battle.player_role),
+                "request_type": request_type,
+                "wait": bool(getattr(battle, "_wait", False)),
+                "forced_switch_slots": list(forced_switch_slots),
+                "active_members": list(active_members),
                 "action": list(action),
                 # The count of replay-visible lines consumed before this request is the
                 # shared boundary: reconstruction reaches the same line index when it
