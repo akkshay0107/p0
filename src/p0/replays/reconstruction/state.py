@@ -1,0 +1,1323 @@
+"""Owned battle state and immutable snapshots for replay reconstruction v2."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
+from p0.replays.protocol import ReplayDocument
+from p0.replays.reconstruction.classification import EventClassification
+from p0.replays.reconstruction.diagnostics import (
+    ReplayEventDiagnostic,
+    ReplayEventParseError,
+)
+from p0.replays.reconstruction.events import EffectReference
+from p0.replays.reconstruction.resolution import (
+    ResolvedPokemonRefArgument,
+    ResolvedProtocolEvent,
+    resolve_replay_events,
+)
+from p0.replays.schema import OTSData, OTSMember
+
+_BOOST_NAMES = ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
+_STATUS_NAMES = frozenset({"brn", "frz", "par", "psn", "slp", "tox"})
+_STACKING_SIDE_CONDITIONS = frozenset({"spikes", "toxicspikes"})
+_TRANSIENT_ACTION_TAGS = frozenset(
+    {
+        "-anim",
+        "-block",
+        "-combine",
+        "-eat",
+        "-fail",
+        "-fieldactivate",
+        "-hitcount",
+        "-immune",
+        "-miss",
+        "-nothing",
+        "-notarget",
+        "-waiting",
+    }
+)
+_INITIALIZATION_TAGS = frozenset({"player", "clearpoke", "poke", "showteam", "teamsize", "start"})
+
+
+@dataclass(frozen=True, slots=True)
+class AbilityState:
+    """Original, form-native, and temporary ability components."""
+
+    base: str
+    forme: str | None = None
+    temporary: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.base:
+            raise ValueError("AbilityState.base must not be empty")
+        if self.forme == "" or self.temporary == "":
+            raise ValueError("Optional ability components must be absent or nonempty")
+
+    @property
+    def current(self) -> str:
+        """Return the effective named ability without modelling suppression."""
+        return self.temporary or self.forme or self.base
+
+
+@dataclass(frozen=True, slots=True)
+class MoveState:
+    """Immutable move-slot state used by base members and Transform overlays."""
+
+    move_id: str
+    name: str
+    move_type: str
+    category: str
+    target: str
+    current_pp: int
+    max_pp: int
+
+    def __post_init__(self) -> None:
+        if not self.move_id or not self.name:
+            raise ValueError("MoveState requires a nonempty id and name")
+        if not 0 <= self.current_pp <= self.max_pp:
+            raise ValueError("MoveState.current_pp must be within its PP range")
+        if self.max_pp <= 0:
+            raise ValueError("MoveState.max_pp must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class TransformSnapshot:
+    """Values copied atomically from a Transform target."""
+
+    source_member_id: ReplayMemberId
+    species: str
+    types: tuple[str, ...]
+    weight: float
+    non_hp_base_stats: tuple[tuple[str, int], ...]
+    ability: str
+    boosts: tuple[tuple[str, int], ...]
+    moves: tuple[MoveState, ...]
+
+    def __post_init__(self) -> None:
+        if not self.species or not self.ability:
+            raise ValueError("TransformSnapshot requires a species and ability")
+        if not 1 <= len(self.types) <= 3:
+            raise ValueError("TransformSnapshot.types must contain one to three types")
+        if tuple(name for name, _ in self.non_hp_base_stats) != _BOOST_NAMES[:5]:
+            raise ValueError("TransformSnapshot.non_hp_base_stats must use canonical stat order")
+        if tuple(name for name, _ in self.boosts) != _BOOST_NAMES:
+            raise ValueError("TransformSnapshot.boosts must use canonical stat order")
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayPokemonState:
+    """One stable roster member at a specific public replay cursor."""
+
+    member_id: ReplayMemberId
+    nickname: str
+    original_species: str
+    current_form: str
+    displayed_species: str
+    nature: str
+    level: int
+    hp_fraction: float | None
+    status: str | None
+    item: str | None
+    ability: AbilityState
+    base_types: tuple[str, ...]
+    current_types: tuple[str, ...]
+    base_stats: tuple[tuple[str, int], ...]
+    weight: float
+    moves: tuple[MoveState, ...]
+    boosts: tuple[tuple[str, int], ...]
+    effects: tuple[tuple[str, int], ...]
+    tera_type: str | None
+    terastallized: bool
+    transform: TransformSnapshot | None
+    revealed: bool
+    selected: bool | None
+    fainted: bool
+    active_turns: int
+    status_counter: int
+    protect_counter: int
+    preparing: str | None
+    last_move: str | None
+
+    def __post_init__(self) -> None:
+        if self.hp_fraction is not None and not 0.0 <= self.hp_fraction <= 1.0:
+            raise ValueError("ReplayPokemonState.hp_fraction must be in [0, 1]")
+        if self.fainted and self.hp_fraction != 0.0:
+            raise ValueError("A fainted ReplayPokemonState must have zero HP")
+        if self.hp_fraction == 0.0 and not self.fainted:
+            raise ValueError("ReplayPokemonState fainted and HP state disagree")
+        if tuple(name for name, _ in self.boosts) != _BOOST_NAMES:
+            raise ValueError("ReplayPokemonState.boosts must use canonical stat order")
+
+
+@dataclass(frozen=True, slots=True)
+class ReplaySideState:
+    """Immutable side state and active-slot bindings."""
+
+    side: ReplaySide
+    active: tuple[ReplayMemberId | None, ReplayMemberId | None]
+    conditions: tuple[tuple[str, int], ...]
+    used_mega: bool
+    used_z_move: bool
+
+    def __post_init__(self) -> None:
+        if any(member is not None and member.side is not self.side for member in self.active):
+            raise ValueError("Active members must belong to ReplaySideState.side")
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayBattleState:
+    """Deeply immutable public battle state after one protocol line."""
+
+    replay_id: str
+    line_index: int
+    turn: int
+    members: tuple[ReplayPokemonState, ...]
+    sides: tuple[ReplaySideState, ReplaySideState]
+    weather: tuple[tuple[str, int], ...]
+    fields: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if not self.replay_id:
+            raise ValueError("ReplayBattleState.replay_id must not be empty")
+        if self.line_index < 0 or self.turn < 0:
+            raise ValueError("ReplayBattleState indices must be nonnegative")
+        if tuple(side.side for side in self.sides) != (ReplaySide.P1, ReplaySide.P2):
+            raise ValueError("ReplayBattleState sides must be ordered as p1 and p2")
+
+    def member(self, member_id: ReplayMemberId) -> ReplayPokemonState:
+        """Return one member from its stable side and roster index."""
+        offset = member_id.side.side_index * 6 + member_id.roster_index
+        try:
+            member = self.members[offset]
+        except IndexError as exc:
+            raise KeyError(member_id) from exc
+        if member.member_id != member_id:
+            raise KeyError(member_id)
+        return member
+
+
+@dataclass(frozen=True, slots=True)
+class ReconstructedReplayState:
+    """All line-indexed snapshots or a whole-replay rejection."""
+
+    replay_id: str
+    snapshots: tuple[ReplayBattleState, ...]
+    diagnostics: tuple[ReplayEventDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.replay_id:
+            raise ValueError("ReconstructedReplayState.replay_id must not be empty")
+        if self.snapshots and self.diagnostics:
+            raise ValueError("Rejected state reconstruction cannot retain snapshots")
+        if any(snapshot.replay_id != self.replay_id for snapshot in self.snapshots):
+            raise ValueError("State reconstruction cannot contain another replay")
+
+    def require_accepted(self) -> tuple[ReplayBattleState, ...]:
+        """Return snapshots or raise the structured whole-replay rejection."""
+        if self.diagnostics:
+            raise ReplayEventParseError(self.diagnostics)
+        return self.snapshots
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeciesData:
+    species: str
+    base_species: str
+    types: tuple[str, ...]
+    base_stats: tuple[tuple[str, int], ...]
+    weight: float
+    native_ability: str | None
+
+
+@dataclass(slots=True)
+class _MutableMove:
+    move_id: str
+    name: str
+    move_type: str
+    category: str
+    target: str
+    current_pp: int
+    max_pp: int
+
+    def snapshot(self) -> MoveState:
+        return MoveState(
+            self.move_id,
+            self.name,
+            self.move_type,
+            self.category,
+            self.target,
+            self.current_pp,
+            self.max_pp,
+        )
+
+
+@dataclass(slots=True)
+class _MutablePokemon:
+    member_id: ReplayMemberId
+    nickname: str
+    original_species: str
+    current_form: str
+    displayed_species: str
+    nature: str
+    level: int
+    hp_fraction: float | None
+    status: str | None
+    item: str | None
+    ability: AbilityState
+    base_types: tuple[str, ...]
+    current_types: tuple[str, ...]
+    base_stats: tuple[tuple[str, int], ...]
+    weight: float
+    moves: dict[str, _MutableMove]
+    mimic_move: _MutableMove | None = None
+    boosts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(_BOOST_NAMES, 0))
+    effects: dict[str, int] = field(default_factory=dict)
+    single_turn_effects: set[str] = field(default_factory=set)
+    single_move_effects: set[str] = field(default_factory=set)
+    tera_type: str | None = None
+    terastallized: bool = False
+    transform: TransformSnapshot | None = None
+    revealed: bool = False
+    selected: bool | None = None
+    fainted: bool = False
+    active_turns: int = 0
+    status_counter: int = 0
+    protect_counter: int = 0
+    preparing: str | None = None
+    last_move: str | None = None
+
+    def move_snapshots(self) -> tuple[MoveState, ...]:
+        """Return effective move slots without exposing mutable move objects."""
+        if self.transform is not None:
+            return self.transform.moves
+        return tuple(
+            self.mimic_move.snapshot()
+            if move_id == "mimic" and self.mimic_move is not None
+            else move.snapshot()
+            for move_id, move in self.moves.items()
+        )
+
+    def snapshot(self) -> ReplayPokemonState:
+        return ReplayPokemonState(
+            member_id=self.member_id,
+            nickname=self.nickname,
+            original_species=self.original_species,
+            current_form=self.current_form,
+            displayed_species=self.displayed_species,
+            nature=self.nature,
+            level=self.level,
+            hp_fraction=self.hp_fraction,
+            status=self.status,
+            item=self.item,
+            ability=self.ability,
+            base_types=self.base_types,
+            current_types=self.current_types,
+            base_stats=self.base_stats,
+            weight=self.weight,
+            moves=self.move_snapshots(),
+            boosts=tuple((name, self.boosts[name]) for name in _BOOST_NAMES),
+            effects=tuple(sorted(self.effects.items())),
+            tera_type=self.tera_type,
+            terastallized=self.terastallized,
+            transform=self.transform,
+            revealed=self.revealed,
+            selected=self.selected,
+            fainted=self.fainted,
+            active_turns=self.active_turns,
+            status_counter=self.status_counter,
+            protect_counter=self.protect_counter,
+            preparing=self.preparing,
+            last_move=self.last_move,
+        )
+
+
+class _StateTransitionError(ValueError):
+    pass
+
+
+class _StateReducer:
+    """Single owner of mutable replay state and all supported transitions."""
+
+    def __init__(
+        self,
+        replay_id: str,
+        ots: tuple[OTSData, OTSData],
+        dex: Mapping[str, Any],
+    ) -> None:
+        self.replay_id = replay_id
+        self.turn = 0
+        self._species = _species_index(dex)
+        self._moves = _move_index(dex)
+        self._legal_effects = _legal_effect_index(dex)
+        self.members = {
+            member.member_id: self._member_from_ots(member)
+            for sheet in ots
+            for member in sheet.members
+        }
+        self.active: dict[tuple[ReplaySide, int], ReplayMemberId] = {}
+        self.side_conditions = {ReplaySide.P1: {}, ReplaySide.P2: {}}
+        self.used_mega = {ReplaySide.P1: False, ReplaySide.P2: False}
+        self.used_z_move = {ReplaySide.P1: False, ReplaySide.P2: False}
+        self.weather: dict[str, int] = {}
+        self.fields: dict[str, int] = {}
+        self._handlers: dict[str, Callable[[ResolvedProtocolEvent], None]] = {
+            "switch": self._handle_switch,
+            "drag": self._handle_drag,
+            "swap": self._handle_swap,
+            "faint": self._handle_faint,
+            "move": self._handle_move,
+            "cant": self._handle_cant,
+            "-damage": self._handle_minus_damage,
+            "-heal": self._handle_minus_heal,
+            "-sethp": self._handle_minus_sethp,
+            "-status": self._handle_minus_status,
+            "-curestatus": self._handle_minus_curestatus,
+            "-cureteam": self._handle_minus_cureteam,
+            "-boost": self._handle_minus_boost,
+            "-unboost": self._handle_minus_unboost,
+            "-setboost": self._handle_minus_setboost,
+            "-clearboost": self._handle_minus_clearboost,
+            "-clearallboost": self._handle_minus_clearallboost,
+            "-clearpositiveboost": self._handle_minus_clearpositiveboost,
+            "-clearnegativeboost": self._handle_minus_clearnegativeboost,
+            "-invertboost": self._handle_minus_invertboost,
+            "-copyboost": self._handle_minus_copyboost,
+            "-swapboost": self._handle_minus_swapboost,
+            "-item": self._handle_minus_item,
+            "-enditem": self._handle_minus_enditem,
+            "-ability": self._handle_minus_ability,
+            "-endability": self._handle_minus_endability,
+            "detailschange": self._handle_detailschange,
+            "-formechange": self._handle_minus_formechange,
+            "-mega": self._handle_minus_mega,
+            "-primal": self._handle_minus_primal,
+            "-burst": self._handle_minus_burst,
+            "-zpower": self._handle_minus_zpower,
+            "-zbroken": self._handle_minus_zbroken,
+            "-terastallize": self._handle_minus_terastallize,
+            "-transform": self._handle_minus_transform,
+            "-typechange": self._handle_minus_typechange,
+            "-typeadd": self._handle_minus_typeadd,
+            "-start": self._handle_minus_start,
+            "-end": self._handle_minus_end,
+            "-singleturn": self._handle_minus_singleturn,
+            "-singlemove": self._handle_minus_singlemove,
+            "-activate": self._handle_minus_activate,
+            "-prepare": self._handle_minus_prepare,
+            "-mustrecharge": self._handle_minus_mustrecharge,
+            "-weather": self._handle_minus_weather,
+            "-fieldstart": self._handle_minus_fieldstart,
+            "-fieldend": self._handle_minus_fieldend,
+            "-sidestart": self._handle_minus_sidestart,
+            "-sideend": self._handle_minus_sideend,
+            "-swapsideconditions": self._handle_minus_swapsideconditions,
+        }
+
+    def _member_from_ots(self, member: OTSMember) -> _MutablePokemon:
+        species = self._species_data(member.species)
+        if not member.ability:
+            raise _StateTransitionError(
+                f"OTS member {member.member_id!r} has no recoverable base ability"
+            )
+        moves = {
+            move.move_id: move for move in (self._move_from_name(name) for name in member.moves)
+        }
+        return _MutablePokemon(
+            member_id=member.member_id,
+            nickname=member.nickname,
+            original_species=member.species,
+            current_form=member.species,
+            displayed_species=member.species,
+            nature=member.nature,
+            level=member.level,
+            hp_fraction=None,
+            status=None,
+            item=member.item or None,
+            ability=AbilityState(member.ability),
+            base_types=species.types,
+            current_types=species.types,
+            base_stats=species.base_stats,
+            weight=species.weight,
+            moves=moves,
+        )
+
+    def _species_data(self, name: str) -> _SpeciesData:
+        try:
+            return self._species[normalize_showdown_id(name)]
+        except KeyError as exc:
+            raise _StateTransitionError(f"species {name!r} is absent from the pinned dex") from exc
+
+    def _move_from_name(self, name: str, *, transform: bool = False) -> _MutableMove:
+        move_id = normalize_showdown_id(name)
+        try:
+            data = self._moves[move_id]
+        except KeyError as exc:
+            raise _StateTransitionError(f"move {name!r} is absent from the pinned dex") from exc
+        base_pp = int(data.get("pp", 0))
+        if base_pp <= 0:
+            raise _StateTransitionError(f"move {name!r} has invalid PP data")
+        max_pp = min(5, base_pp) if transform else _maximum_pp(data, base_pp)
+        return _MutableMove(
+            move_id=move_id,
+            name=str(data.get("name", name)),
+            move_type=str(data.get("type", "unknown")),
+            category=str(data.get("category", "unknown")),
+            target=str(data.get("target", "normal")),
+            current_pp=max_pp,
+            max_pp=max_pp,
+        )
+
+    def apply(self, resolved: ResolvedProtocolEvent) -> None:
+        event = resolved.event
+        classification = event.classification
+        if classification.rejects_replay:
+            raise _StateTransitionError(event.rejection_reason)
+        if classification is EventClassification.NO_STATE_CHANGE:
+            return
+        if classification is EventClassification.BOUNDARY_SIGNAL:
+            self._apply_boundary(event.tag, event.arguments)
+            return
+        if event.tag in _INITIALIZATION_TAGS:
+            return
+
+        handler = self._handlers.get(event.tag)
+        if handler is None:
+            if event.tag in _TRANSIENT_ACTION_TAGS:
+                self._apply_provenance(resolved)
+                return
+            raise _StateTransitionError(f"state transition {event.tag!r} is not implemented")
+        handler(resolved)
+        self._apply_provenance(resolved)
+
+    def _apply_boundary(self, tag: str, arguments: tuple[str, ...]) -> None:
+        if tag == "turn":
+            turn = int(arguments[0])
+            if turn <= self.turn:
+                raise _StateTransitionError(
+                    f"turn number {turn} does not advance current turn {self.turn}"
+                )
+            self.turn = turn
+            for member_id in self.active.values():
+                member = self.members[member_id]
+                member.active_turns += 1
+                for effect in member.single_turn_effects:
+                    member.effects.pop(effect, None)
+                member.single_turn_effects.clear()
+                if member.status == "tox":
+                    member.status_counter += 1
+        elif tag in {"", "teampreview", "upkeep", "win", "tie", "forfeit"}:
+            return
+        else:
+            raise _StateTransitionError(f"boundary signal {tag!r} is not implemented")
+
+    def _handle_switch(self, resolved: ResolvedProtocolEvent) -> None:
+        self._switch(resolved)
+
+    def _handle_drag(self, resolved: ResolvedProtocolEvent) -> None:
+        self._switch(resolved)
+
+    def _switch(self, resolved: ResolvedProtocolEvent) -> None:
+        reference = _resolved_reference(resolved, 0)
+        member_id = _required_member(reference)
+        slot = _required_slot(reference)
+        key = (member_id.side, slot)
+        outgoing_id = self.active.get(key)
+        if outgoing_id is not None and outgoing_id != member_id:
+            self._clear_switch_state(self.members[outgoing_id])
+
+        member = self.members[member_id]
+        details_species = _details_species(resolved.event.arguments[1])
+        details_data = self._species_data(details_species)
+        original_data = self._species_data(member.original_species)
+        if normalize_showdown_id(details_data.base_species) != normalize_showdown_id(
+            original_data.base_species
+        ):
+            raise _StateTransitionError(
+                "switch details do not match the resolved roster member; Illusion is unresolved"
+            )
+        hp_fraction, status = _parse_hp_status(resolved.event.arguments[2])
+        self._set_form(member, details_species)
+        member.hp_fraction = hp_fraction
+        member.status = status
+        member.fainted = hp_fraction == 0.0
+        member.revealed = True
+        member.selected = True
+        member.active_turns = 0
+        self.active[key] = member_id
+
+    def _handle_swap(self, resolved: ResolvedProtocolEvent) -> None:
+        reference = _resolved_reference(resolved, 0)
+        member_id = _required_member(reference)
+        source_slot = _required_slot(reference)
+        target_slot = int(resolved.event.arguments[1])
+        if not 0 <= target_slot < 2:
+            raise _StateTransitionError("swap target must be a doubles active slot")
+        source_key = (member_id.side, source_slot)
+        target_key = (member_id.side, target_slot)
+        if self.active.get(source_key) != member_id:
+            raise _StateTransitionError("swap source does not match reducer active state")
+        target = self.active.get(target_key)
+        self.active[target_key] = member_id
+        if target is None:
+            self.active.pop(source_key)
+        else:
+            self.active[source_key] = target
+
+    def _handle_faint(self, resolved: ResolvedProtocolEvent) -> None:
+        reference = _resolved_reference(resolved, 0)
+        member_id = _required_member(reference)
+        slot = _required_slot(reference)
+        key = (member_id.side, slot)
+        if self.active.get(key) != member_id:
+            raise _StateTransitionError("faint member does not match reducer active state")
+        member = self.members[member_id]
+        member.hp_fraction = 0.0
+        member.fainted = True
+        member.status = None
+        self._clear_switch_state(member)
+        self.active.pop(key)
+
+    def _handle_move(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        move_id = normalize_showdown_id(resolved.event.arguments[1])
+        move = next((item for item in member.move_snapshots() if item.move_id == move_id), None)
+        if move is None:
+            raise _StateTransitionError(
+                f"move {resolved.event.arguments[1]!r} is not in the member's effective move slots"
+            )
+        if resolved.event.cause is None:
+            self._decrement_move(member, move_id)
+        for effect in member.single_move_effects:
+            member.effects.pop(effect, None)
+        member.single_move_effects.clear()
+        member.last_move = move_id
+        member.preparing = None
+
+    def _handle_cant(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        if member.status == "slp":
+            member.status_counter += 1
+        member.protect_counter = 0
+
+    def _handle_minus_damage(self, resolved: ResolvedProtocolEvent) -> None:
+        self._set_hp(resolved)
+
+    def _handle_minus_heal(self, resolved: ResolvedProtocolEvent) -> None:
+        self._set_hp(resolved)
+
+    def _handle_minus_sethp(self, resolved: ResolvedProtocolEvent) -> None:
+        arguments = resolved.event.arguments
+        if len(arguments) % 2:
+            raise _StateTransitionError("-sethp requires Pokémon/HP argument pairs")
+        for argument_index in range(0, len(arguments), 2):
+            member = self._member_for(resolved, argument_index)
+            hp_fraction, status = _parse_hp_status(arguments[argument_index + 1])
+            member.hp_fraction = hp_fraction
+            member.fainted = hp_fraction == 0.0
+            if status is not None:
+                member.status = status
+
+    def _set_hp(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        hp_fraction, status = _parse_hp_status(resolved.event.arguments[1])
+        member.hp_fraction = hp_fraction
+        member.fainted = hp_fraction == 0.0
+        if hp_fraction > 0.0 and status is not None:
+            member.status = status
+
+    def _handle_minus_status(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        status = normalize_showdown_id(resolved.event.arguments[1])
+        if status not in _STATUS_NAMES:
+            raise _StateTransitionError(f"unsupported status {status!r}")
+        member.status = status
+        member.status_counter = 0
+
+    def _handle_minus_curestatus(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        expected = normalize_showdown_id(resolved.event.arguments[1])
+        if member.status is not None and member.status != expected:
+            raise _StateTransitionError("curestatus does not match the current status")
+        member.status = None
+        member.status_counter = 0
+
+    def _handle_minus_cureteam(self, resolved: ResolvedProtocolEvent) -> None:
+        side = _resolved_reference(resolved, 0).pokemon_ref.side
+        for member_id, member in self.members.items():
+            if member_id.side is side:
+                member.status = None
+                member.status_counter = 0
+
+    def _handle_minus_boost(self, resolved: ResolvedProtocolEvent) -> None:
+        self._change_boost(resolved, 1)
+
+    def _handle_minus_unboost(self, resolved: ResolvedProtocolEvent) -> None:
+        self._change_boost(resolved, -1)
+
+    def _handle_minus_setboost(self, resolved: ResolvedProtocolEvent) -> None:
+        self._change_boost(resolved, 0)
+
+    def _change_boost(self, resolved: ResolvedProtocolEvent, direction: int) -> None:
+        member = self._member_for(resolved, 0)
+        stat = normalize_showdown_id(resolved.event.arguments[1])
+        if stat not in _BOOST_NAMES:
+            raise _StateTransitionError(f"unsupported boost stat {stat!r}")
+        amount = int(resolved.event.arguments[2])
+        value = amount if direction == 0 else member.boosts[stat] + direction * amount
+        member.boosts[stat] = max(-6, min(6, value))
+
+    def _handle_minus_clearboost(self, resolved: ResolvedProtocolEvent) -> None:
+        self._clear_boosts(self._member_for(resolved, 0), lambda _: True)
+
+    def _handle_minus_clearallboost(self, resolved: ResolvedProtocolEvent) -> None:
+        for member_id in self.active.values():
+            self._clear_boosts(self.members[member_id], lambda _: True)
+
+    def _handle_minus_clearpositiveboost(self, resolved: ResolvedProtocolEvent) -> None:
+        self._clear_boosts(self._member_for(resolved, 0), lambda value: value > 0)
+
+    def _handle_minus_clearnegativeboost(self, resolved: ResolvedProtocolEvent) -> None:
+        self._clear_boosts(self._member_for(resolved, 0), lambda value: value < 0)
+
+    def _handle_minus_invertboost(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        member.boosts = {name: -value for name, value in member.boosts.items()}
+
+    def _handle_minus_copyboost(self, resolved: ResolvedProtocolEvent) -> None:
+        source = self._member_for(resolved, 0)
+        target = self._member_for(resolved, 1)
+        target.boosts = dict(source.boosts)
+
+    def _handle_minus_swapboost(self, resolved: ResolvedProtocolEvent) -> None:
+        source = self._member_for(resolved, 0)
+        target = self._member_for(resolved, 1)
+        stats = _boost_argument(resolved.event.arguments[2:])
+        for stat in stats:
+            source.boosts[stat], target.boosts[stat] = target.boosts[stat], source.boosts[stat]
+
+    @staticmethod
+    def _clear_boosts(member: _MutablePokemon, predicate: Callable[[int], bool]) -> None:
+        member.boosts = {
+            name: 0 if predicate(value) else value for name, value in member.boosts.items()
+        }
+
+    def _handle_minus_item(self, resolved: ResolvedProtocolEvent) -> None:
+        self._member_for(resolved, 0).item = resolved.event.arguments[1]
+
+    def _handle_minus_enditem(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        announced = normalize_showdown_id(resolved.event.arguments[1])
+        if member.item is not None and normalize_showdown_id(member.item) != announced:
+            raise _StateTransitionError("enditem does not match the member's current item")
+        member.item = None
+
+    def _handle_minus_ability(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        ability = resolved.event.arguments[1]
+        current_ids = {
+            normalize_showdown_id(value)
+            for value in (member.ability.base, member.ability.forme, member.ability.temporary)
+            if value is not None
+        }
+        temporary = member.ability.temporary
+        if resolved.event.cause is not None or normalize_showdown_id(ability) not in current_ids:
+            temporary = ability
+        if temporary is not None:
+            self._set_temporary_ability(member, temporary)
+
+    def _handle_minus_endability(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        member.effects.setdefault("gastroacid", self.turn)
+
+    def _handle_detailschange(self, resolved: ResolvedProtocolEvent) -> None:
+        self._change_form(resolved, resolved.event.arguments[1])
+
+    def _handle_minus_formechange(self, resolved: ResolvedProtocolEvent) -> None:
+        self._change_form(resolved, resolved.event.arguments[1])
+
+    def _change_form(self, resolved: ResolvedProtocolEvent, details: str) -> None:
+        member = self._member_for(resolved, 0)
+        form = _details_species(details)
+        self._set_form(member, form)
+
+    def _set_form(self, member: _MutablePokemon, form: str) -> None:
+        data = self._species_data(form)
+        member.current_form = form
+        member.displayed_species = form
+        if not member.terastallized:
+            member.current_types = data.types
+        member.base_stats = data.base_stats
+        member.weight = data.weight
+        forme_ability = (
+            None
+            if normalize_showdown_id(form) == normalize_showdown_id(member.original_species)
+            else data.native_ability
+        )
+        member.ability = AbilityState(
+            member.ability.base,
+            forme_ability,
+            member.ability.temporary,
+        )
+
+    def _handle_minus_mega(self, resolved: ResolvedProtocolEvent) -> None:
+        self.used_mega[self._member_for(resolved, 0).member_id.side] = True
+
+    def _handle_minus_primal(self, resolved: ResolvedProtocolEvent) -> None:
+        self._member_for(resolved, 0)
+
+    def _handle_minus_burst(self, resolved: ResolvedProtocolEvent) -> None:
+        self._change_form(resolved, resolved.event.arguments[1])
+
+    def _handle_minus_zpower(self, resolved: ResolvedProtocolEvent) -> None:
+        self.used_z_move[self._member_for(resolved, 0).member_id.side] = True
+
+    def _handle_minus_zbroken(self, resolved: ResolvedProtocolEvent) -> None:
+        self._member_for(resolved, 0)
+
+    def _handle_minus_terastallize(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        tera_type = resolved.event.arguments[1]
+        if not tera_type:
+            raise _StateTransitionError("terastallize requires a nonempty type")
+        member.tera_type = tera_type
+        member.terastallized = True
+        member.current_types = (tera_type,)
+
+    def _handle_minus_transform(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        target = self._member_for(resolved, 1)
+        target_species = (
+            target.transform.species if target.transform is not None else target.current_form
+        )
+        target_types = (
+            target.transform.types if target.transform is not None else target.current_types
+        )
+        target_weight = target.transform.weight if target.transform is not None else target.weight
+        target_base_stats = (
+            target.transform.non_hp_base_stats
+            if target.transform is not None
+            else tuple((name, dict(target.base_stats)[name]) for name in _BOOST_NAMES[:5])
+        )
+        target_ability = self._current_ability(target)
+        copied_moves = tuple(
+            MoveState(
+                move.move_id,
+                move.name,
+                move.move_type,
+                move.category,
+                move.target,
+                min(5, move.max_pp),
+                min(5, move.max_pp),
+            )
+            for move in target.move_snapshots()
+        )
+        member.transform = TransformSnapshot(
+            source_member_id=target.member_id,
+            species=target_species,
+            types=target_types,
+            weight=target_weight,
+            non_hp_base_stats=target_base_stats,
+            ability=target_ability,
+            boosts=tuple((name, target.boosts[name]) for name in _BOOST_NAMES),
+            moves=copied_moves,
+        )
+        member.boosts = dict(target.boosts)
+
+    def _handle_minus_typechange(self, resolved: ResolvedProtocolEvent) -> None:
+        self._member_for(resolved, 0).current_types = _parse_types(resolved.event.arguments[1])
+
+    def _handle_minus_typeadd(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        added = resolved.event.arguments[1].strip()
+        if not added:
+            raise _StateTransitionError("typeadd requires a nonempty type")
+        member.current_types = tuple(dict.fromkeys((*member.current_types, added)))
+
+    def _handle_minus_start(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        effect = _required_effect(resolved)
+        self._validate_effect(effect.normalized, "effect")
+        if effect.normalized == "typechange":
+            if len(resolved.event.arguments) < 3:
+                raise _StateTransitionError("typechange start requires resulting types")
+            member.current_types = _parse_types(resolved.event.arguments[2])
+        elif effect.normalized == "mimic":
+            if len(resolved.event.arguments) < 3:
+                raise _StateTransitionError("Mimic start requires the copied move")
+            if "mimic" not in member.moves:
+                raise _StateTransitionError(
+                    "Mimic effect requires Mimic in the member's move slots"
+                )
+            member.mimic_move = self._move_from_name(resolved.event.arguments[2])
+        member.effects.setdefault(effect.normalized, self.turn)
+
+    def _handle_minus_end(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        effect = _required_effect(resolved)
+        self._validate_effect(effect.normalized, "effect")
+        member.effects.pop(effect.normalized, None)
+        if effect.normalized == "typechange" and not member.terastallized:
+            member.current_types = self._species_data(member.current_form).types
+        elif effect.normalized == "mimic":
+            member.mimic_move = None
+
+    def _handle_minus_singleturn(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        effect = _required_effect(resolved).normalized
+        self._validate_effect(effect, "effect")
+        member.effects[effect] = self.turn
+        member.single_turn_effects.add(effect)
+
+    def _handle_minus_singlemove(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        effect = _required_effect(resolved).normalized
+        self._validate_effect(effect, "effect")
+        member.effects[effect] = self.turn
+        member.single_move_effects.add(effect)
+
+    def _handle_minus_activate(self, resolved: ResolvedProtocolEvent) -> None:
+        effect = _required_effect(resolved)
+        if effect.normalized != "skillswap":
+            return
+        references = tuple(
+            reference for reference in resolved.pokemon_refs if reference.member_id is not None
+        )
+        if len(references) != 2:
+            raise _StateTransitionError("Skill Swap requires source and target references")
+        source = self.members[_required_member(references[0])]
+        target = self.members[_required_member(references[1])]
+        source_ability = self._current_ability(source)
+        target_ability = self._current_ability(target)
+        arguments = resolved.event.arguments
+        if len(arguments) >= 4 and arguments[2] and arguments[3]:
+            target_ability = arguments[2]
+            source_ability = arguments[3]
+        self._set_temporary_ability(source, target_ability)
+        self._set_temporary_ability(target, source_ability)
+
+    def _handle_minus_prepare(self, resolved: ResolvedProtocolEvent) -> None:
+        move_id = normalize_showdown_id(resolved.event.arguments[1])
+        if move_id not in self._moves:
+            raise _StateTransitionError(f"prepare references unknown move {move_id!r}")
+        self._member_for(resolved, 0).preparing = move_id
+
+    def _handle_minus_mustrecharge(self, resolved: ResolvedProtocolEvent) -> None:
+        self._member_for(resolved, 0).effects["mustrecharge"] = self.turn
+
+    def _handle_minus_weather(self, resolved: ResolvedProtocolEvent) -> None:
+        weather = _required_effect(resolved).normalized
+        if weather == "none":
+            self.weather.clear()
+            return
+        self._validate_effect(weather, "weather")
+        if "[upkeep]" in resolved.event.arguments[1:]:
+            if weather not in self.weather:
+                raise _StateTransitionError(f"weather upkeep has no active {weather!r} weather")
+            return
+        self.weather = {weather: self.turn}
+
+    def _handle_minus_fieldstart(self, resolved: ResolvedProtocolEvent) -> None:
+        effect = _required_effect(resolved).normalized
+        self._validate_effect(effect, "field")
+        self.fields.setdefault(effect, self.turn)
+
+    def _handle_minus_fieldend(self, resolved: ResolvedProtocolEvent) -> None:
+        effect = _required_effect(resolved).normalized
+        self._validate_effect(effect, "field")
+        if effect not in self.fields:
+            raise _StateTransitionError(f"field effect {effect!r} ended before it started")
+        self.fields.pop(effect)
+
+    def _handle_minus_sidestart(self, resolved: ResolvedProtocolEvent) -> None:
+        side = _resolved_reference(resolved, 0).pokemon_ref.side
+        effect = _required_effect(resolved).normalized
+        self._validate_effect(effect, "side_condition")
+        conditions = self.side_conditions[side]
+        if effect in _STACKING_SIDE_CONDITIONS:
+            conditions[effect] = conditions.get(effect, 0) + 1
+        else:
+            conditions.setdefault(effect, self.turn)
+
+    def _handle_minus_sideend(self, resolved: ResolvedProtocolEvent) -> None:
+        side = _resolved_reference(resolved, 0).pokemon_ref.side
+        effect = _required_effect(resolved).normalized
+        self._validate_effect(effect, "side_condition")
+        if effect not in self.side_conditions[side]:
+            raise _StateTransitionError(f"side condition {effect!r} ended before it started")
+        self.side_conditions[side].pop(effect)
+
+    def _handle_minus_swapsideconditions(self, resolved: ResolvedProtocolEvent) -> None:
+        self.side_conditions[ReplaySide.P1], self.side_conditions[ReplaySide.P2] = (
+            self.side_conditions[ReplaySide.P2],
+            self.side_conditions[ReplaySide.P1],
+        )
+
+    def _apply_provenance(self, resolved: ResolvedProtocolEvent) -> None:
+        event = resolved.event
+        if event.tag in {"-ability", "-endability"}:
+            return
+        source = _provenance_member(resolved)
+        if source is None:
+            return
+        member = self.members[source]
+        references = tuple(value for value in (event.cause, event.effect) if value is not None)
+        for reference in references:
+            if reference.namespace == "item":
+                member.item = reference.name
+            elif reference.namespace == "ability":
+                current = member.ability
+                if normalize_showdown_id(reference.name) == normalize_showdown_id(current.base):
+                    continue
+                if current.forme is not None and normalize_showdown_id(
+                    reference.name
+                ) == normalize_showdown_id(current.forme):
+                    continue
+                self._set_temporary_ability(member, reference.name)
+
+    def _member_for(self, resolved: ResolvedProtocolEvent, argument_index: int) -> _MutablePokemon:
+        return self.members[_required_member(_resolved_reference(resolved, argument_index))]
+
+    def _validate_effect(self, effect: str, category: str) -> None:
+        if category == "effect" and effect in {"mimic", "typechange"}:
+            return
+        allowed = self._legal_effects.get(category)
+        if allowed is not None and effect not in allowed:
+            raise _StateTransitionError(
+                f"unsupported {category.replace('_', ' ')} effect variant {effect!r}"
+            )
+
+    @staticmethod
+    def _current_ability(member: _MutablePokemon) -> str:
+        return member.transform.ability if member.transform is not None else member.ability.current
+
+    @staticmethod
+    def _set_temporary_ability(member: _MutablePokemon, ability: str) -> None:
+        if member.transform is not None:
+            member.transform = replace(member.transform, ability=ability)
+        else:
+            member.ability = AbilityState(member.ability.base, member.ability.forme, ability)
+
+    def _clear_switch_state(self, member: _MutablePokemon) -> None:
+        member.ability = AbilityState(member.ability.base, member.ability.forme)
+        member.boosts = dict.fromkeys(_BOOST_NAMES, 0)
+        member.effects.clear()
+        member.single_turn_effects.clear()
+        member.single_move_effects.clear()
+        member.active_turns = 0
+        member.protect_counter = 0
+        member.preparing = None
+        member.last_move = None
+        member.transform = None
+        member.mimic_move = None
+        species = self._species_data(member.current_form)
+        if member.terastallized:
+            if member.tera_type is None:
+                raise _StateTransitionError("terastallized member has no tera type")
+            member.current_types = (member.tera_type,)
+        else:
+            member.current_types = species.types
+
+    @staticmethod
+    def _decrement_move(member: _MutablePokemon, move_id: str) -> None:
+        if member.transform is not None:
+            updated = tuple(
+                replace(move, current_pp=max(0, move.current_pp - 1))
+                if move.move_id == move_id
+                else move
+                for move in member.transform.moves
+            )
+            member.transform = replace(member.transform, moves=updated)
+            return
+        if member.mimic_move is not None and member.mimic_move.move_id == move_id:
+            member.mimic_move.current_pp = max(0, member.mimic_move.current_pp - 1)
+            return
+        member.moves[move_id].current_pp = max(0, member.moves[move_id].current_pp - 1)
+
+    def snapshot(self, line_index: int) -> ReplayBattleState:
+        members = tuple(
+            self.members[ReplayMemberId(side, roster_index)].snapshot()
+            for side in (ReplaySide.P1, ReplaySide.P2)
+            for roster_index in range(6)
+        )
+        sides = tuple(
+            ReplaySideState(
+                side=side,
+                active=(self.active.get((side, 0)), self.active.get((side, 1))),
+                conditions=tuple(sorted(self.side_conditions[side].items())),
+                used_mega=self.used_mega[side],
+                used_z_move=self.used_z_move[side],
+            )
+            for side in (ReplaySide.P1, ReplaySide.P2)
+        )
+        return ReplayBattleState(
+            replay_id=self.replay_id,
+            line_index=line_index,
+            turn=self.turn,
+            members=members,
+            sides=(sides[0], sides[1]),
+            weather=tuple(sorted(self.weather.items())),
+            fields=tuple(sorted(self.fields.items())),
+        )
+
+
+def _species_index(dex: Mapping[str, Any]) -> dict[str, _SpeciesData]:
+    index: dict[str, _SpeciesData] = {}
+    for value in dex.get("species", ()):
+        if not isinstance(value, Mapping):
+            continue
+        name = str(value.get("name", value.get("id", "")))
+        species_id = normalize_showdown_id(str(value.get("id", name)))
+        types = tuple(str(item) for item in value.get("types", ()) if isinstance(item, str))
+        base_stats_value = value.get("baseStats", {})
+        if not species_id or not types or not isinstance(base_stats_value, Mapping):
+            continue
+        try:
+            base_stats = tuple(
+                (stat, int(base_stats_value[stat]))
+                for stat in ("hp", "atk", "def", "spa", "spd", "spe")
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        abilities = value.get("abilities", {})
+        native_ability = (
+            str(abilities["0"])
+            if isinstance(abilities, Mapping) and isinstance(abilities.get("0"), str)
+            else None
+        )
+        data = _SpeciesData(
+            name,
+            str(value.get("baseSpecies", name)),
+            types,
+            base_stats,
+            float(value.get("weightkg", 0.0)),
+            native_ability,
+        )
+        index[species_id] = data
+        index.setdefault(normalize_showdown_id(name), data)
+    return index
+
+
+def _move_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    return {
+        normalize_showdown_id(str(value.get("id", value.get("name", "")))): value
+        for value in dex.get("moves", ())
+        if isinstance(value, Mapping) and value.get("id", value.get("name"))
+    }
+
+
+def _legal_effect_index(dex: Mapping[str, Any]) -> dict[str, frozenset[str]]:
+    value = dex.get("legalProtocolEffects")
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(category): frozenset(
+            normalize_showdown_id(str(effect)) for effect in effects if str(effect)
+        )
+        for category, effects in value.items()
+        if isinstance(effects, (list, tuple))
+    }
+
+
+def _maximum_pp(data: Mapping[str, Any], base_pp: int) -> int:
+    return base_pp if data.get("noPPBoosts") else base_pp * 8 // 5
+
+
+def _resolved_reference(
+    resolved: ResolvedProtocolEvent,
+    argument_index: int,
+) -> ResolvedPokemonRefArgument:
+    try:
+        return next(
+            reference
+            for reference in resolved.pokemon_refs
+            if reference.argument_index == argument_index
+        )
+    except StopIteration as exc:
+        raise _StateTransitionError(
+            f"event {resolved.event.tag!r} has no resolved reference at argument {argument_index}"
+        ) from exc
+
+
+def _required_member(reference: ResolvedPokemonRefArgument) -> ReplayMemberId:
+    if reference.member_id is None:
+        raise _StateTransitionError("state transition requires an active member reference")
+    return reference.member_id
+
+
+def _required_slot(reference: ResolvedPokemonRefArgument) -> int:
+    slot = reference.pokemon_ref.active_slot
+    if slot is None:
+        raise _StateTransitionError("state transition requires an active slot")
+    return slot
+
+
+def _required_effect(resolved: ResolvedProtocolEvent) -> EffectReference:
+    if resolved.event.effect is None:
+        raise _StateTransitionError(f"event {resolved.event.tag!r} requires a normalized effect")
+    return resolved.event.effect
+
+
+def _details_species(details: str) -> str:
+    species = details.split(",", 1)[0].strip()
+    if not species:
+        raise _StateTransitionError("Pokémon details require a species")
+    return species
+
+
+def _parse_hp_status(value: str) -> tuple[float, str | None]:
+    parts = value.split()
+    if not parts:
+        raise _StateTransitionError("HP status must not be empty")
+    hp = parts[0]
+    if "/" in hp:
+        numerator_text, denominator_text = hp.split("/", 1)
+        denominator_text = denominator_text.rstrip(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ%"
+        )
+        try:
+            numerator = float(numerator_text)
+            denominator = float(denominator_text)
+        except ValueError as exc:
+            raise _StateTransitionError(f"invalid HP status {value!r}") from exc
+        if denominator <= 0 or not 0 <= numerator <= denominator:
+            raise _StateTransitionError(f"invalid HP range {value!r}")
+        fraction = numerator / denominator
+    elif hp == "0":
+        fraction = 0.0
+    else:
+        raise _StateTransitionError(f"invalid HP status {value!r}")
+    status = normalize_showdown_id(parts[1]) if len(parts) > 1 else None
+    if status == "fnt":
+        status = None
+    elif status is not None and status not in _STATUS_NAMES:
+        raise _StateTransitionError(f"invalid HP status suffix {status!r}")
+    return fraction, status
+
+
+def _parse_types(value: str) -> tuple[str, ...]:
+    types = tuple(item.strip() for item in value.split("/") if item.strip())
+    if not 1 <= len(types) <= 2:
+        raise _StateTransitionError(f"invalid type list {value!r}")
+    return types
+
+
+def _boost_argument(arguments: tuple[str, ...]) -> tuple[str, ...]:
+    if not arguments or arguments[0].startswith("["):
+        return _BOOST_NAMES
+    stats = tuple(normalize_showdown_id(value) for value in arguments[0].split(","))
+    if not stats or any(stat not in _BOOST_NAMES for stat in stats):
+        raise _StateTransitionError(f"invalid boost list {arguments[0]!r}")
+    return stats
+
+
+def _provenance_member(resolved: ResolvedProtocolEvent) -> ReplayMemberId | None:
+    annotated = tuple(
+        reference.member_id
+        for reference in resolved.pokemon_refs
+        if resolved.event.arguments[reference.argument_index].startswith(("[of] ", "[from] "))
+        and reference.member_id is not None
+    )
+    if annotated:
+        return annotated[-1]
+    return next(
+        (
+            reference.member_id
+            for reference in resolved.pokemon_refs
+            if reference.member_id is not None
+        ),
+        None,
+    )
+
+
+def _diagnostic(event: ResolvedProtocolEvent, reason: str) -> ReplayEventDiagnostic:
+    parsed = event.event
+    return ReplayEventDiagnostic(
+        replay_id=parsed.replay_id,
+        line_index=parsed.line_index,
+        tag=parsed.tag,
+        normalized_effect="" if parsed.effect is None else parsed.effect.normalized,
+        normalized_cause="" if parsed.cause is None else parsed.cause.normalized,
+        raw_line=parsed.raw_line,
+        reason=reason,
+    )
+
+
+def reduce_replay_state(
+    replay_id: str,
+    ots: tuple[OTSData, OTSData],
+    events: Iterable[ResolvedProtocolEvent],
+    *,
+    dex: Mapping[str, Any],
+) -> ReconstructedReplayState:
+    """Apply resolved events once and emit immutable state at every replay cursor."""
+    event_tuple = tuple(events)
+    if tuple(sheet.side for sheet in ots) != (ReplaySide.P1, ReplaySide.P2):
+        raise ValueError("OTS sheets must be ordered as p1 and p2")
+    if any(not sheet.is_complete for sheet in ots):
+        raise ValueError("State reconstruction requires complete OTS for both sides")
+    if any(event.event.replay_id != replay_id for event in event_tuple):
+        raise ValueError("State reconstruction cannot contain events from another replay")
+    line_indices = tuple(event.event.line_index for event in event_tuple)
+    if line_indices != tuple(sorted(set(line_indices))):
+        raise ValueError("Resolved events must have unique ascending line indices")
+    if not event_tuple:
+        return ReconstructedReplayState(replay_id, ())
+    try:
+        reducer = _StateReducer(replay_id, ots, dex)
+    except _StateTransitionError as exc:
+        return ReconstructedReplayState(
+            replay_id,
+            (),
+            (_diagnostic(event_tuple[0], str(exc)),),
+        )
+
+    snapshots: list[ReplayBattleState] = []
+    for resolved in event_tuple:
+        try:
+            reducer.apply(resolved)
+            snapshots.append(reducer.snapshot(resolved.event.line_index))
+        except (KeyError, TypeError, ValueError) as exc:
+            return ReconstructedReplayState(
+                replay_id,
+                (),
+                (_diagnostic(resolved, str(exc)),),
+            )
+    return ReconstructedReplayState(replay_id, tuple(snapshots))
+
+
+def reconstruct_replay_state(
+    document: ReplayDocument,
+    *,
+    dex: Mapping[str, Any] | None = None,
+) -> ReconstructedReplayState:
+    """Resolve and reduce one normalized replay document without legacy battle objects."""
+    resolved = resolve_replay_events(document)
+    if resolved.diagnostics:
+        return ReconstructedReplayState(document.metadata.replay_id, (), resolved.diagnostics)
+    if dex is None:
+        from p0.model.resources import default_runtime_resources
+
+        dex = default_runtime_resources().dex
+    return reduce_replay_state(
+        document.metadata.replay_id,
+        document.ots,
+        resolved.events,
+        dex=dex,
+    )
+
+
+__all__ = [
+    "AbilityState",
+    "MoveState",
+    "ReconstructedReplayState",
+    "ReplayBattleState",
+    "ReplayPokemonState",
+    "ReplaySideState",
+    "TransformSnapshot",
+    "reconstruct_replay_state",
+    "reduce_replay_state",
+]
