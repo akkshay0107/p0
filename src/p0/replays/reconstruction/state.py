@@ -24,13 +24,65 @@ from p0.replays.schema import OTSData, OTSMember
 _BOOST_NAMES = ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
 _STATUS_NAMES = frozenset({"brn", "frz", "par", "psn", "slp", "tox"})
 _STACKING_SIDE_CONDITIONS = frozenset({"spikes", "toxicspikes"})
+# These four are emitted through -singleturn but are side conditions in the
+# simulator. Other ally-side conditions remain governed by the generated dex.
+_SIDE_GUARDS = frozenset({"craftyshield", "matblock", "quickguard", "wideguard"})
+_BREAKING_PROTECT_MOVES = frozenset(
+    {"feint", "hyperspacefury", "hyperspacehole", "phantomforce", "shadowforce"}
+)
+_BREAKABLE_MEMBER_PROTECT_EFFECTS = frozenset(
+    {
+        "banefulbunker",
+        "burningbulwark",
+        "kingsshield",
+        "obstruct",
+        "protect",
+        "silktrap",
+        "spikyshield",
+    }
+)
+_PROTECT_COUNTER_MOVES = frozenset(
+    {
+        "banefulbunker",
+        "burningbulwark",
+        "detect",
+        "endure",
+        "kingsshield",
+        "matblock",
+        "maxguard",
+        "obstruct",
+        "protect",
+        "quickguard",
+        "silktrap",
+        "spikyshield",
+        "wideguard",
+    }
+)
+_IMPLICIT_ACTION_MOVES = frozenset({"recharge", "struggle"})
+_SLOT_CONDITION_MOVES = frozenset({"healingwish", "wish"})
+_DELAYED_MOVE_IDS = frozenset({"doomdesire", "futuresight"})
+_DYNAMIC_EFFECTS: dict[str, dict[str, int | str]] = {
+    "perishsong": {f"perish{count}": count for count in range(4)},
+    "stockpile": {f"stockpile{layer}": layer for layer in range(1, 4)},
+    "protosynthesis": {f"protosynthesis{stat}": stat for stat in _BOOST_NAMES[:5]},
+    "quarkdrive": {f"quarkdrive{stat}": stat for stat in _BOOST_NAMES[:5]},
+    "supremeoverlord": {f"fallen{count}": count for count in range(1, 6)},
+}
+_DYNAMIC_PREFIXES = (
+    ("perish", "perishsong"),
+    ("stockpile", "stockpile"),
+    ("protosynthesis", "protosynthesis"),
+    ("quarkdrive", "quarkdrive"),
+    ("fallen", "supremeoverlord"),
+)
+_DYNAMIC_CANONICAL_EFFECTS = frozenset(_DYNAMIC_EFFECTS)
+_VARIANT_EFFECTS = frozenset(_DYNAMIC_CANONICAL_EFFECTS - {"perishsong"})
 _TRANSIENT_ACTION_TAGS = frozenset(
     {
         "-anim",
         "-block",
         "-combine",
         "-eat",
-        "-fail",
         "-fieldactivate",
         "-hitcount",
         "-immune",
@@ -61,6 +113,92 @@ class AbilityState:
     def current(self) -> str:
         """Return the effective named ability without modelling suppression."""
         return self.temporary or self.forme or self.base
+
+
+@dataclass(frozen=True, slots=True)
+class DynamicEffectVariant:
+    """Validated wire suffix retained alongside a canonical effect ID."""
+
+    canonical_id: str
+    wire_id: str
+    value: int | str
+
+    def __post_init__(self) -> None:
+        if self.canonical_id not in _DYNAMIC_EFFECTS:
+            raise ValueError(f"Unknown dynamic effect {self.canonical_id!r}")
+        if _DYNAMIC_EFFECTS[self.canonical_id].get(self.wire_id) != self.value:
+            raise ValueError("DynamicEffectVariant does not match its canonical effect")
+
+
+def normalize_dynamic_effect(effect: str) -> DynamicEffectVariant | None:
+    """Return validated dynamic-effect metadata, or None for a static effect ID."""
+    normalized = normalize_showdown_id(effect)
+    for prefix, canonical_id in _DYNAMIC_PREFIXES:
+        if not normalized.startswith(prefix):
+            continue
+        if normalized == canonical_id:
+            return None
+        try:
+            value = _DYNAMIC_EFFECTS[canonical_id][normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported dynamic effect variant {effect!r}") from exc
+        return DynamicEffectVariant(canonical_id, normalized, value)
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class DelayedMoveState:
+    """A validated Future Sight or Doom Desire condition attached to a side slot."""
+
+    source_member_id: ReplayMemberId
+    target_side: ReplaySide
+    target_slot: int
+    move_id: str
+    move_name: str
+    move_type: str
+    category: str
+    base_power: int
+    scheduled_turn: int
+    announced: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target_side, ReplaySide):
+            raise ValueError("DelayedMoveState has an invalid target side")
+        if not 0 <= self.target_slot < 2:
+            raise ValueError("DelayedMoveState.target_slot must be a doubles slot")
+        if self.move_id not in _DELAYED_MOVE_IDS:
+            raise ValueError("DelayedMoveState.move_id must be Doom Desire or Future Sight")
+        if not self.move_name or not self.move_type or not self.category:
+            raise ValueError("DelayedMoveState requires move metadata")
+        if self.base_power < 0 or self.scheduled_turn < 0:
+            raise ValueError("DelayedMoveState numeric metadata must be nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
+class SlotConditionState:
+    """A validated Wish or Healing Wish condition attached to a side slot."""
+
+    source_member_id: ReplayMemberId
+    target_side: ReplaySide
+    target_slot: int
+    move_id: str
+    created_turn: int
+    expiration_turn: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target_side, ReplaySide):
+            raise ValueError("SlotConditionState has an invalid target side")
+        if not 0 <= self.target_slot < 2:
+            raise ValueError("SlotConditionState.target_slot must be a doubles slot")
+        if self.move_id not in _SLOT_CONDITION_MOVES:
+            raise ValueError("SlotConditionState.move_id must be Wish or Healing Wish")
+        if self.created_turn < 0:
+            raise ValueError("SlotConditionState.created_turn must be nonnegative")
+        if self.move_id == "wish":
+            if self.expiration_turn is None or self.expiration_turn <= self.created_turn:
+                raise ValueError("Wish must have a later expiration turn")
+        elif self.expiration_turn is not None:
+            raise ValueError("Healing Wish must persist until it resolves")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +280,7 @@ class ReplayPokemonState:
     protect_counter: int
     preparing: str | None
     last_move: str | None
+    effect_variants: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.hp_fraction is not None and not 0.0 <= self.hp_fraction <= 1.0:
@@ -152,6 +291,22 @@ class ReplayPokemonState:
             raise ValueError("ReplayPokemonState fainted and HP state disagree")
         if tuple(name for name, _ in self.boosts) != _BOOST_NAMES:
             raise ValueError("ReplayPokemonState.boosts must use canonical stat order")
+        variant_effects = dict(self.effect_variants)
+        variant_effect_names = tuple(variant_effects)
+        if variant_effect_names != tuple(sorted(variant_effect_names)):
+            raise ValueError("ReplayPokemonState.effect_variants must be sorted")
+        if len(self.effect_variants) != len(variant_effects):
+            raise ValueError("ReplayPokemonState.effect_variants must be unique")
+        effects = dict(self.effects)
+        for effect, wire_id in variant_effects.items():
+            if effect not in _VARIANT_EFFECTS or effect not in effects:
+                raise ValueError("Effect variant must belong to an active canonical effect")
+            try:
+                variant = normalize_dynamic_effect(wire_id)
+            except ValueError as exc:
+                raise ValueError("ReplayPokemonState has an invalid effect variant") from exc
+            if variant is None or variant.canonical_id != effect:
+                raise ValueError("ReplayPokemonState effect variant has the wrong canonical ID")
         if self.perish_count is not None and not 0 <= self.perish_count <= 3:
             raise ValueError("ReplayPokemonState.perish_count must be in [0, 3]")
         if self.perish_count is not None and not any(
@@ -186,6 +341,8 @@ class ReplayBattleState:
     sides: tuple[ReplaySideState, ReplaySideState]
     weather: tuple[tuple[str, int], ...]
     fields: tuple[tuple[str, int], ...]
+    delayed_moves: tuple[DelayedMoveState, ...] = ()
+    slot_conditions: tuple[SlotConditionState, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.replay_id:
@@ -194,6 +351,19 @@ class ReplayBattleState:
             raise ValueError("ReplayBattleState indices must be nonnegative")
         if tuple(side.side for side in self.sides) != (ReplaySide.P1, ReplaySide.P2):
             raise ValueError("ReplayBattleState sides must be ordered as p1 and p2")
+        delayed_keys = tuple(
+            (delayed.target_side.side_index, delayed.target_slot) for delayed in self.delayed_moves
+        )
+        if delayed_keys != tuple(sorted(delayed_keys)) or len(delayed_keys) != len(
+            set(delayed_keys)
+        ):
+            raise ValueError("ReplayBattleState delayed moves must have unique sorted slots")
+        slot_keys = tuple(
+            (condition.target_side.side_index, condition.target_slot, condition.move_id)
+            for condition in self.slot_conditions
+        )
+        if slot_keys != tuple(sorted(slot_keys)) or len(slot_keys) != len(set(slot_keys)):
+            raise ValueError("ReplayBattleState slot conditions must be uniquely sorted")
 
     def member(self, member_id: ReplayMemberId) -> ReplayPokemonState:
         """Return one member from its stable side and roster index."""
@@ -283,6 +453,7 @@ class _MutablePokemon:
     mimic_move: _MutableMove | None = None
     boosts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(_BOOST_NAMES, 0))
     effects: dict[str, int] = field(default_factory=dict)
+    effect_variants: dict[str, str] = field(default_factory=dict)
     perish_count: int | None = None
     single_turn_effects: set[str] = field(default_factory=set)
     single_move_effects: set[str] = field(default_factory=set)
@@ -329,6 +500,7 @@ class _MutablePokemon:
             moves=self.move_snapshots(),
             boosts=tuple((name, self.boosts[name]) for name in _BOOST_NAMES),
             effects=tuple(sorted(self.effects.items())),
+            effect_variants=tuple(sorted(self.effect_variants.items())),
             perish_count=self.perish_count,
             tera_type=self.tera_type,
             terastallized=self.terastallized,
@@ -369,10 +541,13 @@ class _StateReducer:
         }
         self.active: dict[tuple[ReplaySide, int], ReplayMemberId] = {}
         self.side_conditions = {ReplaySide.P1: {}, ReplaySide.P2: {}}
+        self.side_single_turn_effects = {ReplaySide.P1: set(), ReplaySide.P2: set()}
         self.used_mega = {ReplaySide.P1: False, ReplaySide.P2: False}
         self.used_z_move = {ReplaySide.P1: False, ReplaySide.P2: False}
         self.weather: dict[str, int] = {}
         self.fields: dict[str, int] = {}
+        self.delayed_moves: dict[tuple[ReplaySide, int], DelayedMoveState] = {}
+        self.slot_conditions: dict[tuple[ReplaySide, int, str], SlotConditionState] = {}
         self._handlers: dict[str, Callable[[ResolvedProtocolEvent], None]] = {
             "switch": self._handle_switch,
             "drag": self._handle_drag,
@@ -418,6 +593,7 @@ class _StateReducer:
             "-singlemove": self._handle_minus_singlemove,
             "-activate": self._handle_minus_activate,
             "-prepare": self._handle_minus_prepare,
+            "-fail": self._handle_minus_fail,
             "-mustrecharge": self._handle_minus_mustrecharge,
             "-weather": self._handle_minus_weather,
             "-fieldstart": self._handle_minus_fieldstart,
@@ -510,19 +686,35 @@ class _StateReducer:
                 raise _StateTransitionError(
                     f"turn number {turn} does not advance current turn {self.turn}"
                 )
+            self._expire_member_single_turn_effects()
+            self._expire_side_single_turn_effects()
             self.turn = turn
             for member_id in self.active.values():
                 member = self.members[member_id]
                 member.active_turns += 1
-                for effect in member.single_turn_effects:
-                    member.effects.pop(effect, None)
-                member.single_turn_effects.clear()
                 if member.status == "tox":
                     member.status_counter += 1
-        elif tag in {"", "teampreview", "upkeep", "win", "tie", "forfeit"}:
+        elif tag == "upkeep":
+            self._expire_member_single_turn_effects()
+            self._expire_side_single_turn_effects()
+            self._expire_slot_conditions()
+        elif tag in {"", "teampreview", "win", "tie", "forfeit"}:
             return
         else:
             raise _StateTransitionError(f"boundary signal {tag!r} is not implemented")
+
+    def _expire_member_single_turn_effects(self) -> None:
+        for member_id in self.active.values():
+            member = self.members[member_id]
+            for effect in member.single_turn_effects:
+                member.effects.pop(effect, None)
+            member.single_turn_effects.clear()
+
+    def _expire_side_single_turn_effects(self) -> None:
+        for side, effects in self.side_single_turn_effects.items():
+            for effect in effects:
+                self.side_conditions[side].pop(effect, None)
+            effects.clear()
 
     def _handle_switch(self, resolved: ResolvedProtocolEvent) -> None:
         self._switch(resolved)
@@ -559,6 +751,8 @@ class _StateReducer:
         hp_fraction, status = _parse_hp_status(resolved.event.arguments[2])
         member.hp_fraction = hp_fraction
         member.status = status
+        if status != "slp":
+            member.status_counter = 0
         member.fainted = hp_fraction == 0.0
         member.revealed = not disguised
         member.selected = True
@@ -617,11 +811,19 @@ class _StateReducer:
         member = self._member_for(resolved, 0)
         move_id = normalize_showdown_id(resolved.event.arguments[1])
         move = next((item for item in member.move_snapshots() if item.move_id == move_id), None)
-        if move is None:
+        if move is None and move_id not in _IMPLICIT_ACTION_MOVES:
             raise _StateTransitionError(
                 f"move {resolved.event.arguments[1]!r} is not in the member's effective move slots"
             )
-        if resolved.event.cause is None:
+        if move_id in _DELAYED_MOVE_IDS:
+            self._schedule_delayed_move(resolved, member, move_id)
+        elif move_id in _SLOT_CONDITION_MOVES:
+            self._schedule_slot_condition(resolved, member, move_id)
+        elif move_id == "recharge":
+            member.effects.pop("mustrecharge", None)
+        elif move_id not in _PROTECT_COUNTER_MOVES:
+            member.protect_counter = 0
+        if resolved.event.cause is None and move_id not in _IMPLICIT_ACTION_MOVES:
             self._decrement_move(member, move_id)
         for effect in member.single_move_effects:
             member.effects.pop(effect, None)
@@ -629,8 +831,139 @@ class _StateReducer:
         member.last_move = move_id
         member.preparing = None
 
+    def _schedule_delayed_move(
+        self,
+        resolved: ResolvedProtocolEvent,
+        source: _MutablePokemon,
+        move_id: str,
+    ) -> None:
+        target_ref = _resolved_reference(resolved, 2)
+        target_member_id = _required_member(target_ref)
+        target_slot = _required_slot(target_ref)
+        target_key = (target_member_id.side, target_slot)
+        if self.active.get(target_key) != target_member_id:
+            raise _StateTransitionError("delayed move target is not active in its referenced slot")
+        if target_key in self.delayed_moves:
+            raise _StateTransitionError("delayed move target slot already has a pending effect")
+
+        data = self._moves[move_id]
+        try:
+            move_name = str(data["name"])
+            move_type = str(data["type"])
+            category = str(data["category"])
+            base_power = int(data["basePower"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _StateTransitionError(
+                f"delayed move {move_id!r} has incomplete damage metadata"
+            ) from exc
+        self.delayed_moves[target_key] = DelayedMoveState(
+            source_member_id=source.member_id,
+            target_side=target_member_id.side,
+            target_slot=target_slot,
+            move_id=move_id,
+            move_name=move_name,
+            move_type=move_type,
+            category=category,
+            base_power=base_power,
+            scheduled_turn=self.turn + 1,
+            announced=False,
+        )
+
+    def _schedule_slot_condition(
+        self,
+        resolved: ResolvedProtocolEvent,
+        source: _MutablePokemon,
+        move_id: str,
+    ) -> None:
+        source_slot = _required_slot(_resolved_reference(resolved, 0))
+        key = (source.member_id.side, source_slot, move_id)
+        if key in self.slot_conditions:
+            return
+        self.slot_conditions[key] = SlotConditionState(
+            source_member_id=source.member_id,
+            target_side=source.member_id.side,
+            target_slot=source_slot,
+            move_id=move_id,
+            created_turn=self.turn,
+            expiration_turn=self.turn + 1 if move_id == "wish" else None,
+        )
+
+    def _expire_slot_conditions(self) -> None:
+        for key, condition in tuple(self.slot_conditions.items()):
+            if (
+                condition.move_id == "wish"
+                and condition.expiration_turn is not None
+                and condition.expiration_turn <= self.turn
+            ):
+                del self.slot_conditions[key]
+
+    def _discard_failed_slot_condition(self, member: _MutablePokemon) -> None:
+        if member.last_move not in _SLOT_CONDITION_MOVES:
+            return
+        for key, condition in tuple(self.slot_conditions.items()):
+            if (
+                condition.source_member_id == member.member_id
+                and condition.move_id == member.last_move
+                and condition.created_turn == self.turn
+            ):
+                del self.slot_conditions[key]
+
+    def _handle_delayed_start(
+        self,
+        resolved: ResolvedProtocolEvent,
+        move_id: str,
+    ) -> None:
+        source = self._member_for(resolved, 0)
+        matches = tuple(
+            (key, delayed)
+            for key, delayed in self.delayed_moves.items()
+            if delayed.source_member_id == source.member_id and delayed.move_id == move_id
+        )
+        pending = tuple((key, delayed) for key, delayed in matches if not delayed.announced)
+        if len(pending) != 1:
+            if not pending and matches:
+                raise _StateTransitionError(f"{move_id} start was emitted more than once")
+            raise _StateTransitionError(
+                f"{move_id} start has an ambiguous pending move from the referenced caster"
+            )
+        key, delayed = pending[0]
+        self.delayed_moves[key] = replace(delayed, announced=True)
+
+    def _handle_delayed_end(
+        self,
+        resolved: ResolvedProtocolEvent,
+        move_id: str,
+    ) -> None:
+        target_ref = _resolved_reference(resolved, 0)
+        target_member_id = _required_member(target_ref)
+        target_slot = _required_slot(target_ref)
+        target_key = (target_member_id.side, target_slot)
+        if self.active.get(target_key) != target_member_id:
+            raise _StateTransitionError("delayed move ended for a non-active target slot")
+        try:
+            delayed = self.delayed_moves[target_key]
+        except KeyError as exc:
+            raise _StateTransitionError(
+                f"{move_id} ended without a pending target-slot condition"
+            ) from exc
+        if delayed.move_id != move_id:
+            raise _StateTransitionError(
+                f"delayed move end {move_id!r} does not match {delayed.move_id!r}"
+            )
+        if not delayed.announced:
+            raise _StateTransitionError("delayed move ended before its start message")
+        if self.turn > 0 and self.turn != delayed.scheduled_turn:
+            timing = "before" if self.turn < delayed.scheduled_turn else "after"
+            raise _StateTransitionError(f"delayed move ended {timing} its scheduled turn")
+        del self.delayed_moves[target_key]
+
     def _handle_cant(self, resolved: ResolvedProtocolEvent) -> None:
         member = self._member_for(resolved, 0)
+        effect = _required_effect(resolved).normalized
+        if effect == "recharge":
+            member.effects.pop("mustrecharge", None)
+        else:
+            self._discard_failed_slot_condition(member)
         if member.status == "slp":
             member.status_counter += 1
         member.protect_counter = 0
@@ -639,7 +972,21 @@ class _StateReducer:
         self._set_hp(resolved)
 
     def _handle_minus_heal(self, resolved: ResolvedProtocolEvent) -> None:
-        self._set_hp(resolved)
+        cause = resolved.event.cause
+        move_id = cause.normalized if cause is not None and cause.namespace == "move" else None
+        condition_key = None
+        if move_id in _SLOT_CONDITION_MOVES:
+            target_reference = _resolved_reference(resolved, 0)
+            target_member_id = _required_member(target_reference)
+            target_slot = _required_slot(target_reference)
+            condition_key = (target_member_id.side, target_slot, move_id)
+            if condition_key not in self.slot_conditions:
+                raise _StateTransitionError(
+                    f"{move_id} healed a slot without a pending slot condition"
+                )
+        self._set_hp(resolved, clear_status=move_id == "healingwish")
+        if condition_key is not None:
+            del self.slot_conditions[condition_key]
 
     def _handle_minus_sethp(self, resolved: ResolvedProtocolEvent) -> None:
         arguments = resolved.event.arguments
@@ -653,12 +1000,17 @@ class _StateReducer:
             if status is not None:
                 member.status = status
 
-    def _set_hp(self, resolved: ResolvedProtocolEvent) -> None:
+    def _set_hp(self, resolved: ResolvedProtocolEvent, *, clear_status: bool = False) -> None:
         member = self._member_for(resolved, 0)
         hp_fraction, status = _parse_hp_status(resolved.event.arguments[1])
+        if clear_status and status is not None:
+            raise _StateTransitionError("Healing Wish heal must not retain a status")
         member.hp_fraction = hp_fraction
         member.fainted = hp_fraction == 0.0
-        if hp_fraction > 0.0 and status is not None:
+        if clear_status:
+            member.status = None
+            member.status_counter = 0
+        elif hp_fraction > 0.0 and status is not None:
             member.status = status
 
     def _handle_minus_status(self, resolved: ResolvedProtocolEvent) -> None:
@@ -870,19 +1222,30 @@ class _StateReducer:
         member.current_types = tuple(dict.fromkeys((*member.current_types, added)))
 
     def _handle_minus_start(self, resolved: ResolvedProtocolEvent) -> None:
-        member = self._member_for(resolved, 0)
         effect = _required_effect(resolved)
-        perish_count = _perish_count(effect.normalized)
-        if perish_count is not None:
-            member.effects.setdefault("perishsong", self.turn)
-            member.perish_count = perish_count
+        variant = _dynamic_effect_or_none(effect.normalized)
+        canonical_id = effect.normalized if variant is None else variant.canonical_id
+        if canonical_id in _DELAYED_MOVE_IDS:
+            self._handle_delayed_start(resolved, canonical_id)
             return
-        self._validate_effect(effect.normalized, "effect")
-        if effect.normalized == "typechange":
+
+        member = self._member_for(resolved, 0)
+        if variant is None and effect.normalized in _DYNAMIC_CANONICAL_EFFECTS:
+            raise _StateTransitionError(f"unsupported effect variant {effect.normalized!r}")
+        if variant is not None and variant.canonical_id == "perishsong":
+            member.effects.setdefault("perishsong", self.turn)
+            member.perish_count = int(variant.value)
+            return
+        self._validate_effect(canonical_id, "effect")
+        if variant is not None:
+            member.effects.setdefault(canonical_id, self.turn)
+            member.effect_variants[canonical_id] = variant.wire_id
+            return
+        if canonical_id == "typechange":
             if len(resolved.event.arguments) < 3:
                 raise _StateTransitionError("typechange start requires resulting types")
             member.current_types = _parse_types(resolved.event.arguments[2])
-        elif effect.normalized == "mimic":
+        elif canonical_id == "mimic":
             if len(resolved.event.arguments) < 3:
                 raise _StateTransitionError("Mimic start requires the copied move")
             if "mimic" not in member.moves:
@@ -890,26 +1253,50 @@ class _StateReducer:
                     "Mimic effect requires Mimic in the member's move slots"
                 )
             member.mimic_move = self._move_from_name(resolved.event.arguments[2])
-        member.effects.setdefault(effect.normalized, self.turn)
+        member.effects.setdefault(canonical_id, self.turn)
 
     def _handle_minus_end(self, resolved: ResolvedProtocolEvent) -> None:
-        member = self._member_for(resolved, 0)
         effect = _required_effect(resolved)
-        self._validate_effect(effect.normalized, "effect")
-        member.effects.pop(effect.normalized, None)
-        if effect.normalized == "perishsong":
+        variant = _dynamic_effect_or_none(effect.normalized)
+        canonical_id = effect.normalized if variant is None else variant.canonical_id
+        if canonical_id in _DELAYED_MOVE_IDS:
+            self._handle_delayed_end(resolved, canonical_id)
+            return
+        member = self._member_for(resolved, 0)
+        self._validate_effect(canonical_id, "effect")
+        active_variant = member.effect_variants.get(canonical_id)
+        if variant is not None and active_variant is not None and active_variant != variant.wire_id:
+            raise _StateTransitionError(
+                f"{canonical_id} ended with variant {effect.normalized!r}, "
+                f"but active variant is {active_variant!r}"
+            )
+        member.effects.pop(canonical_id, None)
+        member.effect_variants.pop(canonical_id, None)
+        if canonical_id == "perishsong":
             member.perish_count = None
-        if effect.normalized == "typechange" and not member.terastallized:
+        if canonical_id == "typechange" and not member.terastallized:
             member.current_types = self._species_data(member.current_form).types
-        elif effect.normalized == "mimic":
+        elif canonical_id == "mimic":
             member.mimic_move = None
 
     def _handle_minus_singleturn(self, resolved: ResolvedProtocolEvent) -> None:
-        member = self._member_for(resolved, 0)
         effect = _required_effect(resolved).normalized
+        if effect in _SIDE_GUARDS:
+            member = self._member_for(resolved, 0)
+            side = member.member_id.side
+            if effect in self.side_single_turn_effects[side]:
+                raise _StateTransitionError(f"side guard {effect!r} started twice")
+            self.side_conditions[side][effect] = self.turn
+            self.side_single_turn_effects[side].add(effect)
+            self._record_successful_protection(member)
+            return
+
+        member = self._member_for(resolved, 0)
         self._validate_effect(effect, "effect")
         member.effects[effect] = self.turn
         member.single_turn_effects.add(effect)
+        if effect in _PROTECT_COUNTER_MOVES:
+            self._record_successful_protection(member)
 
     def _handle_minus_singlemove(self, resolved: ResolvedProtocolEvent) -> None:
         member = self._member_for(resolved, 0)
@@ -920,6 +1307,13 @@ class _StateReducer:
 
     def _handle_minus_activate(self, resolved: ResolvedProtocolEvent) -> None:
         effect = _required_effect(resolved)
+        breaking = (
+            "[broken]" in resolved.event.arguments or effect.normalized in _BREAKING_PROTECT_MOVES
+        )
+        if breaking:
+            target = self._member_for(resolved, 0)
+            self._break_protect(target.member_id.side, target)
+            return
         if effect.normalized != "skillswap":
             return
         references = tuple(
@@ -937,6 +1331,27 @@ class _StateReducer:
             source_ability = arguments[3]
         self._set_temporary_ability(source, target_ability)
         self._set_temporary_ability(target, source_ability)
+
+    def _handle_minus_fail(self, resolved: ResolvedProtocolEvent) -> None:
+        member = self._member_for(resolved, 0)
+        member.protect_counter = 0
+        self._discard_failed_slot_condition(member)
+        for key, delayed in tuple(self.delayed_moves.items()):
+            if delayed.source_member_id == member.member_id and not delayed.announced:
+                del self.delayed_moves[key]
+
+    def _record_successful_protection(self, member: _MutablePokemon) -> None:
+        member.protect_counter += 1
+
+    def _break_protect(self, side: ReplaySide, target: _MutablePokemon) -> None:
+        active_guards = self.side_single_turn_effects[side]
+        for effect in _BREAKABLE_MEMBER_PROTECT_EFFECTS:
+            target.effects.pop(effect, None)
+            target.single_turn_effects.discard(effect)
+        for effect in tuple(active_guards):
+            self.side_conditions[side].pop(effect, None)
+        active_guards.clear()
+        target.protect_counter = 0
 
     def _handle_minus_prepare(self, resolved: ResolvedProtocolEvent) -> None:
         move_id = normalize_showdown_id(resolved.event.arguments[1])
@@ -984,15 +1399,29 @@ class _StateReducer:
     def _handle_minus_sideend(self, resolved: ResolvedProtocolEvent) -> None:
         side = _resolved_reference(resolved, 0).pokemon_ref.side
         effect = _required_effect(resolved).normalized
+        if effect in _SIDE_GUARDS:
+            if effect not in self.side_conditions[side]:
+                raise _StateTransitionError(f"side condition {effect!r} ended before it started")
+            self.side_conditions[side].pop(effect)
+            self.side_single_turn_effects[side].discard(effect)
+            return
         self._validate_effect(effect, "side_condition")
         if effect not in self.side_conditions[side]:
             raise _StateTransitionError(f"side condition {effect!r} ended before it started")
         self.side_conditions[side].pop(effect)
+        self.side_single_turn_effects[side].discard(effect)
 
     def _handle_minus_swapsideconditions(self, resolved: ResolvedProtocolEvent) -> None:
         self.side_conditions[ReplaySide.P1], self.side_conditions[ReplaySide.P2] = (
             self.side_conditions[ReplaySide.P2],
             self.side_conditions[ReplaySide.P1],
+        )
+        (
+            self.side_single_turn_effects[ReplaySide.P1],
+            self.side_single_turn_effects[ReplaySide.P2],
+        ) = (
+            self.side_single_turn_effects[ReplaySide.P2],
+            self.side_single_turn_effects[ReplaySide.P1],
         )
 
     def _apply_provenance(self, resolved: ResolvedProtocolEvent) -> None:
@@ -1021,7 +1450,9 @@ class _StateReducer:
         return self.members[_required_member(_resolved_reference(resolved, argument_index))]
 
     def _validate_effect(self, effect: str, category: str) -> None:
-        if category == "effect" and effect in {"illusion", "mimic", "typechange"}:
+        if category == "effect" and (
+            effect in {"illusion", "mimic", "typechange"} or effect in _DYNAMIC_CANONICAL_EFFECTS
+        ):
             return
         allowed = self._legal_effects.get(category)
         if allowed is not None and effect not in allowed:
@@ -1044,6 +1475,7 @@ class _StateReducer:
         member.ability = AbilityState(member.ability.base, member.ability.forme)
         member.boosts = dict.fromkeys(_BOOST_NAMES, 0)
         member.effects.clear()
+        member.effect_variants.clear()
         member.perish_count = None
         member.single_turn_effects.clear()
         member.single_move_effects.clear()
@@ -1053,6 +1485,8 @@ class _StateReducer:
         member.last_move = None
         member.transform = None
         member.mimic_move = None
+        if member.status != "slp":
+            member.status_counter = 0
         species = self._species_data(member.current_form)
         if member.terastallized:
             if member.tera_type is None:
@@ -1093,6 +1527,17 @@ class _StateReducer:
             )
             for side in (ReplaySide.P1, ReplaySide.P2)
         )
+        delayed_moves = tuple(
+            self.delayed_moves[key]
+            for key in sorted(self.delayed_moves, key=lambda item: (item[0].side_index, item[1]))
+        )
+        slot_conditions = tuple(
+            self.slot_conditions[key]
+            for key in sorted(
+                self.slot_conditions,
+                key=lambda item: (item[0].side_index, item[1], item[2]),
+            )
+        )
         return ReplayBattleState(
             replay_id=self.replay_id,
             line_index=line_index,
@@ -1101,6 +1546,8 @@ class _StateReducer:
             sides=(sides[0], sides[1]),
             weather=tuple(sorted(self.weather.items())),
             fields=tuple(sorted(self.fields.items())),
+            delayed_moves=delayed_moves,
+            slot_conditions=slot_conditions,
         )
 
 
@@ -1201,10 +1648,11 @@ def _required_effect(resolved: ResolvedProtocolEvent) -> EffectReference:
     return resolved.event.effect
 
 
-def _perish_count(effect: str) -> int | None:
-    if len(effect) == 7 and effect.startswith("perish") and effect[-1] in "0123":
-        return int(effect[-1])
-    return None
+def _dynamic_effect_or_none(effect: str) -> DynamicEffectVariant | None:
+    try:
+        return normalize_dynamic_effect(effect)
+    except ValueError as exc:
+        raise _StateTransitionError(f"unsupported effect variant {effect!r}") from exc
 
 
 def _details_species(details: str) -> str:
@@ -1358,12 +1806,16 @@ def reconstruct_replay_state(
 
 __all__ = [
     "AbilityState",
+    "DelayedMoveState",
+    "DynamicEffectVariant",
     "MoveState",
     "ReconstructedReplayState",
     "ReplayBattleState",
     "ReplayPokemonState",
     "ReplaySideState",
+    "SlotConditionState",
     "TransformSnapshot",
     "reconstruct_replay_state",
+    "normalize_dynamic_effect",
     "reduce_replay_state",
 ]

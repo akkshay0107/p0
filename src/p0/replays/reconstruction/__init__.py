@@ -26,12 +26,16 @@ from p0.replays.reconstruction.resolution import (
 )
 from p0.replays.reconstruction.state import (
     AbilityState,
+    DelayedMoveState,
+    DynamicEffectVariant,
     MoveState,
     ReconstructedReplayState,
     ReplayBattleState,
     ReplayPokemonState,
     ReplaySideState,
+    SlotConditionState,
     TransformSnapshot,
+    normalize_dynamic_effect,
     reconstruct_replay_state,
     reduce_replay_state,
 )
@@ -39,6 +43,8 @@ from p0.replays.reconstruction.state import (
 __all__ = [
     "EventClassification",
     "AbilityState",
+    "DelayedMoveState",
+    "DynamicEffectVariant",
     "MoveState",
     "ParsedReplayEvents",
     "PokemonRefArgument",
@@ -55,8 +61,10 @@ __all__ = [
     "ResolvedPokemonRefArgument",
     "ResolvedProtocolEvent",
     "ResolvedReplayEvents",
+    "SlotConditionState",
     "TransformSnapshot",
     "looks_like_protocol_pokemon_reference",
+    "normalize_dynamic_effect",
     "parse_protocol_event",
     "parse_protocol_events",
     "parse_protocol_pokemon_reference",
