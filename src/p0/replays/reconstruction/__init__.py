@@ -17,6 +17,18 @@ from p0.replays.reconstruction.identity import (
     looks_like_protocol_pokemon_reference,
     parse_protocol_pokemon_reference,
 )
+from p0.replays.reconstruction.projection import (
+    ProjectedPerspective,
+    ProjectedSnapshot,
+    ReplayBattleView,
+    ReplayMoveView,
+    ReplayNamedValue,
+    ReplayPokemonView,
+    ReplayStatValue,
+    impute_replay_stats,
+    project_battle_view,
+    project_replay_perspectives,
+)
 from p0.replays.reconstruction.resolution import (
     ResolvedPokemonRefArgument,
     ResolvedProtocolEvent,
@@ -73,4 +85,14 @@ __all__ = [
     "resolve_replay_events",
     "reconstruct_replay_state",
     "reduce_replay_state",
+    "ProjectedPerspective",
+    "ProjectedSnapshot",
+    "ReplayBattleView",
+    "ReplayNamedValue",
+    "ReplayMoveView",
+    "ReplayPokemonView",
+    "ReplayStatValue",
+    "impute_replay_stats",
+    "project_battle_view",
+    "project_replay_perspectives",
 ]

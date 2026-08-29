@@ -42,7 +42,8 @@ from p0.replays.reconstruct import (
     impute_stat_points,
     reconstruct_both,
 )
-from p0.replays.schema import DecisionType, LabelKind
+from p0.replays.reconstruction.projection import ProjectedPerspective, ReplayStatValue
+from p0.replays.schema import REPLAY_IR_SCHEMA_VERSION, DecisionType, LabelKind
 from p0.replays.shards import (
     BO3_COMPILATION_SEMANTICS,
     SHARD_ARTIFACT_SCHEMA,
@@ -107,11 +108,13 @@ def _build_configuration(
     max_candidates: int,
     max_decisions_per_shard: int,
     external_rejections: tuple[str, ...] = (),
+    compiler_backend: str = "legacy",
 ) -> dict[str, Any]:
     return {
         "parser_version": REPLAY_PARSER_VERSION,
-        "replay_ir_version": 1,
+        "replay_ir_version": REPLAY_IR_SCHEMA_VERSION,
         "compiler_version": REPLAY_COMPILER_VERSION,
+        "compiler_backend": compiler_backend,
         # The dataset hash names the output directory, so the shard layout has
         # to be part of it: a schema-only bump must land in a new directory
         # rather than colliding with a build the reader would now reject.
@@ -203,7 +206,7 @@ def _empty_scalar_values() -> dict[str, list[Any]]:
 
 def _perspective_tensors(
     game: CompiledGame,
-    perspective: ReconstructedPerspective,
+    perspective: ReconstructedPerspective | ProjectedPerspective,
     *,
     builder: ObservationBuilder,
     stat_estimates: tuple[Any, ...],
@@ -212,29 +215,39 @@ def _perspective_tensors(
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
 
+    v2_estimates = {
+        estimate.member_id: estimate.values
+        for estimate in stat_estimates
+        if isinstance(estimate, ReplayStatValue)
+    }
     estimates = {
         (estimate.side, _normalized(estimate.species)): estimate.precomputed
         for estimate in stat_estimates
-        if estimate.precomputed is not None
+        if not isinstance(estimate, ReplayStatValue) and estimate.precomputed is not None
     }
+    if v2_estimates and len(v2_estimates) != 12:
+        raise ValueError("v2 replay stats must contain one result for every roster member")
 
     winner = game.document.outcome.winner
     outcome = 0.0 if winner < 0 else (1.0 if winner == perspective.player else -1.0)
 
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
-        snapshot.view.stat_cache = {}
-        overrides = {}
-        # Only the opponent is overridden. Live battles read our own exact stats from
-        # the request message and mark them SELF_KNOWN, so imputing our own side here
-        # would train the model on estimates for stats it can trust at inference.
-        # Public replays cannot recover those exact stats either way.
-        opponent_side = 1 if perspective.player == 0 else 0
-        for pokemon in snapshot.view.opponent_team.values():
-            precomputed = estimates.get((opponent_side, _normalized(pokemon.species)))
-            if precomputed is not None:
-                overrides[pokemon] = precomputed
-        # ReconstructedSnapshot.spatial_turn is the request-scoped spatial interaction records.
-        snapshot.view.spatial_turn = snapshot.spatial_turn
+        snapshot.view.stat_cache.clear()
+        overrides: dict[Any, tuple[int, int, int, int, int, int] | None] = {}
+        if v2_estimates:
+            for pokemon in (*snapshot.view.team.values(), *snapshot.view.opponent_team.values()):
+                try:
+                    overrides[pokemon] = v2_estimates[pokemon.member_id]
+                except KeyError as exc:
+                    raise ValueError("v2 replay stats are missing a roster member") from exc
+        else:
+            # Legacy replay views preserve live-side exact-stat behaviour and only
+            # replace public opponent estimates.
+            opponent_side = 1 if perspective.player == 0 else 0
+            for pokemon in snapshot.view.opponent_team.values():
+                precomputed = estimates.get((opponent_side, _normalized(pokemon.species)))
+                if precomputed is not None:
+                    overrides[pokemon] = precomputed
         observation = builder.build(snapshot.view, overrides)
         observation.validate(batch_rank=0)
         observation.validate_overflow_contract()
@@ -339,6 +352,7 @@ def write_tensor_shards(
     raw_replays: Iterable[Mapping[str, str]] | None = None,
     source_series: Mapping[str, tuple[str, ...]] | None = None,
     external_rejections: tuple[str, ...] = (),
+    compiler_backend: str = "legacy",
 ) -> ShardBuildResult:
     """Persist a compiled result as immutable, runtime-bound tensor shards.
 
@@ -353,6 +367,7 @@ def write_tensor_shards(
         raw_replays: Optional precomputed identities for raw replay payload.
         source_series: Optional precomputed mappings of source series.
         external_rejections: Input identities rejected before replay parsing.
+        compiler_backend: Backend identity included in the temporary v2 build contract.
 
     Returns:
         The generated shard manifest and its path as a ShardBuildResult.
@@ -366,6 +381,7 @@ def write_tensor_shards(
         max_candidates=max_candidates,
         max_decisions_per_shard=max_decisions_per_shard,
         external_rejections=external_rejections,
+        compiler_backend=compiler_backend,
     )
     identities = tuple(raw_replays or _raw_replay_identities(result))
     memberships = dict(source_series or _source_series(result))
@@ -394,7 +410,7 @@ def write_tensor_shards(
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     diagnostics["rejected_input_files"] += len(external_rejections)
-    current_games: list[tuple[CompiledGame, ReconstructedPerspective]] = []
+    current_games: list[tuple[CompiledGame, ReconstructedPerspective | ProjectedPerspective]] = []
     current_decisions = 0
     shard_index = 0
     failed_games: set[str] = set()
@@ -595,7 +611,10 @@ class CompiledGame:
     replay_id: str
     canonical_player_roles: tuple[int, int]
     document: ReplayDocument
-    perspectives: tuple[ReconstructedPerspective, ReconstructedPerspective]
+    perspectives: tuple[
+        ReconstructedPerspective | ProjectedPerspective,
+        ReconstructedPerspective | ProjectedPerspective,
+    ]
     stat_estimates: tuple[Any, ...]
 
     def __post_init__(self) -> None:
@@ -717,6 +736,38 @@ def _quality_reasons(
     return tuple(sorted(reasons))
 
 
+def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
+    counters: Counter[str] = Counter()
+    counters["illegal_candidates"] = 0
+    for key in (
+        "replay_count",
+        "series_count",
+        "player_perspective_games",
+        "decisions",
+        "label_exact",
+        "label_partial",
+        "label_unknown",
+        "oov_ids",
+        "missing_pre_hp",
+        "grounding_misses",
+        "effect_overflow",
+        "parser_errors",
+        "preview_decisions",
+        "imputation_confidence_sum",
+        "accepted_games",
+        "rejected_games",
+    ):
+        counters[key] = 0
+    counters["replays"] = sum(len(group.games) for group in grouping.series)
+    counters["series"] = len(grouping.series)
+    counters["replay_count"] = counters["replays"]
+    counters["series_count"] = counters["series"]
+    counters["complete_series"] = sum(group.record.is_complete for group in grouping.series)
+    counters["incomplete_series"] = counters["series"] - counters["complete_series"]
+    counters["grouping_diagnostics"] = len(grouping.diagnostics)
+    return counters
+
+
 def _compile_worker(
     args: tuple[
         ReplayDocument,
@@ -784,35 +835,7 @@ def compile_documents(
         A CompilationResult containing the series, games, and metrics.
     """
     grouping: GroupingResult = group_replays(documents, format_id=format_id)
-    counters: Counter[str] = Counter()
-
-    counters["illegal_candidates"] = 0
-    for key in (
-        "replay_count",
-        "series_count",
-        "player_perspective_games",
-        "decisions",
-        "label_exact",
-        "label_partial",
-        "label_unknown",
-        "oov_ids",
-        "missing_pre_hp",
-        "grounding_misses",
-        "effect_overflow",
-        "parser_errors",
-        "preview_decisions",
-        "imputation_confidence_sum",
-        "accepted_games",
-        "rejected_games",
-    ):
-        counters[key] = 0
-    counters["replays"] = sum(len(group.games) for group in grouping.series)
-    counters["series"] = len(grouping.series)
-    counters["replay_count"] = counters["replays"]
-    counters["series_count"] = counters["series"]
-    counters["complete_series"] = sum(group.record.is_complete for group in grouping.series)
-    counters["incomplete_series"] = counters["series"] - counters["complete_series"]
-    counters["grouping_diagnostics"] = len(grouping.diagnostics)
+    counters = _initial_compilation_counters(grouping)
 
     games: list[CompiledGame] = []
     imputation_confidence_sum = 0.0
@@ -913,6 +936,27 @@ def compile_payloads(
     )
 
 
+def compile_documents_v2(*args: Any, **kwargs: Any) -> CompilationResult:
+    """Compile documents through the additive v2 backend."""
+    from p0.replays.reconstruction.pipeline import compile_documents_v2 as compile_v2
+
+    return compile_v2(*args, **kwargs)
+
+
+def compile_payloads_v2(*args: Any, **kwargs: Any) -> CompilationResult:
+    """Parse and compile payloads through the additive v2 backend."""
+    from p0.replays.reconstruction.pipeline import compile_payloads_v2 as compile_v2
+
+    return compile_v2(*args, **kwargs)
+
+
+def compile_to_shards_v2(*args: Any, **kwargs: Any) -> ShardBuildResult:
+    """Compile v2 payloads and persist a backend-identified shard build."""
+    from p0.replays.reconstruction.pipeline import compile_to_shards_v2 as compile_v2
+
+    return compile_v2(*args, **kwargs)
+
+
 def write_compilation(result: CompilationResult, path: str | Path) -> None:
     """Write a canonical JSON report suitable for deterministic regression checks."""
     destination = Path(path)
@@ -929,9 +973,12 @@ __all__ = [
     "CompiledGame",
     "ShardBuildResult",
     "compile_documents",
+    "compile_documents_v2",
     "compile_payloads",
+    "compile_payloads_v2",
     "compile_replays",
     "compile_to_shards",
+    "compile_to_shards_v2",
     "write_tensor_shards",
     "write_compilation",
 ]

@@ -559,7 +559,7 @@ def _mega_items(dex: Mapping[str, Any]) -> frozenset[str]:
     )
 
 
-def _decision_view(
+def build_decision_view(
     state: ReplayBattleState,
     ots: OTSData,
     perspective: int,
@@ -654,7 +654,7 @@ def _decision_for_window(
         observed = _preview_actions(
             window_events, document.ots[perspective], final_state, perspective
         )
-        view = _decision_view(
+        view = build_decision_view(
             final_state,
             document.ots[perspective],
             perspective,
@@ -668,7 +668,7 @@ def _decision_for_window(
         if pre_state is None:
             raise ValueError("Policy decision window has no pre-decision state")
         observed = _observed_actions(window_events, pre_state, perspective, animation_targets)
-        view = _decision_view(
+        view = build_decision_view(
             pre_state,
             document.ots[perspective],
             perspective,
@@ -715,6 +715,7 @@ def reconstruct_decisions_from_trace(
     perspective: int,
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
+    windows: tuple[DecisionWindow, ...] | None = None,
 ) -> DecisionReconstruction:
     """Build decisions from an already resolved and reduced replay trace.
 
@@ -725,6 +726,7 @@ def reconstruct_decisions_from_trace(
         perspective: The player index to reconstruct, either 0 or 1.
         max_candidates: Maximum joint-action candidates to retain per decision.
         dex: Optional runtime dex used for mega legality metadata.
+        windows: Optional shared boundary classification for both perspectives.
 
     Returns:
         A decision reconstruction containing shared windows and player-owned records.
@@ -755,18 +757,19 @@ def reconstruct_decisions_from_trace(
     runtime_dex = default_runtime_resources().dex if dex is None else dex
     animation_targets = _animation_targets(event_tuple)
     mega_items = _mega_items(runtime_dex)
-    try:
-        windows = infer_decision_windows(event_tuple)
-    except ValueError as exc:
-        first_event = event_tuple[0]
-        diagnostic = _diagnostic(first_event, str(exc))
-        return DecisionReconstruction(
-            document.metadata.replay_id,
-            perspective,
-            (),
-            (),
-            (diagnostic,),
-        )
+    if windows is None:
+        try:
+            windows = infer_decision_windows(event_tuple)
+        except ValueError as exc:
+            first_event = event_tuple[0]
+            diagnostic = _diagnostic(first_event, str(exc))
+            return DecisionReconstruction(
+                document.metadata.replay_id,
+                perspective,
+                (),
+                (),
+                (diagnostic,),
+            )
 
     records: list[DecisionRecord] = []
     for window in windows:
@@ -894,6 +897,7 @@ __all__ = [
     "BoundaryKind",
     "DecisionReconstruction",
     "DecisionWindow",
+    "build_decision_view",
     "infer_decision_windows",
     "reconstruct_decisions_from_trace",
     "reconstruct_replay_decisions",
