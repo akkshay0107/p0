@@ -656,7 +656,7 @@ class ActionEvidence:
 class DecisionRecord:
     """One inferred decision request and its attached evidence.
 
-    Line indices bound the execution segment in the owning GameRecord's
+    Line indices bound the execution segment in the owning replay's
     protocol_lines: the observation is captured before pre_line_index and the
     evidence derives from lines [pre_line_index, post_line_index).
     """
@@ -790,100 +790,6 @@ class ReplayOutcome:
             terminal_line_index=(
                 None if value["terminal_line_index"] is None else int(value["terminal_line_index"])
             ),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class GameRecord:
-    """One game of a series with raw protocol lines and derived decisions."""
-
-    game_id: str
-    series_id: str
-    game_number: int
-    protocol_lines: tuple[str, ...]
-    ots_payloads: tuple[str, str]
-    winner: int
-    end_reason: GameEndReason
-    turns: int
-    decisions: tuple[DecisionRecord, ...]
-    diagnostics: ReplayDiagnostics
-    ir_schema: int = REPLAY_IR_SCHEMA_VERSION
-
-    _FIELDS = frozenset(
-        {
-            "game_id",
-            "series_id",
-            "game_number",
-            "protocol_lines",
-            "ots_payloads",
-            "winner",
-            "end_reason",
-            "turns",
-            "decisions",
-            "diagnostics",
-            "ir_schema",
-        }
-    )
-
-    def __post_init__(self) -> None:
-        _require_ir_schema(self.ir_schema, "GameRecord")
-        if not self.game_id or not self.series_id:
-            raise ValueError("GameRecord requires game_id and series_id")
-        if type(self.game_number) is not int or self.game_number < 1:
-            raise ValueError("GameRecord.game_number must be a positive integer")
-        if len(self.ots_payloads) != 2:
-            raise ValueError("GameRecord.ots_payloads must hold both players' sheets")
-        if self.winner not in (-1, 0, 1):
-            raise ValueError("GameRecord.winner must be 0, 1, or -1 for no result")
-        if self.end_reason is GameEndReason.UNSPECIFIED:
-            raise ValueError("GameRecord.end_reason must be specified")
-        if type(self.turns) is not int or self.turns < 0:
-            raise ValueError("GameRecord.turns must be a nonnegative integer")
-        line_count = len(self.protocol_lines)
-        previous_index = -1
-        for decision in self.decisions:
-            if decision.decision_index <= previous_index:
-                raise ValueError("GameRecord decisions must have ascending decision_index")
-            previous_index = decision.decision_index
-            if decision.post_line_index > line_count:
-                raise ValueError(
-                    f"Decision {decision.decision_index} boundary exceeds protocol length"
-                )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "game_id": self.game_id,
-            "series_id": self.series_id,
-            "game_number": self.game_number,
-            "protocol_lines": list(self.protocol_lines),
-            "ots_payloads": list(self.ots_payloads),
-            "winner": self.winner,
-            "end_reason": int(self.end_reason),
-            "turns": self.turns,
-            "decisions": [decision.to_dict() for decision in self.decisions],
-            "diagnostics": self.diagnostics.to_dict(),
-            "ir_schema": self.ir_schema,
-        }
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> GameRecord:
-        _require_fields(value, cls._FIELDS, "GameRecord")
-        _require_ir_schema(value["ir_schema"], "GameRecord")
-        ots = tuple(str(item) for item in value["ots_payloads"])
-        if len(ots) != 2:
-            raise ValueError("GameRecord.ots_payloads must hold both players' sheets")
-        return cls(
-            game_id=str(value["game_id"]),
-            series_id=str(value["series_id"]),
-            game_number=int(value["game_number"]),
-            protocol_lines=tuple(str(line) for line in value["protocol_lines"]),
-            ots_payloads=(ots[0], ots[1]),
-            winner=int(value["winner"]),
-            end_reason=GameEndReason(value["end_reason"]),
-            turns=int(value["turns"]),
-            decisions=tuple(DecisionRecord.from_dict(item) for item in value["decisions"]),
-            diagnostics=ReplayDiagnostics.from_dict(value["diagnostics"]),
-            ir_schema=int(value["ir_schema"]),
         )
 
 

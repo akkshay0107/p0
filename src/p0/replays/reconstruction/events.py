@@ -159,6 +159,16 @@ def _shape_error(rule: EventRule, arguments: tuple[str, ...]) -> str:
 
 
 def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
+    if (
+        tag == "move"
+        and len(arguments) == 2
+        and normalize_showdown_id(arguments[1])
+        in {
+            "doomdesire",
+            "futuresight",
+        }
+    ):
+        return "delayed move requires an explicit target"
     if tag in {"turn", "gen"} and not arguments[0].isdigit():
         return f"{tag} argument must be an integer"
     if tag == "teampreview" and arguments and not arguments[0].isdigit():
@@ -169,14 +179,14 @@ def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
         return "swap position must be an integer"
     if tag == "-hitcount" and not arguments[1].isdigit():
         return "-hitcount count must be an integer"
-    if tag in {"-boost", "-unboost", "-setboost"}:
+    if tag in {"-boost", "-unboost", "-setboost"} and len(arguments) > 2:
         try:
             int(arguments[2])
         except ValueError:
             return f"{tag} amount must be an integer"
-    if tag in {"poke", "showteam"} and arguments[0] not in {"p1", "p2"}:
+    if tag in {"poke", "showteam"} and (not arguments or arguments[0] not in {"p1", "p2"}):
         return f"{tag} requires a p1/p2 side"
-    if tag == "player" and arguments[0] not in {"p1", "p2"}:
+    if tag == "player" and (not arguments or arguments[0] not in {"p1", "p2"}):
         return "player requires a p1/p2 side"
     return ""
 

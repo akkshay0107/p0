@@ -451,14 +451,8 @@ def parse_replay_payload(
     return ReplayDocument(metadata, lines, _ots(lines), _outcome(metadata, lines), raw)
 
 
-parse_replay = parse_replay_payload
-parse_protocol = _protocol_lines
-
-
 __all__ = [
     "ReplayDocument",
     "ReplayParseError",
-    "parse_protocol",
-    "parse_replay",
     "parse_replay_payload",
 ]

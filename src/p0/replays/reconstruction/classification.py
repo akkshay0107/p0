@@ -159,7 +159,9 @@ _RULES = {
     "teamsize": _state(2, 2, required=(0, 1)),
     "start": _state(0, 0),
     # Executions and action metadata. Choice inference happens in a later stage.
-    "move": _action(3, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)),
+    # A missing target is valid protocol for some moves and is retained as
+    # partial evidence by the decision stage.
+    "move": _action(2, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)),
     "switch": _action(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
     "drag": _action(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
     "replace": _action(2, 2, required=(0, 1), pokemon_refs=(0,)),

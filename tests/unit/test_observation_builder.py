@@ -730,17 +730,16 @@ def test_switch_slots_identify_roster_members_not_shared_base_species() -> None:
 
 def test_reconstructed_observations_clear_reused_buffer_state() -> None:
     """Verify build_into on reconstructed replay snapshots clears and overwrites observation buffer tensors across turns."""
+    from p0.replays.compile import compile_documents
     from p0.replays.protocol import parse_replay_payload
-    from p0.replays.reconstruct import reconstruct_both
     from tests.unit.replay_fixtures import golden_replay_payload
 
     document = parse_replay_payload(golden_replay_payload("buffer-reuse"))
-    perspective = reconstruct_both(document)[0]
+    perspective = compile_documents((document,), chunksize=0).games[0].perspectives[0]
     assert len(perspective.snapshots) >= 2
     builder = ObservationBuilder(default_runtime_resources())
     output = StructuredObservation.empty_batch(1)[0]
     for snapshot in perspective.snapshots:
-        snapshot.view.spatial_turn = snapshot.spatial_turn
         output.token_type_ids.fill_(99)
         output.categorical.fill_(99)
         output.numerical.fill_(99.0)

@@ -26,20 +26,20 @@ def golden_replay_payload(
 ) -> dict[str, Any]:
     """Return a replay payload with the pinned protocol shape."""
     p1_team = [
-        {"species": "Pikachu", "moves": ["Protect", "Tackle"]},
-        {"species": "Eevee", "moves": ["Tackle", "Helping Hand"]},
-        {"species": "Raichu", "moves": ["Protect", "Thunderbolt"]},
-        {"species": "Jolteon", "moves": ["Protect", "Thunderbolt"]},
-        {"species": "Vaporeon", "moves": ["Protect", "Surf"]},
-        {"species": "Flareon", "moves": ["Protect", "Flare Blitz"]},
+        {"species": "Pikachu", "ability": "Static", "moves": ["Protect", "Tackle"]},
+        {"species": "Eevee", "ability": "Run Away", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Raichu", "ability": "Static", "moves": ["Protect", "Thunderbolt"]},
+        {"species": "Jolteon", "ability": "Volt Absorb", "moves": ["Protect", "Thunderbolt"]},
+        {"species": "Vaporeon", "ability": "Water Absorb", "moves": ["Protect", "Surf"]},
+        {"species": "Flareon", "ability": "Flash Fire", "moves": ["Protect", "Flare Blitz"]},
     ]
     p2_team = [
-        {"species": "Bulbasaur", "moves": ["Protect", "Tackle"]},
-        {"species": "Charmander", "moves": ["Tackle", "Helping Hand"]},
-        {"species": "Squirtle", "moves": ["Protect", "Water Gun"]},
-        {"species": "Ivysaur", "moves": ["Protect", "Tackle"]},
-        {"species": "Charmeleon", "moves": ["Protect", "Ember"]},
-        {"species": "Wartortle", "moves": ["Protect", "Water Gun"]},
+        {"species": "Bulbasaur", "ability": "Overgrow", "moves": ["Protect", "Tackle"]},
+        {"species": "Charmander", "ability": "Blaze", "moves": ["Tackle", "Helping Hand"]},
+        {"species": "Squirtle", "ability": "Torrent", "moves": ["Protect", "Water Gun"]},
+        {"species": "Ivysaur", "ability": "Overgrow", "moves": ["Protect", "Tackle"]},
+        {"species": "Charmeleon", "ability": "Blaze", "moves": ["Protect", "Ember"]},
+        {"species": "Wartortle", "ability": "Torrent", "moves": ["Protect", "Water Gun"]},
     ]
     lines = [
         "|start",

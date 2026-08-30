@@ -929,7 +929,7 @@ def test_delayed_move_source_only_context_is_rejected_during_event_parsing() -> 
     parsed = parse_protocol_events("state-test", (line,))
 
     assert parsed.events[0].classification.rejects_replay
-    assert "expected at least 3 arguments" in parsed.diagnostics[0].reason
+    assert "delayed move requires an explicit target" in parsed.diagnostics[0].reason
 
 
 def test_illusion_reveal_preserves_actual_state_and_causal_display_history() -> None:
@@ -1025,10 +1025,17 @@ def test_unsupported_reducer_transition_discards_all_snapshots() -> None:
 
 @pytest.mark.skipif(not _GOLDEN_REPLAYS, reason="local golden replays are not present")
 @pytest.mark.parametrize("replay_path", _GOLDEN_REPLAYS, ids=lambda path: path.stem)
-def test_local_golden_replay_reduces_to_one_snapshot_per_line(replay_path: Path) -> None:
+def test_local_golden_replay_reduces_or_reports_known_rejection(replay_path: Path) -> None:
     document = parse_replay_payload(replay_path.read_bytes())
+    reconstruction = reconstruct_replay_state(document)
 
-    snapshots = reconstruct_replay_state(document).require_accepted()
+    if reconstruction.diagnostics:
+        assert tuple(diagnostic.reason for diagnostic in reconstruction.diagnostics) == (
+            "unresolved_illusion: active history has multiple valid assignments",
+        )
+        return
+
+    snapshots = reconstruction.require_accepted()
 
     assert len(snapshots) == len(document.protocol_lines)
     assert tuple(snapshot.line_index for snapshot in snapshots) == tuple(

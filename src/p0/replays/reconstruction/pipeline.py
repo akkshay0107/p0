@@ -1,4 +1,4 @@
-"""Thin v2 orchestration from normalized replays to compiler-facing results."""
+"""Orchestrate normalized replays into compiler-facing results."""
 
 from __future__ import annotations
 
@@ -6,20 +6,10 @@ import concurrent.futures
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST
 from p0.model.resources import RuntimeResources, default_runtime_resources
-from p0.replays.compile import (
-    CompilationMetrics,
-    CompilationResult,
-    CompiledGame,
-    ShardBuildResult,
-    _initial_compilation_counters,
-    _measure_game,
-    _quality_reasons,
-    write_tensor_shards,
-)
 from p0.replays.group import group_replays
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.reconstruction.decisions import (
@@ -35,12 +25,16 @@ from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import reduce_replay_state
 from p0.runtime.process_context import PROCESS_CONTEXT
 
+if TYPE_CHECKING:
+    from p0.replays.compile import CompilationResult, CompiledGame, ShardBuildResult
+
 
 def _rejection_name(reason: str) -> str:
-    return reason.split(":", 1)[0].replace(" ", "_") or "reconstruction"
+    token = reason.partition(":")[0].strip().replace(" ", "_")
+    return token if token.replace("_", "").isalnum() else "reconstruction"
 
 
-def _compile_worker_v2(
+def _compile_worker(
     args: tuple[
         ReplayDocument,
         str,
@@ -102,6 +96,8 @@ def _compile_worker_v2(
     except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
         return None, type(exc).__name__
 
+    from p0.replays.compile import CompiledGame
+
     return (
         CompiledGame(
             series_id,
@@ -116,7 +112,7 @@ def _compile_worker_v2(
     )
 
 
-def compile_documents_v2(
+def compile_documents(
     documents: Iterable[ReplayDocument],
     *,
     format_id: str | None = None,
@@ -124,7 +120,15 @@ def compile_documents_v2(
     dex: Mapping[str, Any] | None = None,
     chunksize: int | None = None,
 ) -> CompilationResult:
-    """Compile documents through the v2 reducer, decisions, projection, and stats path."""
+    """Compile documents through the reducer, decisions, projection, and stats path."""
+    from p0.replays.compile import (
+        CompilationMetrics,
+        CompilationResult,
+        _initial_compilation_counters,
+        _measure_game,
+        _quality_reasons,
+    )
+
     grouping = group_replays(documents, format_id=format_id)
     counters = _initial_compilation_counters(grouping)
     jobs = []
@@ -151,11 +155,11 @@ def compile_documents_v2(
     if not jobs:
         results: Iterable[tuple[CompiledGame | None, str | None]] = ()
     elif len(jobs) <= (os.cpu_count() or 1) or (chunksize is not None and chunksize <= 0):
-        results = (_compile_worker_v2(job) for job in jobs)
+        results = (_compile_worker(job) for job in jobs)
     else:
         assert chunksize is not None
         with concurrent.futures.ProcessPoolExecutor(mp_context=PROCESS_CONTEXT) as executor:
-            results = executor.map(_compile_worker_v2, jobs, chunksize=chunksize)
+            results = executor.map(_compile_worker, jobs, chunksize=chunksize)
 
     games: list[CompiledGame] = []
     confidence_sum = 0.0
@@ -190,7 +194,7 @@ def compile_documents_v2(
     return CompilationResult(grouping.series, tuple(games), CompilationMetrics(metric_values))
 
 
-def compile_payloads_v2(
+def compile_payloads(
     payloads: Iterable[bytes | str | dict[str, Any]],
     *,
     format_id: str | None = None,
@@ -198,9 +202,9 @@ def compile_payloads_v2(
     dex: Mapping[str, Any] | None = None,
     chunksize: int | None = None,
 ) -> CompilationResult:
-    """Parse raw replay payloads and compile them through the v2 pipeline."""
+    """Parse raw replay payloads and compile them through the replay pipeline."""
     documents = tuple(parse_replay_payload(payload, format_id=format_id) for payload in payloads)
-    return compile_documents_v2(
+    return compile_documents(
         documents,
         format_id=format_id,
         max_candidates=max_candidates,
@@ -209,7 +213,7 @@ def compile_payloads_v2(
     )
 
 
-def compile_to_shards_v2(
+def compile_to_shards(
     documents: Iterable[ReplayDocument],
     output_dir: str | Path,
     *,
@@ -223,8 +227,10 @@ def compile_to_shards_v2(
     chunksize: int | None = None,
     external_rejections: tuple[str, ...] = (),
 ) -> ShardBuildResult:
-    """Compile v2 documents and write a temporary backend-identified shard build."""
-    result = compile_documents_v2(
+    """Compile documents and write a validated tensor shard build."""
+    from p0.replays.compile import write_tensor_shards
+
+    result = compile_documents(
         documents,
         format_id=format_id,
         max_candidates=max_candidates,
@@ -240,12 +246,11 @@ def compile_to_shards_v2(
         created_at=created_at,
         max_candidates=max_candidates,
         external_rejections=external_rejections,
-        compiler_backend="v2",
     )
 
 
 __all__ = [
-    "compile_documents_v2",
-    "compile_payloads_v2",
-    "compile_to_shards_v2",
+    "compile_documents",
+    "compile_payloads",
+    "compile_to_shards",
 ]
