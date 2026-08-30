@@ -316,13 +316,14 @@ def _resolve_stats(
     pokemon: PokemonView | None,
     is_opponent: bool,
     cache: dict[Any, tuple[int, int, int, int, int, int]],
-    overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None,
+    overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None,
 ) -> tuple[int, int, int, int, int, int] | None:
     if pokemon is None:
         return None
-    supplied = overrides.get(pokemon) if overrides is not None else None
-    if supplied is not None or (not is_opponent and _has_exact_stats(pokemon)):
-        return supplied
+    if overrides is not None and pokemon in overrides:
+        return overrides[pokemon]
+    if not is_opponent and _has_exact_stats(pokemon):
+        return None
     return _cached_imputed_stats(pokemon, cache)
 
 
@@ -505,7 +506,7 @@ def _pokemon_categorical_into(
     except (KeyError, AttributeError):
         base_species_id = ""
 
-    if isinstance(pokemon, TransformedPokemonView):
+    if isinstance(pokemon, TransformedPokemonView) or getattr(pokemon, "is_transformed", False):
         row[CAT_IDX_MECHANIC_STATE] = MechanicState.TRANSFORMED
     elif (
         PokemonTokenizer.normalize_id(pokemon.ability or "") == "illusion"
@@ -748,7 +749,7 @@ def _write_observation(
     battle: BattleView,
     out: StructuredObservation,
     tok: PokemonTokenizer,
-    stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+    stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
 ) -> None:
     """Serialize a battle view into a pre-allocated StructuredObservation in place.
 
@@ -927,7 +928,7 @@ class ObservationBuilder:
         self,
         battle: BattleView,
         out: StructuredObservation,
-        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
     ) -> None:
         self.validate_output(out)
         self.build_into_prevalidated(battle, out, stat_overrides)
@@ -936,7 +937,7 @@ class ObservationBuilder:
         self,
         battle: BattleView,
         out: StructuredObservation,
-        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
     ) -> None:
         _write_observation(battle, out, self.tokenizer, stat_overrides)
 
@@ -947,7 +948,7 @@ class ObservationBuilder:
     def build(
         self,
         battle: BattleView,
-        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
     ) -> StructuredObservation:
         obs = StructuredObservation.empty_batch(1)[0]
         self.build_into_prevalidated(battle, obs, stat_overrides)

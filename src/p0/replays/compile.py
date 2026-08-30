@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import hashlib
 import os
 import shutil
@@ -35,14 +34,10 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save, atomic_torch_save
-from p0.replays.group import GroupedSeries, GroupingResult, group_replays
-from p0.replays.protocol import ReplayDocument, parse_replay_payload
-from p0.replays.reconstruct import (
-    ReconstructedPerspective,
-    impute_stat_points,
-    reconstruct_both,
-)
-from p0.replays.schema import DecisionType, LabelKind
+from p0.replays.group import GroupedSeries, GroupingResult
+from p0.replays.protocol import ReplayDocument
+from p0.replays.reconstruction.projection import ProjectedPerspective, ReplayStatValue
+from p0.replays.schema import REPLAY_IR_SCHEMA_VERSION, DecisionType, LabelKind
 from p0.replays.shards import (
     BO3_COMPILATION_SEMANTICS,
     SHARD_ARTIFACT_SCHEMA,
@@ -52,7 +47,6 @@ from p0.replays.shards import (
     observation_field_specs,
     validate_shard_tensors,
 )
-from p0.runtime.process_context import PROCESS_CONTEXT
 from p0.teams.spread_usage import DEFAULT_SPREAD_TABLE_PATH
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
@@ -67,10 +61,6 @@ IMPUTATION_VERSION = _REPLAY_CONTRACT["imputation_version"]
 class ShardBuildResult:
     manifest_path: Path
     manifest: ShardManifest
-
-
-def _normalized(value: str) -> str:
-    return "".join(character for character in value.casefold() if character.isalnum())
 
 
 def _runtime_hash(manifest_path: str | Path) -> str:
@@ -110,7 +100,7 @@ def _build_configuration(
 ) -> dict[str, Any]:
     return {
         "parser_version": REPLAY_PARSER_VERSION,
-        "replay_ir_version": 1,
+        "replay_ir_version": REPLAY_IR_SCHEMA_VERSION,
         "compiler_version": REPLAY_COMPILER_VERSION,
         # The dataset hash names the output directory, so the shard layout has
         # to be part of it: a schema-only bump must land in a new directory
@@ -203,38 +193,30 @@ def _empty_scalar_values() -> dict[str, list[Any]]:
 
 def _perspective_tensors(
     game: CompiledGame,
-    perspective: ReconstructedPerspective,
+    perspective: ProjectedPerspective,
     *,
     builder: ObservationBuilder,
-    stat_estimates: tuple[Any, ...],
+    stat_estimates: tuple[ReplayStatValue, ...],
 ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
     """Convert a single perspective's snapshots into raw python observation and scalar lists."""
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
 
-    estimates = {
-        (estimate.side, _normalized(estimate.species)): estimate.precomputed
-        for estimate in stat_estimates
-        if estimate.precomputed is not None
-    }
+    stat_overrides = {estimate.member_id: estimate.values for estimate in stat_estimates}
+    if len(stat_overrides) != 12:
+        raise ValueError("Replay stats must contain one result for every roster member")
 
     winner = game.document.outcome.winner
     outcome = 0.0 if winner < 0 else (1.0 if winner == perspective.player else -1.0)
 
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
-        snapshot.view.stat_cache = {}
-        overrides = {}
-        # Only the opponent is overridden. Live battles read our own exact stats from
-        # the request message and mark them SELF_KNOWN, so imputing our own side here
-        # would train the model on estimates for stats it can trust at inference.
-        # Public replays cannot recover those exact stats either way.
-        opponent_side = 1 if perspective.player == 0 else 0
-        for pokemon in snapshot.view.opponent_team.values():
-            precomputed = estimates.get((opponent_side, _normalized(pokemon.species)))
-            if precomputed is not None:
-                overrides[pokemon] = precomputed
-        # ReconstructedSnapshot.spatial_turn is the request-scoped spatial interaction records.
-        snapshot.view.spatial_turn = snapshot.spatial_turn
+        snapshot.view.stat_cache.clear()
+        overrides: dict[Any, tuple[int, int, int, int, int, int] | None] = {}
+        for pokemon in (*snapshot.view.team.values(), *snapshot.view.opponent_team.values()):
+            try:
+                overrides[pokemon] = stat_overrides[pokemon.member_id]
+            except KeyError as exc:
+                raise ValueError("Replay stats are missing a roster member") from exc
         observation = builder.build(snapshot.view, overrides)
         observation.validate(batch_rank=0)
         observation.validate_overflow_contract()
@@ -394,7 +376,7 @@ def write_tensor_shards(
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     diagnostics["rejected_input_files"] += len(external_rejections)
-    current_games: list[tuple[CompiledGame, ReconstructedPerspective]] = []
+    current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
     current_decisions = 0
     shard_index = 0
     failed_games: set[str] = set()
@@ -529,57 +511,6 @@ def write_tensor_shards(
         raise
 
 
-def compile_to_shards(
-    documents: Iterable[ReplayDocument],
-    output_dir: str | Path,
-    *,
-    format_id: str | None = None,
-    max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
-    max_decisions_per_shard: int = 4096,
-    manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
-    resources: RuntimeResources | None = None,
-    created_at: str | None = None,
-    chunksize: int | None = None,
-    external_rejections: tuple[str, ...] = (),
-) -> ShardBuildResult:
-    """Compile normalized replay documents and persist their tensor shards.
-
-    Arguments:
-        documents: Iterable stream of replay documents to compile.
-        output_dir: Directory where shard artifacts are written.
-        format_id: Optional exact format filter.
-        max_candidates: Maximum number of action candidates per decision.
-        dex: Optional stat dex for imputation.
-        max_decisions_per_shard: Maximum decisions packed into a single shard.
-        manifest_path: Path to the runtime manifest for contract validation.
-        resources: Optional pre-loaded runtime resources.
-        created_at: Optional ISO timestamp stamped into the manifest.
-        chunksize: Optional ProcessPoolExecutor chunk size (see compile_documents).
-        external_rejections: Input identities rejected before replay parsing.
-
-    Returns:
-        A ShardBuildResult containing the manifest path and manifest object.
-    """
-    result = compile_documents(
-        documents,
-        format_id=format_id,
-        max_candidates=max_candidates,
-        dex=dex,
-        chunksize=chunksize,
-    )
-    return write_tensor_shards(
-        result,
-        output_dir,
-        max_decisions_per_shard=max_decisions_per_shard,
-        manifest_path=manifest_path,
-        resources=resources,
-        created_at=created_at,
-        max_candidates=max_candidates,
-        external_rejections=external_rejections,
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class CompilationMetrics:
     counters: dict[str, int | float]
@@ -595,8 +526,8 @@ class CompiledGame:
     replay_id: str
     canonical_player_roles: tuple[int, int]
     document: ReplayDocument
-    perspectives: tuple[ReconstructedPerspective, ReconstructedPerspective]
-    stat_estimates: tuple[Any, ...]
+    perspectives: tuple[ProjectedPerspective, ProjectedPerspective]
+    stat_estimates: tuple[ReplayStatValue, ...]
 
     def __post_init__(self) -> None:
         if sorted(self.canonical_player_roles) != [0, 1]:
@@ -687,9 +618,7 @@ def _quality_reasons(
     game: CompiledGame,
 ) -> tuple[str, ...]:
     reasons: set[str] = set()
-    if any(
-        not ots.raw_payload.strip() or len(ots.revealed_species) < 2 for ots in game.document.ots
-    ):
+    if any(not ots.is_complete for ots in game.document.ots):
         reasons.add("missing_or_unusable_ots")
 
     for perspective in game.perspectives:
@@ -719,75 +648,8 @@ def _quality_reasons(
     return tuple(sorted(reasons))
 
 
-def _compile_worker(
-    args: tuple[
-        ReplayDocument,
-        str,
-        int,
-        tuple[int, int],
-        int,
-        Mapping[str, Any] | None,
-    ],
-) -> tuple[CompiledGame | None, str | None]:
-    (
-        document,
-        series_id,
-        game_number,
-        canonical_player_roles,
-        max_candidates,
-        dex,
-    ) = args
-    estimates = ()
-
-    if dex is not None:
-        estimates = impute_stat_points(document, dex=dex)
-
-    try:
-        perspectives = reconstruct_both(document, max_candidates=max_candidates, dex=dex)
-    except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-        return None, type(exc).__name__
-
-    compiled = CompiledGame(
-        series_id,
-        game_number,
-        document.metadata.replay_id,
-        canonical_player_roles,
-        document,
-        perspectives,
-        estimates,
-    )
-    return compiled, None
-
-
-def compile_documents(
-    documents: Iterable[ReplayDocument],
-    *,
-    format_id: str | None = None,
-    max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
-    chunksize: int | None = None,
-) -> CompilationResult:
-    """Compile a stream of raw ReplayDocuments into state-machine verified CompiledGames.
-
-    This function processes every document twice (once from each player's perspective),
-    imputes missing stats, groups games by series, and tracks all diagnostic counters.
-
-    Arguments:
-        documents: Iterable stream of replay documents to compile.
-        format_id: Optional exact format filter.
-        max_candidates: Maximum number of action candidates per decision.
-        dex: Optional stat dex for imputation.
-        chunksize: Optional ProcessPoolExecutor chunk size. When None (the
-            default) a value is derived from the job count and CPU count. For
-            small corpora (fewer jobs than workers) compilation runs inline to
-            avoid the overhead of spawning a process pool.
-
-    Returns:
-        A CompilationResult containing the series, games, and metrics.
-    """
-    grouping: GroupingResult = group_replays(documents, format_id=format_id)
+def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
     counters: Counter[str] = Counter()
-
     counters["illegal_candidates"] = 0
     for key in (
         "replay_count",
@@ -815,104 +677,28 @@ def compile_documents(
     counters["complete_series"] = sum(group.record.is_complete for group in grouping.series)
     counters["incomplete_series"] = counters["series"] - counters["complete_series"]
     counters["grouping_diagnostics"] = len(grouping.diagnostics)
-
-    games: list[CompiledGame] = []
-    imputation_confidence_sum = 0.0
-
-    jobs = []
-    for group in grouping.series:
-        membership_by_replay = {
-            membership.replay_id: membership for membership in group.memberships
-        }
-
-        for document in group.games:
-            membership = membership_by_replay[document.metadata.replay_id]
-            jobs.append(
-                (
-                    document,
-                    group.record.series_id,
-                    membership.game_number,
-                    membership.canonical_player_roles,
-                    max_candidates,
-                    dex,
-                )
-            )
-
-    if jobs:
-        worker_count = os.cpu_count() or 1
-        if chunksize is None:
-            # Derive a chunk size that balances pickling overhead against
-            # worker utilisation. Each job carries a ReplayDocument with
-            # raw_payload bytes, so large chunks can pressure memory.
-            chunksize = max(1, len(jobs) // (worker_count * 4))
-
-        if len(jobs) <= worker_count or chunksize <= 0:
-            # For small corpora the process-pool startup cost exceeds the
-            # benefit; run inline so callers get deterministic single-process
-            # behaviour without the multiprocessing fork() deprecation.
-            results = (_compile_worker(job) for job in jobs)
-        else:
-            # Do not inherit the parent process with fork: the compiler can run
-            # after PyTorch and other threaded libraries have been initialized,
-            # which makes fork unsafe and emits a deprecation warning on Python
-            # 3.13+. Use the shared forkserver-on-Linux/spawn-elsewhere context.
-            with concurrent.futures.ProcessPoolExecutor(mp_context=PROCESS_CONTEXT) as executor:
-                results = executor.map(_compile_worker, jobs, chunksize=chunksize)
-
-        for compiled, exc_name in results:
-            if exc_name is not None:
-                counters[f"rejected_reconstruction_{exc_name}"] += 1
-                counters["rejected_games"] += 1
-                continue
-
-            if compiled is None:
-                continue
-
-            if dex is not None:
-                counters["imputations"] += sum(
-                    item.provenance == "IMPUTED" for item in compiled.stat_estimates
-                )
-                counters["imputation_unknown"] += sum(
-                    item.provenance == "UNKNOWN" for item in compiled.stat_estimates
-                )
-                imputation_confidence_sum += sum(
-                    item.confidence for item in compiled.stat_estimates
-                )
-
-            reasons = _quality_reasons(compiled)
-            if reasons:
-                for reason in reasons:
-                    counters[f"rejected_{reason}"] += 1
-                counters["rejected_games"] += 1
-                continue
-
-            counters["accepted_games"] += 1
-            games.append(compiled)
-            _measure_game(counters, compiled)
-
-    metric_values: dict[str, int | float] = dict(counters)
-    metric_values["imputation_confidence_sum"] = imputation_confidence_sum
-    return CompilationResult(grouping.series, tuple(games), CompilationMetrics(metric_values))
+    return counters
 
 
-def compile_payloads(
-    payloads: Iterable[bytes | str | dict[str, Any]],
-    *,
-    format_id: str | None = None,
-    max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
-    chunksize: int | None = None,
-) -> CompilationResult:
-    """Parse raw replay JSON payloads and compile them into verified games."""
-    documents = tuple(parse_replay_payload(payload, format_id=format_id) for payload in payloads)
+def compile_documents(*args: Any, **kwargs: Any) -> CompilationResult:
+    """Compile normalized replay documents through the production pipeline."""
+    from p0.replays.reconstruction.pipeline import compile_documents as compile_pipeline
 
-    return compile_documents(
-        documents,
-        format_id=format_id,
-        max_candidates=max_candidates,
-        dex=dex,
-        chunksize=chunksize,
-    )
+    return compile_pipeline(*args, **kwargs)
+
+
+def compile_payloads(*args: Any, **kwargs: Any) -> CompilationResult:
+    """Parse and compile replay payloads through the production pipeline."""
+    from p0.replays.reconstruction.pipeline import compile_payloads as compile_pipeline
+
+    return compile_pipeline(*args, **kwargs)
+
+
+def compile_to_shards(*args: Any, **kwargs: Any) -> ShardBuildResult:
+    """Compile replay documents and persist their tensor shards."""
+    from p0.replays.reconstruction.pipeline import compile_to_shards as compile_pipeline
+
+    return compile_pipeline(*args, **kwargs)
 
 
 def write_compilation(result: CompilationResult, path: str | Path) -> None:
@@ -922,9 +708,6 @@ def write_compilation(result: CompilationResult, path: str | Path) -> None:
     destination.write_bytes(orjson.dumps(result.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n")
 
 
-compile_replays = compile_documents
-
-
 __all__ = [
     "CompilationMetrics",
     "CompilationResult",
@@ -932,7 +715,6 @@ __all__ = [
     "ShardBuildResult",
     "compile_documents",
     "compile_payloads",
-    "compile_replays",
     "compile_to_shards",
     "write_tensor_shards",
     "write_compilation",

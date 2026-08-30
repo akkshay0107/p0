@@ -20,9 +20,9 @@
       "minor_version": 0
     },
     "replays": {
-      "major_sha256": "4ce38fde85eb4062c8155c58e12790eaea690e2bbe34c6913e68f9b14c0812fc",
-      "minor_sha256": "4bd32cca07f38a6693391605ba34ab7ce5c35ead229aaebbd507d2b5429097cc",
-      "major_version": 2,
+      "major_sha256": "7c971b7087a05eb2d528c7fd9591408459f86e6156535758712165b8db94a5a5",
+      "minor_sha256": "b0fa8e43c556b4089a639bdc7f45f455299907f1f043ea11f5b954a893eb6464",
+      "major_version": 3,
       "minor_version": 0
     },
     "resources": {
@@ -135,8 +135,8 @@
         "compiler_version": 7,
         "imputation_algorithm": "usage_prior_stat_point_imputation",
         "imputation_version": 2,
-        "parser_version": 1,
-        "replay_ir_schema_version": 1,
+        "parser_version": 2,
+        "replay_ir_schema_version": 2,
         "shard_artifact_schema": "p0.replay_shard.v5",
         "split_artifact_schema": "p0.replay_split.v2"
       },
@@ -163,5 +163,5 @@
       "minor": {}
     }
   },
-  "global_sha256": "53e62ee37dab3511293b158112bc2942424fbefae6d732d0fe1aa7da71a719b5"
+  "global_sha256": "519c36ecf3976b84df6b3a47b637ab39278185fe3492a60fc9a66fc4dd3ed9d0"
 }

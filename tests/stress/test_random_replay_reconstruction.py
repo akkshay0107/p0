@@ -50,13 +50,9 @@ from p0.model.structured_observation import (
     StructuredObservation,
 )
 from p0.replays.compile import compile_documents, write_tensor_shards
+from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
-from p0.replays.reconstruct import (
-    ReconstructedPerspective,
-    ReconstructedSnapshot,
-    normalize_id,
-    reconstruct_both,
-)
+from p0.replays.reconstruction.projection import ProjectedPerspective, ProjectedSnapshot
 from p0.replays.schema import LabelKind
 from p0.replays.shards import validate_shard_tensors
 from p0.rl_player import TeamPlayerMixin
@@ -127,7 +123,7 @@ def _endpoint_role(endpoint: str) -> str:
     return endpoint.split("a", 1)[0].strip()
 
 
-def _cant_reasons(snapshot: ReconstructedSnapshot, role: int) -> tuple[str, ...]:
+def _cant_reasons(snapshot: ProjectedSnapshot, role: int) -> tuple[str, ...]:
     """Collect all '|cant|' failure reasons recorded in a turn snapshot for a specific player role."""
     reasons: list[str] = []
     for raw_line in snapshot.raw_lines:
@@ -219,11 +215,30 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
 
     def _record_decision(self, battle: DoubleBattle, action: tuple[int, int]) -> None:
         observation = self.observation_builder.build(battle_view(battle)).cpu()
+        forced_switch_slots = tuple(
+            index for index, forced in enumerate(battle.force_switch) if forced
+        )
+        if battle.teampreview:
+            request_type = "teampreview"
+        elif forced_switch_slots:
+            request_type = "forced_switch"
+        elif bool(getattr(battle, "_wait", False)):
+            request_type = "wait"
+        else:
+            request_type = "turn"
+        active_members = tuple(
+            None if pokemon is None else str(getattr(pokemon, "species", ""))
+            for pokemon in battle.active_pokemon
+        )
         self._live_records.setdefault(battle.battle_tag, []).append(
             {
                 "turn": int(battle.turn),
                 "teampreview": bool(battle.teampreview),
                 "player_role": str(battle.player_role),
+                "request_type": request_type,
+                "wait": bool(getattr(battle, "_wait", False)),
+                "forced_switch_slots": list(forced_switch_slots),
+                "active_members": list(active_members),
                 "action": list(action),
                 # The count of replay-visible lines consumed before this request is the
                 # shared boundary: reconstruction reaches the same line index when it
@@ -472,12 +487,15 @@ def _assert_legality_provenance(
     )
 
 
-def _assert_reconstruction_labels(document: ReplayDocument) -> tuple[ReconstructedPerspective, ...]:
-    perspectives = reconstruct_both(
-        document,
+def _assert_reconstruction_labels(document: ReplayDocument) -> tuple[ProjectedPerspective, ...]:
+    compilation = compile_documents(
+        (document,),
         max_candidates=256,
         dex=default_runtime_resources().dex,
+        chunksize=0,
     )
+    assert len(compilation.games) == 1
+    perspectives = compilation.games[0].perspectives
     for perspective in perspectives:
         assert perspective.decisions
         assert len(perspective.snapshots) == len(perspective.decisions)
@@ -523,10 +541,10 @@ def _assert_live_action_is_observable(
 
 
 def _match_live_records(
-    perspective: ReconstructedPerspective,
+    perspective: ProjectedPerspective,
     live_records: tuple[dict[str, Any], ...],
     document: ReplayDocument,
-) -> tuple[tuple[ReconstructedSnapshot, dict[str, Any]], ...]:
+) -> tuple[tuple[ProjectedSnapshot, dict[str, Any]], ...]:
     """Pair requests with decisions at the boundary both sides can name.
 
     Reconstruction is not required to reproduce the live request schedule, so waits and
@@ -536,7 +554,7 @@ def _match_live_records(
     splice_index, splice_count = _showteam_offset(document)
     boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
 
-    matched: list[tuple[ReconstructedSnapshot, dict[str, Any]]] = []
+    matched: list[tuple[ProjectedSnapshot, dict[str, Any]]] = []
     for record in live_records:
         if _live_action(record) is None:
             continue
@@ -553,7 +571,7 @@ def _match_live_records(
 
 
 def _assert_live_truth(
-    perspective: ReconstructedPerspective,
+    perspective: ProjectedPerspective,
     live_records: tuple[dict[str, Any], ...],
     document: ReplayDocument,
     builder: ObservationBuilder,
@@ -605,7 +623,7 @@ def _oracle_battle(document: ReplayDocument, perspective: int) -> DoubleBattle:
 
 
 def _assert_poke_env_state_agreement(
-    perspective: ReconstructedPerspective,
+    perspective: ProjectedPerspective,
     document: ReplayDocument,
 ) -> None:
     """Diff the pure replay state machine against poke-env over the same lines.
@@ -643,8 +661,10 @@ def _assert_poke_env_state_agreement(
             assert {field.name for field in battle.fields} == {
                 field.name for field in snapshot.view.fields
             }
-            assert {normalize_id(condition.name) for condition in battle.side_conditions} == {
-                normalize_id(condition.name) for condition in snapshot.view.side_conditions
+            assert {
+                normalize_showdown_id(condition.name) for condition in battle.side_conditions
+            } == {
+                normalize_showdown_id(condition.name) for condition in snapshot.view.side_conditions
             }
 
         if line.parts[1] in _ORACLE_SKIPPED_TAGS:
@@ -705,7 +725,7 @@ def _assert_line_stream_fidelity(
 
 
 def _assert_decision_boundaries_partition_the_log(
-    perspective: ReconstructedPerspective,
+    perspective: ProjectedPerspective,
     document: ReplayDocument,
 ) -> None:
     """Decisions must be ordered, disjoint, and quote the log they point at."""

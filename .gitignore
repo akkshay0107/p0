@@ -31,5 +31,8 @@ data/champions_coverage.json
 teams/**/*.txt
 teams/*.txt
 
+# temporary golden replay to use as reference while building the reconstruction pipeline
+src/p0/replays/reconstruction/golden_replays/*.json
+
 # Generated corpus manifests
 teams/**/corpus_manifest.json

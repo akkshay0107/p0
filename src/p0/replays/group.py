@@ -71,19 +71,23 @@ def _time(document: ReplayDocument) -> datetime:
 def _team_hash(document: ReplayDocument, side: int) -> str:
     ots = document.ots[side]
     members = []
-    for species in sorted(ots.revealed_species, key=str.casefold):
-        details = ots.revealed_details.get(species, {})
+    for member in sorted(
+        ots.members,
+        key=lambda item: (
+            item.species.casefold(),
+            item.item.casefold(),
+            item.ability.casefold(),
+            item.nature.casefold(),
+            tuple(sorted(move.casefold() for move in item.moves)),
+        ),
+    ):
         members.append(
             {
-                "species": species.casefold(),
-                "item": str(details.get("item", "")).casefold(),
-                "ability": str(details.get("ability", "")).casefold(),
-                "nature": str(details.get("nature", "")).casefold(),
-                "moves": sorted(
-                    str(move).casefold()
-                    for move in details.get("moves", ())
-                    if isinstance(move, str)
-                ),
+                "species": member.species.casefold(),
+                "item": member.item.casefold(),
+                "ability": member.ability.casefold(),
+                "nature": member.nature.casefold(),
+                "moves": sorted(move.casefold() for move in member.moves),
             }
         )
     payload = orjson.dumps(members, option=orjson.OPT_SORT_KEYS)
