@@ -9,7 +9,7 @@ from poke_env.battle import DoubleBattle
 
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.battle.views import TransformedPokemonView
-from p0.runtime.live_event_capture import last_move
+from p0.runtime.live_event_capture import captured_protocol_lines, last_move
 
 
 class PokeEnvBattleView:
@@ -100,6 +100,15 @@ class PokeEnvBattleView:
         # poke-env exposes wait as _wait (asserted integer reason code). This is a
         # version-pinned access point: poke-env is locked to 0.15.0 in pyproject.toml.
         return self._battle._wait
+
+    @property
+    def protocol_lines(self) -> tuple[str, ...]:
+        """Return raw battle protocol lines when runtime capture is enabled."""
+        return captured_protocol_lines(self._battle)
+
+    def replay_events(self) -> tuple[str, ...]:
+        """Return poke-env's public replay serialization for this battle."""
+        return tuple(self._battle._build_replay_events())
 
     @property
     def weather(self):

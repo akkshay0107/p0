@@ -50,4 +50,5 @@ def test_token_store_append_drop_clear_and_high_cardinality_keys() -> None:
     store.drop(keys[0])
     assert not store.get_tokens((keys[0],), torch.device("cpu"))[1].any()
     store.clear()
-    assert not store._store
+    _, cleared_mask = store.get_tokens(keys[:1], torch.device("cpu"))
+    assert not cleared_mask.any()

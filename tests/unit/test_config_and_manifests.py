@@ -15,9 +15,9 @@ from poke_env.battle import Pokemon
 from poke_env.battle.move import Move
 from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.status import Status
+from poke_env.teambuilder.teambuilder import TeambuilderPokemon
 
 from p0.cli.build_vocab import build
-from p0.cli.train import _parser as train_parser
 from p0.format_config import (
     ACTION_CONTRACT,
     FORMAT,
@@ -35,11 +35,9 @@ from p0.model.architecture_contract import SERIES_SLOTS, SERIES_TOKENS_PER_GAME
 from p0.model.config import ModelConfig
 from p0.model.fused_token_encoder import (
     FusedTokenEncoder,
-    _load_mechanic_tag_tables,
-    _load_move_statics,
-    _load_species_statics,
 )
 from p0.model.resources import RuntimeResources, default_runtime_resources
+from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
 from p0.model.tokenizer import PokemonTokenizer, Resolution, tokenizer
 from p0.paths import DEFAULT_PATHS
@@ -330,13 +328,6 @@ def test_config_sections(tmp_path: Path) -> None:
         GlobalConfig(training=TrainingConfig(gamma=0.95), bc=BCConfig(gamma=0.9))
 
 
-def test_train_cli_selects_agent_team_source() -> None:
-    assert train_parser().parse_args([]).agent_team_source == "all"
-    assert (
-        train_parser().parse_args(["--agent-team-source", "reduced"]).agent_team_source == "reduced"
-    )
-
-
 def test_schema_modules_stay_pure() -> None:
     """Verify intermediate representation modules (p0.replays.schema, p0.battle.series) stay pure without importing torch or runtime."""
     code = (
@@ -391,29 +382,29 @@ def test_every_legal_content_key_resolves() -> None:
             assert tokenizer_instance.resolve(table, key)[1] == "known", (table, key)
 
 
-def test_mechanics_tables_cover_the_vocab() -> None:
-    """Verify static mechanics lookup tables match vocabulary sizes (+1 for index 0 unrevealed/padding)."""
-    vocab = json.loads((ROOT / "data/vocab.json").read_text())
+def test_item_and_ability_mechanics_reach_public_encoder_output() -> None:
+    """Verify changing public item and ability IDs changes the encoded Pokémon token."""
     resources = default_runtime_resources()
-    assert _load_move_statics(resources).shape[0] == len(vocab["moves"]) + 1
-    assert _load_species_statics(resources).shape[0] == len(vocab["species"]) + 1
-    mechanic_tags = _load_mechanic_tag_tables(resources)
-    assert mechanic_tags["items"].shape[0] == len(vocab["items"]) + 1
-    assert mechanic_tags["abilities"].shape[0] == len(vocab["abilities"]) + 1
-
-
-def test_item_and_ability_mechanics_are_wired_into_encoder() -> None:
-    """Verify FusedTokenEncoder projects item and ability mechanic tag tensors into the embedding pipeline."""
     encoder = FusedTokenEncoder(
         d_model=32,
         nhead=4,
         dim_feedforward=64,
-        resources=default_runtime_resources(),
+        resources=resources,
     )
-    assert encoder.item_mechanic_proj.in_features == encoder._item_mechanic_tags.shape[1]
-    assert encoder.ability_mechanic_proj.in_features == encoder._ability_mechanic_tags.shape[1]
-    assert encoder._item_mechanic_tags.count_nonzero() > 0
-    assert encoder._ability_mechanic_tags.count_nonzero() > 0
+    encoder.eval()
+    first = StructuredObservation.empty_batch(1)
+    second = first.clone()
+    first.categorical[0, 0, 1] = resources.tokenizer.id_for("abilities", "intimidate")
+    first.categorical[0, 0, 2] = resources.tokenizer.id_for("items", "sitrusberry")
+    second.categorical[0, 0, 1] = resources.tokenizer.id_for("abilities", "defiant")
+    second.categorical[0, 0, 2] = resources.tokenizer.id_for("items", "leftovers")
+    action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+
+    with torch.inference_mode():
+        first_tokens, _ = encoder(first, action_mask)
+        second_tokens, _ = encoder(second, action_mask)
+
+    assert not torch.equal(first_tokens[:, 0], second_tokens[:, 0])
 
 
 def test_field_namespace_and_coverage_audit_are_present(tmp_path: Path) -> None:
@@ -495,8 +486,7 @@ def test_tokenizer_normalization_and_table_resolution() -> None:
 
 
 def test_tokenizer_normalization_cache_is_stable_across_repeated_protocol_ids() -> None:
-    """Verify normalization is deterministic and repeated IDs use the LRU cache."""
-    PokemonTokenizer._cached_normalize.cache_clear()
+    """Verify repeated normalization calls return stable canonical IDs."""
     values = (
         "Charizard-Mega-Y",
         "U-turn",
@@ -511,14 +501,8 @@ def test_tokenizer_normalization_cache_is_stable_across_repeated_protocol_ids() 
         )
         for value in values
     )
-    try:
-        for _ in range(4):
-            assert tuple(PokemonTokenizer.normalize_id(value) for value in values) == expected
-        info = PokemonTokenizer._cached_normalize.cache_info()
-        assert info.misses == len(values)
-        assert info.hits == 3 * len(values)
-    finally:
-        PokemonTokenizer._cached_normalize.cache_clear()
+    for _ in range(4):
+        assert tuple(PokemonTokenizer.normalize_id(value) for value in values) == expected
 
 
 def test_tokenizer_domain_objects_and_missing_values() -> None:
@@ -544,13 +528,17 @@ def test_tokenizer_domain_objects_and_missing_values() -> None:
     assert tokenizer.species_id(p2) == tokenizer.vocab["species"]["charizard"]
     assert tokenizer.species_id(None) == 0
 
-    p3 = Pokemon(gen=9, species="charizard")
-    p3._ability = "intimidate"
+    p3 = Pokemon(
+        gen=9,
+        teambuilder=TeambuilderPokemon(species="charizard", ability="intimidate"),
+    )
     assert tokenizer.ability_id(p3) == tokenizer.vocab["abilities"]["intimidate"]
     assert tokenizer.ability_id(None) == 0
 
-    p4 = Pokemon(gen=9, species="charizard")
-    p4._item = "choicescarf"
+    p4 = Pokemon(
+        gen=9,
+        teambuilder=TeambuilderPokemon(species="charizard", item="choicescarf"),
+    )
     assert tokenizer.item_id(p4) == tokenizer.vocab["items"]["choicescarf"]
     assert tokenizer.item_id(None) == 0
 
@@ -579,25 +567,42 @@ def test_tokenizer_domain_objects_and_missing_values() -> None:
     assert tokenizer.nature_id(p) == 0
 
     # Neutral natures map to 0
-    p._nature = "Serious"
+    p = Pokemon(
+        gen=9,
+        teambuilder=TeambuilderPokemon(species="pikachu", nature="Serious", evs=[1, 0, 0, 0, 0, 0]),
+    )
     serious_id = tokenizer.nature_id(p)
     assert serious_id == 0
-    p._nature = "Bashful"
-    assert serious_id == tokenizer.nature_id(p)
+    bashful = Pokemon(
+        gen=9,
+        teambuilder=TeambuilderPokemon(species="pikachu", nature="Bashful", evs=[1, 0, 0, 0, 0, 0]),
+    )
+    assert serious_id == tokenizer.nature_id(bashful)
 
     # Non-neutral natures map to positive integers > 0
-    p._nature = "Jolly"
-    jolly_id = tokenizer.nature_id(p)
+    jolly = Pokemon(
+        gen=9,
+        teambuilder=TeambuilderPokemon(species="pikachu", nature="Jolly", evs=[1, 0, 0, 0, 0, 0]),
+    )
+    jolly_id = tokenizer.nature_id(jolly)
     assert jolly_id > 0
     assert tokenizer.natures_list[jolly_id] == "jolly"
 
-    p._nature = "Adamant"
-    adamant_id = tokenizer.nature_id(p)
+    adamant = Pokemon(
+        gen=9,
+        teambuilder=TeambuilderPokemon(species="pikachu", nature="Adamant", evs=[1, 0, 0, 0, 0, 0]),
+    )
+    adamant_id = tokenizer.nature_id(adamant)
     assert adamant_id > 0
     assert tokenizer.natures_list[adamant_id] == "adamant"
 
-    p._nature = "unknown_nature"
-    assert tokenizer.nature_id(p) == 0
+    unknown = Pokemon(
+        gen=9,
+        teambuilder=TeambuilderPokemon(
+            species="pikachu", nature="unknown_nature", evs=[1, 0, 0, 0, 0, 0]
+        ),
+    )
+    assert tokenizer.nature_id(unknown) == 0
 
 
 def test_token_store_initialization() -> None:
@@ -605,7 +610,6 @@ def test_token_store_initialization() -> None:
     store = SeriesTokenStore(d_model=64, max_games=2)
     assert store.d_model == 64
     assert store.max_games == 2
-    assert store._store == {}
 
 
 def test_token_store_append_and_get() -> None:

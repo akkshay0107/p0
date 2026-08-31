@@ -22,6 +22,7 @@ _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
 _ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
 _installed = False
+_capture_protocol_lines = False
 _filtered_loggers: list[logging.Logger] = []
 
 
@@ -55,6 +56,15 @@ def enable_environment_team_preview(player: _EnvPlayer) -> None:
     player.__class__ = _TeamPreviewEnvPlayer
 
 
+def enable_forced_open_team_sheet(player: Any) -> None:
+    """Configure a poke-env player for a format with server-forced open sheets."""
+    try:
+        client = player.ps_client
+    except AttributeError as exc:
+        raise TypeError("player must expose a poke-env ps_client") from exc
+    setattr(client, "_p0_force_open_team_sheet", True)
+
+
 async def _wait_for_login(self: PSClient, checking_interval: float = 0.1, wait_for: int = 30):
     start = perf_counter()
     while perf_counter() - start < wait_for:
@@ -70,7 +80,11 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     # It is not a battle event and poke-env 0.15 raises NotImplementedError for it.
     if len(split_message) >= 2 and split_message[1] in {"tempnotify", "tempnotifyoff"}:
         return None
-    capture_message(self, split_message)
+    capture_message(
+        self,
+        split_message,
+        capture_protocol_line=_capture_protocol_lines,
+    )
     return _ORIGINAL_PARSE_MESSAGE(self, split_message)
 
 
@@ -143,9 +157,21 @@ async def _stop_listening_cleanly(self: PSClient) -> None:
     await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(cancel_active_tasks(), self.loop))
 
 
-def install(logger: logging.Logger | None = None) -> None:
-    """Install compatibility patches for the pinned poke-env release."""
-    global _installed
+def install(
+    logger: logging.Logger | None = None,
+    *,
+    capture_protocol_lines: bool = False,
+) -> None:
+    """Install compatibility patches for the pinned poke-env release.
+
+    Arguments:
+      logger: Optional logger that receives the inactive-Pokémon filter.
+      capture_protocol_lines: Retain parsed protocol lines for replay verification.
+
+    Returns:
+      None
+    """
+    global _capture_protocol_lines, _installed
     target = logger or logging.getLogger("poke_env")
 
     if target not in _filtered_loggers:
@@ -153,8 +179,10 @@ def install(logger: logging.Logger | None = None) -> None:
         _filtered_loggers.append(target)
 
     if _installed:
+        _capture_protocol_lines = _capture_protocol_lines or capture_protocol_lines
         return
 
+    _capture_protocol_lines = capture_protocol_lines
     PSClient.wait_for_login = _wait_for_login
     PSClient.stop_listening = _stop_listening_cleanly
     PSClient._handle_message = _handle_message
@@ -167,7 +195,8 @@ def install(logger: logging.Logger | None = None) -> None:
 
 def uninstall_for_tests() -> None:
     """Uninstall monkey patches for unit test isolation."""
-    global _installed
+    global _capture_protocol_lines, _installed
+    _capture_protocol_lines = False
     for logger in _filtered_loggers:
         logger.removeFilter(_INACTIVE_POKEMON_FILTER)
 

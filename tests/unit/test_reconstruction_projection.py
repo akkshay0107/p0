@@ -17,7 +17,7 @@ from p0.model.structured_observation import (
 from p0.replays.compile import compile_documents, compile_payloads, write_tensor_shards
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.projection import impute_replay_stats
-from tests.unit.test_reconstruction_decisions import _decision_payload
+from tests.unit.replay_fixtures import decision_payload
 
 _GOLDEN_REPLAY_DIRECTORY = (
     Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
@@ -25,7 +25,7 @@ _GOLDEN_REPLAY_DIRECTORY = (
 
 
 def test_production_compiler_projects_both_perspectives_from_one_compilation() -> None:
-    result = compile_payloads((_decision_payload(),), chunksize=0)
+    result = compile_payloads((decision_payload(),), chunksize=0)
 
     assert len(result.games) == 1
     first, second = result.games[0].perspectives
@@ -44,7 +44,7 @@ def test_production_compiler_projects_both_perspectives_from_one_compilation() -
 
 
 def test_replay_stats_are_explicit_for_both_sides_and_never_known() -> None:
-    document = parse_replay_payload(_decision_payload())
+    document = parse_replay_payload(decision_payload())
     estimates = impute_replay_stats(document, dex=default_runtime_resources().dex)
 
     assert len(estimates) == 12
@@ -56,7 +56,7 @@ def test_replay_stats_are_explicit_for_both_sides_and_never_known() -> None:
 
 
 def test_shards_preserve_explicit_unknown_stat_provenance(tmp_path: Path) -> None:
-    result = compile_payloads((_decision_payload(),), chunksize=0)
+    result = compile_payloads((decision_payload(),), chunksize=0)
     built = write_tensor_shards(
         result,
         tmp_path,

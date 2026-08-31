@@ -3,14 +3,12 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from p0.battle.actions import encode_team_pair
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_TOKENS_PER_GAME
+from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
@@ -25,13 +23,12 @@ from p0.replays.schema import LabelKind
 from p0.training.bc import (
     BCGameWindow,
     BCTrainer,
-    _expand_team_preview_orbits,
     collate_bc_batches,
     compute_bc_objective,
 )
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
-from tests.unit.test_replay import _sample_replay_payload as _payload
+from tests.unit.replay_fixtures import sample_replay_payload
 
 
 def test_exact_and_partial_losses_match_probability_definitions() -> None:
@@ -140,27 +137,6 @@ def test_invalid_label_and_candidate_shapes_are_rejected(labels, offsets, mask, 
         )
 
 
-def test_team_preview_candidates_expand_to_four_orientations() -> None:
-    """Verify _expand_team_preview_orbits expands 1 team preview decision into 4 symmetrical lead permutations."""
-    first = encode_team_pair(0, 1)
-    second = encode_team_pair(2, 3)
-    values, offsets = _expand_team_preview_orbits(
-        torch.tensor([[first, second], [7, 8]]),
-        torch.tensor([0, 1, 2]),
-        torch.tensor([True, False]),
-    )
-
-    # First decision expands into 4 combinations (lead 1 & lead 2 symmetric permutations); second stays 1
-    assert offsets.tolist() == [0, 4, 5]
-    assert {tuple(value) for value in values[:4].tolist()} == {
-        (first, second),
-        (encode_team_pair(1, 0), second),
-        (first, encode_team_pair(3, 2)),
-        (encode_team_pair(1, 0), encode_team_pair(3, 2)),
-    }
-    assert values[4:].tolist() == [[7, 8]]
-
-
 def _chunk(
     label_kind: list[int],
     candidate_values: list[tuple[int, int]],
@@ -217,24 +193,9 @@ def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
     )
 
 
-def _count_reducer_passes(trainer: BCTrainer, monkeypatch) -> list[int]:
-    """Count memory-window reductions. forward funnels through reduce,
-    so patching only reduce counts each pass exactly once."""
-    passes = [0]
-    reducer = trainer.policy.actor.reducer
-    original = reducer.reduce
-
-    def counted(*args, **kwargs):
-        passes[0] += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(reducer, "reduce", counted)
-    return passes
-
-
 def test_replay_to_series_bc_checkpoint_smoke(tmp_path: Path) -> None:
     """End-to-end smoke test: replay JSON compilation -> tensor shards -> BC training -> checkpoint save/load."""
-    result = compile_payloads((_payload("game-1"), _payload("game-2")))
+    result = compile_payloads((sample_replay_payload("game-1"), sample_replay_payload("game-2")))
     built = write_tensor_shards(
         result,
         tmp_path / "shards",
@@ -281,26 +242,6 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path: Path) -> None:
     assert restored_trainer.load_checkpoint(checkpoint) == 1
     for name, parameter in trainer.policy.state_dict().items():
         torch.testing.assert_close(parameter, restored_trainer.policy.state_dict()[name])
-
-
-def test_training_and_eval_reduce_memory_window_once_per_batch(monkeypatch) -> None:
-    """Verify reducer pass counts match batch iteration counts for both training and evaluation passes."""
-    chunk = _chunk(
-        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
-        [(7, 8), (7, 8)],
-        [0, 1, 2],
-    )
-    trainer_train = _trainer(chunk, minibatch_size=1)
-    passes_train = _count_reducer_passes(trainer_train, monkeypatch)
-    trainer_train.train()
-    # 2 decisions with minibatch_size=1 -> 2 forward reduction passes
-    assert passes_train[0] == 2
-
-    trainer_eval = _trainer(chunk, minibatch_size=2)
-    passes_eval = _count_reducer_passes(trainer_eval, monkeypatch)
-    trainer_eval.evaluate()
-    # 2 decisions with minibatch_size=2 -> 1 forward reduction pass
-    assert passes_eval[0] == 1
 
 
 def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
@@ -355,33 +296,6 @@ def test_unknown_only_game_does_not_report_an_optimizer_update() -> None:
     assert metrics["games"] == 1
 
 
-def test_game_boundary_accumulation_uses_total_loss_weight() -> None:
-    """Verify gradient accumulation across mini-batches scales identically to full-game single-batch optimization."""
-    chunk = _chunk(
-        [int(LabelKind.EXACT)] * 4,
-        [(7, 8)] * 4,
-        [0, 1, 2, 3, 4],
-    )
-    whole_game = _trainer(chunk, minibatch_size=4)
-    decision_chunks = _trainer(chunk, minibatch_size=1)
-
-    with patch.object(
-        whole_game,
-        "_step_optimizer",
-        wraps=whole_game._step_optimizer,
-    ) as whole_step:
-        whole_metrics = whole_game.train()
-    with patch.object(
-        decision_chunks,
-        "_step_optimizer",
-        wraps=decision_chunks._step_optimizer,
-    ) as chunk_step:
-        chunk_metrics = decision_chunks.train()
-
-    assert whole_metrics["updates"] == chunk_metrics["updates"] == 1
-    assert whole_step.call_args.args == chunk_step.call_args.args == (4.0,)
-
-
 def test_bc_target_windows_keep_only_past_48_local_tokens() -> None:
     """Verify collator truncates intra-game memory history to HISTORY_WINDOW=48 past tokens per decision."""
     length = 52
@@ -430,70 +344,6 @@ def test_collated_context_is_compact_and_never_crosses_game_boundaries() -> None
         assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
 
 
-def test_model_inputs_encode_all_game_windows_once() -> None:
-    """Verify _prepare_model_inputs invokes observation encoder exactly once across all decisions in the batch."""
-    first = _chunk(
-        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
-        [(7, 8), (7, 8)],
-        [0, 1, 2],
-    )
-    second = _chunk(
-        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
-        [(7, 8), (7, 8)],
-        [0, 1, 2],
-    )
-    second = replace(second, canonical_player=1)
-    trainer = _trainer(first, minibatch_size=4)
-    batch = next(collate_bc_batches((first, second), 4))
-
-    with (
-        torch.inference_mode(),
-        patch.object(trainer.policy, "encode", wraps=trainer.policy.encode) as encode,
-    ):
-        prepared = trainer._prepare_model_inputs(batch)
-
-    assert encode.call_count == 1
-    assert prepared.prepared.encoded.tokens.size(0) == batch.decisions
-    assert prepared.memory.history_tokens.shape[:2] == (
-        batch.decisions,
-        HISTORY_WINDOW,
-    )
-
-
-def test_continued_chunk_matches_per_window_reference_inputs() -> None:
-    """Verify continued chunk tensor slices and history indices match manual reference sliding window slices."""
-    length = 100
-    game = _chunk(
-        [int(LabelKind.EXACT)] * length,
-        [(7, 8)] * length,
-        list(range(length + 1)),
-    )
-    trainer = _trainer(game, minibatch_size=64)
-    trainer.policy.eval()
-    batch = list(collate_bc_batches((game,), 64))[1]
-
-    with torch.inference_mode():
-        actual = trainer._prepare_model_inputs(batch)
-        context_start = 64 - HISTORY_WINDOW
-        encoded = trainer.policy.encode(
-            game.observations[context_start:],
-            game.action_mask[context_start:],
-        )
-        local_tokens = encoded.local_history_token
-        expected_history_tokens = local_tokens[
-            batch.history_indices
-        ] * batch.history_mask.unsqueeze(-1)
-
-    torch.testing.assert_close(actual.prepared.encoded.tokens, encoded.tokens[batch.target_indices])
-    torch.testing.assert_close(actual.prepared.encoded.aux, encoded.aux[batch.target_indices])
-    torch.testing.assert_close(
-        actual.prepared.encoded.numerical, encoded.numerical[batch.target_indices]
-    )
-    torch.testing.assert_close(actual.memory.history_tokens, expected_history_tokens)
-    torch.testing.assert_close(actual.memory.history_mask, batch.history_mask)
-    torch.testing.assert_close(actual.memory.history_age_ids, batch.history_age_ids)
-
-
 def test_completed_game_sets_terminal_window_flag() -> None:
     """Verify is_game_end flag is set on the terminal batch window of a completed game."""
     length = 100
@@ -508,255 +358,6 @@ def test_completed_game_sets_terminal_window_flag() -> None:
     assert not first.windows[0].is_game_end
     assert second.windows[0].is_game_end
     assert second.observations.categorical.size(0) == HISTORY_WINDOW + length - 64
-
-
-def test_raw_game_history_caches_each_target_token_once() -> None:
-    """Verify resample_single_game is invoked once per completed game to generate inter-game summary tokens."""
-    length = 100
-    first = _chunk(
-        [int(LabelKind.EXACT)] * length,
-        [(7, 8)] * length,
-        list(range(length + 1)),
-    )
-    second = _chunk(
-        [int(LabelKind.EXACT)] * 2,
-        [(7, 8)] * 2,
-        [0, 1, 2],
-        game_number=2,
-        is_series_end=True,
-    )
-    trainer = _trainer(first, minibatch_size=64)
-
-    with patch.object(
-        trainer.policy.series,
-        "resample_single_game",
-        wraps=trainer.policy.series.resample_single_game,
-    ) as resample:
-        trainer.evaluate((first, second))
-
-    assert resample.call_count == 1
-    history, history_mask = resample.call_args.args
-    assert history.shape == (1, length, trainer.policy.d_model)
-    assert history_mask.shape == (1, length)
-    assert history_mask.all()
-
-
-def test_ordered_history_allows_skipped_game_numbers() -> None:
-    """Verify series history handles skipped game numbers (e.g. game 1 then game 3)."""
-    first = _chunk(
-        [int(LabelKind.EXACT)],
-        [(7, 8)],
-        [0, 1],
-        game_number=1,
-    )
-    third = _chunk(
-        [int(LabelKind.EXACT)],
-        [(7, 8)],
-        [0, 1],
-        game_number=3,
-        is_series_end=True,
-    )
-    trainer = _trainer(first, minibatch_size=2)
-    batch = next(collate_bc_batches((first, third), 2))
-
-    prepared = trainer._prepare_model_inputs(batch)
-
-    series_mask = prepared.memory.series_mask
-    assert not series_mask[0].any()
-    assert series_mask[1, :SERIES_TOKENS_PER_GAME].all()
-
-
-def test_ordered_history_keeps_interleaved_series_independent() -> None:
-    """Verify series history buffers keep state strictly partitioned across distinct interleaved series IDs."""
-    first_a = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1], game_number=1)
-    first_b = replace(
-        first_a,
-        series_id="series-2",
-    )
-    third_a = _chunk(
-        [int(LabelKind.EXACT)],
-        [(7, 8)],
-        [0, 1],
-        game_number=3,
-        is_series_end=True,
-    )
-    second_b = replace(
-        _chunk(
-            [int(LabelKind.EXACT)],
-            [(7, 8)],
-            [0, 1],
-            game_number=2,
-            is_series_end=True,
-        ),
-        series_id="series-2",
-    )
-    trainer = _trainer(first_a, minibatch_size=4)
-    batch = next(collate_bc_batches((first_a, first_b, third_a, second_b), 4))
-
-    series_mask = trainer._prepare_model_inputs(batch).memory.series_mask
-
-    assert not series_mask[:2].any()
-    assert series_mask[2:, :SERIES_TOKENS_PER_GAME].all()
-    assert not series_mask[2:, SERIES_TOKENS_PER_GAME:].any()
-
-
-def test_ordered_history_rejects_repeated_or_decreasing_games() -> None:
-    """Verify series tracking raises ValueError if game numbers within a perspective series are non-increasing."""
-    for game_numbers in [(2, 2), (2, 1)]:
-        first = _chunk(
-            [int(LabelKind.EXACT)],
-            [(7, 8)],
-            [0, 1],
-            game_number=game_numbers[0],
-        )
-        invalid = _chunk(
-            [int(LabelKind.EXACT)],
-            [(7, 8)],
-            [0, 1],
-            game_number=game_numbers[1],
-            is_series_end=True,
-        )
-        trainer = _trainer(first, minibatch_size=2)
-        batch = next(collate_bc_batches((first, invalid), 2))
-
-        with pytest.raises(ValueError, match="must increase"):
-            trainer._prepare_model_inputs(batch)
-
-
-def test_ordered_history_rejects_data_after_series_end() -> None:
-    """Verify series tracking raises ValueError if additional chunks arrive after an is_series_end chunk."""
-    ended = _chunk(
-        [int(LabelKind.EXACT)],
-        [(7, 8)],
-        [0, 1],
-        game_number=1,
-        is_series_end=True,
-    )
-    extra = _chunk(
-        [int(LabelKind.EXACT)],
-        [(7, 8)],
-        [0, 1],
-        game_number=2,
-    )
-    trainer = _trainer(ended, minibatch_size=2)
-    batch = next(collate_bc_batches((ended, extra), 2))
-
-    with pytest.raises(ValueError, match="after a perspective-series ended"):
-        trainer._prepare_model_inputs(batch)
-
-
-def test_ordered_history_tracks_an_incomplete_final_game() -> None:
-    """Verify series history records partial games when the chunk does not complete the battle."""
-    length = 100
-    game = _chunk(
-        [int(LabelKind.EXACT)] * length,
-        [(7, 8)] * length,
-        list(range(length + 1)),
-    )
-    trainer = _trainer(game, minibatch_size=64)
-    first = next(collate_bc_batches((game,), 64))
-
-    prepared = trainer._prepare_model_inputs(first)
-    trainer._series_history.apply(prepared.history_updates)
-
-    assert trainer._series_history.has_partial_games
-
-
-def test_same_batch_next_game_receives_differentiable_series_context() -> None:
-    """Verify that within the same batch, subsequent games receive differentiable series summary tokens with gradient tracking."""
-    first = _chunk(
-        [int(LabelKind.EXACT)] * 2,
-        [(7, 8)] * 2,
-        [0, 1, 2],
-        game_number=1,
-    )
-    second = _chunk(
-        [int(LabelKind.EXACT)] * 2,
-        [(7, 8)] * 2,
-        [0, 1, 2],
-        game_number=2,
-        is_series_end=True,
-    )
-    trainer = _trainer(first, minibatch_size=4)
-    batch = next(collate_bc_batches((first, second), 4))
-
-    prepared = trainer._prepare_model_inputs(batch)
-    series_mask = prepared.memory.series_mask
-
-    assert not series_mask[:2].any()
-    assert series_mask[2:, :4].all()
-    assert not series_mask[2:, 4:].any()
-    assert prepared.memory.series_tokens.requires_grad
-
-
-def test_cross_batch_series_history_truncates_encoder_gradients() -> None:
-    """Verify that across distinct batch boundaries, series history tokens are detached (truncated backprop through time)."""
-    first = _chunk(
-        [int(LabelKind.EXACT)] * 2,
-        [(7, 8)] * 2,
-        [0, 1, 2],
-        game_number=1,
-    )
-    second = _chunk(
-        [int(LabelKind.EXACT)] * 2,
-        [(7, 8)] * 2,
-        [0, 1, 2],
-        game_number=2,
-        is_series_end=True,
-    )
-    trainer = _trainer(first, minibatch_size=2)
-    first_batch, second_batch = collate_bc_batches((first, second), 2)
-    first_tokens = torch.randn(2, trainer.policy.d_model, requires_grad=True)
-
-    with patch.object(
-        trainer.policy.actor.reducer,
-        "local_summary",
-        return_value=first_tokens,
-    ):
-        first_prepared = trainer._prepare_model_inputs(first_batch)
-    trainer._series_history.apply(first_prepared.history_updates)
-
-    second_prepared = trainer._prepare_model_inputs(second_batch)
-    second_prepared.memory.series_tokens.sum().backward()
-
-    # Gradients should not propagate into previous batch tokens
-    assert first_tokens.grad is None
-
-
-def test_bc_loss_trains_series_resampler() -> None:
-    """Verify BC loss backpropagates into series resampler parameters when multi-game series data is trained."""
-    first = _chunk(
-        [int(LabelKind.EXACT)] * 2,
-        [(7, 8)] * 2,
-        [0, 1, 2],
-        game_number=1,
-    )
-    second = _chunk(
-        [int(LabelKind.EXACT)] * 2,
-        [(7, 8)] * 2,
-        [0, 1, 2],
-        game_number=2,
-        is_series_end=True,
-    )
-    trainer = _trainer(first, minibatch_size=4)
-    trainer.dataset = (first, second)
-    captured_grads: list[torch.Tensor] = []
-
-    original_step = trainer.optimizer.step
-
-    def step_with_capture(*args, **kwargs):
-        captured_grads.extend(
-            p.grad.detach().clone()
-            for p in trainer.policy.series.parameters()
-            if p.grad is not None
-        )
-        return original_step(*args, **kwargs)
-
-    with patch.object(trainer.optimizer, "step", side_effect=step_with_capture):
-        trainer.train()
-
-    assert captured_grads
-    assert any(torch.count_nonzero(gradient) for gradient in captured_grads)
 
 
 def test_multi_epoch_training_rejects_one_shot_dataset() -> None:

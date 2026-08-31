@@ -1,7 +1,7 @@
 import pytest
 
 from p0.teams.validation import validate_variant
-from tests.unit.test_teams import _mock_team_variant
+from tests.team_fixtures import team_variant
 
 
 @pytest.mark.integration
@@ -12,7 +12,7 @@ def test_pinned_showdown_admits_and_packs_legal_variant() -> None:
     item clauses, EV limits) and that team validation produces a valid packed wire representation
     with matching hash identity.
     """
-    variant = _mock_team_variant()
+    variant = team_variant()
     result = validate_variant(variant)
     assert result.valid, result.problems
     assert result.team_hash == variant.team.team_hash

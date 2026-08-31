@@ -140,22 +140,17 @@ def test_training_checkpoint_rejects_state_config_mismatch(tmp_path: Path) -> No
         DEFAULT_POLICY_STORE.load_training_state(path, policy)
 
 
-def test_atomic_checkpoint_failure_preserves_previous_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verify that checkpoint writes are atomic; if replace fails, previous file content is left intact."""
+def test_atomic_checkpoint_failure_preserves_previous_target(tmp_path: Path) -> None:
+    """Verify a failed filesystem replacement leaves the existing checkpoint target untouched."""
     path = tmp_path / "policy.pt"
-    path.write_bytes(b"previous")
+    path.mkdir()
+    sentinel = path / "previous"
+    sentinel.write_bytes(b"previous")
 
-    # Inject failure during atomic filesystem rename/replace step
-    def fail_replace(source: Any, destination: Any) -> None:
-        raise OSError("injected replace failure")
-
-    monkeypatch.setattr("p0.persistence.os.replace", fail_replace)
-    with pytest.raises(OSError, match="injected"):
+    with pytest.raises(OSError):
         DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
-    # The original file must remain untouched
-    assert path.read_bytes() == b"previous"
+
+    assert sentinel.read_bytes() == b"previous"
 
 
 def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance(

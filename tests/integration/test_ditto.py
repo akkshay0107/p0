@@ -132,24 +132,17 @@ class DittoTrackerPlayer(RandomPlayer):
 
     def choose_move(self, battle: AbstractBattle) -> Any:
         try:
-            targets = getattr(battle, "_p0_transform_targets", {})
-            if targets:
-                view = battle_view(cast(DoubleBattle, battle))
-
-                # Check active pokemon
-                for active in view.active_pokemon:
-                    if (
-                        active is not None
-                        and isinstance(active, TransformedPokemonView)
-                        and active.species != "ditto"
-                    ):
-                        # Found a transformed pokemon!
-                        assert isinstance(active, TransformedPokemonView)
-                        # The tracking id should match the original ditto
-                        assert active == active._base
-                        assert hash(active) == hash(active._base)
-                        self.saw_transform = True
-                        break
+            view = battle_view(cast(DoubleBattle, battle))
+            for active in view.active_pokemon:
+                if (
+                    active is not None
+                    and isinstance(active, TransformedPokemonView)
+                    and active.species != "ditto"
+                ):
+                    assert active.base_species == active.species
+                    assert active.moves
+                    self.saw_transform = True
+                    break
         except Exception as e:
             if self.error is None:
                 self.error = e

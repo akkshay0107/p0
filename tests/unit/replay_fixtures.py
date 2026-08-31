@@ -72,3 +72,96 @@ def golden_replay_payload(
         "game_number": game_number,
         "log": "\n".join(lines),
     }
+
+
+def sample_replay_payload(
+    replay_id: str,
+    parent: str = "series-1",
+    *,
+    winner: str = "Alice",
+    game_number: int | None = None,
+    players: tuple[str, str] = ("Alice", "Bob"),
+) -> dict[str, object]:
+    """Return a compact replay payload for grouping and shard tests."""
+    ots = {
+        "p1": [
+            {"species": "Pikachu", "ability": "Static", "moves": ["Protect", "Tackle"]},
+            {"species": "Eevee", "ability": "Run Away", "moves": ["Tackle", "Helping Hand"]},
+            {"species": "Raichu", "ability": "Static", "moves": ["Protect", "Thunderbolt"]},
+            {"species": "Jolteon", "ability": "Volt Absorb", "moves": ["Protect", "Thunderbolt"]},
+            {"species": "Vaporeon", "ability": "Water Absorb", "moves": ["Protect", "Surf"]},
+            {"species": "Flareon", "ability": "Flash Fire", "moves": ["Protect", "Flare Blitz"]},
+        ],
+        "p2": [
+            {"species": "Bulbasaur", "ability": "Overgrow", "moves": ["Protect", "Tackle"]},
+            {"species": "Charmander", "ability": "Blaze", "moves": ["Tackle", "Helping Hand"]},
+            {"species": "Squirtle", "ability": "Torrent", "moves": ["Protect", "Water Gun"]},
+            {"species": "Ivysaur", "ability": "Overgrow", "moves": ["Protect", "Tackle"]},
+            {"species": "Charmeleon", "ability": "Blaze", "moves": ["Protect", "Ember"]},
+            {"species": "Wartortle", "ability": "Torrent", "moves": ["Protect", "Water Gun"]},
+        ],
+    }
+    lines = [
+        "|start",
+        "|teampreview",
+        f"|showteam|p1|{json.dumps(ots['p1'], separators=(',', ':'))}",
+        f"|showteam|p2|{json.dumps(ots['p2'], separators=(',', ':'))}",
+        "|",
+        "|switch|p1a: Pikachu|Pikachu, L50|100/100",
+        "|switch|p1b: Eevee|Eevee, L50|100/100",
+        "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100",
+        "|switch|p2b: Charmander|Charmander, L50|100/100",
+        "|turn|1",
+        "|",
+        "|move|p1a: Pikachu|Protect|p1a: Pikachu",
+        "|move|p1b: Eevee|Tackle|p2b: Charmander",
+        "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur",
+        "|move|p2b: Charmander|Tackle|p1b: Eevee",
+        "|",
+        f"|win|{winner}",
+    ]
+    return {
+        "id": replay_id,
+        "format": "gen9championsvgc2026regmbbo3",
+        "p1": players[0],
+        "p2": players[1],
+        "uploadtime": 1_750_000_000,
+        "roomid": replay_id,
+        "parent": parent,
+        "game_number": game_number,
+        "log": "\n".join(lines),
+    }
+
+
+def decision_payload() -> dict[str, Any]:
+    """Return a replay payload with complete OTS entries for decision tests."""
+    payload = golden_replay_payload("decision-test")
+    lines = str(payload["log"]).splitlines()
+    teams = {
+        "p1": ("Pikachu", "Eevee", "Raichu", "Jolteon", "Vaporeon", "Flareon"),
+        "p2": (
+            "Bulbasaur",
+            "Charmander",
+            "Squirtle",
+            "Ivysaur",
+            "Charmeleon",
+            "Wartortle",
+        ),
+    }
+    for index, line in enumerate(lines):
+        if not line.startswith("|showteam|"):
+            continue
+        side = line.split("|", 3)[2]
+        entries = [
+            {
+                "species": species,
+                "name": species,
+                "ability": "Static" if side == "p1" else "Overgrow",
+                "moves": ["Protect", "Tackle"],
+                "item": "Leftovers",
+            }
+            for species in teams[side]
+        ]
+        lines[index] = f"|showteam|{side}|{json.dumps(entries, separators=(',', ':'))}"
+    payload["log"] = "\n".join(lines)
+    return payload

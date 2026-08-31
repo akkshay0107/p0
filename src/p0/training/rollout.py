@@ -39,9 +39,7 @@ def _terminal_action_mask(
 
     mask = torch.as_tensor(raw_mask, device=device, dtype=torch.bool)
     if mask.shape != (2, ACT_SIZE):
-        raise ValueError(
-            f"Expected {key} to have shape (2, {ACT_SIZE}), got {tuple(mask.shape)}"
-        )
+        raise ValueError(f"Expected {key} to have shape (2, {ACT_SIZE}), got {tuple(mask.shape)}")
     return mask
 
 

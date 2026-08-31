@@ -58,19 +58,16 @@ def _provenance(
 
 
 def _validation_is_failed(metrics: BCEvaluationMetrics) -> bool:
-    return (
-        metrics.non_finite_values > 0
-        or not all(
-            math.isfinite(value)
-            for value in (
-                metrics.overall_nll,
-                metrics.exact_nll,
-                metrics.partial_nll,
-                metrics.exact_joint_accuracy,
-                metrics.value_loss,
-                metrics.illegal_probability_mass,
-                metrics.unknown_label_fraction,
-            )
+    return metrics.non_finite_values > 0 or not all(
+        math.isfinite(value)
+        for value in (
+            metrics.overall_nll,
+            metrics.exact_nll,
+            metrics.partial_nll,
+            metrics.exact_joint_accuracy,
+            metrics.value_loss,
+            metrics.illegal_probability_mass,
+            metrics.unknown_label_fraction,
         )
     )
 
@@ -206,9 +203,7 @@ def train_bc(
     if _validation_is_failed(initial_training):
         raise RuntimeError("Initial BC training evaluation contains invalid predictions or values")
     initial_nll = initial_training.overall_nll
-    final_training_evaluation: BCEvaluationMetrics | None = (
-        initial_training if overfit else None
-    )
+    final_training_evaluation: BCEvaluationMetrics | None = initial_training if overfit else None
     last_training_update: dict[str, float | int] | None = None
     final_validation: BCEvaluationMetrics | None = None
     max_epochs = 200 if overfit else config.epochs

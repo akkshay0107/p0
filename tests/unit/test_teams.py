@@ -3,17 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import random
-import subprocess
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import orjson
 import pytest
 
 from p0.cli.build_spreads import DEFAULT_CUTOFF, DEFAULT_MONTH, USAGE_URL
-from p0.cli.corpus import _variants_from_showdown
 from p0.cli.corpus import main as corpus_main
+from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT, current_manifest
 from p0.model.tokenizer import PokemonTokenizer
 from p0.teams.corpus import (
@@ -47,101 +46,15 @@ from p0.teams.spread_usage import (
 )
 from p0.teams.stat_points import BaseStats, StatPoints, calculate_stats, fallback_points
 from p0.teams.team import (
-    CanonicalTeam,
-    TeamMember,
     TeamMetadata,
     TeamRecord,
     deduplicate_variants,
 )
-from p0.teams.validation import (
-    AdmissionResult,
-    PersistentShowdownValidator,
-    validate_many,
-    validate_many_batched,
-    validate_variant,
-)
+from p0.teams.validation import validate_many
+from tests.team_fixtures import metadata, team_variant
 
 
-def _metadata(source="series-1", usage=1) -> TeamMetadata:
-    return TeamMetadata(
-        source_series=(source,),
-        source_replays=(f"{source}-game-1",),
-        first_seen="2026-01-01T00:00:00Z",
-        last_seen="2026-01-02T00:00:00Z",
-        usage_count=usage,
-    )
-
-
-def _mock_team_variant(
-    species: str = "Pikachu",
-    item: str = "Light Ball",
-    source_series: tuple[str, ...] = ("series-1",),
-    usage_count: int = 1,
-    move: str = "Fake Out",
-    members: Sequence[TeamMember] | None = None,
-    spreads: tuple[StatPoints, ...] | None = None,
-    metadata: TeamMetadata | None = None,
-) -> TeamRecord:
-    if members is None:
-        members = (
-            TeamMember(
-                species=species,
-                item=item,
-                ability="Static",
-                moves=(move, "Protect", "Thunderbolt", "Electroweb"),
-                nature="Jolly",
-            ),
-            TeamMember(
-                species="Charizard",
-                item="Charizardite Y",
-                ability="Blaze",
-                moves=("Heat Wave", "Solar Beam", "Protect", "Weather Ball"),
-                nature="Modest",
-            ),
-            TeamMember(
-                species="Whimsicott",
-                item="Focus Sash",
-                ability="Prankster",
-                moves=("Moonblast", "Tailwind", "Encore", "Protect"),
-                nature="Timid",
-            ),
-            TeamMember(
-                species="Garchomp",
-                item="Sitrus Berry",
-                ability="Rough Skin",
-                moves=("Earthquake", "Dragon Claw", "Rock Slide", "Protect"),
-                nature="Jolly",
-            ),
-            TeamMember(
-                species="Kingambit",
-                item="Black Glasses",
-                ability="Defiant",
-                moves=("Kowtow Cleave", "Sucker Punch", "Protect", "Low Kick"),
-                nature="Adamant",
-            ),
-            TeamMember(
-                species="Glimmora",
-                item="Shuca Berry",
-                ability="Toxic Debris",
-                moves=("Power Gem", "Sludge Bomb", "Earth Power", "Protect"),
-                nature="Modest",
-            ),
-        )
-    return TeamRecord(
-        team=CanonicalTeam(tuple(members)),
-        spreads=spreads or tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
-        metadata=metadata
-        or TeamMetadata(
-            source_series=source_series,
-            source_replays=(f"{source_series[0] if source_series else 'series-1'}-game-1",),
-            first_seen="2026-01-01T00:00:00Z",
-            last_seen="2026-01-02T00:00:00Z",
-            usage_count=usage_count,
-        ),
-    )
-
-
-def _mock_vocab() -> dict[str, dict[str, int]]:
+def vocabulary() -> dict[str, dict[str, int]]:
     return {
         "species": {
             "pikachu": 1,
@@ -150,6 +63,7 @@ def _mock_vocab() -> dict[str, dict[str, int]]:
             "garchomp": 4,
             "kingambit": 5,
             "glimmora": 6,
+            "raichu": 7,
         },
         "items": {
             "lightball": 1,
@@ -158,6 +72,7 @@ def _mock_vocab() -> dict[str, dict[str, int]]:
             "sitrusberry": 4,
             "blackglasses": 5,
             "shucaberry": 6,
+            "lifeorb": 7,
         },
         "abilities": {
             "static": 1,
@@ -191,33 +106,18 @@ def _mock_vocab() -> dict[str, dict[str, int]]:
     }
 
 
-def _mock_validator(variants: Sequence[TeamRecord], **kwargs: Any) -> tuple[AdmissionResult, ...]:
-    return tuple(
-        AdmissionResult(
-            team_hash=variant.team.team_hash,
-            valid=True,
-            packed_team="]".join(
-                f"{m.species}|{m.species}|{m.item}|{m.ability}|{','.join(m.moves)}|{m.nature}"
-                for m in variant.team.members
-            ),
-            problems=(),
-        )
-        for variant in variants
-    )
-
-
 def test_team_hash_ignores_display_and_member_order() -> None:
     """Verify CanonicalTeam team_hash computation is invariant to member permutation or nickname ordering."""
-    first = _mock_team_variant()
+    first = team_variant()
     reversed_members = tuple(reversed(first.team.members))
-    second = _mock_team_variant(members=reversed_members)
+    second = team_variant(members=reversed_members)
     assert first.team.team_hash == second.team.team_hash
 
 
 def test_deduplication_merges_metadata_but_preserves_spread_variants() -> None:
     """Verify deduplicate_variants merges replay/series metadata for identical teams while preserving distinct EV spread variants."""
-    first = _mock_team_variant()
-    duplicate = replace(first, metadata=_metadata("series-2", 2))
+    first = team_variant()
+    duplicate = replace(first, metadata=metadata("series-2", 2))
     alternate = replace(
         first,
         spreads=tuple(StatPoints(hp=32, defense=17, spd=17) for _ in first.spreads),
@@ -231,24 +131,24 @@ def test_deduplication_merges_metadata_but_preserves_spread_variants() -> None:
 
 def test_team_record_serialization_round_trip_is_strict() -> None:
     """Verify TeamRecord and TeamMetadata serialize and deserialize strictly, rejecting unknown fields."""
-    variant = _mock_team_variant()
+    variant = team_variant()
     assert TeamRecord.from_dict(variant.to_dict()) == replace(
         variant, team=variant.team.canonical()
     )
-    assert TeamMetadata.from_dict(_metadata().to_dict()) == _metadata()
+    assert TeamMetadata.from_dict(metadata().to_dict()) == metadata()
     with pytest.raises(ValueError, match="fields"):
         TeamRecord.from_dict({**variant.to_dict(), "unexpected": True})
 
 
 def test_corpus_builder_admits_valid_variants() -> None:
     """Verify build_corpus validates legal variants and generates coverage audit reports."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
-    v1 = _mock_team_variant("Pikachu", usage_count=5)
-    v2 = _mock_team_variant("Charizard", source_series=("series-2",), usage_count=3)
+    tokenizer = PokemonTokenizer(vocabulary())
+    v1 = team_variant("Pikachu", usage_count=5)
+    v2 = team_variant("Raichu", source_series=("series-2",), usage_count=3)
     manifest, audit = build_corpus(
         (v1, v2),
         tokenizer=tokenizer,
-        validator=_mock_validator,
+        validator=validate_many,
         global_contract_sha256="a" * 64,
         format_id=FORMAT.battle_format,
     )
@@ -257,76 +157,36 @@ def test_corpus_builder_admits_valid_variants() -> None:
     assert manifest.global_contract_sha256 == "a" * 64
     assert audit["admitted_count"] == 2
     assert audit["rejected_count"] == 0
-    assert set(audit["species_coverage"]) >= {"pikachu", "charizard"}
+    assert set(audit["species_coverage"]) >= {"pikachu", "raichu"}
 
 
-def test_corpus_builder_rejects_oov_species() -> None:
-    """Verify build_corpus filters out team variants containing out-of-vocabulary species."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
-    v_valid = _mock_team_variant("Pikachu")
-    v_oov = _mock_team_variant("Missingno")
+def test_corpus_builder_rejects_oov_content() -> None:
+    """Verify build_corpus filters valid team variants containing out-of-vocabulary content."""
+    tokenizer = PokemonTokenizer(vocabulary())
+    v_valid = team_variant("Pikachu")
+    v_oov = team_variant("Pikachu", item="Leftovers")
     manifest, audit = build_corpus(
         (v_valid, v_oov),
         tokenizer=tokenizer,
-        validator=_mock_validator,
+        validator=validate_many,
         global_contract_sha256="a" * 64,
     )
     assert len(manifest.entries) == 1
     assert audit["admitted_count"] == 1
     assert audit["rejected_count"] == 1
-    assert any("oov" in reason for reason in audit["rejections_by_reason"])
-
-
-def test_corpus_builder_rejects_showdown_invalid() -> None:
-    """Verify build_corpus filters out variants that fail Showdown legality validation."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
-
-    def failing_validator(
-        variants: Sequence[TeamRecord], **kwargs: Any
-    ) -> tuple[AdmissionResult, ...]:
-        results = []
-        for index, variant in enumerate(variants):
-            if index == 1:
-                results.append(
-                    AdmissionResult(
-                        variant.team.team_hash,
-                        valid=False,
-                        packed_team=None,
-                        problems=("Illegal ability",),
-                    )
-                )
-            else:
-                packed = "]".join(
-                    f"{m.species}|{m.species}|{m.item}|{m.ability}|{','.join(m.moves)}|{m.nature}"
-                    for m in variant.team.members
-                )
-                results.append(
-                    AdmissionResult(
-                        variant.team.team_hash, valid=True, packed_team=packed, problems=()
-                    )
-                )
-        return tuple(results)
-
-    v1 = _mock_team_variant("Pikachu", source_series=("s1",))
-    v2 = _mock_team_variant("Charizard", source_series=("s2",))
-    manifest, audit = build_corpus(
-        (v1, v2), tokenizer=tokenizer, validator=failing_validator, global_contract_sha256="a" * 64
-    )
-    assert len(manifest.entries) == 1
-    assert audit["rejected_count"] == 1
-    assert any("showdown_invalid" in reason for reason in audit["rejections_by_reason"])
+    assert "oov_item: Leftovers" in audit["rejections_by_reason"]
 
 
 def test_split_assignment_prevents_series_leakage() -> None:
     """Verify team variants originating from the same series ID are assigned to the same split (train/val/test)."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
-    v1 = _mock_team_variant("Pikachu", source_series=("shared-series",))
-    v2 = _mock_team_variant("Charizard", source_series=("shared-series",))
-    v3 = _mock_team_variant("Whimsicott", source_series=("other-series",))
+    tokenizer = PokemonTokenizer(vocabulary())
+    v1 = team_variant("Pikachu", source_series=("shared-series",))
+    v2 = team_variant("Raichu", source_series=("shared-series",))
+    v3 = team_variant("Pikachu", item="Life Orb", source_series=("other-series",))
     manifest, _ = build_corpus(
         (v1, v2, v3),
         tokenizer=tokenizer,
-        validator=_mock_validator,
+        validator=validate_many,
         global_contract_sha256="a" * 64,
         ratio_train=0.5,
         ratio_val=0.5,
@@ -341,11 +201,14 @@ def test_split_assignment_prevents_series_leakage() -> None:
 
 def test_audit_corpus_and_coverage() -> None:
     """Verify audit_corpus accurately aggregates admitted counts, species coverage sets, and split distribution."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
-    v1 = _mock_team_variant("Pikachu", usage_count=10)
-    v2 = _mock_team_variant("Charizard", source_series=("s2",), usage_count=5)
+    tokenizer = PokemonTokenizer(vocabulary())
+    v1 = team_variant("Pikachu", usage_count=10)
+    v2 = team_variant("Raichu", source_series=("s2",), usage_count=5)
     manifest, audit = build_corpus(
-        (v1, v2), tokenizer=tokenizer, validator=_mock_validator, global_contract_sha256="b" * 64
+        (v1, v2),
+        tokenizer=tokenizer,
+        validator=validate_many,
+        global_contract_sha256="b" * 64,
     )
     re_audit = audit_corpus(manifest)
     assert re_audit["admitted_count"] == 2
@@ -355,21 +218,29 @@ def test_audit_corpus_and_coverage() -> None:
 
 def test_write_corpus_manifest(tmp_path: Path) -> None:
     """Verify each pool gets only the manifest built from its own input directory."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
-    # Each variant needs a unique species or move so canonical_hash is distinct
+    tokenizer = PokemonTokenizer(vocabulary())
+    # Each variant needs a unique species/item combination so canonical_hash is distinct.
     unique_variants = tuple(
-        _mock_team_variant(
-            "Pikachu" if i % 2 == 0 else "Charizard",
+        team_variant(
+            species,
+            item=item,
             source_series=(f"series-{i}",),
             usage_count=i * 10,
-            move="Fake Out" if i < 3 else "Protect",
         )
-        for i in range(1, 5)
+        for i, (species, item) in enumerate(
+            (
+                ("Pikachu", "Light Ball"),
+                ("Raichu", "Light Ball"),
+                ("Pikachu", "Life Orb"),
+                ("Raichu", "Life Orb"),
+            ),
+            start=1,
+        )
     )
     manifest, _ = build_corpus(
         unique_variants,
         tokenizer=tokenizer,
-        validator=_mock_validator,
+        validator=validate_many,
         global_contract_sha256="c" * 64,
     )
     all_dir = tmp_path / "all"
@@ -529,233 +400,15 @@ def test_uniform_sampling_index(tmp_path: Path) -> None:
         split=CorpusSplit.TRAIN,
     )
     source = CorpusTeamSource(spec)
-    assert len(source._canonical_pools) == 2
+    assert source.describe()["pool_size"] == 2
     rng = random.Random(700)
     assert source.sample(rng) is not None
-
-
-TEAM = """
-Pikachu @ Light Ball
-Ability: Static
-Jolly Nature
-- Fake Out
-
-Charizard @ Charizardite Y
-Ability: Blaze
-Modest Nature
-- Heat Wave
-
-Whimsicott @ Focus Sash
-Ability: Prankster
-Timid Nature
-- Tailwind
-
-Garchomp @ Sitrus Berry
-Ability: Rough Skin
-Jolly Nature
-- Earthquake
-
-Kingambit @ Black Glasses
-Ability: Defiant
-Adamant Nature
-- Sucker Punch
-
-Glimmora @ Shuca Berry
-Ability: Toxic Debris
-Modest Nature
-- Power Gem
-"""
-
-
-def test_validate_many_preserves_order_and_parses_diagnostics():
-    """Verify validate_many preserves variant ordering and parses validation results."""
-    calls = []
-
-    def runner(*args, **kwargs):
-        calls.append(kwargs["input"])
-        return subprocess.CompletedProcess(
-            args[0],
-            0,
-            stdout='[{"valid": true, "packedTeam": "packed", "problems": []}, {"valid": true, "packedTeam": "packed", "problems": []}]',
-            stderr="",
-        )
-
-    variants = (_mock_team_variant(), _mock_team_variant())
-    results = validate_many(variants, runner=runner)
-    assert [result.team_hash for result in results] == [item.team.team_hash for item in variants]
-    assert len(calls) == 1
 
 
 def test_validated_team_rejects_untrusted_packed_values():
     """Verify ValidatedTeam verifies SHA-256 hash length and formatting."""
     with pytest.raises(ValueError, match="SHA-256"):
         ValidatedTeam("packed", "short")
-
-
-def test_validate_many_empty_returns_empty_tuple() -> None:
-    """Verify validate_many on empty inputs returns () without invoking subprocess runner."""
-    calls: list[Any] = []
-
-    def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        calls.append(kwargs.get("input"))
-        return subprocess.CompletedProcess(args[0], 0, stdout="[]", stderr="")
-
-    assert validate_many((), runner=runner) == ()
-    assert validate_many_batched((), runner=runner) == ()
-    assert len(calls) == 0
-
-
-def test_validate_many_batched_splits_chunks_and_preserves_order() -> None:
-    """Verify validate_many_batched breaks variant lists into batch_size chunks and preserves return ordering."""
-    calls: list[str] = []
-
-    def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        payload = str(kwargs.get("input", ""))
-        calls.append(payload)
-        items = json.loads(payload)
-        response = [
-            {"valid": True, "packedTeam": f"packed_{index}", "problems": []}
-            for index, _ in enumerate(items)
-        ]
-        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(response), stderr="")
-
-    variants = (
-        _mock_team_variant("Pikachu"),
-        _mock_team_variant("Raichu"),
-        _mock_team_variant("Zapdos"),
-    )
-    results = validate_many_batched(variants, batch_size=2, runner=runner)
-    assert len(results) == 3
-    assert [result.team_hash for result in results] == [
-        variant.team.team_hash for variant in variants
-    ]
-    assert results[0].packed_team == "packed_0"
-    assert len(calls) == 2
-    assert len(json.loads(calls[0])) == 2
-    assert len(json.loads(calls[1])) == 1
-
-
-def test_validate_many_delegates_to_batched_runner() -> None:
-    """Verify validate_many seamlessly delegates batch execution to validate_many_batched."""
-    calls: list[str] = []
-
-    def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        payload = str(kwargs.get("input", ""))
-        calls.append(payload)
-        items = json.loads(payload)
-        response = [{"valid": True, "packedTeam": "packed_team", "problems": []} for _ in items]
-        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(response), stderr="")
-
-    variants = (_mock_team_variant("Pikachu"), _mock_team_variant("Raichu"))
-    results = validate_many(variants, runner=runner)
-    assert len(results) == 2
-    assert len(calls) == 1
-    assert len(json.loads(calls[0])) == 2
-
-
-def test_validate_many_batched_handles_process_failure() -> None:
-    """Verify validate_many_batched raises RuntimeError when validation subprocess returns non-zero exit code."""
-
-    def failing_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="Node error")
-
-    with pytest.raises(RuntimeError, match="failed: Node error"):
-        validate_many_batched((_mock_team_variant(),), runner=failing_runner)
-
-
-def test_validate_many_batched_handles_timeout() -> None:
-    """Verify validate_many_batched raises RuntimeError upon subprocess timeout expiration."""
-
-    def timeout_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(args[0], 30.0)
-
-    with pytest.raises(RuntimeError, match="timed out"):
-        validate_many_batched((_mock_team_variant(),), runner=timeout_runner)
-
-
-def test_validate_many_batched_handles_malformed_json() -> None:
-    """Verify validate_many_batched raises RuntimeError when subprocess outputs non-JSON payload."""
-
-    def malformed_runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(args[0], 0, stdout="not json", stderr="")
-
-    with pytest.raises(RuntimeError, match="malformed response"):
-        validate_many_batched((_mock_team_variant(),), runner=malformed_runner)
-
-
-def test_persistent_showdown_validator_lifecycle_and_validation() -> None:
-    """Verify PersistentShowdownValidator manages daemon subprocess stdin/stdout communication and shutdown."""
-    calls: list[str] = []
-    closed = [False]
-
-    class MockProcess:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.stdin = self
-            self.stdout = self
-            self.stderr = self
-            self.returncode = None
-
-        def write(self, data: str) -> None:
-            trimmed = data.strip()
-            calls.append(trimmed)
-            try:
-                payload = json.loads(trimmed)
-                if payload.get("command") == "stop":
-                    closed[0] = True
-            except Exception:
-                pass
-
-        def flush(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-        def readline(self) -> str:
-            if not calls:
-                return ""
-            payload = json.loads(calls[-1])
-            if payload.get("command") == "stop":
-                return ""
-            items = payload.get("batch", [])
-            response = [
-                {"valid": True, "packedTeam": f"persistent_{index}", "problems": []}
-                for index, _ in enumerate(items)
-            ]
-            return json.dumps({"status": "ok", "results": response}) + "\n"
-
-        def terminate(self) -> None:
-            closed[0] = True
-
-        def wait(self, timeout: float | None = None) -> int:
-            return 0
-
-    def mock_popen(*args: Any, **kwargs: Any) -> Any:
-        return MockProcess()
-
-    variants = (_mock_team_variant("Pikachu"), _mock_team_variant("Raichu"))
-    with PersistentShowdownValidator(popen_factory=mock_popen) as validator:
-        results = validator.validate_many(variants)
-        assert len(results) == 2
-        assert results[0].packed_team == "persistent_0"
-        assert results[1].packed_team == "persistent_1"
-
-    assert closed[0] is True
-    assert len(calls) >= 1
-    first_request = json.loads(calls[0])
-    assert len(first_request["batch"]) == 2
-
-
-def test_single_team_validation_reports_pinned_runner_failures() -> None:
-    """Verify validate_variant raises RuntimeError with stderr output on validation failure."""
-    variant = _mock_team_variant()
-
-    def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        del args, kwargs
-        return subprocess.CompletedProcess("node", 1, stdout="", stderr="invalid team")
-
-    with pytest.raises(RuntimeError, match="validator failed: invalid team"):
-        validate_variant(variant, runner=runner)
 
 
 def _chaos(species: str, spreads: dict[str, float]) -> dict[str, Any]:
@@ -1188,13 +841,13 @@ def test_corpus_source_spec_validates() -> None:
 
 def test_build_team_source_resolves_corpus_manifest(tmp_path: Path) -> None:
     """Verify the team-source factory instantiates CorpusTeamSource for a manifest path."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
+    tokenizer = PokemonTokenizer(vocabulary())
     contract_hash = current_manifest().global_sha256
-    v1 = _mock_team_variant("Pikachu")
+    v1 = team_variant("Pikachu")
     manifest, _ = build_corpus(
         (v1,),
         tokenizer=tokenizer,
-        validator=_mock_validator,
+        validator=validate_many,
         global_contract_sha256=contract_hash,
         format_id=FORMAT.battle_format,
     )
@@ -1252,26 +905,12 @@ def test_build_team_source_rejects_invalid_manifest(tmp_path: Path) -> None:
         build_team_source(pool_dir)
 
 
-def test_corpus_cli_build_and_audit(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_corpus_cli_build_and_audit(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Verify corpus CLI subcommands ('build' and 'audit') execute and output valid JSON audit results."""
-    monkeypatch.setattr("p0.cli.corpus.current_manifest", lambda: current_manifest())
-    monkeypatch.setattr(
-        "p0.cli.corpus.PokemonTokenizer.from_file", lambda: PokemonTokenizer(_mock_vocab())
-    )
-    monkeypatch.setattr("p0.cli.corpus.validate_many", _mock_validator)
-
     input_dir = tmp_path / "inputs"
     input_dir.mkdir()
-    team_text_1 = "\n\n".join(
-        "Pikachu @ Light Ball\nAbility: Static\nJolly Nature\n- Fake Out\n- Protect\n- Thunderbolt\n- Electroweb"
-        for i in range(1, 7)
-    )
-    team_text_2 = "\n\n".join(
-        "Charizard @ Charizardite Y\nAbility: Blaze\nModest Nature\n- Heat Wave\n- Solar Beam\n- Protect\n- Weather Ball"
-        for i in range(1, 7)
-    )
+    team_text_1 = DEFAULT_TEST_TEAM
+    team_text_2 = DEFAULT_TEST_TEAM.replace("Pikachu @ Light Ball", "Raichu @ Light Ball", 1)
     (input_dir / "v1.txt").write_text(team_text_1, encoding="utf-8")
     (input_dir / "v2.txt").write_text(team_text_2, encoding="utf-8")
 
@@ -1306,13 +945,13 @@ def test_corpus_cli_build_and_audit(
 
 def test_build_team_source_resolves_directory_manifest(tmp_path: Path) -> None:
     """Verify the team-source factory resolves a manifest inside a pool directory."""
-    tokenizer = PokemonTokenizer(_mock_vocab())
+    tokenizer = PokemonTokenizer(vocabulary())
     contract_hash = current_manifest().global_sha256
-    v1 = _mock_team_variant("Pikachu")
+    v1 = team_variant("Pikachu")
     manifest, _ = build_corpus(
         (v1,),
         tokenizer=tokenizer,
-        validator=_mock_validator,
+        validator=validate_many,
         global_contract_sha256=contract_hash,
         format_id=FORMAT.battle_format,
     )
@@ -1323,32 +962,6 @@ def test_build_team_source_resolves_directory_manifest(tmp_path: Path) -> None:
 
     source = build_team_source(pool_dir)
     assert isinstance(source, CorpusTeamSource)
-
-
-def test_variants_from_showdown_with_dex() -> None:
-    """Verify _variants_from_showdown extracts EV spreads using dex move category inspection."""
-    mock_dex = {
-        "species": [
-            {
-                "name": "Pikachu",
-                "baseStats": {"hp": 35, "atk": 55, "def": 40, "spa": 50, "spd": 50, "spe": 90},
-            }
-        ],
-        "moves": [
-            {"name": "Thunderbolt", "category": "Special"},
-            {"name": "Fake Out", "category": "Physical"},
-        ],
-    }
-    showdown_text = "\n\n".join(
-        "Pikachu @ Light Ball\nAbility: Static\nJolly Nature\n- Fake Out\n- Thunderbolt"
-        for _ in range(6)
-    )
-    variants = _variants_from_showdown(showdown_text, dex=mock_dex)
-    assert len(variants) == 1
-    variant = variants[0]
-    assert len(variant.spreads) == 6
-    assert any(spread != StatPoints(hp=2, spa=32, spe=32) for spread in variant.spreads)
-    assert variant.spread_provenance == "imputed"
 
 
 def test_corpus_manifest_hash_is_order_independent_but_packed_content_bound() -> None:

@@ -26,8 +26,20 @@ def last_move(pokemon: Pokemon) -> str | None:
     return None if move is None else move.id
 
 
-def capture_message(battle: DoubleBattle, split_message: Sequence[str]) -> None:
+def capture_message(
+    battle: DoubleBattle,
+    split_message: Sequence[str],
+    *,
+    capture_protocol_line: bool = False,
+) -> None:
     """Capture a raw protocol line from Showdown onto the battle's live spatial recorder."""
+    if capture_protocol_line:
+        protocol_lines = getattr(battle, "_p0_protocol_lines", None)
+        if protocol_lines is None:
+            protocol_lines = []
+            battle._p0_protocol_lines = protocol_lines  # type: ignore[attr-defined]
+        protocol_lines.append(tuple(split_message))
+
     if len(split_message) >= 2 and split_message[1] == "turn":
         recorder = _recorder_for(battle)
         recorder.reset_turn()
@@ -103,3 +115,8 @@ def capture_message(battle: DoubleBattle, split_message: Sequence[str]) -> None:
 
     recorder.apply_line(split_message, tokenizer, pre_hp_for)
     battle._p0_spatial_turn = recorder.to_records()  # type: ignore[attr-defined]
+
+
+def captured_protocol_lines(battle: DoubleBattle) -> tuple[str, ...]:
+    """Return opt-in protocol lines captured for a live battle in arrival order."""
+    return tuple("|".join(parts) for parts in getattr(battle, "_p0_protocol_lines", ()))

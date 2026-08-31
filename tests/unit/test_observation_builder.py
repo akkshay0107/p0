@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import logging
-from dataclasses import replace
-from types import SimpleNamespace
-from typing import Any, cast
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import pytest
 import torch
-from poke_env.battle import DoubleBattle, Pokemon
+from poke_env.battle import Pokemon
 from poke_env.battle.effect import Effect
 from poke_env.battle.field import Field
 from poke_env.battle.move import Move
@@ -28,10 +27,6 @@ from p0.battle.legality import DecisionView, SlotDecision
 from p0.battle.views import FixtureBattleView
 from p0.model.observation_builder import (
     ObservationBuilder,
-    _cached_imputed_stats,
-    _get_ordered_pokemon,
-    _get_pokemon_level_stats,
-    _slot_condition,
 )
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
@@ -67,10 +62,56 @@ from p0.model.structured_observation import (
     TokenType,
 )
 from p0.model.tokenizer import tokenizer
-from p0.runtime.poke_env_battle_adapter import battle_view, decision_view
 
 
-def make_real_pokemon(
+@dataclass(frozen=True, slots=True)
+class ObservationMove:
+    """Concrete move value used to exercise the public MoveView protocol."""
+
+    id: str
+    type: Any
+    category: Any
+    current_pp: int
+    max_pp: int
+    non_ghost_target: bool = True
+    deduced_target: Any = None
+
+
+@dataclass(eq=False, slots=True)
+class ObservationPokemon:
+    """Concrete Pokémon value used to exercise the public PokemonView protocol."""
+
+    species: str | None
+    base_species: str
+    ability: str | None
+    item: str | None
+    nature: str | None
+    moves: dict[str, ObservationMove] = field(default_factory=dict)
+    type_1: Any = None
+    type_2: Any = None
+    status: Any = None
+    base_stats: dict[str, int] = field(default_factory=dict)
+    stats: dict[str, int | None] | None = None
+    boosts: dict[str, int] = field(default_factory=dict)
+    current_hp_fraction: float = 0.0
+    protect_counter: int = 0
+    first_turn: bool = False
+    weight: float = 0.0
+    fainted: bool = False
+    revealed: bool = False
+    selected_in_teampreview: bool | None = False
+    effects: dict[Any, int] = field(default_factory=dict)
+    status_counter: int = 0
+    preparing: Any = False
+    last_move: ObservationMove | None = None
+    level: int | None = 50
+    is_dynamaxed: bool = False
+    is_terastallized: bool = False
+    tera_type: Any = None
+    types: tuple[Any, ...] = ()
+
+
+def make_pokemon_view(
     species: str = "charizard",
     ability: str = "blaze",
     item: str = "charizarditey",
@@ -89,98 +130,109 @@ def make_real_pokemon(
     preparing_move: str | None = None,
     last_move_id: str | None = None,
     nature: str | None = None,
-) -> Pokemon:
-    """Helper to create a real Pokemon object and populate its slots."""
-    p = Pokemon(gen=9, species=species)
-    if nature:
-        p._nature = nature
-    if ability:
-        p._ability = ability
-    if item:
-        p._item = item
-    if type_1:
-        p._type_1 = PokemonType.from_name(type_1)
-    if type_2:
-        p._type_2 = PokemonType.from_name(type_2)
-    if moves:
-        for m_id, m_pp in moves.items():
-            m = Move(m_id, 9)
-            m._current_pp = m_pp
-            p._moves._base_moves[m_id] = m
-    if effects:
-        p._effects = effects
-    if status:
-        p._status = status
-    p._current_hp = current_hp
-    p._max_hp = max_hp
-    if boosts:
-        p._boosts.update(boosts)
-    p._protect_counter = protect_counter
-    p._active_turns = active_turns
-    if weightkg is not None:
-        cast(Any, p)._weightkg = weightkg
-    p._status_counter = status_counter
-    if preparing_move:
-        p._preparing_move = Move(preparing_move, 9)
-    if last_move_id and last_move_id in p._moves._base_moves:
-        p._moves._base_moves[last_move_id]._is_last_used = True
-    return p
+    reported_species: str | None = None,
+) -> ObservationPokemon:
+    """Build a concrete value object implementing the public PokemonView protocol."""
+    source = Pokemon(gen=9, species=species)
+    move_views: dict[str, ObservationMove] = {}
+    for move_id, move_pp in (moves or {}).items():
+        source_move = Move(move_id, 9)
+        move_views[move_id] = ObservationMove(
+            id=source_move.id,
+            type=source_move.type,
+            category=source_move.category,
+            current_pp=move_pp,
+            max_pp=source_move.max_pp or move_pp,
+            non_ghost_target=source_move.non_ghost_target,
+            deduced_target=source_move.deduced_target,
+        )
+
+    base_stats = dict(source.base_stats)
+    boost_values = {
+        "accuracy": 0,
+        "atk": 0,
+        "def": 0,
+        "evasion": 0,
+        "spa": 0,
+        "spd": 0,
+        "spe": 0,
+    }
+    boost_values.update(boosts or {})
+    first_type = PokemonType.from_name(type_1) if type_1 else source.type_1
+    second_type = PokemonType.from_name(type_2) if type_2 else source.type_2
+    effective_species = species if reported_species is None else reported_species
+    effective_base_species = source.base_species if reported_species is None else reported_species
+    return ObservationPokemon(
+        species=effective_species,
+        base_species=effective_base_species,
+        ability=ability,
+        item=item,
+        nature=nature,
+        moves=move_views,
+        type_1=first_type,
+        type_2=second_type,
+        status=status,
+        base_stats=base_stats,
+        boosts=boost_values,
+        current_hp_fraction=current_hp / max_hp if max_hp else 0.0,
+        protect_counter=protect_counter,
+        first_turn=active_turns == 1,
+        weight=source.weight if weightkg is None else weightkg,
+        fainted=status is Status.FNT or current_hp <= 0,
+        effects=effects or {},
+        status_counter=status_counter,
+        preparing=preparing_move is not None,
+        last_move=move_views.get(last_move_id) if last_move_id else None,
+        types=tuple(value for value in (first_type, second_type) if value is not None),
+    )
 
 
-def make_real_battle(
-    active_pokemon: list[Pokemon | None] | None = None,
-    opponent_active_pokemon: list[Pokemon | None] | None = None,
-    team: list[Pokemon] | None = None,
-    opponent_team: list[Pokemon] | None = None,
+def make_battle_view(
+    active_pokemon: Sequence[ObservationPokemon | None] | None = None,
+    opponent_active_pokemon: Sequence[ObservationPokemon | None] | None = None,
+    team: Sequence[ObservationPokemon] | None = None,
+    opponent_team: Sequence[ObservationPokemon] | None = None,
     teampreview: bool = False,
-    available_switches: list[list[Pokemon]] | None = None,
+    available_switches: Sequence[Sequence[ObservationPokemon]] | None = None,
     weather: dict[Weather, int] | None = None,
     fields: dict[Field, int] | None = None,
     turn: int = 0,
     can_mega_evolve: list[bool] | None = None,
     side_conditions: dict[SideCondition, int] | None = None,
     opponent_side_conditions: dict[SideCondition, int] | None = None,
-) -> DoubleBattle:
-    """Helper to create a real DoubleBattle object and populate its slots/private dicts."""
-    logger = logging.getLogger("test")
-    logger.setLevel(logging.ERROR)
-    battle = DoubleBattle("tag", "user", logger, 9)
-    battle._player_role = "p1"
-
-    active_dict = {}
-    if active_pokemon:
-        if len(active_pokemon) > 0 and active_pokemon[0] is not None:
-            active_dict["p1a"] = active_pokemon[0]
-            active_pokemon[0]._active = True
-        if len(active_pokemon) > 1 and active_pokemon[1] is not None:
-            active_dict["p1b"] = active_pokemon[1]
-            active_pokemon[1]._active = True
-    battle._active_pokemon = active_dict
-
-    opponent_active_dict = {}
-    if opponent_active_pokemon:
-        if len(opponent_active_pokemon) > 0 and opponent_active_pokemon[0] is not None:
-            opponent_active_dict["p2a"] = opponent_active_pokemon[0]
-            opponent_active_pokemon[0]._active = True
-        if len(opponent_active_pokemon) > 1 and opponent_active_pokemon[1] is not None:
-            opponent_active_dict["p2b"] = opponent_active_pokemon[1]
-            opponent_active_pokemon[1]._active = True
-    battle._opponent_active_pokemon = opponent_active_dict
-
-    if team:
-        battle._team = {p.species: p for p in team}
-    if opponent_team:
-        battle._opponent_team = {p.species: p for p in opponent_team}
-
-    battle._teampreview = teampreview
-    battle._available_switches = available_switches or [[], []]
-    battle._weather = weather or {}
-    battle._fields = fields or {}
-    battle._turn = turn
-    battle._can_mega_evolve = can_mega_evolve or [False, False]
-    battle._side_conditions = side_conditions or {}
-    battle._opponent_side_conditions = opponent_side_conditions or {}
-    return battle
+    decision: DecisionView | None = None,
+) -> FixtureBattleView:
+    """Build a concrete BattleView value object from public observation inputs."""
+    active = (tuple(active_pokemon or ()) + (None, None))[:2]
+    opponent_active = (tuple(opponent_active_pokemon or ()) + (None, None))[:2]
+    allies = tuple(team or ())
+    opponents = tuple(opponent_team or ())
+    selected_decision = decision or DecisionView(slots=(SlotDecision(), SlotDecision()))
+    return FixtureBattleView(
+        team={f"p1:{index}": pokemon for index, pokemon in enumerate(allies)},
+        opponent_team={f"p2:{index}": pokemon for index, pokemon in enumerate(opponents)},
+        active_pokemon=active,
+        opponent_active_pokemon=opponent_active,
+        available_moves=tuple(
+            tuple(pokemon.moves.values()) if pokemon is not None else () for pokemon in active
+        ),
+        available_switches=available_switches or [[], []],
+        can_mega_evolve=can_mega_evolve or [False, False],
+        force_switch=(False, False),
+        trapped=(False, False),
+        maybe_trapped=(False, False),
+        teampreview=teampreview,
+        player_role="p1",
+        wait=False,
+        weather=weather or {},
+        fields=fields or {},
+        side_conditions=side_conditions or {},
+        opponent_side_conditions=opponent_side_conditions or {},
+        turn=turn,
+        used_mega_evolve=False,
+        opponent_used_mega_evolve=False,
+        decision=selected_decision,
+    )
 
 
 _OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
@@ -188,12 +240,12 @@ _OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
 
 def from_battle(battle, tok=tokenizer, stat_overrides=None):
     assert tok is _OBSERVATION_BUILDER.tokenizer
-    return _OBSERVATION_BUILDER.build(battle_view(battle), stat_overrides)
+    return _OBSERVATION_BUILDER.build(battle, stat_overrides)
 
 
 def from_battle_into(battle, out, tok=tokenizer, stat_overrides=None):
     assert tok is _OBSERVATION_BUILDER.tokenizer
-    _OBSERVATION_BUILDER.build_into(battle_view(battle), out, stat_overrides)
+    _OBSERVATION_BUILDER.build_into(battle, out, stat_overrides)
 
 
 def test_observation_builder_serializes_pokemon_features() -> None:
@@ -206,7 +258,7 @@ def test_observation_builder_serializes_pokemon_features() -> None:
     """
     builder = _OBSERVATION_BUILDER
 
-    mon = make_real_pokemon(
+    mon = make_pokemon_view(
         species="charizard",
         ability="blaze",
         item="charizarditey",
@@ -224,10 +276,10 @@ def test_observation_builder_serializes_pokemon_features() -> None:
         status_counter=3,
         preparing_move="closecombat",
     )
-    mon._nature = "Jolly"
-    battle = make_real_battle(active_pokemon=[mon, None], team=[mon], can_mega_evolve=[True, False])
+    mon.nature = "Jolly"
+    battle = make_battle_view(active_pokemon=[mon, None], team=[mon], can_mega_evolve=[True, False])
 
-    obs = builder.build(battle_view(battle))
+    obs = builder.build(battle)
 
     # Validate Categoricals
     cat = obs.categorical[0]
@@ -260,58 +312,52 @@ def test_observation_builder_serializes_pokemon_features() -> None:
 
 
 def test_ordered_pokemon_and_slot_conditions_real() -> None:
-    """Verify Pokemon slot ordering across Team Preview (original roster order) and active battle (active slots first, then bench)."""
-    p1 = make_real_pokemon(species="aerodactyl")
-    p2 = make_real_pokemon(species="archaludon")
-    p3 = make_real_pokemon(species="azumarill")
-    p4 = make_real_pokemon(species="basculegion")
-    p5 = make_real_pokemon(species="camerupt", status=Status.FNT)
-    p6 = make_real_pokemon(species="dragonite")
+    """Verify public observations preserve roster order and active-slot placement."""
+    p1 = make_pokemon_view(species="aerodactyl")
+    p2 = make_pokemon_view(species="archaludon")
+    p3 = make_pokemon_view(species="azumarill")
+    p4 = make_pokemon_view(species="basculegion")
+    p5 = make_pokemon_view(species="camerupt", status=Status.FNT)
+    p6 = make_pokemon_view(species="dragonite")
     team = [p1, p2, p3, p4, p5, p6]
 
     # Teampreview ordering
-    battle_tp = make_real_battle(team=team, teampreview=True)
-    ordered_tp = _get_ordered_pokemon(battle_tp, is_opponent=False)
-    assert len(ordered_tp) == 6
-    assert ordered_tp[0][0] == p1
-    assert ordered_tp[5][0] == p6
+    battle_tp = make_battle_view(team=team, teampreview=True)
+    preview = _OBSERVATION_BUILDER.build(battle_tp)
+    assert preview.categorical[:6, 0].tolist() == [
+        tokenizer.species_id(pokemon) for pokemon in team
+    ]
 
     # Regular battle ordering (active slots first, then bench)
-    battle_reg = make_real_battle(
+    battle_reg = make_battle_view(
         active_pokemon=[p1, p2],
         team=team,
         teampreview=False,
         available_switches=[[p3, p4], [p3, p4]],
     )
-    ordered_reg = _get_ordered_pokemon(battle_reg, is_opponent=False)
-    assert len(ordered_reg) == 6
-    assert ordered_reg[0][0] == p1
-    assert ordered_reg[1][0] == p2
-    assert [entry[0] for entry in ordered_reg[2:]] == [p3, p4, p5, p6]
+    regular = _OBSERVATION_BUILDER.build(battle_reg)
+    assert regular.categorical[:6, 0].tolist() == [
+        tokenizer.species_id(pokemon) for pokemon in (p1, p2, p3, p4, p5, p6)
+    ]
 
     # Empty left active slot placeholder
-    battle_left_empty = make_real_battle(
+    battle_left_empty = make_battle_view(
         active_pokemon=[None, p2],
         team=team,
         teampreview=False,
         available_switches=[[p3, p4], [p3, p4]],
     )
-    ordered_le = _get_ordered_pokemon(battle_left_empty, is_opponent=False)
-    assert len(ordered_le) == 6
-    assert ordered_le[0] == (None, -1, None)
-    assert ordered_le[1][0] == p2
-
-    # Slot condition checks
-    assert _slot_condition(battle_reg, None, 0, is_opponent=False) == 0
-    assert _slot_condition(battle_tp, p1, 0, is_opponent=False) == 2
-    assert _slot_condition(battle_reg, p1, 1, is_opponent=False) == 1
-    assert _slot_condition(battle_reg, p5, 2, is_opponent=False) == 3
+    left_empty = _OBSERVATION_BUILDER.build(battle_left_empty)
+    assert left_empty.categorical[0, 0] == 0
+    assert left_empty.categorical[1, 0] == tokenizer.species_id(p2)
+    assert left_empty.numerical[0, 1] == 1.0
+    assert left_empty.numerical[1, 2] == 1.0
 
 
 def test_global_and_side_field_tokens_include_mega_availability() -> None:
     """Verify global field and side tokens include turn fraction scaling, team preview indicator, and mega availability."""
-    ally_mega = make_real_pokemon(species="charizard", item="charizarditey")
-    battle = make_real_battle(
+    ally_mega = make_pokemon_view(species="charizard", item="charizarditey")
+    battle = make_battle_view(
         active_pokemon=[ally_mega, None],
         team=[ally_mega],
         weather={Weather.SUNNYDAY: 3},
@@ -323,7 +369,7 @@ def test_global_and_side_field_tokens_include_mega_availability() -> None:
         can_mega_evolve=[True, False],
     )
 
-    obs = _OBSERVATION_BUILDER.build(battle_view(battle))
+    obs = _OBSERVATION_BUILDER.build(battle)
 
     # Global Field Token (index 12)
     assert obs.token_type_ids[TOKEN_IDX_GLOBAL_FIELD] == TokenType.FIELD
@@ -357,10 +403,10 @@ def test_effect_overflow_is_counted_and_enforced() -> None:
         Effect.INFESTATION: 1,
         Effect.OCTOLOCK: 1,
     }
-    mon = make_real_pokemon(effects=effects)
-    battle = make_real_battle(active_pokemon=[mon, None], team=[mon])
+    mon = make_pokemon_view(effects=effects)
+    battle = make_battle_view(active_pokemon=[mon, None], team=[mon])
 
-    obs = _OBSERVATION_BUILDER.build(battle_view(battle))
+    obs = _OBSERVATION_BUILDER.build(battle)
     # Total effects: 14, overflow over MAX_EFFECTS (12) is 2
     assert obs.numerical[0, NUM_IDX_EFFECT_COUNT] == 14
     assert obs.numerical[0, NUM_IDX_EFFECT_OVERFLOW] == 2.0
@@ -370,7 +416,7 @@ def test_effect_overflow_is_counted_and_enforced() -> None:
 
 def test_concurrent_universal_effect_stress_state() -> None:
     """Verify simultaneous active effects across Pokémon, side conditions, weather, and terrain tokens."""
-    mon = make_real_pokemon(
+    mon = make_pokemon_view(
         effects={
             Effect.TAUNT: 1,
             Effect.LEECH_SEED: 1,
@@ -383,26 +429,30 @@ def test_concurrent_universal_effect_stress_state() -> None:
             Effect.TRAPPED: 1,
         }
     )
-    battle = make_real_battle(active_pokemon=[mon, None], team=[mon], turn=3)
-    battle._side_conditions = {
-        SideCondition.REFLECT: 1,
-        SideCondition.LIGHT_SCREEN: 1,
-        SideCondition.AURORA_VEIL: 1,
-        SideCondition.TAILWIND: 1,
-        SideCondition.SAFEGUARD: 1,
-        SideCondition.SPIKES: 3,
-        SideCondition.TOXIC_SPIKES: 2,
-    }
-    battle._weather = {Weather.RAINDANCE: 1}
-    battle._fields = {
-        Field.GRASSY_TERRAIN: 1,
-        Field.TRICK_ROOM: 1,
-        Field.WONDER_ROOM: 1,
-        Field.MAGIC_ROOM: 1,
-        Field.GRAVITY: 1,
-    }
+    battle = make_battle_view(
+        active_pokemon=[mon, None],
+        team=[mon],
+        turn=3,
+        side_conditions={
+            SideCondition.REFLECT: 1,
+            SideCondition.LIGHT_SCREEN: 1,
+            SideCondition.AURORA_VEIL: 1,
+            SideCondition.TAILWIND: 1,
+            SideCondition.SAFEGUARD: 1,
+            SideCondition.SPIKES: 3,
+            SideCondition.TOXIC_SPIKES: 2,
+        },
+        weather={Weather.RAINDANCE: 1},
+        fields={
+            Field.GRASSY_TERRAIN: 1,
+            Field.TRICK_ROOM: 1,
+            Field.WONDER_ROOM: 1,
+            Field.MAGIC_ROOM: 1,
+            Field.GRAVITY: 1,
+        },
+    )
 
-    obs = _OBSERVATION_BUILDER.build(battle_view(battle))
+    obs = _OBSERVATION_BUILDER.build(battle)
 
     assert obs.numerical[0, NUM_IDX_EFFECT_COUNT] == 9
     assert obs.numerical[13, NUM_IDX_EFFECT_COUNT] == 7
@@ -453,19 +503,19 @@ def test_spatial_events_ground_to_slots() -> None:
 
 def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
     """Verify from_battle_into performs in-place tensor writing into pre-allocated memory buffers without stale artifact leakage."""
-    ally = make_real_pokemon(
+    ally = make_pokemon_view(
         species="charizard",
         moves={"airslash": 10, "protect": 8},
         effects={Effect.CONFUSION: 2},
         current_hp=73,
         max_hp=100,
     )
-    opponent = make_real_pokemon(
+    opponent = make_pokemon_view(
         species="venusaur",
         moves={"gigadrain": 6},
         status=Status.BRN,
     )
-    battle = make_real_battle(
+    battle = make_battle_view(
         active_pokemon=[ally, None],
         opponent_active_pokemon=[opponent, None],
         team=[ally],
@@ -505,66 +555,31 @@ def test_from_battle_into_overwrites_and_validates_output_buffer() -> None:
         from_battle_into(battle, invalid)
 
 
-def test_stat_resolution_provenance_and_cache_behavior() -> None:
-    """Verify stat resolution provenance tracking (UNKNOWN, IMPUTED from OTS spreads, SELF_KNOWN) and caching."""
-    pokemon = make_real_pokemon(species="charizard")
-    pokemon._nature = None
-    values, provenance = _get_pokemon_level_stats(pokemon, True, None)
-    assert values == (0.0,) * 6
-    assert provenance == StatProvenance.UNKNOWN
-
-    # Test OTS-imputed stats
-    expected = cast(tuple[int, int, int, int, int, int], tuple((155, 93, 98, 177, 105, 152)))
-    values, provenance = _get_pokemon_level_stats(pokemon, True, expected)
-    assert values == tuple(float(value) for value in expected)
-    assert provenance == StatProvenance.IMPUTED
-
-    # Test our own known Pokemon stats (StatProvenance.KNOWN)
-    pokemon.stats = {"hp": 153, "atk": 104, "def": 98, "spa": 177, "spd": 105, "spe": 152}
-    values_self, provenance_self = _get_pokemon_level_stats(pokemon, False, None)
-    assert values_self == (153.0, 104.0, 98.0, 177.0, 105.0, 152.0)
-    assert provenance_self == StatProvenance.KNOWN
-
-    # Verify stat imputation caching
-    pokemon = make_real_pokemon(
-        species="charizard",
-        moves={"heatwave": 10, "solarbeam": 10, "protect": 10, "weatherball": 10},
-    )
-    pokemon._nature = "modest"
-    cache: dict[tuple[str, str | None, tuple[str, ...]], Any] = {}
-    first = _cached_imputed_stats(pokemon, cache)
-    second = _cached_imputed_stats(pokemon, cache)
-    assert first is second
-    assert len(cache) == 1
-
-
 def test_observation_builder_identity_knownness_and_stat_provenance() -> None:
     """Verify IdentityKnownness (KNOWN/OOV/UNKNOWN/PAD) and StatProvenance (KNOWN/IMPUTED/UNKNOWN/PAD)."""
     builder = ObservationBuilder(default_runtime_resources())
 
     # 1. Standard valid species (KNOWN)
-    valid_ally = make_real_pokemon(species="charizard")
+    valid_ally = make_pokemon_view(species="charizard")
     valid_ally.stats = {"hp": 153, "atk": 104, "def": 98, "spa": 177, "spd": 105, "spe": 152}
 
     # 2. Out-of-vocabulary species (OOV)
-    oov_mon = make_real_pokemon(species="pikachu")
-    oov_mon._species = "nonexistentspecies123"
+    oov_mon = make_pokemon_view(species="pikachu", reported_species="nonexistentspecies123")
 
     # 3. Missing species (UNKNOWN)
-    unknown_mon = make_real_pokemon(species="pikachu")
-    unknown_mon._species = ""
+    unknown_mon = make_pokemon_view(species="pikachu", reported_species="")
 
     # 4. Standard valid opponent with imputed stats (IMPUTED)
-    valid_opp = make_real_pokemon(species="pikachu", nature="timid")
+    valid_opp = make_pokemon_view(species="pikachu", nature="timid")
 
-    battle = make_real_battle(
+    battle = make_battle_view(
         active_pokemon=[valid_ally, oov_mon],
         opponent_active_pokemon=[valid_opp, unknown_mon],
         team=[valid_ally, oov_mon],
         opponent_team=[valid_opp, unknown_mon],
     )
 
-    obs = builder.build(battle_view(battle))
+    obs = builder.build(battle)
 
     # Token 0: Ally Charizard with exact stats -> KNOWN identity, KNOWN stats, ACTIVE presence, NORMAL mechanic
     assert obs.categorical[0, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.KNOWN
@@ -619,39 +634,15 @@ def test_observation_overflow_contract_holds_at_capacity_boundaries() -> None:
 
 
 def _legality_fixture_view(decision: DecisionView) -> FixtureBattleView:
-    battle = DoubleBattle("legality", "player", logging.getLogger(__name__), 9)
-    battle._player_role = "p1"
-    allies = [Pokemon(gen=9, species=species) for species in ("charizard", "blastoise")]
-    bench = Pokemon(gen=9, species="pikachu")
-    opponent = Pokemon(gen=9, species="venusaur")
-    for mon in (*allies, opponent):
-        mon._active = mon is not bench
-    battle._team = {"p1: Charizard": allies[0], "p1: Blastoise": allies[1], "p1: Pikachu": bench}
-    battle._opponent_team = {"p2: Venusaur": opponent}
-    battle._active_pokemon = {"p1a": allies[0], "p1b": allies[1]}
-    battle._opponent_active_pokemon = {"p2a": opponent}
-
-    return FixtureBattleView(
-        team=battle.team,
-        opponent_team=battle.opponent_team,
-        active_pokemon=battle.active_pokemon,
-        opponent_active_pokemon=battle.opponent_active_pokemon,
-        available_moves=battle.available_moves,
-        available_switches=battle.available_switches,
-        can_mega_evolve=battle.can_mega_evolve,
-        force_switch=battle.force_switch,
-        trapped=battle.trapped,
-        maybe_trapped=battle.maybe_trapped,
-        teampreview=False,
-        player_role=battle.player_role,
-        wait=False,
-        weather=battle.weather,
-        fields=battle.fields,
-        side_conditions=battle.side_conditions,
-        opponent_side_conditions=battle.opponent_side_conditions,
-        turn=battle.turn,
-        used_mega_evolve=battle.used_mega_evolve,
-        opponent_used_mega_evolve=battle.opponent_used_mega_evolve,
+    allies = [make_pokemon_view(species=species) for species in ("charizard", "blastoise")]
+    bench = make_pokemon_view(species="pikachu")
+    opponent = make_pokemon_view(species="venusaur")
+    return make_battle_view(
+        active_pokemon=allies,
+        opponent_active_pokemon=[opponent, None],
+        team=[*allies, bench],
+        opponent_team=[opponent],
+        available_switches=[[bench], [bench]],
         decision=decision,
     )
 
@@ -681,51 +672,6 @@ def test_unknown_legality_is_gated_rather_than_written_as_illegal() -> None:
     assert unknown.numerical[TOKEN_IDX_ALLY_SIDE, gates].tolist() == [1.0, 1.0]
     assert proven.numerical[TOKEN_IDX_ALLY_SIDE, gates].tolist() == [0.0, 0.0]
     assert unknown.numerical[TOKEN_IDX_OPPONENT_SIDE, gates].tolist() == [0.0, 0.0]
-
-
-def test_switch_slots_identify_roster_members_not_shared_base_species() -> None:
-    """Verify decision_view distinguishes duplicate base species on team by their specific roster index."""
-    active = SimpleNamespace(
-        moves={"tackle": SimpleNamespace(id="tackle")},
-        fainted=False,
-        base_species="Pikachu",
-    )
-    team = {
-        f"p1: Species-{index}": SimpleNamespace(base_species=f"Species-{index}")
-        for index in range(6)
-    }
-    twin = SimpleNamespace(base_species="Urshifu")
-    other = SimpleNamespace(base_species="Urshifu")
-    team["p1: Urshifu-A"] = twin
-    team["p1: Urshifu-B"] = other
-
-    battle = SimpleNamespace(
-        player_username="player",
-        battle_tag="test-roster",
-        teampreview=False,
-        team=team,
-        active_pokemon=[active, None],
-        opponent_active_pokemon=[None, None],
-        available_moves=[[SimpleNamespace(id="tackle")], []],
-        available_switches=[[twin], []],
-        valid_orders=[[], []],
-        can_mega_evolve=[False, False],
-        force_switch=[False, False],
-        trapped=[False, False],
-        maybe_trapped=[False, False],
-        _wait=False,
-        player_role="p1",
-        opponent_team={},
-        weather={},
-        fields={},
-        side_conditions={},
-        opponent_side_conditions={},
-        turn=1,
-        used_mega_evolve=False,
-        opponent_used_mega_evolve=False,
-        get_possible_showdown_targets=lambda move, pokemon: [0],
-    )
-    assert decision_view(cast(Any, battle)).slots[0].switch_slots == (6,)
 
 
 def test_reconstructed_observations_clear_reused_buffer_state() -> None:
@@ -763,10 +709,10 @@ def test_reconstructed_observations_clear_reused_buffer_state() -> None:
 
 def test_empty_slot_and_fainted_pokemon_zero_padding() -> None:
     """Verify empty/unrevealed bench slots write empty slot condition (1.0) and zero out stat/move numerical columns."""
-    mon = make_real_pokemon(species="pikachu")
-    battle = make_real_battle(active_pokemon=[mon, None], team=[mon])
+    mon = make_pokemon_view(species="pikachu")
+    battle = make_battle_view(active_pokemon=[mon, None], team=[mon])
 
-    obs = _OBSERVATION_BUILDER.build(battle_view(battle))
+    obs = _OBSERVATION_BUILDER.build(battle)
 
     # Empty ally bench slot (slot index 2): condition 0 (empty) is encoded at numerical[1]
     assert obs.token_type_ids[2] == TokenType.POKEMON
@@ -783,15 +729,15 @@ def test_empty_slot_and_fainted_pokemon_zero_padding() -> None:
 
 def test_field_and_weather_turn_fraction_scaling() -> None:
     """Verify turn numbers are scaled by 1/24 on the global field token and all output tensors contain finite numbers."""
-    mon = make_real_pokemon(species="charizard")
-    battle = make_real_battle(
+    mon = make_pokemon_view(species="charizard")
+    battle = make_battle_view(
         active_pokemon=[mon, None],
         team=[mon],
         weather={Weather.SUNNYDAY: 3},
         fields={Field.ELECTRIC_TERRAIN: 5},
         turn=12,
     )
-    obs = _OBSERVATION_BUILDER.build(battle_view(battle))
+    obs = _OBSERVATION_BUILDER.build(battle)
 
     # Global field token turn count is normalized by 24 (12 / 24 = 0.5)
     assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, 3].item() == pytest.approx(12.0 / 24.0)

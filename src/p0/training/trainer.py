@@ -103,11 +103,7 @@ class PPOTrainer:
             if (episode + 1) % refresh_interval == 0:
                 self.magnet.refresh(self.policy)
                 logging.info(f"Refreshed magnet at episode {episode + 1}")
-            metrics = {
-                name: float(stats[name])
-                for name in PPO_BOARD_METRICS
-                if name in stats
-            }
+            metrics = {name: float(stats[name]) for name in PPO_BOARD_METRICS if name in stats}
             metrics.update(rollout_metrics)
             self._json_metrics.append(
                 {
