@@ -159,6 +159,21 @@ def test_argument_shape_selects_effect_and_pokemon_ref_variants(
     assert len(event.pokemon_refs) == pokemon_ref_count
 
 
+def test_transform_accepts_species_and_reference_targets() -> None:
+    species_target = parse_protocol_event(
+        "replay-1",
+        _line("|-transform|p1a: Ditto|Pikachu|[from] ability: Imposter"),
+    )
+    reference_target = parse_protocol_event(
+        "replay-1",
+        _line("|-transform|p1a: Ditto|p2a: Pikachu|[from] ability: Imposter"),
+    )
+
+    assert species_target.classification is EventClassification.PUBLIC_STATE
+    assert tuple(reference.argument_index for reference in species_target.pokemon_refs) == (0,)
+    assert tuple(reference.argument_index for reference in reference_target.pokemon_refs) == (0, 1)
+
+
 def test_malformed_known_event_produces_structured_rejection() -> None:
     result = parse_protocol_events(
         "replay-1",

@@ -8,6 +8,7 @@ import pytest
 
 from p0.replays.identity import ReplayMemberId, ReplaySide
 from p0.replays.protocol import parse_replay_payload
+from p0.replays.reconstruction.decisions import build_decision_view
 from p0.replays.reconstruction.events import parse_protocol_events
 from p0.replays.reconstruction.resolution import resolve_protocol_events
 from p0.replays.reconstruction.state import (
@@ -331,7 +332,7 @@ def test_transform_is_an_immutable_overlay_with_its_own_pp() -> None:
         "|switch|p1a: Alpha|Alpha, L50|100/100",
         "|switch|p2a: Golf|Golf, L50|100/100",
         "|-boost|p2a: Golf|atk|2",
-        "|-transform|p1a: Alpha|p2a: Golf",
+        "|-transform|p1a: Alpha|Golf",
         "|detailschange|p2a: Golf|Golf-Mega, L50",
         "|move|p1a: Alpha|Tackle|p2a: Golf",
         "|switch|p1a: Charlie|Charlie, L50|100/100",
@@ -360,6 +361,35 @@ def test_transform_is_an_immutable_overlay_with_its_own_pp() -> None:
         "protect",
         "mimic",
     )
+
+
+def test_declared_team_size_excludes_unselected_open_sheet_reserves() -> None:
+    events = _resolved(
+        "|teamsize|p2|4",
+        "|switch|p2a: Golf|Golf, L50|100/100",
+        "|switch|p2b: Hotel|Hotel, L50|100/100",
+        "|faint|p2a: Golf",
+        "|switch|p2a: India|India, L50|100/100",
+        "|faint|p2a: India",
+        "|switch|p2a: Juliet|Juliet, L50|100/100",
+        "|faint|p2a: Juliet",
+    )
+    sheets = _complete_ots()
+    snapshots = reduce_replay_state("state-test", sheets, events, dex=_dex()).require_accepted()
+    final = snapshots[-1]
+
+    view = build_decision_view(
+        final,
+        sheets[1],
+        1,
+        (),
+        preview=False,
+        mega_items=frozenset(),
+    )
+
+    assert final.team_sizes == (4, 4)
+    assert view.slots[0].switch_slots == ()
+    assert not view.slots[0].force_switch
 
 
 def test_unnamed_skill_swap_uses_current_ability_components() -> None:

@@ -343,6 +343,7 @@ class ReplayBattleState:
     fields: tuple[tuple[str, int], ...]
     delayed_moves: tuple[DelayedMoveState, ...] = ()
     slot_conditions: tuple[SlotConditionState, ...] = ()
+    team_sizes: tuple[int, int] = (4, 4)
 
     def __post_init__(self) -> None:
         if not self.replay_id:
@@ -351,6 +352,10 @@ class ReplayBattleState:
             raise ValueError("ReplayBattleState indices must be nonnegative")
         if tuple(side.side for side in self.sides) != (ReplaySide.P1, ReplaySide.P2):
             raise ValueError("ReplayBattleState sides must be ordered as p1 and p2")
+        if len(self.team_sizes) != 2 or any(
+            type(size) is not int or not 1 <= size <= 6 for size in self.team_sizes
+        ):
+            raise ValueError("ReplayBattleState.team_sizes must contain two values in [1, 6]")
         delayed_keys = tuple(
             (delayed.target_side.side_index, delayed.target_slot) for delayed in self.delayed_moves
         )
@@ -540,6 +545,7 @@ class _StateReducer:
             for member in sheet.members
         }
         self.active: dict[tuple[ReplaySide, int], ReplayMemberId] = {}
+        self.team_sizes = {sheet.side: min(4, len(sheet.members)) for sheet in ots}
         self.side_conditions = {ReplaySide.P1: {}, ReplaySide.P2: {}}
         self.side_single_turn_effects = {ReplaySide.P1: set(), ReplaySide.P2: set()}
         self.used_mega = {ReplaySide.P1: False, ReplaySide.P2: False}
@@ -667,6 +673,9 @@ class _StateReducer:
         if classification is EventClassification.BOUNDARY_SIGNAL:
             self._apply_boundary(event.tag, event.arguments)
             return
+        if event.tag == "teamsize":
+            self._set_team_size(event.arguments)
+            return
         if event.tag in _INITIALIZATION_TAGS:
             return
 
@@ -702,6 +711,15 @@ class _StateReducer:
             return
         else:
             raise _StateTransitionError(f"boundary signal {tag!r} is not implemented")
+
+    def _set_team_size(self, arguments: tuple[str, ...]) -> None:
+        if len(arguments) < 2:
+            raise _StateTransitionError("teamsize requires a side and a size")
+        side = ReplaySide(arguments[0])
+        size = int(arguments[1])
+        if not 1 <= size <= len(self.members) // 2:
+            raise _StateTransitionError(f"invalid team size {size} for {side.value}")
+        self.team_sizes[side] = size
 
     def _expire_member_single_turn_effects(self) -> None:
         for member_id in self.active.values():
@@ -1173,7 +1191,7 @@ class _StateReducer:
 
     def _handle_minus_transform(self, resolved: ResolvedProtocolEvent) -> None:
         member = self._member_for(resolved, 0)
-        target = self._member_for(resolved, 1)
+        target = self._transform_target(resolved, member)
         target_species = (
             target.transform.species if target.transform is not None else target.current_form
         )
@@ -1210,6 +1228,44 @@ class _StateReducer:
             moves=copied_moves,
         )
         member.boosts = dict(target.boosts)
+
+    def _transform_target(
+        self,
+        resolved: ResolvedProtocolEvent,
+        member: _MutablePokemon,
+    ) -> _MutablePokemon:
+        """Resolve a Transform target from a reference or the emitted species name."""
+        target_reference = next(
+            (reference for reference in resolved.pokemon_refs if reference.argument_index == 1),
+            None,
+        )
+        if target_reference is not None:
+            target_id = _required_member(target_reference)
+            if target_id == member.member_id:
+                raise _StateTransitionError("Transform cannot target the transforming member")
+            return self.members[target_id]
+
+        target_species = normalize_showdown_id(resolved.event.arguments[1])
+        candidates = tuple(
+            candidate
+            for candidate in self.members.values()
+            if candidate.member_id != member.member_id
+            and candidate.member_id in self.active.values()
+            and target_species
+            in {
+                normalize_showdown_id(candidate.current_form),
+                normalize_showdown_id(candidate.displayed_species),
+                normalize_showdown_id(
+                    candidate.transform.species if candidate.transform is not None else ""
+                ),
+            }
+        )
+        if len(candidates) != 1:
+            raise _StateTransitionError(
+                f"Transform species {resolved.event.arguments[1]!r} resolved to "
+                f"{len(candidates)} active targets"
+            )
+        return candidates[0]
 
     def _handle_minus_typechange(self, resolved: ResolvedProtocolEvent) -> None:
         self._member_for(resolved, 0).current_types = _parse_types(resolved.event.arguments[1])
@@ -1548,6 +1604,7 @@ class _StateReducer:
             fields=tuple(sorted(self.fields.items())),
             delayed_moves=delayed_moves,
             slot_conditions=slot_conditions,
+            team_sizes=(self.team_sizes[ReplaySide.P1], self.team_sizes[ReplaySide.P2]),
         )
 
 

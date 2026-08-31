@@ -8,6 +8,7 @@ from poke_env.battle import DoubleBattle, Pokemon
 
 from p0.battle.events import SpatialTurnRecorder
 from p0.model.tokenizer import tokenizer
+from p0.replays.identity import normalize_showdown_id
 
 
 def _recorder_for(battle: DoubleBattle) -> SpatialTurnRecorder:
@@ -24,6 +25,55 @@ def last_move(pokemon: Pokemon) -> str | None:
     """Return the ID of the last move executed by the given Pokemon, or None."""
     move = pokemon.last_move
     return None if move is None else move.id
+
+
+def _transform_target(
+    battle: DoubleBattle,
+    base: Pokemon,
+    target_value: str,
+) -> Pokemon:
+    """Resolve a Transform target from the protocol reference or species name."""
+    try:
+        return battle.get_pokemon(target_value)
+    except (AssertionError, IndexError, KeyError, ValueError):
+        target_species = normalize_showdown_id(target_value)
+        candidates = tuple(
+            pokemon
+            for pokemon in (*battle.active_pokemon, *battle.opponent_active_pokemon)
+            if pokemon is not None
+            and pokemon is not base
+            and target_species
+            in {
+                normalize_showdown_id(str(pokemon.species)),
+                normalize_showdown_id(str(pokemon.base_species)),
+            }
+        )
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Transform species {target_value!r} resolved to {len(candidates)} active targets"
+            )
+        return candidates[0]
+
+
+def transform_target_reference(
+    battle: DoubleBattle,
+    base: Pokemon,
+    target_value: str,
+) -> str:
+    """Return a canonical active reference for a Transform target."""
+    target = _transform_target(battle, base, target_value)
+    player_role = battle.player_role
+    if player_role not in {"p1", "p2"}:
+        raise ValueError("Transform target resolution requires a known player role")
+    opponent_role = "p2" if player_role == "p1" else "p1"
+    for side, active_pokemon in (
+        (player_role, battle.active_pokemon),
+        (opponent_role, battle.opponent_active_pokemon),
+    ):
+        for slot, pokemon in enumerate(active_pokemon):
+            if pokemon is target:
+                return f"{side}{'ab'[slot]}: {target.name}"
+    raise ValueError(f"Transform target {target_value!r} is not active")
 
 
 def capture_message(
@@ -47,7 +97,7 @@ def capture_message(
     if len(split_message) >= 4 and split_message[1] == "-transform":
         try:
             base = battle.get_pokemon(split_message[2])
-            target = battle.get_pokemon(split_message[3])
+            target = _transform_target(battle, base, split_message[3])
             targets = getattr(battle, "_p0_transform_targets", None)
             if targets is None:
                 targets = {}
@@ -55,9 +105,6 @@ def capture_message(
             targets[id(base)] = target
         except (AssertionError, IndexError, KeyError, ValueError):
             pass
-            # will run into a bunch of silent fallbacks where the tensor state
-            # maps everything to unknown slot, since ditto wont have the moves
-            # of the pokemon it copied.
 
     elif len(split_message) >= 3 and split_message[1] in ("switch", "drag"):
         try:

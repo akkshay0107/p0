@@ -4,12 +4,18 @@ import os
 
 import pytest
 import torch
+from hypothesis.internal.conjecture import engine as conjecture_engine
 from poke_env import LocalhostServerConfiguration, ServerConfiguration
 
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
+
+# Stress strategies intentionally generate large tensor batches. Hypothesis' default
+# choice buffer rejects the configured 128-by-64 case before the test body runs.
+HYPOTHESIS_STRESS_BUFFER_SIZE = 256 * 1024
+conjecture_engine.BUFFER_SIZE = HYPOTHESIS_STRESS_BUFFER_SIZE
 
 
 @pytest.fixture(scope="function")

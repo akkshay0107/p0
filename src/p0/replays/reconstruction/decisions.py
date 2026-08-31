@@ -569,23 +569,30 @@ def build_decision_view(
     preview: bool,
     mega_items: frozenset[str],
 ) -> DecisionView:
-    team_size = len(ots.members)
+    roster_size = len(ots.members)
     if preview:
         return DecisionView(
             slots=(SlotDecision(), SlotDecision()),
             team_preview=True,
-            team_size=team_size,
+            team_size=roster_size,
         )
 
     own_side = state.sides[perspective]
     active = own_side.active
     active_set = frozenset(member_id for member_id in active if member_id is not None)
+    selected_count = sum(
+        member.selected is True
+        for member in state.members
+        if member.member_id.side.side_index == perspective
+    )
+    selection_complete = selected_count >= state.team_sizes[perspective]
     switches = tuple(
         member.member_id.roster_index
         for member in state.members
         if member.member_id.side.side_index == perspective
         and member.member_id not in active_set
         and not member.fainted
+        and (not selection_complete or member.selected is True)
     )
     forced_slots = frozenset(
         reference.pokemon_ref.active_slot
@@ -620,7 +627,7 @@ def build_decision_view(
         )
     return DecisionView(
         slots=(slots[0], slots[1]),
-        team_size=team_size,
+        team_size=roster_size,
     )
 
 

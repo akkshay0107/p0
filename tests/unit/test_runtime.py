@@ -11,8 +11,10 @@ from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
 
+from p0.battle.views import TransformedPokemonView
 from p0.runtime import poke_env_patches, showdown
 from p0.runtime.live_event_capture import captured_protocol_lines
+from p0.runtime.poke_env_battle_adapter import battle_view
 
 
 def test_event_parser_import_does_not_install_poke_env_patches() -> None:
@@ -81,6 +83,26 @@ def test_protocol_line_capture_is_opt_in_and_survives_idempotent_install() -> No
     )
     after_uninstall.parse_message(["", "gen", "9"])
     assert captured_protocol_lines(after_uninstall) == ()
+
+
+def test_transform_patch_accepts_species_target() -> None:
+    """Verify species-form Transform lines are normalized for poke-env's reference-only parser."""
+    poke_env_patches.install()
+    try:
+        battle = DoubleBattle("transform-test", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
+        battle.parse_message(["", "switch", "p2a: Pikachu", "Pikachu, L50", "100/100"])
+        battle.parse_message(
+            ["", "-transform", "p1a: Ditto", "Pikachu", "[from] ability: Imposter"]
+        )
+
+        transformed = battle_view(battle).active_pokemon[0]
+        assert isinstance(transformed, TransformedPokemonView)
+        assert transformed.species == "pikachu"
+    finally:
+        poke_env_patches.uninstall_for_tests()
 
 
 _EV_LESS_SHEET = "Incineroar||sitrusberry|intimidate|fakeout,partingshot|Impish|||||50|"

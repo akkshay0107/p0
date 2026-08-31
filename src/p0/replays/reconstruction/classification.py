@@ -205,7 +205,7 @@ _RULES = {
     "-zpower": _state(1, None, pokemon_refs=(0,)),
     "-zbroken": _state(1, None, pokemon_refs=(0,)),
     "-terastallize": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
-    "-transform": _state(2, None, pokemon_refs=(0, 1)),
+    "-transform": _state(2, None, required=(1,), pokemon_refs=(0,)),
     "-typechange": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-typeadd": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-start": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),

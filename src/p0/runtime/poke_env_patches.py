@@ -12,7 +12,7 @@ from poke_env.environment.env import _EnvPlayer
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
 
-from p0.runtime.live_event_capture import capture_message
+from p0.runtime.live_event_capture import capture_message, transform_target_reference
 
 _ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
 _ORIGINAL_STOP_LISTENING = PSClient.stop_listening
@@ -86,6 +86,14 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
         split_message,
         capture_protocol_line=_capture_protocol_lines,
     )
+    if len(split_message) >= 4 and split_message[1] == "-transform":
+        try:
+            base = self.get_pokemon(split_message[2])
+            target_reference = transform_target_reference(self, base, split_message[3])
+        except (AssertionError, IndexError, KeyError, ValueError):
+            target_reference = split_message[3]
+        if target_reference != split_message[3]:
+            split_message = [*split_message[:3], target_reference, *split_message[4:]]
     return _ORIGINAL_PARSE_MESSAGE(self, split_message)
 
 
