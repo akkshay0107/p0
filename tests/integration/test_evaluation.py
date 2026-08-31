@@ -15,7 +15,8 @@ from p0.teams.source import FixedTeamSource
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_evaluation_harness_completes_matchup(showdown_server) -> None:
-    """Verify EvaluationHarness runs a live matchup between baseline random players and tracks stats.
+    """
+    Verify EvaluationHarness runs a live matchup between baseline random players and tracks stats.
 
     Checks that the matchup completes without unhandled exceptions, computes win rates,
     aggregates results per team archetype, and produces a complete dictionary serialization

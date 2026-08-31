@@ -240,7 +240,8 @@ class ReplayFetcher:
         return tuple(sorted(discovered))
 
     def _write_immutable(self, replay_id: str, body: bytes) -> tuple[str, int]:
-        """Atomically stores a raw replay in a content-addressed pool and links it to its ID.
+        """
+        Atomically stores a raw replay in a content-addressed pool and links it to its ID.
 
         Arguments:
           replay_id: The unique string identifier for the replay.

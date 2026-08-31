@@ -51,7 +51,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the complete evaluation category set and persist its report.
+    """
+    Run the complete evaluation category set and persist its report.
 
     Arguments:
         argv: Optional command-line arguments supplied by an embedding caller.

@@ -9,7 +9,8 @@ from p0.model.architecture_contract import EVENT_RAW_WIDTH
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    """Architecture choices for constructing a new policy.
+    """
+    Architecture choices for constructing a new policy.
 
     This checkpoint intentionally contains architecture only. Compatibility
     fingerprints and resource-bundle identity remain deferred.

@@ -35,7 +35,8 @@ DEFAULT_SPREAD = StatPoints(hp=2, spa=32, spe=32)
 def _variants_from_showdown(
     text: str, dex: Mapping[str, Any] | None = None
 ) -> tuple[TeamRecord, ...]:
-    """Parse a showdown text export into canonical team records.
+    """
+    Parse a showdown text export into canonical team records.
 
     Arguments:
         text: Showdown export containing one or more six-member teams.

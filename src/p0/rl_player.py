@@ -1,4 +1,5 @@
-"""Live policy player, command-line configuration, and Showdown listener lifecycle.
+"""
+Live policy player, command-line configuration, and Showdown listener lifecycle.
 
 This module provides the core RLPlayer agent integrating neural network policy inference,
 history token management, series token persistence, team sampling, and CLI configuration
@@ -80,7 +81,8 @@ class _LiveBattleHistory:
 
 @dataclass(slots=True)
 class _LiveSeriesState:
-    """Local identity and score for one live Showdown Bo3 series.
+    """
+    Local identity and score for one live Showdown Bo3 series.
 
     Showdown creates a parent BestOfGame room and a separate child battle room
     for each game. poke-env only exposes the child battle tag, so the live player
@@ -215,7 +217,8 @@ class RLPlayer(TeamPlayerMixin, Player):
         return opponent.strip().casefold()
 
     def _series_for_battle(self, battle: DoubleBattle) -> _LiveSeriesState:
-        """Return the parent-series state associated with a child battle.
+        """
+        Return the parent-series state associated with a child battle.
 
         Showdown's child battle room IDs are intentionally game-scoped.  The
         opponent identity is stable across the child rooms in a Bo3, while the
@@ -505,7 +508,8 @@ class RLBotConfig:
 
 
 def parse_args(argv: list[str] | None = None) -> RLBotConfig:
-    """Parse command line arguments and return structured bot configuration.
+    """
+    Parse command line arguments and return structured bot configuration.
 
     Arguments:
       argv: list of command line argument strings or None to parse sys.argv
@@ -665,7 +669,8 @@ async def run_bot(
     config: RLBotConfig,
     policy_store: PolicyStore = DEFAULT_POLICY_STORE,
 ) -> None:
-    """Boot and run the RL bot Showdown listener process.
+    """
+    Boot and run the RL bot Showdown listener process.
 
     Arguments:
       config: RLBotConfig containing connection, policy, and team options

@@ -162,7 +162,8 @@ class PokemonTokenizer:
         return self.id_for(table, remainder if separator else name)
 
     def resolve(self, table: str, name: str | None) -> tuple[int, str]:
-        """Resolve a value while exposing why ID zero was returned.
+        """
+        Resolve a value while exposing why ID zero was returned.
 
         Args:
             table: The vocabulary table name to query (e.g. 'weathers', 'status').

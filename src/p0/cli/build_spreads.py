@@ -1,4 +1,5 @@
-"""Build the empirical Stat Point spread priors from Showdown usage exports.
+"""
+Build the empirical Stat Point spread priors from Showdown usage exports.
 
 The raw exports live under a gitignored cache, so a clean checkout cannot rebuild
 the artifact without re-downloading them. --fetch performs that download so a
@@ -40,7 +41,8 @@ USAGE_URL = "https://www.smogon.com/stats/{month}/chaos/{format_id}-{cutoff}.jso
 
 
 def fetch_usage_export(month: str, format_id: str, cutoff: int, destination: Path) -> Path:
-    """Download and decompress one chaos export, returning the written path.
+    """
+    Download and decompress one chaos export, returning the written path.
 
     Arguments:
         month: Usage month in YYYY-MM form.

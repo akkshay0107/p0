@@ -45,7 +45,8 @@ def test_stress_int_enforces_the_configured_minimum(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.stress
 def test_random_team_records_stay_inside_the_active_dex() -> None:
-    """Verify that randomly generated synthetic team records satisfy all dex legality constraints.
+    """
+    Verify that randomly generated synthetic team records satisfy all dex legality constraints.
 
     Checks that species, items, abilities, natures, and moves belong to the active format catalog,
     and that stat spreads satisfy the 66-point EV budget rule.

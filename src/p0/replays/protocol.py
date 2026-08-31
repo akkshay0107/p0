@@ -1,4 +1,5 @@
-"""Parsing of public Showdown replay payloads into ordered pure records.
+"""
+Parsing of public Showdown replay payloads into ordered pure records.
 
 This module understands transport JSON and the line-oriented Showdown protocol,
 but does not simulate a battle. Keeping parsing here makes reconstruction

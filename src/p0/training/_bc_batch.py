@@ -81,7 +81,8 @@ def _compact_tensors(tensors: list[Tensor]) -> Tensor:
 def _collate_bc_window(
     source_windows: list[tuple[ReplayGameChunk, int, int]],
 ) -> BCDecisionBatch:
-    """Collate a list of source game-chunk window references into a BC decision batch.
+    """
+    Collate a list of source game-chunk window references into a BC decision batch.
 
     Arguments:
       source_windows: list of (chunk, start, end) window boundaries to collate

@@ -68,7 +68,8 @@ def build(
     coverage_path: Path | None = None,
     spread_usage_path: Path = DEFAULT_SPREAD_USAGE,
 ) -> dict[str, Any]:
-    """Build the vocab mapping, checking for schema and dataset coverage.
+    """
+    Build the vocab mapping, checking for schema and dataset coverage.
 
     Arguments:
         dex_path: Champions data file containing legal content and protocol IDs.

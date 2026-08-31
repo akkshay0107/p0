@@ -224,7 +224,8 @@ def build_corpus(
     ratio_test: float = 0.1,
     created_at: str | None = None,
 ) -> tuple[TeamCorpusManifest, dict[str, Any]]:
-    """Admit, deduplicate, validate, and audit candidate team variants.
+    """
+    Admit, deduplicate, validate, and audit candidate team variants.
 
     Arguments:
         variants: Candidate teams, including provenance metadata.

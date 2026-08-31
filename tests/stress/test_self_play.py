@@ -10,7 +10,8 @@ from tests.stress._helpers import stress_repetitions
 
 @pytest.mark.stress
 def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
-    """Stress test recurrent BattleMemoryBuffer window slicing, overflow handling, and env isolation.
+    """
+    Stress test recurrent BattleMemoryBuffer window slicing, overflow handling, and env isolation.
 
     Verifies that:
     1. BattleMemoryBuffer inputs() returns the latest HISTORY_WINDOW steps.

@@ -68,7 +68,8 @@ class _ObservationCapturePlayer(RandomPlayer):
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_observation_builder_live(showdown_server, battle_format, sample_team) -> None:
-    """Exercise observation construction against the real local Showdown protocol.
+    """
+    Exercise observation construction against the real local Showdown protocol.
 
     Verifies that the ObservationBuilder succeeds on real wire state across both
     the initial Team Preview phase and mid-battle turn phases without raising exceptions,
@@ -124,7 +125,8 @@ async def test_observation_builder_live(showdown_server, battle_format, sample_t
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_showdown_observations_remain_valid(showdown_server) -> None:
-    """Verify live Showdown observations satisfy numerical validity and vocabulary bounds.
+    """
+    Verify live Showdown observations satisfy numerical validity and vocabulary bounds.
 
     Captures turns over multiple live games to verify:
     1. Categorical token IDs do not violate vocabulary bounds or overflow contracts.

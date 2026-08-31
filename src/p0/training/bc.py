@@ -360,7 +360,8 @@ class BCTrainer:
         batch: BCDecisionBatch,
         totals: dict[str, Any],
     ) -> float:
-        """Backpropagate one validated decision chunk and update running totals.
+        """
+        Backpropagate one validated decision chunk and update running totals.
 
         Arguments:
           batch: Collated CPU batch containing one contiguous set of decisions.

@@ -249,7 +249,8 @@ def from_battle_into(battle, out, tok=tokenizer, stat_overrides=None):
 
 
 def test_observation_builder_serializes_pokemon_features() -> None:
-    """Verify ObservationBuilder converts Pokemon attributes into correctly scaled and indexed categorical/numerical tensors.
+    """
+    Verify ObservationBuilder converts Pokemon attributes into correctly scaled and indexed categorical/numerical tensors.
 
     Verifies:
     - Categorical columns: species, ability, item, typing (type 1 & 2), move slots (0..3), status condition, nature.

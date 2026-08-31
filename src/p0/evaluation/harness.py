@@ -88,7 +88,8 @@ logger = logging.getLogger(__name__)
 
 
 def wilson_score_interval(wins: int, total: int) -> tuple[float, float]:
-    """Calculate the Wilson 95% score interval for a binomial proportion.
+    """
+    Calculate the Wilson 95% score interval for a binomial proportion.
 
     Arguments:
       wins: Number of successes (wins)
@@ -298,7 +299,8 @@ class EvaluationHarness:
         team_source: TeamSource,
         server_configuration: Any,
     ) -> MatchupResult:
-        """Run a single matchup between two policies on a specific team source.
+        """
+        Run a single matchup between two policies on a specific team source.
 
         Arguments:
             name_a: Display name for the first policy.

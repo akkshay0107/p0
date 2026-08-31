@@ -19,7 +19,8 @@ def _small_policy() -> PolicyNet:
 
 
 def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path: Path) -> None:
-    """Verify that checkpoint saving captures required schema metadata and strips immutable runtime statics.
+    """
+    Verify that checkpoint saving captures required schema metadata and strips immutable runtime statics.
 
     Verifies that:
     1. Saved artifact contains global contract SHA-256 and configuration envelopes.

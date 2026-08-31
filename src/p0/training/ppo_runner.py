@@ -75,7 +75,8 @@ def run_training(
     cancel_requested: Callable[[], bool] = lambda: False,
     agent_team_source: str = "all",
 ) -> None:
-    """Build the self-play stack and run training to completion.
+    """
+    Build the self-play stack and run training to completion.
 
     Arguments:
         config: Validated global runtime and training configuration.

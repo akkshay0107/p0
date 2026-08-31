@@ -48,7 +48,8 @@ class _TeamPreviewEnvPlayer(_EnvPlayer):
 
 
 def enable_environment_team_preview(player: _EnvPlayer) -> None:
-    """Enable policy-selected preview for poke-env's private environment player.
+    """
+    Enable policy-selected preview for poke-env's private environment player.
 
     poke-env 0.15 constructs _EnvPlayer internally and exposes no player
     factory. The instance-local class replacement is therefore isolated here.
@@ -118,7 +119,8 @@ def _forme_change(self: Pokemon, species: str) -> None:
 
 
 def _update_from_teambuilder(self: Pokemon, tb: TeambuilderPokemon) -> None:
-    """Keep the open-team-sheet nature that poke-env drops for EV-less formats.
+    """
+    Keep the open-team-sheet nature that poke-env drops for EV-less formats.
 
     poke-env 0.15 assigns nature only inside if not all(e == 0 for e in tb.evs),
     so a sheet that declares a nature but no EVs loses it. Champions spends Stat
@@ -134,7 +136,8 @@ def _update_from_teambuilder(self: Pokemon, tb: TeambuilderPokemon) -> None:
 
 
 async def _stop_listening_cleanly(self: PSClient) -> None:
-    """Close a client and drain poke-env's listener/message-handler tasks.
+    """
+    Close a client and drain poke-env's listener/message-handler tasks.
 
     poke-env 0.15 closes the websocket from stop_listening but does not
     wait for the listener future or the message-handler tasks it creates on its
@@ -162,7 +165,8 @@ def install(
     *,
     capture_protocol_lines: bool = False,
 ) -> None:
-    """Install compatibility patches for the pinned poke-env release.
+    """
+    Install compatibility patches for the pinned poke-env release.
 
     Arguments:
       logger: Optional logger that receives the inactive-Pokémon filter.

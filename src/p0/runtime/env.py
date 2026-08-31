@@ -246,7 +246,8 @@ class SimEnv(MegaEnv):
         return super().reset(seed=seed, options=options)
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """Score one finished game from the passed battle's own perspective.
+        """
+        Score one finished game from the passed battle's own perspective.
 
         poke-env calls this once per agent per step, with that agent's battle
         object, so it must stay free of side effects. The series score is

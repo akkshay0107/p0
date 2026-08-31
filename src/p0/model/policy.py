@@ -1,4 +1,5 @@
-"""Policy network: fixed memory reducer, fused token encoder, and the 49-action joint heads.
+"""
+Policy network: fixed memory reducer, fused token encoder, and the 49-action joint heads.
 
 Defines ActorPolicy (stateless action sampling/scoring with sequential joint-action masks)
 and PolicyNet (full actor+critic model). Shared by live play, rollouts, and behaviour-cloning
@@ -138,7 +139,8 @@ class PreparedDecision:
 
 
 class ActOutput(NamedTuple):
-    """Outputs for one action decision.
+    """
+    Outputs for one action decision.
 
     value is predicted from the post-memory cls readout. The
     history_token is the pre-memory h_t snapshot returned by the reducer
@@ -312,7 +314,8 @@ class ActorPolicy(nn.Module):
         head_idx: int,
         ctx_a1: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """Build phase-aware queries and score every action with attention.
+        """
+        Build phase-aware queries and score every action with attention.
 
         Arguments:
           z: Reduced battle-state summaries, one per batch row.
@@ -614,7 +617,8 @@ class ActorPolicy(nn.Module):
         *,
         validated: bool = False,
     ) -> Tensor:
-        """Score ragged candidates against a batch that is already reduced.
+        """
+        Score ragged candidates against a batch that is already reduced.
 
         Setting validated=True bypasses every candidate-contract check. It is
         reserved for callers that validated the complete source batch before
@@ -701,7 +705,8 @@ class ActorPolicy(nn.Module):
         return (log_prob_first + log_prob_second).squeeze(1)
 
     def unmasked_first_slot_logits(self, reduced: ReducerOutput, enc: EncodedObs) -> Tensor:
-        """First-slot logits before legality masking, for legality diagnostics.
+        """
+        First-slot logits before legality masking, for legality diagnostics.
 
         Reuses an already-reduced batch so the diagnostic costs one pointer-head pass
         rather than a second reducer pass.
@@ -907,7 +912,8 @@ class PolicyNet(nn.Module):
         *,
         validated: bool = False,
     ) -> Tensor:
-        """Score ragged joint-action candidates from one prepared decision batch.
+        """
+        Score ragged joint-action candidates from one prepared decision batch.
 
         Setting validated=True delegates directly to unchecked scoring and is
         safe only after the caller validates the complete source batch.

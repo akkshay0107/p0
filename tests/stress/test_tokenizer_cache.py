@@ -11,7 +11,8 @@ from tests.stress._helpers import stress_count
 
 @pytest.mark.stress
 def test_token_store_append_drop_clear_and_high_cardinality_keys() -> None:
-    """Stress test SeriesTokenStore across high key volumes, FIFO eviction, and masking.
+    """
+    Stress test SeriesTokenStore across high key volumes, FIFO eviction, and masking.
 
     Verifies that:
     1. Appending more games than max_games=2 correctly evicts oldest entries (FIFO).

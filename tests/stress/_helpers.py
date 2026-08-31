@@ -133,7 +133,8 @@ def stress_dex_catalog() -> StressDexCatalog:
 
 
 def _random_stat_points(rng: random.Random) -> StatPoints:
-    """Sample random EV point allocations respecting the maximum total EV budget constraint.
+    """
+    Sample random EV point allocations respecting the maximum total EV budget constraint.
 
     Generates 6 stat points in [0, 32] such that their sum does not exceed 66 total points
     (representing the 508 EV cap in Showdown VGC / Singles).
@@ -245,7 +246,8 @@ def stress_random_replay_teams(
 
 
 def stress_series_id(parent: str, players: tuple[str, str] = ("Alice", "Bob")) -> str:
-    """Calculate the deterministic grouping identity used by the replay compiler.
+    """
+    Calculate the deterministic grouping identity used by the replay compiler.
 
     Hashes the format ID, parent series ID, and casefolded player names to produce
     a 24-character hexadecimal series identifier.
@@ -280,7 +282,8 @@ def stress_random_replay_payload(
     winner: str | None = None,
     teams: tuple[tuple[TeamMember, ...], tuple[TeamMember, ...]] | None = None,
 ) -> dict[str, Any]:
-    """Build a replay-shaped payload with random values from the active legal dex.
+    """
+    Build a replay-shaped payload with random values from the active legal dex.
 
     Emits simulated Showdown protocol lines including teampreview, showteam headers,
     lead switches, double battle moves, and match conclusion.
@@ -352,7 +355,8 @@ def stress_random_bo3_payloads(
     replay_prefix: str,
     series_prefix: str,
 ) -> tuple[dict[str, Any], ...]:
-    """Build paired games (game 1 & game 2) per series while preserving each series' team roster.
+    """
+    Build paired games (game 1 & game 2) per series while preserving each series' team roster.
 
     Ensures that both games in a Best-of-3 series share the same team compositions across
     players, mimicking actual tournament series conditions for replay grouping tests.

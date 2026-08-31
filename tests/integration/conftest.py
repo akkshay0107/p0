@@ -23,7 +23,8 @@ def battle_format() -> str:
 
 @pytest.fixture(scope="session")
 def sample_team() -> str:
-    """Return a packed team string converted from standard Showdown export text.
+    """
+    Return a packed team string converted from standard Showdown export text.
 
     Packed format is required for direct wire transmission when initializing
     Showdown player sessions.
@@ -33,7 +34,8 @@ def sample_team() -> str:
 
 @pytest.fixture(scope="function")
 def showdown_server(showdown_assets):
-    """Start a local ephemeral Showdown server process for live battle integration tests.
+    """
+    Start a local ephemeral Showdown server process for live battle integration tests.
 
     Dynamically binds an unused loopback port to prevent port collisions between
     concurrent test workers, launching an isolated Showdown server instance for the test lifecycle.
@@ -50,7 +52,8 @@ def showdown_server(showdown_assets):
 
 
 def _integration_devices() -> tuple[torch.device, ...]:
-    """Parse requested test devices from P0_INTEGRATION_DEVICES environment variable.
+    """
+    Parse requested test devices from P0_INTEGRATION_DEVICES environment variable.
 
     Defaults to checking both CPU and CUDA (if CUDA is actually available on the host).
     Deduplicates device entries while preserving order, falling back to CPU if empty.
@@ -79,7 +82,8 @@ def model_device(request: pytest.FixtureRequest) -> torch.device:
 
 @pytest.fixture
 def model_policy(model_device: torch.device):
-    """Instantiate a minimal Transformer policy in eval mode for integration testing.
+    """
+    Instantiate a minimal Transformer policy in eval mode for integration testing.
 
     Uses small dimensions (d_model=32, 1 reducer layer) to keep forward pass execution
     fast while exercising the complete forward pipeline and action masking on the target device.

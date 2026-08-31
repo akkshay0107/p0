@@ -1,4 +1,5 @@
-"""Compiled tensor-shard artifact contract for streaming behaviour cloning.
+"""
+Compiled tensor-shard artifact contract for streaming behaviour cloning.
 
 This module owns the derived-tensor layer: bounded shard files holding stacked
 observations at the active OBSERVATION_SCHEMA_VERSION and label tensors for
@@ -76,7 +77,8 @@ SHARD_SUMMARY_KEY = "series_summaries"
 
 
 def observation_field_specs() -> tuple[tuple[str, tuple[int, ...], torch.dtype], ...]:
-    """Observation tensors stacked along a leading decision axis.
+    """
+    Observation tensors stacked along a leading decision axis.
 
     Derived from StructuredObservation._FIELD_SPECS so an observation-schema
     change cannot silently diverge from the shard layout.
@@ -365,7 +367,8 @@ def load_shard_manifest(
 
 
 def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
-    """Check a shard tensor payload against the frozen layout above.
+    """
+    Check a shard tensor payload against the frozen layout above.
 
     Shared by compilation and loading so a writer cannot emit a payload the
     reader would reject.

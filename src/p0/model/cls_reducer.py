@@ -21,7 +21,8 @@ from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 
 class ReducerOutput(NamedTuple):
-    """The outputs needed by actor, critic, and runtime orchestration.
+    """
+    The outputs needed by actor, critic, and runtime orchestration.
 
     cls is the memory-aware readout used for the current policy/value
     decision. local_history_token is deliberately the pre-memory summary
@@ -36,7 +37,8 @@ class ReducerOutput(NamedTuple):
 
 
 def pack_history_tokens(history_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    """Pack chronological history into the fixed 48-slot reducer input.
+    """
+    Pack chronological history into the fixed 48-slot reducer input.
 
     history_tokens is ordered oldest to newest. The returned age identity
     is zero for the newest valid token and increases toward the oldest token.
@@ -139,7 +141,8 @@ class MemoryReducer(nn.Module):
         history_mask: Tensor,
         history_age_ids: Tensor,
     ) -> ReducerOutput:
-        """Reduce the memory window from an already-computed local summary.
+        """
+        Reduce the memory window from an already-computed local summary.
 
         Behaviour cloning builds the per-decision local summaries to fill its
         history window, so it passes the target rows straight back in rather
@@ -209,7 +212,8 @@ class MemoryReducer(nn.Module):
         )
 
     def local_summary(self, current_tokens: Tensor) -> Tensor:
-        """Summarize current tokens before any memory interaction.
+        """
+        Summarize current tokens before any memory interaction.
 
         This method intentionally cannot see series/history tokens or future
         outcomes. Its output is both the initial reducer readout and the

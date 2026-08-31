@@ -141,7 +141,8 @@ def collect_rollouts(
     series_store1: SeriesTokenStore,
     series_store2: SeriesTokenStore,
 ) -> None:
-    """Collect one all-self-play rollout using explicit fixed-window memory.
+    """
+    Collect one all-self-play rollout using explicit fixed-window memory.
 
     Arguments:
         vec_env: Batched self-play environments.

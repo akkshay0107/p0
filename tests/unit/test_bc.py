@@ -32,7 +32,8 @@ from tests.unit.replay_fixtures import sample_replay_payload
 
 
 def test_exact_and_partial_losses_match_probability_definitions() -> None:
-    """Verify behavior cloning objective calculations for EXACT, PARTIAL, and UNKNOWN label kinds.
+    """
+    Verify behavior cloning objective calculations for EXACT, PARTIAL, and UNKNOWN label kinds.
 
     Mathematical Formulation:
     - EXACT label: Standard Negative Log Likelihood: NLL = -log(P(action))

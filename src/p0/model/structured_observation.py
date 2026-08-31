@@ -1,4 +1,5 @@
-"""Structured tensor observation schema shared by encode, rollouts, and evaluation.
+"""
+Structured tensor observation schema shared by encode, rollouts, and evaluation.
 
 Defines the fixed categorical/numerical/sequence layout of StructuredObservation, the
 ActionMasker helpers, and the observer-facing indices used across the model and runtime.

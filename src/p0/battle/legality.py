@@ -1,4 +1,5 @@
-"""Pure scalar legality and joint-action constraints.
+"""
+Pure scalar legality and joint-action constraints.
 
 A SlotDecision carries both the legality itself and whether that legality is proven.
 Live play and self-play own the authoritative |request| and leave legality_known

@@ -1,4 +1,5 @@
-"""Stress the live observation -> replay -> reconstructed observation path.
+"""
+Stress the live observation -> replay -> reconstructed observation path.
 
 The important assertion in this test is deliberately made before tensor fusion:
 the observation captured at a live request must be the same observation that the
@@ -148,7 +149,8 @@ def _cant_reasons(snapshot: ProjectedSnapshot, role: int) -> tuple[str, ...]:
 
 
 def _showteam_offset(document: ReplayDocument) -> tuple[int, int]:
-    """Where the harness spliced open-team-sheet lines into the captured log.
+    """
+    Where the harness spliced open-team-sheet lines into the captured log.
 
     The live cursor counts only lines poke-env parsed, and showteam is not one of
     them, so cursors at or past the splice point are shifted by the inserted lines.
@@ -168,7 +170,8 @@ def _live_boundary(record: dict[str, Any], splice_index: int, splice_count: int)
 
 
 class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
-    """Random player that saves pre-fusion decisions and completed replay JSON.
+    """
+    Random player that saves pre-fusion decisions and completed replay JSON.
 
     Captures exact raw observation tensors, action decisions, and replay line stream offsets
     during live battle execution so offline replay reconstruction can be verified 1-to-1 against ground truth.
@@ -512,7 +515,8 @@ def _assert_legality_provenance(
     live: StructuredObservation,
     reconstructed: StructuredObservation,
 ) -> None:
-    """A reconstructed legality cell must match live exactly, or be marked unproven.
+    """
+    A reconstructed legality cell must match live exactly, or be marked unproven.
 
     Hidden level/stat values and their provenance intentionally differ: the live battle
     knows the player's actual values, while a replay reconstructs them from the public
@@ -570,7 +574,8 @@ def _assert_live_action_is_observable(
     live_action: tuple[int, int],
     evidence: Any,
 ) -> None:
-    """Check only the live action components that a public replay can expose.
+    """
+    Check only the live action components that a public replay can expose.
 
     Showdown does not emit a protocol line for a slot that submitted pass.
     A replacement request can therefore produce a live pair such as
@@ -599,7 +604,8 @@ def _match_live_records(
     live_records: tuple[dict[str, Any], ...],
     document: ReplayDocument,
 ) -> tuple[tuple[ProjectedSnapshot, dict[str, Any]], ...]:
-    """Pair requests with decisions at the boundary both sides can name.
+    """
+    Pair requests with decisions at the boundary both sides can name.
 
     Reconstruction is not required to reproduce the live request schedule, so waits and
     requests answered with no order are dropped. Every request that carried an order is
@@ -703,7 +709,8 @@ def _assert_poke_env_state_agreement(
     perspective: ProjectedPerspective,
     document: ReplayDocument,
 ) -> None:
-    """Diff the pure replay state machine against poke-env over the same lines.
+    """
+    Diff the pure replay state machine against poke-env over the same lines.
 
     Only fields both can know from public protocol are compared. This isolates a state
     tracking regression (Illusion, boosts, field state) from a boundary or tensor
@@ -755,7 +762,8 @@ def _assert_poke_env_state_agreement(
 
 
 def _hp_fields_agree(left: str, right: str) -> bool:
-    """Whether two HP fields describe the same health within percent quantization.
+    """
+    Whether two HP fields describe the same health within percent quantization.
 
     Each player receives its own mons' HP exactly and the opponent's rounded to a
     percentage, so the same battle line differs in precision between the two streams.
@@ -783,7 +791,8 @@ def _assert_line_stream_fidelity(
     document: ReplayDocument,
     live_lines: tuple[str, ...],
 ) -> None:
-    """The parsed replay must be the line stream this player actually received.
+    """
+    The parsed replay must be the line stream this player actually received.
 
     Isolating this from grouping turns a downstream tensor mismatch into a line-level
     diff, which is where a parsing or capture regression actually originates.
@@ -826,7 +835,8 @@ def _assert_decision_boundaries_partition_the_log(
 async def test_random_local_games_reconstruct_to_valid_tensors(
     showdown_server, tmp_path: Path
 ) -> None:
-    """End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
+    """
+    End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
 
     Verifies that:
     1. 100+ random live battles run concurrently against a local Showdown server.

@@ -228,7 +228,8 @@ def _run_batched_ppo(
     alpha: float,
     magnet_cache: dict[int, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, Tensor], int]:
-    """Evaluate one PPO minibatch with one reducer pass per decision.
+    """
+    Evaluate one PPO minibatch with one reducer pass per decision.
 
     Arguments:
         episodes: Trajectories included in the minibatch.
@@ -333,7 +334,8 @@ def ppo_update(
     alpha: float,
     cancel_requested: Callable[[], bool],
 ) -> dict[str, float | int]:
-    """Apply PPO epochs to a collection of completed trajectories.
+    """
+    Apply PPO epochs to a collection of completed trajectories.
 
     Arguments:
         episodes: Prepared trajectories with returns and advantages.

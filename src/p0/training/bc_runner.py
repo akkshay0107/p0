@@ -124,7 +124,8 @@ def train_bc(
     device: torch.device | str | None = None,
     cancel_requested: Callable[[], bool] = lambda: False,
 ) -> dict[str, Any]:
-    """Train one epoch at a time, validate, and checkpoint completed epochs.
+    """
+    Train one epoch at a time, validate, and checkpoint completed epochs.
 
     Arguments:
         config: Behaviour-cloning dataset, optimizer, and output configuration.

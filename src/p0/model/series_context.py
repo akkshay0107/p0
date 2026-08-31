@@ -1,4 +1,5 @@
-"""Series-context resampler for Best-of-3 games.
+"""
+Series-context resampler for Best-of-3 games.
 
 Compresses un-truncated turn histories [z_1, ..., z_T] from prior completed games
 into a fixed number of continuous latent summary tokens (4 per game, 8 total for
@@ -25,7 +26,8 @@ from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
 
 
 class DynamicSeriesResampler(nn.Module):
-    """Perceiver Cross-Attention Resampler for dynamic Best-of-3 game summaries.
+    """
+    Perceiver Cross-Attention Resampler for dynamic Best-of-3 game summaries.
 
     Compresses an un-truncated turn history sequence [z_1, ..., z_T] of length T
     into K=4 continuous latent summary tokens per game. For up to MAX_PRIOR_GAMES (2)

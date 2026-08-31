@@ -55,7 +55,8 @@ def _identity_rows(loader: DataLoader) -> list[tuple[Any, ...]]:
 def test_dataset_workers_yield_each_random_perspective_once(
     tmp_path: Path, num_workers: int
 ) -> None:
-    """Verify DataLoader multiprocess sharding yields every series perspective exactly once without duplicates.
+    """
+    Verify DataLoader multiprocess sharding yields every series perspective exactly once without duplicates.
 
     Each compiled game produces two distinct perspective chunks (player 0 and player 1).
     When distributing workload across 0, 1, 2, or 4 worker processes, the union of all
@@ -87,7 +88,8 @@ def test_dataset_workers_yield_each_random_perspective_once(
 
 @pytest.mark.stress
 def test_dataset_prefetch_and_repeated_iteration_are_stable(tmp_path) -> None:
-    """Verify that multi-worker prefetching with persistent workers produces consistent epoch iterations.
+    """
+    Verify that multi-worker prefetching with persistent workers produces consistent epoch iterations.
 
     Ensures that background prefetch buffers and persistent worker worker-loop state
     do not cause order corruption, missed elements, or memory leakage across repeated dataset epochs.

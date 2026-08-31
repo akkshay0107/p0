@@ -1,4 +1,5 @@
-"""Validated team domain objects with lazy runtime-source exports.
+"""
+Validated team domain objects with lazy runtime-source exports.
 
 The pure team schema and Stat Point modules are used by offline replay code.
 Importing the package must not eagerly import poke-env just to access them.

@@ -1,4 +1,5 @@
-"""Identity for one player's state across the games of a Bo3 series.
+"""
+Identity for one player's state across the games of a Bo3 series.
 
 Series context itself is continuous, not symbolic: a completed game is
 summarized by compressing its per-decision local history tokens through

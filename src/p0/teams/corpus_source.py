@@ -1,4 +1,5 @@
-"""Corpus-backed TeamSource implementation with uniform team sampling.
+"""
+Corpus-backed TeamSource implementation with uniform team sampling.
 
 This module implements CorpusTeamSource, which loads a validated TeamCorpusManifest
 and provides allocation-free, pure-Python sampling of ValidatedTeam instances from

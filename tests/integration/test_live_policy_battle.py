@@ -54,7 +54,8 @@ async def test_policy_handles_showdown_captured_batches(
     model_device: torch.device,
     batch_size: int,
 ) -> None:
-    """Verify the full forward pipeline (encode -> prepare -> act -> evaluate) on live battle batches.
+    """
+    Verify the full forward pipeline (encode -> prepare -> act -> evaluate) on live battle batches.
 
     Tests that:
     1. Sampled actions strictly respect the action mask (invalid actions have probability 0).

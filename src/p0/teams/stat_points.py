@@ -1,4 +1,5 @@
-"""Champions Stat Point arithmetic and the spread fallback used without usage data.
+"""
+Champions Stat Point arithmetic and the spread fallback used without usage data.
 
 Stat Point spreads are hidden in Champions, so opponent stats are always estimated.
 Empirical priors live in p0.teams.spread_usage; this module owns the level-clause
@@ -140,7 +141,8 @@ _FALLBACK_STATUS = StatPoints(hp=32, defense=17, spd=17)
 
 
 def fallback_points(move_categories: tuple[str, ...]) -> StatPoints | None:
-    """Guess a spread from move categories alone, for species with no usage data.
+    """
+    Guess a spread from move categories alone, for species with no usage data.
 
     Categories are tested in a fixed physical, special, status order rather than by
     base stat, so the result depends only on the moves and never on the species.

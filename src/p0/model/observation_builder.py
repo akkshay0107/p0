@@ -1,4 +1,5 @@
-"""Builds structured battle observations and per-slot action masks from poke-env battles.
+"""
+Builds structured battle observations and per-slot action masks from poke-env battles.
 
 Implements the observation builder that serializes a DoubleBattle into the
 StructuredObservation contract (entities, categoricals, numericals, action mask and
@@ -105,7 +106,8 @@ _SLOT_LAYOUT = np.asarray(
 
 
 def _status_counter_kind(status: object | None) -> CounterKind:
-    """StatusRecord counter semantics.
+    """
+    StatusRecord counter semantics.
 
     SLP counts public turns already slept (never the hidden RNG total duration);
     TOX is the badly-poisoned stage that scales the damage tick, the same role
@@ -254,7 +256,8 @@ def _slot_condition(
 
 
 def _imputed_stats(pokemon: PokemonView) -> tuple[int, int, int, int, int, int] | None:
-    """Estimate level-50 stats from the usage priors, or None when unrecoverable.
+    """
+    Estimate level-50 stats from the usage priors, or None when unrecoverable.
 
     Only the species and nature are required: the usage prior is keyed on those, and
     move categories matter solely for the fallback used on uncovered species. A
@@ -354,7 +357,8 @@ def _side_mega_available(
     is_opponent: bool,
     selected_allies: set[Any] | None = None,
 ) -> tuple[bool, bool]:
-    """Whether the side still holds a mega stone, and whether that is knowable.
+    """
+    Whether the side still holds a mega stone, and whether that is knowable.
 
     A replay cannot see an unbrought reserve's item, so a side whose only mega-stone
     holder has not been revealed reports unknown instead of a false negative.
@@ -751,7 +755,8 @@ def _write_observation(
     tok: PokemonTokenizer,
     stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
 ) -> None:
-    """Serialize a battle view into a pre-allocated StructuredObservation in place.
+    """
+    Serialize a battle view into a pre-allocated StructuredObservation in place.
 
     Arguments:
       battle: battle view providing the entity, categorical, and numerical features

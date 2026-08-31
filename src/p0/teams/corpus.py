@@ -1,4 +1,5 @@
-"""Validated team-corpus manifest contract.
+"""
+Validated team-corpus manifest contract.
 
 Team identity: corpus identity is CanonicalTeam.team_hash, the order- and
 spelling-independent SHA-256 of the canonical team JSON. ValidatedTeam's

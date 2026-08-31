@@ -1,4 +1,5 @@
-"""Versioned replay intermediate representation and action-evidence labels.
+"""
+Versioned replay intermediate representation and action-evidence labels.
 
 The raw layer beneath this schema is deliberately schema-free: scraped replay
 JSON is stored as verbatim immutable response bytes on disk
@@ -516,7 +517,8 @@ def _require_iso_timestamp(value: str, owner: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class FetchIndexEntry:
-    """One line of the append-only raw-cache fetch index.
+    """
+    One line of the append-only raw-cache fetch index.
 
     Knows nothing about replay content, so it survives every IR schema change.
     """
@@ -579,7 +581,8 @@ class FetchIndexEntry:
 
 @dataclass(frozen=True, slots=True)
 class ActionEvidence:
-    """Reconstructed joint-action supervision for one decision.
+    """
+    Reconstructed joint-action supervision for one decision.
 
     Candidates are explicit joint pairs at this layer; the flat
     values-plus-offsets ragged encoding exists only in compiled tensor shards.
@@ -654,7 +657,8 @@ class ActionEvidence:
 
 @dataclass(frozen=True, slots=True)
 class DecisionRecord:
-    """One inferred decision request and its attached evidence.
+    """
+    One inferred decision request and its attached evidence.
 
     Line indices bound the execution segment in the owning replay's
     protocol_lines: the observation is captured before pre_line_index and the
@@ -714,7 +718,8 @@ class DecisionRecord:
 
 @dataclass(frozen=True, slots=True)
 class ReplayDiagnostics:
-    """Parser and reconstruction counters kept alongside the derived records.
+    """
+    Parser and reconstruction counters kept alongside the derived records.
 
     Counter keys mirror EVENT_DIAGNOSTICS (oov_ids, missing_pre_hp,
     grounding_misses) plus reconstruction-specific counts, so ambiguity and
@@ -795,7 +800,8 @@ class ReplayOutcome:
 
 @dataclass(frozen=True, slots=True)
 class SeriesRecord:
-    """A grouped Bo3 series with ordered games and canonical player identity.
+    """
+    A grouped Bo3 series with ordered games and canonical player identity.
 
     team_hashes are CanonicalTeam.team_hash values (order- and
     spelling-independent), tying the series to corpus team identity.

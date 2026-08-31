@@ -201,7 +201,8 @@ def _make_group(
     method: GroupingMethod,
     diagnostics: tuple[GroupingDiagnostic, ...] = (),
 ) -> GroupedSeries:
-    """Forms a strict deterministic Series out of a collection of grouped games.
+    """
+    Forms a strict deterministic Series out of a collection of grouped games.
 
     Arguments:
         documents: A tuple of replay documents belonging to the same grouping bucket.
@@ -304,7 +305,8 @@ def group_replays(
     format_id: str | None = None,
     max_games: int = 3,
 ) -> GroupingResult:
-    """Group compatible documents without merging conflicting player pairs.
+    """
+    Group compatible documents without merging conflicting player pairs.
 
     Arguments:
         documents: Parsed, model-agnostic replay documents.

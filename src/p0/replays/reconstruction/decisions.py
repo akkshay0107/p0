@@ -1,4 +1,5 @@
-"""Decision-window inference and action evidence for replay reconstruction v2.
+"""
+Decision-window inference and action evidence for replay reconstruction v2.
 
 This module consumes resolved protocol events and immutable state snapshots. It
 keeps request-boundary inference separate from action extraction so execution
@@ -717,7 +718,8 @@ def reconstruct_decisions_from_trace(
     dex: Mapping[str, Any] | None = None,
     windows: tuple[DecisionWindow, ...] | None = None,
 ) -> DecisionReconstruction:
-    """Build decisions from an already resolved and reduced replay trace.
+    """
+    Build decisions from an already resolved and reduced replay trace.
 
     Arguments:
         document: The normalized replay document containing OTS and protocol lines.

@@ -322,7 +322,8 @@ def write_tensor_shards(
     source_series: Mapping[str, tuple[str, ...]] | None = None,
     external_rejections: tuple[str, ...] = (),
 ) -> ShardBuildResult:
-    """Persist a compiled result as immutable, runtime-bound tensor shards.
+    """
+    Persist a compiled result as immutable, runtime-bound tensor shards.
 
     Arguments:
         result: Model-agnostic compilation result to tensorize.

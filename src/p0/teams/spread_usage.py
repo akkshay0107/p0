@@ -1,4 +1,5 @@
-"""Empirical Stat Point spread priors derived from Showdown usage statistics.
+"""
+Empirical Stat Point spread priors derived from Showdown usage statistics.
 
 Champions hides Stat Point spreads, so an opponent's real stats are never observable.
 Smogon's chaos usage exports publish spreads in Champions Stat Point units already
@@ -83,7 +84,8 @@ class SpreadTable:
         return self.buckets.get((normalize_id(species), nature.lower()), ())
 
     def best(self, species: str, nature: str) -> StatPoints | None:
-        """Return the most-used spread for a bucket, or None when it is absent.
+        """
+        Return the most-used spread for a bucket, or None when it is absent.
 
         Buckets are stored weight-descending, so the argmax is the first entry.
         """
@@ -93,7 +95,8 @@ class SpreadTable:
     def resolve(
         self, species: str, nature: str, move_categories: tuple[str, ...]
     ) -> SpreadEstimate | None:
-        """Estimate a spread from the usage prior, falling back to move categories.
+        """
+        Estimate a spread from the usage prior, falling back to move categories.
 
         Returns None when neither source can produce one, which callers record as an
         explicit UNKNOWN rather than substituting a blind guess.
@@ -107,7 +110,8 @@ class SpreadTable:
     def sample(
         self, species: str, nature: str, move_categories: tuple[str, ...], rng: random.Random
     ) -> SpreadEstimate | None:
-        """Draw a spread in proportion to usage, for generating varied teams.
+        """
+        Draw a spread in proportion to usage, for generating varied teams.
 
         Mirrors resolve() except that a populated bucket is sampled by weight rather
         than reduced to its argmax.
@@ -132,7 +136,8 @@ class SpreadTable:
 
 
 def cosmetic_forme_aliases(dex: Mapping[str, Any]) -> dict[str, str]:
-    """Map purely cosmetic formes onto the base species whose priors they can share.
+    """
+    Map purely cosmetic formes onto the base species whose priors they can share.
 
     Usage exports report cosmetic formes under the base name, so without this a
     Florges-Blue sheet would miss the Florges bucket entirely. A forme qualifies only
@@ -146,7 +151,8 @@ def cosmetic_forme_aliases(dex: Mapping[str, Any]) -> dict[str, str]:
     }
 
     def canonical_id(entry: Mapping[str, Any]) -> str:
-        """Resolve one entry to the species whose priors it may share.
+        """
+        Resolve one entry to the species whose priors it may share.
 
         Anchored on baseSpecies rather than on whichever entry happens to list the
         forme: Alcremie's variants each list all the others, so listing order would
@@ -222,7 +228,8 @@ class SourceBuckets(NamedTuple):
 
 
 def _normalized_buckets(document: Mapping[str, Any]) -> SourceBuckets:
-    """Group one chaos export into (species, nature) buckets that each sum to 1.
+    """
+    Group one chaos export into (species, nature) buckets that each sum to 1.
 
     Also records how much of each species' total spread mass its nature accounts
     for, which is what the rare-nature prune is applied against.
@@ -269,7 +276,8 @@ def build_spread_table(
     max_spreads: int = MAX_SPREADS_PER_BUCKET,
     min_nature_share: float = MIN_NATURE_SHARE,
 ) -> dict[str, Any]:
-    """Blend two chaos exports into the serializable spread-prior artifact.
+    """
+    Blend two chaos exports into the serializable spread-prior artifact.
 
     Each (species, nature) bucket present in both exports is mixed
     BO3_BLEND_WEIGHT toward Bo3; a bucket present in only one export is taken from
@@ -427,7 +435,8 @@ def _load_bucket(rows: Any, species_id: str, nature: str) -> tuple[SpreadPrior, 
 
 @lru_cache(maxsize=2)
 def load_spread_table_file(path: Path = DEFAULT_SPREAD_TABLE_PATH) -> SpreadTable:
-    """Load and cache a spread table from disk.
+    """
+    Load and cache a spread table from disk.
 
     Cached because every observation build consults the table, and re-parsing a
     multi-megabyte artifact per battle would dominate the build cost.

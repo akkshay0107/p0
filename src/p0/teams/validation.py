@@ -116,7 +116,8 @@ def validate_many_batched(
     repository_root: Path = DEFAULT_PATHS.repository_root,
     format_id: str = FORMAT.battle_format,
 ) -> tuple[AdmissionResult, ...]:
-    """Validate multiple team variants using batched Node invocations.
+    """
+    Validate multiple team variants using batched Node invocations.
 
     Arguments:
       variants: Sequence of team variants to validate against Champions rules.
@@ -207,7 +208,8 @@ def validate_many(
 
 
 class PersistentShowdownValidator:
-    """Persistent Node subprocess context manager for continuous validation.
+    """
+    Persistent Node subprocess context manager for continuous validation.
 
     Spawns a long-lived Node worker over stdio to validate large streams of
     teams without per-batch startup overhead.
@@ -329,7 +331,8 @@ class PersistentShowdownValidator:
         *,
         batch_size: int = 256,
     ) -> tuple[AdmissionResult, ...]:
-        """Validate variants through the active persistent worker.
+        """
+        Validate variants through the active persistent worker.
 
         Arguments:
           variants: Sequence of team variants to validate.
