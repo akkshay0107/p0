@@ -23,7 +23,6 @@ from p0.teams.factory import build_team_source
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
 from p0.training.config import GlobalConfig
 from p0.training.magnet import Magnet
-from p0.training.ppo import PPOUpdater
 from p0.training.rollout import RolloutCollector
 from p0.training.trainer import PPOTrainer
 from p0.training.utils import (
@@ -34,6 +33,8 @@ from p0.training.utils import (
     select_optimization_precision,
 )
 from p0.training.vector_env import ThreadVecEnv
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _tensorboard_sink(writer: SummaryWriter):
@@ -65,7 +66,7 @@ def _close_environments(envs: list[SimEnv]) -> None:
         # Environment and client shutdown cross async/thread boundaries; cleanup
         # must continue for the remaining environments after any one failure.
         except Exception:
-            logging.exception("Failed to close a simulation environment cleanly")
+            LOGGER.exception("Failed to close a simulation environment cleanly")
 
 
 def _close_vector_env(vector_env: ThreadVecEnv) -> None:
@@ -198,20 +199,13 @@ def run_training(
             )
             if isinstance(resume_collector_state, Mapping):
                 collector.restore_training_state(resume_collector_state)
-            updater = PPOUpdater(
-                policy,
-                optimizer,
-                scaler,
-                training,
-                magnet,
-                cancel_requested=cancel_requested,
-            )
             trainer = PPOTrainer(
                 policy=policy,
                 policy_store=policy_store,
                 checkpoint_path=paths.checkpoint_path,
                 collector=collector,
-                updater=updater,
+                optimizer=optimizer,
+                scaler=scaler,
                 magnet=magnet,
                 scheduler=scheduler,
                 training_config=training,

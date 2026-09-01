@@ -9,7 +9,7 @@ from hypothesis import strategies as st
 
 from p0.model.structured_observation import StructuredObservation
 from p0.training.trajectory import (
-    TrajectoryBatch,
+    CollectedTrajectory,
     compute_gae_batch,
     prepare_trajectory_batches,
 )
@@ -151,7 +151,7 @@ def test_prepared_training_batches_keep_returns_and_normalize_active_steps(
     """Check global advantage normalization while preserving trajectory-local returns."""
     rewards, values, dones, bootstraps = case
     trajectories = [
-        TrajectoryBatch(
+        CollectedTrajectory(
             observations=StructuredObservation.empty_batch(reward.numel()),
             action_masks=torch.ones((reward.numel(), 2, 49), dtype=torch.bool),
             actions=torch.zeros((reward.numel(), 2), dtype=torch.long),
@@ -161,6 +161,7 @@ def test_prepared_training_batches_keep_returns_and_normalize_active_steps(
             dones=done,
             length=reward.numel(),
             bootstrap_value=float(bootstrap),
+            series_history=(),
         )
         for reward, value, done, bootstrap in zip(rewards, values, dones, bootstraps, strict=True)
     ]
@@ -191,12 +192,9 @@ def test_prepared_training_batches_keep_returns_and_normalize_active_steps(
         gamma=gamma,
         gae_lambda=gae_lambda,
     )
-    actual_advantages = torch.cat(
-        [batch.advantages for batch in prepared if batch.advantages is not None]
-    )
+    actual_advantages = torch.cat([batch.advantages for batch in prepared])
     torch.testing.assert_close(actual_advantages, (raw_flat - mean) / std)
     for batch, raw_advantage, value in zip(prepared, raw_advantages, values, strict=True):
-        assert batch.returns is not None
         torch.testing.assert_close(batch.returns, raw_advantage + value)
         assert batch.length == len(batch.rewards)
     assert sum(batch.length for batch in prepared) == sum(

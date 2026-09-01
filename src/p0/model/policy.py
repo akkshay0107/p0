@@ -126,8 +126,7 @@ class MemoryInputs:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class PreparedDecision:
+class PreparedDecision(NamedTuple):
     """Encoded observation and memory-aware readout for one policy decision."""
 
     encoded: EncodedObs
@@ -506,20 +505,21 @@ class ActorPolicy(nn.Module):
         ) + F.log_softmax(logits[:, 1], dim=-1).gather(1, a2.unsqueeze(1)).squeeze(1)
         return actions, log_probs, z, reduced.local_history_token
 
-    def score_reduced(
+    def forward(
         self,
-        reduced: ReducerOutput,
-        enc: EncodedObs,
+        z: Tensor,
+        pokemon: Tensor,
+        aux: Tensor,
+        numerical: Tensor,
+        phase: Tensor,
         action_mask: Tensor,
         actions: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Score actions from a reducer output that was already computed."""
-        _require_matching_batch(reduced, enc)
-        z = reduced.cls
-        k_entity_extended = self._compute_keys(reduced.pokemon)
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Evaluate actions through a deterministic tensor-only PPO kernel."""
+        k_entity_extended = self._compute_keys(pokemon)
 
         logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
+            z, k_entity_extended, aux[:, 0], numerical, phase, head_idx=0
         )
         a1 = actions[:, 0]
 
@@ -529,20 +529,23 @@ class ActorPolicy(nn.Module):
         logits2, _ = self._compute_pointer_logits(
             z,
             k_entity_extended,
-            enc.aux[:, 1],
-            enc.numerical,
-            enc.phase,
+            aux[:, 1],
+            numerical,
+            phase,
             head_idx=1,
             ctx_a1=ctx_a1,
         )
 
-        logits = torch.stack([logits1, logits2], dim=1)
-        logits = self._apply_sequential_masks(logits, a1, action_mask, enc.phase)
-
+        logits = self._apply_sequential_masks(
+            torch.stack([logits1, logits2], dim=1),
+            a1,
+            action_mask,
+            phase,
+        )
         dist1 = Categorical(logits=logits[:, 0])
         dist2 = Categorical(logits=logits[:, 1])
         log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
-        return logits, log_probs, z, reduced.local_history_token
+        return logits, log_probs, z
 
     def _validated_offsets(
         self,
@@ -783,10 +786,6 @@ class PolicyNet(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def encode_series(self, histories) -> tuple[Tensor, Tensor]:
-        """Encode completed game turn histories into series tokens and mask."""
-        return self.series(histories)
-
     def encode(
         self,
         obs: StructuredObservation,
@@ -851,9 +850,12 @@ class PolicyNet(nn.Module):
         actions: Tensor,
     ) -> EvalOutput:
         """Evaluate actions from an already-prepared decision."""
-        logits, log_probs, z, local_history = self.actor.score_reduced(
-            prepared.reduced,
-            prepared.encoded,
+        logits, log_probs, z = self.actor(
+            prepared.reduced.cls,
+            prepared.reduced.pokemon,
+            prepared.encoded.aux,
+            prepared.encoded.numerical,
+            prepared.encoded.phase,
             action_mask,
             actions,
         )
@@ -873,7 +875,14 @@ class PolicyNet(nn.Module):
             torch.zeros_like(entropy),
         )
 
-        return EvalOutput(log_probs, entropy, norm_entropy, value, local_history, logits)
+        return EvalOutput(
+            log_probs,
+            entropy,
+            norm_entropy,
+            value,
+            prepared.reduced.local_history_token,
+            logits,
+        )
 
     def score_candidates(
         self,

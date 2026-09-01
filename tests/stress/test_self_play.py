@@ -24,8 +24,8 @@ def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
     for index in range(repetitions):
         buffer.append(torch.tensor([0, 1]), torch.full((2, 3), float(index)))
 
-    history, mask, ages = buffer.inputs(torch.tensor([0, 1]), torch.device("cpu"), torch.float32)
-    assert history.shape[0] == mask.shape[0] == ages.shape[0] == 2
+    history, mask = buffer.inputs(torch.tensor([0, 1]), torch.device("cpu"), torch.float32)
+    assert history.shape[0] == mask.shape[0] == 2
     assert mask[0].sum().item() == mask[1].sum().item()
     assert torch.equal(history[0], history[1])
     # The history slice must correspond strictly to the most recent HISTORY_WINDOW turns
@@ -40,10 +40,7 @@ def test_battle_memory_window_is_bounded_and_reset_is_local() -> None:
 
     # Reset environment 0 and verify environment 1 is unaffected
     buffer.reset(0)
-    empty_history, empty_mask, empty_ages = buffer.inputs(
-        torch.tensor([0]), torch.device("cpu"), torch.float32
-    )
+    empty_history, empty_mask = buffer.inputs(torch.tensor([0]), torch.device("cpu"), torch.float32)
     assert not empty_mask.any()
     assert not empty_history.any()
-    assert not empty_ages.any()
     assert mask[1].any()

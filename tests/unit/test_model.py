@@ -271,8 +271,8 @@ def test_encoded_phase_is_an_immutable_snapshot(policy_net: PolicyNet) -> None:
         setattr(encoded, "phase", torch.ones_like(encoded.phase))
 
 
-def test_reducer_detaches_history_but_keeps_current_summary_trainable() -> None:
-    """Verify MemoryReducer truncates historical token gradients while allowing backpropagation through current tokens."""
+def test_reducer_keeps_current_and_history_summaries_trainable() -> None:
+    """Verify differentiable training reconstruction reaches current and history tokens."""
     reducer = MemoryReducer(32, 4, 1, 64)
     current = torch.randn(2, CURRENT_TOKEN_COUNT, 32, requires_grad=True)
     local_summary = reducer.local_summary(current)
@@ -291,9 +291,9 @@ def test_reducer_detaches_history_but_keeps_current_summary_trainable() -> None:
     )
     output.cls.square().mean().backward()
 
-    # Gradients flow back to current turn tokens but stop at detached history tokens
-    assert current.grad is not None
-    assert history.grad is None
+    assert current.grad is not None and torch.isfinite(current.grad).all()
+    assert history.grad is not None and torch.isfinite(history.grad).all()
+    assert torch.count_nonzero(history.grad) > 0
 
 
 def test_policy_inputs_reject_unbatched_missing_mask_and_invalid_top_p(
@@ -971,6 +971,55 @@ def test_policy_exposes_fixed_current_tokens_and_immutable_history_token(policy:
     assert output.history_token.shape == (2, policy.d_model)
 
 
+@pytest.mark.parametrize("history_length", (1, HISTORY_WINDOW))
+def test_policy_training_path_backpropagates_into_earlier_same_game_summary(
+    history_length: int,
+) -> None:
+    """Verify a later public policy decision trains the encoder for a prior history row."""
+    torch.manual_seed(3)
+    policy = build_policy(
+        ModelConfig(d_model=32, nhead=4, reducer_layers=1, dim_feedforward=64),
+        default_runtime_resources(),
+    )
+    observations = StructuredObservation.empty_batch(2)
+    action_mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool)
+    encoded = policy.encode(observations, action_mask)
+    earlier_summary = encoded.local_history_token[0:1]
+    earlier_summary.retain_grad()
+    history_padding = torch.zeros((1, HISTORY_WINDOW - history_length, policy.d_model))
+    history_suffix = torch.zeros((1, history_length - 1, policy.d_model))
+    memory = MemoryInputs(
+        series_tokens=torch.zeros((1, SERIES_SLOTS, policy.d_model)),
+        series_mask=torch.zeros((1, SERIES_SLOTS), dtype=torch.bool),
+        history_tokens=torch.cat(
+            (
+                history_padding,
+                earlier_summary.unsqueeze(1),
+                history_suffix,
+            ),
+            dim=1,
+        ),
+        history_mask=torch.cat(
+            (
+                torch.zeros((1, HISTORY_WINDOW - history_length), dtype=torch.bool),
+                torch.ones((1, history_length), dtype=torch.bool),
+            ),
+            dim=1,
+        ),
+    )
+
+    output = policy.evaluate(
+        policy.prepare(encoded[1:2], memory),
+        action_mask[1:2],
+        torch.zeros((1, 2), dtype=torch.long),
+    )
+    output.log_probs.sum().backward()
+
+    assert earlier_summary.grad is not None
+    assert torch.isfinite(earlier_summary.grad).all()
+    assert torch.count_nonzero(earlier_summary.grad) > 0
+
+
 D_MODEL = 32
 
 
@@ -985,19 +1034,20 @@ def _resampler() -> DynamicSeriesResampler:
     )
 
 
-def test_resample_single_game_shape() -> None:
-    """Verify resample_single_game compresses variable turn histories into SERIES_TOKENS_PER_GAME summary tokens."""
+def test_series_resampler_shape() -> None:
+    """Verify the masked series kernel compresses histories into summary tokens."""
     resampler = _resampler()
     batch_size = 2
     turns = 15
     history = torch.randn(batch_size, turns, D_MODEL)
-    output = resampler.resample_single_game(history)
+    history_mask = torch.ones(batch_size, turns, dtype=torch.bool)
+    output = resampler(history, history_mask)
     assert output.shape == (batch_size, SERIES_TOKENS_PER_GAME, D_MODEL)
     assert torch.isfinite(output).all()
 
 
 def test_padded_resampling_matches_independent_game_histories() -> None:
-    """Verify batched resample_single_game with padding masks matches independent single-game resampling passes."""
+    """Verify vectorized masked resampling matches independent game resampling."""
     resampler = _resampler()
     short = torch.randn(5, D_MODEL)
     long = torch.randn(9, D_MODEL)
@@ -1006,47 +1056,42 @@ def test_padded_resampling_matches_independent_game_histories() -> None:
     padded[1] = long
     mask = torch.arange(9).unsqueeze(0) < torch.tensor((5, 9)).unsqueeze(1)
 
-    actual = resampler.resample_single_game(padded, mask)
+    actual = resampler(padded, mask)
     expected = torch.cat(
         (
-            resampler.resample_single_game(short.unsqueeze(0)),
-            resampler.resample_single_game(long.unsqueeze(0)),
+            resampler(short.unsqueeze(0), torch.ones((1, 5), dtype=torch.bool)),
+            resampler(long.unsqueeze(0), torch.ones((1, 9), dtype=torch.bool)),
         )
     )
 
     torch.testing.assert_close(actual, expected)
 
 
-def test_resample_empty_game() -> None:
-    """Verify resample_single_game on 0-length game history returns learned empty_game_context tokens."""
+def test_series_resampler_rejects_empty_game() -> None:
+    """Verify empty games are handled outside the tensor-only neural kernel."""
     resampler = _resampler()
-    batch_size = 2
-    empty_history = torch.zeros(batch_size, 0, D_MODEL)
-    output = resampler.resample_single_game(empty_history)
-    assert output.shape == (batch_size, SERIES_TOKENS_PER_GAME, D_MODEL)
-    assert torch.equal(output[0], resampler.empty_game_context[0])
+    empty_history = torch.zeros(2, 1, D_MODEL)
+    empty_mask = torch.zeros(2, 1, dtype=torch.bool)
+    with pytest.raises(ValueError, match="at least one"):
+        resampler(empty_history, empty_mask)
 
 
-def test_series_context_encoding_shapes() -> None:
-    """Verify DynamicSeriesResampler handles 1 or 2 historical games and produces active attention masks."""
+def test_series_resampler_handles_mixed_lengths() -> None:
+    """Verify the vectorized kernel handles mixed game lengths and padding masks."""
     resampler = _resampler()
-    batch_size = 2
-    game1 = torch.randn(batch_size, 10, D_MODEL)
-    game2 = torch.randn(batch_size, 20, D_MODEL)
+    history = torch.zeros(2, 20, D_MODEL)
+    history[0, :10] = torch.randn(10, D_MODEL)
+    history[1] = torch.randn(20, D_MODEL)
+    history_mask = torch.arange(20).unsqueeze(0) < torch.tensor((10, 20)).unsqueeze(1)
 
-    series_tokens, series_mask = resampler([game1, game2])
-    assert series_tokens.shape == (batch_size, SERIES_SLOTS, D_MODEL)
-    assert series_mask.shape == (batch_size, SERIES_SLOTS)
-    assert series_mask.all()
+    output = resampler(history, history_mask)
 
-    series_tokens_1, series_mask_1 = resampler([game1])
-    assert series_tokens_1.shape == (batch_size, SERIES_SLOTS, D_MODEL)
-    assert series_mask_1[:, :4].all()
-    assert not series_mask_1[:, 4:].any()
+    assert output.shape == (2, SERIES_TOKENS_PER_GAME, D_MODEL)
+    assert torch.isfinite(output).all()
 
 
 def test_policy_series_resampler() -> None:
-    """Verify PolicyNet encode_series projects historical game tensors into series slot dimensions."""
+    """Verify PolicyNet's series module emits the per-game token contract."""
     torch.manual_seed(0)
     config = ModelConfig(
         d_model=64,
@@ -1055,10 +1100,59 @@ def test_policy_series_resampler() -> None:
         dim_feedforward=128,
     )
     policy = build_policy(config, default_runtime_resources())
-    game1 = torch.randn(1, 12, policy.d_model)
-    tokens, mask = policy.encode_series([game1])
-    assert tokens.shape == (1, SERIES_SLOTS, policy.d_model)
-    assert mask.shape == (1, SERIES_SLOTS)
+    history = torch.randn(1, 12, policy.d_model)
+    history_mask = torch.ones(1, 12, dtype=torch.bool)
+    tokens = policy.series(history, history_mask)
+    assert tokens.shape == (1, SERIES_TOKENS_PER_GAME, policy.d_model)
+
+
+@pytest.mark.parametrize("prior_games", (1, 2))
+def test_policy_series_path_trains_every_used_resampler_group(prior_games: int) -> None:
+    """Verify one and two prior games reach every live series-resampler parameter group."""
+    torch.manual_seed(9)
+    policy = build_policy(
+        ModelConfig(d_model=32, nhead=4, reducer_layers=1, dim_feedforward=64),
+        default_runtime_resources(),
+    )
+    observations = StructuredObservation.empty_batch(2)
+    action_mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool)
+    encoded = policy.encode(observations, action_mask)
+    histories = torch.randn(prior_games, 7, policy.d_model)
+    history_mask = torch.ones((prior_games, 7), dtype=torch.bool)
+    series_tokens = policy.series(histories, history_mask).flatten(0, 1)
+    series_tokens = torch.cat(
+        (
+            series_tokens,
+            torch.zeros(
+                (SERIES_SLOTS - series_tokens.size(0), policy.d_model),
+                dtype=series_tokens.dtype,
+            ),
+        ),
+        dim=0,
+    ).unsqueeze(0)
+    series_tokens = series_tokens.expand(2, -1, -1)
+    series_mask = torch.zeros((2, SERIES_SLOTS), dtype=torch.bool)
+    series_mask[:, : prior_games * SERIES_TOKENS_PER_GAME] = True
+    memory = MemoryInputs(
+        series_tokens=series_tokens,
+        series_mask=series_mask,
+        history_tokens=torch.zeros((2, HISTORY_WINDOW, policy.d_model)),
+        history_mask=torch.zeros((2, HISTORY_WINDOW), dtype=torch.bool),
+    )
+
+    output = policy.evaluate(
+        policy.prepare(encoded, memory),
+        action_mask,
+        torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+    )
+    output.log_probs.sum().backward()
+
+    assert all(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad) > 0
+        for parameter in policy.series.parameters()
+    )
 
 
 def test_compile_policy_device_guard() -> None:

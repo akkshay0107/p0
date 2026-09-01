@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import random
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,11 @@ from p0.training._bc_batch import (
     BCGameWindow,
     collate_bc_batches,
 )
-from p0.training._bc_history import _BCHistoryUpdate, _BCSeriesHistory
+from p0.training._bc_history import (
+    _BCHistoryUpdate,
+    commit_history_updates,
+    prepare_series_context,
+)
 from p0.training._bc_metrics import (
     BCEvaluationMetrics,
     BCObjective,
@@ -37,7 +40,10 @@ from p0.training._bc_metrics import (
 )
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
 from p0.training.config import BCConfig
+from p0.training.series_history import SeriesHistoryStore
 from p0.training.utils import select_optimization_precision
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _expand_team_preview_orbits(
@@ -80,18 +86,6 @@ def _expand_team_preview_orbits(
 
 class BCCancelled(RuntimeError):
     """Raised between batches so callers keep the last completed epoch checkpoint."""
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedBCBatch:
-    """One collated batch resolved into the tensors the policy consumes."""
-
-    prepared: PreparedDecision
-    memory: MemoryInputs
-    action_mask: Tensor
-    candidate_values: Tensor
-    candidate_offsets: Tensor
-    history_updates: tuple[_BCHistoryUpdate, ...]
 
 
 def _empty_training_totals() -> dict[str, Any]:
@@ -143,7 +137,7 @@ class BCTrainer:
         self.checkpoint_store = checkpoint_store
         self.provenance = dict(provenance or {})
         self.batch_decisions = config.batch_decisions
-        self._series_history = _BCSeriesHistory(policy.d_model)
+        self._series_history = SeriesHistoryStore(policy.d_model)
         self.cancel_requested = cancel_requested
 
     def train(self) -> dict[str, float | int]:
@@ -267,7 +261,9 @@ class BCTrainer:
             raise ValueError("BC checkpoint selection_state must be a mapping")
         return state
 
-    def _prepare_model_inputs(self, batch: BCDecisionBatch) -> _PreparedBCBatch:
+    def _prepare_model_inputs(
+        self, batch: BCDecisionBatch
+    ) -> tuple[PreparedDecision, Tensor, Tensor, Tensor, tuple[_BCHistoryUpdate, ...]]:
         observations = batch.observations.to(self.device)
         context_action_mask = batch.context_action_mask.to(self.device)
         encoded = self.policy.encode(observations, context_action_mask)
@@ -288,42 +284,44 @@ class BCTrainer:
             candidate_offsets,
             target_encoded.phase,
         )
-        series_context = self._series_history.prepare(
+        series_tokens, series_mask, history_updates = prepare_series_context(
+            self._series_history,
             batch.windows,
             target_local_tokens,
-            self.policy.series.resample_single_game,
+            self.policy.series,
         )
         memory = MemoryInputs(
-            series_tokens=series_context.tokens,
-            series_mask=series_context.mask,
+            series_tokens=series_tokens,
+            series_mask=series_mask,
             history_tokens=history_tokens,
             history_mask=history_mask,
         )
-        return _PreparedBCBatch(
-            prepared=self.policy.prepare(target_encoded, memory),
-            memory=memory,
-            action_mask=batch.action_mask.to(self.device),
-            candidate_values=candidate_values,
-            candidate_offsets=candidate_offsets,
-            history_updates=series_context.updates,
+        return (
+            self.policy.prepare(target_encoded, memory),
+            batch.action_mask.to(self.device),
+            candidate_values,
+            candidate_offsets,
+            history_updates,
         )
 
     def _forward_batch(
         self,
         batch: BCDecisionBatch,
     ) -> tuple[Tensor, Tensor, tuple[_BCHistoryUpdate, ...], Tensor]:
-        prepared = self._prepare_model_inputs(batch)
+        prepared, action_mask, candidate_values, candidate_offsets, history_updates = (
+            self._prepare_model_inputs(batch)
+        )
         return (
             self.policy.score_candidates(
-                prepared.prepared,
-                prepared.action_mask,
-                prepared.candidate_values,
-                prepared.candidate_offsets,
+                prepared,
+                action_mask,
+                candidate_values,
+                candidate_offsets,
                 validated=True,
             ),
-            self.policy.critic(prepared.prepared.reduced.cls),
-            prepared.history_updates,
-            prepared.candidate_offsets,
+            self.policy.critic(prepared.reduced.cls),
+            history_updates,
+            candidate_offsets,
         )
 
     def _step_optimizer(self, loss_weight: float) -> tuple[bool, float]:
@@ -339,7 +337,7 @@ class BCTrainer:
         )
         previous_scale = self.scaler.get_scale()
         if not bool(torch.isfinite(grad_norm).item()):
-            logging.warning(
+            LOGGER.warning(
                 "Non-finite BC gradient norm detected; discarding the accumulated update "
                 f"(loss scale={previous_scale:.0f})"
             )
@@ -438,7 +436,7 @@ class BCTrainer:
         if objective.labeled_count or value_count:
             self.scaler.scale(total_loss).backward()
 
-        self._series_history.apply(history_updates)
+        commit_history_updates(self._series_history, history_updates)
         # Keep the reported policy NLL independent from the auxiliary value loss;
         # the optimizer still receives their weighted sum above.
         totals["loss"] += policy_sum.detach()
@@ -466,21 +464,25 @@ class BCTrainer:
                 batch.label_kind,
                 batch.loss_mask,
             )
-            prepared = self._prepare_model_inputs(batch)
-            encoded = prepared.prepared.encoded
-            reduced = prepared.prepared.reduced
-            action_mask = prepared.action_mask
-            candidate_offsets = prepared.candidate_offsets
-            candidate_log_probs = self.policy.score_candidates(
-                prepared.prepared,
+            (
+                prepared,
                 action_mask,
-                prepared.candidate_values,
+                candidate_values,
+                candidate_offsets,
+                history_updates,
+            ) = self._prepare_model_inputs(batch)
+            encoded = prepared.encoded
+            reduced = prepared.reduced
+            candidate_log_probs = self.policy.score_candidates(
+                prepared,
+                action_mask,
+                candidate_values,
                 candidate_offsets,
                 validated=True,
             )
             value_predictions = self.policy.critic(reduced.cls)
             accumulator.add_legality(
-                self.policy.unmasked_first_slot_logits(prepared.prepared),
+                self.policy.unmasked_first_slot_logits(prepared),
                 action_mask,
                 encoded.numerical,
             )
@@ -499,7 +501,7 @@ class BCTrainer:
                 marginal_nll,
                 torch.zeros_like(marginal_nll),
             )
-            greedy = self.policy.act(prepared.prepared, action_mask, deterministic=True)
+            greedy = self.policy.act(prepared, action_mask, deterministic=True)
             predicted, best_scores = greedy.actions, greedy.log_probs
             accumulator.add(
                 exact_actions=batch.exact_action.to(self.device),
@@ -510,7 +512,7 @@ class BCTrainer:
                 best_scores=best_scores,
             )
             accumulator.add_value(value_predictions, value_targets, value_mask)
-            self._series_history.apply(prepared.history_updates)
+            commit_history_updates(self._series_history, history_updates)
 
         self._series_history.clear()
         return accumulator.finalize()

@@ -137,10 +137,6 @@ class MemoryReducer(nn.Module):
             history_tokens,
             history_mask,
         )
-        # Historical summaries are immutable observations for the current
-        # decision. Detaching here prevents later losses from traversing back
-        # through earlier observations while keeping the current summary live.
-        history_tokens = history_tokens.detach()
         device = current_tokens.device
         batch = current_tokens.size(0)
         if (

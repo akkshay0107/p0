@@ -18,7 +18,7 @@ class SeriesTokenStore:
     Manages the lifecycle of continuous series tokens for Bo3 matches.
 
     Acts as a pure state manager without neural network dependencies. Tokens
-    should be computed by the caller (e.g. via PolicyNet.encode_series) and
+    should be computed by the caller via the policy's series module and
     committed here.
     """
 

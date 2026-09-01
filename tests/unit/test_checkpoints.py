@@ -12,6 +12,7 @@ from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.training.checkpoint import CHECKPOINT_SCHEMA, DEFAULT_POLICY_STORE, CheckpointStore
 from p0.training.magnet import Magnet
+from p0.training.series_history import SeriesHistoryStore
 
 
 def _small_policy() -> PolicyNet:
@@ -76,12 +77,12 @@ def test_series_policy_checkpoint_round_trip(tmp_path: Path) -> None:
     restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
     assert restored.config == config
 
-    histories = [torch.randn(1, 10, config.d_model)]
+    histories = torch.randn(1, 10, config.d_model)
+    history_mask = torch.ones(1, 10, dtype=torch.bool)
     with torch.no_grad():
-        rest_t, rest_m = restored.encode_series(histories)
-        orig_t, orig_m = original.encode_series(histories)
+        rest_t = restored.series(histories, history_mask)
+        orig_t = original.series(histories, history_mask)
         assert torch.equal(rest_t, orig_t)
-        assert torch.equal(rest_m, orig_m)
 
 
 def test_deep_checkpoint_round_trip_is_deterministic(tmp_path: Path) -> None:
@@ -201,6 +202,53 @@ def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance
         torch.testing.assert_close(parameter, policy.state_dict()[name])
     for name, parameter in restored_magnet.state_dict().items():
         torch.testing.assert_close(parameter, magnet.state_dict()[name])
+
+
+def test_training_checkpoint_round_trip_restores_collector_history_metadata(
+    tmp_path: Path,
+) -> None:
+    """Verify detached active history survives the checkpoint metadata envelope."""
+    path = tmp_path / "collector-training.pt"
+    policy = _small_policy()
+    history = SeriesHistoryStore(policy.d_model)
+    history.append(
+        "series",
+        1,
+        torch.ones((3, policy.d_model), requires_grad=True),
+        is_game_end=False,
+        is_series_end=False,
+    )
+    collector_state = {
+        "series_store1": {},
+        "series_store2": {},
+        "series_history1": history.training_state(),
+        "series_history2": {},
+    }
+    store = CheckpointStore()
+    store.save_training_state(
+        path,
+        4,
+        policy,
+        metadata={"collector_state": collector_state},
+        trainer_kind="ppo",
+    )
+
+    metadata = store.load_metadata(path)
+    raw_collector_state = metadata["collector_state"]
+    assert isinstance(raw_collector_state, dict)
+    restored = SeriesHistoryStore(policy.d_model)
+    raw_history = raw_collector_state["series_history1"]
+    assert isinstance(raw_history, dict)
+    restored.restore_training_state(raw_history)
+    assert restored.has_partial_games
+    restored_state = restored.training_state()["series"]
+    active_fragments = restored_state["active_fragments"]
+    assert isinstance(active_fragments, tuple)
+    assert isinstance(active_fragments[0], torch.Tensor)
+    torch.testing.assert_close(
+        active_fragments[0],
+        torch.ones((3, policy.d_model)),
+    )
 
 
 def test_checkpoint_rejects_global_contract_tampering(tmp_path: Path) -> None:

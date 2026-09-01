@@ -76,9 +76,14 @@ def test_two_simulated_bo3_series_run_concurrently(showdown_server, model_policy
         collector_state = collector.training_state()
         store1 = collector_state["series_store1"]
         store2 = collector_state["series_store2"]
+        history1 = collector_state["series_history1"]
+        history2 = collector_state["series_history2"]
         assert isinstance(store1, dict) and isinstance(store2, dict)
+        assert isinstance(history1, dict) and isinstance(history2, dict)
         assert not completed_series_ids.intersection(store1)
         assert not completed_series_ids.intersection(store2)
+        assert not completed_series_ids.intersection(history1)
+        assert not completed_series_ids.intersection(history2)
     finally:
         if vector_env is not None:
             vector_env.shutdown()

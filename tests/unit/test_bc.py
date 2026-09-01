@@ -271,6 +271,43 @@ def test_bc_trainer_updates_policy_in_game_local_chunks() -> None:
     )
 
 
+def test_bc_trainer_resamples_prior_game_history_with_live_gradients() -> None:
+    """Verify BC trains the series resampler from a detached prior-game snapshot."""
+    first = _chunk(
+        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
+        [(7, 8), (7, 8)],
+        [0, 1, 2],
+    )
+    second = _chunk(
+        [int(LabelKind.EXACT), int(LabelKind.EXACT)],
+        [(7, 8), (7, 8)],
+        [0, 1, 2],
+        game_number=2,
+        is_series_end=True,
+    )
+    policy = build_policy(
+        ModelConfig(64, 4, 1, 128),
+        default_runtime_resources(),
+    )
+    trainer = BCTrainer(
+        policy,
+        (first, second),
+        BCConfig(batch_decisions=2, learning_rate=1e-3, enable_optim=False),
+        device="cpu",
+    )
+    before = {
+        name: parameter.detach().clone() for name, parameter in policy.series.named_parameters()
+    }
+
+    metrics = trainer.train()
+
+    assert metrics["games"] == 2
+    assert any(
+        not torch.equal(before[name], parameter)
+        for name, parameter in policy.series.named_parameters()
+    )
+
+
 def test_unknown_decision_is_excluded_without_breaking_game_context() -> None:
     """Verify UNKNOWN decisions are excluded from labeled metrics while preserving full observation history for subsequent turns."""
     chunk = _chunk(

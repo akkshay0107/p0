@@ -11,8 +11,10 @@ from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
 from p0.training.config import TrainingConfig
+from p0.training.series_history import SeriesHistoryStore
 from p0.training.trajectory import (
-    TrajectoryBatch,
+    CollectedTrajectory,
+    PreparedTrajectory,
     TrajectoryStorage,
     prepare_trajectory_batches,
 )
@@ -21,11 +23,11 @@ from p0.training.vector_env import ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
 MAX_TRAJECTORY_STEPS = 200
+SERIES_HISTORY_FLUSH_STEPS = 48
 
 __all__ = [
     "BattleMemoryBuffer",
     "RolloutCollector",
-    "collect_rollouts",
 ]
 
 
@@ -121,223 +123,6 @@ class BattleMemoryBuffer:
         return self.tokens[env_id, :length].unsqueeze(0)
 
 
-@torch.inference_mode()
-def collect_rollouts(
-    vec_env: ThreadVecEnv,
-    policy: PolicyNet,
-    completed_trajectories: list[TrajectoryBatch],
-    config: TrainingConfig,
-    trajectories1: TrajectoryStorage,
-    trajectories2: TrajectoryStorage,
-    memory1: BattleMemoryBuffer,
-    memory2: BattleMemoryBuffer,
-    series_store1: SeriesTokenStore,
-    series_store2: SeriesTokenStore,
-) -> None:
-    """
-    Collect one all-self-play rollout using explicit fixed-window memory.
-
-    Arguments:
-        vec_env: Batched self-play environments.
-        policy: Policy used for both player seats.
-        completed_trajectories: Destination for completed trajectories.
-        config: Rollout length and device optimization settings.
-        trajectories1: Active trajectory storage for the first seat.
-        trajectories2: Active trajectory storage for the second seat.
-        memory1: Per-battle history for the first seat.
-        memory2: Per-battle history for the second seat.
-        series_store1: Persistent cross-episode tokens for the first seat.
-        series_store2: Persistent cross-episode tokens for the second seat.
-
-    Returns:
-        None.
-    """
-    n_envs = vec_env.n_envs
-    device = policy.device
-    idx_all = torch.arange(n_envs)
-    masks1 = vec_env.last_masks1
-    masks2 = vec_env.last_masks2
-
-    for _ in range(config.rollout_steps):
-        obs1_gpu = vec_env.get_batched_obs1(device)
-        mask1_gpu = torch.from_numpy(masks1).to(device, non_blocking=True)
-        obs2_gpu = vec_env.get_batched_obs2(device)
-        mask2_gpu = torch.from_numpy(masks2).to(device, non_blocking=True)
-
-        current_obs = StructuredObservation.cat([obs1_gpu, obs2_gpu])
-        current_mask = torch.cat([mask1_gpu, mask2_gpu])
-
-        infos = vec_env.last_infos
-        assert infos is not None
-
-        # Positional results must describe the corresponding environment.
-        if len(infos) != n_envs:
-            raise ValueError(f"Expected {n_envs} environment infos, got {len(infos)}")
-        series_ids = [str(info["series_id"]) for info in infos]
-        series_tokens1, series_mask1 = series_store1.get_tokens(series_ids, device)
-        series_tokens2, series_mask2 = series_store2.get_tokens(series_ids, device)
-        current_series_tokens = torch.cat([series_tokens1, series_tokens2], dim=0)
-        current_series_mask = torch.cat([series_mask1, series_mask2], dim=0)
-
-        memory1_inputs = memory1.inputs(idx_all, device, torch.float32)
-        memory2_inputs = memory2.inputs(idx_all, device, torch.float32)
-        current_memory = MemoryInputs(
-            series_tokens=current_series_tokens,
-            series_mask=current_series_mask,
-            history_tokens=torch.cat([memory1_inputs[0], memory2_inputs[0]], dim=0),
-            history_mask=torch.cat([memory1_inputs[1], memory2_inputs[1]], dim=0),
-        )
-
-        precision = select_optimization_precision(config.enable_optim, device)
-        with torch.amp.autocast(
-            device_type=device.type,
-            enabled=precision.autocast,
-            dtype=precision.dtype,
-        ):
-            current_out = policy.act(
-                policy.prepare(policy.encode(current_obs, current_mask), current_memory),
-                current_mask,
-            )
-
-        memory1.append(idx_all, current_out.history_token[:n_envs])
-        memory2.append(idx_all, current_out.history_token[n_envs:])
-
-        actions_cpu = current_out.actions.to(device="cpu", dtype=torch.long)
-        log_probs_cpu = current_out.log_probs.to(device="cpu", dtype=torch.float32)
-        values_cpu = current_out.value.to(device="cpu", dtype=torch.float32)
-
-        actions1_cpu = actions_cpu[:n_envs]
-        actions2_cpu = actions_cpu[n_envs:]
-        log_probs1_cpu = log_probs_cpu[:n_envs]
-        log_probs2_cpu = log_probs_cpu[n_envs:]
-        values1_cpu = values_cpu[:n_envs]
-        values2_cpu = values_cpu[n_envs:]
-
-        obs1_cpu = vec_env.obs1_buffers
-        obs2_cpu = vec_env.obs2_buffers
-
-        s1 = trajectories1.record(
-            idx_all,
-            obs1_cpu,
-            actions1_cpu,
-            log_probs1_cpu,
-            values1_cpu,
-            torch.from_numpy(masks1).to(torch.bool),
-            series_tokens1.cpu(),
-            series_mask1.cpu(),
-        )
-        s2 = trajectories2.record(
-            idx_all,
-            obs2_cpu,
-            actions2_cpu,
-            log_probs2_cpu,
-            values2_cpu,
-            torch.from_numpy(masks2).to(torch.bool),
-            series_tokens2.cpu(),
-            series_mask2.cpu(),
-        )
-
-        env_actions = [
-            {
-                vec_env.envs[i].agent1.username: actions1_cpu[i].numpy(),
-                vec_env.envs[i].agent2.username: actions2_cpu[i].numpy(),
-            }
-            for i in range(n_envs)
-        ]
-
-        next_masks1, next_masks2, rewards1, rewards2, done_status, infos = vec_env.step(env_actions)
-
-        # RL non-terminal masking only cares if the episode naturally terminated.
-        # Status 1 is Terminated, Status 2 is Truncated.
-        game_done = (done_status == 1).astype(np.float32)
-
-        trajectories1.rewards[idx_all, s1] = torch.from_numpy(rewards1)
-        trajectories1.dones[idx_all, s1] = torch.from_numpy(game_done)
-        trajectories2.rewards[idx_all, s2] = torch.from_numpy(rewards2)
-        trajectories2.dones[idx_all, s2] = torch.from_numpy(game_done)
-
-        for i in range(n_envs):
-            if not done_status[i]:
-                continue
-
-            info = infos[i]
-            bootstrap_value1 = 0.0
-            bootstrap_value2 = 0.0
-
-            if done_status[i] == 2:
-                # truncated case
-                term1: StructuredObservation = info.get("terminal_observation1")  # type: ignore
-                term2: StructuredObservation = info.get("terminal_observation2")  # type: ignore
-
-                term1 = term1.unsqueeze(0).to(device)
-                term2 = term2.unsqueeze(0).to(device)
-                t_obs = StructuredObservation.cat([term1, term2])
-                terminal_mask = torch.stack(
-                    (
-                        _terminal_action_mask(info, "terminal_action_mask1", device),
-                        _terminal_action_mask(info, "terminal_action_mask2", device),
-                    ),
-                    dim=0,
-                )
-
-                idx_tensor = torch.tensor([i], dtype=torch.long)
-                mem1 = memory1.inputs(idx_tensor, device, torch.float32)
-                mem2 = memory2.inputs(idx_tensor, device, torch.float32)
-
-                s_tok1, s_mask1 = series_store1.get_tokens([str(series_ids[i])], device)
-                s_tok2, s_mask2 = series_store2.get_tokens([str(series_ids[i])], device)
-                t_s_tok = torch.cat([s_tok1, s_tok2], dim=0)
-                t_s_mask = torch.cat([s_mask1, s_mask2], dim=0)
-
-                with (
-                    torch.no_grad(),
-                    torch.amp.autocast(
-                        device_type=device.type,
-                        enabled=precision.autocast,
-                        dtype=precision.dtype,
-                    ),
-                ):
-                    t_memory = MemoryInputs(
-                        series_tokens=t_s_tok,
-                        series_mask=t_s_mask,
-                        history_tokens=torch.cat([mem1[0], mem2[0]], dim=0),
-                        history_mask=torch.cat([mem1[1], mem2[1]], dim=0),
-                    )
-                    t_out = policy.act(
-                        policy.prepare(policy.encode(t_obs, terminal_mask), t_memory),
-                        terminal_mask,
-                    )
-                    bootstrap_value1 = t_out.value[0].item()
-                    bootstrap_value2 = t_out.value[1].item()
-
-            # The artificial truncation value sees only the current game. Commit
-            # its summary after inference so the game is not represented twice.
-            val1 = memory1.full_values(i)
-            if val1 is not None:
-                with torch.no_grad():
-                    new_tok1 = policy.series.resample_single_game(val1)[0]
-                series_store1.append(str(series_ids[i]), new_tok1)
-
-            val2 = memory2.full_values(i)
-            if val2 is not None:
-                with torch.no_grad():
-                    new_tok2 = policy.series.resample_single_game(val2)[0]
-                series_store2.append(str(series_ids[i]), new_tok2)
-
-            if info.get("series_complete"):
-                series_store1.drop(series_ids[i])
-                series_store2.drop(series_ids[i])
-
-            completed_trajectories.append(trajectories1.complete(i, bootstrap_value1))
-            completed_trajectories.append(trajectories2.complete(i, bootstrap_value2))
-
-            memory1.reset(i)
-            memory2.reset(i)
-
-        masks1 = next_masks1
-        masks2 = next_masks2
-
-
 class RolloutCollector:
     """Own fixed-window memory and active trajectory storage for all self-play."""
 
@@ -352,11 +137,9 @@ class RolloutCollector:
         self.vector_env = vector_env
         self.policy = policy
         self.config = config
-        self.completed_trajectories: list[TrajectoryBatch] = []
-        self.first = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps, policy.d_model)
-        self.second = TrajectoryStorage.allocate(
-            config.n_envs, max_trajectory_steps, policy.d_model
-        )
+        self.completed_trajectories: list[CollectedTrajectory] = []
+        self.first = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
+        self.second = TrajectoryStorage.allocate(config.n_envs, max_trajectory_steps)
         self.memory1 = BattleMemoryBuffer(
             config.n_envs,
             policy.d_model,
@@ -371,20 +154,266 @@ class RolloutCollector:
         )
         self.series_store1 = SeriesTokenStore(policy.d_model)
         self.series_store2 = SeriesTokenStore(policy.d_model)
+        self.series_history1 = SeriesHistoryStore(policy.d_model)
+        self.series_history2 = SeriesHistoryStore(policy.d_model)
+        self._pending_history1: list[torch.Tensor] = []
+        self._pending_history2: list[torch.Tensor] = []
 
+    @torch.inference_mode()
     def collect(self) -> None:
-        collect_rollouts(
-            self.vector_env,
-            self.policy,
-            self.completed_trajectories,
-            self.config,
-            self.first,
-            self.second,
-            self.memory1,
-            self.memory2,
-            self.series_store1,
-            self.series_store2,
-        )
+        """Collect one all-self-play rollout using explicit fixed-window memory."""
+        vec_env = self.vector_env
+        policy = self.policy
+        completed_trajectories = self.completed_trajectories
+        config = self.config
+        trajectories1 = self.first
+        trajectories2 = self.second
+        memory1 = self.memory1
+        memory2 = self.memory2
+        series_store1 = self.series_store1
+        series_store2 = self.series_store2
+        series_history1 = self.series_history1
+        series_history2 = self.series_history2
+        pending_history1 = self._pending_history1
+        pending_history2 = self._pending_history2
+
+        n_envs = vec_env.n_envs
+        device = policy.device
+        idx_all = torch.arange(n_envs)
+        masks1 = vec_env.last_masks1
+        masks2 = vec_env.last_masks2
+
+        for _ in range(config.rollout_steps):
+            obs1_gpu = vec_env.get_batched_obs1(device)
+            mask1_gpu = torch.from_numpy(masks1).to(device, non_blocking=True)
+            obs2_gpu = vec_env.get_batched_obs2(device)
+            mask2_gpu = torch.from_numpy(masks2).to(device, non_blocking=True)
+
+            current_obs = StructuredObservation.cat([obs1_gpu, obs2_gpu])
+            current_mask = torch.cat([mask1_gpu, mask2_gpu])
+
+            infos = vec_env.last_infos
+            assert infos is not None
+
+            # Positional results must describe the corresponding environment.
+            if len(infos) != n_envs:
+                raise ValueError(f"Expected {n_envs} environment infos, got {len(infos)}")
+            series_ids = [str(info["series_id"]) for info in infos]
+            series_tokens1, series_mask1 = series_store1.get_tokens(series_ids, device)
+            series_tokens2, series_mask2 = series_store2.get_tokens(series_ids, device)
+            current_series_tokens = torch.cat([series_tokens1, series_tokens2], dim=0)
+            current_series_mask = torch.cat([series_mask1, series_mask2], dim=0)
+
+            memory1_inputs = memory1.inputs(idx_all, device, torch.float32)
+            memory2_inputs = memory2.inputs(idx_all, device, torch.float32)
+            current_memory = MemoryInputs(
+                series_tokens=current_series_tokens,
+                series_mask=current_series_mask,
+                history_tokens=torch.cat([memory1_inputs[0], memory2_inputs[0]], dim=0),
+                history_mask=torch.cat([memory1_inputs[1], memory2_inputs[1]], dim=0),
+            )
+
+            precision = select_optimization_precision(config.enable_optim, device)
+            with torch.amp.autocast(
+                device_type=device.type,
+                enabled=precision.autocast,
+                dtype=precision.dtype,
+            ):
+                current_out = policy.act(
+                    policy.prepare(policy.encode(current_obs, current_mask), current_memory),
+                    current_mask,
+                )
+
+            memory1.append(idx_all, current_out.history_token[:n_envs])
+            memory2.append(idx_all, current_out.history_token[n_envs:])
+            pending_history1.append(current_out.history_token[:n_envs].detach())
+            pending_history2.append(current_out.history_token[n_envs:].detach())
+
+            actions_cpu = current_out.actions.to(device="cpu", dtype=torch.long)
+            log_probs_cpu = current_out.log_probs.to(device="cpu", dtype=torch.float32)
+            values_cpu = current_out.value.to(device="cpu", dtype=torch.float32)
+
+            actions1_cpu = actions_cpu[:n_envs]
+            actions2_cpu = actions_cpu[n_envs:]
+            log_probs1_cpu = log_probs_cpu[:n_envs]
+            log_probs2_cpu = log_probs_cpu[n_envs:]
+            values1_cpu = values_cpu[:n_envs]
+            values2_cpu = values_cpu[n_envs:]
+
+            obs1_cpu = vec_env.obs1_buffers
+            obs2_cpu = vec_env.obs2_buffers
+
+            s1 = trajectories1.record(
+                idx_all,
+                obs1_cpu,
+                actions1_cpu,
+                log_probs1_cpu,
+                values1_cpu,
+                torch.from_numpy(masks1).to(torch.bool),
+            )
+            s2 = trajectories2.record(
+                idx_all,
+                obs2_cpu,
+                actions2_cpu,
+                log_probs2_cpu,
+                values2_cpu,
+                torch.from_numpy(masks2).to(torch.bool),
+            )
+
+            env_actions = [
+                {
+                    vec_env.envs[i].agent1.username: actions1_cpu[i].numpy(),
+                    vec_env.envs[i].agent2.username: actions2_cpu[i].numpy(),
+                }
+                for i in range(n_envs)
+            ]
+
+            next_masks1, next_masks2, rewards1, rewards2, done_status, infos = vec_env.step(
+                env_actions
+            )
+
+            # RL non-terminal masking only cares if the episode naturally terminated.
+            # Status 1 is Terminated, Status 2 is Truncated.
+            game_done = (done_status == 1).astype(np.float32)
+
+            trajectories1.rewards[idx_all, s1] = torch.from_numpy(rewards1)
+            trajectories1.dones[idx_all, s1] = torch.from_numpy(game_done)
+            trajectories2.rewards[idx_all, s2] = torch.from_numpy(rewards2)
+            trajectories2.dones[idx_all, s2] = torch.from_numpy(game_done)
+
+            history_snapshots1: list[tuple[torch.Tensor, ...]] = [()] * n_envs
+            history_snapshots2: list[tuple[torch.Tensor, ...]] = [()] * n_envs
+            should_flush_history = len(pending_history1) >= SERIES_HISTORY_FLUSH_STEPS or bool(
+                np.any(done_status)
+            )
+            for i in range(n_envs):
+                history_key = str(series_ids[i])
+                if done_status[i]:
+                    history_snapshots1[i] = series_history1.snapshot(history_key)
+                    history_snapshots2[i] = series_history2.snapshot(history_key)
+
+            if should_flush_history:
+                pending_values1 = torch.stack(pending_history1).to(
+                    device="cpu", dtype=torch.float32
+                )
+                pending_values2 = torch.stack(pending_history2).to(
+                    device="cpu", dtype=torch.float32
+                )
+                for i in range(n_envs):
+                    history_key = str(series_ids[i])
+                    is_game_end = bool(done_status[i])
+                    is_series_end = is_game_end and bool(infos[i].get("series_complete"))
+                    game_number1 = series_history1.next_game_number(history_key)
+                    game_number2 = series_history2.next_game_number(history_key)
+                    series_history1.append(
+                        history_key,
+                        game_number1,
+                        pending_values1[:, i],
+                        is_game_end=is_game_end,
+                        is_series_end=is_series_end,
+                    )
+                    series_history2.append(
+                        history_key,
+                        game_number2,
+                        pending_values2[:, i],
+                        is_game_end=is_game_end,
+                        is_series_end=is_series_end,
+                    )
+                pending_history1.clear()
+                pending_history2.clear()
+
+            for i in range(n_envs):
+                if not done_status[i]:
+                    continue
+
+                info = infos[i]
+                bootstrap_value1 = 0.0
+                bootstrap_value2 = 0.0
+
+                if done_status[i] == 2:
+                    # truncated case
+                    term1: StructuredObservation = info.get("terminal_observation1")  # type: ignore
+                    term2: StructuredObservation = info.get("terminal_observation2")  # type: ignore
+
+                    term1 = term1.unsqueeze(0).to(device)
+                    term2 = term2.unsqueeze(0).to(device)
+                    t_obs = StructuredObservation.cat([term1, term2])
+                    terminal_mask = torch.stack(
+                        (
+                            _terminal_action_mask(info, "terminal_action_mask1", device),
+                            _terminal_action_mask(info, "terminal_action_mask2", device),
+                        ),
+                        dim=0,
+                    )
+
+                    idx_tensor = torch.tensor([i], dtype=torch.long)
+                    mem1 = memory1.inputs(idx_tensor, device, torch.float32)
+                    mem2 = memory2.inputs(idx_tensor, device, torch.float32)
+
+                    s_tok1, s_mask1 = series_store1.get_tokens([str(series_ids[i])], device)
+                    s_tok2, s_mask2 = series_store2.get_tokens([str(series_ids[i])], device)
+                    t_s_tok = torch.cat([s_tok1, s_tok2], dim=0)
+                    t_s_mask = torch.cat([s_mask1, s_mask2], dim=0)
+
+                    with (
+                        torch.no_grad(),
+                        torch.amp.autocast(
+                            device_type=device.type,
+                            enabled=precision.autocast,
+                            dtype=precision.dtype,
+                        ),
+                    ):
+                        t_memory = MemoryInputs(
+                            series_tokens=t_s_tok,
+                            series_mask=t_s_mask,
+                            history_tokens=torch.cat([mem1[0], mem2[0]], dim=0),
+                            history_mask=torch.cat([mem1[1], mem2[1]], dim=0),
+                        )
+                        t_out = policy.act(
+                            policy.prepare(policy.encode(t_obs, terminal_mask), t_memory),
+                            terminal_mask,
+                        )
+                        bootstrap_value1 = t_out.value[0].item()
+                        bootstrap_value2 = t_out.value[1].item()
+
+                history_key = str(series_ids[i])
+                history_snapshot1 = history_snapshots1[i]
+                history_snapshot2 = history_snapshots2[i]
+
+                # The artificial truncation value sees only the current game. Commit
+                # its summary after inference so the game is not represented twice.
+                val1 = memory1.full_values(i)
+                if val1 is not None:
+                    with torch.no_grad():
+                        val1_mask = torch.ones(val1.shape[:2], dtype=torch.bool, device=val1.device)
+                        new_tok1 = policy.series(val1, val1_mask)[0]
+                    series_store1.append(str(series_ids[i]), new_tok1)
+
+                val2 = memory2.full_values(i)
+                if val2 is not None:
+                    with torch.no_grad():
+                        val2_mask = torch.ones(val2.shape[:2], dtype=torch.bool, device=val2.device)
+                        new_tok2 = policy.series(val2, val2_mask)[0]
+                    series_store2.append(str(series_ids[i]), new_tok2)
+
+                if info.get("series_complete"):
+                    series_store1.drop(series_ids[i])
+                    series_store2.drop(series_ids[i])
+                    series_history1.drop(history_key)
+                    series_history2.drop(history_key)
+
+                completed_trajectories.append(
+                    trajectories1.complete(i, bootstrap_value1, history_snapshot1)
+                )
+                completed_trajectories.append(
+                    trajectories2.complete(i, bootstrap_value2, history_snapshot2)
+                )
+
+                memory1.reset(i)
+                memory2.reset(i)
+
+            masks1 = next_masks1
+            masks2 = next_masks2
 
     def reset_completed(self) -> None:
         self.completed_trajectories.clear()
@@ -396,6 +425,10 @@ class RolloutCollector:
         self.second.step_counts.zero_()
         self.memory1.clear()
         self.memory2.clear()
+        self._pending_history1.clear()
+        self._pending_history2.clear()
+        self.series_history1.discard_active_games()
+        self.series_history2.discard_active_games()
         for env in self.vector_env.envs:
             prepare_env = getattr(env, "prepare_for_checkpoint", None)
             if callable(prepare_env):
@@ -407,6 +440,8 @@ class RolloutCollector:
         return {
             "series_store1": self.series_store1.training_state(),
             "series_store2": self.series_store2.training_state(),
+            "series_history1": self.series_history1.training_state(),
+            "series_history2": self.series_history2.training_state(),
         }
 
     def restore_training_state(self, state: Mapping[str, object]) -> None:
@@ -417,8 +452,16 @@ class RolloutCollector:
             raise ValueError("Invalid PPO collector series training state")
         self.series_store1.restore_training_state(store1)
         self.series_store2.restore_training_state(store2)
+        self._pending_history1.clear()
+        self._pending_history2.clear()
+        history1 = state.get("series_history1")
+        history2 = state.get("series_history2")
+        if not isinstance(history1, Mapping) or not isinstance(history2, Mapping):
+            raise ValueError("Invalid PPO collector history training state")
+        self.series_history1.restore_training_state(history1)
+        self.series_history2.restore_training_state(history2)
 
-    def get_batches(self, device: torch.device) -> list[TrajectoryBatch]:
+    def get_batches(self, device: torch.device) -> list[PreparedTrajectory]:
         return prepare_trajectory_batches(
             self.completed_trajectories,
             device,

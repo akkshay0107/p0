@@ -15,15 +15,19 @@ from p0.evaluation.harness import (
 )
 from p0.format_config import FORMAT, current_manifest
 from p0.model.architecture_contract import HISTORY_WINDOW
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
+from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.teams.corpus import CorpusEntry, CorpusSplit, TeamCorpusManifest, corpus_content_hash
 from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FixedTeamSource
 from p0.training.config import TrainingConfig
-from p0.training.ppo import compute_ppo_objective
+from p0.training.magnet import Magnet
+from p0.training.ppo import compute_ppo_objective, ppo_update
 from p0.training.rollout import BattleMemoryBuffer
 from p0.training.trajectory import (
-    TrajectoryBatch,
+    CollectedTrajectory,
     TrajectoryStorage,
     compute_gae_batch,
     prepare_trajectory_batches,
@@ -147,11 +151,10 @@ def test_battle_memory_gathers_independent_environment_windows():
 
 def test_storage_allocates_completes_and_resets_one_environment():
     """Verify TrajectoryStorage allocation, completion slicing, and reset for a single environment index."""
-    storage = TrajectoryStorage.allocate(2, 3, d_model=1)
+    storage = TrajectoryStorage.allocate(2, 3)
     storage.step_counts[1] = 2
     storage.actions[1, :2] = 7
-    completed = storage.complete(1)
-    assert completed is not None
+    completed = storage.complete(1, 0.0, ())
     assert completed.length == 2
     assert torch.all(completed.actions == 7)
     assert storage.step_counts.tolist() == [0, 0]
@@ -159,7 +162,7 @@ def test_storage_allocates_completes_and_resets_one_environment():
 
 def test_storage_reports_explicit_overflow():
     """Verify TrajectoryStorage raises OverflowError when environment step count exceeds capacity."""
-    storage = TrajectoryStorage.allocate(1, 1, d_model=1)
+    storage = TrajectoryStorage.allocate(1, 1)
     storage.step_counts[0] = 1
     with pytest.raises(OverflowError, match="exceeded"):
         storage.ensure_capacity(torch.tensor([0]))
@@ -167,7 +170,7 @@ def test_storage_reports_explicit_overflow():
 
 def test_completed_batch_prepares_returns_advantages_and_chunks():
     """Verify prepare_trajectory_batches calculates returns and GAE advantages on completed trajectory batches."""
-    batch = TrajectoryBatch(
+    batch = CollectedTrajectory(
         observations=StructuredObservation.empty_batch(3),
         action_masks=torch.ones((3, 2, 49), dtype=torch.bool),
         actions=torch.zeros((3, 2), dtype=torch.long),
@@ -176,15 +179,17 @@ def test_completed_batch_prepares_returns_advantages_and_chunks():
         rewards=torch.tensor([0.0, 1.0, 0.5]),
         dones=torch.tensor([0.0, 1.0, 1.0]),
         length=3,
+        bootstrap_value=0.0,
+        series_history=(),
     )
     prepared = prepare_trajectory_batches([batch], torch.device("cpu"), gamma=0.99, gae_lambda=0.95)
-    assert prepared[0].returns is not None
-    assert prepared[0].advantages is not None
+    assert prepared[0].returns.shape == (3,)
+    assert prepared[0].advantages.shape == (3,)
 
 
 def test_completed_batch_only_moves_ppo_inputs_to_target_device():
     """Verify device transfer moves only policy gradient computation tensors to GPU while retaining tracking metrics on CPU."""
-    batch = TrajectoryBatch(
+    batch = CollectedTrajectory(
         observations=StructuredObservation.empty_batch(1),
         action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
         actions=torch.zeros((1, 2), dtype=torch.long),
@@ -193,6 +198,8 @@ def test_completed_batch_only_moves_ppo_inputs_to_target_device():
         rewards=torch.ones(1),
         dones=torch.ones(1),
         length=1,
+        bootstrap_value=0.0,
+        series_history=(),
     )
 
     prepared = prepare_trajectory_batches(
@@ -201,8 +208,8 @@ def test_completed_batch_only_moves_ppo_inputs_to_target_device():
     result = prepared[0]
 
     assert result.observations.categorical.device.type == "meta"
-    assert result.returns is not None and result.returns.device.type == "meta"
-    assert result.advantages is not None and result.advantages.device.type == "meta"
+    assert result.returns.device.type == "meta"
+    assert result.advantages.device.type == "meta"
     assert result.values.device.type == "cpu"
     assert result.rewards.device.type == "cpu"
     assert result.dones.device.type == "cpu"
@@ -219,6 +226,66 @@ def test_preparing_no_trajectories_is_a_noop() -> None:
         )
         == []
     )
+
+
+def test_ppo_recomputes_prior_game_series_context_with_live_gradients() -> None:
+    """Verify PPO updates the live series resampler from detached prior-game histories."""
+    torch.manual_seed(4)
+    policy = build_policy(
+        ModelConfig(d_model=32, nhead=4, reducer_layers=1, dim_feedforward=64),
+        default_runtime_resources(),
+    )
+    history = torch.randn(3, policy.d_model, requires_grad=True)
+    length = 2
+    trajectory = CollectedTrajectory(
+        observations=StructuredObservation.empty_batch(length),
+        action_masks=torch.ones((length, 2, 49), dtype=torch.bool),
+        actions=torch.tensor([[1, 2], [1, 2]], dtype=torch.long),
+        log_probs=torch.zeros(length),
+        values=torch.zeros(length),
+        rewards=torch.tensor([0.0, 1.0]),
+        dones=torch.ones(length),
+        length=length,
+        bootstrap_value=0.0,
+        series_history=(history,),
+    )
+    prepared = prepare_trajectory_batches(
+        [trajectory], torch.device("cpu"), gamma=0.99, gae_lambda=0.95
+    )
+    optimizer = torch.optim.SGD(policy.parameters(), lr=1e-3)
+    magnet = Magnet(policy)
+    config = TrainingConfig(
+        num_episodes=20,
+        n_envs=1,
+        rollout_steps=1,
+        batch_size=1,
+        minibatch_size=1,
+        ppo_epochs=1,
+        target_kl=1.0e9,
+        enable_optim=False,
+    )
+    before = {
+        name: parameter.detach().clone() for name, parameter in policy.series.named_parameters()
+    }
+
+    ppo_update(
+        prepared,
+        policy,
+        magnet,
+        optimizer,
+        torch.amp.GradScaler("cpu", enabled=False),
+        config,
+        episode=0,
+        alpha=0.0,
+        cancel_requested=lambda: False,
+    )
+
+    assert all(torch.isfinite(parameter).all() for parameter in policy.series.parameters())
+    assert any(
+        not torch.equal(before[name], parameter)
+        for name, parameter in policy.series.named_parameters()
+    )
+    assert history.grad is None
 
 
 def test_evaluation_harness_falls_back_without_corpus_repeatably(tmp_path: Path) -> None:

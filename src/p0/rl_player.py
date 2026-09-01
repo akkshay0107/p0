@@ -356,7 +356,8 @@ class RLPlayer(TeamPlayerMixin, Player):
         if history is not None:
             values = history.complete_values(self.policy.device)
             with torch.no_grad():
-                new_tokens = self.policy.series.resample_single_game(values)[0]
+                values_mask = torch.ones(values.shape[:2], dtype=torch.bool, device=values.device)
+                new_tokens = self.policy.series(values, values_mask)[0]
             # SeriesTokenStore synchronously detaches the completed summary to
             # CPU, establishing a strict device-memory boundary between games.
             self._series_store.append(state.key, new_tokens)

@@ -7,7 +7,10 @@ from hypothesis import strategies as st
 
 from p0.battle.actions import FORCED_ACTION, MOVE_START
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import HISTORY_WINDOW
+from p0.model.architecture_contract import (
+    HISTORY_WINDOW,
+    SERIES_SLOTS,
+)
 from p0.model.policy import MemoryInputs
 from p0.model.structured_observation import (
     CAT_IDX_IDENTITY_KNOWNNESS,
@@ -164,18 +167,16 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
         (batch_size, HISTORY_WINDOW, stress_policy.d_model), generator=generator
     ).to(stress_device)
     history_mask = torch.ones((batch_size, HISTORY_WINDOW), dtype=torch.bool, device=stress_device)
-    prior_games = [
-        [
-            torch.randn((HISTORY_WINDOW, stress_policy.d_model), generator=generator).to(
-                stress_device
-            ),
-            torch.randn((HISTORY_WINDOW, stress_policy.d_model), generator=generator).to(
-                stress_device
-            ),
-        ]
-        for _ in range(batch_size)
-    ]
-    series_tokens, series_mask = stress_policy.encode_series(prior_games)
+    prior_games = torch.randn(
+        (batch_size * 2, HISTORY_WINDOW, stress_policy.d_model), generator=generator
+    ).to(stress_device)
+    prior_mask = torch.ones(
+        (batch_size * 2, HISTORY_WINDOW), dtype=torch.bool, device=stress_device
+    )
+    series_tokens = stress_policy.series(prior_games, prior_mask).reshape(
+        batch_size, SERIES_SLOTS, stress_policy.d_model
+    )
+    series_mask = torch.ones((batch_size, SERIES_SLOTS), dtype=torch.bool, device=stress_device)
 
     with torch.inference_mode():
         memory = MemoryInputs(

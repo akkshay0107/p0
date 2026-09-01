@@ -6,17 +6,21 @@ import logging
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+from torch.amp import GradScaler
+from torch.optim import Optimizer
+
 from p0.model.policy import PolicyNet
 from p0.persistence import atomic_json_save
 from p0.training.checkpoint import PolicyStore
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
-from p0.training.ppo import PPOUpdater
+from p0.training.ppo import ppo_update
 from p0.training.rollout import RolloutCollector
-from p0.training.trajectory import TrajectoryBatch
+from p0.training.trajectory import PreparedTrajectory
 from p0.training.utils import PPOScheduler
 
 MetricSink = Callable[[Mapping[str, float], int, str], None]
+LOGGER = logging.getLogger(__name__)
 
 PPO_BOARD_METRICS = (
     "policy_loss",
@@ -32,7 +36,7 @@ PPO_BOARD_METRICS = (
 )
 
 
-def _rollout_metrics(trajectories: list[TrajectoryBatch]) -> dict[str, float]:
+def _rollout_metrics(trajectories: list[PreparedTrajectory]) -> dict[str, float]:
     """Summarize completed self-play games for the PPO board."""
     if not trajectories:
         raise ValueError("Cannot summarize an empty PPO rollout")
@@ -53,7 +57,8 @@ class PPOTrainer:
         policy_store: PolicyStore,
         checkpoint_path: Path,
         collector: RolloutCollector,
-        updater: PPOUpdater,
+        optimizer: Optimizer,
+        scaler: GradScaler,
         magnet: Magnet,
         scheduler: PPOScheduler,
         training_config: TrainingConfig,
@@ -65,7 +70,8 @@ class PPOTrainer:
         self.policy_store = policy_store
         self.checkpoint_path = checkpoint_path
         self.collector = collector
-        self.updater = updater
+        self.optimizer = optimizer
+        self.scaler = scaler
         self.magnet = magnet
         self.scheduler = scheduler
         self.training_config = training_config
@@ -82,7 +88,7 @@ class PPOTrainer:
             if self.cancel_requested():
                 self._save(episode)
                 return
-            for group in self.updater.optimizer.param_groups:
+            for group in self.optimizer.param_groups:
                 group["lr"] = self.scheduler.lr(episode)
             alpha = self.scheduler.alpha(episode)
             self.collector.reset_completed()
@@ -90,19 +96,29 @@ class PPOTrainer:
             self.collector.collect()
             trajectories = self.collector.get_batches(self.policy.device)
             if not trajectories:
-                logging.warning("No trajectories collected, skipping update")
+                LOGGER.warning("No trajectories collected, skipping update")
                 completed_episode = episode + 1
                 continue
             trajectory_count = len(trajectories)
             rollout_metrics = _rollout_metrics(trajectories)
             try:
-                stats = self.updater.update(trajectories, episode, alpha)
+                stats = ppo_update(
+                    trajectories,
+                    self.policy,
+                    self.magnet,
+                    self.optimizer,
+                    self.scaler,
+                    self.training_config,
+                    episode,
+                    alpha,
+                    cancel_requested=self.cancel_requested,
+                )
             finally:
                 # The next rollout does not need the previous update's GPU copies.
                 del trajectories
             if (episode + 1) % refresh_interval == 0:
                 self.magnet.refresh(self.policy)
-                logging.info(f"Refreshed magnet at episode {episode + 1}")
+                LOGGER.info("Refreshed magnet at episode %s", episode + 1)
             metrics = {name: float(stats[name]) for name in PPO_BOARD_METRICS if name in stats}
             metrics.update(rollout_metrics)
             self._json_metrics.append(
@@ -137,9 +153,9 @@ class PPOTrainer:
             self.checkpoint_path,
             episode,
             self.policy,
-            optimizer=self.updater.optimizer,
+            optimizer=self.optimizer,
             scheduler=self.scheduler,
-            scaler=self.updater.scaler,
+            scaler=self.scaler,
             magnet=self.magnet,
             metadata=metadata,
             trainer_kind="ppo",
