@@ -6,19 +6,16 @@ training:
   batch_size: 128
   minibatch_size: 32
   gamma: 0.99
-  gae_lambda: 0.97
-  clip_low: 0.2
-  clip_high: 0.28
-  lr: 0.00006
-  value_coef: 0.05
+  gae_lambda: 0.95
+  clip_range: 0.2
+  lr: 0.0003
+  value_coef: 0.5
   magnet_alpha: 0.03
   magnet_refresh_interval: 20
-  residual_entropy_coef: 0.0
-  max_grad_norm: 1.0
-  target_kl: 0.015
-  ppo_epochs: 6
-  teampreview_loss_mult: 1.5
-  teampreview_alpha_mult: 2.0
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  target_kl: 0.01
+  ppo_epochs: 10
   enable_optim: true
   seed: 0
   ramp_up_phase: 0.1
@@ -58,7 +55,7 @@ bc:
   weight_decay: 0.0
   max_grad_norm: 1.0
   seed: 0
-  amp: true
+  enable_optim: true
   shard_manifest: artifacts/shards/manifest.json
   split_manifest: artifacts/shards/splits.json
   output_dir: artifacts/checkpoints/bc

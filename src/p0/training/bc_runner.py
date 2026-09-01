@@ -36,7 +36,7 @@ def _trainer_config(config: BCConfig, *, overfit: bool) -> dict[str, Any]:
         "weight_decay": config.weight_decay,
         "max_grad_norm": config.max_grad_norm,
         "seed": config.seed,
-        "amp": config.amp,
+        "enable_optim": config.enable_optim,
         "overfit": overfit,
     }
 
@@ -199,7 +199,10 @@ def train_bc(
         selection_state = {}
         best_validation_nll = float("inf")
         best_selected_epoch = 0
-    policy = compile_policy(policy, enable=selected_device.type == "cuda")
+    policy = compile_policy(
+        policy,
+        enable=config.enable_optim and selected_device.type == "cuda",
+    )
     initial_training = trainer.evaluate(train_dataset)
     if _validation_is_failed(initial_training):
         raise RuntimeError("Initial BC training evaluation contains invalid predictions or values")

@@ -44,19 +44,16 @@ class TrainingConfig:
     batch_size: int = 128
     minibatch_size: int = 32
     gamma: float = 0.99
-    gae_lambda: float = 0.97
-    clip_low: float = 0.2
-    clip_high: float = 0.28
-    lr: float = 6e-5
-    value_coef: float = 0.05
+    gae_lambda: float = 0.95
+    clip_range: float = 0.2
+    lr: float = 3e-4
+    value_coef: float = 0.5
     magnet_alpha: float = 0.03
     magnet_refresh_interval: int = 20
-    residual_entropy_coef: float = 0.0
-    max_grad_norm: float = 1.0
-    target_kl: float = 0.015
-    ppo_epochs: int = 6
-    teampreview_loss_mult: float = 1.5
-    teampreview_alpha_mult: float = 2.0
+    entropy_coef: float = 0.01
+    max_grad_norm: float = 0.5
+    target_kl: float = 0.01
+    ppo_epochs: int = 10
     enable_optim: bool = True
     seed: int = 0
     ramp_up_phase: float = 0.1
@@ -84,11 +81,10 @@ class TrainingConfig:
 
         _non_negative(
             type(self).__name__,
-            ("clip_low", self.clip_low),
-            ("clip_high", self.clip_high),
+            ("clip_range", self.clip_range),
             ("value_coef", self.value_coef),
             ("magnet_alpha", self.magnet_alpha),
-            ("residual_entropy_coef", self.residual_entropy_coef),
+            ("entropy_coef", self.entropy_coef),
             ("target_kl", self.target_kl),
         )
 
@@ -96,8 +92,6 @@ class TrainingConfig:
             type(self).__name__,
             ("lr", self.lr),
             ("max_grad_norm", self.max_grad_norm),
-            ("teampreview_loss_mult", self.teampreview_loss_mult),
-            ("teampreview_alpha_mult", self.teampreview_alpha_mult),
         )
 
         if type(self.seed) is not int or self.seed < 0:
@@ -167,7 +161,7 @@ class BCConfig:
     # These objective settings are copied from TrainingConfig when the full
     # application configuration is built; BC and PPO must share them.
     gamma: float = 0.99
-    value_coef: float = 0.05
+    value_coef: float = 0.5
     epochs: int = 1
     # BC history state is chronological across shards; multiprocessing remains
     # opt-in until an order-preserving prefetcher is available.
@@ -176,7 +170,7 @@ class BCConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     seed: int = 0
-    amp: bool = True
+    enable_optim: bool = True
     shard_manifest: Path = Path("artifacts/shards/manifest.json")
     split_manifest: Path = Path("artifacts/shards/splits.json")
     output_dir: Path = Path("artifacts/checkpoints/bc")

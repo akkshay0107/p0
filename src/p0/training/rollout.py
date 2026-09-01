@@ -16,7 +16,7 @@ from p0.training.trajectory import (
     TrajectoryStorage,
     prepare_trajectory_batches,
 )
-from p0.training.utils import amp_enabled
+from p0.training.utils import select_optimization_precision
 from p0.training.vector_env import ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
@@ -63,7 +63,6 @@ class BattleMemoryBuffer:
         )
         self.step_counts = torch.zeros(n_envs, dtype=torch.long)
         self._history_offsets = torch.arange(-HISTORY_WINDOW, 0, device=device)
-        self._history_ages = torch.arange(HISTORY_WINDOW - 1, -1, -1, device=device)
         self.d_model = d_model
         self.max_steps = max_steps
 
@@ -99,7 +98,7 @@ class BattleMemoryBuffer:
         env_ids: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         env_ids_cpu = env_ids.to(device="cpu", dtype=torch.long)
         env_ids_device = env_ids_cpu.to(self.tokens.device)
         lengths = self.step_counts[env_ids_cpu].to(self.tokens.device)
@@ -109,15 +108,9 @@ class BattleMemoryBuffer:
             env_ids_device.unsqueeze(1),
             indices.clamp_min(0),
         ].masked_fill(~mask.unsqueeze(-1), 0.0)
-        ages = torch.where(
-            mask,
-            self._history_ages,
-            0,
-        )
         return (
             history.to(device=device, dtype=dtype),
             mask.to(device),
-            ages.to(device),
         )
 
     def full_values(self, env_id: int) -> torch.Tensor | None:
@@ -193,10 +186,14 @@ def collect_rollouts(
             series_mask=current_series_mask,
             history_tokens=torch.cat([memory1_inputs[0], memory2_inputs[0]], dim=0),
             history_mask=torch.cat([memory1_inputs[1], memory2_inputs[1]], dim=0),
-            history_age_ids=torch.cat([memory1_inputs[2], memory2_inputs[2]], dim=0),
         )
 
-        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled(config, device)):
+        precision = select_optimization_precision(config.enable_optim, device)
+        with torch.amp.autocast(
+            device_type=device.type,
+            enabled=precision.autocast,
+            dtype=precision.dtype,
+        ):
             current_out = policy.act(
                 policy.prepare(policy.encode(current_obs, current_mask), current_memory),
                 current_mask,
@@ -295,7 +292,9 @@ def collect_rollouts(
                 with (
                     torch.no_grad(),
                     torch.amp.autocast(
-                        device_type=device.type, enabled=amp_enabled(config, device)
+                        device_type=device.type,
+                        enabled=precision.autocast,
+                        dtype=precision.dtype,
                     ),
                 ):
                     t_memory = MemoryInputs(
@@ -303,7 +302,6 @@ def collect_rollouts(
                         series_mask=t_s_mask,
                         history_tokens=torch.cat([mem1[0], mem2[0]], dim=0),
                         history_mask=torch.cat([mem1[1], mem2[1]], dim=0),
-                        history_age_ids=torch.cat([mem1[2], mem2[2]], dim=0),
                     )
                     t_out = policy.act(
                         policy.prepare(policy.encode(t_obs, terminal_mask), t_memory),

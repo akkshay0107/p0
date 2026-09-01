@@ -1,11 +1,20 @@
 import math
 import random
+from typing import NamedTuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from p0.training.config import TrainingConfig
+
+
+class OptimizationPrecision(NamedTuple):
+    """Resolved compute precision for one device."""
+
+    dtype: torch.dtype
+    autocast: bool
+    grad_scaler: bool
 
 
 def default_device() -> torch.device:
@@ -23,9 +32,16 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def amp_enabled(config: TrainingConfig, device: torch.device) -> bool:
-    """Enable FP16 autocast only on CUDA devices."""
-    return config.enable_optim and device.type == "cuda"
+def select_optimization_precision(
+    enable_optim: bool,
+    device: torch.device,
+) -> OptimizationPrecision:
+    """Prefer BF16, then FP16, and fall back to FP32 on unsupported devices."""
+    if not enable_optim or device.type != "cuda":
+        return OptimizationPrecision(torch.float32, False, False)
+    if torch.cuda.is_bf16_supported():
+        return OptimizationPrecision(torch.bfloat16, True, False)
+    return OptimizationPrecision(torch.float16, True, True)
 
 
 class PPOScheduler:

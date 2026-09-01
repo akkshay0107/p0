@@ -188,7 +188,7 @@ def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
             learning_rate=1e-3,
             epochs=1,
             num_workers=0,
-            amp=False,
+            enable_optim=False,
         ),
         device="cpu",
     )
@@ -220,7 +220,7 @@ def test_replay_to_series_bc_checkpoint_smoke(tmp_path: Path) -> None:
             batch_decisions=2,
             learning_rate=1e-3,
             epochs=1,
-            amp=False,
+            enable_optim=False,
         ),
         device="cpu",
     )
@@ -366,7 +366,7 @@ def test_multi_epoch_training_rejects_one_shot_dataset() -> None:
     chunk = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1])
     trainer = _trainer(chunk)
     trainer.dataset = iter((chunk,))
-    trainer.config = BCConfig(epochs=2, amp=False)
+    trainer.config = BCConfig(epochs=2, enable_optim=False)
 
     with pytest.raises(ValueError, match="re-iterable"):
         trainer.train()
@@ -403,7 +403,12 @@ def test_evaluation_reports_legality_diagnostics() -> None:
         ModelConfig(d_model=64, nhead=4, reducer_layers=1, dim_feedforward=128),
         default_runtime_resources(),
     )
-    trainer = BCTrainer(policy, (game,), BCConfig(batch_decisions=2, amp=False), device="cpu")
+    trainer = BCTrainer(
+        policy,
+        (game,),
+        BCConfig(batch_decisions=2, enable_optim=False),
+        device="cpu",
+    )
 
     metrics = trainer.evaluate()
 
@@ -430,7 +435,7 @@ def test_validation_is_deterministic_inference_only_and_reports_all_counts() -> 
     trainer = BCTrainer(
         policy,
         (game,),
-        BCConfig(batch_decisions=3, amp=False),
+        BCConfig(batch_decisions=3, enable_optim=False),
         device="cpu",
     )
     before = {name: parameter.detach().clone() for name, parameter in policy.named_parameters()}

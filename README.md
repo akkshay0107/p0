@@ -35,14 +35,18 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 ## Features
 
 - **Custom Tokenizer & Observation Builder**: Converts Pokemon VGC game states (species, items, moves, abilities, status conditions, active/bench volatiles, side conditions) into tokens mapped from a pre-built game vocabulary. The categorical tokens and the remaining numerical features from the battle are packed into a structured observation used downstream.
-- **Token Fusion Encoder**: Combines categorical embeds and numerical values per Pokemon, routing them through a single-layer encoder. Each Pokemon, global-field, and side-owner row is fused directly; event rows are encoded at low width and pooled into eight fixed event tokens. The custom implementation of a SwiGLU variant was built for fun to try something new. Other tokens for the global field status or the side conditions on each side are also fused at this layer.
+- **Token Fusion Encoder**: Uses nonlinear sum-based DeepSets for the unordered type summary and typed-effect records while retaining primary type as an explicit ordered feature, then uses a learned query to pool the heterogeneous components into one token per Pokémon. The four active-slot event rows remain spatially aligned through a one-layer pre-RMSNorm Transformer.
 - **Autoregressive Policy Pointer Head**: Uses a pointer-attention network to select actions. The first head predicts action `a1` for the first active Pokemon. This selection is embedded and passed as context to the second head to predict action `a2` for the second active Pokemon. Sequential masking prevents invalid choices (such as duplicate switch targets or multiple mega evolutions in a single turn).
 - **Inbuilt Team Preview Handling**: The same policy used for battling can also be used for team picking at the team preview stage. The input is differentiated through a team preview flag in the observation.
 - **Magnetic Mirror-Descent Self-Play**: Runs the live policy on both seats of every environment and regularizes PPO toward a slowly refreshed frozen magnet with a reverse-KL penalty. This preserves strategic diversity in one stochastic policy without a checkpoint league or recurrent BPTT loop.
-- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with perspective-safe prior-game slots and full attention over a 75-position layout. Also uses DAPO style clip-higher (used to prevent entropy collapse in RLVR settings, found it interesting to try since v1 did have entropy collapse issues).
+- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries, gathers a causal 48-decision history window, and reduces it with perspective-safe prior-game slots and a standard pre-RMSNorm Transformer over one explicit absolute-position layout. PPO uses the conventional symmetric clipped objective; MMD regularization supplies the QRE pressure.
+
 - **Bo3 Replay Pretraining**: Acquires complete linked Champions Bo3 OTS series, audits every raw replay, preserves canonical player identity across games, and creates leakage-safe series-level train/validation/test splits.
 - **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
-- **Mixed Precision (FP16) & CUDA Graph Compilation**: Optional but speeds up training by around 1.7x on the few short runs I have done on a T4.
+- **Automatic Mixed Precision & Compilation**: With optimizations enabled, training prefers BF16, falls back to scaled FP16, and otherwise uses FP32. CUDA execution also enables optional `torch.compile` acceleration.
+
+The current baseline, initialization, positional signals, precision policy, and PPO objective are
+documented in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md).
 
 ---
 

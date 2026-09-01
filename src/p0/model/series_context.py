@@ -14,7 +14,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.init as init
 from torch import Tensor
 
 from p0.model.architecture_contract import (
@@ -22,7 +21,7 @@ from p0.model.architecture_contract import (
     SERIES_SLOTS,
     SERIES_TOKENS_PER_GAME,
 )
-from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
+from p0.model.swiglu_encoder import MODEL_INIT_STD, SwiGLUTransformerEncoder, initialize_module
 
 
 class DynamicSeriesResampler(nn.Module):
@@ -49,14 +48,11 @@ class DynamicSeriesResampler(nn.Module):
         self.summary_queries = nn.Parameter(torch.empty(1, num_summary_tokens, d_model))
         self.empty_game_context = nn.Parameter(torch.empty(1, num_summary_tokens, d_model))
 
-        self.pos_emb = nn.Sequential(
-            nn.Linear(1, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model),
-        )
+        # A single scalar projection marks normalized chronological progress.
+        self.position_proj = nn.Linear(1, d_model)
 
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_k = nn.LayerNorm(d_model)
+        self.norm_q = nn.RMSNorm(d_model)
+        self.norm_k = nn.RMSNorm(d_model)
         self.cross_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
         self.self_attn = SwiGLUTransformerEncoder(
             d_model=d_model,
@@ -68,14 +64,10 @@ class DynamicSeriesResampler(nn.Module):
 
     @torch.no_grad()
     def _init_weights(self) -> None:
-        gain = self.d_model**-0.5
-        init.normal_(self.summary_queries, std=gain)
-        init.normal_(self.empty_game_context, std=gain)
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                init.orthogonal_(module.weight, gain=1.0)
-                if module.bias is not None:
-                    init.zeros_(module.bias)
+        initialize_module(self)
+        nn.init.normal_(self.summary_queries, std=MODEL_INIT_STD)
+        nn.init.normal_(self.empty_game_context, std=MODEL_INIT_STD)
+        self.self_attn.reset_parameters()
 
     def resample_single_game(
         self,
@@ -109,7 +101,7 @@ class DynamicSeriesResampler(nn.Module):
             denominators = (history_lengths - 1).clamp_min(1)
             positions = (position_ids / denominators).unsqueeze(-1)
             positions = positions * history_mask.unsqueeze(-1)
-        pos_vectors = self.pos_emb(positions)
+        pos_vectors = self.position_proj(positions)
         keys_values = self.norm_k(history + pos_vectors)
 
         queries = self.norm_q(self.summary_queries.expand(batch_size, -1, -1))

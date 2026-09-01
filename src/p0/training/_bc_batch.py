@@ -44,7 +44,6 @@ class BCDecisionBatch:
     target_indices: Tensor
     history_indices: Tensor
     history_mask: Tensor
-    history_age_ids: Tensor
     outcome: Tensor
     outcome_valid: Tensor
     decision_index: Tensor
@@ -104,7 +103,6 @@ def _collate_bc_window(
     target_indices: list[Tensor] = []
     history_indices: list[Tensor] = []
     history_masks: list[Tensor] = []
-    history_age_ids: list[Tensor] = []
     outcomes: list[Tensor] = []
     outcome_valids: list[Tensor] = []
     decision_indices: list[Tensor] = []
@@ -160,8 +158,6 @@ def _collate_bc_window(
         local_mask = local_history >= 0
         history_indices.append(torch.where(local_mask, context_base + local_history, 0))
         history_masks.append(local_mask)
-        ages = torch.arange(HISTORY_WINDOW - 1, -1, -1, dtype=torch.long).unsqueeze(0)
-        history_age_ids.append(torch.where(local_mask, ages, 0))
 
         context_base += context_length
         batch_start = batch_stop
@@ -180,7 +176,6 @@ def _collate_bc_window(
         target_indices=_compact_tensors(target_indices),
         history_indices=_compact_tensors(history_indices),
         history_mask=_compact_tensors(history_masks),
-        history_age_ids=_compact_tensors(history_age_ids),
         outcome=_compact_tensors(outcomes),
         outcome_valid=_compact_tensors(outcome_valids),
         decision_index=_compact_tensors(decision_indices),

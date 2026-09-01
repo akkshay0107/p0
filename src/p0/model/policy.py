@@ -15,7 +15,6 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
 from torch import Tensor
 from torch.distributions import Categorical
 
@@ -61,6 +60,7 @@ from p0.model.structured_observation import (
     StructuredObservation,
     is_teampreview,
 )
+from p0.model.swiglu_encoder import MODEL_INIT_STD, initialize_module
 
 # Only these entities are ever pointed at: the 6 allies (switch/TP/ally targets)
 # and the 2 opponent actives (move targets). Opponent bench rows get no keys.
@@ -103,7 +103,6 @@ class MemoryInputs:
     series_mask: Tensor
     history_tokens: Tensor
     history_mask: Tensor
-    history_age_ids: Tensor
 
     @classmethod
     def empty(
@@ -124,9 +123,6 @@ class MemoryInputs:
                 (batch_size, HISTORY_WINDOW, d_model), device=device, dtype=dtype
             ),
             history_mask=torch.zeros((batch_size, HISTORY_WINDOW), device=device, dtype=torch.bool),
-            history_age_ids=torch.zeros(
-                (batch_size, HISTORY_WINDOW), device=device, dtype=torch.long
-            ),
         )
 
 
@@ -174,29 +170,15 @@ def _require_matching_batch(reduced: ReducerOutput, enc: EncodedObs) -> None:
 
 
 class ValueHead(nn.Module):
-    """Feedforward critic head over the post-memory summary."""
+    """Linear critic over the normalized Transformer readout."""
 
-    def __init__(
-        self,
-        d_model: int,
-        hidden_dim: int = 768,
-    ):
+    def __init__(self, d_model: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.RMSNorm(d_model),
+            nn.Linear(d_model, 1),
         )
-        self._init_weights()
-
-    @torch.no_grad()
-    def _init_weights(self):
-        for i, module in enumerate(self.net):
-            if isinstance(module, nn.Linear):
-                init.orthogonal_(module.weight, gain=1.0)
-                init.zeros_(module.bias)
+        initialize_module(self)
 
     def forward(self, z: Tensor) -> Tensor:
         return self.net(z).squeeze(-1)
@@ -217,12 +199,10 @@ class ActorPolicy(nn.Module):
         nhead: int,
         nlayer: int,
         act_size: int,
-        side_emb: nn.Embedding,
         dim_feedforward: int = 2048,
-    ):
+    ) -> None:
         super().__init__()
         self.act_size = act_size
-        self.side_emb = side_emb
         self.d_model = d_model
         self.d_k = d_model // 4
 
@@ -235,7 +215,7 @@ class ActorPolicy(nn.Module):
 
         self.w_k_entity = nn.Linear(d_model, self.d_k)
         self.w_k_move = nn.Linear(d_model, self.d_k)
-        self.entity_key_norm = nn.LayerNorm(self.d_k)
+        self.entity_key_norm = nn.RMSNorm(self.d_k)
 
         # fused query projector for the 4 query types
         # switch, move, pass, and team preview, with mega reusing the move query
@@ -244,14 +224,11 @@ class ActorPolicy(nn.Module):
 
         self.move_target_proj = nn.Sequential(
             nn.Linear(2 * self.d_k, self.d_k),
-            nn.GELU(),
-            nn.Linear(self.d_k, self.d_k),
-            nn.LayerNorm(self.d_k),
+            nn.RMSNorm(self.d_k),
         )
         self.tp_pair_proj = nn.Sequential(
-            nn.GELU(),
             nn.Linear(self.d_k, self.d_k),
-            nn.LayerNorm(self.d_k),
+            nn.RMSNorm(self.d_k),
         )
 
         self.mega_emb = nn.Parameter(torch.empty(self.d_k))
@@ -279,21 +256,18 @@ class ActorPolicy(nn.Module):
         self._init_weights()
 
     @torch.no_grad()
-    def _init_weights(self):
-        init.normal_(self.mega_emb, std=0.02)
+    def _init_weights(self) -> None:
+        initialize_module(self)
         for key in (
+            self.mega_emb,
             self.pass_key,
             self.struggle_key,
             self.target_self_key,
             self.tp_lead_role,
             self.tp_back_role,
         ):
-            init.normal_(key, std=1.0)
-            key.mul_(math.sqrt(self.d_k) / key.norm())
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                init.orthogonal_(module.weight, gain=1.0)
-                init.zeros_(module.bias)
+            nn.init.normal_(key, std=MODEL_INIT_STD)
+        self.reducer.encoder.reset_parameters()
 
     def _compute_keys(self, tokens_ctx: Tensor) -> Tensor:
         B = tokens_ctx.size(0)
@@ -793,7 +767,6 @@ class PolicyNet(nn.Module):
             config.nhead,
             config.reducer_layers,
             ACT_SIZE,
-            self.encoder.side_emb,
             dim_feedforward=config.dim_feedforward,
         )
 
@@ -803,7 +776,7 @@ class PolicyNet(nn.Module):
             config.d_model,
             config.nhead,
             config.dim_feedforward,
-            num_layers=2,
+            num_layers=1,
         )
 
     @property
@@ -839,7 +812,6 @@ class PolicyNet(nn.Module):
             memory.series_mask,
             memory.history_tokens,
             memory.history_mask,
-            memory.history_age_ids,
         )
         return PreparedDecision(encoded=encoded, reduced=reduced)
 

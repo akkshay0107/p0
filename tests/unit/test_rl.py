@@ -28,7 +28,7 @@ from p0.training.trajectory import (
     compute_gae_batch,
     prepare_trajectory_batches,
 )
-from p0.training.utils import amp_enabled
+from p0.training.utils import select_optimization_precision
 
 
 def test_compute_gae_batch_matches_single_episode_reference():
@@ -104,13 +104,12 @@ def test_battle_memory_keeps_the_whole_game_but_windows_the_reducer_inputs():
     # The end-of-game series summary compresses every decision.
     assert memory.step_counts.tolist() == [total]
 
-    history, mask, ages = memory.inputs(env_ids, torch.device("cpu"), torch.float32)
+    history, mask = memory.inputs(env_ids, torch.device("cpu"), torch.float32)
     # Reducer input shape is restricted to HISTORY_WINDOW
     assert history.shape == (1, HISTORY_WINDOW, 1)
     assert bool(mask.all())
     assert history[0, -1, 0].item() == float(total - 1)
     assert history[0, 0, 0].item() == float(total - HISTORY_WINDOW)
-    assert ages[0, -1].item() == 0
 
 
 def test_battle_memory_reports_explicit_overflow():
@@ -129,7 +128,7 @@ def test_battle_memory_gathers_independent_environment_windows():
     memory.append(torch.tensor([0, 1]), torch.tensor([[1.0], [10.0]]))
     memory.append(torch.tensor([1]), torch.tensor([[11.0]]))
 
-    history, mask, ages = memory.inputs(
+    history, mask = memory.inputs(
         torch.tensor([0, 1]),
         torch.device("cpu"),
         torch.float32,
@@ -138,8 +137,6 @@ def test_battle_memory_gathers_independent_environment_windows():
     assert mask.sum(dim=1).tolist() == [1, 2]
     assert history[0, -1, 0].item() == 1.0
     assert history[1, -2:, 0].tolist() == [10.0, 11.0]
-    assert ages[0, -1].item() == 0
-    assert ages[1, -2:].tolist() == [1, 0]
 
     memory.reset(0)
     assert memory.full_values(0) is None
@@ -304,14 +301,11 @@ def test_evaluation_confidence_intervals_and_matchup_serialization_are_determini
     assert serialized["per_team_results"][team_hash]["games"] == 5
 
 
-def test_pure_ppo_objective_clips_and_weights_team_preview() -> None:
-    """Verify PPO loss calculations with probability ratio clipping, value loss, and team preview loss multiplier."""
+def test_pure_ppo_objective_uses_symmetric_clipping() -> None:
+    """Verify conventional PPO ratio clipping and value loss."""
     config = TrainingConfig(
-        clip_low=0.2,
-        clip_high=0.2,
-        teampreview_loss_mult=2.0,
-        teampreview_alpha_mult=3.0,
-        residual_entropy_coef=0.0,
+        clip_range=0.2,
+        entropy_coef=0.0,
     )
     total, policy, value, ratio, log_ratio = compute_ppo_objective(
         torch.log(torch.tensor([2.0, 0.5])),
@@ -321,31 +315,27 @@ def test_pure_ppo_objective_clips_and_weights_team_preview() -> None:
         torch.zeros(2),
         torch.ones(2),
         torch.ones(2),
-        torch.tensor([True, False]),
         config,
         alpha=0.1,
     )
     assert total.shape == policy.shape == value.shape == ratio.shape == log_ratio.shape == (2,)
     assert ratio.tolist() == pytest.approx([2.0, 0.5])
     # For element 0: ratio=2.0, clipped to 1.2, adv=1.0 -> policy_loss = -1.2
-    # value_loss = (0 - 1)^2 = 1.0 -> total = 0.5 * 1.0 - 1.2 = -0.7 * 2.0 (team preview) = -1.4
+    # value_loss = (0 - 1)^2 = 1.0 -> total = 0.5 * 1.0 - 1.2 = -0.7
     # For element 1: ratio=0.5, clipped to 0.8, adv=1.0 -> policy_loss = -0.5 (min of unclipped=0.5, clipped=0.8)
     # value_loss = (1 - 1)^2 = 0.0 -> total = -0.5 (no team preview scaling)
     assert policy[0].item() == pytest.approx(-1.2)
     assert policy[1].item() == pytest.approx(-0.5)
-    assert total[0].item() == pytest.approx((config.value_coef * 1.0 - 1.2) * 2.0)
+    assert total[0].item() == pytest.approx(config.value_coef * 1.0 - 1.2)
     assert total[1].item() == pytest.approx(-0.5)
 
 
-def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
-    """Verify PPO objective clipping, value loss, KL penalty, entropy, and preview scaling."""
+def test_ppo_objective_matches_simple_reference() -> None:
+    """Verify symmetric PPO clipping, value loss, MMD penalty, and entropy bonus."""
     config = TrainingConfig(
-        clip_low=0.2,
-        clip_high=0.1,
+        clip_range=0.2,
         value_coef=0.5,
-        teampreview_loss_mult=3.0,
-        teampreview_alpha_mult=4.0,
-        residual_entropy_coef=0.2,
+        entropy_coef=0.2,
     )
     batch_size = 64
     generator = torch.Generator().manual_seed(20260807)
@@ -356,8 +346,6 @@ def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
     returns = torch.randn(batch_size, generator=generator)
     entropy = torch.rand(batch_size, generator=generator)
     kl = torch.rand(batch_size, generator=generator)
-    preview = torch.rand(batch_size, generator=generator) > 0.75
-
     total, policy, value, ratio, log_ratio = compute_ppo_objective(
         current_log_probs,
         values,
@@ -366,29 +354,22 @@ def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
         old_log_probs,
         advantages,
         returns,
-        preview,
         config,
         alpha=0.3,
     )
     expected_ratio = torch.exp(current_log_probs - old_log_probs)
-    expected_clipped = torch.clamp(expected_ratio, 1.0 - config.clip_low, 1.0 + config.clip_high)
+    expected_clipped = torch.clamp(
+        expected_ratio,
+        1.0 - config.clip_range,
+        1.0 + config.clip_range,
+    )
     expected_policy = -torch.minimum(
         expected_ratio * advantages,
         expected_clipped * advantages,
     )
     expected_value = (values - returns).square()
-    expected_total = config.value_coef * expected_value
-    expected_total = (
-        expected_total
-        + expected_policy
-        + 0.3 * torch.where(preview, config.teampreview_alpha_mult, 1.0) * kl
-    )
-    expected_total = expected_total - config.residual_entropy_coef * entropy
-    expected_total = torch.where(
-        preview,
-        expected_total * config.teampreview_loss_mult,
-        expected_total,
-    )
+    expected_total = expected_policy + config.value_coef * expected_value + 0.3 * kl
+    expected_total = expected_total - config.entropy_coef * entropy
     torch.testing.assert_close(ratio, expected_ratio)
     torch.testing.assert_close(log_ratio, current_log_probs - old_log_probs)
     torch.testing.assert_close(policy, expected_policy)
@@ -396,10 +377,27 @@ def test_ppo_objective_matches_reference_clipping_and_preview_weights() -> None:
     torch.testing.assert_close(total, expected_total)
 
 
-def test_ppo_amp_is_cuda_only() -> None:
-    """Verify mixed precision AMP is active only when CUDA devices are present and enabled in TrainingConfig."""
-    config = TrainingConfig(enable_optim=True)
-
-    assert not amp_enabled(config, torch.device("cpu"))
-    assert amp_enabled(config, torch.device("cuda"))
-    assert not amp_enabled(TrainingConfig(enable_optim=False), torch.device("cuda"))
+def test_optimization_precision_waterfall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify BF16, FP16, and FP32 are selected in preference order."""
+    assert select_optimization_precision(True, torch.device("cpu")) == (
+        torch.float32,
+        False,
+        False,
+    )
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    assert select_optimization_precision(True, torch.device("cuda")) == (
+        torch.bfloat16,
+        True,
+        False,
+    )
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    assert select_optimization_precision(True, torch.device("cuda")) == (
+        torch.float16,
+        True,
+        True,
+    )
+    assert select_optimization_precision(False, torch.device("cuda")) == (
+        torch.float32,
+        False,
+        False,
+    )

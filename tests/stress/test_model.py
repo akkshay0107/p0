@@ -164,7 +164,6 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
         (batch_size, HISTORY_WINDOW, stress_policy.d_model), generator=generator
     ).to(stress_device)
     history_mask = torch.ones((batch_size, HISTORY_WINDOW), dtype=torch.bool, device=stress_device)
-    history_age_ids = torch.arange(HISTORY_WINDOW, device=stress_device).expand(batch_size, -1)
     prior_games = [
         [
             torch.randn((HISTORY_WINDOW, stress_policy.d_model), generator=generator).to(
@@ -184,7 +183,6 @@ def test_policy_handles_empty_and_maximum_memory_inputs(
             series_mask,
             history,
             history_mask,
-            history_age_ids,
         )
         encoded = stress_policy.encode(observation, action_mask)
         acted = stress_policy.act(stress_policy.prepare(encoded, memory), action_mask)

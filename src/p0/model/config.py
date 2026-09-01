@@ -38,10 +38,10 @@ class ModelConfig:
     @classmethod
     def baseline(cls) -> ModelConfig:
         return cls(
-            d_model=512,
+            d_model=384,
             nhead=8,
-            reducer_layers=5,
-            dim_feedforward=2048,
+            reducer_layers=8,
+            dim_feedforward=1536,
         )
 
     def to_dict(self) -> dict[str, int | bool]:

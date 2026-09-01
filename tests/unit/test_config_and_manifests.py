@@ -159,8 +159,9 @@ teams:
 def test_model_config_is_checkpoint_local_and_validated() -> None:
     """Verify ModelConfig enforces divisibility requirements (d_model % nhead == 0)."""
     config = ModelConfig.baseline()
-    assert config.d_model == 512
-    assert config.dim_feedforward == 2048
+    assert config.d_model == 384
+    assert config.reducer_layers == 8
+    assert config.dim_feedforward == 1536
     with pytest.raises(ValueError, match="divisible"):
         ModelConfig(63, 8, 1, 256)
 
@@ -285,7 +286,7 @@ def test_artifact_validation_uses_only_the_active_global_contract() -> None:
 def test_model_config_has_only_scaling_fields() -> None:
     """Verify ModelConfig accepts valid scaling architectures and rejects deprecated or incompatible parameters."""
     config = ModelConfig.baseline()
-    assert config.dim_feedforward == 2048
+    assert config.dim_feedforward == 1536
     assert ModelConfig.from_dict(config.to_dict()) == config
     enabled = ModelConfig(
         d_model=64,

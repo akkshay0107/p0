@@ -37,6 +37,7 @@ from p0.training._bc_metrics import (
 )
 from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
 from p0.training.config import BCConfig
+from p0.training.utils import select_optimization_precision
 
 
 def _expand_team_preview_orbits(
@@ -137,8 +138,8 @@ class BCTrainer:
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
-        self.amp_enabled = config.amp and self.device.type == "cuda"
-        self.scaler = GradScaler(device=self.device.type, enabled=self.amp_enabled)
+        self.precision = select_optimization_precision(config.enable_optim, self.device)
+        self.scaler = GradScaler(device=self.device.type, enabled=self.precision.grad_scaler)
         self.checkpoint_store = checkpoint_store
         self.provenance = dict(provenance or {})
         self.batch_decisions = config.batch_decisions
@@ -280,7 +281,6 @@ class BCTrainer:
         history_indices = batch.history_indices.to(self.device)
         history_mask = batch.history_mask.to(self.device)
         history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
-        history_age_ids = batch.history_age_ids.to(self.device)
         candidate_values = batch.candidate_values.to(self.device)
         candidate_offsets = batch.candidate_offsets.to(self.device)
         candidate_values, candidate_offsets = _expand_team_preview_orbits(
@@ -298,7 +298,6 @@ class BCTrainer:
             series_mask=series_context.mask,
             history_tokens=history_tokens,
             history_mask=history_mask,
-            history_age_ids=history_age_ids,
         )
         return _PreparedBCBatch(
             prepared=self.policy.prepare(target_encoded, memory),
@@ -344,7 +343,7 @@ class BCTrainer:
                 "Non-finite BC gradient norm detected; discarding the accumulated update "
                 f"(loss scale={previous_scale:.0f})"
             )
-            if self.amp_enabled:
+            if self.precision.grad_scaler:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
@@ -391,7 +390,11 @@ class BCTrainer:
         labeled_count = labeled_cpu.sum()
         loss_weight = batch.loss_mask.sum()
         loss_mask = batch.loss_mask.to(self.device)
-        with autocast(device_type=self.device.type, enabled=self.amp_enabled):
+        with autocast(
+            device_type=self.device.type,
+            enabled=self.precision.autocast,
+            dtype=self.precision.dtype,
+        ):
             (
                 log_probs,
                 value_predictions,

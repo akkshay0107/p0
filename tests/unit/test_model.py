@@ -101,6 +101,18 @@ def _tiny_policy() -> PolicyNet:
     return build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
 
 
+def test_policy_uses_rmsnorm_and_only_explicit_position_tables(policy: PolicyNet) -> None:
+    """Verify the simplified baseline has one documented table per fixed semantic layout."""
+    assert any(isinstance(module, torch.nn.RMSNorm) for module in policy.modules())
+    assert not any(isinstance(module, torch.nn.LayerNorm) for module in policy.modules())
+    assert policy.encoder.move_pos_emb.num_embeddings == 4
+    assert policy.encoder.entity_position_emb.num_embeddings == SEQUENCE_LENGTH
+    assert policy.encoder.event_slot_emb.num_embeddings == SPATIAL_SLOT_COUNT
+    assert policy.actor.reducer.memory_position_emb.num_embeddings == REDUCER_MAX_LENGTH
+    assert not hasattr(policy.actor.reducer, "history_age_emb")
+    assert not hasattr(policy.actor.reducer, "segment_emb")
+
+
 def _batch(
     policy: PolicyNet, batch_size: int = 3
 ) -> tuple[StructuredObservation, torch.Tensor, torch.Tensor]:
@@ -268,7 +280,6 @@ def test_reducer_detaches_history_but_keeps_current_summary_trainable() -> None:
     series = torch.zeros(2, SERIES_SLOTS, 32)
     series_mask = torch.zeros(2, SERIES_SLOTS, dtype=torch.bool)
     history_mask = torch.ones(2, HISTORY_WINDOW, dtype=torch.bool)
-    ages = torch.arange(HISTORY_WINDOW - 1, -1, -1).expand(2, -1)
 
     output = reducer.reduce(
         local_summary,
@@ -277,7 +288,6 @@ def test_reducer_detaches_history_but_keeps_current_summary_trainable() -> None:
         series_mask,
         history,
         history_mask,
-        ages,
     )
     output.cls.square().mean().backward()
 
@@ -407,7 +417,6 @@ def test_memory_reducer_pokemon_tokens_alignment() -> None:
     series_mask = torch.zeros(2, SERIES_SLOTS, dtype=torch.bool)
     history = torch.zeros(2, 48, 32)
     history_mask = torch.zeros(2, 48, dtype=torch.bool)
-    ages = torch.zeros(2, 48, dtype=torch.long)
     reduced = reducer.reduce(
         reducer.local_summary(current),
         current,
@@ -415,7 +424,6 @@ def test_memory_reducer_pokemon_tokens_alignment() -> None:
         series_mask,
         history,
         history_mask,
-        ages,
     )
     assert reduced.pokemon.shape == (2, 12, 32)
 
@@ -578,7 +586,6 @@ def test_singleton_candidate_scores_match_standard_joint_scoring(policy: PolicyN
                             memory.series_mask[index : index + 1],
                             memory.history_tokens[index : index + 1],
                             memory.history_mask[index : index + 1],
-                            memory.history_age_ids[index : index + 1],
                         ),
                     ),
                     action_mask[index : index + 1],
@@ -603,7 +610,6 @@ def test_reducer_rejects_a_local_summary_that_does_not_match_the_batch(policy: P
             memory.series_mask,
             memory.history_tokens,
             memory.history_mask,
-            memory.history_age_ids,
         )
     with pytest.raises(ValueError, match="local summary"):
         policy.actor.reducer.reduce(
@@ -613,7 +619,6 @@ def test_reducer_rejects_a_local_summary_that_does_not_match_the_batch(policy: P
             memory.series_mask,
             memory.history_tokens,
             memory.history_mask,
-            memory.history_age_ids,
         )
 
 
@@ -810,7 +815,6 @@ def test_magnet_kl_loss_sign_increases_with_divergence() -> None:
         old_log_probs=torch.zeros(2),
         advantages=torch.ones(2),
         returns=torch.zeros(2),
-        team_preview=torch.tensor([False, False]),
         config=config,
     )
     low, *_ = compute_ppo_objective(magnet_kl=torch.zeros(2), alpha=0.5, **common)
@@ -898,7 +902,6 @@ def test_reducer_uses_fixed_padding_only_memory_attention() -> None:
     series_mask[1, :4] = True
     history = torch.randn(2, HISTORY_WINDOW, 32)
     history_mask = torch.zeros(2, HISTORY_WINDOW, dtype=torch.bool)
-    ages = torch.zeros(2, HISTORY_WINDOW, dtype=torch.long)
     first = reducer.reduce(
         reducer.local_summary(current),
         current,
@@ -906,7 +909,6 @@ def test_reducer_uses_fixed_padding_only_memory_attention() -> None:
         series_mask,
         history,
         history_mask,
-        ages,
     )
 
     # Mutating unmasked padding tokens must not change reduced CLS token
@@ -919,7 +921,6 @@ def test_reducer_uses_fixed_padding_only_memory_attention() -> None:
         series_mask,
         history,
         history_mask,
-        ages,
     )
     torch.testing.assert_close(first.cls, second.cls)
 
@@ -935,7 +936,6 @@ def test_reducer_uses_fixed_padding_only_memory_attention() -> None:
         series_mask,
         changed_valid_history,
         changed_mask,
-        ages,
     )
     assert not torch.allclose(first.cls[1], third.cls[1])
     assert first.pokemon.shape == (2, 12, 32)
@@ -943,7 +943,7 @@ def test_reducer_uses_fixed_padding_only_memory_attention() -> None:
 
 
 def test_local_history_summary_is_independent_of_prior_memory_and_window_is_sliding() -> None:
-    """Verify local history token calculation depends strictly on current turn tokens and pack_history_tokens assigns relative age IDs."""
+    """Verify local summaries use only the current turn and history packing is right-aligned."""
     torch.manual_seed(1)
     reducer = MemoryReducer(32, 4, 1, 64)
     current = torch.randn(1, CURRENT_TOKEN_COUNT, 32)
@@ -954,14 +954,13 @@ def test_local_history_summary_is_independent_of_prior_memory_and_window_is_slid
     all_history = torch.arange((HISTORY_WINDOW + 3) * 32, dtype=torch.float32).reshape(
         1, HISTORY_WINDOW + 3, 32
     )
-    packed, mask, ages = pack_history_tokens(all_history[:, -HISTORY_WINDOW:])
+    packed, mask = pack_history_tokens(all_history[:, -HISTORY_WINDOW:])
     assert packed.shape == (1, HISTORY_WINDOW, 32)
     assert mask.all()
-    assert ages[0, 0] == HISTORY_WINDOW - 1 and ages[0, -1] == 0
 
 
-def test_policy_exposes_24_current_tokens_and_immutable_history_token(policy: PolicyNet) -> None:
-    """Verify encoder outputs 24 current turn tokens (12 Pokemon + 3 Field + 8 Pooled Events + 1 Action) and 1 history token."""
+def test_policy_exposes_fixed_current_tokens_and_immutable_history_token(policy: PolicyNet) -> None:
+    """Verify encoder and local-history outputs follow the fixed token contracts."""
     obs = StructuredObservation.empty_batch(2)
     mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool)
     encoded = policy.encode(obs, mask)

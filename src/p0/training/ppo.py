@@ -18,7 +18,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.trajectory import TrajectoryBatch
-from p0.training.utils import amp_enabled
+from p0.training.utils import select_optimization_precision
 
 
 def magnet_kl_per_step(live_logits: torch.Tensor, magnet_logits: torch.Tensor) -> torch.Tensor:
@@ -42,7 +42,6 @@ def compute_ppo_objective(
     old_log_probs: torch.Tensor,
     advantages: torch.Tensor,
     returns: torch.Tensor,
-    team_preview: torch.Tensor,
     config: TrainingConfig,
     *,
     alpha: float,
@@ -52,23 +51,12 @@ def compute_ppo_objective(
     ratio = torch.exp(log_ratio)
 
     unclipped = ratio * advantages
-    clipped = torch.clamp(ratio, 1.0 - config.clip_low, 1.0 + config.clip_high) * advantages
+    clipped = torch.clamp(ratio, 1.0 - config.clip_range, 1.0 + config.clip_range) * advantages
     policy_loss = -torch.min(unclipped, clipped)
 
     value_loss = F.mse_loss(current_values, returns, reduction="none")
-    total = config.value_coef * value_loss
-
-    alpha_scale = alpha * torch.where(team_preview.reshape(-1), config.teampreview_alpha_mult, 1.0)
-    total = total + policy_loss + alpha_scale * magnet_kl
-
-    if config.residual_entropy_coef > 0.0:
-        total = total - config.residual_entropy_coef * normalized_entropy
-
-    total = torch.where(
-        team_preview.reshape(-1),
-        total * config.teampreview_loss_mult,
-        total,
-    )
+    total = policy_loss + config.value_coef * value_loss + alpha * magnet_kl
+    total = total - config.entropy_coef * normalized_entropy
 
     return total, policy_loss, value_loss, ratio, log_ratio
 
@@ -140,11 +128,6 @@ def _build_memory_inputs(
     history_mask = history_indices >= episode_starts[:, None]
     history_indices = history_indices.clamp_min(0)
     history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
-    history_age_ids = torch.where(
-        history_mask,
-        torch.arange(HISTORY_WINDOW - 1, -1, -1, device=device)[None, :],
-        torch.zeros_like(history_indices),
-    )
     decision_count = encoded.tokens.size(0)
     if episodes and all(ep.series_tokens is not None for ep in episodes):
         series_tokens = torch.cat(
@@ -169,7 +152,6 @@ def _build_memory_inputs(
         series_mask=series_mask,
         history_tokens=history_tokens,
         history_mask=history_mask,
-        history_age_ids=history_age_ids,
     )
 
 
@@ -184,11 +166,13 @@ def _compute_magnet_logits(
     action_masks = torch.cat([episode.action_masks for episode in episodes], dim=0)
     actions = torch.cat([episode.actions for episode in episodes], dim=0)
 
+    precision = select_optimization_precision(config.enable_optim, device)
     with (
         torch.inference_mode(),
         autocast(
             device_type=device.type,
-            enabled=amp_enabled(config, device),
+            enabled=precision.autocast,
+            dtype=precision.dtype,
         ),
     ):
         encoded = magnet.policy.encode(observations, action_masks)
@@ -256,9 +240,13 @@ def _run_batched_ppo(
 
     all_obs = StructuredObservation.cat([ep.observations for ep in episodes], dim=0)
     all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0)
-    use_amp = amp_enabled(config, device)
+    precision = select_optimization_precision(config.enable_optim, device)
 
-    with autocast(device_type=device.type, enabled=use_amp):
+    with autocast(
+        device_type=device.type,
+        enabled=precision.autocast,
+        dtype=precision.dtype,
+    ):
         all_enc = policy.encode(all_obs, all_action_masks)
 
     actions = torch.cat([ep.actions for ep in episodes])
@@ -287,7 +275,11 @@ def _run_batched_ppo(
         "kl_div": torch.tensor(0.0, device=device),
         "clip_frac": torch.tensor(0.0, device=device),
     }
-    with autocast(device_type=device.type, enabled=use_amp):
+    with autocast(
+        device_type=device.type,
+        enabled=precision.autocast,
+        dtype=precision.dtype,
+    ):
         out = policy.evaluate(
             policy.prepare(all_enc, live_memory),
             all_action_masks,
@@ -302,7 +294,6 @@ def _run_batched_ppo(
             old_log_probs,
             advantages,
             returns,
-            all_enc.phase,
             config,
             alpha=alpha,
         )
@@ -317,7 +308,7 @@ def _run_batched_ppo(
         metrics["magnet_kl"] = magnet_kl.sum()
         metrics["kl_div"] = ((ratio - 1) - log_ratio).sum()
         metrics["clip_frac"] = (
-            ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high)).float().sum()
+            ((ratio < 1 - config.clip_range) | (ratio > 1 + config.clip_range)).float().sum()
         )
 
     return total_loss, metrics, total_steps

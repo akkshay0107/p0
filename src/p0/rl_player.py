@@ -275,7 +275,7 @@ class RLPlayer(TeamPlayerMixin, Player):
             else history.recent_values(self._empty_history_tensor)
         )
 
-        history_tokens, history_mask, history_age_ids = pack_history_tokens(values)
+        history_tokens, history_mask = pack_history_tokens(values)
 
         series_key = self._series_for_battle(battle).key
         series_tokens, series_mask = self._series_store.get_tokens(
@@ -286,7 +286,6 @@ class RLPlayer(TeamPlayerMixin, Player):
             series_mask=series_mask,
             history_tokens=history_tokens,
             history_mask=history_mask,
-            history_age_ids=history_age_ids,
         )
 
     def _append_history(self, battle: DoubleBattle, token: torch.Tensor) -> None:

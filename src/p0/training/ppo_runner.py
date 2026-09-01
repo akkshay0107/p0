@@ -26,7 +26,13 @@ from p0.training.magnet import Magnet
 from p0.training.ppo import PPOUpdater
 from p0.training.rollout import RolloutCollector
 from p0.training.trainer import PPOTrainer
-from p0.training.utils import PPOScheduler, adamw_param_groups, default_device, seed_everything
+from p0.training.utils import (
+    PPOScheduler,
+    adamw_param_groups,
+    default_device,
+    seed_everything,
+    select_optimization_precision,
+)
 from p0.training.vector_env import ThreadVecEnv
 
 
@@ -127,9 +133,8 @@ def run_training(
         policy = build_policy(ModelConfig.baseline(), resources).to(device)
 
     optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
-    scaler = GradScaler(
-        "cuda", enabled=training.enable_optim and device.type == "cuda", init_scale=512.0
-    )
+    precision = select_optimization_precision(training.enable_optim, device)
+    scaler = GradScaler(device.type, enabled=precision.grad_scaler)
     magnet = Magnet(policy)
     scheduler = PPOScheduler(training)
     resume_environment_state: object | None = None
