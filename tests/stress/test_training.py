@@ -113,90 +113,94 @@ def _prepared_cases(
     return rewards, values, dones, bootstraps
 
 
-@pytest.mark.stress
-@settings(max_examples=32, deadline=None)
-@given(case=_gae_cases())
-def test_gae_matches_independent_reference_for_generated_batches(
-    case: tuple[torch.Tensor, ...],
-) -> None:
-    """Check vectorized GAE across generated lengths, terminals, and truncations."""
-    rewards, values, dones, lengths, bootstraps = case
-    gamma, gae_lambda = 0.97, 0.91
+class TestTraining:
+    @pytest.mark.stress
+    @settings(max_examples=32, deadline=None)
+    @given(case=_gae_cases())
+    def test_gae_matches_independent_reference_for_generated_batches(
+        self,
+        case: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Check vectorized GAE across generated lengths, terminals, and truncations."""
+        rewards, values, dones, lengths, bootstraps = case
+        gamma, gae_lambda = 0.97, 0.91
 
-    actual = compute_gae_batch(rewards, values, dones, lengths, gamma, gae_lambda, bootstraps)
-    expected = torch.zeros_like(actual)
-    for index, length in enumerate(lengths.tolist()):
-        expected[index, :length] = torch.tensor(
-            _reference_gae(
-                rewards[index, :length].tolist(),
-                values[index, :length].tolist(),
-                dones[index, :length].tolist(),
-                float(bootstraps[index]),
-                gamma,
-                gae_lambda,
+        actual = compute_gae_batch(rewards, values, dones, lengths, gamma, gae_lambda, bootstraps)
+        expected = torch.zeros_like(actual)
+        for index, length in enumerate(lengths.tolist()):
+            expected[index, :length] = torch.tensor(
+                _reference_gae(
+                    rewards[index, :length].tolist(),
+                    values[index, :length].tolist(),
+                    dones[index, :length].tolist(),
+                    float(bootstraps[index]),
+                    gamma,
+                    gae_lambda,
+                )
             )
-        )
 
-    torch.testing.assert_close(actual, expected)
-    active = torch.arange(rewards.size(1)).expand(rewards.size(0), -1) < lengths.unsqueeze(1)
-    assert not actual[~active].any()
+        torch.testing.assert_close(actual, expected)
+        active = torch.arange(rewards.size(1)).expand(rewards.size(0), -1) < lengths.unsqueeze(1)
+        assert not actual[~active].any()
 
-
-@pytest.mark.stress
-@settings(max_examples=32, deadline=None)
-@given(case=_prepared_cases())
-def test_prepared_training_batches_keep_returns_and_normalize_active_steps(
-    case: tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor],
-) -> None:
-    """Check global advantage normalization while preserving trajectory-local returns."""
-    rewards, values, dones, bootstraps = case
-    trajectories = [
-        CollectedTrajectory(
-            observations=StructuredObservation.empty_batch(reward.numel()),
-            action_masks=torch.ones((reward.numel(), 2, 49), dtype=torch.bool),
-            actions=torch.zeros((reward.numel(), 2), dtype=torch.long),
-            log_probs=torch.zeros(reward.numel()),
-            values=value,
-            rewards=reward,
-            dones=done,
-            length=reward.numel(),
-            bootstrap_value=float(bootstrap),
-            series_history=(),
-        )
-        for reward, value, done, bootstrap in zip(rewards, values, dones, bootstraps, strict=True)
-    ]
-
-    gamma, gae_lambda = 0.99, 0.95
-    raw_advantages = [
-        torch.tensor(
-            _reference_gae(
-                reward.tolist(),
-                value.tolist(),
-                done.tolist(),
-                trajectory.bootstrap_value,
-                gamma,
-                gae_lambda,
+    @pytest.mark.stress
+    @settings(max_examples=32, deadline=None)
+    @given(case=_prepared_cases())
+    def test_prepared_training_batches_keep_returns_and_normalize_active_steps(
+        self,
+        case: tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor],
+    ) -> None:
+        """Check global advantage normalization while preserving trajectory-local returns."""
+        rewards, values, dones, bootstraps = case
+        trajectories = [
+            CollectedTrajectory(
+                observations=StructuredObservation.empty_batch(reward.numel()),
+                action_masks=torch.ones((reward.numel(), 2, 49), dtype=torch.bool),
+                actions=torch.zeros((reward.numel(), 2), dtype=torch.long),
+                log_probs=torch.zeros(reward.numel()),
+                values=value,
+                rewards=reward,
+                dones=done,
+                length=reward.numel(),
+                bootstrap_value=float(bootstrap),
+                series_history=(),
             )
-        )
-        for trajectory, reward, value, done in zip(
-            trajectories, rewards, values, dones, strict=True
-        )
-    ]
-    raw_flat = torch.cat(raw_advantages)
-    mean = raw_flat.mean()
-    std = raw_flat.std(unbiased=False).clamp_min(1e-8)
+            for reward, value, done, bootstrap in zip(
+                rewards, values, dones, bootstraps, strict=True
+            )
+        ]
 
-    prepared = prepare_trajectory_batches(
-        trajectories,
-        torch.device("cpu"),
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-    )
-    actual_advantages = torch.cat([batch.advantages for batch in prepared])
-    torch.testing.assert_close(actual_advantages, (raw_flat - mean) / std)
-    for batch, raw_advantage, value in zip(prepared, raw_advantages, values, strict=True):
-        torch.testing.assert_close(batch.returns, raw_advantage + value)
-        assert batch.length == len(batch.rewards)
-    assert sum(batch.length for batch in prepared) == sum(
-        trajectory.length for trajectory in trajectories
-    )
+        gamma, gae_lambda = 0.99, 0.95
+        raw_advantages = [
+            torch.tensor(
+                _reference_gae(
+                    reward.tolist(),
+                    value.tolist(),
+                    done.tolist(),
+                    trajectory.bootstrap_value,
+                    gamma,
+                    gae_lambda,
+                )
+            )
+            for trajectory, reward, value, done in zip(
+                trajectories, rewards, values, dones, strict=True
+            )
+        ]
+        raw_flat = torch.cat(raw_advantages)
+        mean = raw_flat.mean()
+        std = raw_flat.std(unbiased=False).clamp_min(1e-8)
+
+        prepared = prepare_trajectory_batches(
+            trajectories,
+            torch.device("cpu"),
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+        )
+        actual_advantages = torch.cat([batch.advantages for batch in prepared])
+        torch.testing.assert_close(actual_advantages, (raw_flat - mean) / std)
+        for batch, raw_advantage, value in zip(prepared, raw_advantages, values, strict=True):
+            torch.testing.assert_close(batch.returns, raw_advantage + value)
+            assert batch.length == len(batch.rewards)
+        assert sum(batch.length for batch in prepared) == sum(
+            trajectory.length for trajectory in trajectories
+        )

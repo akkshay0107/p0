@@ -70,47 +70,48 @@ class _ReplayHttpServer:
         return 200, body
 
 
-@pytest.mark.stress
-def test_replay_fetcher_retries_caches_and_resumes_many_ids(tmp_path: Path) -> None:
-    """Stress ReplayFetcher through a real local HTTP service and resumable disk cache."""
-    format_id = "gen9stress"
-    count = stress_count("P0_STRESS_FETCH_REPLAYS", 1000)
-    replay_ids = tuple(f"{format_id}-{index}" for index in range(count))
-    rng = stress_rng()
-    retry_ids = {
-        replay_ids[0],
-        *(replay_id for replay_id in replay_ids[1:] if rng.randrange(17) == 0),
-    }
+class TestReplayFetcher:
+    @pytest.mark.stress
+    def test_replay_fetcher_retries_caches_and_resumes_many_ids(self, tmp_path: Path) -> None:
+        """Stress ReplayFetcher through a real local HTTP service and resumable disk cache."""
+        format_id = "gen9stress"
+        count = stress_count("P0_STRESS_FETCH_REPLAYS", 1000)
+        replay_ids = tuple(f"{format_id}-{index}" for index in range(count))
+        rng = stress_rng()
+        retry_ids = {
+            replay_ids[0],
+            *(replay_id for replay_id in replay_ids[1:] if rng.randrange(17) == 0),
+        }
 
-    with _ReplayHttpServer(retry_ids) as server:
-        config = ScrapeConfig(
-            format_id=format_id,
-            cache_dir=tmp_path,
-            replay_url_template=f"http://127.0.0.1:{server.port}/{{replay_id}}.json",
-            concurrency=stress_count("P0_STRESS_FETCH_CONCURRENCY", 16),
-            retries=3,
-            backoff_seconds=0,
-            rate_limit_per_second=0,
-            limit_games=count,
-        )
-        fetcher = ReplayFetcher(config)
-        entries = fetcher.acquire(replay_ids)
+        with _ReplayHttpServer(retry_ids) as server:
+            config = ScrapeConfig(
+                format_id=format_id,
+                cache_dir=tmp_path,
+                replay_url_template=f"http://127.0.0.1:{server.port}/{{replay_id}}.json",
+                concurrency=stress_count("P0_STRESS_FETCH_CONCURRENCY", 16),
+                retries=3,
+                backoff_seconds=0,
+                rate_limit_per_second=0,
+                limit_games=count,
+            )
+            fetcher = ReplayFetcher(config)
+            entries = fetcher.acquire(replay_ids)
 
-        assert [entry.replay_id for entry in entries] == sorted(replay_ids)
-        assert all(
-            server.calls.count(replay_id) == (2 if replay_id in retry_ids else 1)
-            for replay_id in replay_ids
-        )
-        assert len(server.calls) == count + len(retry_ids)
+            assert [entry.replay_id for entry in entries] == sorted(replay_ids)
+            assert all(
+                server.calls.count(replay_id) == (2 if replay_id in retry_ids else 1)
+                for replay_id in replay_ids
+            )
+            assert len(server.calls) == count + len(retry_ids)
 
-        first_index = fetcher.index_path.read_bytes()
-        raw_path = tmp_path / format_id / "raw" / f"{format_id}-1.json.gz"
-        first_raw = load_raw_replay(raw_path)
-        assert gzip.decompress(raw_path.read_bytes()) == first_raw
-        assert json.loads(first_raw)["log"] == [f"|turn|{format_id}-1"]
+            first_index = fetcher.index_path.read_bytes()
+            raw_path = tmp_path / format_id / "raw" / f"{format_id}-1.json.gz"
+            first_raw = load_raw_replay(raw_path)
+            assert gzip.decompress(raw_path.read_bytes()) == first_raw
+            assert json.loads(first_raw)["log"] == [f"|turn|{format_id}-1"]
 
-        resumed = ReplayFetcher(config).acquire(replay_ids)
-        assert resumed == entries
-        assert fetcher.index_path.read_bytes() == first_index
-        assert len(server.calls) == count + len(retry_ids)
-        assert len(read_fetch_index(fetcher.index_path)) == count
+            resumed = ReplayFetcher(config).acquire(replay_ids)
+            assert resumed == entries
+            assert fetcher.index_path.read_bytes() == first_index
+            assert len(server.calls) == count + len(retry_ids)
+            assert len(read_fetch_index(fetcher.index_path)) == count

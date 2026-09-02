@@ -35,11 +35,15 @@ def seed_everything(seed: int) -> None:
 def select_optimization_precision(
     enable_optim: bool,
     device: torch.device,
+    *,
+    bf16_supported: bool | None = None,
 ) -> OptimizationPrecision:
     """Prefer BF16, then FP16, and fall back to FP32 on unsupported devices."""
     if not enable_optim or device.type != "cuda":
         return OptimizationPrecision(torch.float32, False, False)
-    if torch.cuda.is_bf16_supported():
+    if bf16_supported is None:
+        bf16_supported = torch.cuda.is_bf16_supported()
+    if bf16_supported:
         return OptimizationPrecision(torch.bfloat16, True, False)
     return OptimizationPrecision(torch.float16, True, True)
 

@@ -12,6 +12,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from p0.format_config import FORMAT
 from p0.model.resources import default_runtime_resources
 from p0.teams.stat_points import StatPoints
@@ -391,24 +393,49 @@ def stress_random_bo3_payloads(
     return tuple(payloads)
 
 
-def stress_int(name: str, default: int, *, minimum: int = 1) -> int:
+def stress_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    raw_value: str | None = None,
+) -> int:
     """Read a positive integer stress-test control from the environment."""
-    value = int(os.getenv(name, str(default)))
+    configured_value = os.getenv(name, str(default)) if raw_value is None else raw_value
+    value = int(configured_value)
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}, got {value}")
     return value
 
 
-def stress_batch_sizes() -> tuple[int, ...]:
+def stress_batch_sizes(raw_value: str | None = None) -> tuple[int, ...]:
     """Return configured model batch sizes, preserving declaration order."""
-    values = tuple(
-        int(value.strip())
-        for value in os.getenv("P0_STRESS_BATCHES", "1,8,32").split(",")
-        if value.strip()
-    )
+    configured_value = os.getenv("P0_STRESS_BATCHES", "1,8,32") if raw_value is None else raw_value
+    values = tuple(int(value.strip()) for value in configured_value.split(",") if value.strip())
     if not values or any(value < 1 for value in values):
         raise ValueError("P0_STRESS_BATCHES must contain positive integers")
     return tuple(dict.fromkeys(values))
+
+
+def stress_devices(raw_value: str | None = None) -> tuple[torch.device, ...]:
+    """Return requested stress-test devices, filtering unavailable CUDA and duplicates."""
+    configured_value = (
+        os.getenv("P0_STRESS_DEVICES", "cpu,cuda") if raw_value is None else raw_value
+    )
+    requested = tuple(
+        value.strip().lower() for value in configured_value.split(",") if value.strip()
+    )
+    devices: list[torch.device] = []
+    for name in requested:
+        if name == "cpu":
+            devices.append(torch.device("cpu"))
+        elif name == "cuda" and torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        elif name != "cuda":
+            raise ValueError(f"Unsupported stress-test device {name!r}")
+    if not devices:
+        return (torch.device("cpu"),)
+    return tuple(dict.fromkeys(devices))
 
 
 def stress_repetitions(default: int = 32) -> int:

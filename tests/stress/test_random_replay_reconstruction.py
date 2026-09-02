@@ -767,6 +767,12 @@ def _assert_poke_env_state_agreement(
                         f"Active slot {slot} disagrees at line {line.index}"
                     )
                     continue
+                # poke-env keys active Pokémon by their displayed species and
+                # cannot disambiguate two simultaneous identical Illusion
+                # disguises. Keep parsing and slot-occupancy checks, but do not
+                # compare mutable fields for the unrevealed actual member.
+                if not reconstructed.revealed:
+                    continue
                 assert mon.fainted == reconstructed.fainted
                 assert mon.current_hp_fraction == pytest.approx(
                     reconstructed.current_hp_fraction, abs=0.02
@@ -866,146 +872,149 @@ def _assert_decision_boundaries_partition_the_log(
     assert cursor <= len(document.protocol_lines)
 
 
-@pytest.mark.integration
-@pytest.mark.stress
-@pytest.mark.asyncio
-async def test_random_local_games_reconstruct_to_valid_tensors(
-    showdown_server, tmp_path: Path
-) -> None:
-    """
-    End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
+class TestRandomReplayReconstruction:
+    @pytest.mark.integration
+    @pytest.mark.stress
+    @pytest.mark.asyncio
+    async def test_random_local_games_reconstruct_to_valid_tensors(
+        self, showdown_server, tmp_path: Path
+    ) -> None:
+        """
+        End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
 
-    Verifies that:
-    1. 100+ random live battles run concurrently against a local Showdown server.
-    2. Spliced replay documents capture all turns with valid terminal line indices.
-    3. Reconstructed observations match ground truth live captured tensors at exact line boundaries.
-    4. Offline reconstructed state machines perfectly agree with poke-env active pokemon/field state.
-    5. Reconstructed action candidates encapsulate the actual live chosen actions.
-    6. Shard compilation produces valid training tensors with correct loss mask semantics:
-       - UNKNOWN label kinds have loss_mask == 0 (excluded from policy gradient / imitation loss)
-       - EXACT and PARTIAL label kinds have loss_mask > 0 (included in loss calculation).
-    """
-    seed = int(os.getenv("P0_STRESS_SEED", "20260802"))
-    game_count = _stress_game_count()
-    concurrency = _stress_concurrency()
-    replay_dir = tmp_path / "local-replays"
-    observation_dir = tmp_path / "live-observations"
-    resources = default_runtime_resources()
-    builder = ObservationBuilder(resources)
-    max_candidates = stress_count("P0_STRESS_MAX_CANDIDATES", 256)
-    team_source = _random_team_source(
-        tmp_path / "random-teams",
-        seed=seed + 1,
-        count=max(32, game_count * 2),
-    )
-    random_state = random.getstate()
-    random.seed(seed)
-    poke_env_patches.install(capture_protocol_lines=True)
-
-    player_a = JsonCapturingRandomPlayer(
-        account_configuration=AccountConfiguration("StressRandomA", None),
-        battle_format=FORMAT.battle_format,
-        server_configuration=showdown_server,
-        team_source=team_source,
-        team_rng=random.Random(seed + 1),
-        accept_open_team_sheet=True,
-        max_concurrent_battles=concurrency,
-        observation_builder=builder,
-        observation_dir=observation_dir,
-        replay_dir=replay_dir,
-        write_replays=True,
-    )
-    player_b = JsonCapturingRandomPlayer(
-        account_configuration=AccountConfiguration("StressRandomB", None),
-        battle_format=FORMAT.battle_format,
-        server_configuration=showdown_server,
-        team_source=team_source,
-        team_rng=random.Random(seed + 2),
-        accept_open_team_sheet=True,
-        max_concurrent_battles=concurrency,
-        observation_builder=builder,
-        observation_dir=observation_dir,
-    )
-
-    try:
-        await asyncio.wait_for(
-            player_a.battle_against(player_b, n_battles=game_count),
-            timeout=_stress_timeout(game_count),
+        Verifies that:
+        1. 100+ random live battles run concurrently against a local Showdown server.
+        2. Spliced replay documents capture all turns with valid terminal line indices.
+        3. Reconstructed observations match ground truth live captured tensors at exact line boundaries.
+        4. Offline reconstructed state machines perfectly agree with poke-env active pokemon/field state.
+        5. Reconstructed action candidates encapsulate the actual live chosen actions.
+        6. Shard compilation produces valid training tensors with correct loss mask semantics:
+           - UNKNOWN label kinds have loss_mask == 0 (excluded from policy gradient / imitation loss)
+           - EXACT and PARTIAL label kinds have loss_mask > 0 (included in loss calculation).
+        """
+        seed = int(os.getenv("P0_STRESS_SEED", "20260802"))
+        game_count = _stress_game_count()
+        concurrency = _stress_concurrency()
+        replay_dir = tmp_path / "local-replays"
+        observation_dir = tmp_path / "live-observations"
+        resources = default_runtime_resources()
+        builder = ObservationBuilder(resources)
+        max_candidates = stress_count("P0_STRESS_MAX_CANDIDATES", 256)
+        team_source = _random_team_source(
+            tmp_path / "random-teams",
+            seed=seed + 1,
+            count=max(32, game_count * 2),
         )
-    finally:
-        await player_a.ps_client.stop_listening()
-        await player_b.ps_client.stop_listening()
-        poke_env_patches.uninstall_for_tests()
-        random.setstate(random_state)
+        random_state = random.getstate()
+        random.seed(seed)
+        poke_env_patches.install(capture_protocol_lines=True)
 
-    replay_paths = tuple(sorted(player_a.replay_paths))
-    assert len(replay_paths) == game_count
-    assert all(path.is_file() and path.suffix == ".json" for path in replay_paths)
+        player_a = JsonCapturingRandomPlayer(
+            account_configuration=AccountConfiguration("StressRandomA", None),
+            battle_format=FORMAT.battle_format,
+            server_configuration=showdown_server,
+            team_source=team_source,
+            team_rng=random.Random(seed + 1),
+            accept_open_team_sheet=True,
+            max_concurrent_battles=concurrency,
+            observation_builder=builder,
+            observation_dir=observation_dir,
+            replay_dir=replay_dir,
+            write_replays=True,
+        )
+        player_b = JsonCapturingRandomPlayer(
+            account_configuration=AccountConfiguration("StressRandomB", None),
+            battle_format=FORMAT.battle_format,
+            server_configuration=showdown_server,
+            team_source=team_source,
+            team_rng=random.Random(seed + 2),
+            accept_open_team_sheet=True,
+            max_concurrent_battles=concurrency,
+            observation_builder=builder,
+            observation_dir=observation_dir,
+        )
 
-    documents = tuple(
-        parse_replay_payload(
-            path.read_bytes(),
-            replay_id=path.stem,
+        try:
+            await asyncio.wait_for(
+                player_a.battle_against(player_b, n_battles=game_count),
+                timeout=_stress_timeout(game_count),
+            )
+        finally:
+            await player_a.ps_client.stop_listening()
+            await player_b.ps_client.stop_listening()
+            poke_env_patches.uninstall_for_tests()
+            random.setstate(random_state)
+
+        replay_paths = tuple(sorted(player_a.replay_paths))
+        assert len(replay_paths) == game_count
+        assert all(path.is_file() and path.suffix == ".json" for path in replay_paths)
+
+        documents = tuple(
+            parse_replay_payload(
+                path.read_bytes(),
+                replay_id=path.stem,
+                format_id=FORMAT.battle_format,
+            )
+            for path in replay_paths
+        )
+        assert len(documents) == game_count
+        assert all(document.outcome.terminal_line_index is not None for document in documents)
+
+        # For every completed game, verify offline reconstruction against the live recorded ground truth
+        for document in documents:
+            replay_id = document.metadata.replay_id
+            for perspective in _assert_reconstruction_labels(
+                document, max_candidates=max_candidates
+            ):
+                role = f"p{perspective.player + 1}"
+                path = observation_dir / f"{replay_id}-{role}.pt"
+                assert path.is_file(), f"Missing live observation capture: {path}"
+                artifact = _load_live_artifact(path)
+                # Verify protocol line stream matches what player received over websocket
+                _assert_line_stream_fidelity(document, artifact["lines"])
+                # Verify reconstructed decision snapshots form an ordered partition of the log
+                _assert_decision_boundaries_partition_the_log(perspective, document)
+                # Verify agreement with poke-env oracle battle state
+                _assert_poke_env_state_agreement(perspective, document)
+                # Verify reconstructed structured observations match live pre-fusion observation tensors
+                _assert_live_truth(perspective, artifact["records"], document, builder)
+
+        # Compile replay documents into training dataset representation
+        compilation = compile_documents(
+            documents,
             format_id=FORMAT.battle_format,
+            max_candidates=max_candidates,
+            dex=resources.dex,
         )
-        for path in replay_paths
-    )
-    assert len(documents) == game_count
-    assert all(document.outcome.terminal_line_index is not None for document in documents)
+        assert len(compilation.games) == game_count
+        assert compilation.metrics.counters["accepted_games"] == game_count
+        assert compilation.metrics.counters["rejected_games"] == 0
 
-    # For every completed game, verify offline reconstruction against the live recorded ground truth
-    for document in documents:
-        replay_id = document.metadata.replay_id
-        for perspective in _assert_reconstruction_labels(document, max_candidates=max_candidates):
-            role = f"p{perspective.player + 1}"
-            path = observation_dir / f"{replay_id}-{role}.pt"
-            assert path.is_file(), f"Missing live observation capture: {path}"
-            artifact = _load_live_artifact(path)
-            # Verify protocol line stream matches what player received over websocket
-            _assert_line_stream_fidelity(document, artifact["lines"])
-            # Verify reconstructed decision snapshots form an ordered partition of the log
-            _assert_decision_boundaries_partition_the_log(perspective, document)
-            # Verify agreement with poke-env oracle battle state
-            _assert_poke_env_state_agreement(perspective, document)
-            # Verify reconstructed structured observations match live pre-fusion observation tensors
-            _assert_live_truth(perspective, artifact["records"], document, builder)
-
-    # Compile replay documents into training dataset representation
-    compilation = compile_documents(
-        documents,
-        format_id=FORMAT.battle_format,
-        max_candidates=max_candidates,
-        dex=resources.dex,
-    )
-    assert len(compilation.games) == game_count
-    assert compilation.metrics.counters["accepted_games"] == game_count
-    assert compilation.metrics.counters["rejected_games"] == 0
-
-    # Write out serialized PyTorch tensor shards
-    build = write_tensor_shards(
-        compilation,
-        tmp_path / "tensor-shards",
-        resources=resources,
-        max_candidates=max_candidates,
-        max_decisions_per_shard=4096,
-    )
-    assert build.manifest.accepted_games == game_count
-    assert build.manifest.rejected_games == 0
-
-    # Verify tensor contracts and loss masking across all generated shard files
-    for shard in build.manifest.shards:
-        artifact = torch.load(
-            build.manifest_path.parent / shard.filename,
-            map_location="cpu",
-            weights_only=True,
+        # Write out serialized PyTorch tensor shards
+        build = write_tensor_shards(
+            compilation,
+            tmp_path / "tensor-shards",
+            resources=resources,
+            max_candidates=max_candidates,
+            max_decisions_per_shard=4096,
         )
-        validate_shard_tensors(artifact["tensors"])
+        assert build.manifest.accepted_games == game_count
+        assert build.manifest.rejected_games == 0
 
-        tensors = artifact["tensors"]
-        label_kind = tensors["label_kind"]
-        loss_mask = tensors["loss_mask"]
-        # UNKNOWN labels must never contribute to training loss (loss_mask == 0)
-        assert torch.all(loss_mask[label_kind == int(LabelKind.UNKNOWN)] == 0)
-        # EXACT and PARTIAL candidate labels must have active training loss weights
-        assert torch.all(loss_mask[label_kind == int(LabelKind.EXACT)] > 0)
-        assert torch.all(loss_mask[label_kind == int(LabelKind.PARTIAL)] > 0)
+        # Verify tensor contracts and loss masking across all generated shard files
+        for shard in build.manifest.shards:
+            artifact = torch.load(
+                build.manifest_path.parent / shard.filename,
+                map_location="cpu",
+                weights_only=True,
+            )
+            validate_shard_tensors(artifact["tensors"])
+
+            tensors = artifact["tensors"]
+            label_kind = tensors["label_kind"]
+            loss_mask = tensors["loss_mask"]
+            # UNKNOWN labels must never contribute to training loss (loss_mask == 0)
+            assert torch.all(loss_mask[label_kind == int(LabelKind.UNKNOWN)] == 0)
+            # EXACT and PARTIAL candidate labels must have active training loss weights
+            assert torch.all(loss_mask[label_kind == int(LabelKind.EXACT)] > 0)
+            assert torch.all(loss_mask[label_kind == int(LabelKind.PARTIAL)] > 0)

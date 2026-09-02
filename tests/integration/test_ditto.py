@@ -5,6 +5,7 @@ import pytest
 from poke_env import AccountConfiguration, ServerConfiguration
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
+from poke_env.player.battle_order import DoubleBattleOrder
 
 from p0.battle.views import TransformedPokemonView
 from p0.format_config import FORMAT
@@ -125,6 +126,7 @@ class DittoTrackerPlayer(RandomPlayer):
     def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)
         self.saw_transform = False
+        self.transform_observations: list[tuple[str | None, str, str | None, bool]] = []
         self.error: Exception | None = None
 
     def teampreview(self, battle: AbstractBattle) -> str:
@@ -133,54 +135,96 @@ class DittoTrackerPlayer(RandomPlayer):
     def choose_move(self, battle: AbstractBattle) -> Any:
         try:
             view = battle_view(cast(DoubleBattle, battle))
-            for active in view.active_pokemon:
+            for position, active in enumerate(view.active_pokemon):
                 if (
                     active is not None
                     and isinstance(active, TransformedPokemonView)
                     and active.species != "ditto"
                 ):
-                    assert active.base_species == active.species
+                    self.transform_observations.append(
+                        (
+                            active.species,
+                            active.base_species,
+                            active.item,
+                            view.decision.slots[position].can_mega,
+                        )
+                    )
                     assert active.moves
                     self.saw_transform = True
                     break
-        except Exception as e:
+        except Exception as exc:
+            # Preserve callback failures so the async battle can finish and report them in the test.
             if self.error is None:
-                self.error = e
+                self.error = exc
 
         return super().choose_move(battle)
 
 
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_live_ditto_transform_proxy_integration(
-    showdown_server: ServerConfiguration,
-) -> None:
-    """Verify live capture correctly wraps a transformed Ditto with the TransformedPokemonView on a real server."""
-    poke_env_patches.install()
+class MegaCharizardPlayer(RandomPlayer):
+    def teampreview(self, battle: AbstractBattle) -> str:
+        return "/team 1234"
 
-    first = DittoTrackerPlayer(
-        account_configuration=AccountConfiguration("DittoTrackerA", None),
-        battle_format=FORMAT.battle_format,
-        server_configuration=showdown_server,
-        team=DITTO_TEAM,
-        max_concurrent_battles=1,
-    )
-    second = RandomPlayer(
-        account_configuration=AccountConfiguration("DittoTrackerB", None),
-        battle_format=FORMAT.battle_format,
-        server_configuration=showdown_server,
-        team=OPPONENT_TEAM,
-        max_concurrent_battles=1,
-    )
+    def choose_move(self, battle: AbstractBattle) -> Any:
+        order = super().choose_move(battle)
+        if not isinstance(battle, DoubleBattle) or not isinstance(order, DoubleBattleOrder):
+            return order
 
-    try:
-        await asyncio.wait_for(first.battle_against(second, n_battles=1), timeout=60.0)
-    finally:
-        await first.ps_client.stop_listening()
-        await second.ps_client.stop_listening()
-        poke_env_patches.uninstall_for_tests()
+        for position, active in enumerate(battle.active_pokemon):
+            if (
+                active is None
+                or active.base_species != "charizard"
+                or not battle.can_mega_evolve[position]
+            ):
+                continue
 
-    if first.error:
-        raise first.error
+            mega_order = next(
+                (candidate for candidate in battle.valid_orders[position] if candidate.mega),
+                None,
+            )
+            if mega_order is None:
+                continue
 
-    assert first.saw_transform, "Did not observe a transform proxy during the battle"
+            orders = [order.first_order, order.second_order]
+            orders[position] = mega_order
+            return DoubleBattleOrder(orders[0], orders[1])
+
+        return order
+
+
+class TestDitto:
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_live_ditto_transform_proxy_integration(
+        self,
+        showdown_server: ServerConfiguration,
+    ) -> None:
+        """Verify live capture correctly wraps a transformed Ditto with the TransformedPokemonView on a real server."""
+        poke_env_patches.install()
+
+        first = DittoTrackerPlayer(
+            account_configuration=AccountConfiguration("DittoTrackerA", None),
+            battle_format=FORMAT.battle_format,
+            server_configuration=showdown_server,
+            team=DITTO_TEAM,
+            max_concurrent_battles=1,
+        )
+        second = MegaCharizardPlayer(
+            account_configuration=AccountConfiguration("DittoTrackerB", None),
+            battle_format=FORMAT.battle_format,
+            server_configuration=showdown_server,
+            team=OPPONENT_TEAM,
+            max_concurrent_battles=1,
+        )
+
+        try:
+            await asyncio.wait_for(first.battle_against(second, n_battles=1), timeout=60.0)
+        finally:
+            await first.ps_client.stop_listening()
+            await second.ps_client.stop_listening()
+            poke_env_patches.uninstall_for_tests()
+
+        if first.error is not None:
+            raise first.error
+
+        assert first.saw_transform, "Did not observe a transform proxy during the battle"
+        assert ("charizardmegay", "charizard", "choicescarf", False) in first.transform_observations

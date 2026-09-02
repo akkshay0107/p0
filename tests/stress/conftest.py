@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 from hypothesis.internal.conjecture import engine as conjecture_engine
@@ -11,6 +9,7 @@ from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
+from tests.stress._helpers import stress_devices
 
 # Stress strategies intentionally generate large tensor batches. Hypothesis' default
 # choice buffer rejects the configured 128-by-64 case before the test body runs.
@@ -38,32 +37,7 @@ def showdown_server(showdown_assets):
         yield server_configuration
 
 
-def _stress_devices() -> tuple[torch.device, ...]:
-    """
-    Parse requested stress test compute devices from P0_STRESS_DEVICES.
-
-    Filters out CUDA when host hardware lacks GPU support, deduplicates entries,
-    and falls back to CPU.
-    """
-    requested = tuple(
-        value.strip().lower()
-        for value in os.getenv("P0_STRESS_DEVICES", "cpu,cuda").split(",")
-        if value.strip()
-    )
-    devices: list[torch.device] = []
-    for name in requested:
-        if name == "cpu":
-            devices.append(torch.device("cpu"))
-        elif name == "cuda" and torch.cuda.is_available():
-            devices.append(torch.device("cuda"))
-        elif name != "cuda":
-            raise ValueError(f"Unsupported stress-test device {name!r}")
-    if not devices:
-        return (torch.device("cpu"),)
-    return tuple(dict.fromkeys(devices))
-
-
-@pytest.fixture(params=_stress_devices(), ids=lambda device: device.type)
+@pytest.fixture(params=stress_devices(), ids=lambda device: device.type)
 def stress_device(request: pytest.FixtureRequest) -> torch.device:
     """Parametrize device-sensitive stress tests across CPU and available CUDA accelerators."""
     return request.param

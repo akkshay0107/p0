@@ -553,6 +553,7 @@ class _StateReducer:
         self.weather: dict[str, int] = {}
         self.fields: dict[str, int] = {}
         self.delayed_moves: dict[tuple[ReplaySide, int], DelayedMoveState] = {}
+        self._ignored_delayed_starts: set[tuple[ReplayMemberId, str]] = set()
         self.slot_conditions: dict[tuple[ReplaySide, int, str], SlotConditionState] = {}
         self._handlers: dict[str, Callable[[ResolvedProtocolEvent], None]] = {
             "switch": self._handle_switch,
@@ -668,6 +669,9 @@ class _StateReducer:
         classification = event.classification
         if classification.rejects_replay:
             raise _StateTransitionError(event.rejection_reason)
+        if event.tag == "-hint":
+            self._handle_hint(resolved)
+            return
         if classification is EventClassification.NO_STATE_CHANGE:
             return
         if classification is EventClassification.BOUNDARY_SIGNAL:
@@ -695,6 +699,7 @@ class _StateReducer:
                 raise _StateTransitionError(
                     f"turn number {turn} does not advance current turn {self.turn}"
                 )
+            self._ignored_delayed_starts.clear()
             self._expire_member_single_turn_effects()
             self._expire_side_single_turn_effects()
             self.turn = turn
@@ -834,7 +839,17 @@ class _StateReducer:
                 f"move {resolved.event.arguments[1]!r} is not in the member's effective move slots"
             )
         if move_id in _DELAYED_MOVE_IDS:
-            self._schedule_delayed_move(resolved, member, move_id)
+            target = resolved.event.arguments[2] if len(resolved.event.arguments) > 2 else ""
+            if target:
+                target_ref = _resolved_reference(resolved, 2)
+                if (
+                    target_ref.member_id is not None
+                    and target_ref.pokemon_ref.active_slot is not None
+                ):
+                    self._ignored_delayed_starts.discard((member.member_id, move_id))
+                    self._schedule_delayed_move(resolved, member, move_id)
+                else:
+                    self._ignored_delayed_starts.add((member.member_id, move_id))
         elif move_id in _SLOT_CONDITION_MOVES:
             self._schedule_slot_condition(resolved, member, move_id)
         elif move_id == "recharge":
@@ -883,7 +898,8 @@ class _StateReducer:
             move_type=move_type,
             category=category,
             base_power=base_power,
-            scheduled_turn=self.turn + 1,
+            # Showdown resolves delayed moves at the end of the second turn after use.
+            scheduled_turn=self.turn + 2,
             announced=False,
         )
 
@@ -938,6 +954,9 @@ class _StateReducer:
             if delayed.source_member_id == source.member_id and delayed.move_id == move_id
         )
         pending = tuple((key, delayed) for key, delayed in matches if not delayed.announced)
+        if (source.member_id, move_id) in self._ignored_delayed_starts:
+            self._ignored_delayed_starts.remove((source.member_id, move_id))
+            return
         if len(pending) != 1:
             if not pending and matches:
                 raise _StateTransitionError(f"{move_id} start was emitted more than once")
@@ -974,6 +993,40 @@ class _StateReducer:
             timing = "before" if self.turn < delayed.scheduled_turn else "after"
             raise _StateTransitionError(f"delayed move ended {timing} its scheduled turn")
         del self.delayed_moves[target_key]
+
+    def _handle_hint(self, resolved: ResolvedProtocolEvent) -> None:
+        hint = resolved.event.arguments[0]
+        marker = " did not hit because the target is "
+        move_name, separator, outcome = hint.partition(marker)
+        if not separator:
+            return
+
+        move_id = normalize_showdown_id(move_name)
+        if move_id not in _DELAYED_MOVE_IDS:
+            return
+
+        outcome = outcome.casefold()
+        if outcome == "the user.":
+            keys = tuple(
+                key
+                for key, delayed in self.delayed_moves.items()
+                if delayed.move_id == move_id
+                and delayed.scheduled_turn == self.turn
+                and self.active.get(key) == delayed.source_member_id
+            )
+        elif outcome == "fainted.":
+            keys = tuple(
+                key
+                for key, delayed in self.delayed_moves.items()
+                if delayed.move_id == move_id
+                and delayed.scheduled_turn == self.turn
+                and self.active.get(key) is None
+            )
+        else:
+            return
+
+        for key in keys:
+            del self.delayed_moves[key]
 
     def _handle_cant(self, resolved: ResolvedProtocolEvent) -> None:
         member = self._member_for(resolved, 0)
@@ -1313,6 +1366,12 @@ class _StateReducer:
 
     def _handle_minus_end(self, resolved: ResolvedProtocolEvent) -> None:
         effect = _required_effect(resolved)
+        if len(resolved.event.arguments) > 2:
+            secondary_effect = normalize_showdown_id(resolved.event.arguments[2])
+            if secondary_effect == "partiallytrapped":
+                member = self._member_for(resolved, 0)
+                member.effects.pop(secondary_effect, None)
+                return
         variant = _dynamic_effect_or_none(effect.normalized)
         canonical_id = effect.normalized if variant is None else variant.canonical_id
         if canonical_id in _DELAYED_MOVE_IDS:
