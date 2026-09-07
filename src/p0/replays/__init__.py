@@ -7,7 +7,12 @@ so the IR survives observation-schema changes.
 """
 
 from p0.replays.group import individual_games, validated_bo3_series
-from p0.replays.protocol import ReplayDocument, ReplayParseError, parse_replay_payload
+from p0.replays.protocol import (
+    ReplayDocument,
+    ReplayInputContractError,
+    ReplayParseError,
+    parse_replay_payload,
+)
 from p0.replays.schema import (
     REPLAY_IR_SCHEMA_VERSION,
     ActionEvidence,
@@ -50,6 +55,7 @@ __all__ = [
     "SeriesRecord",
     "ReplayDocument",
     "ReplayParseError",
+    "ReplayInputContractError",
     "parse_replay_payload",
     "individual_games",
     "validated_bo3_series",

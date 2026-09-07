@@ -18,12 +18,13 @@ from p0.model.resources import default_runtime_resources
 from p0.replays.compile import (
     CompilationResult,
     ShardBuildResult,
+    compile_documents,
     compile_payloads,
     write_tensor_shards,
 )
 from p0.replays.group import group_replays, individual_games, validated_bo3_series
 from p0.replays.identity import ReplayMemberId, ReplaySide, linked_replay_ids
-from p0.replays.protocol import ReplayParseError, parse_replay_payload
+from p0.replays.protocol import ReplayInputContractError, ReplayParseError, parse_replay_payload
 from p0.replays.reconstruction.projection import impute_replay_stats
 from p0.replays.schema import (
     ActionEvidence,
@@ -193,6 +194,74 @@ class TestReplayProtocolAndGrouping:
             ProtocolLine.from_dict({**document.protocol_lines[0].to_dict(), "unknown": 1})
         with pytest.raises(ReplayParseError, match="Malformed protocol line"):
             parse_replay_payload({**sample_replay_payload("bad"), "log": "not a protocol line"})
+
+
+class TestReplayInputContract:
+    def test_chat_variants_bare_room_message_and_double_bar_message_are_neutral(self) -> None:
+        payload = sample_replay_payload("input-chat")
+        for chat in ("c", "chat", "c:", "chatmsg"):
+            candidate = {
+                **payload,
+                "log": str(payload["log"]).replace(
+                    "|win|Alice", f"|{chat}|Alice|hello\nroom text\n|win|Alice"
+                ),
+            }
+            document = parse_replay_payload(candidate)
+            assert document.outcome.winner == 0
+
+        candidate = {
+            **payload,
+            "log": str(payload["log"]).replace("|win|Alice", "||MESSAGE\n|win|Alice"),
+        }
+        document = parse_replay_payload(candidate)
+        assert document.outcome.winner == 0
+
+    def test_terminal_forms_preserve_terminal_index_and_reason(self) -> None:
+        payload = sample_replay_payload("input-terminal")
+        for ending, reason in (
+            ("|tie", GameEndReason.NORMAL),
+            ("|-message|Alice| lost due to inactivity.\n|win|Bob", GameEndReason.TIMEOUT),
+            ("|-message|Alice| forfeited.\n|win|Bob", GameEndReason.FORFEIT),
+        ):
+            candidate = {**payload, "log": str(payload["log"]).replace("|win|Alice", ending)}
+            document = parse_replay_payload(candidate)
+            assert document.outcome.terminal_line_index is not None
+            assert document.outcome.end_reason is reason
+        assert (
+            parse_replay_payload(
+                {**payload, "log": str(payload["log"]).replace("|win|Alice", "|tie")}
+            ).outcome.winner
+            == -1
+        )
+
+    def test_inactivity_tie_is_a_timeout(self) -> None:
+        payload = sample_replay_payload("input-inactivity-tie")
+        payload["log"] = str(payload["log"]).replace(
+            "|win|Alice", "|-message|All players are inactive.\n|tie"
+        )
+
+        assert parse_replay_payload(payload).outcome.end_reason is GameEndReason.TIMEOUT
+
+    def test_malformed_metadata_and_complete_compile_contract_raise_named_errors(self) -> None:
+        payload = sample_replay_payload("input-invalid")
+        with pytest.raises(ReplayInputContractError, match="game_number"):
+            parse_replay_payload({**payload, "game_number": "unknown"})
+
+        document = parse_replay_payload(payload)
+        incomplete = replace(document, ots=(OTSData(ReplaySide.P1, "", ()), document.ots[1]))
+        with pytest.raises(ReplayInputContractError, match="complete six-member OTS"):
+            compile_documents((incomplete,))
+
+        with pytest.raises(ReplayInputContractError, match="does not match requested"):
+            compile_documents((document,), format_id="unsupported-format")
+
+    def test_changed_runtime_dex_is_rejected(self) -> None:
+        payload = sample_replay_payload("input-dex")
+        document = parse_replay_payload(payload)
+        dex = json.loads(json.dumps(default_runtime_resources().dex))
+        dex["moves"][0]["name"] = "Changed move name"
+        with pytest.raises(ReplayInputContractError, match="pinned Champions artifact"):
+            compile_documents((document,), dex=dex)
 
     def test_ots_preserves_duplicate_species_as_distinct_ordered_members(self) -> None:
         payload = sample_replay_payload("duplicate-species")
@@ -678,7 +747,9 @@ class TestReplayProtocolAndGrouping:
         )
         assert tensors["categorical"].shape[0] == manifest.decisions
         assert tensors["action_mask"].shape == (4, 2, 49)
-        assert tensors["candidate_offsets"].tolist() == [0, 12, 16, 28, 32]
+        # Candidate counts use the pinned Showdown target classes: normal/any
+        # exclude the user, while non-choosable targets contribute target 0.
+        assert tensors["candidate_offsets"].tolist() == [0, 12, 15, 27, 30]
         assert tensors["game_offsets"].tolist() == [0, 2, 4]
         assert tensors["series_offsets"].tolist() == [0, 4]
         assert len(payload["series_summaries"]) == manifest.games

@@ -22,6 +22,7 @@ from p0.replays.compile import (
 from p0.replays.dataset import (
     LazyReplayDataset,
 )
+from p0.replays.protocol import ReplayInputContractError
 from p0.replays.schema import (
     ActionEvidence,
     GroupingMethod,
@@ -220,9 +221,9 @@ class TestReplayDatasets:
         rejected["log"] = "\n".join(
             line for line in str(rejected["log"]).splitlines() if "|showteam|" not in line
         )
-        rejected_result = compile_payloads((rejected,), format_id=rejected["formatid"])
-        assert not rejected_result.games
-        assert rejected_result.metrics.counters["rejected_games"] == 1
+        with pytest.raises(ReplayInputContractError) as error:
+            compile_payloads((rejected,), format_id=rejected["formatid"])
+        assert error.value.category == "INVALID_INPUT_CONTRACT"
 
     def test_compiler_is_stable_across_worker_chunk_sizes(self) -> None:
         """Verify public compilation produces the same replay result for serial and parallel chunks."""

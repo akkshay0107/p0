@@ -36,6 +36,12 @@ from p0.replays.schema import (
 class ReplayParseError(ValueError):
     """Raised when a response is not a supported public replay payload."""
 
+    category = "INVALID_INPUT_CONTRACT"
+
+
+class ReplayInputContractError(ReplayParseError):
+    """Raised when transport, metadata, OTS, or terminal input is unusable."""
+
 
 @dataclass(frozen=True, slots=True)
 class ReplayDocument:
@@ -81,7 +87,10 @@ class ReplayDocument:
 
 def _as_object(payload: bytes | str | Mapping[str, Any]) -> tuple[Mapping[str, Any], bytes]:
     if isinstance(payload, Mapping):
-        encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+        try:
+            encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+        except (TypeError, ValueError) as exc:
+            raise ReplayInputContractError("Replay payload contains non-JSON metadata") from exc
         return payload, encoded
 
     raw = payload.encode("utf-8") if isinstance(payload, str) else payload
@@ -152,6 +161,17 @@ def _metadata(
     if not isinstance(winner, str):
         raise ReplayParseError("Replay winner must be a string when present")
 
+    def _optional_int(field: str) -> int | None:
+        candidate = value.get(field)
+        if candidate in (None, ""):
+            return None
+        if isinstance(candidate, bool):
+            raise ReplayInputContractError(f"Replay metadata {field} must be an integer")
+        try:
+            return int(candidate)
+        except (TypeError, ValueError) as exc:
+            raise ReplayInputContractError(f"Replay metadata {field} must be an integer") from exc
+
     return ReplayMetadata(
         replay_id=replay_id,
         format_id=actual_format,
@@ -160,9 +180,9 @@ def _metadata(
         upload_time=_timestamp(value.get("uploadtime", value.get("upload_time"))),
         room_id=room_id,
         parent_room=parent_room,
-        game_number=int(v) if (v := value.get("game_number")) else None,
-        rating=int(v) if (v := value.get("rating")) else None,
-        views=int(v) if (v := value.get("views")) else None,
+        game_number=_optional_int("game_number"),
+        rating=_optional_int("rating"),
+        views=_optional_int("views"),
     )
 
 
@@ -184,12 +204,16 @@ def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
             continue
 
         if not line.startswith("|"):
+            # The replay endpoint occasionally emits the room's plain MESSAGE
+            # text as an unframed line after a chat record.  It carries no
+            # battle state and must not make an otherwise valid replay fail.
             if skipping_chat_response:
+                skipping_chat_response = False
                 continue
             raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
 
         parts_list = line.split("|")
-        if len(parts_list) >= 2 and parts_list[1] in {"c", "chatmsg"}:
+        if len(parts_list) >= 2 and parts_list[1] in {"c", "chat", "c:", "chatmsg"}:
             skipping_chat_response = True
             continue
 
@@ -382,24 +406,57 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
     end_reason = GameEndReason.NORMAL
     terminal: int | None = None
     players = tuple(normalize_showdown_id(name) for name in metadata.player_names)
+    pending_message_reason: GameEndReason | None = None
     for line in lines:
-        if len(line.parts) < 3:
+        if len(line.parts) < 2:
             continue
         tag = line.parts[1]
+        if tag in {"message", "-message"}:
+            text = "|".join(line.parts[2:]).casefold()
+            if (
+                "timed out" in text
+                or "timeout" in text
+                or "inactive" in text
+                or "inactivity" in text
+            ):
+                pending_message_reason = GameEndReason.TIMEOUT
+            elif "forfeit" in text or "changing their name" in text or "inappropriate name" in text:
+                pending_message_reason = GameEndReason.FORFEIT
+            continue
         if tag == "win":
+            if len(line.parts) != 3 or not line.parts[2]:
+                raise ReplayInputContractError(f"Malformed win line at index {line.index}")
             terminal = line.index
             winner_name = normalize_showdown_id(line.parts[2])
             if winner_name in players:
                 winner = players.index(winner_name)
+            else:
+                raise ReplayInputContractError(
+                    f"Win line names an unknown player at index {line.index}"
+                )
         elif tag == "tie":
+            if len(line.parts) != 2:
+                raise ReplayInputContractError(f"Malformed tie line at index {line.index}")
             terminal = line.index
         elif tag == "forfeit":
+            if len(line.parts) != 3 or not line.parts[2]:
+                raise ReplayInputContractError(f"Malformed forfeit line at index {line.index}")
             terminal = line.index
             end_reason = GameEndReason.FORFEIT
-        elif tag == "message" and "timeout" in line.parts[-1].casefold():
-            end_reason = GameEndReason.TIMEOUT
-            terminal = line.index
+        if tag in {"win", "tie"} and pending_message_reason is not None:
+            end_reason = pending_message_reason
     turns = max((line.turn or 0 for line in lines), default=0)
+    if terminal is None:
+        # Incomplete captures are retained for grouping/quarantine.  A
+        # terminal marker is required before reconstruction, but its absence
+        # is not malformed transport input.
+        return ReplayOutcome(-1, GameEndReason.NORMAL, turns, None)
+    if (
+        winner < 0
+        and end_reason is GameEndReason.NORMAL
+        and any(line.parts[1] == "win" for line in lines if len(line.parts) > 1)
+    ):
+        raise ReplayInputContractError("Replay win outcome has no recognized winner")
     return ReplayOutcome(winner, end_reason, turns, terminal)
 
 
@@ -455,5 +512,6 @@ def parse_replay_payload(
 __all__ = [
     "ReplayDocument",
     "ReplayParseError",
+    "ReplayInputContractError",
     "parse_replay_payload",
 ]

@@ -202,7 +202,7 @@ class TestReplayCompiler:
         assert [chunk.canonical_player for chunk in chunks] == [0, 1, 0, 1]
         assert [chunk.is_series_end for chunk in chunks] == [False, False, True, True]
         assert all(chunk.length == 2 for chunk in chunks)
-        assert chunks[2].candidate_offsets.tolist() == [0, 12, 16]
+        assert chunks[2].candidate_offsets.tolist() == [0, 12, 15]
 
     def test_canonical_player_identity_survives_replay_side_swap(self, tmp_path: Path) -> None:
         """Verify canonical player IDs track original human players even when Showdown swaps p1/p2 sides between games."""

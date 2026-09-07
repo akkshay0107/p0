@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from p0.model.resources import default_runtime_resources
 from p0.replays.identity import ReplayMemberId, ReplaySide
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.decisions import build_decision_view
@@ -27,7 +30,7 @@ _P2_SPECIES = ("Golf", "Hotel", "India", "Juliet", "Kilo", "Lima")
 
 
 def _dex() -> dict[str, object]:
-    species = []
+    species: list[dict[str, object]] = []
     for index, name in enumerate((*_P1_SPECIES, *_P2_SPECIES, "Alpha-Mega", "Golf-Mega")):
         entry = {
             "id": name.lower().replace("-", ""),
@@ -178,6 +181,537 @@ def _resolved(
 
 
 class TestReconstructionState:
+    def test_clearallboost_clears_every_active_boost(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-clearallboost",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 0
+
+    def test_clearboost_clears_the_named_member_boosts(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-clearboost|p1a: Alpha",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 0
+
+    def test_clearnegativeboost_preserves_positive_boosts(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-unboost|p1a: Alpha|def|1",
+            "|-clearnegativeboost|p1a: Alpha",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        member = final.member(ReplayMemberId(ReplaySide.P1, 0))
+        assert dict(member.boosts)["atk"] == 2
+        assert dict(member.boosts)["def"] == 0
+
+    def test_clearpositiveboost_preserves_negative_boosts(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-unboost|p1a: Alpha|def|1",
+            "|-clearpositiveboost|p1a: Alpha|p2a: Golf|move: Psych Up",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        member = final.member(ReplayMemberId(ReplaySide.P1, 0))
+        assert dict(member.boosts)["atk"] == 0
+        assert dict(member.boosts)["def"] == -1
+
+    def test_copyboost_copies_donor_to_argument_zero(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p1b: Charlie|Charlie, L50|100/100",
+            "|-boost|p1b: Charlie|atk|2",
+            "|-copyboost|p1a: Alpha|p1b: Charlie",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 2
+
+    def test_invertboost_inverts_each_member_boost(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-invertboost|p1a: Alpha",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == -2
+
+    def test_setboost_sets_the_named_stat_absolute_value(self) -> None:
+        events = _resolved("|switch|p1a: Alpha|Alpha, L50|100/100", "|-setboost|p1a: Alpha|atk|3")
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 3
+
+    def test_unboost_decreases_the_named_stat(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-unboost|p1a: Alpha|atk|1",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 1
+
+    def test_formechange_updates_the_transient_form(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100", "|-formechange|p1a: Alpha|Alpha-Mega, L50"
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).current_form == "Alpha-Mega"
+
+    def test_mega_marks_the_side_as_having_mega_evolved(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100", "|-mega|p1a: Alpha|Alpha-Mega|Alpha Stone"
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert final.sides[0].used_mega is True
+
+    def test_sidestart_and_sideend_update_side_conditions(self) -> None:
+        events = _resolved("|-sidestart|p1: Player|move: Reflect", "|-sideend|p1: Player|Reflect")
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert final.sides[0].conditions == ()
+
+    def test_singlemove_records_a_member_scoped_effect(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100", "|-singlemove|p1a: Alpha|Destiny Bond"
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).effects) == {"destinybond": 0}
+
+    def test_swapboost_swaps_only_the_named_stat(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p1b: Charlie|Charlie, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-boost|p1b: Charlie|atk|1",
+            "|-swapboost|p1a: Alpha|p1b: Charlie|atk",
+        )
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 1
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 2)).boosts)["atk"] == 2
+
+    def test_initialization_events_are_state_neutral(self) -> None:
+        events = _resolved(
+            "|clearpoke",
+            "|player|p1|Alice|1",
+            "|poke|p1|Alpha|Alpha, L50",
+            "|showteam|p1|Alpha",
+            "|start",
+        )
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+        assert snapshots[-1].sides[0].active == (None, None)
+
+    def test_source_shaped_state_neutral_effect_events(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-block|p1a: Alpha|move: Protect",
+            "|-immune|p1a: Alpha",
+            "|-hitcount|p1a: Alpha|2",
+            "|-zbroken|p1a: Alpha",
+        )
+
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+
+        assert snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).hp_fraction == 1.0
+        assert dict(snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).effects) == {}
+
+    def test_source_shaped_weather_and_field_transitions(self) -> None:
+        events = _resolved(
+            "|-weather|SunnyDay|[from] move: Sunny Day",
+            "|-fieldstart|move: Electric Terrain",
+            "|-fieldactivate|move: Electric Terrain",
+            "|-fieldend|move: Electric Terrain",
+            "|-weather|none",
+        )
+
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+
+        assert snapshots[-1].weather == ()
+        assert snapshots[-1].fields == ()
+
+    def test_source_shaped_item_status_hp_transitions(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-item|p1a: Alpha|Leftovers",
+            "|-status|p1a: Alpha|brn",
+            "|-damage|p1a: Alpha|75/100|[from] item: Life Orb",
+            "|-sethp|p1a: Alpha|80/100|[silent]",
+            "|-heal|p1a: Alpha|100/100|[from] item: Leftovers",
+            "|-curestatus|p1a: Alpha|brn",
+            "|-enditem|p1a: Alpha|Leftovers",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        member = final.member(ReplayMemberId(ReplaySide.P1, 0))
+
+        assert member.hp_fraction == 1.0
+        assert member.status is None
+        assert member.item is None
+
+    def test_roost_restores_flying_type_when_single_turn_effect_expires(self) -> None:
+        dex = _dex()
+        cast(list[dict[str, object]], dex["species"])[0]["types"] = [
+            "Flying",
+            "Normal",
+        ]
+        cast(list[dict[str, object]], dex["moves"]).append(
+            {
+                "id": "roost",
+                "name": "Roost",
+                "type": "Flying",
+                "category": "Status",
+                "target": "self",
+                "pp": 10,
+            }
+        )
+        sheets = (
+            _ots(ReplaySide.P1, _P1_SPECIES, moves=("Roost",)),
+            _ots(ReplaySide.P2, _P2_SPECIES),
+        )
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-singleturn|p1a: Alpha|move: Roost",
+            "|upkeep",
+            ots=sheets,
+        )
+
+        snapshots = reduce_replay_state("state-test", sheets, events, dex=dex).require_accepted()
+
+        assert snapshots[1].member(ReplayMemberId(ReplaySide.P1, 0)).current_types == ("Normal",)
+        assert snapshots[2].member(ReplayMemberId(ReplaySide.P1, 0)).current_types == (
+            "Flying",
+            "Normal",
+        )
+
+    def test_baton_pass_transfers_boosts_but_shed_tail_only_substitute(self) -> None:
+        baton_events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|switch|p1a: Bravo|Bravo, L50|100/100|[from] Baton Pass",
+        )
+        shed_events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-start|p1a: Alpha|Substitute",
+            "|switch|p1a: Bravo|Bravo, L50|100/100|[from] Shed Tail",
+        )
+        baton = reduce_replay_state(
+            "state-test", _complete_ots(), baton_events, dex=_dex()
+        ).require_accepted()[-1]
+        shed = reduce_replay_state(
+            "state-test", _complete_ots(), shed_events, dex=_dex()
+        ).require_accepted()[-1]
+        bravo_id = ReplayMemberId(ReplaySide.P1, 1)
+        assert dict(baton.member(bravo_id).boosts)["atk"] == 2
+        assert dict(shed.member(bravo_id).boosts)["atk"] == 0
+        assert dict(shed.member(bravo_id).effects) == {"substitute": 0}
+
+    def test_baton_pass_preserves_copyable_source_and_dynamic_metadata(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-start|p1a: Alpha|Leech Seed|[of] p2a: Golf",
+            "|-start|p1a: Alpha|perish3",
+            "|switch|p1a: Bravo|Bravo, L50|100/100|[from] Baton Pass",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        bravo = final.member(ReplayMemberId(ReplaySide.P1, 1))
+
+        assert dict(bravo.effects) == {"leechseed": 0, "perishsong": 0}
+        assert dict(bravo.effect_sources) == {"leechseed": ReplayMemberId(ReplaySide.P2, 0)}
+        assert bravo.perish_count == 3
+
+    def test_baton_pass_filters_condition_copy_set_from_pinned_source(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-start|p1a: Alpha|Aqua Ring",
+            "|-start|p1a: Alpha|Ingrain",
+            "|-start|p1a: Alpha|Confusion",
+            "|-start|p1a: Alpha|Focus Energy",
+            "|-start|p1a: Alpha|Dragon Cheer",
+            "|-start|p1a: Alpha|stockpile2",
+            "|-start|p1a: Alpha|Trapped",
+            "|-start|p1a: Alpha|Trapper",
+            "|switch|p1a: Bravo|Bravo, L50|100/100|[from] Baton Pass",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        bravo = final.member(ReplayMemberId(ReplaySide.P1, 1))
+
+        assert dict(bravo.effects) == {
+            "aquaring": 0,
+            "confusion": 0,
+            "dragoncheer": 0,
+            "focusenergy": 0,
+            "ingrain": 0,
+        }
+        assert dict(bravo.effect_variants) == {}
+
+    def test_source_emitted_partial_trap_is_tracked_and_baton_passed(self) -> None:
+        dex = _dex()
+        cast(list[dict[str, object]], dex["moves"]).append(
+            {
+                "id": "firespin",
+                "name": "Fire Spin",
+                "type": "Fire",
+                "category": "Special",
+                "target": "normal",
+                "pp": 15,
+                "volatileStatus": "partiallytrapped",
+            }
+        )
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-activate|p1a: Alpha|move: Fire Spin|[of] p2a: Golf",
+            "|switch|p1a: Bravo|Bravo, L50|100/100|[from] Baton Pass",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=dex
+        ).require_accepted()[-1]
+        bravo = final.member(ReplayMemberId(ReplaySide.P1, 1))
+
+        assert dict(bravo.effects) == {"firespin": 0}
+        assert dict(bravo.effect_sources) == {"firespin": ReplayMemberId(ReplaySide.P2, 0)}
+
+    def test_copyboost_critical_effects_persist_across_turns(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p1b: Charlie|Charlie, L50|100/100",
+            "|-start|p1b: Charlie|Focus Energy",
+            "|-copyboost|p1a: Alpha|p1b: Charlie",
+            "|turn|1",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+
+        assert "focusenergy" in dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).effects)
+
+    def test_reflect_type_copies_the_annotated_targets_types(self) -> None:
+        dex = _dex()
+        species = cast(list[dict[str, object]], dex["species"])
+        next(entry for entry in species if entry["name"] == "Golf")["types"] = ["Rock", "Dark"]
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-start|p1a: Alpha|typechange|[from] move: Reflect Type|[of] p2a: Golf",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=dex
+        ).require_accepted()[-1]
+
+        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).current_types == ("Rock", "Dark")
+
+    def test_mimicry_end_restores_species_types(self) -> None:
+        dex = _dex()
+        species = cast(list[dict[str, object]], dex["species"])
+        next(entry for entry in species if entry["name"] == "Alpha")["types"] = [
+            "Ground",
+            "Steel",
+        ]
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-start|p1a: Alpha|typechange|Electric|[from] ability: Mimicry",
+            "|-end|p1a: Alpha|typechange|[silent]",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=dex
+        ).require_accepted()[-1]
+
+        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).current_types == (
+            "Ground",
+            "Steel",
+        )
+
+    def test_spread_move_uses_champions_pp_formula_and_each_pressure_target(self) -> None:
+        dex = default_runtime_resources().dex
+        p1 = _ots(
+            ReplaySide.P1,
+            ("Charizard", "Pikachu", "Mew", "Garchomp", "Incineroar", "Gholdengo"),
+            moves=("Heat Wave",),
+        )
+        p2 = _ots(
+            ReplaySide.P2,
+            ("Tyranitar", "Rotom-Wash", "Mewtwo", "Excadrill", "Gallade", "Basculegion"),
+        )
+        p2 = replace(
+            p2,
+            members=tuple(
+                replace(member, ability="Pressure")
+                if member.nickname in {"Tyranitar", "Rotom-Wash"}
+                else member
+                for member in p2.members
+            ),
+        )
+        sheets = (p1, p2)
+        events = _resolved(
+            "|switch|p1a: Charizard|Charizard, L50|100/100",
+            "|switch|p2a: Tyranitar|Tyranitar, L50|100/100",
+            "|switch|p2b: Rotom-Wash|Rotom-Wash, L50|100/100",
+            "|move|p1a: Charizard|Heat Wave|p2a: Tyranitar|[spread] p2a,p2b",
+            ots=sheets,
+        )
+
+        snapshots = reduce_replay_state("state-test", sheets, events, dex=dex).require_accepted()
+
+        tackle = next(
+            move
+            for move in snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).moves
+            if move.move_id == "heatwave"
+        )
+        assert tackle.max_pp == 12
+        assert tackle.current_pp == 9
+
+    def test_spread_move_does_not_charge_allied_pressure(self) -> None:
+        dex = default_runtime_resources().dex
+        p1 = _ots(
+            ReplaySide.P1,
+            ("Garchomp", "Mewtwo", "Mew", "Charizard", "Incineroar", "Gholdengo"),
+            moves=("Earthquake",),
+        )
+        p1 = replace(
+            p1,
+            members=tuple(
+                replace(member, ability="Pressure") if member.nickname == "Mewtwo" else member
+                for member in p1.members
+            ),
+        )
+        p2 = _ots(
+            ReplaySide.P2,
+            ("Pikachu", "Rotom-Wash", "Tyranitar", "Excadrill", "Gallade", "Basculegion"),
+        )
+        sheets = (p1, p2)
+        events = _resolved(
+            "|switch|p1a: Garchomp|Garchomp, L50|100/100",
+            "|switch|p1b: Mewtwo|Mewtwo, L50|100/100",
+            "|switch|p2a: Pikachu|Pikachu, L50|100/100",
+            "|move|p1a: Garchomp|Earthquake|p2a: Pikachu|[spread] p1b,p2a",
+            ots=sheets,
+        )
+
+        final = reduce_replay_state("state-test", sheets, events, dex=dex).require_accepted()[-1]
+        earthquake = final.member(ReplayMemberId(ReplaySide.P1, 0)).moves[0]
+
+        assert earthquake.current_pp == earthquake.max_pp - 1
+
+    def test_named_pp_effects_follow_emitted_move_and_amount(self) -> None:
+        dex = _dex()
+        moves = cast(list[dict[str, object]], dex["moves"])
+        dex["moves"] = [
+            *moves,
+            {
+                "id": "spite",
+                "name": "Spite",
+                "type": "Ghost",
+                "category": "Status",
+                "target": "normal",
+                "pp": 10,
+            },
+        ]
+        sheets = (
+            _ots(ReplaySide.P1, _P1_SPECIES, moves=("Tackle",)),
+            _ots(ReplaySide.P2, _P2_SPECIES, moves=("Spite",)),
+        )
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|move|p1a: Alpha|Tackle|p2a: Golf",
+            "|-activate|p1a: Alpha|move: Spite|Tackle|4",
+            "|-activate|p1a: Alpha|item: Leppa Berry|Tackle|[consumed]",
+            ots=sheets,
+        )
+
+        snapshots = reduce_replay_state("state-test", sheets, events, dex=dex).require_accepted()
+        tackle = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).moves[0]
+        assert tackle.max_pp == 32
+        assert tackle.current_pp == 32
+
+    def test_caused_spread_execution_charges_sleep_talk_owner_under_pressure(self) -> None:
+        dex = default_runtime_resources().dex
+        p1 = _ots(
+            ReplaySide.P1,
+            ("Charizard", "Pikachu", "Mew", "Garchomp", "Incineroar", "Gholdengo"),
+            moves=("Sleep Talk",),
+        )
+        p2 = _ots(
+            ReplaySide.P2,
+            ("Tyranitar", "Rotom-Wash", "Mewtwo", "Excadrill", "Gallade", "Basculegion"),
+        )
+        p2 = replace(
+            p2,
+            members=tuple(
+                replace(member, ability="Pressure")
+                if member.nickname in {"Tyranitar", "Rotom-Wash"}
+                else member
+                for member in p2.members
+            ),
+        )
+        sheets = (p1, p2)
+        events = _resolved(
+            "|switch|p1a: Charizard|Charizard, L50|100/100",
+            "|switch|p2a: Tyranitar|Tyranitar, L50|100/100",
+            "|switch|p2b: Rotom-Wash|Rotom-Wash, L50|100/100",
+            "|move|p1a: Charizard|Sleep Talk|p1a: Charizard",
+            "|move|p1a: Charizard|Heat Wave|p2a: Tyranitar|[from] move: Sleep Talk|[spread] p2a,p2b",
+            ots=sheets,
+        )
+
+        snapshots = reduce_replay_state("state-test", sheets, events, dex=dex).require_accepted()
+        sleep_talk = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).moves[0]
+        assert sleep_talk.max_pp == 12
+        assert sleep_talk.current_pp == 9
+
     def test_switch_cleanup_preserves_persistent_state_and_old_snapshots(self) -> None:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
@@ -376,7 +910,7 @@ class TestReconstructionState:
             1,
             (),
             preview=False,
-            mega_items=frozenset(),
+            dex=_dex(),
         )
 
         assert final.team_sizes == (4, 4)
@@ -580,8 +1114,6 @@ class TestReconstructionState:
     @pytest.mark.parametrize(
         ("guard", "guard_id"),
         (
-            ("Crafty Shield", "craftyshield"),
-            ("Mat Block", "matblock"),
             ("Quick Guard", "quickguard"),
             ("Wide Guard", "wideguard"),
         ),
@@ -644,23 +1176,25 @@ class TestReconstructionState:
         assert member.protect_counter == 0
 
     def test_side_guard_follows_side_condition_swap_but_not_source_switch_or_faint(self) -> None:
-        events = _resolved(
-            "|switch|p1a: Alpha|Alpha, L50|100/100",
-            "|switch|p2a: Golf|Golf, L50|100/100",
-            "|turn|1",
-            "|-singleturn|p1a: Alpha|Quick Guard",
-            "|-singleturn|p2a: Golf|Mat Block",
-            "|-swapsideconditions",
-            "|switch|p1a: Bravo|Bravo, L50|100/100",
-            "|faint|p1a: Bravo",
+        lines = tuple(
+            ProtocolLine(index, raw, tuple(raw.split("|")), None)
+            for index, raw in enumerate(
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|switch|p2a: Golf|Golf, L50|100/100",
+                    "|turn|1",
+                    "|-singleturn|p1a: Alpha|Quick Guard",
+                    "|-singleturn|p2a: Golf|Mat Block",
+                    "|-swapsideconditions",
+                    "|switch|p1a: Bravo|Bravo, L50|100/100",
+                    "|faint|p1a: Bravo",
+                )
+            )
         )
-
-        final = reduce_replay_state(
-            "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
-
-        assert dict(final.sides[0].conditions) == {"matblock": 1}
-        assert dict(final.sides[1].conditions) == {"quickguard": 1}
+        parsed = parse_protocol_events("state-test", lines)
+        result = resolve_protocol_events("state-test", _complete_ots(), parsed.events)
+        assert result.events == ()
+        assert "unsupported by the reconstruction contract" in result.diagnostics[0].reason
 
     def test_duplicate_side_guard_and_member_scoped_singleturn_have_distinct_lifecycles(
         self,
@@ -1118,17 +1652,19 @@ class TestReconstructionState:
         assert final.member(bravo_id).fainted
 
     def test_unsupported_reducer_transition_discards_all_snapshots(self) -> None:
-        events = _resolved(
-            "|switch|p1a: Alpha|Alpha, L50|100/100",
-            "|-center",
+        lines = tuple(
+            ProtocolLine(index, raw, tuple(raw.split("|")), None)
+            for index, raw in enumerate(
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|-center",
+                )
+            )
         )
+        parsed = parse_protocol_events("state-test", lines)
+        events = parsed.events
 
-        result = reduce_replay_state("state-test", _complete_ots(), events, dex=_dex())
-
-        assert result.snapshots == ()
-        assert len(result.diagnostics) == 1
-        assert result.diagnostics[0].line_index == 1
-        assert "not implemented" in result.diagnostics[0].reason
+        assert events[1].diagnostic is not None
 
     @pytest.mark.skipif(not _GOLDEN_REPLAYS, reason="local golden replays are not present")
     @pytest.mark.parametrize("replay_path", _GOLDEN_REPLAYS, ids=lambda path: path.stem)

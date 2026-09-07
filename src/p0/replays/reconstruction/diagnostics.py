@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
+
+
+class ReplayRejectionCategory(StrEnum):
+    """Stable top-level categories for replay rejection diagnostics."""
+
+    UNSUPPORTED_EVENT = "UNSUPPORTED_EVENT"
+    AMBIGUOUS_IDENTITY = "AMBIGUOUS_IDENTITY"
+    INVALID_INPUT_CONTRACT = "INVALID_INPUT_CONTRACT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +25,7 @@ class ReplayEventDiagnostic:
     normalized_cause: str
     raw_line: str
     reason: str
+    category: ReplayRejectionCategory = ReplayRejectionCategory.INVALID_INPUT_CONTRACT
 
     def __post_init__(self) -> None:
         if not self.replay_id:
@@ -35,10 +45,15 @@ class ReplayEventParseError(ValueError):
         if not diagnostics:
             raise ValueError("ReplayEventParseError requires at least one diagnostic")
         self.diagnostics = diagnostics
+        self.category = diagnostics[0].category
         first = diagnostics[0]
         super().__init__(
             f"Replay {first.replay_id!r} rejected at line {first.line_index}: {first.reason}"
         )
 
 
-__all__ = ["ReplayEventDiagnostic", "ReplayEventParseError"]
+__all__ = [
+    "ReplayEventDiagnostic",
+    "ReplayEventParseError",
+    "ReplayRejectionCategory",
+]

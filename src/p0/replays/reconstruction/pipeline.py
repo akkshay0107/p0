@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from p0.format_config import DEFAULT_RUNTIME_MANIFEST
+import orjson
+
+from p0.format_config import DEFAULT_RUNTIME_MANIFEST, FORMAT
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.replays.group import group_replays
-from p0.replays.protocol import ReplayDocument, parse_replay_payload
+from p0.replays.protocol import (
+    ReplayDocument,
+    ReplayInputContractError,
+    parse_replay_payload,
+)
 from p0.replays.reconstruction.decisions import (
     infer_decision_windows,
     reconstruct_decisions_from_trace,
@@ -28,10 +35,46 @@ from p0.runtime.process_context import PROCESS_CONTEXT
 if TYPE_CHECKING:
     from p0.replays.compile import CompilationResult, CompiledGame, ShardBuildResult
 
+_SUPPORTED_FORMATS = frozenset({FORMAT.battle_format, FORMAT.bo3_format})
 
-def _rejection_name(reason: str) -> str:
-    token = reason.partition(":")[0].strip().replace(" ", "_")
-    return token if token.replace("_", "").isalnum() else "reconstruction"
+
+def _validate_compile_input(document: ReplayDocument) -> None:
+    """Enforce the complete replay contract at the reconstruction boundary."""
+    if document.metadata.format_id not in _SUPPORTED_FORMATS:
+        raise ReplayInputContractError(
+            f"Unsupported replay format {document.metadata.format_id!r}; "
+            f"supported formats are {sorted(_SUPPORTED_FORMATS)!r}"
+        )
+    if any(not sheet.is_complete for sheet in document.ots):
+        raise ReplayInputContractError(
+            f"Replay {document.metadata.replay_id!r} requires complete six-member OTS"
+        )
+    if document.outcome.terminal_line_index is None:
+        raise ReplayInputContractError("Replay has no terminal protocol line")
+
+
+def _validate_runtime_dex(dex: Mapping[str, Any] | None) -> None:
+    """Validate the runtime artifact once before workers are started."""
+    if dex is None:
+        try:
+            default_runtime_resources()
+        except (OSError, ValueError, TypeError) as exc:
+            raise ReplayInputContractError("Pinned runtime dex is unusable") from exc
+        return
+    required = {"species", "items", "abilities", "moves", "transformations"}
+    if not required.issubset(dex):
+        missing = sorted(required - set(dex))
+        raise ReplayInputContractError(f"Runtime dex is missing required sections: {missing!r}")
+    pinned_dex = default_runtime_resources().dex
+    dex_hash = hashlib.sha256(orjson.dumps(dex, option=orjson.OPT_SORT_KEYS)).hexdigest()
+    pinned_hash = hashlib.sha256(orjson.dumps(pinned_dex, option=orjson.OPT_SORT_KEYS)).hexdigest()
+    if dex_hash != pinned_hash:
+        raise ReplayInputContractError("Runtime dex does not match the pinned Champions artifact")
+    declared_format = dex.get("format_id")
+    if declared_format is not None and declared_format not in _SUPPORTED_FORMATS:
+        raise ReplayInputContractError(
+            f"Runtime dex format does not match supported formats: {declared_format!r}"
+        )
 
 
 def _compile_worker(
@@ -47,54 +90,50 @@ def _compile_worker(
     document, series_id, game_number, roles, max_candidates, dex = args
     runtime_dex = default_runtime_resources().dex if dex is None else dex
 
-    try:
-        resolved = resolve_replay_events(document, dex=runtime_dex)
-        if resolved.diagnostics:
-            return None, _rejection_name(resolved.diagnostics[0].reason)
-        events = resolved.require_accepted()
+    resolved = resolve_replay_events(document, dex=runtime_dex)
+    if resolved.diagnostics:
+        diagnostic = resolved.diagnostics[0]
+        return None, diagnostic.category.value
+    events = resolved.require_accepted()
 
-        state = reduce_replay_state(
-            document.metadata.replay_id,
-            document.ots,
-            events,
-            dex=runtime_dex,
-        )
-        if state.diagnostics:
-            return None, _rejection_name(state.diagnostics[0].reason)
-    except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-        return None, type(exc).__name__
+    state = reduce_replay_state(
+        document.metadata.replay_id,
+        document.ots,
+        events,
+        dex=runtime_dex,
+    )
+    if state.diagnostics:
+        diagnostic = state.diagnostics[0]
+        return None, diagnostic.category.value
 
-    try:
-        windows = infer_decision_windows(events)
-        decisions = tuple(
-            reconstruct_decisions_from_trace(
-                document,
-                events,
-                state,
-                perspective=perspective,
-                max_candidates=max_candidates,
-                dex=runtime_dex,
-                windows=windows,
-            )
-            for perspective in (0, 1)
-        )
-    except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-        return None, type(exc).__name__
-
-    if any(result.diagnostics for result in decisions):
-        return None, _rejection_name(decisions[0].diagnostics[0].reason)
-
-    try:
-        perspectives = project_replay_perspectives(
+    windows = infer_decision_windows(events)
+    decisions = tuple(
+        reconstruct_decisions_from_trace(
             document,
             events,
             state,
-            (decisions[0], decisions[1]),
+            perspective=perspective,
+            max_candidates=max_candidates,
             dex=runtime_dex,
+            windows=windows,
         )
-        estimates = impute_replay_stats(document, dex=runtime_dex)
-    except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-        return None, type(exc).__name__
+        for perspective in (0, 1)
+    )
+
+    decision_diagnostics = tuple(
+        diagnostic for result in decisions for diagnostic in result.diagnostics
+    )
+    if decision_diagnostics:
+        return None, decision_diagnostics[0].category.value
+
+    perspectives = project_replay_perspectives(
+        document,
+        events,
+        state,
+        (decisions[0], decisions[1]),
+        dex=runtime_dex,
+    )
+    estimates = impute_replay_stats(document, dex=runtime_dex)
 
     from p0.replays.compile import CompiledGame
 
@@ -129,6 +168,14 @@ def compile_documents(
         _quality_reasons,
     )
 
+    documents = tuple(documents)
+    for document in documents:
+        _validate_compile_input(document)
+        if format_id is not None and document.metadata.format_id != format_id:
+            raise ReplayInputContractError(
+                f"Replay format {document.metadata.format_id!r} does not match requested {format_id!r}"
+            )
+    _validate_runtime_dex(dex)
     grouping = group_replays(documents, format_id=format_id)
     counters = _initial_compilation_counters(grouping)
     jobs = []

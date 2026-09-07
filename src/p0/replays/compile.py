@@ -36,6 +36,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save, atomic_torch_save
 from p0.replays.group import GroupedSeries, GroupingResult
 from p0.replays.protocol import ReplayDocument
+from p0.replays.reconstruction.events import parse_protocol_event
 from p0.replays.reconstruction.projection import ProjectedPerspective, ReplayStatValue
 from p0.replays.schema import REPLAY_IR_SCHEMA_VERSION, DecisionType, LabelKind
 from p0.replays.shards import (
@@ -380,7 +381,6 @@ def write_tensor_shards(
     current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
     current_decisions = 0
     shard_index = 0
-    failed_games: set[str] = set()
 
     def flush() -> None:
         nonlocal current_games, current_decisions, shard_index
@@ -393,23 +393,12 @@ def write_tensor_shards(
         summaries: list[dict[str, Any]] = []
         last_series_id: str | None = None
         for game, perspective in current_games:
-            if game.replay_id in failed_games:
-                continue
-
-            try:
-                fields, values = _perspective_tensors(
-                    game,
-                    perspective,
-                    builder=builder,
-                    stat_estimates=game.stat_estimates,
-                )
-            except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
-                diagnostics[f"rejected_tensorization_{type(exc).__name__}"] += 1
-                if game.replay_id not in failed_games:
-                    failed_games.add(game.replay_id)
-                    diagnostics["rejected_games"] += 1
-                    diagnostics["accepted_games"] -= 1
-                continue
+            fields, values = _perspective_tensors(
+                game,
+                perspective,
+                builder=builder,
+                stat_estimates=game.stat_estimates,
+            )
 
             if last_series_id is not None and game.series_id != last_series_id:
                 series_offsets.append(game_offsets[-1])
@@ -613,6 +602,49 @@ def _measure_game(counters: Counter[str], game: CompiledGame) -> None:
                         counters["illegal_candidates"] += 1
             for tag in decision.evidence.tags:
                 counters[f"tag_{tag}"] += 1
+
+    # Keep multidimensional acceptance evidence in the same flat, stable
+    # counter representation used by the shard manifest.  These dimensions
+    # are measured from source protocol/OTS facts, independently of decision
+    # reconstruction, so clustered failures remain visible in release review.
+    turn_lengths = [
+        int(line.parts[2])
+        for line in game.document.protocol_lines
+        if len(line.parts) == 3 and line.parts[1] == "turn" and line.parts[2].isdigit()
+    ]
+    _metric_dimension(counters, "turn_length", str(max(turn_lengths, default=0)))
+    _metric_dimension(counters, "outcome", game.document.outcome.end_reason.name.lower())
+    for line in game.document.protocol_lines:
+        if len(line.parts) < 2:
+            continue
+        tag = line.parts[1]
+        _metric_dimension(counters, "protocol_tag", tag)
+        if tag.startswith("-"):
+            event = parse_protocol_event(game.replay_id, line)
+            for namespace, reference in (("effect", event.effect), ("cause", event.cause)):
+                if reference is not None:
+                    _metric_dimension(counters, namespace, reference.normalized)
+        if tag == "move" and len(line.parts) >= 3:
+            _metric_dimension(
+                counters,
+                "move",
+                line.parts[3].split("|", 1)[0] if len(line.parts) > 3 else line.parts[2],
+            )
+    for sheet in game.document.ots:
+        for member in sheet.members:
+            _metric_dimension(counters, "species", member.species)
+            if member.ability:
+                _metric_dimension(counters, "ability", member.ability)
+            if member.item:
+                _metric_dimension(counters, "item", member.item)
+            for move in member.moves:
+                _metric_dimension(counters, "move", move)
+
+
+def _metric_dimension(counters: Counter[str], dimension: str, value: str) -> None:
+    """Increment a sanitized multidimensional compilation metric."""
+    normalized = "_".join(value.casefold().strip().split()) or "unknown"
+    counters[f"{dimension}_{normalized}"] += 1
 
 
 def _quality_reasons(

@@ -28,7 +28,7 @@ from p0.replays.dataset import (
     assign_series_splits,
 )
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
-from p0.replays.protocol import parse_replay_payload
+from p0.replays.protocol import ReplayInputContractError, parse_replay_payload
 from p0.replays.schema import (
     ActionEvidence,
     GroupingMethod,
@@ -361,14 +361,22 @@ class TestReplayScraping:
             parse_replay_payload(load_raw_replay(p))
             for p in (cache / FORMAT.bo3_format / "raw").glob("*.json.gz")
         ]
+        with pytest.raises(ReplayInputContractError) as error:
+            compile_to_shards(docs, tmp_path / "shards", format_id=FORMAT.bo3_format)
+        assert error.value.category == "INVALID_INPUT_CONTRACT"
+        docs = [
+            parse_replay_payload(load_raw_replay(path))
+            for path in (cache / FORMAT.bo3_format / "raw").glob("*.json.gz")
+            if "bad" not in path.name
+        ]
         first = compile_to_shards(docs, tmp_path / "shards", format_id=FORMAT.bo3_format)
         second = compile_to_shards(docs, tmp_path / "shards", format_id=FORMAT.bo3_format)
 
         assert first.manifest_path == second.manifest_path
         assert first.manifest.dataset_hash == second.manifest.dataset_hash
-        assert first.manifest.source_games == 2
+        assert first.manifest.source_games == 1
         assert first.manifest.accepted_games == 1
-        assert first.manifest.rejected_games == 1
+        assert first.manifest.rejected_games == 0
         chunks = list(LazyReplayDataset(first.manifest_path))
         assert len(chunks) == 2
 

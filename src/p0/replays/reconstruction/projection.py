@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from p0.battle.events import SpatialSlotRecord, SpatialTurnRecorder
 from p0.battle.legality import DecisionView
@@ -13,6 +13,7 @@ from p0.replays.identity import ReplayMemberId, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.decisions import (
     DecisionReconstruction,
+    _mega_rules,
     build_decision_view,
 )
 from p0.replays.reconstruction.resolution import ResolvedProtocolEvent
@@ -44,8 +45,7 @@ def _enum_name(value: str) -> str:
     return _ENUM_ALIASES.get(normalized, normalized.upper())
 
 
-@dataclass(frozen=True, slots=True)
-class ReplayNamedValue:
+class ReplayNamedValue(NamedTuple):
     """Small immutable enum-like value accepted by the observation contracts."""
 
     name: str
@@ -601,11 +601,7 @@ def project_replay_perspectives(
     if any(result.diagnostics for result in decisions):
         raise ValueError("Projection requires accepted decision reconstruction")
 
-    mega_items = frozenset(
-        normalize_showdown_id(str(entry.get("requiredItem")))
-        for entry in dex.get("transformations", ())
-        if isinstance(entry, Mapping) and entry.get("isMega") and entry.get("requiredItem")
-    )
+    mega_rules = _mega_rules(dex)
     window_by_bounds = {
         (window.start_line_index, window.end_line_index): window for window in decisions[0].windows
     }
@@ -649,7 +645,8 @@ def project_replay_perspectives(
                 perspective,
                 window_events,
                 preview=preview,
-                mega_items=mega_items,
+                dex=dex,
+                mega_rules=mega_rules,
             )
             projected_snapshots.append(
                 ProjectedSnapshot(

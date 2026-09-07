@@ -1,7 +1,11 @@
 """Typed, player-relative replay reconstruction pipeline."""
 
 from p0.replays.reconstruction.classification import EventClassification
-from p0.replays.reconstruction.diagnostics import ReplayEventDiagnostic, ReplayEventParseError
+from p0.replays.reconstruction.diagnostics import (
+    ReplayEventDiagnostic,
+    ReplayEventParseError,
+    ReplayRejectionCategory,
+)
 from p0.replays.reconstruction.events import (
     ParsedReplayEvents,
     PokemonRefArgument,
@@ -64,6 +68,7 @@ __all__ = [
     "ProtocolEvent",
     "ReplayEventDiagnostic",
     "ReplayEventParseError",
+    "ReplayRejectionCategory",
     "ReplayBattleState",
     "ReplayMemberId",
     "ReplayPokemonState",

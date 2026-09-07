@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 
 from p0.battle.actions import (
     FORCED_ACTION,
@@ -48,7 +48,17 @@ from p0.replays.reconstruction.state import (
 from p0.replays.schema import DecisionRecord, DecisionType, OTSData
 
 _ACTION_TAGS = frozenset({"move", "switch", "cant"})
-_PIVOT_CAUSES = frozenset({"uturn", "flipturn", "voltswitch", "batonpass", "partingshot"})
+_PIVOT_CAUSES = frozenset(
+    {
+        "uturn",
+        "flipturn",
+        "voltswitch",
+        "batonpass",
+        "partingshot",
+        "chillyreception",
+        "shedtail",
+    }
+)
 _FORCED_MOVES = frozenset({"struggle", "recharge"})
 _SELF_TARGETS = frozenset(
     {
@@ -64,36 +74,39 @@ _SELF_TARGETS = frozenset(
         "scripted",
     }
 )
-_ENDPOINT_ACTION_STATE_TAGS = frozenset(
-    {
-        "-ability",
-        "-activate",
-        "-boost",
-        "-clearallboost",
-        "-clearboost",
-        "-clearnegativeboost",
-        "-clearpositiveboost",
-        "-copyboost",
-        "-curestatus",
-        "-end",
-        "-enditem",
-        "-formechange",
-        "-invertboost",
-        "-item",
-        "-singlemove",
-        "-singleturn",
-        "-start",
-        "-status",
-        "-swapboost",
-        "-terastallize",
-        "-transform",
-        "-unboost",
-        "detailschange",
-    }
-)
-_GLOBAL_ACTION_STATE_TAGS = frozenset(
-    {"-fieldend", "-fieldstart", "-sideend", "-sidestart", "-weather"}
-)
+_FOE_TARGETS = frozenset({"adjacentfoe"})
+_NORMAL_TARGETS = frozenset({"normal", "any"})
+_ALLY_TARGETS = frozenset({"adjacentally"})
+_ALLY_OR_SELF_TARGETS = frozenset({"adjacentallyorself"})
+
+
+def _target_codes(move_target: str, actor_slot: int) -> tuple[int, ...]:
+    if move_target in _SELF_TARGETS:
+        return (0,)
+    if move_target in _ALLY_TARGETS:
+        return (-2,) if actor_slot == 0 else (-1,)
+    if move_target in _ALLY_OR_SELF_TARGETS:
+        return (0, -2) if actor_slot == 0 else (0, -1)
+    if move_target in _FOE_TARGETS:
+        return (1, 2)
+    if move_target in _NORMAL_TARGETS:
+        return ((-2,) if actor_slot == 0 else (-1,)) + (1, 2)
+    return (0,)
+
+
+class _MegaRules(NamedTuple):
+    species_by_item: Mapping[str, frozenset[str]]
+    z_items: frozenset[str]
+
+
+def _effective_move_target(member: ReplayPokemonState, move: MoveState) -> str:
+    if move.move_id == "curse":
+        return (
+            "any"
+            if any(normalize_showdown_id(value) == "ghost" for value in member.current_types)
+            else "self"
+        )
+    return move.target.casefold()
 
 
 class BoundaryKind(StrEnum):
@@ -343,16 +356,6 @@ def _move_states(member: ReplayPokemonState) -> tuple[MoveState, ...]:
     return member.moves
 
 
-def _move_slot(member: ReplayPokemonState, move_id: str) -> int | None:
-    normalized = normalize_showdown_id(move_id)
-    try:
-        return next(
-            index for index, move in enumerate(_move_states(member)) if move.move_id == normalized
-        )
-    except StopIteration:
-        return None
-
-
 def _target_code(
     actor: ResolvedPokemonRefArgument,
     target: ResolvedPokemonRefArgument | None,
@@ -369,7 +372,7 @@ def _observed_move(
     event: ResolvedProtocolEvent,
     state: ReplayBattleState,
     animation_targets: Mapping[tuple[ReplayMemberId, str], ResolvedPokemonRefArgument],
-    mega_slots: frozenset[tuple[ReplaySide, int]],
+    mega_slots: set[tuple[ReplaySide, int]],
 ) -> ObservedAction:
     actor = _reference(event, 0)
     if actor is None or actor.member_id is None:
@@ -383,19 +386,25 @@ def _observed_move(
         action = MEGA_FORCED_ACTION if mega else FORCED_ACTION
         return ObservedAction(action, tag="forced_move")
 
-    move_slot = _move_slot(member, move_id)
+    move_states = _move_states(member)
+    move_slot = next(
+        (index for index, move in enumerate(move_states) if move.move_id == move_id),
+        None,
+    )
     if move_slot is None:
         return ObservedAction(tag="move_slot_or_target_unknown")
 
-    move_states = _move_states(member)
-    move_target = move_states[move_slot].target.casefold()
+    move_target = _effective_move_target(member, move_states[move_slot])
     target = _reference(event, 2)
     if target is None:
         target = animation_targets.get((actor.member_id, move_id))
         target_tag = "move_anim_target"
     else:
         target_tag = "move"
+    allowed_targets = _target_codes(move_target, slot or 0)
     target_code = 0 if move_target in _SELF_TARGETS else _target_code(actor, target)
+    if target_code is not None and target_code not in allowed_targets:
+        target_code = None
     if target_code is None:
         return ObservedAction(tag="move_slot_or_target_unknown")
 
@@ -407,7 +416,7 @@ def _observed_move(
 
     alternatives = tuple(
         encode_action(SlotAction(ActionKind.MOVE, move_slot=move_slot, target=value, mega=mega))
-        for value in (-2, -1, 1, 2)
+        for value in allowed_targets
     )
     return ObservedAction(
         action,
@@ -415,10 +424,6 @@ def _observed_move(
         exact=False,
         tag="execution_target",
     )
-
-
-def _is_submission_state_event(event: ResolvedProtocolEvent) -> bool:
-    return event.event.tag in _ENDPOINT_ACTION_STATE_TAGS
 
 
 def _observed_actions(
@@ -430,8 +435,7 @@ def _observed_actions(
     observed: list[ObservedAction | None] = [None, None]
     tags: list[str] = []
     mega_slots: set[tuple[ReplaySide, int]] = set()
-    invalidated: set[tuple[ReplaySide, int]] = set()
-    globally_invalidated = False
+    generated_slots: set[tuple[ReplaySide, int]] = set()
     for event in events:
         parsed = event.event
         if parsed.tag == "-mega":
@@ -440,14 +444,15 @@ def _observed_actions(
                 slot = actor.pokemon_ref.active_slot
                 if slot is not None:
                     mega_slots.add((actor.pokemon_ref.side, slot))
-        elif _is_submission_state_event(event):
+        elif parsed.tag == "-singleturn" and any(
+            normalize_showdown_id(argument).startswith("moveinstruct")
+            for argument in parsed.arguments
+        ):
             actor = _reference(event, 0)
             if actor is not None and actor.member_id is not None:
                 slot = actor.pokemon_ref.active_slot
                 if slot is not None:
-                    invalidated.add((actor.pokemon_ref.side, slot))
-        elif parsed.tag in _GLOBAL_ACTION_STATE_TAGS:
-            globally_invalidated = True
+                    generated_slots.add((actor.pokemon_ref.side, slot))
 
         if parsed.tag not in _ACTION_TAGS:
             continue
@@ -460,6 +465,10 @@ def _observed_actions(
         key = (actor.pokemon_ref.side, slot)
 
         if parsed.tag == "move":
+            if key in generated_slots:
+                generated_slots.remove(key)
+                tags.append("externally_generated_move")
+                continue
             if parsed.cause is not None:
                 tags.append("externally_generated_move")
                 continue
@@ -467,11 +476,7 @@ def _observed_actions(
                 observed[slot] = ObservedAction(tag="multiple_moves_same_slot", exact=False)
                 tags.append("multiple_moves_same_slot")
                 continue
-            if key in invalidated or globally_invalidated:
-                observed[slot] = ObservedAction(tag="submission_state_changed", exact=False)
-                tags.append("submission_state_changed")
-                continue
-            action = _observed_move(event, state, animation_targets, frozenset(mega_slots))
+            action = _observed_move(event, state, animation_targets, mega_slots)
             observed[slot] = action
             if action.tag and action.tag != "move":
                 tags.append(action.tag)
@@ -552,11 +557,35 @@ def _preview_actions(
     )
 
 
-def _mega_items(dex: Mapping[str, Any]) -> frozenset[str]:
-    return frozenset(
-        normalize_showdown_id(str(entry.get("requiredItem")))
-        for entry in dex.get("transformations", ())
-        if isinstance(entry, Mapping) and entry.get("isMega") and entry.get("requiredItem")
+def _mega_rules(dex: Mapping[str, Any]) -> _MegaRules:
+    species_by_item: dict[str, set[str]] = {}
+    for entry in dex.get("items", ()):
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("megaStone"), Mapping):
+            continue
+        item = normalize_showdown_id(str(entry.get("id", entry.get("name", ""))))
+        species_by_item[item] = {
+            normalize_showdown_id(str(species)) for species in entry["megaStone"]
+        }
+    z_items = frozenset(
+        normalize_showdown_id(str(entry.get("id", entry.get("name", ""))))
+        for entry in dex.get("items", ())
+        if isinstance(entry, Mapping) and entry.get("zMove")
+    )
+    return _MegaRules(
+        {item: frozenset(species) for item, species in species_by_item.items()},
+        z_items,
+    )
+
+
+def _can_mega(member: ReplayPokemonState, rules: _MegaRules, used: bool) -> bool:
+    if used:
+        return False
+    item = normalize_showdown_id(member.item or "")
+    species = normalize_showdown_id(member.current_form)
+    return species in rules.species_by_item.get(item, ()) or (
+        species == "rayquaza"
+        and "dragonascent" in {move.move_id for move in member.moves}
+        and item not in rules.z_items
     )
 
 
@@ -567,7 +596,8 @@ def build_decision_view(
     window_events: tuple[ResolvedProtocolEvent, ...],
     *,
     preview: bool,
-    mega_items: frozenset[str],
+    dex: Mapping[str, Any],
+    mega_rules: _MegaRules | None = None,
 ) -> DecisionView:
     roster_size = len(ots.members)
     if preview:
@@ -578,6 +608,7 @@ def build_decision_view(
         )
 
     own_side = state.sides[perspective]
+    rules = _mega_rules(dex) if mega_rules is None else mega_rules
     active = own_side.active
     active_set = frozenset(member_id for member_id in active if member_id is not None)
     selected_count = sum(
@@ -608,12 +639,15 @@ def build_decision_view(
     slots: list[SlotDecision] = []
     for slot, member_id in enumerate(active):
         member = None if member_id is None else state.member(member_id)
-        moves = () if member is None else tuple((-2, -1, 0, 1, 2) for _ in _move_states(member))
-        can_mega = bool(
-            member is not None
-            and not own_side.used_mega
-            and normalize_showdown_id(member.item or "") in mega_items
+        moves = (
+            ()
+            if member is None
+            else tuple(
+                _target_codes(_effective_move_target(member, move), slot)
+                for move in _move_states(member)
+            )
         )
+        can_mega = bool(member is not None and _can_mega(member, rules, own_side.used_mega))
         slots.append(
             SlotDecision(
                 switch_slots=switches,
@@ -648,7 +682,8 @@ def _decision_for_window(
     perspective: int,
     max_candidates: int,
     animation_targets: Mapping[tuple[ReplayMemberId, str], ResolvedPokemonRefArgument],
-    mega_items: frozenset[str],
+    dex: Mapping[str, Any],
+    mega_rules: _MegaRules,
 ) -> DecisionRecord | None:
     window_events = events[window.start_line_index : window.end_line_index]
     if window.decision_type in {
@@ -668,7 +703,8 @@ def _decision_for_window(
             perspective,
             window_events,
             preview=True,
-            mega_items=mega_items,
+            dex=dex,
+            mega_rules=mega_rules,
         )
         tags = observed[2]
         unknown = not any(action is not None for action in observed[:2])
@@ -682,7 +718,8 @@ def _decision_for_window(
             perspective,
             window_events,
             preview=False,
-            mega_items=mega_items,
+            dex=dex,
+            mega_rules=mega_rules,
         )
         observed_slots = list(observed[:2])
         tags = observed[2]
@@ -765,7 +802,7 @@ def reconstruct_decisions_from_trace(
 
     runtime_dex = default_runtime_resources().dex if dex is None else dex
     animation_targets = _animation_targets(event_tuple)
-    mega_items = _mega_items(runtime_dex)
+    mega_rules = _mega_rules(runtime_dex)
     if windows is None:
         try:
             windows = infer_decision_windows(event_tuple)
@@ -792,7 +829,8 @@ def reconstruct_decisions_from_trace(
             perspective,
             max_candidates,
             animation_targets,
-            mega_items,
+            runtime_dex,
+            mega_rules,
         )
         if record is not None:
             records.append(record)

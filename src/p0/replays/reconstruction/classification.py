@@ -139,6 +139,10 @@ _RULES = {
     "gametype": _no_state_change(1, 1, required=(0,)),
     "message": _no_state_change(1, 1),
     "-message": _no_state_change(1, 1),
+    "bigerror": _no_state_change(1, 1, required=(0,)),
+    # OHKO is emitted as a bare informational marker after the target is
+    # reduced to zero HP; the target is intentionally not repeated.
+    "-ohko": _no_state_change(0, 0),
     "-hint": _no_state_change(1, 1),
     "-center": _state(0, 0),
     "-crit": _no_state_change(1, 2, required=(0,)),
@@ -180,6 +184,7 @@ _RULES = {
     "swap": _state(2, None, required=(1,), pokemon_refs=(0,)),
     "-damage": _state(2, None, required=(1,), pokemon_refs=(0,)),
     "-heal": _state(2, None, required=(1,), pokemon_refs=(0,)),
+    # One Pokémon/HP pair followed by free-form annotations ([from], [silent]).
     "-sethp": _state(2, None, required=(1,), pokemon_refs=(0,)),
     "-status": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-curestatus": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
@@ -229,5 +234,43 @@ _RULES = {
 
 CLASSIFICATION_REGISTRY: Mapping[str, EventRule] = MappingProxyType(_RULES)
 
+# These tags cannot be produced by either supported Champions format at the
+# pinned simulator revision. Keeping the list explicit makes additions fail
+# closed rather than silently becoming state-neutral.
+UNSUPPORTED_TAGS = frozenset(
+    {
+        "debug",
+        "-candynamax",
+        "-center",
+        "-terastallize",
+        "-zpower",
+        "-primal",
+        "-burst",
+        "-swapsideconditions",
+        "-combine",
+        "-waiting",
+        "-notarget",
+        "-nothing",
+        "-eat",
+    }
+)
 
-__all__ = ["CLASSIFICATION_REGISTRY", "EventClassification", "EventRule"]
+# Reachable events whose semantics depend on Showdown's storedStats model.
+# They are rejected before reduction until that state is represented exactly.
+UNSUPPORTED_PREDICATES = frozenset(
+    {
+        ("-activate", "powersplit"),
+        ("-activate", "guardsplit"),
+        ("-activate", "speedswap"),
+        ("-start", "powertrick"),
+    }
+)
+
+
+__all__ = [
+    "CLASSIFICATION_REGISTRY",
+    "EventClassification",
+    "EventRule",
+    "UNSUPPORTED_PREDICATES",
+    "UNSUPPORTED_TAGS",
+]

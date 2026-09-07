@@ -80,7 +80,7 @@ class TestReconstructionProjection:
         assert len(paths) == 51
         assert result.metrics.counters["accepted_games"] == 40
         assert result.metrics.counters["rejected_games"] == 11
-        assert result.metrics.counters["rejected_reconstruction_unresolved_illusion"] == 11
+        assert result.metrics.counters["rejected_reconstruction_AMBIGUOUS_IDENTITY"] == 11
         assert len(result.games) == 40
         assert all(
             len(perspective.snapshots) == len(perspective.decisions)

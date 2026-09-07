@@ -82,6 +82,79 @@ class TestReconstructionEvents:
         with pytest.raises(ValueError, match="Invalid protocol Pokémon reference"):
             parse_protocol_pokemon_reference("Nickname")
 
+    def test_activation_unknown_and_wrong_move_fail_closed(self) -> None:
+        for raw in ("|-activate|p1a: A|move: UnknownMadeUp", "|-activate|p1a: A|move: Thunderbolt"):
+            event = parse_protocol_event("activation", _line(raw))
+            assert event.classification is EventClassification.UNSUPPORTED_STATE
+
+    def test_effect_valid_for_another_tag_fails_closed(self) -> None:
+        event = parse_protocol_event("effect-family", _line("|-singlemove|p1a: A|move: Protect"))
+
+        assert event.classification is EventClassification.UNSUPPORTED_STATE
+
+    def test_source_causes_are_catalog_checked_without_rejecting_of_annotations(self) -> None:
+        legal = (
+            "|-damage|p1a: A|50/100|[from] item: White Herb",
+            "|-activate|p1a: A|ability: Hospitality|[from] ability: Hospitality",
+            "|-start|p1a: A|Chilly Reception|[from] move: Chilly Reception",
+            "|-end|p1a: A|Chilly Reception|[of] p1a: A",
+        )
+        assert (
+            parse_protocol_events(
+                "causes", tuple(_line(raw, index=i) for i, raw in enumerate(legal))
+            ).diagnostics
+            == ()
+        )
+
+        invalid = (
+            "|-damage|p1a: A|50/100|[from] move: Made Up",
+            "|-damage|p1a: A|50/100|[from] item: Made Up",
+            "|-damage|p1a: A|50/100|[from] ability: Made Up",
+            "|-damage|p1a: A|50/100|[from] Made Up",
+        )
+        parsed = parse_protocol_events(
+            "causes", tuple(_line(raw, index=i) for i, raw in enumerate(invalid))
+        )
+        assert len(parsed.diagnostics) == len(invalid)
+        assert all(
+            diagnostic.category.value == "UNSUPPORTED_EVENT" for diagnostic in parsed.diagnostics
+        )
+
+    def test_activation_pp_amounts_require_bounded_positive_values(self) -> None:
+        for raw in (
+            "|-activate|p1a: A|move: Spite|Tackle|0",
+            "|-activate|p1a: A|move: Spite|Tackle|5",
+            "|-activate|p1a: A|move: Eerie Spell|Tackle|4",
+        ):
+            event = parse_protocol_event("activation", _line(raw))
+            assert event.classification is EventClassification.MALFORMED
+
+    def test_activation_leppa_requires_named_move(self) -> None:
+        event = parse_protocol_event(
+            "activation", _line("|-activate|p1a: A|item: Leppa Berry|[consumed]")
+        )
+        assert event.classification is EventClassification.MALFORMED
+
+    def test_activation_mummy_and_symbiosis_retain_source_references(self) -> None:
+        mummy = parse_protocol_event(
+            "activation", _line("|-activate|p1a: A|ability: Mummy|p2a: B|[ability]")
+        )
+        symbiosis = parse_protocol_event(
+            "activation", _line("|-activate|p1a: A|ability: Symbiosis|Leftovers|[of] p2a: B")
+        )
+        assert mummy.classification is EventClassification.PUBLIC_STATE
+        assert len(mummy.pokemon_refs) == 2
+        assert symbiosis.classification is EventClassification.PUBLIC_STATE
+        assert len(symbiosis.pokemon_refs) == 2
+
+    def test_activation_substitute_is_known_source_effect(self) -> None:
+        event = parse_protocol_event("activation", _line("|-activate|p1a: A|move: Substitute"))
+        assert event.classification is EventClassification.PUBLIC_STATE
+
+    def test_activation_stored_stat_family_remains_unsupported(self) -> None:
+        event = parse_protocol_event("activation", _line("|-activate|p1a: A|move: Power Split"))
+        assert event.classification is EventClassification.UNSUPPORTED_STATE
+
     def test_bare_separator_and_empty_tag_text_have_different_classifications(self) -> None:
         separator = parse_protocol_event("replay-1", _line("|"))
         text = parse_protocol_event("replay-1", _line("||player is ready"))

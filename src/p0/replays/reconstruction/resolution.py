@@ -10,6 +10,7 @@ from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.diagnostics import (
     ReplayEventDiagnostic,
     ReplayEventParseError,
+    ReplayRejectionCategory,
 )
 from p0.replays.reconstruction.events import (
     PokemonRefArgument,
@@ -32,8 +33,8 @@ class ResolvedPokemonRefArgument:
         if self.argument_index < 0:
             raise ValueError("Resolved reference argument index must be nonnegative")
         if self.pokemon_ref.active_slot is None:
-            if self.member_id is not None:
-                raise ValueError("Side references cannot resolve to roster members")
+            if self.member_id is not None and self.member_id.side is not self.pokemon_ref.side:
+                raise ValueError("Slotless references require a member on the same side")
         elif self.member_id is None or self.member_id.side is not self.pokemon_ref.side:
             raise ValueError("Active-slot references require a member on the same side")
 
@@ -118,7 +119,11 @@ class _HistoryBuilder:
         )
 
 
-class _HistoryResolutionError(ValueError):
+class _ResolutionError(Exception):
+    """Expected failure while resolving a protocol reference to a roster member."""
+
+    category = ReplayRejectionCategory.AMBIGUOUS_IDENTITY
+
     def __init__(self, event: ProtocolEvent, reason: str) -> None:
         self.event = event
         super().__init__(reason)
@@ -143,6 +148,7 @@ class _HistoryScanner:
             for sheet in ots
         }
         self._active: dict[tuple[ReplaySide, int], int] = {}
+        self._last_occupant: dict[tuple[ReplaySide, int], int] = {}
         self._histories: list[_HistoryBuilder] = []
         self.team_sizes = {sheet.side: min(4, len(sheet.members)) for sheet in ots}
 
@@ -164,7 +170,7 @@ class _HistoryScanner:
         side = ReplaySide(event.arguments[0])
         size = int(event.arguments[1])
         if not 1 <= size <= len(self._members[side]):
-            raise _HistoryResolutionError(event, f"invalid selected team size {size}")
+            raise _ResolutionError(event, f"invalid selected team size {size}")
         self.team_sizes[side] = size
 
     def _start_history(self, event: ProtocolEvent) -> None:
@@ -179,7 +185,7 @@ class _HistoryScanner:
             self._species_bases,
         )
         if not candidates:
-            raise _HistoryResolutionError(
+            raise _ResolutionError(
                 event,
                 f"incoming reference {reference.pokemon_ref.displayed_name!r} resolved to "
                 "0 available roster members",
@@ -187,6 +193,7 @@ class _HistoryScanner:
 
         key = (side, slot)
         predecessor_history_id = self._active.pop(key, None)
+        self._last_occupant.pop(key, None)
         overlaps = {
             history_id
             for (active_side, _), history_id in self._active.items()
@@ -216,7 +223,7 @@ class _HistoryScanner:
             self._species_bases,
         )
         if history.revealed_member is not None and history.revealed_member != revealed:
-            raise _HistoryResolutionError(event, "Illusion history has conflicting reveals")
+            raise _ResolutionError(event, "Illusion history has conflicting reveals")
         history.revealed_member = revealed
         history.reveal_event = event
 
@@ -225,14 +232,16 @@ class _HistoryScanner:
         slot = _required_active_slot(event, reference)
         history = self._active_history(event, reference)
         history.faint_line_index = event.line_index
-        self._active.pop((history.side, slot))
+        key = (history.side, slot)
+        self._active.pop(key, None)
+        self._last_occupant[key] = history.history_id
 
     def _swap_history(self, event: ProtocolEvent) -> None:
         reference = _event_reference(event)
         source_slot = _required_active_slot(event, reference)
         target_slot = int(event.arguments[1])
         if not 0 <= target_slot < 2:
-            raise _HistoryResolutionError(
+            raise _ResolutionError(
                 event,
                 f"swap target slot {target_slot} is outside a doubles battle",
             )
@@ -243,7 +252,7 @@ class _HistoryScanner:
         try:
             source_history = self._active[source_key]
         except KeyError as exc:
-            raise _HistoryResolutionError(event, "swap source has no active history") from exc
+            raise _ResolutionError(event, "swap source has no active history") from exc
         target_history = self._active.get(target_key)
         self._active[target_key] = source_history
         if target_history is None:
@@ -258,13 +267,13 @@ class _HistoryScanner:
     ) -> _HistoryBuilder:
         slot = _required_active_slot(event, reference)
         key = (reference.pokemon_ref.side, slot)
-        try:
-            return self._histories[self._active[key]]
-        except KeyError as exc:
-            raise _HistoryResolutionError(
+        history_id = self._active.get(key, self._last_occupant.get(key))
+        if history_id is None:
+            raise _ResolutionError(
                 event,
                 f"{reference.pokemon_ref.side.value}{slot} has no active member",
-            ) from exc
+            )
+        return self._histories[history_id]
 
     def has_illusion_member(self, side: ReplaySide) -> bool:
         return bool(self._illusion_members[side])
@@ -354,7 +363,7 @@ def _event_reference(event: ProtocolEvent, argument_index: int = 0) -> PokemonRe
             if reference.argument_index == argument_index
         )
     except StopIteration as exc:
-        raise _HistoryResolutionError(
+        raise _ResolutionError(
             event,
             f"event {event.tag!r} has no Pokémon reference at argument {argument_index}",
         ) from exc
@@ -363,7 +372,7 @@ def _event_reference(event: ProtocolEvent, argument_index: int = 0) -> PokemonRe
 def _required_active_slot(event: ProtocolEvent, reference: PokemonRefArgument) -> int:
     slot = reference.pokemon_ref.active_slot
     if slot is None:
-        raise _HistoryResolutionError(event, f"event {event.tag!r} requires an active slot")
+        raise _ResolutionError(event, f"event {event.tag!r} requires an active slot")
     return slot
 
 
@@ -446,7 +455,7 @@ def _revealed_member(
 ) -> ReplayMemberId:
     candidates = _matching_members(event, pokemon_ref, members, species_bases)
     if len(candidates) != 1:
-        raise _HistoryResolutionError(
+        raise _ResolutionError(
             event,
             f"Illusion reveal {pokemon_ref.displayed_name!r} resolved to "
             f"{len(candidates)} roster members",
@@ -481,7 +490,7 @@ def _resolve_incoming_histories(
             event = (
                 side_histories[0].entry_event if impossible_reveal is None else impossible_reveal
             )
-            raise _HistoryResolutionError(
+            raise _ResolutionError(
                 event,
                 "unresolved_illusion: active history has no valid roster assignment",
             )
@@ -502,7 +511,7 @@ def _resolve_incoming_histories(
                 )
             else:
                 reason = "unresolved_illusion: active history has multiple valid assignments"
-            raise _HistoryResolutionError(history.entry_event, reason)
+            raise _ResolutionError(history.entry_event, reason)
 
         solution = next(iter(solutions))
         for history, candidate in zip(side_histories, solution, strict=True):
@@ -520,7 +529,22 @@ class _IdentityResolver:
         self._members = {side_sheet.side: side_sheet.members for side_sheet in ots}
         self._incoming_bindings = incoming_bindings
         self._species_bases = species_bases
+        slotless_matches: dict[tuple[ReplaySide, str], set[ReplayMemberId]] = {}
+        for side, members in self._members.items():
+            for member in members:
+                keys = {
+                    normalize_showdown_id(member.nickname),
+                    normalize_showdown_id(member.species),
+                    _base_species_id(member.species, species_bases),
+                }
+                for key in keys:
+                    if key:
+                        slotless_matches.setdefault((side, key), set()).add(member.member_id)
+        self._slotless_matches = {
+            key: tuple(sorted(matches)) for key, matches in slotless_matches.items()
+        }
         self._active: dict[tuple[ReplaySide, int], ReplayMemberId] = {}
+        self._last_occupant: dict[tuple[ReplaySide, int], ReplayMemberId] = {}
 
     def resolve(self, event: ProtocolEvent) -> ResolvedProtocolEvent:
         switch_reference = self._switch_reference(event)
@@ -530,13 +554,11 @@ class _IdentityResolver:
         )
 
         if switch_reference is not None:
-            incoming = next(
-                reference.member_id
-                for reference in resolved
-                if reference.argument_index == switch_reference.argument_index
-            )
+            incoming = resolved[0].member_id
             if incoming is None or switch_reference.pokemon_ref.active_slot is None:
-                raise ValueError("switch reference did not resolve to an active member")
+                raise _ResolutionError(
+                    event, "switch reference did not resolve to an active member"
+                )
             occupied_elsewhere = any(
                 member_id == incoming
                 and key
@@ -547,8 +569,10 @@ class _IdentityResolver:
                 for key, member_id in self._active.items()
             )
             if occupied_elsewhere:
-                raise ValueError("incoming member is already active in another slot")
-            self._active[(incoming.side, switch_reference.pokemon_ref.active_slot)] = incoming
+                raise _ResolutionError(event, "incoming member is already active in another slot")
+            key = (incoming.side, switch_reference.pokemon_ref.active_slot)
+            self._active[key] = incoming
+            self._last_occupant.pop(key, None)
         elif event.tag == "replace" and resolved:
             revealed = _revealed_member(
                 event,
@@ -557,12 +581,18 @@ class _IdentityResolver:
                 self._species_bases,
             )
             if resolved[0].member_id != revealed:
-                raise ValueError("Illusion reveal does not match the active history assignment")
+                raise _ResolutionError(
+                    event, "Illusion reveal does not match the active history assignment"
+                )
         elif event.tag == "faint" and resolved:
             fainted = resolved[0]
             slot = fainted.pokemon_ref.active_slot
             if slot is not None:
-                self._active.pop((fainted.pokemon_ref.side, slot), None)
+                if fainted.member_id is None:
+                    raise _ResolutionError(event, "faint reference has no roster member")
+                key = (fainted.pokemon_ref.side, slot)
+                self._active.pop(key, None)
+                self._last_occupant[key] = fainted.member_id
         elif event.tag == "swap" and resolved:
             self._apply_swap(event, resolved[0])
 
@@ -582,7 +612,12 @@ class _IdentityResolver:
     ) -> ResolvedPokemonRefArgument:
         pokemon_ref = reference.pokemon_ref
         if pokemon_ref.active_slot is None:
-            return ResolvedPokemonRefArgument(reference.argument_index, pokemon_ref, None)
+            # Side-condition protocol arguments carry labels such as
+            # ``p1: Player`` that are not roster nicknames.
+            if event.tag in {"-sidestart", "-sideend", "-cureteam"}:
+                return ResolvedPokemonRefArgument(reference.argument_index, pokemon_ref, None)
+            member_id = self._resolve_slotless(event, pokemon_ref)
+            return ResolvedPokemonRefArgument(reference.argument_index, pokemon_ref, member_id)
 
         if (
             switch_reference is not None
@@ -591,13 +626,35 @@ class _IdentityResolver:
             member_id = self._resolve_incoming(event, pokemon_ref)
         else:
             key = (pokemon_ref.side, pokemon_ref.active_slot)
-            try:
-                member_id = self._active[key]
-            except KeyError as exc:
-                raise ValueError(
-                    f"{pokemon_ref.side.value}{pokemon_ref.active_slot} has no active member"
-                ) from exc
+            member_id = self._active.get(key, self._last_occupant.get(key))
+            if member_id is None:
+                raise _ResolutionError(
+                    event,
+                    f"{pokemon_ref.side.value}{pokemon_ref.active_slot} has no active member",
+                )
         return ResolvedPokemonRefArgument(reference.argument_index, pokemon_ref, member_id)
+
+    def _resolve_slotless(
+        self,
+        event: ProtocolEvent,
+        pokemon_ref: ProtocolPokemonReference,
+    ) -> ReplayMemberId | None:
+        displayed_name = normalize_showdown_id(pokemon_ref.displayed_name)
+        matches = self._slotless_matches.get((pokemon_ref.side, displayed_name), ())
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise _ResolutionError(
+                event,
+                f"side reference {pokemon_ref.displayed_name!r} resolved to "
+                f"{len(matches)} roster members",
+            )
+        if displayed_name:
+            raise _ResolutionError(
+                event,
+                f"side reference {pokemon_ref.displayed_name!r} matched no roster member",
+            )
+        return None
 
     def _resolve_incoming(
         self,
@@ -607,9 +664,9 @@ class _IdentityResolver:
         try:
             member_id = self._incoming_bindings[event.line_index]
         except KeyError as exc:
-            raise ValueError("switch event has no inferred incoming member") from exc
+            raise _ResolutionError(event, "switch event has no inferred incoming member") from exc
         if member_id.side is not pokemon_ref.side:
-            raise ValueError("inferred incoming member belongs to the wrong side")
+            raise _ResolutionError(event, "inferred incoming member belongs to the wrong side")
         return member_id
 
     def _apply_swap(
@@ -619,15 +676,19 @@ class _IdentityResolver:
     ) -> None:
         source_slot = reference.pokemon_ref.active_slot
         if source_slot is None:
-            raise ValueError("swap requires an active-slot reference")
+            raise _ResolutionError(event, "swap requires an active-slot reference")
         target_slot = int(event.arguments[1])
         if not 0 <= target_slot < 2:
-            raise ValueError(f"swap target slot {target_slot} is outside a doubles battle")
+            raise _ResolutionError(
+                event, f"swap target slot {target_slot} is outside a doubles battle"
+            )
 
         side = reference.pokemon_ref.side
         source_key = (side, source_slot)
         target_key = (side, target_slot)
-        source_member = self._active[source_key]
+        source_member = self._active.get(source_key)
+        if source_member is None:
+            raise _ResolutionError(event, "swap source has no active member")
         target_member = self._active.get(target_key)
         self._active[target_key] = source_member
         if target_member is None:
@@ -636,7 +697,11 @@ class _IdentityResolver:
             self._active[source_key] = target_member
 
 
-def _diagnostic(event: ProtocolEvent, reason: str) -> ReplayEventDiagnostic:
+def _diagnostic(
+    event: ProtocolEvent,
+    reason: str,
+    category: ReplayRejectionCategory = ReplayRejectionCategory.INVALID_INPUT_CONTRACT,
+) -> ReplayEventDiagnostic:
     return ReplayEventDiagnostic(
         replay_id=event.replay_id,
         line_index=event.line_index,
@@ -645,6 +710,7 @@ def _diagnostic(event: ProtocolEvent, reason: str) -> ReplayEventDiagnostic:
         normalized_cause="" if event.cause is None else event.cause.normalized,
         raw_line=event.raw_line,
         reason=reason,
+        category=category,
     )
 
 
@@ -673,16 +739,22 @@ def resolve_protocol_events(
     species_bases = _species_base_index({} if dex is None else dex)
     try:
         incoming_bindings = _resolve_incoming_histories(ots, event_tuple, species_bases)
-    except _HistoryResolutionError as exc:
-        return ResolvedReplayEvents(replay_id, (), (_diagnostic(exc.event, str(exc)),))
+    except _ResolutionError as exc:
+        return ResolvedReplayEvents(
+            replay_id, (), (_diagnostic(exc.event, str(exc), exc.category),)
+        )
 
     resolver = _IdentityResolver(ots, incoming_bindings, species_bases)
     resolved: list[ResolvedProtocolEvent] = []
     for event in event_tuple:
         try:
             resolved.append(resolver.resolve(event))
-        except (KeyError, ValueError) as exc:
-            return ResolvedReplayEvents(replay_id, (), (_diagnostic(event, str(exc)),))
+        except _ResolutionError as exc:
+            return ResolvedReplayEvents(
+                replay_id,
+                (),
+                (_diagnostic(event, str(exc), exc.category),),
+            )
     return ResolvedReplayEvents(replay_id, tuple(resolved))
 
 

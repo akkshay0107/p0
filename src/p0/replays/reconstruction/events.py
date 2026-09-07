@@ -9,12 +9,22 @@ from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.classification import (
     CLASSIFICATION_REGISTRY,
+    UNSUPPORTED_PREDICATES,
+    UNSUPPORTED_TAGS,
     EventClassification,
     EventRule,
+)
+from p0.replays.reconstruction.contract import (
+    ALL_LEGAL_EFFECT_NAMES,
+    ALLOWED_CAUSE_NAMESPACES,
+    ALLOWED_EFFECTS_BY_TAG,
+    KNOWN_ACTIVATION_EFFECTS,
+    LEGAL_EFFECT_IDS,
 )
 from p0.replays.reconstruction.diagnostics import (
     ReplayEventDiagnostic,
     ReplayEventParseError,
+    ReplayRejectionCategory,
 )
 from p0.replays.reconstruction.identity import (
     ProtocolPokemonReference,
@@ -90,6 +100,11 @@ class ProtocolEvent:
             normalized_cause="" if self.cause is None else self.cause.normalized,
             raw_line=self.raw_line,
             reason=self.rejection_reason,
+            category=(
+                ReplayRejectionCategory.UNSUPPORTED_EVENT
+                if self.classification is EventClassification.UNSUPPORTED_STATE
+                else ReplayRejectionCategory.INVALID_INPUT_CONTRACT
+            ),
         )
 
 
@@ -188,6 +203,50 @@ def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
         return f"{tag} requires a p1/p2 side"
     if tag == "player" and (not arguments or arguments[0] not in {"p1", "p2"}):
         return "player requires a p1/p2 side"
+    if tag == "-activate" and len(arguments) > 1:
+        effect = _effect_reference(arguments[1])
+        catalog_kind = (
+            {
+                "item": "items",
+                "ability": "abilities",
+            }.get(effect.namespace)
+            if effect is not None
+            else None
+        )
+        catalog_effect = (
+            catalog_kind is not None
+            and effect is not None
+            and effect.normalized in LEGAL_EFFECT_IDS[catalog_kind]
+        )
+        if (
+            effect is not None
+            and effect.normalized not in KNOWN_ACTIVATION_EFFECTS
+            and not catalog_effect
+        ):
+            return f"unsupported -activate effect {effect.normalized!r}"
+        if effect is not None and effect.normalized in {"spite", "eeriespell"}:
+            if (
+                len(arguments) != 4
+                or not arguments[2]
+                or not arguments[3].isdigit()
+                or not 1 <= int(arguments[3]) <= (4 if effect.normalized == "spite" else 3)
+            ):
+                return "PP deduction activation requires a named move and bounded positive amount"
+        if effect is not None and effect.normalized == "leppaberry":
+            if len(arguments) < 4 or not arguments[2] or arguments[3] != "[consumed]":
+                return "Leppa activation requires a named move and [consumed] annotation"
+    if tag == "-sethp":
+        # Showdown's sethp wire shape is exactly one target/HP pair plus
+        # annotations. Annotation fields are never additional pairs.
+        hp = arguments[1] if len(arguments) > 1 else ""
+        if not hp or hp.startswith("[") or "/" not in hp:
+            return "-sethp requires one target/HP pair"
+        if any(not value.startswith("[") for value in arguments[2:]):
+            return "-sethp permits only annotations after the HP value"
+    if tag == "-activate":
+        effect_index = 1 if arguments and looks_like_protocol_pokemon_reference(arguments[0]) else 0
+        if effect_index >= len(arguments) or _effect_reference(arguments[effect_index]) is None:
+            return "-activate requires a source-backed effect"
     return ""
 
 
@@ -275,6 +334,10 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
     """Parse and classify one normalized protocol line without changing state."""
     tag = line.parts[1]
     arguments = line.parts[2:]
+    # Showdown serializes a missing move target as the literal JSON-ish token
+    # ``null``.  It is a protocol sentinel, never a Pokémon reference.
+    if tag == "move" and len(arguments) >= 3 and arguments[2] == "null":
+        arguments = (*arguments[:2], "", *arguments[3:])
     cause = _cause(arguments)
 
     if line.raw == "|":
@@ -337,7 +400,48 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
 
     effect = _event_effect(tag, rule, arguments)
 
-    classification = rule.classification if not reason else EventClassification.MALFORMED
+    if effect is not None and tag in {"-activate", "-singlemove"}:
+        allowed = ALLOWED_EFFECTS_BY_TAG.get(tag, frozenset())
+        allowed_for_tag = (effect.namespace, effect.normalized) in allowed or (
+            "",
+            effect.normalized,
+        ) in allowed
+        globally_legal_activation = (
+            tag == "-activate" and effect.normalized in ALL_LEGAL_EFFECT_NAMES
+        )
+        if not allowed_for_tag and not globally_legal_activation:
+            reason = f"unsupported {tag} effect {effect.normalized!r}"
+    if cause is not None and cause.namespace and cause.namespace not in ALLOWED_CAUSE_NAMESPACES:
+        reason = f"unsupported cause namespace {cause.namespace!r}"
+    if cause is not None:
+        catalog_kind = {"move": "moves", "item": "items", "ability": "abilities"}.get(
+            cause.namespace
+        )
+        if catalog_kind is not None and cause.normalized not in LEGAL_EFFECT_IDS[catalog_kind]:
+            reason = f"unsupported cause {cause.namespace}:{cause.normalized}"
+        elif not cause.namespace and cause.normalized not in ALL_LEGAL_EFFECT_NAMES:
+            reason = f"unsupported cause {cause.normalized!r}"
+
+    predicate = None
+    for candidate in (effect, cause):
+        if candidate and (tag, candidate.normalized) in UNSUPPORTED_PREDICATES:
+            predicate = candidate
+            break
+
+    if not reason and tag in UNSUPPORTED_TAGS:
+        reason = f"protocol tag {tag!r} is unsupported by the reconstruction contract"
+        classification = EventClassification.UNSUPPORTED_STATE
+    elif not reason and predicate is not None:
+        reason = f"protocol effect {predicate.normalized!r} on {tag!r} requires unsupported stored-stat state"
+        classification = EventClassification.UNSUPPORTED_STATE
+    else:
+        classification = (
+            EventClassification.UNSUPPORTED_STATE
+            if reason.startswith("unsupported ")
+            else rule.classification
+            if not reason
+            else EventClassification.MALFORMED
+        )
     return ProtocolEvent(
         replay_id,
         line.index,
