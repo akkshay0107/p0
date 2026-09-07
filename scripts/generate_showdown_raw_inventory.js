@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const ts = require('../pokemon-showdown/node_modules/typescript');
 
 const ROOT = path.resolve(__dirname, '..', 'pokemon-showdown');
+const DATA_ROOT = path.resolve(ROOT, '..', 'data');
 const EXPECTED = '8282e63102fa824fd2f7472778ec09793ceb7cac';
 const DIRECTORIES = ['config/formats.ts', 'data/mods/champions', 'sim', 'data'];
 const DATA_FILES = new Set(['moves.ts', 'abilities.ts', 'items.ts', 'conditions.ts']);
@@ -131,7 +132,7 @@ function volatileTable() {
     }
     return {path: 'data/conditions.ts', line: null};
   };
-  const dexCatalog = JSON.parse(fs.readFileSync(path.join(ROOT, '..', 'data/champions_dex.json'), 'utf8'));
+  const dexCatalog = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, 'champions_dex.json'), 'utf8'));
   const legalEffects = new Set(dexCatalog.legalProtocolEffects.effect || []);
   const legalOwners = new Map(['moves', 'items', 'abilities'].map(kind => [kind,
     new Set((dexCatalog.legality?.[kind] || []).map(entry => typeof entry === 'string' ? entry : entry.id))]));
@@ -174,7 +175,7 @@ function main() {
   const files = sourceFiles().map(scan);
   const entries = files.flatMap(file => file.entries);
   const impossible = new Set(['debug', '-candynamax', '-center', '-terastallize', '-zpower', '-primal', '-burst', '-swapsideconditions', '-combine', '-waiting', '-notarget', '-nothing', '-eat']);
-  const catalog = JSON.parse(fs.readFileSync(path.join(ROOT, '..', 'data/champions_dex.json'), 'utf8'));
+  const catalog = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, 'champions_dex.json'), 'utf8'));
   const legal = new Map(['moves', 'items', 'abilities'].map(kind => [kind, new Set(catalog.legality?.[kind] || [])]));
   const dex = require('../pokemon-showdown/dist/sim/dex').Dex.mod('champions');
   const dynamicActivationEffects = [];
@@ -218,7 +219,7 @@ function main() {
     review_status: 'raw_inventory_unreviewed_dynamic_sites_explicit',
     activation_effects: [...new Set(['trickroom', 'protect', 'mummy', 'symbiosis', ...dynamicActivationEffects, ...entries.filter(entry => entry.tag === '-activate' && entry.reachability !== 'excluded').map(entry => entry.arguments[2] || entry.arguments[1]).filter(arg => arg && /^['"]/.test(arg)).map(arg => arg.replace(/^['"]|['"]$/g, '').replace(/^\[(move|ability|item)\]\s*/i, '').replace(/^(move|ability|item):\s*/i, '').toLowerCase().replace(/\s+/g, ''))])],
     volatile_conditions: volatileTable()};
-  const destination = path.join(ROOT, '..', 'src/p0/replays/reconstruction/showdown_raw_emission_inventory.json');
+  const destination = path.join(DATA_ROOT, 'showdown_raw_emission_inventory.json');
   fs.writeFileSync(destination, JSON.stringify(output, null, 2) + '\n');
 }
 main();

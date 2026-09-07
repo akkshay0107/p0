@@ -13,6 +13,8 @@ from p0.replays.reconstruction.classification import (
 )
 
 SHOWDOWN_COMMIT = "8282e63102fa824fd2f7472778ec09793ceb7cac"
+PROJECT_ROOT = Path(__file__).parents[1]
+DATA_ROOT = PROJECT_ROOT / "data"
 
 # This is deliberately explicit.  Test-name substring matching silently
 # dropped most stateful protocol tags from the old contract.  Each entry names
@@ -70,10 +72,7 @@ STATEFUL_TRANSITION_TESTS = {
 
 
 def main() -> None:
-    raw_inventory_path = (
-        Path(__file__).parents[1]
-        / "src/p0/replays/reconstruction/showdown_raw_emission_inventory.json"
-    )
+    raw_inventory_path = DATA_ROOT / "showdown_raw_emission_inventory.json"
     raw_entries = json.loads(raw_inventory_path.read_text(encoding="utf-8"))["entries"]
     source_by_tag = {}
     raw_witnesses = []
@@ -111,9 +110,9 @@ def main() -> None:
                 }
             )
     test_files = [
-        Path(__file__).parents[1] / "tests/unit/test_reconstruction_events.py",
-        Path(__file__).parents[1] / "tests/unit/test_reconstruction_contract.py",
-        Path(__file__).parents[1] / "tests/unit/test_reconstruction_state.py",
+        PROJECT_ROOT / "tests/unit/test_reconstruction_events.py",
+        PROJECT_ROOT / "tests/unit/test_reconstruction_contract.py",
+        PROJECT_ROOT / "tests/unit/test_reconstruction_state.py",
     ]
     test_nodes = []
     for test_file in test_files:
@@ -121,7 +120,7 @@ def main() -> None:
             stripped = line.strip()
             if stripped.startswith("def test_"):
                 test_nodes.append(
-                    f"{test_file.relative_to(Path(__file__).parents[1])}:{stripped[4 : stripped.index('(')]}"
+                    f"{test_file.relative_to(PROJECT_ROOT)}:{stripped[4 : stripped.index('(')]}"
                 )
     test_node_by_name = {node.rsplit(":", 1)[-1]: node for node in test_nodes}
     missing_witness_tests = {
@@ -173,7 +172,7 @@ def main() -> None:
         },
         "entries": entries,
     }
-    path = Path(__file__).parents[1] / "src/p0/replays/reconstruction/replay_protocol_contract.json"
+    path = DATA_ROOT / "replay_protocol_contract.json"
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

@@ -9,13 +9,13 @@ import random
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 import torch
 
 from p0.format_config import FORMAT
 from p0.model.resources import default_runtime_resources
+from p0.paths import DEFAULT_PATHS
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 
@@ -55,7 +55,7 @@ def _legal_display_names(dex: Mapping[str, Any], kind: str) -> tuple[str, ...]:
 
 def _load_species_pools() -> tuple[StressSpeciesPool, ...]:
     """Load species-specific ability and learnset pools from the stress catalog."""
-    catalog_path = Path(__file__).parent / "stress_team_catalog.json"
+    catalog_path = DEFAULT_PATHS.data_root / "stress_team_catalog.json"
     if not catalog_path.is_file():
         raise FileNotFoundError(f"Stress team catalog JSON not found: {catalog_path}")
 

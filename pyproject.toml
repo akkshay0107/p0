@@ -42,7 +42,11 @@ include = ["p0*"]
 [tool.setuptools.data-files]
 "share/p0" = [
     "data/champions_dex.json",
+    "data/replay_protocol_contract.json",
     "data/runtime_manifest.json",
+    "data/showdown_raw_emission_inventory.json",
+    "data/spread_usage.json",
+    "data/stress_team_catalog.json",
     "data/vocab.json",
 ]
 

@@ -40,14 +40,7 @@ def collect_export_files(project_root: Path, artifacts: Path) -> list[tuple[Path
     """Collect runtime artifacts plus the contracts needed to interpret them."""
     targets: list[tuple[Path, str, int]] = []
     gather_directory_files(artifacts, project_root, targets)
-    for relative in (
-        Path("data/runtime_manifest.json"),
-        Path("data/vocab.json"),
-        Path("data/champions_dex.json"),
-    ):
-        source = project_root / relative
-        if source.exists():
-            targets.append((source, str(relative), source.stat().st_size))
+    gather_directory_files(project_root / "data", project_root, targets)
     return targets
 
 

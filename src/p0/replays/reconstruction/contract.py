@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from p0.paths import DEFAULT_PATHS
 from p0.replays.identity import normalize_showdown_id
 from p0.replays.reconstruction.classification import (
     CLASSIFICATION_REGISTRY,
@@ -16,9 +17,9 @@ from p0.replays.reconstruction.classification import (
 )
 
 SHOWDOWN_COMMIT = "8282e63102fa824fd2f7472778ec09793ceb7cac"
-CONTRACT_PATH = Path(__file__).with_name("replay_protocol_contract.json")
-RAW_INVENTORY_PATH = Path(__file__).with_name("showdown_raw_emission_inventory.json")
-DEX_PATH = RAW_INVENTORY_PATH.parents[4] / "data" / "champions_dex.json"
+CONTRACT_PATH = DEFAULT_PATHS.data_root / "replay_protocol_contract.json"
+RAW_INVENTORY_PATH = DEFAULT_PATHS.data_root / "showdown_raw_emission_inventory.json"
+DEX_PATH = DEFAULT_PATHS.data_root / "champions_dex.json"
 
 
 def load_protocol_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
@@ -45,7 +46,7 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
     """Verify revision and source hashes against the current Showdown checkout."""
     if value is None:
         value = RAW_EMISSION_INVENTORY
-    showdown_root = RAW_INVENTORY_PATH.parents[4] / "pokemon-showdown"
+    showdown_root = DEFAULT_PATHS.showdown_root
     gitdir_line = (showdown_root / ".git").read_text(encoding="utf-8").strip()
     gitdir = (showdown_root / gitdir_line.removeprefix("gitdir: ")).resolve()
     head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
@@ -187,7 +188,7 @@ def validate_protocol_contract(contract: dict[str, Any] = PROTOCOL_CONTRACT) -> 
     test_nodes = contract.get("test_nodes")
     if not isinstance(test_nodes, list) or not test_nodes:
         raise ValueError("protocol contract must include discovered test witness IDs")
-    repository_root = Path(__file__).parents[4]
+    repository_root = DEFAULT_PATHS.repository_root
     for node in test_nodes:
         parts = node.rsplit(":", 1)
         if len(parts) != 2:
