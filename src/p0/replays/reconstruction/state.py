@@ -837,7 +837,7 @@ class _StateReducer:
             elif cause is not None and cause.normalized == "shedtail":
                 if "substitute" in outgoing.effects:
                     incoming.effects["substitute"] = self.turn
-            self._clear_switch_state(outgoing)
+            self._clear_battle_state(outgoing, reset_form=True)
 
         member = self.members[member_id]
         details_species = _details_species(resolved.event.arguments[1])
@@ -912,7 +912,7 @@ class _StateReducer:
         member.hp_fraction = 0.0
         member.fainted = True
         member.status = None
-        self._clear_switch_state(member)
+        self._clear_battle_state(member, reset_form=False)
         self.active.pop(key)
 
     def _handle_move(self, resolved: ResolvedProtocolEvent) -> None:
@@ -1902,8 +1902,9 @@ class _StateReducer:
         else:
             member.ability = AbilityState(member.ability.base, member.ability.forme, ability)
 
-    def _clear_switch_state(self, member: _MutablePokemon) -> None:
-        self._set_form(member, member.persistent_form, persistent=False)
+    def _clear_battle_state(self, member: _MutablePokemon, *, reset_form: bool) -> None:
+        if reset_form:
+            self._set_form(member, member.persistent_form, persistent=False)
         member.ability = AbilityState(member.ability.base, member.ability.forme)
         member.boosts = dict.fromkeys(_BOOST_NAMES, 0)
         member.effects.clear()
@@ -1921,7 +1922,7 @@ class _StateReducer:
         member.dragoncheer_has_dragon_type = False
         if member.status != "slp":
             member.status_counter = 0
-        species = self._species_data(member.persistent_form)
+        species = self._species_data(member.persistent_form if reset_form else member.current_form)
         if member.terastallized:
             if member.tera_type is None:
                 raise _StateTransitionError("terastallized member has no tera type")

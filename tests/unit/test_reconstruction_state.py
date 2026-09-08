@@ -171,13 +171,14 @@ def _complete_wish_ots() -> tuple[OTSData, OTSData]:
 def _resolved(
     *raw_lines: str,
     ots: tuple[OTSData, OTSData] | None = None,
+    dex: dict[str, object] | None = None,
 ):
     lines = tuple(
         ProtocolLine(index, raw, tuple(raw.split("|")), None) for index, raw in enumerate(raw_lines)
     )
     parsed = parse_protocol_events("state-test", lines)
     sheets = _complete_ots() if ots is None else ots
-    return resolve_protocol_events("state-test", sheets, parsed.events).require_accepted()
+    return resolve_protocol_events("state-test", sheets, parsed.events, dex=dex).require_accepted()
 
 
 class TestReconstructionState:
@@ -282,6 +283,41 @@ class TestReconstructionState:
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
         assert final.member(ReplayMemberId(ReplaySide.P1, 0)).current_form == "Alpha-Mega"
+
+    def test_faint_preserves_transient_form(self) -> None:
+        p1 = _ots(
+            ReplaySide.P1,
+            ("Morpeko", "Pikachu", "Conkeldurr", "Gliscor", "Talonflame", "Cofagrigus"),
+        )
+        p1 = replace(p1, members=(replace(p1.members[0], ability="Hunger Switch"), *p1.members[1:]))
+        p2 = _ots(
+            ReplaySide.P2,
+            (
+                "Incineroar",
+                "Gholdengo",
+                "Amoonguss",
+                "Landorus-Therian",
+                "Urshifu-Rapid-Strike",
+                "Flutter Mane",
+            ),
+        )
+        ots = (p1, p2)
+        dex = default_runtime_resources().dex
+        events = _resolved(
+            "|switch|p1a: Morpeko|Morpeko, L50|100/100",
+            "|-formechange|p1a: Morpeko|Morpeko-Hangry",
+            "|-damage|p1a: Morpeko|0 fnt",
+            "|faint|p1a: Morpeko",
+            ots=ots,
+            dex=dex,
+        )
+
+        snapshots = reduce_replay_state("state-test", ots, events, dex=dex).require_accepted()
+        morpeko_id = ReplayMemberId(ReplaySide.P1, 0)
+        fainted = snapshots[-1].member(morpeko_id)
+
+        assert fainted.fainted
+        assert fainted.current_form == "Morpeko-Hangry"
 
     def test_mega_marks_the_side_as_having_mega_evolved(self) -> None:
         events = _resolved(
