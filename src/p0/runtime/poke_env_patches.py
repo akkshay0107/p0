@@ -7,7 +7,8 @@ import logging
 from time import perf_counter
 from typing import Any, cast
 
-from poke_env.battle import AbstractBattle, DoubleBattle, Pokemon
+from poke_env.battle import AbstractBattle, DoubleBattle, Effect, Pokemon, PokemonType
+from poke_env.data import to_id_str
 from poke_env.environment.env import _EnvPlayer
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
@@ -21,9 +22,21 @@ _ORIGINAL_SEND_MESSAGE = PSClient.send_message
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
 _ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
+_ORIGINAL_START_EFFECT = Pokemon.start_effect
+_ORIGINAL_COPY_BOOSTS = Pokemon.copy_boosts
 _installed = False
 _capture_protocol_lines = False
-_filtered_loggers: list[logging.Logger] = []
+_filtered_loggers: set[logging.Logger] = set()
+
+_CRITICAL_COPY_EFFECTS = (
+    Effect.DRAGON_CHEER,
+    Effect.FOCUS_ENERGY,
+    Effect.G_MAX_CHI_STRIKE,
+    Effect.LASER_FOCUS,
+)
+_MAX_G_MAX_CHI_STRIKE_LAYERS = 3
+_LEPPA_PP_RECOVERY = 10
+_RIPEN_LEPPA_PP_RECOVERY = 20
 
 
 class _InactivePokemonFilter(logging.Filter):
@@ -48,12 +61,7 @@ class _TeamPreviewEnvPlayer(_EnvPlayer):
 
 
 def enable_environment_team_preview(player: _EnvPlayer) -> None:
-    """
-    Enable policy-selected preview for poke-env's private environment player.
-
-    poke-env 0.15 constructs _EnvPlayer internally and exposes no player
-    factory. The instance-local class replacement is therefore isolated here.
-    """
+    """Enable policy-selected preview on poke-env's private environment player."""
     player.__class__ = _TeamPreviewEnvPlayer
 
 
@@ -76,17 +84,67 @@ async def _wait_for_login(self: PSClient, checking_interval: float = 0.1, wait_f
     assert self.logged_in.is_set(), f"Expected {self.username} to be logged in."
 
 
+def _start_effect(self: Pokemon, effect_str: str, details: Any = None) -> None:
+    """Track the counters and metadata needed by Showdown's copied volatiles."""
+    _ORIGINAL_START_EFFECT(self, effect_str, details)
+    effect = Effect.from_showdown_message(effect_str)
+    if effect == Effect.G_MAX_CHI_STRIKE:
+        self.effects[effect] = min(
+            self.effects.get(effect, 0) + 1,
+            _MAX_G_MAX_CHI_STRIKE_LAYERS,
+        )
+    elif effect == Effect.DRAGON_CHEER:
+        self.effects[effect] = int(PokemonType.DRAGON in self.types)
+
+
+def _copy_boosts(self: Pokemon, mon: Pokemon) -> None:
+    """Copy boosts and Showdown's critical-stage volatiles from the donor."""
+    self.boosts = dict(mon.boosts)
+    receiver_effects = self.effects
+    donor_effects = mon.effects
+    for effect in _CRITICAL_COPY_EFFECTS:
+        receiver_effects.pop(effect, None)
+        if effect in donor_effects:
+            receiver_effects[effect] = donor_effects[effect]
+
+
+def _restore_leppa_pp(battle: DoubleBattle, event: list[str]) -> None:
+    target = battle.get_pokemon(event[2])
+    move_id = to_id_str(event[4])
+    move = target.moves.get(move_id)
+    if move is None:
+        raise KeyError(f"Leppa Berry activation names unknown move: {event[4]}")
+
+    restoration = _RIPEN_LEPPA_PP_RECOVERY if target.ability == "ripen" else _LEPPA_PP_RECOVERY
+    move._current_pp = min(move._current_pp + restoration, move.max_pp)
+
+
 def _parse_message(self: DoubleBattle, split_message: list[str]):
+    event_type = split_message[1] if len(split_message) >= 2 else None
     # Best-of rooms send this UI-only notification to the child battle room.
     # It is not a battle event and poke-env 0.15 raises NotImplementedError for it.
-    if len(split_message) >= 2 and split_message[1] in {"tempnotify", "tempnotifyoff"}:
+    if event_type in {"tempnotify", "tempnotifyoff"}:
         return None
     capture_message(
         self,
         split_message,
         capture_protocol_line=_capture_protocol_lines,
     )
-    if len(split_message) >= 4 and split_message[1] == "-transform":
+    if event_type == "-copyboost" and len(split_message) >= 4:
+        self._replay_data.append(split_message[:])
+        receiver = self.get_pokemon(split_message[2])
+        donor = self.get_pokemon(split_message[3])
+        receiver.copy_boosts(donor)
+        return None
+    if (
+        len(split_message) >= 5
+        and event_type == "-activate"
+        and split_message[3] == "item: Leppa Berry"
+    ):
+        self._replay_data.append(split_message[:])
+        _restore_leppa_pp(self, split_message)
+        return None
+    if event_type == "-transform" and len(split_message) >= 4:
         try:
             base = self.get_pokemon(split_message[2])
             target_reference = transform_target_reference(self, base, split_message[3])
@@ -127,45 +185,32 @@ def _forme_change(self: Pokemon, species: str) -> None:
 
 
 def _update_from_teambuilder(self: Pokemon, tb: TeambuilderPokemon) -> None:
-    """
-    Keep the open-team-sheet nature that poke-env drops for EV-less formats.
-
-    poke-env 0.15 assigns nature only inside if not all(e == 0 for e in tb.evs),
-    so a sheet that declares a nature but no EVs loses it. Champions spends Stat
-    Points rather than EVs, so every opponent sheet parses with all-zero EVs and
-    the revealed nature is discarded - which is exactly the nature stat imputation
-    keys on. Upstream deleted the gate in PR #920, merged 2026-05-31 but unreleased
-    as of 0.15.0, so this restores that behaviour without moving off the pin.
-    """
+    """Restore open-team-sheet natures for EV-less teams in poke-env 0.15."""
     _ORIGINAL_UPDATE_FROM_TEAMBUILDER(self, tb)
 
     if self._nature is None and tb.nature is not None:
         self._nature = tb.nature.lower()
 
 
-async def _stop_listening_cleanly(self: PSClient) -> None:
-    """
-    Close a client and drain poke-env's listener/message-handler tasks.
+async def _cancel_active_tasks(tasks: tuple[asyncio.Task[Any], ...]) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-    poke-env 0.15 closes the websocket from stop_listening but does not
-    wait for the listener future or the message-handler tasks it creates on its
-    dedicated event loop. Those tasks otherwise survive until the loop is
-    closed, producing pending-task warnings during integration-test cleanup.
-    """
+
+async def _stop_listening_cleanly(self: PSClient) -> None:
+    """Close a client and drain its listener and message-handler tasks."""
     await _ORIGINAL_STOP_LISTENING(self)
 
     listening_future = getattr(self, "_listening_coroutine", None)
     if listening_future is not None:
         await asyncio.wrap_future(listening_future)
 
-    async def cancel_active_tasks() -> None:
-        tasks = tuple(cast(set[asyncio.Task[Any]], getattr(self, "_active_tasks", set())))
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(cancel_active_tasks(), self.loop))
+    tasks = tuple(cast(set[asyncio.Task[Any]], getattr(self, "_active_tasks", set())))
+    if tasks:
+        await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(_cancel_active_tasks(tasks), self.loop)
+        )
 
 
 def install(
@@ -173,22 +218,13 @@ def install(
     *,
     capture_protocol_lines: bool = False,
 ) -> None:
-    """
-    Install compatibility patches for the pinned poke-env release.
-
-    Arguments:
-      logger: Optional logger that receives the inactive-Pokémon filter.
-      capture_protocol_lines: Retain parsed protocol lines for replay verification.
-
-    Returns:
-      None
-    """
+    """Install compatibility patches for the pinned poke-env release."""
     global _capture_protocol_lines, _installed
-    target = logger or logging.getLogger("poke_env")
+    target = logger if logger is not None else logging.getLogger("poke_env")
 
     if target not in _filtered_loggers:
         target.addFilter(_INACTIVE_POKEMON_FILTER)
-        _filtered_loggers.append(target)
+        _filtered_loggers.add(target)
 
     if _installed:
         _capture_protocol_lines = _capture_protocol_lines or capture_protocol_lines
@@ -202,6 +238,8 @@ def install(
     DoubleBattle.parse_message = _parse_message
     Pokemon.forme_change = _forme_change
     Pokemon._update_from_teambuilder = _update_from_teambuilder
+    Pokemon.start_effect = _start_effect
+    Pokemon.copy_boosts = _copy_boosts
     _installed = True
 
 
@@ -221,6 +259,8 @@ def uninstall_for_tests() -> None:
         DoubleBattle.parse_message = _ORIGINAL_PARSE_MESSAGE
         Pokemon.forme_change = _ORIGINAL_FORME_CHANGE
         Pokemon._update_from_teambuilder = _ORIGINAL_UPDATE_FROM_TEAMBUILDER
+        Pokemon.start_effect = _ORIGINAL_START_EFFECT
+        Pokemon.copy_boosts = _ORIGINAL_COPY_BOOSTS
         _installed = False
 
 
