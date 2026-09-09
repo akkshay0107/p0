@@ -88,3 +88,56 @@ def team_variant(
             usage_count=usage_count,
         ),
     )
+
+
+def sample_vocabulary() -> dict[str, dict[str, int]]:
+    """Standard test vocabulary covering standard fixture species, items, abilities, and moves."""
+    return {
+        "species": {
+            "pikachu": 1,
+            "charizard": 2,
+            "whimsicott": 3,
+            "garchomp": 4,
+            "kingambit": 5,
+            "glimmora": 6,
+            "raichu": 7,
+        },
+        "items": {
+            "lightball": 1,
+            "charizarditey": 2,
+            "focussash": 3,
+            "sitrusberry": 4,
+            "blackglasses": 5,
+            "shucaberry": 6,
+            "lifeorb": 7,
+        },
+        "abilities": {
+            "static": 1,
+            "blaze": 2,
+            "prankster": 3,
+            "roughskin": 4,
+            "defiant": 5,
+            "toxicdebris": 6,
+        },
+        "moves": {
+            "fakeout": 1,
+            "protect": 2,
+            "thunderbolt": 3,
+            "electroweb": 4,
+            "heatwave": 5,
+            "solarbeam": 6,
+            "weatherball": 7,
+            "moonblast": 8,
+            "tailwind": 9,
+            "encore": 10,
+            "earthquake": 11,
+            "dragonclaw": 12,
+            "rockslide": 13,
+            "kowtowcleave": 14,
+            "suckerpunch": 15,
+            "lowkick": 16,
+            "powergem": 17,
+            "sludgebomb": 18,
+            "earthpower": 19,
+        },
+    }

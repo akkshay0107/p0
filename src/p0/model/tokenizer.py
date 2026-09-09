@@ -11,7 +11,7 @@ from p0.paths import DEFAULT_PATHS
 CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
 
 
-class _EnumIdTable(dict["NamedEffectView | str", int]):
+class _EnumIdTable(dict[NamedEffectView | str, int]):
     """
     Vocabulary IDs resolved from enum-like members and normalized names.
 
@@ -198,12 +198,7 @@ class PokemonTokenizer:
     def species_id(self, pokemon: PokemonView | None) -> int:
         if pokemon is None:
             return 0
-        species = pokemon.species
-        if not species:
-            try:
-                species = pokemon.base_species
-            except (KeyError, AttributeError):
-                species = None
+        species = pokemon.species or getattr(pokemon, "base_species", None)
         if not species:
             return 0
         return self.species.get(self.normalize_id(species), 0)

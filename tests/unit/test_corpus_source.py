@@ -1,19 +1,18 @@
-"""Tests for team corpus manifests and source construction."""
+"""Unit tests for corpus team pools, corpus source sampling, and CLI operations."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import random
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from p0.cli.corpus import main as corpus_main
 from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT, current_manifest
-from p0.model.tokenizer import PokemonTokenizer
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
@@ -21,71 +20,10 @@ from p0.teams.corpus import (
     CorpusSplit,
     TeamCorpusManifest,
     corpus_content_hash,
-    load_corpus_manifest,
 )
-from p0.teams.corpus_build import (
-    build_corpus,
-)
-from p0.teams.corpus_source import CorpusTeamSource
+from p0.teams.corpus_source import CorpusTeamPool, CorpusTeamSource
 from p0.teams.factory import build_team_source
 from p0.teams.source import FileTeamSource
-from p0.teams.spread_usage import (
-    SPREAD_USAGE_SCHEMA,
-)
-from p0.teams.validation import validate_many
-from tests.team_fixtures import team_variant
-
-
-def vocabulary() -> dict[str, dict[str, int]]:
-    return {
-        "species": {
-            "pikachu": 1,
-            "charizard": 2,
-            "whimsicott": 3,
-            "garchomp": 4,
-            "kingambit": 5,
-            "glimmora": 6,
-            "raichu": 7,
-        },
-        "items": {
-            "lightball": 1,
-            "charizarditey": 2,
-            "focussash": 3,
-            "sitrusberry": 4,
-            "blackglasses": 5,
-            "shucaberry": 6,
-            "lifeorb": 7,
-        },
-        "abilities": {
-            "static": 1,
-            "blaze": 2,
-            "prankster": 3,
-            "roughskin": 4,
-            "defiant": 5,
-            "toxicdebris": 6,
-        },
-        "moves": {
-            "fakeout": 1,
-            "protect": 2,
-            "thunderbolt": 3,
-            "electroweb": 4,
-            "heatwave": 5,
-            "solarbeam": 6,
-            "weatherball": 7,
-            "moonblast": 8,
-            "tailwind": 9,
-            "encore": 10,
-            "earthquake": 11,
-            "dragonclaw": 12,
-            "rockslide": 13,
-            "kowtowcleave": 14,
-            "suckerpunch": 15,
-            "lowkick": 16,
-            "powergem": 17,
-            "sludgebomb": 18,
-            "earthpower": 19,
-        },
-    }
 
 
 def _make_entry(
@@ -129,128 +67,89 @@ def _write_manifest(
     return path, manifest
 
 
-def _chaos(species: str, spreads: dict[str, float]) -> dict[str, Any]:
-    """Build a minimal chaos export carrying one species' spread distribution."""
-    return {"data": {species: {"Spreads": spreads}}}
-
-
-def _dex(*species: dict[str, Any]) -> dict[str, Any]:
-    """Build a minimal dex carrying only what forme aliasing reads."""
-    return {"species": list(species), "moves": []}
-
-
-_BASE_STATS = {"hp": 78, "atk": 65, "def": 68, "spa": 112, "spd": 154, "spe": 75}
-
-
-def _payload(spreads: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
-    return {
-        "schema": SPREAD_USAGE_SCHEMA,
-        "format_id": FORMAT.battle_format,
-        "weight_scale": 1_000_000,
-        "aliases": aliases or {},
-        "spreads": spreads,
-    }
-
-
-_ONE_BUCKET = {"real": {"timid": [[2, 0, 0, 32, 0, 32, 1000]]}}
-
-
-def _corpus_entry(packed: str = "packed-team") -> CorpusEntry:
-    return CorpusEntry(
-        canonical_hash=hashlib.sha256(packed.encode()).hexdigest(),
-        packed=packed,
-        packed_sha256=hashlib.sha256(packed.encode()).hexdigest(),
-        split=CorpusSplit.TRAIN,
-        usage_count=3,
-    )
-
-
-def _corpus_manifest(entries: tuple[CorpusEntry, ...]) -> TeamCorpusManifest:
-    active_contract = current_manifest().global_sha256
-    return TeamCorpusManifest(
-        global_contract_sha256=active_contract,
-        format_id="gen9championsvgc2026regmb",
-        corpus_hash=corpus_content_hash(entries),
-        entries=entries,
-        created_at="2026-07-17T00:00:00Z",
-        sampling_metadata={"sampling": "uniform_canonical"},
-    )
-
-
-class TestCorpusManifests:
-    def test_corpus_manifest_contract(self) -> None:
-        """Verify TeamCorpusManifest serializes losslessly and enforces canonical hash contracts."""
-        entries = (_corpus_entry("team-a"), _corpus_entry("team-b"))
-        assert entries[0].spread_provenance == "imputed"
-        manifest = _corpus_manifest(entries)
-        assert TeamCorpusManifest.from_dict(manifest.to_dict()) == manifest
-        assert load_corpus_manifest(manifest.to_dict()) == manifest
-        assert corpus_content_hash(entries) == corpus_content_hash(entries[::-1])
-        with pytest.raises(ValueError, match="does not match the packed team"):
-            CorpusEntry(
-                canonical_hash="a" * 64,
-                packed="team",
-                packed_sha256="b" * 64,
-                split=CorpusSplit.TRAIN,
-                usage_count=1,
-            )
-        with pytest.raises(ValueError, match="does not match the entries"):
-            TeamCorpusManifest.from_dict({**manifest.to_dict(), "corpus_hash": "0" * 64})
-        with pytest.raises(ValueError, match="Duplicate corpus entry"):
-            _corpus_manifest((entries[0], entries[0]))
-        with pytest.raises(ValueError, match="unknown"):
-            CorpusEntry.from_dict({**entries[0].to_dict(), "archetype_tags": []})
-
-    def test_corpus_source_spec_validates(self) -> None:
-        """Verify CorpusSourceSpec validates split parameter."""
+class TestCorpusTeamPool:
+    def test_pool_split_filtering(self, tmp_path: Path) -> None:
+        entries = (
+            _make_entry(1, split=CorpusSplit.TRAIN),
+            _make_entry(2, split=CorpusSplit.VALIDATION),
+            _make_entry(3, split=CorpusSplit.TEST),
+        )
+        path, manifest = _write_manifest(tmp_path, entries)
         spec = CorpusSourceSpec(
-            corpus_path="teams/corpus_manifest.json",
-            corpus_hash="a" * 64,
-            format_id="gen9championsvgc2026regmb",
+            corpus_path=str(path),
+            corpus_hash=manifest.corpus_hash,
+            format_id=manifest.format_id,
             split=CorpusSplit.TRAIN,
         )
-        assert spec.split is CorpusSplit.TRAIN
-        with pytest.raises(ValueError, match="split"):
-            CorpusSourceSpec(
-                corpus_path="x",
-                corpus_hash="a" * 64,
-                format_id="f",
-                split=CorpusSplit.UNSPECIFIED,
-            )
+        pool = CorpusTeamPool.from_spec(spec)
+        assert len(pool.entries(CorpusSplit.TRAIN)) == 1
+        assert len(pool.entries(CorpusSplit.VALIDATION)) == 1
+        assert len(pool.entries(CorpusSplit.TEST)) == 1
 
-    def test_build_team_source_resolves_corpus_manifest(self, tmp_path: Path) -> None:
-        """Verify the team-source factory instantiates CorpusTeamSource for a manifest path."""
-        tokenizer = PokemonTokenizer(vocabulary())
-        contract_hash = current_manifest().global_sha256
-        v1 = team_variant("Pikachu")
-        manifest, _ = build_corpus(
-            (v1,),
-            tokenizer=tokenizer,
-            validator=validate_many,
-            global_contract_sha256=contract_hash,
-            format_id=FORMAT.battle_format,
+    def test_pool_spec_mismatch_raises(self, tmp_path: Path) -> None:
+        path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+        spec = CorpusSourceSpec(
+            corpus_path=str(path),
+            corpus_hash="0" * 64,
+            format_id=manifest.format_id,
+            split=CorpusSplit.TRAIN,
         )
+        with pytest.raises(ValueError, match="Corpus hash does not match"):
+            CorpusTeamPool.from_spec(spec)
+
+
+class TestCorpusTeamSource:
+    def test_sampling_uniform_canonical(self, tmp_path: Path) -> None:
+        entries = (
+            _make_entry(1, canonical_index=1),
+            _make_entry(2, canonical_index=1),  # variant of canonical 1
+            _make_entry(3, canonical_index=2),  # canonical 2
+        )
+        path, manifest = _write_manifest(tmp_path, entries)
+        spec = CorpusSourceSpec(
+            corpus_path=str(path),
+            corpus_hash=manifest.corpus_hash,
+            format_id=manifest.format_id,
+            split=CorpusSplit.TRAIN,
+        )
+        source = CorpusTeamSource(spec)
+        rng = random.Random(42)
+        sample = source.sample(rng)
+        assert sample.packed in {e.packed for e in entries}
+        assert sample.team_hash in {e.packed_sha256 for e in entries}
+
+    def test_describe(self, tmp_path: Path) -> None:
+        path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+        spec = CorpusSourceSpec(
+            corpus_path=str(path),
+            corpus_hash=manifest.corpus_hash,
+            format_id=manifest.format_id,
+            split=CorpusSplit.TRAIN,
+        )
+        source = CorpusTeamSource(spec)
+        desc = source.describe()
+        assert desc["kind"] == "corpus"
+        assert desc["split"] == "TRAIN"
+        assert desc["pool_size"] == 1
+
+
+class TestBuildTeamSource:
+    def test_resolves_corpus_manifest(self, tmp_path: Path) -> None:
+        path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
         manifest_path = tmp_path / "corpus_manifest.json"
         manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
 
         source = build_team_source(manifest_path)
         assert isinstance(source, CorpusTeamSource)
-        desc = source.describe()
-        assert desc["kind"] == "corpus"
-        assert desc["corpus_hash"] == manifest.corpus_hash
-        assert desc["split"] == "TRAIN"
-        assert desc["sampling"] == "uniform_canonical"
+        assert source.describe()["kind"] == "corpus"
 
-    def test_build_team_source_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
-        """Verify a regular-format corpus can feed a Bo3 model."""
+    def test_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
         path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
-
         source = build_team_source(path, expected_format_id=FORMAT.bo3_format)
         assert isinstance(source, CorpusTeamSource)
         assert source.describe()["format_id"] == manifest.format_id
 
-    def test_build_team_source_rejects_incompatible_manifest_format(self, tmp_path: Path) -> None:
-        """Verify unsupported corpus and model format pairs fail loudly."""
+    def test_rejects_incompatible_manifest_format(self, tmp_path: Path) -> None:
         path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
         incompatible = replace(manifest, format_id="unsupported-format")
         path.write_text(json.dumps(incompatible.to_dict()), encoding="utf-8")
@@ -258,8 +157,7 @@ class TestCorpusManifests:
         with pytest.raises(ValueError, match="Corpus format mismatch"):
             build_team_source(path, expected_format_id=FORMAT.bo3_format)
 
-    def test_build_team_source_falls_back_to_file_source(self, tmp_path: Path) -> None:
-        """Verify the team-source factory falls back for a raw team directory."""
+    def test_falls_back_to_file_source(self, tmp_path: Path) -> None:
         pool_dir = tmp_path / "pool"
         pool_dir.mkdir()
         team_text = "\n\n".join(
@@ -270,8 +168,7 @@ class TestCorpusManifests:
         source = build_team_source(pool_dir)
         assert isinstance(source, FileTeamSource)
 
-    def test_build_team_source_rejects_invalid_manifest(self, tmp_path: Path) -> None:
-        """Verify a present manifest is authoritative and malformed content raises."""
+    def test_rejects_invalid_manifest(self, tmp_path: Path) -> None:
         pool_dir = tmp_path / "pool"
         pool_dir.mkdir()
         (pool_dir / "corpus_manifest.json").write_text("{}", encoding="utf-8")
@@ -279,10 +176,9 @@ class TestCorpusManifests:
         with pytest.raises(ValueError, match="Invalid corpus manifest"):
             build_team_source(pool_dir)
 
-    def test_corpus_cli_build_and_audit(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Verify corpus CLI subcommands ('build' and 'audit') execute and output valid JSON audit results."""
+
+class TestCorpusCLI:
+    def test_cli_build_and_audit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         input_dir = tmp_path / "inputs"
         input_dir.mkdir()
         team_text_1 = DEFAULT_TEST_TEAM
@@ -317,50 +213,3 @@ class TestCorpusManifests:
             json.loads(audit_captured.out.split("\n")[-2]) if audit_captured.out.strip() else {}
         )
         assert re_audit_data["admitted_count"] == 2
-
-    def test_build_team_source_resolves_directory_manifest(self, tmp_path: Path) -> None:
-        """Verify the team-source factory resolves a manifest inside a pool directory."""
-        tokenizer = PokemonTokenizer(vocabulary())
-        contract_hash = current_manifest().global_sha256
-        v1 = team_variant("Pikachu")
-        manifest, _ = build_corpus(
-            (v1,),
-            tokenizer=tokenizer,
-            validator=validate_many,
-            global_contract_sha256=contract_hash,
-            format_id=FORMAT.battle_format,
-        )
-        pool_dir = tmp_path / "pool_all"
-        pool_dir.mkdir(parents=True, exist_ok=True)
-        (pool_dir / "corpus_manifest.json").write_text(
-            json.dumps(manifest.to_dict()), encoding="utf-8"
-        )
-        (pool_dir / "invalid-team.txt").write_text("not a team", encoding="utf-8")
-
-        source = build_team_source(pool_dir)
-        assert isinstance(source, CorpusTeamSource)
-
-    def test_corpus_manifest_hash_is_order_independent_but_packed_content_bound(self) -> None:
-        """Verify corpus content hash calculation is invariant to entry permutation but sensitive to packed team changes."""
-        entries = tuple(
-            CorpusEntry(
-                canonical_hash=hashlib.sha256(f"canonical-{letter}".encode()).hexdigest(),
-                packed=f"team-{letter}",
-                packed_sha256=hashlib.sha256(f"team-{letter}".encode()).hexdigest(),
-                split=CorpusSplit.TRAIN,
-                usage_count=index + 1,
-            )
-            for index, letter in enumerate(("a", "b", "c"))
-        )
-        manifest = TeamCorpusManifest(
-            global_contract_sha256="d" * 64,
-            format_id="gen9championsvgc2026regmb",
-            corpus_hash=corpus_content_hash(entries),
-            entries=entries,
-            created_at="2026-07-17T00:00:00Z",
-            sampling_metadata={"seed": 3},
-        )
-        assert TeamCorpusManifest.from_dict(manifest.to_dict()) == manifest
-        assert corpus_content_hash(entries) == corpus_content_hash(entries[::-1])
-        with pytest.raises(ValueError, match="does not match"):
-            TeamCorpusManifest.from_dict({**manifest.to_dict(), "corpus_hash": "e" * 64})

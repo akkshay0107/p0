@@ -1,15 +1,8 @@
 """
-Validated team-corpus manifest contract.
+Team corpus manifest schema and validation.
 
-Team identity: corpus identity is CanonicalTeam.team_hash, the order- and
-spelling-independent SHA-256 of the canonical team JSON. ValidatedTeam's
-team_hash (SHA-256 of the packed Showdown string) is a derived runtime
-instance identity produced at pack time; each corpus entry stores both so
-corpus records map onto runtime sampling without re-parsing.
-
-This module defines only the manifest schema and its validation. Corpus
-construction, split assignment, and the corpus-backed TeamSource
-implementation live in the corpus workstream.
+Each entry records both the CanonicalTeam hash (order-independent JSON SHA-256)
+and the packed Showdown string hash for runtime sampling.
 """
 
 from __future__ import annotations

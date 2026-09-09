@@ -61,36 +61,37 @@ def _component_splits(
     """Assign every connected source-series component one corpus split."""
     _validate_ratios(ratio_train, ratio_val, ratio_test)
 
-    parents: dict[tuple[str, str], tuple[str, str]] = {}
+    parents: dict[str, str] = {}
 
-    def find(value: tuple[str, str]) -> tuple[str, str]:
+    def find(value: str) -> str:
         parent = parents.setdefault(value, value)
         while parents[parent] != parent:
             parents[parent] = parents[parents[parent]]
             parent = parents[parent]
         return parent
 
-    def union(first: tuple[str, str], second: tuple[str, str]) -> None:
+    def union(first: str, second: str) -> None:
         first_root, second_root = find(first), find(second)
         if first_root != second_root:
             parents[second_root] = first_root
 
     for variant in variants:
         series = variant.metadata.source_series
-        for current in series:
-            find(("series", current))
-        for current in series[1:]:
-            union(("series", series[0]), ("series", current))
+        if series:
+            first = f"s:{series[0]}"
+            find(first)
+            for current in series[1:]:
+                union(first, f"s:{current}")
 
-    component_members: dict[tuple[str, str], list[int]] = {}
+    component_members: dict[str, list[int]] = {}
     for index, variant in enumerate(variants):
         if variant.metadata.source_series:
-            root = find(("series", variant.metadata.source_series[0]))
+            root = find(f"s:{variant.metadata.source_series[0]}")
         else:
-            root = ("record", variant.team.team_hash)
+            root = f"r:{variant.team.team_hash}"
         component_members.setdefault(root, []).append(index)
 
-    component_assignments: dict[tuple[str, str], CorpusSplit] = {}
+    component_assignments: dict[str, CorpusSplit] = {}
     for root, indexes in component_members.items():
         source_series = sorted(
             series for index in indexes for series in variants[index].metadata.source_series
@@ -105,41 +106,12 @@ def _component_splits(
 
     return tuple(
         component_assignments[
-            find(("series", variant.metadata.source_series[0]))
+            find(f"s:{variant.metadata.source_series[0]}")
             if variant.metadata.source_series
-            else ("record", variant.team.team_hash)
+            else f"r:{variant.team.team_hash}"
         ]
         for variant in variants
     )
-
-
-def assign_split(
-    variant: TeamRecord,
-    series_to_split: dict[str, CorpusSplit],
-    ratio_train: float = 0.8,
-    ratio_val: float = 0.1,
-    ratio_test: float = 0.1,
-) -> CorpusSplit:
-    """Deterministic, series-leak-free split assignment."""
-    _validate_ratios(ratio_train, ratio_val, ratio_test)
-    known = {
-        series_to_split[series]
-        for series in variant.metadata.source_series
-        if series in series_to_split
-    }
-    if len(known) > 1:
-        raise ValueError("A source-series component has contradictory split assignments")
-
-    if known:
-        split = next(iter(known))
-    else:
-        seed_key = ",".join(sorted(variant.metadata.source_series)) or variant.team.team_hash
-        split = _split_for_key(seed_key, ratio_train, ratio_val, ratio_test)
-
-    for series in variant.metadata.source_series:
-        series_to_split[series] = split
-
-    return split
 
 
 def audit_corpus(manifest: TeamCorpusManifest) -> dict[str, Any]:
@@ -228,7 +200,7 @@ def build_corpus(
     Admit, deduplicate, validate, and audit candidate team variants.
 
     Arguments:
-        variants: Candidate teams, including provenance metadata.
+        variants: Candidate teams with metadata.
         tokenizer: Vocabulary used to reject out-of-vocabulary team content.
         validator: Callable that validates the deduplicated candidates.
         global_contract_sha256: Global major-contract identity recorded in the manifest.

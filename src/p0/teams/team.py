@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Mapping, cast
+from typing import Mapping, cast
 
 import orjson
 
@@ -183,7 +183,7 @@ class TeamRecord:
             raise ValueError("Each team member requires one Stat Point spread")
 
         if self.spread_provenance != "imputed":
-            raise ValueError("Reconstructed public teams must retain imputed provenance")
+            raise ValueError("Reconstructed public teams must have spread_provenance='imputed'")
 
     def to_dict(self) -> dict[str, object]:
         pairs = sorted(
@@ -213,14 +213,7 @@ class TeamRecord:
             raise ValueError("Invalid serialized team record fields")
         try:
             spreads = tuple(
-                StatPoints(
-                    hp=int(cast(dict[str, int], spread)["hp"]),
-                    atk=int(cast(dict[str, int], spread)["atk"]),
-                    defense=int(cast(dict[str, int], spread)["def"]),
-                    spa=int(cast(dict[str, int], spread)["spa"]),
-                    spd=int(cast(dict[str, int], spread)["spd"]),
-                    spe=int(cast(dict[str, int], spread)["spe"]),
-                )
+                StatPoints.from_dict(cast(Mapping[str, int], spread))
                 for spread in cast(list[object], value["spreads"])
             )
             return cls(
@@ -236,7 +229,7 @@ class TeamRecord:
 
 
 def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ...]:
-    deduped: dict[Any, TeamRecord] = {}
+    deduped: dict[tuple[str, tuple[StatPoints, ...]], TeamRecord] = {}
 
     for variant in variants:
         canonical_members = variant.team.canonical().members

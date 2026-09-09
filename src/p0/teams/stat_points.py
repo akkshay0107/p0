@@ -73,6 +73,13 @@ class StatPoints:
     def as_dict(self) -> dict[str, int]:
         return dict(zip(STAT_NAMES, self.as_tuple(), strict=True))
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, int]) -> StatPoints:
+        try:
+            return cls(*(int(data[name]) for name in STAT_NAMES))
+        except KeyError as exc:
+            raise ValueError(f"Missing stat point field: {exc.args[0]}") from exc
+
 
 class BaseStats(NamedTuple):
     hp: int
@@ -117,17 +124,19 @@ def calculate_stats(
     """Match the pinned Champions level-clause statModify implementation."""
     if not 1 <= level <= 100:
         raise ValueError("Level must be in [1, 100]")
-    result: list[int] = []
-    for stat_name, base, stat_points in zip(
-        STAT_NAMES, base_stats.as_tuple(), points.as_tuple(), strict=True
-    ):
-        iv_contribution = max(2 * stat_points - 1, 0)
-        stat = (2 * base + 31 + iv_contribution) * level // 100
-        if stat_name == "hp":
-            result.append(stat + level + 10)
-        else:
-            result.append(_modify_nature(stat + 5, stat_name, nature))
-    return tuple(result)  # type: ignore[return-value]
+
+    bases = base_stats.as_tuple()
+    sps = points.as_tuple()
+    hp = (2 * bases[0] + 31 + max(2 * sps[0] - 1, 0)) * level // 100 + level + 10
+
+    def _stat(i: int) -> int:
+        return _modify_nature(
+            (2 * bases[i] + 31 + max(2 * sps[i] - 1, 0)) * level // 100 + 5,
+            STAT_NAMES[i],
+            nature,
+        )
+
+    return (hp, _stat(1), _stat(2), _stat(3), _stat(4), _stat(5))
 
 
 MOVE_CATEGORY_PHYSICAL = "physical"

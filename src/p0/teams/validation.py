@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import selectors
 import subprocess
-import threading
 from collections.abc import Sequence
 from pathlib import Path
-from queue import Empty, Queue
 from typing import Any, NamedTuple
 
 import orjson
@@ -117,7 +115,6 @@ def validate_many_batched(
     Arguments:
       variants: Sequence of team variants to validate against Champions rules.
       batch_size: Maximum number of variants sent per Node subprocess call.
-      runner: Subprocess invocation callable used to spawn Node.
       timeout: Maximum execution duration allowed per batch subprocess.
       repository_root: Root path where validation scripts are located.
 
@@ -215,7 +212,7 @@ class PersistentShowdownValidator:
         format_id: str = FORMAT.battle_format,
     ) -> None:
         self._repository_root = repository_root
-        self._process: Any = None
+        self._process: subprocess.Popen[str] | None = None
         self._request_timeout = request_timeout
         self._format_id = format_id
 
@@ -280,40 +277,14 @@ class PersistentShowdownValidator:
         if self._process is None or self._process.stdout is None:
             raise RuntimeError("Persistent worker stdout is unavailable")
         stream = self._process.stdout
-        try:
-            selector = selectors.DefaultSelector()
-            try:
-                selector.register(stream, selectors.EVENT_READ)
-                ready = selector.select(self._request_timeout)
-            finally:
-                selector.close()
+        with selectors.DefaultSelector() as selector:
+            selector.register(stream, selectors.EVENT_READ)
+            ready = selector.select(self._request_timeout)
             if not ready:
                 raise TimeoutError(
                     f"Persistent validator response timed out after {self._request_timeout:g}s"
                 )
-            return stream.readline()
-        except (AttributeError, OSError, TypeError, ValueError):
-            # Test doubles and non-file streams may not expose a selectable fd.
-            result: Queue[str | BaseException] = Queue(maxsize=1)
-
-            def read() -> None:
-                try:
-                    result.put(stream.readline())
-                # Preserve worker failures, including interpreter-level errors,
-                # so the caller receives them instead of hanging on the queue.
-                except BaseException as exc:
-                    result.put(exc)
-
-            threading.Thread(target=read, daemon=True).start()
-            try:
-                value = result.get(timeout=self._request_timeout)
-            except Empty as exc:
-                raise TimeoutError(
-                    f"Persistent validator response timed out after {self._request_timeout:g}s"
-                ) from exc
-            if isinstance(value, BaseException):
-                raise value
-            return value
+        return stream.readline()
 
     def validate_many(
         self,
