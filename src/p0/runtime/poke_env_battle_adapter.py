@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, cast
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from poke_env.battle import DoubleBattle
 
@@ -15,12 +15,19 @@ from p0.runtime.live_event_capture import captured_protocol_lines, last_move
 class PokeEnvBattleView:
     """Cached facade with explicit properties and no copied per-decision graph."""
 
-    __slots__ = ("_battle", "_decision", "stat_cache")
+    __slots__ = ("_battle_ref", "_decision", "stat_cache")
 
     def __init__(self, battle: DoubleBattle):
-        self._battle = battle
+        self._battle_ref: ReferenceType[DoubleBattle] = ref(battle)
         self._decision: DecisionView | None = None
         self.stat_cache: dict[object, tuple[int, int, int, int, int, int]] = {}
+
+    @property
+    def _battle(self) -> DoubleBattle:
+        battle = self._battle_ref()
+        if battle is None:
+            raise ReferenceError("The underlying battle has been garbage-collected")
+        return battle
 
     def refresh(self) -> PokeEnvBattleView:
         self._decision = None
@@ -36,32 +43,13 @@ class PokeEnvBattleView:
 
     @property
     def active_pokemon(self):
-        from typing import Any, cast
-
-        active_list = cast(list[Any], list(self._battle.active_pokemon))
-        targets = getattr(self._battle, "_p0_transform_targets", {})
-        available = getattr(self._battle, "available_moves", [])
-        for i, mon in enumerate(active_list):
-            if mon is not None and id(mon) in targets:
-                target_mon = targets[id(mon)]
-                moves = dict(target_mon.moves)
-                if i < len(available) and available[i]:
-                    for move in available[i]:
-                        if move.id not in moves:
-                            moves[move.id] = move
-                active_list[i] = TransformedPokemonView(mon, target_mon, moves=moves)
-        return active_list
+        return _transformed_active_pokemon(self._battle, include_available_moves=True)
 
     @property
     def opponent_active_pokemon(self):
-        from typing import Any, cast
-
-        active_list = cast(list[Any], list(self._battle.opponent_active_pokemon))
-        targets = getattr(self._battle, "_p0_transform_targets", {})
-        for i, mon in enumerate(active_list):
-            if mon is not None and id(mon) in targets:
-                active_list[i] = TransformedPokemonView(mon, targets[id(mon)])
-        return active_list
+        return _transformed_active_pokemon(
+            self._battle, include_available_moves=False, opponent=True
+        )
 
     @property
     def available_moves(self):
@@ -178,20 +166,34 @@ def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
     return view
 
 
+def _transformed_active_pokemon(
+    battle: DoubleBattle,
+    *,
+    include_available_moves: bool,
+    opponent: bool = False,
+) -> list[Any]:
+    active = battle.opponent_active_pokemon if opponent else battle.active_pokemon
+    active_list = cast(list[Any], list(active))
+    targets = getattr(battle, "_p0_transform_targets", {})
+    available = getattr(battle, "available_moves", ()) if include_available_moves else ()
+    for index, pokemon in enumerate(active_list):
+        if pokemon is None or id(pokemon) not in targets:
+            continue
+        target = targets[id(pokemon)]
+        if include_available_moves:
+            moves = dict(target.moves)
+            if index < len(available) and available[index]:
+                moves.update({move.id: move for move in available[index]})
+            active_list[index] = TransformedPokemonView(pokemon, target, moves=moves)
+        else:
+            active_list[index] = TransformedPokemonView(pokemon, target)
+    return active_list
+
+
 def decision_view(battle: DoubleBattle) -> DecisionView:
     """Extract a lightweight DecisionView from live battle state."""
-    targets = getattr(battle, "_p0_transform_targets", {})
     available_moves = battle.available_moves
-    active_pokemon = cast(list[Any], list(battle.active_pokemon))
-    for i, mon in enumerate(active_pokemon):
-        if mon is not None and id(mon) in targets:
-            target_mon = targets[id(mon)]
-            moves = dict(target_mon.moves)
-            if i < len(available_moves) and available_moves[i]:
-                for move in available_moves[i]:
-                    if move.id not in moves:
-                        moves[move.id] = move
-            active_pokemon[i] = TransformedPokemonView(mon, target_mon, moves=moves)
+    active_pokemon = _transformed_active_pokemon(battle, include_available_moves=True)
 
     available_switches = battle.available_switches
     team = tuple(battle.team.values())

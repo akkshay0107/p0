@@ -78,10 +78,11 @@ class TestReconstructionProjection:
         result = compile_documents(documents, chunksize=0)
 
         assert len(paths) == 51
-        assert result.metrics.counters["accepted_games"] == 40
-        assert result.metrics.counters["rejected_games"] == 11
+        assert result.metrics.counters["accepted_games"] == 34
+        assert result.metrics.counters["rejected_games"] == 17
         assert result.metrics.counters["rejected_reconstruction_AMBIGUOUS_IDENTITY"] == 11
-        assert len(result.games) == 40
+        assert result.metrics.counters["complete_series"] == 11
+        assert len(result.games) == 34
         assert all(
             len(perspective.snapshots) == len(perspective.decisions)
             for game in result.games

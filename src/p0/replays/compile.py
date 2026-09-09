@@ -353,6 +353,23 @@ def write_tensor_shards(
     )
     identities = tuple(raw_replays or _raw_replay_identities(result))
     memberships = dict(source_series or _source_series(result))
+    games_by_series: dict[str, list[CompiledGame]] = {}
+    for game in result.games:
+        games_by_series.setdefault(game.series_id, []).append(game)
+    for series_id, replay_ids in memberships.items():
+        games = games_by_series.get(series_id, [])
+        if not games:
+            # A rejected series remains in source_series for auditability and
+            # contributes to rejected_games; it must not block valid series
+            # from being published.
+            continue
+        numbers = tuple(sorted(game.game_number for game in games))
+        expected = tuple(range(1, len(replay_ids) + 1))
+        if numbers != expected:
+            raise ValueError(
+                f"Series {series_id!r} has duplicate or incomplete chronological games: "
+                f"expected {expected!r}, got {numbers!r}"
+            )
     source_format_id = next(
         (game.document.metadata.format_id for game in result.games),
         FORMAT.bo3_format,

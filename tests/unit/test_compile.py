@@ -224,25 +224,18 @@ class TestReplayCompiler:
             (2, 1, 0),
         ]
 
-    def test_downstream_shards_preserve_noncontiguous_source_game_numbers(
+    def test_downstream_shards_reject_noncontiguous_source_game_numbers(
         self,
         tmp_path: Path,
     ) -> None:
-        """Verify LazyReplayDataset preserves source game numbers even when non-contiguous (e.g. games 2 and 3)."""
+        """Reject shard publication when a series has a missing first game."""
         second = sample_replay_payload("game-2")
         second["game_number"] = 2
         third = sample_replay_payload("game-3")
         third["game_number"] = 3
 
-        built = _write_dataset_replay_dataset(tmp_path, (third, second))
-        chunks = list(LazyReplayDataset(built.manifest_path))
-
-        assert [(chunk.game_number, chunk.player) for chunk in chunks] == [
-            (2, 0),
-            (2, 1),
-            (3, 0),
-            (3, 1),
-        ]
+        with pytest.raises(ValueError, match="incomplete chronological games"):
+            _write_dataset_replay_dataset(tmp_path, (third, second))
 
     def test_split_dataset_keeps_series_together(self, tmp_path: Path) -> None:
         """Verify series split partitioning assigns all games of a series to the same split, avoiding data leakage."""

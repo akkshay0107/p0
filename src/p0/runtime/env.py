@@ -11,6 +11,7 @@ import numpy.typing as npt
 from gymnasium.spaces import Box, MultiDiscrete
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.environment.env import PokeEnv
+from poke_env.player import Player
 from poke_env.ps_client import (
     AccountConfiguration,
     LocalhostServerConfiguration,
@@ -195,13 +196,11 @@ class SimEnv(MegaEnv):
         self._resume_reset_pending = True
 
     @staticmethod
-    def _current_team_packed(player: object) -> str:
+    def _current_team_packed(player: Player) -> str:
         """Read the packed team from poke-env's current team builder."""
-        team_builder = getattr(player, "_team", None)
-        yield_team = getattr(team_builder, "yield_team", None)
-        if not callable(yield_team):
+        if player._team is None:
             raise RuntimeError("Simulation player has no serializable active team")
-        team = yield_team()
+        team = player._team.yield_team()
         if not isinstance(team, str) or not team.strip():
             raise RuntimeError("Simulation player has an invalid active team")
         return team

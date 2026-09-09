@@ -162,7 +162,8 @@ class BCTrainer:
 
         totals = _empty_training_totals()
         accumulated_decisions = 0
-        accumulated_loss_weight = 0.0
+        update_batches: list[BCDecisionBatch] = []
+        pending_game_keys: set[tuple[object, int]] = set()
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
         self.optimizer.zero_grad(set_to_none=True)
         num_workers = self.config.num_workers
@@ -180,29 +181,45 @@ class BCTrainer:
         for batch in dataloader:
             if self.cancel_requested():
                 raise BCCancelled("Behaviour-cloning training was cancelled")
-            accumulated_loss_weight += self._backward_chunk(batch, totals)
+            update_batches.append(batch)
             accumulated_decisions += batch.decisions
+            for window in batch.windows:
+                game_key = (window.series_key, window.game_number)
+                if window.is_game_end:
+                    pending_game_keys.discard(game_key)
+                else:
+                    pending_game_keys.add(game_key)
             if (
-                accumulated_decisions >= self.batch_decisions
-                and not self._series_history.has_partial_games
+                batch.windows
+                and accumulated_decisions >= self.batch_decisions
+                and not pending_game_keys
             ):
-                if accumulated_loss_weight > 0:
-                    updated, grad_norm = self._step_optimizer(accumulated_loss_weight)
+                policy_weight = sum(float(item.loss_mask.sum()) for item in update_batches)
+                value_count = sum(int(item.outcome_valid.sum()) for item in update_batches)
+                for item in update_batches:
+                    self._backward_chunk(item, totals, policy_weight, value_count)
+                if policy_weight or value_count:
+                    updated, grad_norm = self._step_optimizer(1.0)
                     if updated:
                         totals["updates"] += 1
                         totals["grad_norm_sum"] += grad_norm
                         totals["grad_norm_count"] += 1
+                update_batches.clear()
                 accumulated_decisions = 0
-                accumulated_loss_weight = 0.0
 
-        if self._series_history.has_partial_games:
+        if update_batches:
+            policy_weight = sum(float(item.loss_mask.sum()) for item in update_batches)
+            value_count = sum(int(item.outcome_valid.sum()) for item in update_batches)
+            for item in update_batches:
+                self._backward_chunk(item, totals, policy_weight, value_count)
+            if policy_weight or value_count:
+                updated, grad_norm = self._step_optimizer(1.0)
+                if updated:
+                    totals["updates"] += 1
+                    totals["grad_norm_sum"] += grad_norm
+                    totals["grad_norm_count"] += 1
+        if pending_game_keys or self._series_history.has_partial_games:
             raise ValueError("BC dataset ended with an incomplete perspective-game")
-        if accumulated_loss_weight > 0:
-            updated, grad_norm = self._step_optimizer(accumulated_loss_weight)
-            if updated:
-                totals["updates"] += 1
-                totals["grad_norm_sum"] += grad_norm
-                totals["grad_norm_count"] += 1
         self._series_history.clear()
         return totals
 
@@ -341,9 +358,7 @@ class BCTrainer:
                 "Non-finite BC gradient norm detected; discarding the accumulated update "
                 f"(loss scale={previous_scale:.0f})"
             )
-            if self.precision.grad_scaler:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+            self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
             return False, 0.0
         self.scaler.step(self.optimizer)
@@ -356,16 +371,20 @@ class BCTrainer:
         self,
         batch: BCDecisionBatch,
         totals: dict[str, Any],
-    ) -> float:
+        policy_weight: float,
+        effective_value_count: int,
+    ) -> None:
         """
         Backpropagate one validated decision chunk and update running totals.
 
         Arguments:
           batch: Collated CPU batch containing one contiguous set of decisions.
           totals: Mutable epoch totals receiving detached reporting tensors.
+          policy_weight: Effective update's total fractional policy-label weight.
+          effective_value_count: Effective update's total valid outcome count.
 
         Returns:
-          The scalar weight used to normalize the accumulated optimizer update.
+          None. Gradients are accumulated for the effective update.
         """
         validated_masks = _validate_objective_inputs(
             batch.candidate_values.size(0),
@@ -423,17 +442,17 @@ class BCTrainer:
             torch.pow(gamma, (game_length - 1 - decision_index).to(outcome.dtype)) * outcome
         )
         value_error = value_predictions - value_targets
-        value_count = int(batch.outcome_valid.sum())
-        value_loss = (
-            value_error.square()[value_mask].mean()
-            if value_count
+        batch_value_count = int(batch.outcome_valid.sum())
+        policy_sum = objective.loss * objective.loss_weight
+        value_sum = (
+            value_error.square()[value_mask].sum()
+            if batch_value_count
             else value_predictions.sum() * 0.0
         )
-        policy_sum = objective.loss * objective.loss_weight
-        policy_loss = policy_sum / objective.loss_weight.clamp_min(1.0)
-        loss_weight = max(float(objective.loss_weight), float(value_count))
-        total_loss = (policy_loss + self.config.value_coef * value_loss) * loss_weight
-        if objective.labeled_count or value_count:
+        policy_term = policy_sum / policy_weight if policy_weight else policy_sum * 0.0
+        value_term = value_sum / effective_value_count if effective_value_count else value_sum * 0.0
+        total_loss = policy_term + self.config.value_coef * value_term
+        if objective.labeled_count or batch_value_count:
             self.scaler.scale(total_loss).backward()
 
         commit_history_updates(self._series_history, history_updates)
@@ -443,7 +462,6 @@ class BCTrainer:
         totals["loss_weight"] += objective.loss_weight
         totals["decisions"] += batch.decisions
         totals["games"] += batch.completed_game_count
-        return loss_weight
 
     @torch.inference_mode()
     def evaluate(

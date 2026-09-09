@@ -88,6 +88,43 @@ def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
 
 
 class TestBCRunner:
+    def test_real_shards_close_all_worker_game_boundaries(self, tmp_path: Path) -> None:
+        """Multiple loader workers must flush every buffered perspective-game."""
+        result = compile_payloads(
+            (
+                sample_replay_payload("worker-a", parent="worker-series-a"),
+                sample_replay_payload("worker-b", parent="worker-series-b"),
+            )
+        )
+        built = write_tensor_shards(
+            result,
+            tmp_path / "shards",
+            max_decisions_per_shard=1,
+            created_at="2026-01-01T00:00:00Z",
+        )
+        dataset = LazyReplayDataset(built.manifest_path)
+        policy = build_policy(
+            ModelConfig(64, 4, 1, 128),
+            default_runtime_resources(),
+        )
+        trainer = BCTrainer(
+            policy,
+            dataset,
+            BCConfig(
+                batch_decisions=3,
+                max_chunk_size=3,
+                num_workers=2,
+                learning_rate=1e-3,
+                enable_optim=False,
+            ),
+            device="cpu",
+        )
+
+        metrics = trainer.train_epoch()
+
+        assert metrics["decisions"] > 0
+        assert metrics["games"] == 4
+
     def test_replay_to_series_bc_checkpoint_smoke(self, tmp_path: Path) -> None:
         """End-to-end smoke test: replay JSON compilation -> tensor shards -> BC training -> checkpoint save/load."""
         result = compile_payloads(

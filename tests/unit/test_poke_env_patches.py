@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import subprocess
 import sys
+import weakref
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,16 @@ from p0.runtime.poke_env_battle_adapter import battle_view
 
 
 class TestPokeEnvPatches:
+    def test_cached_battle_view_does_not_keep_battle_alive(self) -> None:
+        battle = DoubleBattle("weak-view-test", "Alice", logging.getLogger("test"), gen=9)
+        view = battle_view(battle)
+        battle_ref = weakref.ref(battle)
+        del battle
+        gc.collect()
+        assert battle_ref() is None
+        with pytest.raises(ReferenceError):
+            _ = view.team
+
     def test_event_parser_import_does_not_install_poke_env_patches(self) -> None:
         result = subprocess.run(
             [

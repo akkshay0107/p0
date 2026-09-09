@@ -257,11 +257,9 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
         teams_root=_resolve_path(config.paths.teams_root, repository_root),
         artifacts_root=_resolve_path(config.paths.artifacts_root, repository_root),
         showdown_root=_resolve_path(config.paths.showdown_root, repository_root),
-        gauntlet_dir=_resolve_path(config.paths.gauntlet_dir, repository_root),
         checkpoint_path=_resolve_path(config.paths.checkpoint_path, repository_root),
         runs_dir=_resolve_path(config.paths.runs_dir, repository_root),
         replays_dir=_resolve_path(config.paths.replays_dir, repository_root),
-        backups_dir=_resolve_path(config.paths.backups_dir, repository_root),
         log_path=_resolve_path(config.paths.log_path, repository_root),
         resume_checkpoint=(
             None

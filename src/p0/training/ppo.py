@@ -173,9 +173,9 @@ def _compute_magnet_logits(
     ):
         encoded = magnet.policy.encode(observations, action_masks)
         memory = _build_memory_inputs(magnet.policy, encoded, list(episodes), device)
-        logits = magnet.policy.evaluate(
+        logits = magnet.policy.action_logits(
             magnet.policy.prepare(encoded, memory), action_masks, actions
-        ).logits
+        )
     return logits.detach()
 
 
@@ -466,9 +466,11 @@ def ppo_update(
                         )
                     else:
                         tot_grad_norm += grad_norm.detach()
-                    if grad_norm_finite or scaler.is_enabled():
+                    if grad_norm_finite:
                         scaler.step(optimizer)
-                        scaler.update()
+                    # GradScaler.update consumes the finite check recorded by
+                    # unscale_, including the rejected norm-overflow case.
+                    scaler.update()
                     if grad_norm_finite:
                         num_updates += 1
 

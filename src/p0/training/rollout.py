@@ -430,9 +430,7 @@ class RolloutCollector:
         self.series_history1.discard_active_games()
         self.series_history2.discard_active_games()
         for env in self.vector_env.envs:
-            prepare_env = getattr(env, "prepare_for_checkpoint", None)
-            if callable(prepare_env):
-                prepare_env()
+            env.prepare_for_checkpoint()
         self.vector_env.reset()
 
     def training_state(self) -> dict[str, object]:

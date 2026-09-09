@@ -114,6 +114,15 @@ _TRANSIENT_ACTION_TAGS = frozenset(
     }
 )
 _INITIALIZATION_TAGS = frozenset({"player", "clearpoke", "poke", "showteam", "teamsize", "start"})
+_INDEX_CACHE: (
+    tuple[
+        Mapping[str, Any],
+        dict[str, _SpeciesData],
+        dict[str, Mapping[str, Any]],
+        dict[str, frozenset[str]],
+    ]
+    | None
+) = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,9 +584,7 @@ class _StateReducer:
     ) -> None:
         self.replay_id = replay_id
         self.turn = 0
-        self._species = _species_index(dex)
-        self._moves = _move_index(dex)
-        self._legal_effects = _legal_effect_index(dex)
+        self._species, self._moves, self._legal_effects = _cached_indexes(dex)
         self.members = {
             member.member_id: self._member_from_ots(member)
             for sheet in ots
@@ -2063,6 +2070,15 @@ def _legal_effect_index(dex: Mapping[str, Any]) -> dict[str, frozenset[str]]:
         for category, effects in value.items()
         if isinstance(effects, (list, tuple))
     }
+
+
+def _cached_indexes(
+    dex: Mapping[str, Any],
+) -> tuple[dict[str, _SpeciesData], dict[str, Mapping[str, Any]], dict[str, frozenset[str]]]:
+    global _INDEX_CACHE
+    if _INDEX_CACHE is None or _INDEX_CACHE[0] is not dex:
+        _INDEX_CACHE = (dex, _species_index(dex), _move_index(dex), _legal_effect_index(dex))
+    return _INDEX_CACHE[1:]
 
 
 def _maximum_pp(data: Mapping[str, Any], base_pp: int) -> int:

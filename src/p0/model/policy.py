@@ -22,6 +22,7 @@ from p0.battle.actions import (
     ACT_SIZE,
     MOVE_END,
     MOVE_START,
+    SWITCH_START,
 )
 from p0.battle.actions import (
     FORCED_ACTION as STRUGGLE_START,
@@ -53,8 +54,6 @@ from p0.model.series_context import (
 from p0.model.structured_observation import (
     ALLY_POKE_TOKENS,
     NUM_IDX_ORIG_IDX_RATIO,
-    NUMERICAL_WIDTH,
-    SEQUENCE_LENGTH,
     TARGET_SEQ_INDICES,
     TEAM_SIZE,
     StructuredObservation,
@@ -159,6 +158,16 @@ class EvalOutput(NamedTuple):
     logits: Tensor
 
 
+class PointerOutputs(NamedTuple):
+    """Logits and concrete key groups produced by one pointer head."""
+
+    logits: Tensor
+    switch_keys: Tensor
+    move_keys: Tensor
+    mega_move_keys: Tensor
+    tp_pair_keys: Tensor
+
+
 def _require_matching_batch(reduced: ReducerOutput, enc: EncodedObs) -> None:
     """Reject a reduced batch that was not produced from these observations."""
     if reduced.cls.size(0) != enc.tokens.size(0):
@@ -166,6 +175,16 @@ def _require_matching_batch(reduced: ReducerOutput, enc: EncodedObs) -> None:
             f"Reduced batch of {reduced.cls.size(0)} does not match "
             f"{enc.tokens.size(0)} encoded observations"
         )
+
+
+def _distribution_statistics(logits: Tensor) -> tuple[Tensor, Tensor]:
+    """Return masked log probabilities and finite entropy for one action slot."""
+    logits_fp32 = logits.float()
+    log_probs = F.log_softmax(logits_fp32, dim=-1)
+    finite = torch.isfinite(log_probs)
+    probabilities = torch.where(finite, log_probs.exp(), 0.0)
+    entropy = -(probabilities * torch.where(finite, log_probs, 0.0)).sum(-1)
+    return log_probs, entropy
 
 
 class ValueHead(nn.Module):
@@ -277,80 +296,67 @@ class ActorPolicy(nn.Module):
 
         return k_entity_extended
 
-    def _compute_pointer_logits(
+    def _compute_first_pointer_query(
         self,
         z: Tensor,
+        k_entity_extended: Tensor,
+        phase: Tensor,
+    ) -> Tensor:
+        """Build the first-slot phase-aware query."""
+        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
+        decision_owner = torch.where(
+            phase.unsqueeze(-1),
+            self.tp_lead_role.unsqueeze(0),
+            k_ally[:, 0],
+        )
+        return self.q_proj1(torch.cat([z, decision_owner], dim=-1))
+
+    def _compute_second_pointer_query(
+        self,
+        z: Tensor,
+        k_entity_extended: Tensor,
+        phase: Tensor,
+        ctx_a1: Tensor,
+    ) -> Tensor:
+        """Build the second-slot query conditioned on the selected first action."""
+        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
+        decision_owner = torch.where(
+            phase.unsqueeze(-1),
+            self.tp_back_role.unsqueeze(0),
+            k_ally[:, 1],
+        )
+        return self.q_proj2(torch.cat([z, decision_owner, ctx_a1], dim=-1))
+
+    def _compute_pointer_logits(
+        self,
+        q_all: Tensor,
         k_entity_extended: Tensor,
         aux_moves: Tensor,
         numerical: Tensor,
         phase: Tensor,
-        head_idx: int,
-        ctx_a1: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        Build phase-aware queries and score every action with attention.
-
-        Arguments:
-          z: Reduced battle-state summaries, one per batch row.
-          k_entity_extended: Projected entity keys plus the learned self-target key.
-          aux_moves: Encoded move tokens for the decision slot being scored.
-          numerical: Observation numerics used for switch-slot routing.
-          phase: Immutable team-preview flags captured during observation encoding.
-          head_idx: Zero for the first decision and one for the second decision.
-          ctx_a1: The exact key scored for the selected first action; required by head one.
-
-        Returns:
-          Raw scaled-dot-product logits and their corresponding action keys.
-        """
-        if head_idx not in (0, 1):
-            raise ValueError(f"head_idx must be 0 or 1, got {head_idx}")
-        if head_idx == 1 and ctx_a1 is None:
-            raise ValueError("ctx_a1 must be provided for head 2")
-
-        B = z.size(0)
-        device = z.device
+    ) -> PointerOutputs:
+        """Score one pointer query against all action candidates."""
+        B = q_all.size(0)
+        device = q_all.device
         pointer_scale = math.sqrt(self.d_k)
 
         k_moves = self.w_k_move(aux_moves)
         k_ally = k_entity_extended[:, self.ally_poke_entities, :]
-        is_tp = phase
-
-        if head_idx == 0:
-            decision_owner = torch.where(
-                is_tp.unsqueeze(-1),
-                self.tp_lead_role.unsqueeze(0),
-                k_ally[:, 0],
-            )
-            q_all = self.q_proj1(torch.cat([z, decision_owner], dim=-1))
-        else:
-            assert ctx_a1 is not None
-            decision_owner = torch.where(
-                is_tp.unsqueeze(-1),
-                self.tp_back_role.unsqueeze(0),
-                k_ally[:, 1],
-            )
-            z_ctx = torch.cat([z, decision_owner, ctx_a1], dim=-1)
-            q_all = self.q_proj2(z_ctx)
 
         q_switch, q_move, q_pass, q_tp = torch.split(q_all, self.d_k, dim=-1)
 
-        # one scratch column past the action count absorbs the switch scatter of empty
-        # ally rows (orig ratio 0), which would otherwise land on the pass slot
+        # One scratch column past the action count absorbs switch scatter for empty
+        # ally rows (orig ratio 0), which would otherwise land on the pass slot.
         logits = torch.zeros((B, self.act_size + 1), device=device)
-        action_keys = torch.zeros(B, self.act_size + 1, self.d_k, device=device)
 
         logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / pointer_scale).to(
             logits.dtype
         )
-        action_keys[:, PASS_START] = self.pass_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
 
         switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / pointer_scale
         orig_ids = torch.round(numerical[:, self.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
         orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
         logits.scatter_(1, orig_ids, switch_scores.to(logits.dtype))
-        action_keys.scatter_(
-            1, orig_ids.unsqueeze(-1).expand(-1, -1, self.d_k), k_ally.to(action_keys.dtype)
-        )
 
         k_targets = k_entity_extended[:, self.target_entity_indices, :]
         # Broadcast grids remain views until concatenation materializes
@@ -364,7 +370,6 @@ class ActorPolicy(nn.Module):
         move_scores = torch.einsum("bd,bnd->bn", q_move, move_action_keys) / pointer_scale
 
         logits[:, MOVE_START:MOVE_END] = move_scores.to(logits.dtype)
-        action_keys[:, MOVE_START:MOVE_END, :] = move_action_keys.to(action_keys.dtype)
 
         k_mega_moves_grid = (k_moves + self.mega_emb).unsqueeze(2).expand(-1, -1, 5, -1)
         mega_action_keys = self.move_target_proj(
@@ -373,24 +378,17 @@ class ActorPolicy(nn.Module):
         mega_scores = torch.einsum("bd,bnd->bn", q_move, mega_action_keys) / pointer_scale
 
         logits[:, MEGA_START:MEGA_END] = mega_scores.to(logits.dtype)
-        action_keys[:, MEGA_START:MEGA_END, :] = mega_action_keys.to(action_keys.dtype)
 
         mega_struggle_key = self.struggle_key + self.mega_emb
         logits[:, MEGA_STRUGGLE_START] = (
             (q_move * mega_struggle_key).sum(dim=-1) / pointer_scale
         ).to(logits.dtype)
-        action_keys[:, MEGA_STRUGGLE_START] = (
-            mega_struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
-        )
 
         logits[:, STRUGGLE_START] = ((q_move * self.struggle_key).sum(dim=-1) / pointer_scale).to(
             logits.dtype
         )
-        action_keys[:, STRUGGLE_START] = (
-            self.struggle_key.unsqueeze(0).expand(B, -1).to(action_keys.dtype)
-        )
 
-        is_tp_column = is_tp.unsqueeze(-1)
+        is_tp_column = phase.unsqueeze(-1)
 
         tp_pair_keys_grid = (k_ally.unsqueeze(2) + k_ally.unsqueeze(1)) / math.sqrt(2.0)
         tp_pair_keys = self.tp_pair_proj(tp_pair_keys_grid.reshape(B, TP_END, self.d_k))
@@ -399,11 +397,53 @@ class ActorPolicy(nn.Module):
         logits[:, TP_START:TP_END] = torch.where(
             is_tp_column, tp_scores, logits[:, TP_START:TP_END]
         ).to(logits.dtype)
-        action_keys[:, TP_START:TP_END, :] = torch.where(
-            is_tp_column.unsqueeze(-1), tp_pair_keys, action_keys[:, TP_START:TP_END, :]
-        ).to(action_keys.dtype)
+        return PointerOutputs(
+            logits=logits[:, : self.act_size],
+            switch_keys=k_ally,
+            move_keys=move_action_keys,
+            mega_move_keys=mega_action_keys,
+            tp_pair_keys=tp_pair_keys,
+        )
 
-        return logits[:, : self.act_size], action_keys[:, : self.act_size]
+    def _select_action_keys(
+        self,
+        outputs: PointerOutputs,
+        actions: Tensor,
+        phase: Tensor,
+        batch_indices: Tensor,
+    ) -> Tensor:
+        """Select first-slot context keys without materializing an action table."""
+        batch_size = actions.size(0)
+        key = self.pass_key.unsqueeze(0).expand(batch_size, -1)
+
+        switch = (actions >= SWITCH_START) & (actions < MOVE_START)
+        switch_index = (actions - SWITCH_START).clamp(0, TEAM_SIZE - 1)
+        switch_key = outputs.switch_keys[batch_indices, switch_index]
+        key = torch.where(switch[:, None], switch_key, key)
+
+        move = (actions >= MOVE_START) & (actions < MOVE_END)
+        move_index = (actions - MOVE_START).clamp(0, MOVE_END - MOVE_START - 1)
+        move_key = outputs.move_keys[batch_indices, move_index]
+        key = torch.where(move[:, None], move_key, key)
+
+        mega_move = (actions >= MEGA_START) & (actions < MEGA_END)
+        mega_index = (actions - MEGA_START).clamp(0, MEGA_END - MEGA_START - 1)
+        mega_key = outputs.mega_move_keys[batch_indices, mega_index]
+        key = torch.where(mega_move[:, None], mega_key, key)
+
+        tp = phase & (actions < TP_END)
+        tp_index = actions.clamp(0, TP_END - 1)
+        tp_key = outputs.tp_pair_keys[batch_indices, tp_index]
+        key = torch.where(tp[:, None], tp_key, key)
+
+        mega_struggle = actions == MEGA_STRUGGLE_START
+        key = torch.where(
+            mega_struggle[:, None],
+            (self.struggle_key + self.mega_emb).unsqueeze(0),
+            key,
+        )
+        struggle = actions == STRUGGLE_START
+        return torch.where(struggle[:, None], self.struggle_key.unsqueeze(0), key)
 
     @staticmethod
     def _apply_top_p(logits: Tensor, top_p: float) -> Tensor:
@@ -431,27 +471,35 @@ class ActorPolicy(nn.Module):
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
 
-        logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
+        first = self._compute_pointer_logits(
+            self._compute_first_pointer_query(z, k_entity_extended, enc.phase),
+            k_entity_extended,
+            enc.aux[:, 0],
+            enc.numerical,
+            enc.phase,
         )
+        logits1 = first.logits
         logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
         sample_logits1 = self._apply_top_p(logits1, top_p) if top_p < 1.0 else logits1
 
         dist1 = Categorical(logits=sample_logits1)
         a1 = dist1.sample()
 
-        batch_idx = torch.arange(a1.size(0), device=a1.device)
-        ctx_a1 = keys1[batch_idx, a1]
+        ctx_a1 = self._select_action_keys(
+            first,
+            a1,
+            enc.phase,
+            torch.arange(a1.size(0), device=a1.device),
+        )
 
-        logits2, _ = self._compute_pointer_logits(
-            z,
+        second = self._compute_pointer_logits(
+            self._compute_second_pointer_query(z, k_entity_extended, enc.phase, ctx_a1),
             k_entity_extended,
             enc.aux[:, 1],
             enc.numerical,
             enc.phase,
-            head_idx=1,
-            ctx_a1=ctx_a1,
         )
+        logits2 = second.logits
 
         logits = torch.stack([logits1, logits2], dim=1)
         logits = self._apply_sequential_masks(logits, a1, action_mask, enc.phase)
@@ -475,23 +523,31 @@ class ActorPolicy(nn.Module):
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
 
-        logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
+        first = self._compute_pointer_logits(
+            self._compute_first_pointer_query(z, k_entity_extended, enc.phase),
+            k_entity_extended,
+            enc.aux[:, 0],
+            enc.numerical,
+            enc.phase,
         )
+        logits1 = first.logits
         logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
         a1 = torch.argmax(logits1, dim=-1)
 
-        batch_idx = torch.arange(a1.size(0), device=a1.device)
-        ctx_a1 = keys1[batch_idx, a1]
-        logits2, _ = self._compute_pointer_logits(
-            z,
+        ctx_a1 = self._select_action_keys(
+            first,
+            a1,
+            enc.phase,
+            torch.arange(a1.size(0), device=a1.device),
+        )
+        second = self._compute_pointer_logits(
+            self._compute_second_pointer_query(z, k_entity_extended, enc.phase, ctx_a1),
             k_entity_extended,
             enc.aux[:, 1],
             enc.numerical,
             enc.phase,
-            head_idx=1,
-            ctx_a1=ctx_a1,
         )
+        logits2 = second.logits
         logits = self._apply_sequential_masks(
             torch.stack([logits1, logits2], dim=1),
             a1,
@@ -505,6 +561,53 @@ class ActorPolicy(nn.Module):
         ) + F.log_softmax(logits[:, 1], dim=-1).gather(1, a2.unsqueeze(1)).squeeze(1)
         return actions, log_probs, z, reduced.local_history_token
 
+    def _action_logits(
+        self,
+        z: Tensor,
+        pokemon: Tensor,
+        aux: Tensor,
+        numerical: Tensor,
+        phase: Tensor,
+        action_mask: Tensor,
+        actions: Tensor,
+    ) -> Tensor:
+        """Build masked logits for a known joint action's sequential context."""
+        k_entity_extended = self._compute_keys(pokemon)
+
+        first = self._compute_pointer_logits(
+            self._compute_first_pointer_query(z, k_entity_extended, phase),
+            k_entity_extended,
+            aux[:, 0],
+            numerical,
+            phase,
+        )
+        logits1 = first.logits
+        a1 = actions[:, 0]
+
+        ctx_a1 = self._select_action_keys(
+            first,
+            a1,
+            phase,
+            torch.arange(a1.size(0), device=a1.device),
+        )
+
+        second = self._compute_pointer_logits(
+            self._compute_second_pointer_query(z, k_entity_extended, phase, ctx_a1),
+            k_entity_extended,
+            aux[:, 1],
+            numerical,
+            phase,
+        )
+        logits2 = second.logits
+
+        logits = self._apply_sequential_masks(
+            torch.stack([logits1, logits2], dim=1),
+            a1,
+            action_mask,
+            phase,
+        )
+        return logits
+
     def forward(
         self,
         z: Tensor,
@@ -516,36 +619,28 @@ class ActorPolicy(nn.Module):
         actions: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Evaluate actions through a deterministic tensor-only PPO kernel."""
-        k_entity_extended = self._compute_keys(pokemon)
-
-        logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, aux[:, 0], numerical, phase, head_idx=0
+        logits = self._action_logits(z, pokemon, aux, numerical, phase, action_mask, actions)
+        log_probs_1 = (
+            F.log_softmax(logits[:, 0], dim=-1).gather(1, actions[:, 0].unsqueeze(1)).squeeze(1)
         )
-        a1 = actions[:, 0]
-
-        batch_idx = torch.arange(a1.size(0), device=a1.device)
-        ctx_a1 = keys1[batch_idx, a1]
-
-        logits2, _ = self._compute_pointer_logits(
-            z,
-            k_entity_extended,
-            aux[:, 1],
-            numerical,
-            phase,
-            head_idx=1,
-            ctx_a1=ctx_a1,
+        log_probs_2 = (
+            F.log_softmax(logits[:, 1], dim=-1).gather(1, actions[:, 1].unsqueeze(1)).squeeze(1)
         )
-
-        logits = self._apply_sequential_masks(
-            torch.stack([logits1, logits2], dim=1),
-            a1,
-            action_mask,
-            phase,
-        )
-        dist1 = Categorical(logits=logits[:, 0])
-        dist2 = Categorical(logits=logits[:, 1])
-        log_probs = dist1.log_prob(actions[:, 0]) + dist2.log_prob(actions[:, 1])
+        log_probs = log_probs_1 + log_probs_2
         return logits, log_probs, z
+
+    def logits(
+        self,
+        z: Tensor,
+        pokemon: Tensor,
+        aux: Tensor,
+        numerical: Tensor,
+        phase: Tensor,
+        action_mask: Tensor,
+        actions: Tensor,
+    ) -> Tensor:
+        """Build masked action logits without critic or probability statistics."""
+        return self._action_logits(z, pokemon, aux, numerical, phase, action_mask, actions)
 
     def _validated_offsets(
         self,
@@ -647,25 +742,39 @@ class ActorPolicy(nn.Module):
             return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
-        logits1, keys1 = self._compute_pointer_logits(
-            z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase, head_idx=0
+        first = self._compute_pointer_logits(
+            self._compute_first_pointer_query(z, k_entity_extended, enc.phase),
+            k_entity_extended,
+            enc.aux[:, 0],
+            enc.numerical,
+            enc.phase,
         )
+        logits1 = first.logits
         counts = offsets[1:] - offsets[:-1]
         candidate_batch = torch.repeat_interleave(
             torch.arange(batch_size, device=enc.tokens.device), counts
         )
         first_actions = candidate_values[:, 0]
         second_actions = candidate_values[:, 1]
-        candidate_ctx = keys1[candidate_batch, first_actions]
-        logits2, _ = self._compute_pointer_logits(
-            z[candidate_batch],
+        candidate_ctx = self._select_action_keys(
+            first,
+            first_actions,
+            enc.phase[candidate_batch],
+            candidate_batch,
+        )
+        second = self._compute_pointer_logits(
+            self._compute_second_pointer_query(
+                z[candidate_batch],
+                k_entity_extended[candidate_batch],
+                enc.phase[candidate_batch],
+                candidate_ctx,
+            ),
             k_entity_extended[candidate_batch],
             enc.aux[candidate_batch, 1],
             enc.numerical[candidate_batch],
             enc.phase[candidate_batch],
-            head_idx=1,
-            ctx_a1=candidate_ctx,
         )
+        logits2 = second.logits
         candidate_logits = torch.stack((logits1[candidate_batch], logits2), dim=1)
         candidate_logits = self._apply_sequential_masks(
             candidate_logits,
@@ -688,15 +797,18 @@ class ActorPolicy(nn.Module):
         Reuses an already-reduced batch so the diagnostic costs one pointer-head pass
         rather than a second reducer pass.
         """
-        logits, _ = self._compute_pointer_logits(
-            reduced.cls,
-            self._compute_keys(reduced.pokemon),
+        k_entity_extended = self._compute_keys(reduced.pokemon)
+        return self._compute_pointer_logits(
+            self._compute_first_pointer_query(
+                reduced.cls,
+                k_entity_extended,
+                enc.phase,
+            ),
+            k_entity_extended,
             enc.aux[:, 0],
             enc.numerical,
             enc.phase,
-            head_idx=0,
-        )
-        return logits
+        ).logits
 
     def _apply_sequential_masks(
         self,
@@ -754,8 +866,6 @@ class PolicyNet(nn.Module):
         super().__init__()
         self.config = config
         self.resources = resources
-        self.seq_len = SEQUENCE_LENGTH
-        self.feat_dim = NUMERICAL_WIDTH
         self.act_size = ACT_SIZE
         self.d_model = config.d_model
 
@@ -850,7 +960,7 @@ class PolicyNet(nn.Module):
         actions: Tensor,
     ) -> EvalOutput:
         """Evaluate actions from an already-prepared decision."""
-        logits, log_probs, z = self.actor(
+        logits = self.actor.logits(
             prepared.reduced.cls,
             prepared.reduced.pokemon,
             prepared.encoded.aux,
@@ -859,11 +969,11 @@ class PolicyNet(nn.Module):
             action_mask,
             actions,
         )
-        value = self.critic(z)
+        value = self.critic(prepared.reduced.cls)
 
-        dist1 = Categorical(logits=logits[:, 0])
-        dist2 = Categorical(logits=logits[:, 1])
-        entropy = dist1.entropy() + dist2.entropy()
+        log_probs_1, entropy_1 = _distribution_statistics(logits[:, 0])
+        log_probs_2, entropy_2 = _distribution_statistics(logits[:, 1])
+        entropy = entropy_1 + entropy_2
 
         v1 = torch.isfinite(logits[:, 0]).sum(-1).float().clamp_min(1.0)
         v2 = torch.isfinite(logits[:, 1]).sum(-1).float().clamp_min(1.0)
@@ -876,12 +986,30 @@ class PolicyNet(nn.Module):
         )
 
         return EvalOutput(
-            log_probs,
+            log_probs_1.gather(1, actions[:, 0].unsqueeze(1)).squeeze(1)
+            + log_probs_2.gather(1, actions[:, 1].unsqueeze(1)).squeeze(1),
             entropy,
             norm_entropy,
             value,
             prepared.reduced.local_history_token,
             logits,
+        )
+
+    def action_logits(
+        self,
+        prepared: PreparedDecision,
+        action_mask: Tensor,
+        actions: Tensor,
+    ) -> Tensor:
+        """Return masked actor logits without critic or distribution work."""
+        return self.actor.logits(
+            prepared.reduced.cls,
+            prepared.reduced.pokemon,
+            prepared.encoded.aux,
+            prepared.encoded.numerical,
+            prepared.encoded.phase,
+            action_mask,
+            actions,
         )
 
     def score_candidates(

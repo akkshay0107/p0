@@ -6,6 +6,8 @@ import asyncio
 import functools
 import logging
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
+from pathlib import Path
 
 import torch.optim as optim
 from poke_env import AccountConfiguration
@@ -20,7 +22,7 @@ from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
 from p0.runtime.showdown import start_showdown_servers
 from p0.teams.factory import build_team_source
-from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
+from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore, PolicyStore
 from p0.training.config import GlobalConfig
 from p0.training.magnet import Magnet
 from p0.training.rollout import RolloutCollector
@@ -94,6 +96,37 @@ def run_training(
     Returns:
         None.
     """
+    paths = config.paths
+    checkpoint_path = paths.resume_checkpoint or paths.initial_policy_checkpoint
+    if checkpoint_path is not None:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"PPO checkpoint does not exist: {checkpoint_path}")
+        policy_context = (
+            policy_store.reuse_artifact(checkpoint_path)
+            if isinstance(policy_store, CheckpointStore)
+            else nullcontext()
+        )
+    else:
+        policy_context = nullcontext()
+
+    with policy_context:
+        _run_training_loaded(
+            config,
+            policy_store=policy_store,
+            cancel_requested=cancel_requested,
+            agent_team_source=agent_team_source,
+            checkpoint_path=checkpoint_path,
+        )
+
+
+def _run_training_loaded(
+    config: GlobalConfig,
+    *,
+    policy_store: PolicyStore,
+    cancel_requested: Callable[[], bool],
+    agent_team_source: str,
+    checkpoint_path: Path | None,
+) -> None:
     training, paths = config.training, config.paths
     if agent_team_source == "all":
         agent_team_path = config.teams.all
@@ -101,11 +134,7 @@ def run_training(
         agent_team_path = config.teams.reduced
     else:
         raise ValueError("agent_team_source must be 'all' or 'reduced'")
-
-    checkpoint_path = paths.resume_checkpoint or paths.initial_policy_checkpoint
     if checkpoint_path is not None:
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(f"PPO checkpoint does not exist: {checkpoint_path}")
         policy_store.preflight(checkpoint_path)
 
     seed_everything(training.seed)

@@ -50,6 +50,9 @@ class TestPpoSimulation:
                 )
 
             vector_env = ThreadVecEnv(envs)
+            initial_state = envs[0].training_state()
+            assert isinstance(initial_state["agent_team"], str)
+            assert isinstance(initial_state["opponent_team"], str)
             vector_env.reset()
             collector = RolloutCollector(
                 vector_env,

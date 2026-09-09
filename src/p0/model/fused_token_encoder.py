@@ -159,7 +159,13 @@ def _load_move_statics(resources: RuntimeResources) -> torch.Tensor:
         table[idx, 1] = float(move.get("pp", 0)) / 64.0
         table[idx, 2] = float(move.get("priority", 0)) / 5.0
         accuracy = move.get("accuracy", 100)
-        table[idx, 3] = float(accuracy) / 100.0 if isinstance(accuracy, (int, float)) else 0.0
+        if accuracy is True:
+            accuracy_value = 1.0
+        elif isinstance(accuracy, (int, float)):
+            accuracy_value = float(accuracy) / 100.0
+        else:
+            accuracy_value = 0.0
+        table[idx, 3] = accuracy_value
         target = str(move.get("target", "")).lower()
         target_class = _TARGET_CLASS_ALIASES.get(target, target)
         target_index = _TARGET_CLASS_INDEX.get(target_class)

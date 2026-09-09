@@ -5,7 +5,7 @@ from __future__ import annotations
 import selectors
 import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, NamedTuple
@@ -22,9 +22,6 @@ class AdmissionResult(NamedTuple):
     valid: bool
     packed_team: str | None
     problems: tuple[str, ...]
-
-
-Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def _variant_dict(
@@ -75,14 +72,13 @@ def showdown_payload(
 def validate_variant(
     variant: TeamRecord,
     *,
-    runner: Runner = subprocess.run,
     timeout: float = 30.0,
     repository_root: Path = DEFAULT_PATHS.repository_root,
     format_id: str = FORMAT.battle_format,
 ) -> AdmissionResult:
     validator = repository_root / "scripts" / "validate_champions_team.js"
     try:
-        process = runner(
+        process = subprocess.run(
             ["node", str(validator)],
             input=showdown_payload(variant, format_id=format_id),
             text=True,
@@ -111,7 +107,6 @@ def validate_many_batched(
     variants: Sequence[TeamRecord],
     *,
     batch_size: int = 256,
-    runner: Runner = subprocess.run,
     timeout: float = 60.0,
     repository_root: Path = DEFAULT_PATHS.repository_root,
     format_id: str = FORMAT.battle_format,
@@ -141,7 +136,7 @@ def validate_many_batched(
             [_variant_dict(variant, format_id=format_id) for variant in chunk]
         ).decode("utf-8")
         try:
-            process = runner(
+            process = subprocess.run(
                 ["node", str(validator)],
                 input=payload,
                 text=True,
@@ -181,7 +176,6 @@ def validate_many_batched(
 def validate_many(
     variants: Sequence[TeamRecord],
     *,
-    runner: Runner = subprocess.run,
     timeout: float = 30.0,
     repository_root: Path = DEFAULT_PATHS.repository_root,
     format_id: str = FORMAT.battle_format,
@@ -192,7 +186,6 @@ def validate_many(
         return (
             validate_variant(
                 variants[0],
-                runner=runner,
                 timeout=timeout,
                 repository_root=repository_root,
                 format_id=format_id,
@@ -200,7 +193,6 @@ def validate_many(
         )
     return validate_many_batched(
         variants,
-        runner=runner,
         timeout=timeout,
         repository_root=repository_root,
         format_id=format_id,
@@ -218,12 +210,10 @@ class PersistentShowdownValidator:
     def __init__(
         self,
         *,
-        popen_factory: Callable[..., Any] = subprocess.Popen,
         repository_root: Path = DEFAULT_PATHS.repository_root,
         request_timeout: float = 30.0,
         format_id: str = FORMAT.battle_format,
     ) -> None:
-        self._popen_factory = popen_factory
         self._repository_root = repository_root
         self._process: Any = None
         self._request_timeout = request_timeout
@@ -231,7 +221,7 @@ class PersistentShowdownValidator:
 
     def __enter__(self) -> PersistentShowdownValidator:
         validator = self._repository_root / "scripts" / "validate_champions_batch.js"
-        self._process = self._popen_factory(
+        self._process = subprocess.Popen(
             ["node", str(validator), "--persistent"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -349,8 +339,7 @@ class PersistentShowdownValidator:
             raise ValueError("batch_size must be a positive integer")
         results: list[AdmissionResult] = []
         for offset in range(0, len(variants), batch_size):
-            poll = getattr(self._process, "poll", lambda: None)
-            if poll() is not None:
+            if self._process.poll() is not None:
                 raise RuntimeError("Persistent validator exited before completing the request")
             chunk = variants[offset : offset + batch_size]
             payload = orjson.dumps(

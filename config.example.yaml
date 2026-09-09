@@ -26,13 +26,11 @@ paths:
   teams_root: teams
   artifacts_root: artifacts
   showdown_root: pokemon-showdown
-  gauntlet_dir: artifacts/checkpoints/gauntlet
   checkpoint_path: artifacts/checkpoints/ppo_checkpoint.pt
   resume_checkpoint: null
   initial_policy_checkpoint: null
   runs_dir: artifacts/runs
   replays_dir: artifacts/replays
-  backups_dir: artifacts/backups
   log_path: artifacts/training.log
 
 teams:

@@ -14,11 +14,9 @@ class ProjectPaths:
     teams_root: Path
     artifacts_root: Path
     showdown_root: Path
-    gauntlet_dir: Path
     checkpoint_path: Path
     runs_dir: Path
     replays_dir: Path
-    backups_dir: Path
     log_path: Path
     resume_checkpoint: Path | None = None
     initial_policy_checkpoint: Path | None = None
@@ -41,11 +39,9 @@ class ProjectPaths:
             teams_root=root / "teams",
             artifacts_root=artifacts,
             showdown_root=root / "pokemon-showdown",
-            gauntlet_dir=artifacts / "checkpoints" / "gauntlet",
             checkpoint_path=artifacts / "checkpoints" / "ppo_checkpoint.pt",
             runs_dir=artifacts / "runs",
             replays_dir=artifacts / "replays",
-            backups_dir=artifacts / "backups",
             log_path=artifacts / "training.log",
             resume_checkpoint=None,
             initial_policy_checkpoint=None,
@@ -71,11 +67,9 @@ def _default_paths() -> ProjectPaths:
                 teams_root=paths.teams_root,
                 artifacts_root=paths.artifacts_root,
                 showdown_root=paths.showdown_root,
-                gauntlet_dir=paths.gauntlet_dir,
                 checkpoint_path=paths.checkpoint_path,
                 runs_dir=paths.runs_dir,
                 replays_dir=paths.replays_dir,
-                backups_dir=paths.backups_dir,
                 log_path=paths.log_path,
                 resume_checkpoint=paths.resume_checkpoint,
                 initial_policy_checkpoint=paths.initial_policy_checkpoint,

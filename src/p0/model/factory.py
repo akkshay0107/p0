@@ -31,7 +31,11 @@ def compile_policy(
         return policy
 
     policy.encoder = cast(FusedTokenEncoder, torch.compile(policy.encoder, dynamic=dynamic))
-    policy.actor = cast(ActorPolicy, torch.compile(policy.actor, dynamic=dynamic))
+    actor = policy.actor
+    # PolicyNet.evaluate and magnet refresh use the logits-only entrypoint;
+    # compile it explicitly before wrapping ActorPolicy's forward path.
+    setattr(actor, "logits", torch.compile(actor.logits, dynamic=dynamic))
+    policy.actor = cast(ActorPolicy, torch.compile(actor, dynamic=dynamic))
     policy.critic = cast(ValueHead, torch.compile(policy.critic, dynamic=dynamic))
     policy.series = cast(DynamicSeriesResampler, torch.compile(policy.series, dynamic=dynamic))
     return policy

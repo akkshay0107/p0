@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -98,6 +99,20 @@ class CheckpointStore:
         if self.manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
             raise ValueError("CheckpointStore always uses the default global runtime manifest")
         self._resources = resources
+        self._reused_artifact: tuple[Path, Mapping[str, Any]] | None = None
+
+    @contextmanager
+    def reuse_artifact(self, path: Path) -> Iterator[None]:
+        """Reuse one validated deserialization during a startup sequence."""
+        artifact = self._read_artifact(path)
+        self._validate_envelope(artifact, path)
+        self._validate_checkpoint_contract(artifact, path)
+        previous = self._reused_artifact
+        self._reused_artifact = (path.resolve(), artifact)
+        try:
+            yield
+        finally:
+            self._reused_artifact = previous
 
     def save_policy(
         self,
@@ -111,7 +126,7 @@ class CheckpointStore:
 
     def preflight(self, path: Path) -> ContractCompatibility:
         """Reject a major checkpoint contract difference before training setup begins."""
-        artifact = self._read_artifact(path)
+        artifact = self._load_artifact(path)
         self._validate_envelope(artifact, path)
         return self._validate_checkpoint_contract(artifact, path)
 
@@ -260,6 +275,9 @@ class CheckpointStore:
         }
 
     def _load_artifact(self, path: Path) -> Mapping[str, Any]:
+        reused = self._reused_artifact
+        if reused is not None and reused[0] == path.resolve():
+            return reused[1]
         artifact = self._read_artifact(path)
         self._validate_envelope(artifact, path)
         self._validate_checkpoint_contract(artifact, path)

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -137,6 +138,29 @@ def train_bc(
         The final training and validation metrics plus selected checkpoint state.
     """
     store = CheckpointStore()
+    checkpoint_context = (
+        store.reuse_artifact(config.resume_checkpoint)
+        if config.resume_checkpoint is not None
+        else nullcontext()
+    )
+    with checkpoint_context:
+        return _train_bc_with_store(
+            config,
+            overfit=overfit,
+            device=device,
+            cancel_requested=cancel_requested,
+            store=store,
+        )
+
+
+def _train_bc_with_store(
+    config: BCConfig,
+    *,
+    overfit: bool,
+    device: torch.device | str | None,
+    cancel_requested: Callable[[], bool],
+    store: CheckpointStore,
+) -> dict[str, Any]:
     if config.resume_checkpoint is not None:
         store.preflight(config.resume_checkpoint)
 

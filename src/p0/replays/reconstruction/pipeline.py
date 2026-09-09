@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from p0.replays.compile import CompilationResult, CompiledGame, ShardBuildResult
 
 _SUPPORTED_FORMATS = frozenset({FORMAT.battle_format, FORMAT.bo3_format})
+_WORKER_DEX: Mapping[str, Any] | None = None
 
 
 def _validate_compile_input(document: ReplayDocument) -> None:
@@ -84,11 +85,12 @@ def _compile_worker(
         int,
         tuple[int, int],
         int,
-        Mapping[str, Any] | None,
     ],
 ) -> tuple[CompiledGame | None, str | None]:
-    document, series_id, game_number, roles, max_candidates, dex = args
-    runtime_dex = default_runtime_resources().dex if dex is None else dex
+    document, series_id, game_number, roles, max_candidates = args
+    runtime_dex = _WORKER_DEX
+    if runtime_dex is None:
+        runtime_dex = default_runtime_resources().dex
 
     resolved = resolve_replay_events(document, dex=runtime_dex)
     if resolved.diagnostics:
@@ -102,6 +104,7 @@ def _compile_worker(
         events,
         dex=runtime_dex,
     )
+
     if state.diagnostics:
         diagnostic = state.diagnostics[0]
         return None, diagnostic.category.value
@@ -151,6 +154,11 @@ def _compile_worker(
     )
 
 
+def _initialize_compile_worker(dex: Mapping[str, Any]) -> None:
+    global _WORKER_DEX
+    _WORKER_DEX = dex
+
+
 def compile_documents(
     documents: Iterable[ReplayDocument],
     *,
@@ -176,6 +184,8 @@ def compile_documents(
                 f"Replay format {document.metadata.format_id!r} does not match requested {format_id!r}"
             )
     _validate_runtime_dex(dex)
+    runtime_dex = default_runtime_resources().dex if dex is None else dex
+    _initialize_compile_worker(runtime_dex)
     grouping = group_replays(documents, format_id=format_id)
     counters = _initial_compilation_counters(grouping)
     jobs = []
@@ -192,7 +202,6 @@ def compile_documents(
                     membership.game_number,
                     membership.canonical_player_roles,
                     max_candidates,
-                    dex,
                 )
             )
 
@@ -205,36 +214,67 @@ def compile_documents(
         results = (_compile_worker(job) for job in jobs)
     else:
         assert chunksize is not None
-        with concurrent.futures.ProcessPoolExecutor(mp_context=PROCESS_CONTEXT) as executor:
+        with concurrent.futures.ProcessPoolExecutor(
+            mp_context=PROCESS_CONTEXT,
+            initializer=_initialize_compile_worker,
+            initargs=(runtime_dex,),
+        ) as executor:
             results = executor.map(_compile_worker, jobs, chunksize=chunksize)
 
-    games: list[CompiledGame] = []
+    compiled_by_series: dict[str, list[CompiledGame]] = {}
+    failed_series: set[str] = set()
     confidence_sum = 0.0
-    for compiled, reason in results:
+    for job, (compiled, reason) in zip(jobs, results, strict=True):
+        series_id = job[1]
         if reason is not None:
             counters[f"rejected_reconstruction_{reason}"] += 1
-            counters["rejected_games"] += 1
+            failed_series.add(series_id)
             continue
         if compiled is None:
             continue
-
-        estimates = tuple(
-            value for value in compiled.stat_estimates if isinstance(value, ReplayStatValue)
-        )
-        counters["imputations"] += sum(value.provenance == "IMPUTED" for value in estimates)
-        counters["imputation_unknown"] += sum(value.provenance == "UNKNOWN" for value in estimates)
-        confidence_sum += sum(value.confidence for value in estimates)
 
         reasons = _quality_reasons(compiled)
         if reasons:
             for quality_reason in reasons:
                 counters[f"rejected_{quality_reason}"] += 1
-            counters["rejected_games"] += 1
+            failed_series.add(series_id)
             continue
 
-        counters["accepted_games"] += 1
-        games.append(compiled)
-        _measure_game(counters, compiled)
+        compiled_by_series.setdefault(series_id, []).append(compiled)
+
+    source_games_by_series = {group.record.series_id: len(group.games) for group in grouping.series}
+    games: list[CompiledGame] = []
+    for group in grouping.series:
+        series_id = group.record.series_id
+        retained = compiled_by_series.get(series_id, [])
+        expected_numbers = tuple(sorted(membership.game_number for membership in group.memberships))
+        actual_numbers = tuple(sorted(game.game_number for game in retained))
+        if series_id in failed_series or actual_numbers != expected_numbers:
+            failed_series.add(series_id)
+            continue
+        games.extend(sorted(retained, key=lambda game: game.game_number))
+        for game in retained:
+            estimates = tuple(
+                value for value in game.stat_estimates if isinstance(value, ReplayStatValue)
+            )
+            counters["imputations"] += sum(value.provenance == "IMPUTED" for value in estimates)
+            counters["imputation_unknown"] += sum(
+                value.provenance == "UNKNOWN" for value in estimates
+            )
+            confidence_sum += sum(value.confidence for value in estimates)
+            counters["accepted_games"] += 1
+            _measure_game(counters, game)
+
+    counters["rejected_games"] = sum(
+        source_games_by_series[series_id]
+        for series_id in failed_series
+        if series_id in source_games_by_series
+    )
+    counters["complete_series"] = sum(
+        group.record.is_complete and group.record.series_id not in failed_series
+        for group in grouping.series
+    )
+    counters["incomplete_series"] = counters["series"] - counters["complete_series"]
 
     metric_values: dict[str, int | float] = dict(counters)
     metric_values["imputation_confidence_sum"] = confidence_sum

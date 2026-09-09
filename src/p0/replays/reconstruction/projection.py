@@ -37,6 +37,7 @@ _ENUM_ALIASES = {
     "wonderroom": "WONDER_ROOM",
     "toxicspikes": "TOXIC_SPIKES",
 }
+_SPECIES_INDEX_CACHE: tuple[Mapping[str, Any], dict[str, Mapping[str, Any]]] | None = None
 
 
 def _enum_name(value: str) -> str:
@@ -342,6 +343,13 @@ def _species_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return by_id
 
 
+def _cached_species_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    global _SPECIES_INDEX_CACHE
+    if _SPECIES_INDEX_CACHE is None or _SPECIES_INDEX_CACHE[0] is not dex:
+        _SPECIES_INDEX_CACHE = (dex, _species_index(dex))
+    return _SPECIES_INDEX_CACHE[1]
+
+
 def impute_replay_stats(
     document: ReplayDocument,
     *,
@@ -349,7 +357,7 @@ def impute_replay_stats(
 ) -> tuple[ReplayStatValue, ...]:
     """Estimate every OTS member exactly once, retaining explicit unknowns."""
     table = load_spread_table_file()
-    species = _species_index(dex)
+    species = _cached_species_index(dex)
     move_categories = {
         normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): str(
             entry.get("category", "")
