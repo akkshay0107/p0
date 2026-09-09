@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from p0.format_config import (
 )
 from p0.model.config import ModelConfig
 from p0.training.config import (
+    BCConfig,
     BotConfig,
     GlobalConfig,
     TrainingConfig,
@@ -26,30 +26,7 @@ def write_config(tmp_path: Path, contents: str) -> Path:
     return path
 
 
-def _resources(
-    tmp_path: Path, *, extra_species: bool = False, base_power: int = 90
-) -> tuple[Path, Path]:
-    vocab = tmp_path / "vocab.json"
-    species = {"pikachu": 1}
-    if extra_species:
-        species["raichu"] = 2
-    vocab.write_text(json.dumps({"species": species}), encoding="utf-8")
-    dex = tmp_path / "champions_dex.json"
-    dex.write_text(json.dumps({"moves": [{"id": "test", "basePower": base_power}]}))
-    return vocab, dex
-
-
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def _runtime_files(tmp_path: Path) -> tuple[Path, Path]:
-    vocab = tmp_path / "vocab.json"
-    dex = tmp_path / "champions_dex.json"
-    vocab.write_text(
-        json.dumps({"species": {"pikachu": 1}, "moves": {"tackle": 1}}), encoding="utf-8"
-    )
-    dex.write_text('{"pikachu":{"base_stats":{"hp":35}}}', encoding="utf-8")
-    return vocab, dex
 
 
 class TestConfig:
@@ -157,3 +134,47 @@ class TestConfig:
         assert config.dim_feedforward == 1536
         with pytest.raises(ValueError, match="divisible"):
             ModelConfig(63, 8, 1, 256)
+
+    def test_model_config_has_only_scaling_fields(self) -> None:
+        """Verify ModelConfig accepts valid scaling architectures and rejects deprecated parameters."""
+        config = ModelConfig.baseline()
+        assert config.dim_feedforward == 1536
+        assert ModelConfig.from_dict(config.to_dict()) == config
+        enabled = ModelConfig(
+            d_model=64,
+            nhead=4,
+            reducer_layers=1,
+            dim_feedforward=128,
+        )
+        assert ModelConfig.from_dict(enabled.to_dict()) == enabled
+        stale = config.to_dict()
+        stale["history_tokens"] = 8
+        with pytest.raises(ValueError, match=r"unknown=.*history_tokens"):
+            ModelConfig.from_dict(stale)
+        with pytest.raises(ValueError, match="low-width event channel"):
+            ModelConfig(d_model=96, nhead=3, reducer_layers=1, dim_feedforward=128)
+
+    def test_config_sections(self, tmp_path: Path) -> None:
+        """Verify current config sections load correctly and disallow conflicting objective parameters."""
+        config = load_config("config.example.yaml")
+        assert config.bc.batch_decisions == 256
+        assert config.bc.gamma == config.training.gamma
+        assert config.bc.value_coef == config.training.value_coef
+        assert config.teams.all == (ROOT / "teams" / "all").resolve()
+        assert config.teams.reduced == (ROOT / "teams" / "reduced").resolve()
+        assert config.evaluation.episodes_per_matchup == 20
+        bad = tmp_path / "config.yaml"
+        bad.write_text("bc:\n  bogus: 1\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="unknown BCConfig field"):
+            load_config(bad)
+
+        duplicate_objective = tmp_path / "duplicate-objective.yaml"
+        duplicate_objective.write_text(
+            "training:\n  gamma: 0.95\nbc:\n  gamma: 0.9\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="bc.gamma is derived from training"):
+            load_config(duplicate_objective)
+
+        with pytest.raises(ValueError, match="bc.gamma must match training.gamma"):
+            GlobalConfig(training=TrainingConfig(gamma=0.95), bc=BCConfig(gamma=0.9))

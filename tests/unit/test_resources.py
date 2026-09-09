@@ -31,37 +31,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
 from p0.model.tokenizer import PokemonTokenizer, Resolution, tokenizer
 
-
-def write_config(tmp_path: Path, contents: str) -> Path:
-    path = tmp_path / "config.yaml"
-    path.write_text(contents, encoding="utf-8")
-    return path
-
-
-def _resources(
-    tmp_path: Path, *, extra_species: bool = False, base_power: int = 90
-) -> tuple[Path, Path]:
-    vocab = tmp_path / "vocab.json"
-    species = {"pikachu": 1}
-    if extra_species:
-        species["raichu"] = 2
-    vocab.write_text(json.dumps({"species": species}), encoding="utf-8")
-    dex = tmp_path / "champions_dex.json"
-    dex.write_text(json.dumps({"moves": [{"id": "test", "basePower": base_power}]}))
-    return vocab, dex
-
-
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def _runtime_files(tmp_path: Path) -> tuple[Path, Path]:
-    vocab = tmp_path / "vocab.json"
-    dex = tmp_path / "champions_dex.json"
-    vocab.write_text(
-        json.dumps({"species": {"pikachu": 1}, "moves": {"tackle": 1}}), encoding="utf-8"
-    )
-    dex.write_text('{"pikachu":{"base_stats":{"hp":35}}}', encoding="utf-8")
-    return vocab, dex
 
 
 class TestRuntimeResources:

@@ -29,7 +29,7 @@ class ProjectPaths:
 
     @classmethod
     def from_root(cls, repository_root: str | Path) -> ProjectPaths:
-        """Construct ProjectPaths structure anchored at repository_root."""
+        """Construct ProjectPaths anchored at repository_root."""
         root = Path(repository_root).expanduser().resolve()
         artifacts = root / "artifacts"
 
@@ -43,8 +43,6 @@ class ProjectPaths:
             runs_dir=artifacts / "runs",
             replays_dir=artifacts / "replays",
             log_path=artifacts / "training.log",
-            resume_checkpoint=None,
-            initial_policy_checkpoint=None,
         )
 
 
@@ -61,19 +59,9 @@ def _default_paths() -> ProjectPaths:
 
     for data_root in candidates:
         if (data_root / "vocab.json").is_file():
-            return ProjectPaths(
-                repository_root=paths.repository_root,
-                data_root=data_root,
-                teams_root=paths.teams_root,
-                artifacts_root=paths.artifacts_root,
-                showdown_root=paths.showdown_root,
-                checkpoint_path=paths.checkpoint_path,
-                runs_dir=paths.runs_dir,
-                replays_dir=paths.replays_dir,
-                log_path=paths.log_path,
-                resume_checkpoint=paths.resume_checkpoint,
-                initial_policy_checkpoint=paths.initial_policy_checkpoint,
-            )
+            from dataclasses import replace
+
+            return replace(paths, data_root=data_root)
 
     return paths
 

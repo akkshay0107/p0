@@ -58,14 +58,16 @@ def _validate_json_value(value: Any, location: str = "contract") -> None:
 def canonical_json_sha256(value: Any) -> str:
     """Hash JSON semantics independently of whitespace and object-key order."""
     _validate_json_value(value)
-    return hashlib.sha256(orjson.dumps(_thaw(value), option=orjson.OPT_SORT_KEYS)).hexdigest()
+    return hashlib.sha256(
+        orjson.dumps(value, default=dict, option=orjson.OPT_SORT_KEYS)
+    ).hexdigest()
 
 
 def _domain_sha256(domain: str, value: Mapping[str, Any]) -> str:
     if not domain.endswith("\0"):
         raise ValueError("Hash domain must end with a NUL separator")
     _validate_json_value(value)
-    encoded = orjson.dumps(_thaw(value), option=orjson.OPT_SORT_KEYS)
+    encoded = orjson.dumps(value, default=dict, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(domain.encode("ascii") + encoded).hexdigest()
 
 
@@ -219,8 +221,8 @@ class GlobalContract:
         previous = self.subsystem(name)
         contracts = {
             subsystem: {
-                "major": _thaw(self.contracts[subsystem]["major"]),
-                "minor": _thaw(self.contracts[subsystem]["minor"]),
+                "major": dict(self.contracts[subsystem]["major"]),
+                "minor": dict(self.contracts[subsystem]["minor"]),
             }
             for subsystem in self.subsystems
         }
@@ -271,21 +273,6 @@ class GlobalContract:
         raw_contracts = value["contracts"]
         if not isinstance(raw_subsystems, Mapping) or not isinstance(raw_contracts, Mapping):
             raise ValueError("Global contract subsystems and contracts must be JSON objects")
-        if any(
-            not isinstance(name, str) or not isinstance(entry, Mapping)
-            for name, entry in raw_subsystems.items()
-        ):
-            raise ValueError("Global contract subsystem entries must be JSON objects")
-        if any(
-            not isinstance(name, str)
-            or not isinstance(entry, Mapping)
-            or any(
-                not isinstance(level, str) or not isinstance(payload, Mapping)
-                for level, payload in entry.items()
-            )
-            for name, entry in raw_contracts.items()
-        ):
-            raise ValueError("Global contract payload entries must be JSON objects")
         return cls(
             subsystems={
                 name: SubsystemContract.from_dict(entry) for name, entry in raw_subsystems.items()
@@ -337,9 +324,14 @@ def _freeze(value: Any) -> Any:
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {key: _thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple):
+    if isinstance(value, (list, tuple)):
         return [_thaw(item) for item in value]
     return value
+
+
+def _require_positive_int(value: Any, owner: str) -> None:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{owner} must be positive")
 
 
 def _require_non_empty_string(value: Any, owner: str) -> None:
@@ -353,10 +345,8 @@ def _validate_actions_payload(payload: Mapping[str, Any]) -> None:
         frozenset({"joint_width", "action_count", "ranges", "team_preview", "joint_constraints"}),
         "actions major payload",
     )
-    if type(payload["joint_width"]) is not int or payload["joint_width"] <= 0:
-        raise ValueError("actions major payload joint_width must be positive")
-    if type(payload["action_count"]) is not int or payload["action_count"] <= 0:
-        raise ValueError("actions major payload action_count must be positive")
+    _require_positive_int(payload["joint_width"], "actions major payload joint_width")
+    _require_positive_int(payload["action_count"], "actions major payload action_count")
     ranges = payload["ranges"]
     if not isinstance(ranges, (list, tuple)) or not ranges:
         raise ValueError("actions major payload ranges must be a non-empty array")
@@ -386,9 +376,9 @@ def _validate_actions_payload(payload: Mapping[str, Any]) -> None:
             raise ValueError(f"Unsupported actions major payload range {entry['meaning']!r}")
         _validate_exact_fields(entry, expected_fields, f"actions major payload {entry['meaning']}")
         for field in ("roster_slots", "move_slots"):
-            if field in entry and (type(entry[field]) is not int or entry[field] <= 0):
-                raise ValueError(
-                    f"actions major payload {entry['meaning']} {field} must be positive"
+            if field in entry:
+                _require_positive_int(
+                    entry[field], f"actions major payload {entry['meaning']} {field}"
                 )
         if "targets" in entry and (
             not isinstance(entry["targets"], (list, tuple))
@@ -415,8 +405,7 @@ def _validate_actions_payload(payload: Mapping[str, Any]) -> None:
         "actions major payload team_preview",
     )
     _require_non_empty_string(preview["encoding"], "actions major payload team_preview encoding")
-    if type(preview["roster_size"]) is not int or preview["roster_size"] <= 0:
-        raise ValueError("actions major payload team_preview roster_size must be positive")
+    _require_positive_int(preview["roster_size"], "actions major payload team_preview roster_size")
     if type(preview["joint_unique"]) is not bool:
         raise ValueError("actions major payload team_preview joint_unique must be a boolean")
     if not isinstance(payload["joint_constraints"], (list, tuple)) or not all(
@@ -425,138 +414,103 @@ def _validate_actions_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError("actions major payload joint_constraints must contain non-empty strings")
 
 
+_SUBSYSTEM_MAJOR_SCHEMAS: dict[
+    str, tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]
+] = {
+    "model": (
+        frozenset({"tensor_abi", "structured_observation_abi"}),
+        frozenset(
+            {
+                "observation_schema_version",
+                "observation_entity_count",
+                "pokemon_count",
+                "owner_count",
+                "raw_event_count",
+                "history_window",
+                "series_tokens_per_game",
+                "max_prior_games",
+                "event_raw_width",
+                "pooled_event_count",
+            }
+        ),
+        frozenset({"self_target_sentinel"}),
+        frozenset({"observation_layout_sha256"}),
+    ),
+    "resources": (
+        frozenset({"resource_feature_abi"}),
+        frozenset(),
+        frozenset(),
+        frozenset({"vocabulary_sha256"}),
+    ),
+    "replays": (
+        frozenset(
+            {
+                "shard_artifact_schema",
+                "split_artifact_schema",
+                "compilation_semantics",
+                "imputation_algorithm",
+            }
+        ),
+        frozenset(
+            {
+                "replay_ir_schema_version",
+                "parser_version",
+                "compiler_version",
+                "imputation_version",
+            }
+        ),
+        frozenset(),
+        frozenset(),
+    ),
+    "checkpoints": (frozenset({"artifact_schema"}), frozenset(), frozenset(), frozenset()),
+    "teams": (
+        frozenset({"corpus_manifest_schema"}),
+        frozenset({"stat_point_imputer_version"}),
+        frozenset(),
+        frozenset(),
+    ),
+}
+
+_RESOURCES_MINOR_SCHEMA: tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]] = (
+    frozenset({"showdown_commit", "battle_format", "bo3_format"}),
+    frozenset(),
+    frozenset(),
+    frozenset({"champions_dex_sha256", "spread_usage_sha256"}),
+)
+
+
+def _validate_fields(
+    payload: Mapping[str, Any],
+    schema: tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]],
+    owner: str,
+) -> None:
+    str_fields, pos_int_fields, int_fields, sha_fields = schema
+    all_expected = str_fields | pos_int_fields | int_fields | sha_fields
+    _validate_exact_fields(payload, all_expected, owner)
+    for field in str_fields:
+        _require_non_empty_string(payload[field], f"{owner} {field}")
+    for field in pos_int_fields:
+        _require_positive_int(payload[field], f"{owner} {field}")
+    for field in int_fields:
+        if type(payload[field]) is not int:
+            raise ValueError(f"{owner} {field} must be an integer")
+    for field in sha_fields:
+        if not _is_sha256(payload[field]):
+            raise ValueError(f"{owner} {field} must be a SHA-256 digest")
+
+
 def _validate_subsystem_payload(name: str, payloads: Mapping[str, Mapping[str, Any]]) -> None:
     major = payloads["major"]
     minor = payloads["minor"]
     if name == "actions":
         _validate_actions_payload(major)
-        _validate_exact_fields(minor, frozenset(), "actions minor payload")
-    elif name == "model":
-        _validate_exact_fields(
-            major,
-            frozenset(
-                {
-                    "tensor_abi",
-                    "observation_schema_version",
-                    "observation_entity_count",
-                    "pokemon_count",
-                    "owner_count",
-                    "raw_event_count",
-                    "history_window",
-                    "series_tokens_per_game",
-                    "max_prior_games",
-                    "event_raw_width",
-                    "pooled_event_count",
-                    "self_target_sentinel",
-                    "structured_observation_abi",
-                    "observation_layout_sha256",
-                }
-            ),
-            "model major payload",
-        )
-        for field in ("tensor_abi", "structured_observation_abi"):
-            _require_non_empty_string(major[field], f"model major payload {field}")
-        if not _is_sha256(major["observation_layout_sha256"]):
-            raise ValueError(
-                "model major payload observation_layout_sha256 must be a SHA-256 digest"
-            )
-        for field in set(major) - {
-            "tensor_abi",
-            "structured_observation_abi",
-            "observation_layout_sha256",
-            "self_target_sentinel",
-        }:
-            if type(major[field]) is not int or major[field] <= 0:
-                raise ValueError(f"model major payload {field} must be positive")
-        if type(major["self_target_sentinel"]) is not int:
-            raise ValueError("model major payload self_target_sentinel must be an integer")
-        _validate_exact_fields(minor, frozenset(), "model minor payload")
-    elif name == "resources":
-        _validate_exact_fields(
-            major,
-            frozenset({"resource_feature_abi", "vocabulary_sha256"}),
-            "resources major payload",
-        )
-        _require_non_empty_string(
-            major["resource_feature_abi"], "resources major payload resource_feature_abi"
-        )
-        if not _is_sha256(major["vocabulary_sha256"]):
-            raise ValueError("resources major payload vocabulary_sha256 must be a SHA-256 digest")
-        _validate_exact_fields(
-            minor,
-            frozenset(
-                {
-                    "champions_dex_sha256",
-                    "spread_usage_sha256",
-                    "showdown_commit",
-                    "battle_format",
-                    "bo3_format",
-                }
-            ),
-            "resources minor payload",
-        )
-        if not _is_sha256(minor["champions_dex_sha256"]):
-            raise ValueError(
-                "resources minor payload champions_dex_sha256 must be a SHA-256 digest"
-            )
-        if not _is_sha256(minor["spread_usage_sha256"]):
-            raise ValueError("resources minor payload spread_usage_sha256 must be a SHA-256 digest")
-        for field in ("showdown_commit", "battle_format", "bo3_format"):
-            _require_non_empty_string(minor[field], f"resources minor payload {field}")
-    elif name == "replays":
-        _validate_exact_fields(
-            major,
-            frozenset(
-                {
-                    "replay_ir_schema_version",
-                    "shard_artifact_schema",
-                    "split_artifact_schema",
-                    "compilation_semantics",
-                    "parser_version",
-                    "compiler_version",
-                    "imputation_algorithm",
-                    "imputation_version",
-                }
-            ),
-            "replays major payload",
-        )
-        if (
-            type(major["replay_ir_schema_version"]) is not int
-            or major["replay_ir_schema_version"] <= 0
-        ):
-            raise ValueError("replays major payload replay_ir_schema_version must be positive")
-        for field in (
-            "shard_artifact_schema",
-            "split_artifact_schema",
-            "compilation_semantics",
-            "imputation_algorithm",
-        ):
-            _require_non_empty_string(major[field], f"replays major payload {field}")
-        for field in ("parser_version", "compiler_version", "imputation_version"):
-            if type(major[field]) is not int or major[field] <= 0:
-                raise ValueError(f"replays major payload {field} must be positive")
-        _validate_exact_fields(minor, frozenset(), "replays minor payload")
-    elif name == "checkpoints":
-        _validate_exact_fields(major, frozenset({"artifact_schema"}), "checkpoints major payload")
-        _require_non_empty_string(
-            major["artifact_schema"], "checkpoints major payload artifact_schema"
-        )
-        _validate_exact_fields(minor, frozenset(), "checkpoints minor payload")
+    elif name in _SUBSYSTEM_MAJOR_SCHEMAS:
+        _validate_fields(major, _SUBSYSTEM_MAJOR_SCHEMAS[name], f"{name} major payload")
+
+    if name == "resources":
+        _validate_fields(minor, _RESOURCES_MINOR_SCHEMA, "resources minor payload")
     else:
-        _validate_exact_fields(
-            major,
-            frozenset({"corpus_manifest_schema", "stat_point_imputer_version"}),
-            "teams major payload",
-        )
-        _require_non_empty_string(
-            major["corpus_manifest_schema"], "teams major payload corpus_manifest_schema"
-        )
-        if (
-            type(major["stat_point_imputer_version"]) is not int
-            or major["stat_point_imputer_version"] <= 0
-        ):
-            raise ValueError("teams major payload stat_point_imputer_version must be positive")
-        _validate_exact_fields(minor, frozenset(), "teams minor payload")
+        _validate_exact_fields(minor, frozenset(), f"{name} minor payload")
 
 
 def _validate_contract_structure(
@@ -635,17 +589,16 @@ def _global_sha256(subsystems: Mapping[str, SubsystemContract]) -> str:
 def compare_global_contracts(
     historical: GlobalContract, active: GlobalContract
 ) -> ContractCompatibility:
-    """Classify a snapshot without allowing minor drift to hide major divergence."""
+    """Classify differences between a historical contract snapshot and the active contract."""
     major: list[str] = []
     minor: list[str] = []
-    names = sorted(set(historical.subsystems) | set(active.subsystems))
-    for name in names:
-        before = historical.subsystems.get(name)
-        after = active.subsystems.get(name)
+    for name in sorted(set(historical.subsystems) | set(active.subsystems)):
+        before, after = historical.subsystems.get(name), active.subsystems.get(name)
         if before is None or after is None:
             major.append(f"{name}: subsystem is missing")
-            continue
-        if before.major_version != after.major_version or before.major_sha256 != after.major_sha256:
+        elif (
+            before.major_version != after.major_version or before.major_sha256 != after.major_sha256
+        ):
             major.append(
                 f"{name}: major {before.major_version}/{before.major_sha256} -> "
                 f"{after.major_version}/{after.major_sha256}"
@@ -657,12 +610,7 @@ def compare_global_contracts(
                 f"{name}: minor {before.minor_version}/{before.minor_sha256} -> "
                 f"{after.minor_version}/{after.minor_sha256}"
             )
-    if major:
-        status = "incompatible"
-    elif minor:
-        status = "warning"
-    else:
-        status = "compatible"
+    status = "incompatible" if major else ("warning" if minor else "compatible")
     return ContractCompatibility(status, tuple(major), tuple(minor))
 
 
@@ -689,16 +637,16 @@ def update_resource_contract(
     spread_usage_path: str | Path,
 ) -> GlobalContract:
     """Return a version-bumped resources contract for newly written resource files."""
-    major = _thaw(base.payload("resources", "major"))
-    minor = _thaw(base.payload("resources", "minor"))
+    major = dict(base.payload("resources", "major"))
+    minor = dict(base.payload("resources", "minor"))
     major["vocabulary_sha256"] = sha256_json_file(vocab_path)
     minor["champions_dex_sha256"] = sha256_file(dex_path)
     # Minor because refreshing the usage month shifts opponent stat estimates without
     # changing any tensor or artifact schema, so an existing policy still loads.
     minor["spread_usage_sha256"] = sha256_file(spread_usage_path)
-    if major != _thaw(base.payload("resources", "major")):
+    if major != dict(base.payload("resources", "major")):
         return base.with_subsystem_update("resources", major_payload=major, minor_payload=minor)
-    if minor != _thaw(base.payload("resources", "minor")):
+    if minor != dict(base.payload("resources", "minor")):
         return base.with_subsystem_update("resources", minor_payload=minor)
     return base
 
@@ -721,25 +669,35 @@ load_runtime_manifest = load_global_contract
 
 
 def load_active_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> GlobalContract:
-    """Load a contract and verify its resources still match the active runtime files."""
-    path = Path(path)
-    if path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
+    """Load a contract and verify its resources match the active runtime files."""
+    manifest_path = Path(path)
+    if manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
         raise ValueError("The active runtime contract is always the default global manifest")
-    contract = load_global_contract(path)
-    resources = contract.payload("resources", "major")
-    minor_resources = contract.payload("resources", "minor")
-    vocab = sha256_json_file(Path(path).with_name("vocab.json"))
-    dex = sha256_file(Path(path).with_name("champions_dex.json"))
-    spreads = sha256_file(Path(path).with_name("spread_usage.json"))
-    mismatches = []
-    if resources["vocabulary_sha256"] != vocab:
-        mismatches.append(f"vocabulary={resources['vocabulary_sha256']}, actual={vocab}")
-    if minor_resources["champions_dex_sha256"] != dex:
-        mismatches.append(f"champions_dex={minor_resources['champions_dex_sha256']}, actual={dex}")
-    if minor_resources["spread_usage_sha256"] != spreads:
-        mismatches.append(
-            f"spread_usage={minor_resources['spread_usage_sha256']}, actual={spreads}"
-        )
+    contract = load_global_contract(manifest_path)
+    res_major = contract.payload("resources", "major")
+    res_minor = contract.payload("resources", "minor")
+    checks = (
+        (
+            "vocabulary",
+            res_major["vocabulary_sha256"],
+            sha256_json_file(manifest_path.with_name("vocab.json")),
+        ),
+        (
+            "champions_dex",
+            res_minor["champions_dex_sha256"],
+            sha256_file(manifest_path.with_name("champions_dex.json")),
+        ),
+        (
+            "spread_usage",
+            res_minor["spread_usage_sha256"],
+            sha256_file(manifest_path.with_name("spread_usage.json")),
+        ),
+    )
+    mismatches = [
+        f"{name}={expected}, actual={actual}"
+        for name, expected, actual in checks
+        if expected != actual
+    ]
     if mismatches:
         raise ValueError(
             "Global contract does not describe active resources: " + "; ".join(mismatches)
@@ -759,14 +717,12 @@ def active_global_contract() -> GlobalContract:
 def validate_artifact_runtime_contract(
     artifact: Mapping[str, Any], path: str | Path = DEFAULT_RUNTIME_MANIFEST
 ) -> GlobalContract:
-    """Validate an artifact's reference to the active global major contract."""
+    """Validate an artifact reference against the active global contract."""
+    if Path(path).resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
+        raise ValueError("The active runtime contract is always the default global manifest")
     reference = artifact.get("global_contract_sha256")
     if not _is_sha256(reference):
         raise ValueError("Artifact has no valid global_contract_sha256 reference")
-    manifest_path = Path(path)
-    if manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
-        # Preserve the explicit path guard and its error for unsupported manifests.
-        load_active_global_contract(manifest_path)
     contract = active_global_contract()
     if reference != contract.global_sha256:
         raise ValueError(
@@ -780,6 +736,8 @@ def checkpoint_contract_compatibility(
     artifact: Mapping[str, Any], path: str | Path = DEFAULT_RUNTIME_MANIFEST
 ) -> ContractCompatibility:
     """Validate an embedded checkpoint snapshot against the active contract."""
+    if Path(path).resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
+        raise ValueError("The active runtime contract is always the default global manifest")
     reference = artifact.get("global_contract_sha256")
     snapshot = artifact.get("global_contract")
     if not _is_sha256(reference) or not isinstance(snapshot, Mapping):
@@ -787,7 +745,7 @@ def checkpoint_contract_compatibility(
     historical = GlobalContract.from_dict(snapshot)
     if historical.global_sha256 != reference:
         raise ValueError("Checkpoint global_contract_sha256 does not match its embedded snapshot")
-    return compare_global_contracts(historical, load_active_global_contract(path))
+    return compare_global_contracts(historical, active_global_contract())
 
 
 def _format_spec_from_contract(contract: GlobalContract) -> FormatSpec:
@@ -801,14 +759,13 @@ def _format_spec_from_contract(contract: GlobalContract) -> FormatSpec:
     )
 
 
-FORMAT = _format_spec_from_contract(active_global_contract())
+_active = active_global_contract()
+FORMAT = _format_spec_from_contract(_active)
 
 # Compatibility exports are projections of the loaded global contract.
-TENSOR_ABI = active_global_contract().payload("model", "major")["tensor_abi"]
-RESOURCE_FEATURE_ABI = active_global_contract().payload("resources", "major")[
-    "resource_feature_abi"
-]
-ACTION_CONTRACT = dict(active_global_contract().payload("actions", "major"))
+TENSOR_ABI = _active.payload("model", "major")["tensor_abi"]
+RESOURCE_FEATURE_ABI = _active.payload("resources", "major")["resource_feature_abi"]
+ACTION_CONTRACT = dict(_active.payload("actions", "major"))
 
 
 def is_corpus_format_compatible(model_format_id: str, corpus_format_id: str) -> bool:

@@ -14,12 +14,12 @@ import torch
 
 def atomic_json_save(path: Path, value: Mapping[str, Any]) -> None:
     """Atomically write JSON data to disk using temporary file replacement."""
+    encoded = orjson.dumps(value, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS)
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary)
 
     try:
-        encoded = orjson.dumps(value, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS)
         with os.fdopen(handle, "wb") as stream:
             stream.write(encoded)
             stream.write(b"\n")

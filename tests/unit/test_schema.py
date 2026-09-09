@@ -302,3 +302,18 @@ class TestReplaySchemas:
             ShardManifest.from_dict(
                 {**manifest.to_dict(), "source_series": {"series-1": ("game-1",)}}
             )
+
+    def test_schema_modules_stay_pure(self) -> None:
+        """Verify intermediate representation modules stay pure without importing torch or runtime."""
+        import subprocess
+        import sys
+
+        code = (
+            "import sys\n"
+            "import p0.replays.schema, p0.battle.series\n"
+            "assert 'torch' not in sys.modules, 'IR layer must stay torch-free'\n"
+            "assert not any(m.startswith('p0.runtime') for m in sys.modules)\n"
+            "import p0.replays.shards\n"
+            "assert not any(m.startswith('p0.runtime') for m in sys.modules)\n"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True)

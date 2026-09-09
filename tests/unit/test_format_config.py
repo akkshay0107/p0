@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -16,22 +14,12 @@ from p0.format_config import (
     RuntimeManifest,
     active_global_contract,
     canonical_json_sha256,
+    checkpoint_contract_compatibility,
+    compare_global_contracts,
     current_manifest,
+    load_active_global_contract,
     validate_artifact_runtime_contract,
 )
-from p0.model.config import ModelConfig
-from p0.training.config import (
-    BCConfig,
-    GlobalConfig,
-    TrainingConfig,
-    load_config,
-)
-
-
-def write_config(tmp_path: Path, contents: str) -> Path:
-    path = tmp_path / "config.yaml"
-    path.write_text(contents, encoding="utf-8")
-    return path
 
 
 def _resources(
@@ -44,19 +32,6 @@ def _resources(
     vocab.write_text(json.dumps({"species": species}), encoding="utf-8")
     dex = tmp_path / "champions_dex.json"
     dex.write_text(json.dumps({"moves": [{"id": "test", "basePower": base_power}]}))
-    return vocab, dex
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def _runtime_files(tmp_path: Path) -> tuple[Path, Path]:
-    vocab = tmp_path / "vocab.json"
-    dex = tmp_path / "champions_dex.json"
-    vocab.write_text(
-        json.dumps({"species": {"pikachu": 1}, "moves": {"tackle": 1}}), encoding="utf-8"
-    )
-    dex.write_text('{"pikachu":{"base_stats":{"hp":35}}}', encoding="utf-8")
     return vocab, dex
 
 
@@ -164,58 +139,78 @@ class TestFormatConfig:
         with pytest.raises(ValueError, match="incompatible"):
             validate_artifact_runtime_contract(artifact)
 
-    def test_model_config_has_only_scaling_fields(self) -> None:
-        """Verify ModelConfig accepts valid scaling architectures and rejects deprecated or incompatible parameters."""
-        config = ModelConfig.baseline()
-        assert config.dim_feedforward == 1536
-        assert ModelConfig.from_dict(config.to_dict()) == config
-        enabled = ModelConfig(
-            d_model=64,
-            nhead=4,
-            reducer_layers=1,
-            dim_feedforward=128,
+    def test_compare_global_contracts_detects_compatibility_levels(self) -> None:
+        """Verify compare_global_contracts distinguishes compatible, warning, and incompatible contract transitions."""
+        active = active_global_contract()
+
+        # Same contract is fully compatible
+        compat = compare_global_contracts(active, active)
+        assert compat.is_compatible
+        assert compat.status == "compatible"
+        assert compat.major_differences == ()
+        assert compat.minor_differences == ()
+
+        # Minor difference yields warning
+        minor_bump = active.with_subsystem_update(
+            "resources",
+            minor_payload={**active.payload("resources", "minor"), "showdown_commit": "next"},
         )
-        assert ModelConfig.from_dict(enabled.to_dict()) == enabled
-        stale = config.to_dict()
-        stale["history_tokens"] = 8
-        with pytest.raises(ValueError, match=r"unknown=.*history_tokens"):
-            ModelConfig.from_dict(stale)
-        with pytest.raises(ValueError, match="low-width event channel"):
-            ModelConfig(d_model=96, nhead=3, reducer_layers=1, dim_feedforward=128)
+        compat_minor = compare_global_contracts(minor_bump, active)
+        assert compat_minor.is_compatible
+        assert compat_minor.status == "warning"
+        assert len(compat_minor.minor_differences) == 1
+        assert "resources" in compat_minor.minor_differences[0]
 
-    def test_config_sections(self, tmp_path: Path) -> None:
-        """Verify current config sections load correctly and disallow conflicting objective parameters."""
-        config = load_config("config.example.yaml")
-        assert config.bc.batch_decisions == 256
-        assert config.bc.gamma == config.training.gamma
-        assert config.bc.value_coef == config.training.value_coef
-        assert config.teams.all == (ROOT / "teams" / "all").resolve()
-        assert config.teams.reduced == (ROOT / "teams" / "reduced").resolve()
-        assert config.evaluation.episodes_per_matchup == 20
-        bad = tmp_path / "config.yaml"
-        bad.write_text("bc:\n  bogus: 1\n", encoding="utf-8")
-        with pytest.raises(ValueError, match="unknown BCConfig field"):
-            load_config(bad)
-
-        duplicate_objective = tmp_path / "duplicate-objective.yaml"
-        duplicate_objective.write_text(
-            "training:\n  gamma: 0.95\nbc:\n  gamma: 0.9\n",
-            encoding="utf-8",
+        # Major difference yields incompatible
+        major_bump = active.with_subsystem_update(
+            "model",
+            major_payload={**active.payload("model", "major"), "tensor_abi": "next"},
         )
-        with pytest.raises(ValueError, match="bc.gamma is derived from training"):
-            load_config(duplicate_objective)
+        compat_major = compare_global_contracts(major_bump, active)
+        assert not compat_major.is_compatible
+        assert compat_major.status == "incompatible"
+        assert len(compat_major.major_differences) == 1
+        assert "model" in compat_major.major_differences[0]
 
-        with pytest.raises(ValueError, match="bc.gamma must match training.gamma"):
-            GlobalConfig(training=TrainingConfig(gamma=0.95), bc=BCConfig(gamma=0.9))
+    def test_checkpoint_contract_compatibility(self) -> None:
+        """Verify checkpoint_contract_compatibility verifies embedded contract snapshots."""
+        active = active_global_contract()
+        artifact = {
+            "global_contract_sha256": active.global_sha256,
+            "global_contract": active.to_dict(),
+        }
+        compat = checkpoint_contract_compatibility(artifact)
+        assert compat.is_compatible
+        assert compat.status == "compatible"
 
-    def test_schema_modules_stay_pure(self) -> None:
-        """Verify intermediate representation modules (p0.replays.schema, p0.battle.series) stay pure without importing torch or runtime."""
-        code = (
-            "import sys\n"
-            "import p0.replays.schema, p0.battle.series\n"
-            "assert 'torch' not in sys.modules, 'IR layer must stay torch-free'\n"
-            "assert not any(m.startswith('p0.runtime') for m in sys.modules)\n"
-            "import p0.replays.shards\n"
-            "assert not any(m.startswith('p0.runtime') for m in sys.modules)\n"
-        )
-        subprocess.run([sys.executable, "-c", code], check=True)
+        # Tampered hash
+        corrupt = {
+            "global_contract_sha256": "0" * 64,
+            "global_contract": active.to_dict(),
+        }
+        with pytest.raises(ValueError, match="does not match its embedded snapshot"):
+            checkpoint_contract_compatibility(corrupt)
+
+    def test_single_runtime_policy_rejection(self, tmp_path: Path) -> None:
+        """Verify functions reject non-default manifest paths enforcing single-runtime-per-process."""
+        fake_path = tmp_path / "custom_manifest.json"
+        with pytest.raises(
+            ValueError, match="The active runtime contract is always the default global manifest"
+        ):
+            load_active_global_contract(fake_path)
+
+        active = active_global_contract()
+        artifact = {"global_contract_sha256": active.global_sha256}
+        with pytest.raises(
+            ValueError, match="The active runtime contract is always the default global manifest"
+        ):
+            validate_artifact_runtime_contract(artifact, fake_path)
+
+        checkpoint_artifact = {
+            "global_contract_sha256": active.global_sha256,
+            "global_contract": active.to_dict(),
+        }
+        with pytest.raises(
+            ValueError, match="The active runtime contract is always the default global manifest"
+        ):
+            checkpoint_contract_compatibility(checkpoint_artifact, fake_path)
