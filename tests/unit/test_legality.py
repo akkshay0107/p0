@@ -117,3 +117,35 @@ class TestLegality:
 
         assert mask_unknown.sum() >= mask_known.sum()
         assert (mask_known & ~mask_unknown).sum() == 0
+
+    def test_mega_evolution_joint_constraint_suppression(self) -> None:
+        """Verify that when slot 0 mega evolves, slot 1 mega actions are suppressed."""
+        view = DecisionView(
+            slots=(
+                SlotDecision(move_targets=((-2,),), can_mega=True),
+                SlotDecision(move_targets=((-2,),), can_mega=True),
+            )
+        )
+        # Slot 0 takes mega move (action 27)
+        mask_slot1 = second_action_mask(view, first=27)
+        # Actions 27..47 (mega moves and mega forced move) must all be False
+        assert not mask_slot1[27:48].any()
+        # Non-mega move (action 7) must remain legal
+        assert mask_slot1[7]
+
+    def test_trapped_and_inactive_slot_legality(self) -> None:
+        """Verify that trapped slots cannot switch and inactive slots only switch or pass."""
+        trapped_view = DecisionView(
+            slots=(
+                SlotDecision(switch_slots=(2, 3), trapped=True, active=True, move_targets=((-2,),)),
+                SlotDecision(switch_slots=(2, 3), active=False),
+            )
+        )
+        # Slot 0 is trapped: switch actions (1..6) must not be in legal actions
+        slot0_actions = legal_actions(trapped_view, 0)
+        assert all(not (1 <= a < 7) for a in slot0_actions)
+        assert 7 in slot0_actions  # Move is still legal
+
+        # Slot 1 is inactive: only switches (or pass) are legal
+        slot1_actions = legal_actions(trapped_view, 1)
+        assert all(1 <= a < 7 for a in slot1_actions)

@@ -1,10 +1,4 @@
-"""
-Spatial battlefield interaction records and turn recorder.
-
-This module defines the 4-slot spatial battlefield representation (P1A, P1B, P2A, P2B),
-tracking inter-turn action types, move identifiers, spatial target coordinates, execution
-orders, HP deltas, etc.
-"""
+"""Turn event recorder and slot records for the 4 active battlefield positions."""
 
 from __future__ import annotations
 
@@ -45,9 +39,13 @@ FLAG_MOVE_FAILED = 4
 FLAG_ITEM_CONSUMED = 8
 
 
+MAX_BOOST_STAGES = 6.0
+_HP_STRIP_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ% "
+
+
 @dataclass(frozen=True, slots=True)
 class SpatialSlotRecord:
-    """Fixed-layout inter-turn interaction record for one active battlefield slot."""
+    """Battlefield slot record tracking actions, targets, damage, and stat changes."""
 
     action_type: int = int(SpatialActionType.NONE)
     move_id: int = 0
@@ -61,6 +59,36 @@ class SpatialSlotRecord:
     move_failed: float = 0.0
     item_consumed: float = 0.0
 
+    def copy_with(
+        self,
+        *,
+        action_type: int | None = None,
+        move_id: int | None = None,
+        target_slot: int | None = None,
+        order_rank: float | None = None,
+        hp_delta: float | None = None,
+        damage_dealt: float | None = None,
+        net_boost_delta: float | None = None,
+        landed_crit: float | None = None,
+        took_crit: float | None = None,
+        move_failed: float | None = None,
+        item_consumed: float | None = None,
+    ) -> SpatialSlotRecord:
+        """Return a new SpatialSlotRecord with specified fields updated."""
+        return SpatialSlotRecord(
+            self.action_type if action_type is None else action_type,
+            self.move_id if move_id is None else move_id,
+            self.target_slot if target_slot is None else target_slot,
+            self.order_rank if order_rank is None else order_rank,
+            self.hp_delta if hp_delta is None else hp_delta,
+            self.damage_dealt if damage_dealt is None else damage_dealt,
+            self.net_boost_delta if net_boost_delta is None else net_boost_delta,
+            self.landed_crit if landed_crit is None else landed_crit,
+            self.took_crit if took_crit is None else took_crit,
+            self.move_failed if move_failed is None else move_failed,
+            self.item_consumed if item_consumed is None else item_consumed,
+        )
+
 
 def get_hp_fraction(hp_status: str) -> float:
     """Extract float HP fraction from a Showdown HP status string."""
@@ -69,7 +97,7 @@ def get_hp_fraction(hp_status: str) -> float:
         return 0.0
     try:
         num, den_str = hp_part.split("/")
-        den_clean = den_str.strip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ% ")
+        den_clean = den_str.strip(_HP_STRIP_CHARS)
         return float(num) / float(den_clean)
     except (ValueError, ZeroDivisionError):
         return 0.0
@@ -84,7 +112,7 @@ def _parse_slot_index(endpoint: str, perspective_role: str) -> int | None:
     if player_num not in ("1", "2") or slot_letter not in ("a", "b"):
         return None
 
-    is_ally = f"p{player_num}" == perspective_role
+    is_ally = endpoint.startswith(perspective_role)
     slot_offset = 0 if slot_letter == "a" else 1
     return slot_offset if is_ally else 2 + slot_offset
 
@@ -107,7 +135,7 @@ def _parse_target_slot(endpoint: str, perspective_role: str) -> int:
 
 
 class SpatialTurnRecorder:
-    """Deterministic, pure-protocol recorder for the 4 battlefield active slots."""
+    """Records turn events for the four active battlefield slots (P1A, P1B, P2A, P2B)."""
 
     __slots__ = ("player_role", "slots", "_action_order", "_last_attacker")
 
@@ -150,79 +178,41 @@ class SpatialTurnRecorder:
                         resolved, _ = resolver.resolve("moves", parts[3])
                         move_id = resolved
                     except Exception:
+                        # Move name may be custom, malformed, or missing from vocabulary.
                         move_id = 0
                 target_slot = (
                     _parse_target_slot(parts[4], self.player_role)
                     if len(parts) >= 5
                     else int(SpatialTargetSlot.NONE)
                 )
-                prev = self.slots[actor]
-                self.slots[actor] = SpatialSlotRecord(
+                self.slots[actor] = self.slots[actor].copy_with(
                     action_type=int(SpatialActionType.MOVE),
                     move_id=move_id,
                     target_slot=target_slot,
-                    order_rank=min(1.0, self._action_order / 4.0),
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=prev.move_failed,
-                    item_consumed=prev.item_consumed,
+                    order_rank=min(1.0, self._action_order / float(SPATIAL_SLOT_COUNT)),
                 )
 
         elif tag in ("switch", "drag") and len(parts) >= 3:
             slot = _parse_slot_index(parts[2], self.player_role)
             if slot is not None:
-                prev = self.slots[slot]
-                self.slots[slot] = SpatialSlotRecord(
+                self.slots[slot] = self.slots[slot].copy_with(
                     action_type=int(SpatialActionType.SWITCH),
                     move_id=0,
                     target_slot=int(SpatialTargetSlot.NONE),
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=prev.move_failed,
-                    item_consumed=prev.item_consumed,
                 )
 
         elif tag == "faint" and len(parts) >= 3:
             slot = _parse_slot_index(parts[2], self.player_role)
             if slot is not None:
-                prev = self.slots[slot]
-                self.slots[slot] = SpatialSlotRecord(
-                    action_type=int(SpatialActionType.FAINT),
-                    move_id=prev.move_id,
-                    target_slot=prev.target_slot,
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=prev.move_failed,
-                    item_consumed=prev.item_consumed,
+                self.slots[slot] = self.slots[slot].copy_with(
+                    action_type=int(SpatialActionType.FAINT)
                 )
 
         elif tag == "cant" and len(parts) >= 3:
             slot = _parse_slot_index(parts[2], self.player_role)
             if slot is not None:
-                prev = self.slots[slot]
-                self.slots[slot] = SpatialSlotRecord(
-                    action_type=int(SpatialActionType.CANT),
-                    move_id=prev.move_id,
-                    target_slot=prev.target_slot,
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=prev.move_failed,
-                    item_consumed=prev.item_consumed,
+                self.slots[slot] = self.slots[slot].copy_with(
+                    action_type=int(SpatialActionType.CANT)
                 )
 
         elif tag in ("-damage", "-heal") and len(parts) >= 4:
@@ -231,123 +221,41 @@ class SpatialTurnRecorder:
                 new_hp = get_hp_fraction(parts[3])
                 pre_hp = hp_for(parts[2]) if hp_for is not None else None
                 delta = (new_hp - pre_hp) if pre_hp is not None else 0.0
-                prev = self.slots[target]
-                self.slots[target] = SpatialSlotRecord(
-                    action_type=prev.action_type,
-                    move_id=prev.move_id,
-                    target_slot=prev.target_slot,
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta + delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=prev.move_failed,
-                    item_consumed=prev.item_consumed,
+                self.slots[target] = self.slots[target].copy_with(
+                    hp_delta=self.slots[target].hp_delta + delta
                 )
                 if tag == "-damage" and self._last_attacker is not None and delta < 0:
-                    att_prev = self.slots[self._last_attacker]
-                    self.slots[self._last_attacker] = SpatialSlotRecord(
-                        action_type=att_prev.action_type,
-                        move_id=att_prev.move_id,
-                        target_slot=att_prev.target_slot,
-                        order_rank=att_prev.order_rank,
-                        hp_delta=att_prev.hp_delta,
-                        damage_dealt=att_prev.damage_dealt + abs(delta),
-                        net_boost_delta=att_prev.net_boost_delta,
-                        landed_crit=att_prev.landed_crit,
-                        took_crit=att_prev.took_crit,
-                        move_failed=att_prev.move_failed,
-                        item_consumed=att_prev.item_consumed,
+                    att = self.slots[self._last_attacker]
+                    self.slots[self._last_attacker] = att.copy_with(
+                        damage_dealt=att.damage_dealt + abs(delta)
                     )
 
         elif tag == "-crit" and len(parts) >= 3:
             target = _parse_slot_index(parts[2], self.player_role)
             if target is not None:
-                prev = self.slots[target]
-                self.slots[target] = SpatialSlotRecord(
-                    action_type=prev.action_type,
-                    move_id=prev.move_id,
-                    target_slot=prev.target_slot,
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=1.0,
-                    move_failed=prev.move_failed,
-                    item_consumed=prev.item_consumed,
-                )
+                self.slots[target] = self.slots[target].copy_with(took_crit=1.0)
             if self._last_attacker is not None:
-                att_prev = self.slots[self._last_attacker]
-                self.slots[self._last_attacker] = SpatialSlotRecord(
-                    action_type=att_prev.action_type,
-                    move_id=att_prev.move_id,
-                    target_slot=att_prev.target_slot,
-                    order_rank=att_prev.order_rank,
-                    hp_delta=att_prev.hp_delta,
-                    damage_dealt=att_prev.damage_dealt,
-                    net_boost_delta=att_prev.net_boost_delta,
-                    landed_crit=1.0,
-                    took_crit=att_prev.took_crit,
-                    move_failed=att_prev.move_failed,
-                    item_consumed=att_prev.item_consumed,
-                )
+                att = self.slots[self._last_attacker]
+                self.slots[self._last_attacker] = att.copy_with(landed_crit=1.0)
 
         elif tag in ("-boost", "-unboost") and len(parts) >= 5:
             slot = _parse_slot_index(parts[2], self.player_role)
             if slot is not None:
-                amount = int(parts[4]) / 6.0
+                amount = int(parts[4]) / MAX_BOOST_STAGES
                 delta = amount if tag == "-boost" else -amount
-                prev = self.slots[slot]
-                self.slots[slot] = SpatialSlotRecord(
-                    action_type=prev.action_type,
-                    move_id=prev.move_id,
-                    target_slot=prev.target_slot,
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta + delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=prev.move_failed,
-                    item_consumed=prev.item_consumed,
+                self.slots[slot] = self.slots[slot].copy_with(
+                    net_boost_delta=self.slots[slot].net_boost_delta + delta
                 )
 
         elif tag in ("-fail", "-miss", "-immune"):
             if self._last_attacker is not None:
-                prev = self.slots[self._last_attacker]
-                self.slots[self._last_attacker] = SpatialSlotRecord(
-                    action_type=prev.action_type,
-                    move_id=prev.move_id,
-                    target_slot=prev.target_slot,
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=1.0,
-                    item_consumed=prev.item_consumed,
-                )
+                att = self.slots[self._last_attacker]
+                self.slots[self._last_attacker] = att.copy_with(move_failed=1.0)
 
         elif tag in ("-enditem", "-item") and len(parts) >= 3:
             slot = _parse_slot_index(parts[2], self.player_role)
             if slot is not None:
-                prev = self.slots[slot]
-                self.slots[slot] = SpatialSlotRecord(
-                    action_type=prev.action_type,
-                    move_id=prev.move_id,
-                    target_slot=prev.target_slot,
-                    order_rank=prev.order_rank,
-                    hp_delta=prev.hp_delta,
-                    damage_dealt=prev.damage_dealt,
-                    net_boost_delta=prev.net_boost_delta,
-                    landed_crit=prev.landed_crit,
-                    took_crit=prev.took_crit,
-                    move_failed=prev.move_failed,
-                    item_consumed=1.0,
-                )
+                self.slots[slot] = self.slots[slot].copy_with(item_consumed=1.0)
 
     def to_records(self) -> tuple[SpatialSlotRecord, ...]:
         return tuple(self.slots)
@@ -358,6 +266,7 @@ __all__ = [
     "FLAG_LANDED_CRIT",
     "FLAG_MOVE_FAILED",
     "FLAG_TOOK_CRIT",
+    "MAX_BOOST_STAGES",
     "NUM_ACTION_TYPES",
     "NUM_TARGET_SLOTS",
     "SPATIAL_CATEGORICAL_WIDTH",

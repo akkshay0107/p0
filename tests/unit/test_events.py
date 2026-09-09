@@ -113,3 +113,39 @@ class TestEvents:
 
         recorder.apply_line(["", "-enditem", "p1a: Incineroar", "Sitrus Berry"], tokenizer)
         assert recorder.slots[0].item_consumed == 1.0
+
+    def test_spatial_turn_recorder_drag_cant_heal_and_copy_with(self) -> None:
+        """Verify drag, cant, -heal, and SpatialSlotRecord copy_with behavior."""
+        recorder = SpatialTurnRecorder(player_role="p1")
+
+        # Drag event
+        recorder.apply_line(
+            ["", "drag", "p2a: Rillaboom", "Rillaboom, L50, M", "100/100"], tokenizer
+        )
+        assert recorder.slots[2].action_type == int(SpatialActionType.SWITCH)
+
+        # Cant event
+        recorder.apply_line(["", "cant", "p1b: Ogerpon", "flinch"], tokenizer)
+        assert recorder.slots[1].action_type == int(SpatialActionType.CANT)
+
+        # Heal event
+        hp_map = {"p1a: Incineroar": 0.5}
+        recorder.apply_line(
+            ["", "-heal", "p1a: Incineroar", "75/100"], tokenizer, hp_for=lambda k: hp_map[k]
+        )
+        assert recorder.slots[0].hp_delta == pytest.approx(0.25)
+
+        # Move miss / fail
+        recorder.apply_line(
+            ["", "move", "p2a: Rillaboom", "Wood Hammer", "p1a: Incineroar"], tokenizer
+        )
+        recorder.apply_line(["", "-miss", "p1a: Incineroar"], tokenizer)
+        assert recorder.slots[2].move_failed == 1.0
+
+        # copy_with method
+        rec = recorder.slots[0]
+        rec2 = rec.copy_with(damage_dealt=1.5, landed_crit=1.0)
+        assert rec2.damage_dealt == 1.5
+        assert rec2.landed_crit == 1.0
+        assert rec2.hp_delta == rec.hp_delta
+        assert rec2.action_type == rec.action_type

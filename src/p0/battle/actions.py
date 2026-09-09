@@ -1,16 +1,15 @@
-"""Pure, allocation-light mapping for the 49-action doubles layout."""
+"""Action encoding and decoding for the 49-action doubles layout."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
 
-from p0.format_config import active_global_contract
+from p0.format_config import ACTION_CONTRACT
 
-_ACTION_CONTRACT = active_global_contract().payload("actions", "major")
-_RANGES = {entry["meaning"]: entry for entry in _ACTION_CONTRACT["ranges"]}
+_RANGES = {entry["meaning"]: entry for entry in ACTION_CONTRACT["ranges"]}
 
-ACT_SIZE = _ACTION_CONTRACT["action_count"]
+ACT_SIZE = ACTION_CONTRACT["action_count"]
 PASS_ACTION = _RANGES["pass"]["start"]
 SWITCH_START = _RANGES["switch"]["start"]
 SWITCH_END = _RANGES["switch"]["end"]
@@ -22,7 +21,8 @@ MEGA_FORCED_ACTION = _RANGES["mega_forced_move"]["start"]
 FORCED_ACTION = _RANGES["forced_move"]["start"]
 MOVE_SLOT_COUNT = _RANGES["move"]["move_slots"]
 TARGET_COUNT = len(_RANGES["move"]["targets"])
-TEAM_SIZE = _ACTION_CONTRACT["team_preview"]["roster_size"]
+TARGET_OFFSET = 2
+TEAM_SIZE = ACTION_CONTRACT["team_preview"]["roster_size"]
 
 
 class ActionKind(IntEnum):
@@ -34,7 +34,7 @@ class ActionKind(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class SlotAction:
-    """Semantic action used only at runtime/replay boundaries."""
+    """Action representation used at runtime and replay boundaries."""
 
     kind: ActionKind
     switch_slot: int = -1
@@ -44,7 +44,7 @@ class SlotAction:
 
 
 def decode_action(action: int) -> SlotAction:
-    """Translate one policy action ID into its semantic boundary value."""
+    """Decode an action ID into a SlotAction."""
     action = int(action)
 
     if action == PASS_ACTION:
@@ -63,7 +63,7 @@ def decode_action(action: int) -> SlotAction:
         return SlotAction(
             ActionKind.MOVE,
             move_slot=offset // TARGET_COUNT,
-            target=offset % TARGET_COUNT - 2,
+            target=offset % TARGET_COUNT - TARGET_OFFSET,
             mega=mega,
         )
 
@@ -74,7 +74,7 @@ def decode_action(action: int) -> SlotAction:
 
 
 def encode_action(action: SlotAction) -> int:
-    """Encode a semantic boundary action into a policy action ID."""
+    """Encode a SlotAction into an action ID."""
     if action.kind is ActionKind.PASS:
         return PASS_ACTION
 
@@ -91,14 +91,14 @@ def encode_action(action: SlotAction) -> int:
         if not 0 <= action.move_slot < MOVE_SLOT_COUNT:
             raise ValueError(f"Invalid move slot {action.move_slot}")
 
-        if not -2 <= action.target <= 2:
+        if not -TARGET_OFFSET <= action.target <= TARGET_OFFSET:
             raise ValueError(f"Invalid move target {action.target}")
 
         return (
             MOVE_START
             + action.move_slot * TARGET_COUNT
             + action.target
-            + 2
+            + TARGET_OFFSET
             + (MOVE_END - MOVE_START if action.mega else 0)
         )
 

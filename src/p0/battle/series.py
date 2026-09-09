@@ -1,12 +1,7 @@
-"""
-Identity for one player's state across the games of a Bo3 series.
+"""Series perspective identity.
 
-Series context itself is continuous, not symbolic: a completed game is
-summarized by compressing its per-decision local history tokens through
-DynamicSeriesResampler. Those tokens are a function of the current
-weights, so they are always produced in process and never persisted. This
-key is what behaviour cloning, self-play, and live play use to keep each
-canonical player's prior-game state apart while they do it.
+Identifies a player across games in a best-of-three series. Used by
+training and live play to track prior-game history separately for each player.
 """
 
 from __future__ import annotations

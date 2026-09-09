@@ -1,4 +1,4 @@
-"""Pure battle-domain values and transformations."""
+"""Battle representation, actions, legality, and event tracking."""
 
 from p0.battle.actions import ACT_SIZE, ActionKind, SlotAction, decode_action, encode_action
 from p0.battle.legality import DecisionView, SlotDecision, action_mask, legal_actions

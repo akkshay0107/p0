@@ -1,4 +1,4 @@
-"""Player-relative structural views consumed by pure battle services."""
+"""Battle, team, and Pokémon views used by the battle engine and observation builder."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from p0.battle.legality import DecisionView
 
 
 class NamedEffectView(Protocol):
-    """Enum-like protocol value (status, weather, field, volatile, type, ...)."""
+    """Protocol for named effects like weather, status, and field conditions."""
 
     @property
     def name(self) -> str: ...
@@ -127,7 +127,11 @@ class PokemonView(Protocol):
 
 
 class TransformedMoveView:
-    def __init__(self, base_move: MoveView):
+    """Move view for a transformed Pokemon with PP clamped to 5."""
+
+    __slots__ = ("_base",)
+
+    def __init__(self, base_move: MoveView) -> None:
         self._base = base_move
 
     @property
@@ -160,12 +164,16 @@ class TransformedMoveView:
 
 
 class TransformedPokemonView:
+    """Pokemon view overlay representing the target species while retaining user identity."""
+
+    __slots__ = ("_base", "_target", "_transformed_moves")
+
     def __init__(
         self,
         base: PokemonView,
         target: PokemonView,
         moves: Mapping[str, Any] | None = None,
-    ):
+    ) -> None:
         self._base = base
         self._target = target
         source_moves = moves if moves is not None else target.moves
@@ -175,7 +183,11 @@ class TransformedPokemonView:
         return hash(self._base)
 
     def __eq__(self, other: Any) -> bool:
-        return self._base == other or self is other
+        if self is other:
+            return True
+        if isinstance(other, TransformedPokemonView):
+            return self._base == other._base
+        return self._base == other
 
     @property
     def species(self) -> str | None:
@@ -372,7 +384,7 @@ class BattleView(FieldView, Protocol):
 
 @dataclass(slots=True)
 class FixtureBattleView:
-    """Small concrete view for replay reconstruction and pure tests."""
+    """Concrete battle view used in testing and replay reconstruction."""
 
     team: Mapping[str, Any]
     opponent_team: Mapping[str, Any]

@@ -12,7 +12,7 @@ from p0.battle.actions import (
     encode_team_pair,
     team_selection,
 )
-from p0.format_config import ACTION_CONTRACT
+from p0.format_config import ACTION_CONTRACT, FORMAT
 
 
 class TestActions:
@@ -22,6 +22,7 @@ class TestActions:
             range(ACT_SIZE)
         )
         assert ACTION_CONTRACT["action_count"] == ACT_SIZE
+        assert FORMAT.action_size == ACT_SIZE
         ranges = ACTION_CONTRACT["ranges"]
         assert [(entry["start"], entry["end"]) for entry in ranges] == [
             (0, 1),
