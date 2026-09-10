@@ -1,16 +1,4 @@
-"""
-Compiled tensor-shard artifact contract for streaming behaviour cloning.
-
-This module owns the derived-tensor layer: bounded shard files holding stacked
-observations at the active OBSERVATION_SCHEMA_VERSION and label tensors for
-whole chronological games, plus the manifest and index that tie a compiled
-corpus to one runtime contract. It may import torch and the observation
-schema; p0.replays.schema must stay torch-free, and nothing here may import
-p0.runtime.
-
-Compilation and dataset behavior live elsewhere; this module only defines
-the layout and validates manifests before any tensor payload is consumed.
-"""
+"""Tensor shard format, schema definitions, and manifest validation for replay datasets."""
 
 from __future__ import annotations
 

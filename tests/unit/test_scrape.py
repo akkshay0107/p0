@@ -6,22 +6,16 @@ import json
 from pathlib import Path
 
 import pytest
-import torch
 
 from p0.battle.legality import DecisionView, SlotDecision
-from p0.format_config import (
-    FORMAT,
-    load_runtime_manifest,
-)
+from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.paths import DEFAULT_PATHS
 from p0.replays.compile import (
     CompilationResult,
-    ShardBuildResult,
     compile_payloads,
     compile_to_shards,
-    write_tensor_shards,
 )
 from p0.replays.dataset import (
     LazyReplayDataset,
@@ -29,72 +23,17 @@ from p0.replays.dataset import (
 )
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.protocol import ReplayInputContractError, parse_replay_payload
-from p0.replays.schema import (
-    ActionEvidence,
-    GroupingMethod,
-    LabelKind,
-    MaskProvenance,
-    SeriesRecord,
-)
+from p0.replays.schema import LabelKind
 from p0.replays.scrape import (
     HttpResponse,
     ReplayFetcher,
+    ReplayFetchError,
+    ReplayUnavailableError,
     ScrapeConfig,
     load_raw_replay,
+    read_fetch_index,
 )
-from p0.replays.shards import (
-    ShardIndexEntry,
-    ShardManifest,
-)
-from tests.unit.replay_fixtures import golden_replay_payload, sample_replay_payload
-
-
-def _write_dataset_replay_dataset(
-    tmp_path: Path, payloads: tuple[dict[str, object], ...]
-) -> ShardBuildResult:
-    result = compile_payloads(payloads)
-    return write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
-
-
-def torch_summaries(built) -> list[dict[str, object]]:
-    payload_path = built.manifest_path.parent / built.manifest.shards[0].filename
-    payload = torch.load(payload_path, weights_only=True, map_location="cpu")
-    return payload["series_summaries"]
-
-
-def _build_dataset_from_payloads(tmp_path, payloads):
-    result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
-    return write_tensor_shards(
-        result,
-        tmp_path / "dataset",
-        max_decisions_per_shard=1,
-        created_at="2026-01-01T00:00:00Z",
-    )
-
-
-def _build_dataset(tmp_path, count: int):
-    payloads = tuple(
-        golden_replay_payload(f"dataset-{index}", series_id=f"dataset-series-{index}")
-        for index in range(count)
-    )
-    return _build_dataset_from_payloads(tmp_path, payloads)
-
-
-def _payload_with_ots_natures(replay_id: str) -> dict[str, object]:
-    """A pipeline payload whose open team sheets declare natures, as real replays do."""
-    natures = {"Pikachu": "Jolly", "Eevee": "Adamant", "Bulbasaur": "Bold", "Charmander": "Timid"}
-    payload = sample_replay_payload(replay_id)
-    lines = []
-    for line in str(payload["log"]).splitlines():
-        if line.startswith("|showteam|"):
-            head, _, body = line.rpartition("|")
-            roster = json.loads(body)
-            for mon in roster:
-                mon["nature"] = natures.get(mon["species"], "Serious")
-            line = f"{head}|{json.dumps(roster, separators=(',', ':'))}"
-        lines.append(line)
-    payload["log"] = "\n".join(lines)
-    return payload
+from tests.unit.replay_fixtures import payload_with_ots_natures, sample_replay_payload
 
 
 def _numerical_rows(result: CompilationResult) -> list[tuple[float, ...]]:
@@ -110,68 +49,14 @@ def _numerical_rows(result: CompilationResult) -> list[tuple[float, ...]]:
     return rows
 
 
-def _evidence(kind: LabelKind) -> ActionEvidence:
-    candidates = {
-        LabelKind.EXACT: ((7, 1),),
-        LabelKind.PARTIAL: ((7, 1), (8, 1)),
-        LabelKind.UNKNOWN: (),
-    }[kind]
-    return ActionEvidence(
-        label_kind=kind,
-        candidates=candidates,
-        confidence=0.5 if kind is not LabelKind.UNKNOWN else 0.0,
-        mask_provenance=MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
-        tags=("fixture",),
-    )
-
-
-def _series_record() -> SeriesRecord:
-    return SeriesRecord(
-        series_id="s1",
-        format_id="gen9championsvgc2026regmbbo3",
-        players=("alice", "bob"),
-        game_replay_ids=("r1", "r2"),
-        game_player_roles=((0, 1), (1, 0)),
-        team_hashes=("a" * 64, "b" * 64),
-        is_complete=True,
-        score=(2, 0),
-        grouping_method=GroupingMethod.PARENT_ROOM,
-        grouping_confidence=1.0,
-    )
-
-
-def _shard_manifest_fixture_unit() -> ShardManifest:
-    active_contract = load_runtime_manifest().global_sha256
-    entry = ShardIndexEntry(
-        filename="shard-000.pt", sha256="c" * 64, decisions=10, games=2, series=1, byte_size=1024
-    )
-    return ShardManifest(
-        global_contract_sha256=active_contract,
-        shards=(entry,),
-        diagnostics={"oov_ids": 0},
-        created_at="2026-07-17T00:00:00Z",
-        dataset_hash="d" * 64,
-        source_format_id="gen9championsvgc2026regmbbo3",
-        build_config={"max_candidates": 256},
-        raw_replays={"game-1": "f" * 64},
-        source_series={"series-1": ("game-1",)},
-        source_games=1,
-        accepted_games=1,
-        rejected_games=0,
-        artifact_hashes={
-            "shard-000.pt": "c" * 64,
-        },
-    )
-
-
 class TestReplayScraping:
     def test_replay_stat_imputation_is_consistent_with_runtime_dex(self) -> None:
         """Verify explicit replay stat estimates are stable when the runtime dex is passed explicitly."""
         dex = json.loads(
             (DEFAULT_PATHS.data_root / "champions_dex.json").read_text(encoding="utf-8")
         )
-        without = compile_payloads((_payload_with_ots_natures("metrics-off"),))
-        with_dex = compile_payloads((_payload_with_ots_natures("metrics-on"),), dex=dex)
+        without = compile_payloads((payload_with_ots_natures("metrics-off"),))
+        with_dex = compile_payloads((payload_with_ots_natures("metrics-on"),), dex=dex)
 
         assert _numerical_rows(without) == _numerical_rows(with_dex)
 
@@ -193,7 +78,7 @@ class TestReplayScraping:
         dex = json.loads(
             (DEFAULT_PATHS.data_root / "champions_dex.json").read_text(encoding="utf-8")
         )
-        result = compile_payloads((_payload_with_ots_natures("own-side"),), dex=dex)
+        result = compile_payloads((payload_with_ots_natures("own-side"),), dex=dex)
         assert result.games
 
         # Estimates cover every stable roster member, and both projected sides retain
@@ -389,3 +274,76 @@ class TestReplayScraping:
         )
 
         assert set(manifest.assignments.values()) == {"train", "validation", "test"}
+
+    def test_replay_fetcher_filters_discovery_and_rejects_unsafe_cache_ids(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify ReplayFetcher filters duplicate discovery IDs and prevents directory traversal attacks in cache paths."""
+        config = ScrapeConfig(
+            format_id="gen9stress",
+            cache_dir=tmp_path,
+            page_size=3,
+            max_pages=3,
+            retries=1,
+            rate_limit_per_second=0,
+        )
+
+        def transport(url: str, timeout: float) -> HttpResponse:
+            del timeout
+            if "page=1" in url:
+                body = json.dumps(
+                    [
+                        {"id": "gen9stress-2", "format": "gen9stress"},
+                        {"id": "other-1", "format": "other"},
+                        {"id": "gen9stress-2", "format": "gen9stress"},
+                    ]
+                ).encode()
+                return HttpResponse(200, body)
+            return HttpResponse(200, b"[]")
+
+        fetcher = ReplayFetcher(config, transport=transport)
+        assert fetcher.discover_ids() == ("gen9stress-2",)
+        with pytest.raises(ReplayFetchError, match="unsafe path"):
+            fetcher.acquire(("../escape",))
+
+    @pytest.mark.parametrize(
+        "status, error", ((404, ReplayUnavailableError), (429, ReplayFetchError))
+    )
+    def test_replay_fetcher_handles_http_error_matrix(
+        self, tmp_path: Path, status: int, error: type[Exception]
+    ) -> None:
+        """Verify ReplayFetcher distinguishes 404 Not Found from retryable errors (429/500/503)."""
+        config = ScrapeConfig(
+            format_id="gen9stress", cache_dir=tmp_path, retries=1, backoff_seconds=0
+        )
+
+        def transport(url: str, timeout: float) -> HttpResponse:
+            del url, timeout
+            return HttpResponse(status, b"missing")
+
+        fetcher = ReplayFetcher(config, transport=transport)
+        if status == 404:
+            assert fetcher.acquire(("gen9stress-missing",)) == ()
+        else:
+            with pytest.raises(error):
+                fetcher.acquire(("gen9stress-missing",))
+
+    def test_replay_fetcher_recovers_corrupt_raw_cache_and_rejects_bad_index(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify ReplayFetcher re-fetches when disk cache is corrupted and read_fetch_index validates JSONL schema."""
+        config = ScrapeConfig(format_id="gen9stress", cache_dir=tmp_path, retries=1)
+
+        def transport(url: str, timeout: float) -> HttpResponse:
+            del timeout
+            replay_id = url.rsplit("/", 1)[-1].removesuffix(".json")
+            return HttpResponse(200, json.dumps({"log": [f"|turn|{replay_id}"]}).encode())
+
+        fetcher = ReplayFetcher(config, transport=transport)
+        raw = tmp_path / config.format_id / "raw" / "gen9stress-1.json.gz"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b"not gzip")
+        assert fetcher.acquire(("gen9stress-1",))
+        fetcher.index_path.write_bytes(b"not-json\n")
+        with pytest.raises((ValueError, ReplayFetchError)):
+            read_fetch_index(fetcher.index_path)

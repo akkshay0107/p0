@@ -1,4 +1,4 @@
-"""Fail-closed validation gates for releasing reconstructed replay corpora."""
+"""Quality gates for publishing compiled replay datasets."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from p0.replays.schema import LabelKind
 
@@ -21,7 +22,7 @@ class ReleaseGateStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ReleaseGateReport:
-    """Machine-readable release decision and the evidence behind it."""
+    """Release gate status and check results."""
 
     status: ReleaseGateStatus
     checks: Mapping[str, bool]
@@ -31,9 +32,18 @@ class ReleaseGateReport:
     def releasable(self) -> bool:
         return self.status is ReleaseGateStatus.PASSED
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert report to JSON-serializable dictionary."""
+        return {
+            "status": self.status.value,
+            "releasable": self.releasable,
+            "checks": dict(self.checks),
+            "reasons": list(self.reasons),
+        }
+
 
 def validate_rejection_categories(categories: Iterable[str]) -> tuple[str, ...]:
-    """Reject generic or unknown reconstruction failure buckets."""
+    """Validate that all rejection reasons are recognized."""
     allowed = {"UNSUPPORTED_EVENT", "AMBIGUOUS_IDENTITY", "INVALID_INPUT_CONTRACT"}
     invalid = tuple(sorted(set(categories) - allowed))
     if invalid:
@@ -46,7 +56,7 @@ def run_pinned_showdown_oracle(
     repository_root: str | Path,
     timeout_seconds: float = 10.0,
 ) -> tuple[str, ...]:
-    """Run the real local BattleStream oracle after checking its exact commit."""
+    """Run the local Showdown BattleStream reference check."""
     root = Path(repository_root)
     showdown_root = root / "pokemon-showdown"
     try:
@@ -84,7 +94,7 @@ def evaluate_release_gates(
     sensitivity_data_configured: bool = False,
     sensitivity_evaluation_unchanged: bool = False,
 ) -> ReleaseGateReport:
-    """Evaluate corpus gates, keeping sensitivity unmet without configured data."""
+    """Evaluate dataset quality gates against rejection reasons and label masks."""
     categories = validate_rejection_categories(rejection_categories)
     kinds = tuple(label_kinds)
     masks = tuple(float(mask) for mask in loss_masks)

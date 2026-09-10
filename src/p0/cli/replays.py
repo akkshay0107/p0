@@ -9,6 +9,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, FORMAT
 from p0.paths import DEFAULT_PATHS
 from p0.replays.compile import compile_to_shards
@@ -140,7 +142,7 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
     # corpus rather than as an error.
     if not args.dex.is_file():
         raise FileNotFoundError(f"Champions dex not found: {args.dex}")
-    dex = json.loads(args.dex.read_text(encoding="utf-8"))
+    dex = orjson.loads(args.dex.read_bytes())
 
     built = compile_to_shards(
         documents=documents,
@@ -164,6 +166,7 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
         "rejected_games": manifest.rejected_games,
         "source_series": len(manifest.source_series),
         "parse_errors": parse_errors,
+        "release_gate": built.gate_report.to_dict() if built.gate_report is not None else None,
     }
 
 

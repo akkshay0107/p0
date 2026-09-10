@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
+import torch
+
 from p0.format_config import FORMAT
+from p0.replays.compile import ShardBuildResult, compile_payloads, write_tensor_shards
 
 
 def golden_series_id(parent: str) -> str:
@@ -163,5 +167,62 @@ def decision_payload() -> dict[str, Any]:
             for species in teams[side]
         ]
         lines[index] = f"|showteam|{side}|{json.dumps(entries, separators=(',', ':'))}"
+    payload["log"] = "\n".join(lines)
+    return payload
+
+
+def torch_summaries(built: ShardBuildResult) -> list[dict[str, Any]]:
+    """Return the series summaries from the first shard file of a built dataset."""
+    payload_path = built.manifest_path.parent / built.manifest.shards[0].filename
+    payload = torch.load(payload_path, weights_only=True, map_location="cpu")
+    return payload["series_summaries"]
+
+
+def build_dataset_from_payloads(
+    tmp_path: Path,
+    payloads: tuple[dict[str, Any], ...],
+    max_decisions_per_shard: int = 1,
+) -> ShardBuildResult:
+    """Compile payloads and write shards to a temporary directory."""
+    result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
+    return write_tensor_shards(
+        result,
+        tmp_path / "dataset",
+        max_decisions_per_shard=max_decisions_per_shard,
+        created_at="2026-01-01T00:00:00Z",
+    )
+
+
+def build_dataset(tmp_path: Path, count: int) -> ShardBuildResult:
+    """Build a dataset of golden replays for shard testing."""
+    payloads = tuple(
+        golden_replay_payload(f"dataset-{index}", series_id=f"dataset-series-{index}")
+        for index in range(count)
+    )
+    return build_dataset_from_payloads(tmp_path, payloads)
+
+
+def write_dataset_replay_dataset(
+    tmp_path: Path,
+    payloads: tuple[dict[str, Any], ...],
+) -> ShardBuildResult:
+    """Compile and write shards from payloads with fixed timestamp."""
+    result = compile_payloads(payloads)
+    return write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
+
+
+def payload_with_ots_natures(replay_id: str) -> dict[str, Any]:
+    """A replay payload whose open team sheets declare natures."""
+    natures = {"Pikachu": "Jolly", "Eevee": "Adamant", "Bulbasaur": "Bold", "Charmander": "Timid"}
+    payload = sample_replay_payload(replay_id)
+    lines = []
+    for line in str(payload["log"]).splitlines():
+        if line.startswith("|showteam|"):
+            head, _, body = line.rpartition("|")
+            roster = json.loads(body)
+            for mon in roster:
+                mon["nature"] = natures.get(mon["species"], "Serious")
+            line = f"{head}|{json.dumps(roster, separators=(',', ':'))}"
+        lines.append(line)
     payload["log"] = "\n".join(lines)
     return payload

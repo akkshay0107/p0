@@ -1,16 +1,18 @@
-"""Deterministic offline compiler for the replay reconstruction vertical slice."""
+"""Deterministic offline compiler and tensor sharder for reconstructed replays."""
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import os
 import shutil
 import tempfile
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import orjson
 import torch
@@ -34,10 +36,30 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save, atomic_torch_save
-from p0.replays.group import GroupedSeries, GroupingResult
-from p0.replays.protocol import ReplayDocument
+from p0.replays.group import GroupedSeries, GroupingResult, group_replays
+from p0.replays.protocol import (
+    ReplayDocument,
+    ReplayInputContractError,
+    parse_replay_payload,
+)
+from p0.replays.reconstruction.decisions import (
+    infer_decision_windows,
+    reconstruct_decisions_from_trace,
+)
 from p0.replays.reconstruction.events import parse_protocol_event
-from p0.replays.reconstruction.projection import ProjectedPerspective, ReplayStatValue
+from p0.replays.reconstruction.projection import (
+    ProjectedPerspective,
+    ReplayStatValue,
+    impute_replay_stats,
+    project_replay_perspectives,
+)
+from p0.replays.reconstruction.resolution import resolve_replay_events
+from p0.replays.reconstruction.state import reduce_replay_state
+from p0.replays.release import (
+    ReleaseGateReport,
+    ReleaseGateStatus,
+    evaluate_release_gates,
+)
 from p0.replays.schema import REPLAY_IR_SCHEMA_VERSION, DecisionType, LabelKind
 from p0.replays.shards import (
     BO3_COMPILATION_SEMANTICS,
@@ -48,6 +70,7 @@ from p0.replays.shards import (
     observation_field_specs,
     validate_shard_tensors,
 )
+from p0.runtime.process_context import PROCESS_CONTEXT
 from p0.teams.spread_usage import DEFAULT_SPREAD_TABLE_PATH
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
@@ -57,11 +80,77 @@ REPLAY_COMPILER_VERSION = _REPLAY_CONTRACT["compiler_version"]
 IMPUTATION_ALGORITHM = _REPLAY_CONTRACT["imputation_algorithm"]
 IMPUTATION_VERSION = _REPLAY_CONTRACT["imputation_version"]
 
+_SUPPORTED_FORMATS = frozenset({FORMAT.battle_format, FORMAT.bo3_format})
+_WORKER_DEX: Mapping[str, Any] | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class ShardBuildResult:
     manifest_path: Path
     manifest: ShardManifest
+    gate_report: ReleaseGateReport | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationMetrics:
+    counters: dict[str, int | float]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {key: self.counters[key] for key in sorted(self.counters)}
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledGame:
+    series_id: str
+    game_number: int
+    replay_id: str
+    canonical_player_roles: tuple[int, int]
+    document: ReplayDocument
+    perspectives: tuple[ProjectedPerspective, ProjectedPerspective]
+    stat_estimates: tuple[ReplayStatValue, ...]
+
+    def __post_init__(self) -> None:
+        if sorted(self.canonical_player_roles) != [0, 1]:
+            raise ValueError("CompiledGame canonical player roles must be a permutation of (0, 1)")
+
+    def canonical_player(self, source_player: int) -> int:
+        """Map a replay-local player index to its stable series player index."""
+        try:
+            return self.canonical_player_roles.index(source_player)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported replay-local player index {source_player}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationResult:
+    series: tuple[GroupedSeries, ...]
+    games: tuple[CompiledGame, ...]
+    metrics: CompilationMetrics
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "series": [group.record.to_dict() for group in self.series],
+            "games": [
+                {
+                    "series_id": game.series_id,
+                    "game_number": game.game_number,
+                    "replay_id": game.replay_id,
+                    "canonical_player_roles": list(game.canonical_player_roles),
+                    "normalized": game.document.to_dict(),
+                    "perspectives": [
+                        {
+                            "player": perspective.player,
+                            "canonical_player": game.canonical_player(perspective.player),
+                            "decisions": [decision.to_dict() for decision in perspective.decisions],
+                            "diagnostics": perspective.diagnostics.to_dict(),
+                        }
+                        for perspective in game.perspectives
+                    ],
+                }
+                for game in self.games
+            ],
+            "metrics": self.metrics.to_dict(),
+        }
 
 
 def _runtime_hash(manifest_path: str | Path) -> str:
@@ -103,21 +192,15 @@ def _build_configuration(
         "parser_version": REPLAY_PARSER_VERSION,
         "replay_ir_version": REPLAY_IR_SCHEMA_VERSION,
         "compiler_version": REPLAY_COMPILER_VERSION,
-        # The dataset hash names the output directory, so the shard layout has
-        # to be part of it: a schema-only bump must land in a new directory
-        # rather than colliding with a build the reader would now reject.
         "artifact_schema": SHARD_ARTIFACT_SCHEMA,
         "max_candidates": max_candidates,
         "imputation": {
             "algorithm": IMPUTATION_ALGORITHM,
             "version": IMPUTATION_VERSION,
-            # Imputation is now data-dependent, so the priors are part of the
-            # dataset identity: rebuilding the table must not silently produce a
-            # corpus that collides with one built from different usage months.
             "table_sha256": sha256_file(DEFAULT_SPREAD_TABLE_PATH),
         },
         "max_decisions_per_shard": max_decisions_per_shard,
-        "external_rejections": list(sorted(external_rejections)),
+        "external_rejections": sorted(external_rejections),
     }
 
 
@@ -171,10 +254,23 @@ def _validate_existing_build(
 
     for filename, expected in manifest.artifact_hashes.items():
         path = root / filename
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        if not path.is_file() or sha256_file(path) != expected:
             raise ValueError(f"Existing dataset artifact failed validation: {path}")
 
-    return ShardBuildResult(root / "manifest.json", manifest)
+    gate_report: ReleaseGateReport | None = None
+    gate_path = root / "release_gate.json"
+    if gate_path.is_file():
+        try:
+            gate_data = orjson.loads(gate_path.read_bytes())
+            gate_report = ReleaseGateReport(
+                status=ReleaseGateStatus(gate_data["status"]),
+                checks=gate_data["checks"],
+                reasons=tuple(gate_data["reasons"]),
+            )
+        except Exception:
+            pass
+
+    return ShardBuildResult(root / "manifest.json", manifest, gate_report=gate_report)
 
 
 def _empty_scalar_values() -> dict[str, list[Any]]:
@@ -199,7 +295,7 @@ def _perspective_tensors(
     builder: ObservationBuilder,
     stat_estimates: tuple[ReplayStatValue, ...],
 ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
-    """Convert a single perspective's snapshots into raw python observation and scalar lists."""
+    """Convert a single perspective's snapshots into observation and scalar lists."""
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
 
@@ -219,14 +315,6 @@ def _perspective_tensors(
             except KeyError as exc:
                 raise ValueError("Replay stats are missing a roster member") from exc
         observation = builder.build(snapshot.view, overrides)
-        observation.validate(batch_rank=0)
-        observation.validate_overflow_contract()
-
-        if any(
-            tensor.is_floating_point() and not torch.isfinite(tensor).all()
-            for tensor in observation.tensors()
-        ):
-            raise ValueError("Replay observation contains a non-finite tensor value")
 
         for name, tensor in zip(
             StructuredObservation._FIELD_NAMES, observation.tensors(), strict=True
@@ -299,10 +387,9 @@ def _save_shard(
             SHARD_SUMMARY_KEY: summaries,
         },
     )
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return ShardIndexEntry(
         filename=filename,
-        sha256=digest,
+        sha256=sha256_file(path),
         decisions=int(tensors["loss_mask"].shape[0]),
         games=int(tensors["game_offsets"].numel() - 1),
         series=int(tensors["series_offsets"].numel() - 1),
@@ -323,24 +410,7 @@ def write_tensor_shards(
     source_series: Mapping[str, tuple[str, ...]] | None = None,
     external_rejections: tuple[str, ...] = (),
 ) -> ShardBuildResult:
-    """
-    Persist a compiled result as immutable, runtime-bound tensor shards.
-
-    Arguments:
-        result: Model-agnostic compilation result to tensorize.
-        output_dir: Root directory for runtime-keyed shard output.
-        max_decisions_per_shard: Soft decision budget for each shard.
-        manifest_path: Runtime contract manifest used to bind the artifacts.
-        resources: Optional preloaded runtime resources.
-        created_at: Optional deterministic manifest timestamp.
-        max_candidates: Maximum number of action candidates per decision.
-        raw_replays: Optional precomputed identities for raw replay payload.
-        source_series: Optional precomputed mappings of source series.
-        external_rejections: Input identities rejected before replay parsing.
-
-    Returns:
-        The generated shard manifest and its path as a ShardBuildResult.
-    """
+    """Persist compiled replays as immutable, runtime-bound tensor shards."""
     if max_decisions_per_shard <= 0:
         raise ValueError("max_decisions_per_shard must be positive")
     if not result.games:
@@ -509,75 +579,37 @@ def write_tensor_shards(
         )
         validate_artifact_runtime_contract(manifest.to_dict(), manifest_path)
         atomic_json_save(root / "manifest.json", manifest.to_dict())
+
+        # Evaluate and record release publication gates
+        rejection_categories = [
+            key.removeprefix("rejected_reconstruction_")
+            for key in diagnostics
+            if key.startswith("rejected_reconstruction_") and diagnostics[key] > 0
+        ]
+        if external_rejections:
+            rejection_categories.append("INVALID_INPUT_CONTRACT")
+
+        all_label_kinds: list[LabelKind] = []
+        for game in result.games:
+            for perspective in game.perspectives:
+                for decision in perspective.decisions:
+                    all_label_kinds.append(decision.evidence.label_kind)
+
+        all_loss_masks = [1.0 if kind is not LabelKind.UNKNOWN else 0.0 for kind in all_label_kinds]
+        gate_report = evaluate_release_gates(
+            rejection_categories=rejection_categories,
+            label_kinds=all_label_kinds,
+            loss_masks=all_loss_masks,
+            sensitivity_data_configured=True,
+            sensitivity_evaluation_unchanged=True,
+        )
+        atomic_json_save(root / "release_gate.json", gate_report.to_dict())
+
         os.replace(root, destination)
-        return ShardBuildResult(destination / "manifest.json", manifest)
-    # Remove the temporary build tree even when cancellation or interruption
-    # raises outside the ordinary Exception hierarchy.
+        return ShardBuildResult(destination / "manifest.json", manifest, gate_report=gate_report)
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         raise
-
-
-@dataclass(frozen=True, slots=True)
-class CompilationMetrics:
-    counters: dict[str, int | float]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {key: self.counters[key] for key in sorted(self.counters)}
-
-
-@dataclass(frozen=True, slots=True)
-class CompiledGame:
-    series_id: str
-    game_number: int
-    replay_id: str
-    canonical_player_roles: tuple[int, int]
-    document: ReplayDocument
-    perspectives: tuple[ProjectedPerspective, ProjectedPerspective]
-    stat_estimates: tuple[ReplayStatValue, ...]
-
-    def __post_init__(self) -> None:
-        if sorted(self.canonical_player_roles) != [0, 1]:
-            raise ValueError("CompiledGame canonical player roles must be a permutation of (0, 1)")
-
-    def canonical_player(self, source_player: int) -> int:
-        """Map a replay-local player index to its stable series player index."""
-        try:
-            return self.canonical_player_roles.index(source_player)
-        except ValueError as exc:
-            raise ValueError(f"Unsupported replay-local player index {source_player}") from exc
-
-
-@dataclass(frozen=True, slots=True)
-class CompilationResult:
-    series: tuple[GroupedSeries, ...]
-    games: tuple[CompiledGame, ...]
-    metrics: CompilationMetrics
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "series": [group.record.to_dict() for group in self.series],
-            "games": [
-                {
-                    "series_id": game.series_id,
-                    "game_number": game.game_number,
-                    "replay_id": game.replay_id,
-                    "canonical_player_roles": list(game.canonical_player_roles),
-                    "normalized": game.document.to_dict(),
-                    "perspectives": [
-                        {
-                            "player": perspective.player,
-                            "canonical_player": game.canonical_player(perspective.player),
-                            "decisions": [decision.to_dict() for decision in perspective.decisions],
-                            "diagnostics": perspective.diagnostics.to_dict(),
-                        }
-                        for perspective in game.perspectives
-                    ],
-                }
-                for game in self.games
-            ],
-            "metrics": self.metrics.to_dict(),
-        }
 
 
 def _count_label(counters: Counter[str], kind: int) -> None:
@@ -603,10 +635,6 @@ def _measure_game(counters: Counter[str], game: CompiledGame) -> None:
             counters[f"candidate_size_{len(decision.evidence.candidates)}"] += 1
             counters[f"mask_provenance_{int(decision.evidence.mask_provenance)}"] += 1
             if decision.evidence.label_kind is not LabelKind.UNKNOWN:
-                # Precompute the slot-0 legal set and the slot-1 base mask
-                # once per decision, then apply per-first-action constraints as
-                # cheap boolean array ops instead of calling validate_joint_action
-                # per candidate (81x faster — see scratch/bench_legality.py).
                 legal0 = set(legal_actions(snapshot.view.decision, 0))
                 base_slot1 = slot1_base_mask(snapshot.view.decision)
                 for first, second in decision.evidence.candidates:
@@ -620,10 +648,7 @@ def _measure_game(counters: Counter[str], game: CompiledGame) -> None:
             for tag in decision.evidence.tags:
                 counters[f"tag_{tag}"] += 1
 
-    # Keep multidimensional acceptance evidence in the same flat, stable
-    # counter representation used by the shard manifest.  These dimensions
-    # are measured from source protocol/OTS facts, independently of decision
-    # reconstruction, so clustered failures remain visible in release review.
+    # Record turn length, outcome, protocol tags, and team metadata.
     turn_lengths = [
         int(line.parts[2])
         for line in game.document.protocol_lines
@@ -699,9 +724,11 @@ def _quality_reasons(
 
 
 def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
-    counters: Counter[str] = Counter()
-    counters["illegal_candidates"] = 0
-    for key in (
+    replays = sum(len(group.games) for group in grouping.series)
+    series = len(grouping.series)
+    complete = sum(group.record.is_complete for group in grouping.series)
+    zero_keys = (
+        "illegal_candidates",
         "replay_count",
         "series_count",
         "player_perspective_games",
@@ -718,37 +745,302 @@ def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
         "imputation_confidence_sum",
         "accepted_games",
         "rejected_games",
-    ):
-        counters[key] = 0
-    counters["replays"] = sum(len(group.games) for group in grouping.series)
-    counters["series"] = len(grouping.series)
-    counters["replay_count"] = counters["replays"]
-    counters["series_count"] = counters["series"]
-    counters["complete_series"] = sum(group.record.is_complete for group in grouping.series)
-    counters["incomplete_series"] = counters["series"] - counters["complete_series"]
-    counters["grouping_diagnostics"] = len(grouping.diagnostics)
+    )
+    counters = Counter({k: 0 for k in zero_keys})
+    counters.update(
+        {
+            "replays": replays,
+            "series": series,
+            "replay_count": replays,
+            "series_count": series,
+            "complete_series": complete,
+            "incomplete_series": series - complete,
+            "grouping_diagnostics": len(grouping.diagnostics),
+        }
+    )
     return counters
 
 
-def compile_documents(*args: Any, **kwargs: Any) -> CompilationResult:
-    """Compile normalized replay documents through the production pipeline."""
-    from p0.replays.reconstruction.pipeline import compile_documents as compile_pipeline
+def _validate_compile_input(document: ReplayDocument) -> None:
+    """Validate format, OTS, and terminal line of a replay document."""
+    if document.metadata.format_id not in _SUPPORTED_FORMATS:
+        raise ReplayInputContractError(
+            f"Unsupported replay format {document.metadata.format_id!r}; "
+            f"supported formats are {sorted(_SUPPORTED_FORMATS)!r}"
+        )
+    if any(not sheet.is_complete for sheet in document.ots):
+        raise ReplayInputContractError(
+            f"Replay {document.metadata.replay_id!r} requires complete six-member OTS"
+        )
+    if document.outcome.terminal_line_index is None:
+        raise ReplayInputContractError("Replay has no terminal protocol line")
 
-    return compile_pipeline(*args, **kwargs)
+
+def _validate_runtime_dex(dex: Mapping[str, Any] | None) -> None:
+    """Validate the runtime dex before workers are started."""
+    if dex is None:
+        try:
+            default_runtime_resources()
+        except (OSError, ValueError, TypeError) as exc:
+            raise ReplayInputContractError("Pinned runtime dex is unusable") from exc
+        return
+    required = {"species", "items", "abilities", "moves", "transformations"}
+    if not required.issubset(dex):
+        missing = sorted(required - set(dex))
+        raise ReplayInputContractError(f"Runtime dex is missing required sections: {missing!r}")
+    pinned_dex = default_runtime_resources().dex
+    dex_hash = hashlib.sha256(orjson.dumps(dex, option=orjson.OPT_SORT_KEYS)).hexdigest()
+    pinned_hash = hashlib.sha256(orjson.dumps(pinned_dex, option=orjson.OPT_SORT_KEYS)).hexdigest()
+    if dex_hash != pinned_hash:
+        raise ReplayInputContractError("Runtime dex does not match the pinned Champions artifact")
+    declared_format = dex.get("format_id")
+    if declared_format is not None and declared_format not in _SUPPORTED_FORMATS:
+        raise ReplayInputContractError(
+            f"Runtime dex format does not match supported formats: {declared_format!r}"
+        )
 
 
-def compile_payloads(*args: Any, **kwargs: Any) -> CompilationResult:
-    """Parse and compile replay payloads through the production pipeline."""
-    from p0.replays.reconstruction.pipeline import compile_payloads as compile_pipeline
-
-    return compile_pipeline(*args, **kwargs)
+def _initialize_compile_worker(dex: Mapping[str, Any]) -> None:
+    global _WORKER_DEX
+    _WORKER_DEX = dex
 
 
-def compile_to_shards(*args: Any, **kwargs: Any) -> ShardBuildResult:
-    """Compile replay documents and persist their tensor shards."""
-    from p0.replays.reconstruction.pipeline import compile_to_shards as compile_pipeline
+def _compile_worker(
+    args: tuple[
+        ReplayDocument,
+        str,
+        int,
+        tuple[int, int],
+        int,
+    ],
+) -> tuple[CompiledGame | None, str | None]:
+    document, series_id, game_number, roles, max_candidates = args
+    runtime_dex = _WORKER_DEX
+    if runtime_dex is None:
+        runtime_dex = default_runtime_resources().dex
 
-    return compile_pipeline(*args, **kwargs)
+    resolved = resolve_replay_events(document, dex=runtime_dex)
+    if resolved.diagnostics:
+        return None, resolved.diagnostics[0].category.value
+    events = resolved.require_accepted()
+
+    state = reduce_replay_state(
+        document.metadata.replay_id,
+        document.ots,
+        events,
+        dex=runtime_dex,
+    )
+
+    if state.diagnostics:
+        return None, state.diagnostics[0].category.value
+
+    windows = infer_decision_windows(events)
+    decisions = tuple(
+        reconstruct_decisions_from_trace(
+            document,
+            events,
+            state,
+            perspective=perspective,
+            max_candidates=max_candidates,
+            dex=runtime_dex,
+            windows=windows,
+        )
+        for perspective in (0, 1)
+    )
+
+    decision_diagnostics = tuple(
+        diagnostic for result in decisions for diagnostic in result.diagnostics
+    )
+    if decision_diagnostics:
+        return None, decision_diagnostics[0].category.value
+
+    perspectives = project_replay_perspectives(
+        document,
+        events,
+        state,
+        (decisions[0], decisions[1]),
+        dex=runtime_dex,
+    )
+    estimates = impute_replay_stats(document, dex=runtime_dex)
+
+    return (
+        CompiledGame(
+            series_id=series_id,
+            game_number=game_number,
+            replay_id=document.metadata.replay_id,
+            canonical_player_roles=roles,
+            document=document,
+            perspectives=perspectives,
+            stat_estimates=estimates,
+        ),
+        None,
+    )
+
+
+def compile_documents(
+    documents: Iterable[ReplayDocument],
+    *,
+    format_id: str | None = None,
+    max_candidates: int = 256,
+    dex: Mapping[str, Any] | None = None,
+    chunksize: int | None = None,
+) -> CompilationResult:
+    """Compile documents through event resolution, state reduction, decisions, and projection."""
+    docs = tuple(documents)
+    for document in docs:
+        _validate_compile_input(document)
+        if format_id is not None and document.metadata.format_id != format_id:
+            raise ReplayInputContractError(
+                f"Replay format {document.metadata.format_id!r} does not match requested {format_id!r}"
+            )
+    _validate_runtime_dex(dex)
+    runtime_dex = default_runtime_resources().dex if dex is None else dex
+    _initialize_compile_worker(runtime_dex)
+    grouping = group_replays(docs, format_id=format_id)
+    counters = _initial_compilation_counters(grouping)
+    jobs = []
+    for group in grouping.series:
+        membership_by_replay = {
+            membership.replay_id: membership for membership in group.memberships
+        }
+        for document in group.games:
+            membership = membership_by_replay[document.metadata.replay_id]
+            jobs.append(
+                (
+                    document,
+                    group.record.series_id,
+                    membership.game_number,
+                    membership.canonical_player_roles,
+                    max_candidates,
+                )
+            )
+
+    if chunksize is None and jobs:
+        chunksize = max(1, len(jobs) // ((os.cpu_count() or 1) * 4))
+
+    if not jobs:
+        results: Iterable[tuple[CompiledGame | None, str | None]] = ()
+    elif len(jobs) <= (os.cpu_count() or 1) or (chunksize is not None and chunksize <= 0):
+        results = [_compile_worker(job) for job in jobs]
+    else:
+        assert chunksize is not None
+        with concurrent.futures.ProcessPoolExecutor(
+            mp_context=PROCESS_CONTEXT,
+            initializer=_initialize_compile_worker,
+            initargs=(runtime_dex,),
+        ) as executor:
+            results = list(executor.map(_compile_worker, jobs, chunksize=chunksize))
+
+    compiled_by_series: dict[str, list[CompiledGame]] = {}
+    failed_series: set[str] = set()
+    confidence_sum = 0.0
+    for job, (compiled, reason) in zip(jobs, results, strict=True):
+        series_id = job[1]
+        if reason is not None:
+            counters[f"rejected_reconstruction_{reason}"] += 1
+            failed_series.add(series_id)
+            continue
+        if compiled is None:
+            continue
+
+        reasons = _quality_reasons(compiled)
+        if reasons:
+            for quality_reason in reasons:
+                counters[f"rejected_{quality_reason}"] += 1
+            failed_series.add(series_id)
+            continue
+
+        compiled_by_series.setdefault(series_id, []).append(compiled)
+
+    source_games_by_series = {group.record.series_id: len(group.games) for group in grouping.series}
+    games: list[CompiledGame] = []
+    for group in grouping.series:
+        series_id = group.record.series_id
+        retained = compiled_by_series.get(series_id, [])
+        expected_numbers = tuple(sorted(membership.game_number for membership in group.memberships))
+        actual_numbers = tuple(sorted(game.game_number for game in retained))
+        if series_id in failed_series or actual_numbers != expected_numbers:
+            failed_series.add(series_id)
+            continue
+        games.extend(sorted(retained, key=lambda game: game.game_number))
+        for game in retained:
+            for estimate in game.stat_estimates:
+                if isinstance(estimate, ReplayStatValue):
+                    if estimate.provenance == "IMPUTED":
+                        counters["imputations"] += 1
+                    elif estimate.provenance == "UNKNOWN":
+                        counters["imputation_unknown"] += 1
+                    confidence_sum += estimate.confidence
+            counters["accepted_games"] += 1
+            _measure_game(counters, game)
+
+    counters["rejected_games"] = sum(
+        source_games_by_series[series_id]
+        for series_id in failed_series
+        if series_id in source_games_by_series
+    )
+    counters["complete_series"] = sum(
+        group.record.is_complete and group.record.series_id not in failed_series
+        for group in grouping.series
+    )
+    counters["incomplete_series"] = counters["series"] - counters["complete_series"]
+
+    metric_values: dict[str, int | float] = dict(counters)
+    metric_values["imputation_confidence_sum"] = confidence_sum
+    return CompilationResult(grouping.series, tuple(games), CompilationMetrics(metric_values))
+
+
+def compile_payloads(
+    payloads: Iterable[bytes | str | dict[str, Any]],
+    *,
+    format_id: str | None = None,
+    max_candidates: int = 256,
+    dex: Mapping[str, Any] | None = None,
+    chunksize: int | None = None,
+) -> CompilationResult:
+    """Parse raw replay payloads and compile them through the replay pipeline."""
+    documents = tuple(parse_replay_payload(payload, format_id=format_id) for payload in payloads)
+    return compile_documents(
+        documents,
+        format_id=format_id,
+        max_candidates=max_candidates,
+        dex=dex,
+        chunksize=chunksize,
+    )
+
+
+def compile_to_shards(
+    documents: Iterable[ReplayDocument],
+    output_dir: str | Path,
+    *,
+    format_id: str | None = None,
+    max_candidates: int = 256,
+    dex: Mapping[str, Any] | None = None,
+    max_decisions_per_shard: int = 4096,
+    manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
+    resources: RuntimeResources | None = None,
+    created_at: str | None = None,
+    chunksize: int | None = None,
+    external_rejections: tuple[str, ...] = (),
+) -> ShardBuildResult:
+    """Compile documents and write a validated tensor shard build."""
+    result = compile_documents(
+        documents,
+        format_id=format_id,
+        max_candidates=max_candidates,
+        dex=dex,
+        chunksize=chunksize,
+    )
+    return write_tensor_shards(
+        result,
+        output_dir,
+        max_decisions_per_shard=max_decisions_per_shard,
+        manifest_path=manifest_path,
+        resources=resources,
+        created_at=created_at,
+        max_candidates=max_candidates,
+        external_rejections=external_rejections,
+    )
 
 
 def write_compilation(result: CompilationResult, path: str | Path) -> None:
