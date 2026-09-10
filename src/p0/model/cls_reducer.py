@@ -21,13 +21,10 @@ from p0.model.swiglu_encoder import AttentionPool, SwiGLUTransformerEncoder, ini
 
 class ReducerOutput(NamedTuple):
     """
-    The outputs needed by actor, critic, and runtime orchestration.
+    Outputs from memory reduction.
 
-    cls is the memory-aware readout used for the current policy/value
-    decision. local_history_token is deliberately the pre-memory summary
-    of the current observation; callers store that token for a later turn.
-    Keeping these representations separate prevents history from becoming a
-    recursively nested copy of the entire reducer context.
+    cls is the readout after attending to memory. local_history_token is the
+    pre-memory summary saved for subsequent turns so history stays flat.
     """
 
     cls: Tensor
@@ -49,7 +46,7 @@ def pack_history_tokens(history_tokens: Tensor) -> tuple[Tensor, Tensor]:
         )
     batch, count, width = history_tokens.shape
     packed = history_tokens.new_zeros((batch, HISTORY_WINDOW, width))
-    mask = torch.zeros((batch, HISTORY_WINDOW), dtype=torch.bool, device=history_tokens.device)
+    mask = history_tokens.new_zeros((batch, HISTORY_WINDOW), dtype=torch.bool)
     if count:
         packed[:, -count:] = history_tokens
         mask[:, -count:] = True
@@ -88,12 +85,14 @@ class MemoryReducer(nn.Module):
 
     def _validate_inputs(
         self,
+        local_summary: Tensor,
         current_tokens: Tensor,
         series_tokens: Tensor,
         series_mask: Tensor,
         history_tokens: Tensor,
         history_mask: Tensor,
     ) -> None:
+        batch = current_tokens.size(0)
         if current_tokens.dim() != 3 or current_tokens.shape[1:] != (
             CURRENT_TOKEN_COUNT,
             self.d_model,
@@ -102,15 +101,27 @@ class MemoryReducer(nn.Module):
                 f"Expected current tokens (B, {CURRENT_TOKEN_COUNT}, {self.d_model}); "
                 f"got {tuple(current_tokens.shape)}"
             )
-        batch = current_tokens.size(0)
-        expected = (batch, SERIES_SLOTS, self.d_model)
-        if series_tokens.shape != expected or series_mask.shape != (batch, SERIES_SLOTS):
+        if (
+            local_summary.shape != (batch, self.d_model)
+            or local_summary.dtype != current_tokens.dtype
+            or local_summary.device != current_tokens.device
+        ):
+            raise ValueError(
+                f"Expected local summary ({batch}, {self.d_model}) matching "
+                f"{current_tokens.dtype} on {current_tokens.device}; got "
+                f"{tuple(local_summary.shape)} of {local_summary.dtype} on {local_summary.device}"
+            )
+        if series_tokens.shape != (batch, SERIES_SLOTS, self.d_model) or series_mask.shape != (
+            batch,
+            SERIES_SLOTS,
+        ):
             raise ValueError("series tokens or mask do not match the series slot contract")
-        expected_history = (batch, HISTORY_WINDOW, self.d_model)
-        if history_tokens.shape != expected_history:
-            raise ValueError("history tokens do not match the fixed 48-slot contract")
-        if history_mask.shape != (batch, HISTORY_WINDOW):
-            raise ValueError("history mask must have shape (B, 48)")
+        if history_tokens.shape != (
+            batch,
+            HISTORY_WINDOW,
+            self.d_model,
+        ) or history_mask.shape != (batch, HISTORY_WINDOW):
+            raise ValueError("history tokens or mask do not match the fixed 48-slot contract")
 
     def reduce(
         self,
@@ -124,37 +135,26 @@ class MemoryReducer(nn.Module):
         """
         Reduce the memory window from an already-computed local summary.
 
-        Behaviour cloning builds the per-decision local summaries to fill its
-        history window, so it passes the target rows straight back in rather
-        than paying for the same attention twice. The supplied summary must
-        describe the same current observation as current_tokens; it must
-        not be a previous cls output or a summary from another row.
+        Behavior cloning passes cached local summaries to avoid recomputing attention.
+        The summary must match current_tokens, not a prior readout or another row.
         """
         self._validate_inputs(
+            local_summary,
             current_tokens,
             series_tokens,
             series_mask,
             history_tokens,
             history_mask,
         )
-        device = current_tokens.device
         batch = current_tokens.size(0)
-        if (
-            local_summary.shape != (batch, self.d_model)
-            or local_summary.dtype != current_tokens.dtype
-            or local_summary.device != current_tokens.device
-        ):
-            raise ValueError(
-                f"Expected a local summary of shape ({batch}, {self.d_model}) matching "
-                f"{current_tokens.dtype} on {current_tokens.device}; got "
-                f"{tuple(local_summary.shape)} of {local_summary.dtype} on {local_summary.device}"
-            )
+        device = current_tokens.device
 
         # Position 0 is seeded with the current-turn-only summary. The
         # transformer output at this position becomes the readout after it has
         # attended to history, series context, and all current tokens.
-        current = torch.cat([local_summary[:, None], current_tokens], dim=1)
-        sequence = torch.cat([series_tokens, history_tokens, current], dim=1)
+        sequence = torch.cat(
+            [series_tokens, history_tokens, local_summary[:, None], current_tokens], dim=1
+        )
         sequence = sequence + self.memory_position_emb.weight
         padding = torch.cat(
             [
@@ -166,27 +166,24 @@ class MemoryReducer(nn.Module):
         )
         if sequence.size(1) != REDUCER_MAX_LENGTH:
             raise RuntimeError(f"Reducer layout drifted to {sequence.size(1)} tokens")
-        encoded = self.encoder(sequence, src_key_padding_mask=padding)
-
+        # Only the readout and Pokemon outputs are used; other rows still supply keys/values.
         current_start = SERIES_SLOTS + HISTORY_WINDOW
+        encoded = self.encoder(
+            sequence,
+            src_key_padding_mask=padding,
+            output_slice=slice(current_start, current_start + 1 + len(POKEMON_TOKENS)),
+        )
         return ReducerOutput(
             # cls is the post-memory readout for this decision.
-            cls=encoded[:, current_start],
-            pokemon=encoded[:, current_start + 1 : current_start + 1 + len(POKEMON_TOKENS)],
+            cls=encoded[:, 0],
+            pokemon=encoded[:, 1 : 1 + len(POKEMON_TOKENS)],
             # Store the pre-memory summary so each history entry remains a
             # local snapshot rather than recursively containing prior memory.
             local_history_token=local_summary,
         )
 
     def local_summary(self, current_tokens: Tensor) -> Tensor:
-        """
-        Summarize current tokens before any memory interaction.
-
-        This method intentionally cannot see series/history tokens or future
-        outcomes. Its output is both the initial reducer readout and the
-        snapshot that runtime stores for the next decision; training may keep
-        the graph when it reuses local summaries for differentiable history.
-        """
+        """Summarize current tokens before attending to history."""
         if current_tokens.dim() != 3 or current_tokens.shape[1:] != (
             CURRENT_TOKEN_COUNT,
             self.d_model,

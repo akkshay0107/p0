@@ -41,24 +41,22 @@ def compile_policy(
     return policy
 
 
+def _strip_orig_mod(name: str) -> str:
+    return name.replace("._orig_mod.", ".").removeprefix("_orig_mod.")
+
+
 def canonical_policy_state_dict(policy: PolicyNet) -> OrderedDict[str, torch.Tensor]:
-    """Return policy weights without torch.compile wrapper namespaces."""
-    canonical: OrderedDict[str, torch.Tensor] = OrderedDict()
-    for name, value in policy.state_dict().items():
-        canonical[name.replace("._orig_mod.", ".").removeprefix("_orig_mod.")] = value
-    return canonical
+    """Return policy state dict with torch.compile prefixes removed."""
+    return OrderedDict((_strip_orig_mod(k), v) for k, v in policy.state_dict().items())
 
 
 def load_canonical_policy_state_dict(
     policy: PolicyNet,
     state_dict: Mapping[str, torch.Tensor],
 ) -> None:
-    """Load canonical weights into either compiled or uncompiled policy modules."""
-    target_names = policy.state_dict()
-    canonical_targets = {
-        target_name.replace("._orig_mod.", ".").removeprefix("_orig_mod.")
-        for target_name in target_names
-    }
+    """Load weights with canonical parameter names into a policy module."""
+    target_names = {name: _strip_orig_mod(name) for name in policy.state_dict()}
+    canonical_targets = set(target_names.values())
     source_names = set(state_dict)
     if source_names != canonical_targets:
         missing = sorted(canonical_targets - source_names)
@@ -67,13 +65,6 @@ def load_canonical_policy_state_dict(
             "Canonical policy state keys do not match: "
             f"missing={missing[:3]}, unexpected={unexpected[:3]}"
         )
-    wrapped = {
-        target_name: state_dict[canonical_name]
-        for target_name in target_names
-        if (canonical_name := target_name.replace("._orig_mod.", ".").removeprefix("_orig_mod."))
-        in state_dict
-    }
-    if len(wrapped) != len(target_names):
-        missing = sorted(set(target_names) - set(wrapped))
-        raise RuntimeError(f"Canonical policy state is missing keys: {missing[:3]}")
-    policy.load_state_dict(wrapped, strict=True)
+    policy.load_state_dict(
+        {name: state_dict[canonical] for name, canonical in target_names.items()}, strict=True
+    )

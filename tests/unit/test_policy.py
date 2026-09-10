@@ -30,7 +30,7 @@ from p0.model.architecture_contract import (
 from p0.model.cls_reducer import MemoryReducer, pack_history_tokens
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
-from p0.model.policy import MemoryInputs, PolicyNet
+from p0.model.policy import ActorPolicy, MemoryInputs, PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.model.series_context import DynamicSeriesResampler
 from p0.model.structured_observation import (
@@ -45,6 +45,7 @@ from p0.model.structured_observation import (
     EFFECT_CATEGORICAL_WIDTH,
     EFFECT_NUMERICAL_WIDTH,
     NUM_EFFECT_START,
+    NUM_IDX_ORIG_IDX_RATIO,
     NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
@@ -217,6 +218,29 @@ class TestPolicyArchitecture:
 
 
 class TestPolicy:
+    def test_switch_context_preserves_roster_identity_when_bench_rows_move(self) -> None:
+        torch.manual_seed(0)
+        actor = ActorPolicy(32, 4, 1, ACT_SIZE, 64)
+        readout = torch.randn(1, 32)
+        pokemon = torch.randn(1, 12, 32)
+        moves = torch.randn(1, 2, 4, 32)
+        numerical = torch.zeros(1, SEQUENCE_LENGTH, NUMERICAL_WIDTH)
+        numerical[:, :6, NUM_IDX_ORIG_IDX_RATIO] = torch.arange(1, 7) / 6
+        phase = torch.zeros(1, dtype=torch.bool)
+        mask = torch.ones(1, 2, ACT_SIZE, dtype=torch.bool)
+        actions = torch.tensor([[3, 7]])
+        permutation = torch.tensor([0, 1, 4, 3, 2, 5, 6, 7, 8, 9, 10, 11])
+        reordered_numerical = numerical.clone()
+        reordered_numerical[:, :12] = numerical[:, permutation]
+
+        logits, log_probs, _ = actor(readout, pokemon, moves, numerical, phase, mask, actions)
+        reordered_logits, reordered_log_probs, _ = actor(
+            readout, pokemon[:, permutation], moves, reordered_numerical, phase, mask, actions
+        )
+
+        torch.testing.assert_close(logits, reordered_logits)
+        torch.testing.assert_close(log_probs, reordered_log_probs)
+
     def test_policy_net_act_and_encoded_evaluate_shapes(self, policy_net: PolicyNet) -> None:
         """Verify PolicyNet act() and evaluate() return expected tensor dimensions across policy, value, and history channels."""
         B = 16

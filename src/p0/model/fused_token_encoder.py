@@ -1,7 +1,7 @@
 """
 Fused token encoder that turns categorical/numerical battle features into mixed context tokens.
 
-Produces the casual observation sequence consumed by the memory reducer, including side-owned
+Produces the current observation sequence consumed by the memory reducer, including side-owned
 scalars (turn, team-preview flag, fainted counts), entity rows, and pooled battle events.
 """
 
@@ -74,10 +74,7 @@ MOVE_DYNAMIC_WIDTH = 4
 STATUS_DYNAMIC_WIDTH = 1  # status counter (turns asleep / toxic stage)
 SPECIES_STATIC_WIDTH = 9  # six base stats, weight, mega flag, forme relationship
 
-# Pokemon-owned scalars: everything in the base+provenance numeric row except the
-# fields owned by a narrower record (move dynamics -> MoveRecord, status counter
-# -> StatusRecord). Effects live past NUM_EFFECT_START and are owned by the
-# typed-effect deepset, so they are excluded structurally.
+# Pokemon-owned scalars: base stats and status flags, excluding move dynamics and effects.
 _MOVE_DYN_IDX = frozenset(
     index
     for start in (NUM_IDX_MOVE_PP, NUM_IDX_MOVE_LAST, NUM_IDX_MOVE_LEGAL)
@@ -253,7 +250,6 @@ class DeepSetEncoder(nn.Module):
 class FusedTokenEncoder(nn.Module):
     # Buffers registered dynamically by torch need explicit declarations for Pyright.
     _pokemon_scalar_idx: torch.Tensor
-    _event_effect_namespace: torch.Tensor
     _species_statics: torch.Tensor
     _move_statics: torch.Tensor
     _item_mechanic_tags: torch.Tensor
@@ -398,8 +394,9 @@ class FusedTokenEncoder(nn.Module):
         # non-pooled primary-type channel
         # some moves like revelation dance rely on the primary type
         type_ids = categorical[..., POKEMON_TYPE_START : POKEMON_TYPE_START + POKEMON_TYPE_SLOTS]
-        type_summary = self.type_set(self.type_emb(type_ids), type_ids != 0)
-        primary_type = self.primary_type_proj(self.type_emb(categorical[..., POKEMON_TYPE_START]))
+        type_embeddings = self.type_emb(type_ids)
+        type_summary = self.type_set(type_embeddings, type_ids != 0)
+        primary_type = self.primary_type_proj(type_embeddings[..., 0, :])
 
         # MoveRecord: identity + static dex scalars + move-owned dynamics fused once
         move_ids = categorical[..., 5:9]
@@ -427,9 +424,7 @@ class FusedTokenEncoder(nn.Module):
             ],
             dim=-1,
         )
-        # pos emb added here to break permutation invariance
-        # the model downstream needs to know which slot is which
-        # for a1 to choose the indices
+        # Add position embedding so move slot order is distinguishable.
         move_embs = self.move_proj(move_parts) + self.move_pos_emb.weight
 
         # StatusRecord: identity + counter semantics + counter value fused once
@@ -480,13 +475,6 @@ class FusedTokenEncoder(nn.Module):
         )
         return self.pokemon_pool(components), move_embs
 
-    def _embed_pokemon_super(
-        self, categorical: torch.Tensor, numerical: torch.Tensor
-    ) -> torch.Tensor:
-        """Embed Pokemon rows without exposing pointer-head auxiliary features."""
-        fused_token, _ = self._embed_pokemon_components(categorical, numerical)
-        return fused_token
-
     def _embed_typed_effects(
         self, categorical: torch.Tensor, numerical: torch.Tensor
     ) -> torch.Tensor:
@@ -530,22 +518,21 @@ class FusedTokenEncoder(nn.Module):
         action_mask: torch.Tensor,
         numerical: torch.Tensor,
     ) -> torch.Tensor:
-        """Append the joint action-mask token, gated by per-slot legality provenance."""
+        """Append the joint action-mask token, gated by per-slot unknown-legality flags."""
         B = tokens.size(0)
         if action_mask.shape != (B, 2, ACT_SIZE):
             raise ValueError(
                 f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
             )
+        dtype = tokens.dtype
         slot_unknown = numerical[
             :,
             TOKEN_IDX_ALLY_SIDE,
             NUM_IDX_SLOT_LEGALITY_UNKNOWN : NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2,
-        ].to(tokens.dtype)
-        # An unproven slot contributes no mask magnitude; its learned marker carries the
-        # a fall back to state signal instead.
-        gated_mask = action_mask.to(tokens.dtype) * (1.0 - slot_unknown).unsqueeze(-1)
-
-        unknown_marker = slot_unknown @ self.unknown_legality_emb.to(tokens.dtype)
+        ].to(dtype)
+        # An unknown slot contributes its learned marker instead of mask values.
+        gated_mask = action_mask.to(dtype) * (1.0 - slot_unknown).unsqueeze(-1)
+        unknown_marker = slot_unknown @ self.unknown_legality_emb.to(dtype)
         mask_token = (
             self.action_mask_token.expand(B, -1, -1)
             + self.action_mask_proj(gated_mask.reshape(B, -1)).unsqueeze(1)

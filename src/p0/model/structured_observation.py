@@ -1,15 +1,15 @@
 """
 Structured tensor observation schema shared by encode, rollouts, and evaluation.
 
-Defines the fixed categorical/numerical/sequence layout of StructuredObservation, the
-ActionMasker helpers, and the observer-facing indices used across the model and runtime.
+Defines the categorical, numerical, and event tensor layout, validation helpers,
+and shared feature indices used by the model and runtime.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 
@@ -77,9 +77,8 @@ NUM_IDX_STAT_PROVENANCE = 44
 NUM_IDX_MOVE_LEGAL = 45  # 45-48: per-move-slot legal this step (MoveRecord dynamic)
 NUM_IDX_CAN_SWITCH_OUT = 49  # active allies only
 NUM_IDX_REVEALED = 50  # has appeared on the field this battle
-# Legality provenance. A data source that cannot prove a decision's legality (a public
-# replay carries no |request|) writes zeros into the legality columns above and raises
-# these gates instead, so unknown never masquerades as a proven illegal action.
+# Legality flags. When a data source cannot determine legality (such as a public
+# replay without requests), it sets these flags to distinguish unknown actions from illegal actions.
 NUM_IDX_LEGALITY_UNKNOWN = 51  # this row's move-legal / can-switch-out / can-mega are unproven
 NUM_IDX_SLOT_LEGALITY_UNKNOWN = 52  # 52-53: per-active-slot gate, ally side token only
 
@@ -148,7 +147,7 @@ class CounterKind(IntEnum):
 
 
 def _observation_layout_descriptor() -> dict[str, object]:
-    """Describe every serialized observation interpretation boundary for manifest parity."""
+    """Return observation layout metadata to verify manifest compatibility."""
     return {
         "team_size": TEAM_SIZE,
         "move_slots": MOVE_SLOTS,
@@ -263,15 +262,6 @@ class StructuredObservation:
     spatial_cat: torch.Tensor
     spatial_num: torch.Tensor
 
-    _FIELD_NAMES: ClassVar[tuple[str, ...]] = (
-        "token_type_ids",
-        "side_ids",
-        "slot_ids",
-        "categorical",
-        "numerical",
-        "spatial_cat",
-        "spatial_num",
-    )
     _FIELD_SPECS: ClassVar[tuple[tuple[str, tuple[int, ...], torch.dtype], ...]] = (
         ("token_type_ids", (SEQUENCE_LENGTH,), torch.long),
         ("side_ids", (SEQUENCE_LENGTH,), torch.long),
@@ -281,6 +271,8 @@ class StructuredObservation:
         ("spatial_cat", (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH), torch.long),
         ("spatial_num", (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH), torch.float32),
     )
+
+    _FIELD_NAMES: ClassVar[tuple[str, ...]] = tuple(name for name, _, _ in _FIELD_SPECS)
 
     @classmethod
     def _from_values(cls, values: list[torch.Tensor]) -> StructuredObservation:
@@ -330,22 +322,33 @@ class StructuredObservation:
     def __getitem__(self, index) -> StructuredObservation:
         return self._from_values([tensor[index] for tensor in self.tensors()])
 
+    @classmethod
+    def _combine(
+        cls,
+        observations: list[StructuredObservation],
+        fn: Any,
+        dim: int,
+        empty_msg: str,
+    ) -> StructuredObservation:
+        if not observations:
+            raise ValueError(empty_msg)
+        return cls._from_values(
+            [
+                fn(list(col), dim=dim)
+                for col in zip(*(o.tensors() for o in observations), strict=True)
+            ]
+        )
+
     @staticmethod
     def cat(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
-        if not observations:
-            raise ValueError("Cannot concatenate an empty observation list")
-        columns = zip(*(observation.tensors() for observation in observations), strict=True)
-        return StructuredObservation._from_values(
-            [torch.cat(list(tensors), dim=dim) for tensors in columns]
+        return StructuredObservation._combine(
+            observations, torch.cat, dim, "Cannot concatenate an empty observation list"
         )
 
     @staticmethod
     def stack(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
-        if not observations:
-            raise ValueError("Cannot stack an empty observation list")
-        columns = zip(*(observation.tensors() for observation in observations), strict=True)
-        return StructuredObservation._from_values(
-            [torch.stack(list(tensors), dim=dim) for tensors in columns]
+        return StructuredObservation._combine(
+            observations, torch.stack, dim, "Cannot stack an empty observation list"
         )
 
     @staticmethod

@@ -3,7 +3,7 @@ Policy network: fixed memory reducer, fused token encoder, and the 49-action joi
 
 Defines ActorPolicy (stateless action sampling/scoring with sequential joint-action masks)
 and PolicyNet (full actor+critic model). Shared by live play, rollouts, and behaviour-cloning
-candidate marginalization.
+candidate scoring.
 """
 
 from __future__ import annotations
@@ -136,9 +136,8 @@ class ActOutput(NamedTuple):
     """
     Outputs for one action decision.
 
-    value is predicted from the post-memory cls readout. The
-    history_token is the pre-memory h_t snapshot returned by the reducer
-    for storage as the next turn's history.
+    value is predicted from the reducer readout. history_token is the
+    pre-memory summary saved for subsequent turns.
     """
 
     actions: Tensor
@@ -208,7 +207,6 @@ class ActorPolicy(nn.Module):
     target_entity_indices: Tensor
     ally_poke_entities: Tensor
     ally_token_pos: Tensor
-    batch_indices: Tensor
     all_a: Tensor
 
     def __init__(
@@ -357,6 +355,11 @@ class ActorPolicy(nn.Module):
         orig_ids = torch.round(numerical[:, self.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
         orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
         logits.scatter_(1, orig_ids, switch_scores.to(logits.dtype))
+        # Switching uses roster IDs even though entity rows put active Pokemon first.
+        switch_indices = (orig_ids - SWITCH_START).clamp_max(TEAM_SIZE)
+        switch_keys = k_ally.new_zeros((B, TEAM_SIZE + 1, self.d_k)).scatter(
+            1, switch_indices.unsqueeze(-1).expand_as(k_ally), k_ally
+        )
 
         k_targets = k_entity_extended[:, self.target_entity_indices, :]
         # Broadcast grids remain views until concatenation materializes
@@ -399,7 +402,7 @@ class ActorPolicy(nn.Module):
         ).to(logits.dtype)
         return PointerOutputs(
             logits=logits[:, : self.act_size],
-            switch_keys=k_ally,
+            switch_keys=switch_keys[:, :TEAM_SIZE],
             move_keys=move_action_keys,
             mega_move_keys=mega_action_keys,
             tp_pair_keys=tp_pair_keys,
@@ -466,50 +469,8 @@ class ActorPolicy(nn.Module):
         *,
         top_p: float = 1.0,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Sample actions from a reducer output that was already computed."""
-        _require_matching_batch(reduced, enc)
-        z = reduced.cls
-        k_entity_extended = self._compute_keys(reduced.pokemon)
-
-        first = self._compute_pointer_logits(
-            self._compute_first_pointer_query(z, k_entity_extended, enc.phase),
-            k_entity_extended,
-            enc.aux[:, 0],
-            enc.numerical,
-            enc.phase,
-        )
-        logits1 = first.logits
-        logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
-        sample_logits1 = self._apply_top_p(logits1, top_p) if top_p < 1.0 else logits1
-
-        dist1 = Categorical(logits=sample_logits1)
-        a1 = dist1.sample()
-
-        ctx_a1 = self._select_action_keys(
-            first,
-            a1,
-            enc.phase,
-            torch.arange(a1.size(0), device=a1.device),
-        )
-
-        second = self._compute_pointer_logits(
-            self._compute_second_pointer_query(z, k_entity_extended, enc.phase, ctx_a1),
-            k_entity_extended,
-            enc.aux[:, 1],
-            enc.numerical,
-            enc.phase,
-        )
-        logits2 = second.logits
-
-        logits = torch.stack([logits1, logits2], dim=1)
-        logits = self._apply_sequential_masks(logits, a1, action_mask, enc.phase)
-        sample_logits2 = self._apply_top_p(logits[:, 1], top_p) if top_p < 1.0 else logits[:, 1]
-
-        dist2 = Categorical(logits=sample_logits2)
-        a2 = dist2.sample()
-        log_probs = dist1.log_prob(a1) + dist2.log_prob(a2)
-        actions = torch.stack([a1, a2], dim=-1)
-        return actions, log_probs, z, reduced.local_history_token
+        """Sample actions from an already-computed reducer output."""
+        return self._choose_reduced(reduced, enc, action_mask, top_p=top_p, greedy=False)
 
     @torch.no_grad()
     def greedy_reduced(
@@ -518,50 +479,59 @@ class ActorPolicy(nn.Module):
         enc: EncodedObs,
         action_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Choose one legal joint action from a batch that is already reduced."""
+        """Choose one legal joint action from an already-computed reducer output."""
+        return self._choose_reduced(reduced, enc, action_mask, top_p=1.0, greedy=True)
+
+    def _choose_reduced(
+        self,
+        reduced: ReducerOutput,
+        enc: EncodedObs,
+        action_mask: Tensor,
+        *,
+        top_p: float,
+        greedy: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         _require_matching_batch(reduced, enc)
         z = reduced.cls
-        k_entity_extended = self._compute_keys(reduced.pokemon)
-
+        keys = self._compute_keys(reduced.pokemon)
         first = self._compute_pointer_logits(
-            self._compute_first_pointer_query(z, k_entity_extended, enc.phase),
-            k_entity_extended,
+            self._compute_first_pointer_query(z, keys, enc.phase),
+            keys,
             enc.aux[:, 0],
             enc.numerical,
             enc.phase,
         )
-        logits1 = first.logits
-        logits1 = logits1.masked_fill(action_mask[:, 0] == 0, float("-inf"))
-        a1 = torch.argmax(logits1, dim=-1)
-
-        ctx_a1 = self._select_action_keys(
-            first,
-            a1,
-            enc.phase,
-            torch.arange(a1.size(0), device=a1.device),
+        logits1 = first.logits.masked_fill(action_mask[:, 0] == 0, float("-inf"))
+        a1, log_prob1 = self._choose_action(logits1, top_p=top_p, greedy=greedy)
+        context = self._select_action_keys(
+            first, a1, enc.phase, torch.arange(a1.size(0), device=a1.device)
         )
         second = self._compute_pointer_logits(
-            self._compute_second_pointer_query(z, k_entity_extended, enc.phase, ctx_a1),
-            k_entity_extended,
+            self._compute_second_pointer_query(z, keys, enc.phase, context),
+            keys,
             enc.aux[:, 1],
             enc.numerical,
             enc.phase,
         )
-        logits2 = second.logits
         logits = self._apply_sequential_masks(
-            torch.stack([logits1, logits2], dim=1),
-            a1,
-            action_mask,
-            enc.phase,
+            torch.stack([logits1, second.logits], dim=1), a1, action_mask, enc.phase
         )
-        a2 = torch.argmax(logits[:, 1], dim=-1)
-        actions = torch.stack([a1, a2], dim=-1)
-        log_probs = F.log_softmax(logits[:, 0], dim=-1).gather(1, a1.unsqueeze(1)).squeeze(
-            1
-        ) + F.log_softmax(logits[:, 1], dim=-1).gather(1, a2.unsqueeze(1)).squeeze(1)
-        return actions, log_probs, z, reduced.local_history_token
+        a2, log_prob2 = self._choose_action(logits[:, 1], top_p=top_p, greedy=greedy)
+        return torch.stack([a1, a2], dim=-1), log_prob1 + log_prob2, z, reduced.local_history_token
 
-    def _action_logits(
+    @staticmethod
+    def _choose_action(logits: Tensor, *, top_p: float, greedy: bool) -> tuple[Tensor, Tensor]:
+        if greedy:
+            action = logits.argmax(dim=-1)
+            log_prob = F.log_softmax(logits, dim=-1).gather(1, action[:, None]).squeeze(1)
+            return action, log_prob
+        if top_p < 1.0:
+            logits = ActorPolicy._apply_top_p(logits, top_p)
+        distribution = Categorical(logits=logits)
+        action = distribution.sample()
+        return action, distribution.log_prob(action)
+
+    def logits(
         self,
         z: Tensor,
         pokemon: Tensor,
@@ -600,13 +570,12 @@ class ActorPolicy(nn.Module):
         )
         logits2 = second.logits
 
-        logits = self._apply_sequential_masks(
+        return self._apply_sequential_masks(
             torch.stack([logits1, logits2], dim=1),
             a1,
             action_mask,
             phase,
         )
-        return logits
 
     def forward(
         self,
@@ -619,28 +588,11 @@ class ActorPolicy(nn.Module):
         actions: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Evaluate actions through a deterministic tensor-only PPO kernel."""
-        logits = self._action_logits(z, pokemon, aux, numerical, phase, action_mask, actions)
-        log_probs_1 = (
-            F.log_softmax(logits[:, 0], dim=-1).gather(1, actions[:, 0].unsqueeze(1)).squeeze(1)
+        logits = self.logits(z, pokemon, aux, numerical, phase, action_mask, actions)
+        log_probs = (
+            F.log_softmax(logits, dim=-1).gather(-1, actions.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
         )
-        log_probs_2 = (
-            F.log_softmax(logits[:, 1], dim=-1).gather(1, actions[:, 1].unsqueeze(1)).squeeze(1)
-        )
-        log_probs = log_probs_1 + log_probs_2
         return logits, log_probs, z
-
-    def logits(
-        self,
-        z: Tensor,
-        pokemon: Tensor,
-        aux: Tensor,
-        numerical: Tensor,
-        phase: Tensor,
-        action_mask: Tensor,
-        actions: Tensor,
-    ) -> Tensor:
-        """Build masked action logits without critic or probability statistics."""
-        return self._action_logits(z, pokemon, aux, numerical, phase, action_mask, actions)
 
     def _validated_offsets(
         self,
@@ -649,7 +601,7 @@ class ActorPolicy(nn.Module):
         candidate_values: Tensor,
         candidate_offsets: Tensor,
     ) -> Tensor:
-        """Check the ragged candidate encoding and align its offsets to the batch."""
+        """Validate candidate action tensors and batch offsets."""
         batch_size = enc.tokens.size(0)
         if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
             raise ValueError("candidate_values must have shape (candidates, 2)")
@@ -690,43 +642,19 @@ class ActorPolicy(nn.Module):
         validated: bool = False,
     ) -> Tensor:
         """
-        Score ragged candidates against a batch that is already reduced.
+        Score ragged candidate actions against an already-reduced batch.
 
-        Setting validated=True bypasses every candidate-contract check. It is
-        reserved for callers that validated the complete source batch before
-        moving it to the policy device.
+        validated=True skips candidate validation if the caller already checked the batch.
         """
         _require_matching_batch(reduced, enc)
-        if validated:
-            return self._score_reduced_unchecked(
-                reduced,
-                enc,
-                action_mask,
-                candidate_values,
-                candidate_offsets,
+        if not validated:
+            candidate_offsets = self._validated_offsets(
+                enc, action_mask, candidate_values, candidate_offsets
             )
-
-        offsets = self._validated_offsets(enc, action_mask, candidate_values, candidate_offsets)
-        return self._score_reduced(reduced, enc, action_mask, candidate_values, offsets)
-
-    def _score_reduced(
-        self,
-        reduced: ReducerOutput,
-        enc: EncodedObs,
-        action_mask: Tensor,
-        candidate_values: Tensor,
-        offsets: Tensor,
-    ) -> Tensor:
-        if candidate_values.numel() == 0:
-            return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
-        if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
-            raise ValueError("candidate action ids are outside the action contract")
+            if torch.any((candidate_values < 0) | (candidate_values >= self.act_size)):
+                raise ValueError("candidate action ids are outside the action contract")
         return self._score_reduced_unchecked(
-            reduced,
-            enc,
-            action_mask,
-            candidate_values,
-            offsets,
+            reduced, enc, action_mask, candidate_values, candidate_offsets
         )
 
     def _score_reduced_unchecked(
@@ -755,7 +683,6 @@ class ActorPolicy(nn.Module):
             torch.arange(batch_size, device=enc.tokens.device), counts
         )
         first_actions = candidate_values[:, 0]
-        second_actions = candidate_values[:, 1]
         candidate_ctx = self._select_action_keys(
             first,
             first_actions,
@@ -782,21 +709,15 @@ class ActorPolicy(nn.Module):
             action_mask[candidate_batch],
             enc.phase[candidate_batch],
         )
-        log_prob_first = F.log_softmax(candidate_logits[:, 0], dim=-1).gather(
-            1, first_actions.unsqueeze(1)
+        return (
+            F.log_softmax(candidate_logits, dim=-1)
+            .gather(-1, candidate_values.unsqueeze(-1))
+            .squeeze(-1)
+            .sum(dim=-1)
         )
-        log_prob_second = F.log_softmax(candidate_logits[:, 1], dim=-1).gather(
-            1, second_actions.unsqueeze(1)
-        )
-        return (log_prob_first + log_prob_second).squeeze(1)
 
     def unmasked_first_slot_logits(self, reduced: ReducerOutput, enc: EncodedObs) -> Tensor:
-        """
-        First-slot logits before legality masking, for legality diagnostics.
-
-        Reuses an already-reduced batch so the diagnostic costs one pointer-head pass
-        rather than a second reducer pass.
-        """
+        """First-slot unmasked logits for diagnostics, reusing an already-reduced batch."""
         k_entity_extended = self._compute_keys(reduced.pokemon)
         return self._compute_pointer_logits(
             self._compute_first_pointer_query(
@@ -937,19 +858,11 @@ class PolicyNet(nn.Module):
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
         if deterministic:
             actions, log_probs, z, local_history = self.actor.greedy_reduced(
-                prepared.reduced,
-                prepared.encoded,
-                action_mask,
+                prepared.reduced, prepared.encoded, action_mask
             )
         else:
-            # Truncated sampling probabilities are valid for evaluation only.
-            # PPO collection must use top-p equal to one so old log probabilities
-            # match the distribution evaluated during optimization.
             actions, log_probs, z, local_history = self.actor.sample_reduced(
-                prepared.reduced,
-                prepared.encoded,
-                action_mask,
-                top_p=top_p,
+                prepared.reduced, prepared.encoded, action_mask, top_p=top_p
             )
         return ActOutput(actions, log_probs, self.critic(z), local_history)
 

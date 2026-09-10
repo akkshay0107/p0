@@ -70,12 +70,9 @@ class AttentionPool(nn.Module):
 
 class SwiGLUEncoderLayer(nn.Module):
     """
-    Lean encoder layer for the exact case:
-    - batch_first=True
-    - norm_first=True
-    - dropout=0.0
-    - self-attention only
-    - packed SwiGLU FFN
+    Pre-normalized self-attention and SwiGLU feedforward layer.
+
+    Inputs use batch-first layout; attention has no dropout.
     """
 
     def __init__(
@@ -112,7 +109,10 @@ class SwiGLUEncoderLayer(nn.Module):
         self.w2 = nn.Linear(swiglu_hidden, d_model, bias=bias)
 
     def _self_attention(
-        self, x: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
+        output_slice: slice = slice(None),
     ) -> torch.Tensor:
         batch, sequence, _ = x.shape
 
@@ -120,6 +120,7 @@ class SwiGLUEncoderLayer(nn.Module):
         qkv = qkv.view(batch, sequence, 3, self.nhead, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+        q = q[:, :, output_slice]
 
         attn_mask = None
         if src_key_padding_mask is not None:
@@ -134,7 +135,7 @@ class SwiGLUEncoderLayer(nn.Module):
             is_causal=False,
         )
 
-        x = x.transpose(1, 2).reshape(batch, sequence, self.d_model)
+        x = x.transpose(1, 2).reshape(batch, q.size(2), self.d_model)
         return self.out_proj(x)
 
     def _ffn(self, x: torch.Tensor) -> torch.Tensor:
@@ -145,19 +146,21 @@ class SwiGLUEncoderLayer(nn.Module):
         self,
         src: torch.Tensor,
         src_key_padding_mask: torch.Tensor | None = None,
+        *,
+        output_slice: slice = slice(None),
     ) -> torch.Tensor:
-        x = src + self._self_attention(self.norm1(src), src_key_padding_mask)
+        x = src[:, output_slice] + self._self_attention(
+            self.norm1(src), src_key_padding_mask, output_slice
+        )
         x = x + self._ffn(self.norm2(x))
         return x
 
 
 class SwiGLUTransformerEncoder(nn.Module):
     """
-    Near-direct replacement for nn.TransformerEncoder in the specific setup:
-    - no final encoder norm
-    - batch_first=True inputs
-    - no nested tensor path
-    - only src_key_padding_mask
+    Stack encoder layers and apply a final RMS normalization.
+
+    Inputs use batch-first layout with an optional key padding mask.
     """
 
     def __init__(
@@ -200,8 +203,12 @@ class SwiGLUTransformerEncoder(nn.Module):
         self,
         src: torch.Tensor,
         src_key_padding_mask: torch.Tensor | None = None,
+        *,
+        output_slice: slice = slice(None),
     ) -> torch.Tensor:
+        """Select final output rows; every input row still supplies keys and values."""
         x = src
-        for layer in self.layers:
-            x = layer(x, src_key_padding_mask=src_key_padding_mask)
+        for index, layer in enumerate(self.layers):
+            selected = output_slice if index == len(self.layers) - 1 else slice(None)
+            x = layer(x, src_key_padding_mask=src_key_padding_mask, output_slice=selected)
         return self.norm(x)
