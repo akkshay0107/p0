@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 
 import numpy as np
 import torch
@@ -142,4 +143,7 @@ class ThreadVecEnv:
             env.restore_training_state(state)
 
     def shutdown(self):
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        with ExitStack() as stack:
+            for env in self.envs:
+                stack.callback(env.close)
+            self.executor.shutdown(wait=True, cancel_futures=True)

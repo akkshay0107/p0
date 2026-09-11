@@ -126,6 +126,7 @@ class TestTransformedPokemonView:
             nature="jolly",
             types=("normal",),
             current_hp_fraction=0.85,
+            moves={"electrodrift": DummyMove(move_id="electrodrift", move_type="electric")},
         )
         target = DummyPokemon(
             species="Miraidon",

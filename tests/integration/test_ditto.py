@@ -127,6 +127,7 @@ class DittoTrackerPlayer(RandomPlayer):
         super().__init__(**kwargs)
         self.saw_transform = False
         self.transform_observations: list[tuple[str | None, str, str | None, bool]] = []
+        self.transform_move_sets: list[frozenset[str]] = []
         self.error: Exception | None = None
 
     def teampreview(self, battle: AbstractBattle) -> str:
@@ -149,6 +150,7 @@ class DittoTrackerPlayer(RandomPlayer):
                             view.decision.slots[position].can_mega,
                         )
                     )
+                    self.transform_move_sets.append(frozenset(active.moves))
                     assert active.moves
                     self.saw_transform = True
                     break
@@ -227,4 +229,7 @@ class TestDitto:
             raise first.error
 
         assert first.saw_transform, "Did not observe a transform proxy during the battle"
-        assert ("charizardmegay", "charizard", "choicescarf", False) in first.transform_observations
+        assert ("charizard", "charizard", "choicescarf", False) in first.transform_observations
+        assert frozenset({"heatwave", "solarbeam", "protect", "weatherball"}) in (
+            first.transform_move_sets
+        )

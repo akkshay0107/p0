@@ -1,4 +1,4 @@
-"""Fast player-relative facade over poke-env battle state."""
+"""Fast player-relative view of poke-env battle state."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from poke_env.battle import DoubleBattle
 
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.battle.views import TransformedPokemonView
-from p0.runtime.live_event_capture import captured_protocol_lines, last_move
+from p0.runtime.live_event_capture import captured_protocol_lines, last_move, spatial_turn
 
 
 class PokeEnvBattleView:
-    """Cached facade with explicit properties and no copied per-decision graph."""
+    """Cached view of a live battle without copying its object graph."""
 
     __slots__ = ("_battle_ref", "_decision", "stat_cache")
 
@@ -43,13 +43,11 @@ class PokeEnvBattleView:
 
     @property
     def active_pokemon(self):
-        return _transformed_active_pokemon(self._battle, include_available_moves=True)
+        return _transformed_active_pokemon(self._battle)
 
     @property
     def opponent_active_pokemon(self):
-        return _transformed_active_pokemon(
-            self._battle, include_available_moves=False, opponent=True
-        )
+        return _transformed_active_pokemon(self._battle, opponent=True)
 
     @property
     def available_moves(self):
@@ -85,8 +83,7 @@ class PokeEnvBattleView:
 
     @property
     def wait(self):
-        # poke-env exposes wait as _wait (asserted integer reason code). This is a
-        # version-pinned access point: poke-env is locked to 0.15.0 in pyproject.toml.
+        # poke-env 0.15.0 exposes this request flag only as _wait.
         return self._battle._wait
 
     @property
@@ -134,12 +131,7 @@ class PokeEnvBattleView:
 
     @property
     def spatial_turn(self):
-        try:
-            return self._battle._p0_spatial_turn  # type: ignore[attr-defined]
-        except AttributeError:
-            from p0.battle.events import SpatialSlotRecord
-
-            return tuple(SpatialSlotRecord() for _ in range(4))
+        return spatial_turn(self._battle)
 
     def get_pokemon(self, identifier: str):
         return self._battle.get_pokemon(identifier)
@@ -169,31 +161,25 @@ def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
 def _transformed_active_pokemon(
     battle: DoubleBattle,
     *,
-    include_available_moves: bool,
     opponent: bool = False,
 ) -> list[Any]:
     active = battle.opponent_active_pokemon if opponent else battle.active_pokemon
     active_list = cast(list[Any], list(active))
     targets = getattr(battle, "_p0_transform_targets", {})
-    available = getattr(battle, "available_moves", ()) if include_available_moves else ()
     for index, pokemon in enumerate(active_list):
-        if pokemon is None or id(pokemon) not in targets:
+        if pokemon is None:
             continue
-        target = targets[id(pokemon)]
-        if include_available_moves:
-            moves = dict(target.moves)
-            if index < len(available) and available[index]:
-                moves.update({move.id: move for move in available[index]})
-            active_list[index] = TransformedPokemonView(pokemon, target, moves=moves)
-        else:
-            active_list[index] = TransformedPokemonView(pokemon, target)
+        target = targets.get(id(pokemon))
+        if target is None:
+            continue
+        active_list[index] = TransformedPokemonView(pokemon, target)
     return active_list
 
 
 def decision_view(battle: DoubleBattle) -> DecisionView:
     """Extract a lightweight DecisionView from live battle state."""
     available_moves = battle.available_moves
-    active_pokemon = _transformed_active_pokemon(battle, include_available_moves=True)
+    active_pokemon = _transformed_active_pokemon(battle)
 
     available_switches = battle.available_switches
     team = tuple(battle.team.values())
@@ -219,10 +205,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
             )
         )
 
-        # poke-env draws available switches out of battle.team itself, so
-        # roster identity is the real relation; the species name was only ever a
-        # proxy for it. Identity is matched by id() because poke-env's Pokemon
-        # defines __eq__ and callers may pass unhashable stand-ins.
+        # Match by id: species names can identify the wrong form or duplicate.
         switches = {id(pokemon) for pokemon in available_switches[position]}
         switch_slots = tuple(index for index, pokemon in enumerate(team) if id(pokemon) in switches)
 
@@ -237,9 +220,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
                 switch_slots=switch_slots,
                 move_targets=move_targets,
                 active=active is not None and not active.fainted,
-                # Open team sheets make every trapping ability public, so a
-                # request that reports maybe-trapped is in practice trapped.
-                # Offering the switch anyway produced invalid choices live.
+                # With open sheets, maybe-trapped still means switching will fail.
                 trapped=trapped[position] or maybe_trapped[position],
                 force_switch=force_switch[position],
                 can_mega=can_mega_evolve[position],

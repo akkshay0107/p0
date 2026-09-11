@@ -6,11 +6,25 @@ import logging
 
 from poke_env.battle import DoubleBattle
 
+from p0.battle.events import SpatialActionType
 from p0.runtime import poke_env_patches
-from p0.runtime.live_event_capture import captured_protocol_lines
+from p0.runtime.live_event_capture import capture_message, captured_protocol_lines
+from p0.runtime.poke_env_battle_adapter import battle_view
 
 
 class TestLiveEventCapture:
+    def test_battle_view_reads_current_turn_records(self) -> None:
+        battle = DoubleBattle("turn-records", "TestPlayer", logging.getLogger("test"), gen=9)
+        capture_message(
+            battle,
+            ("", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Charizard"),
+        )
+
+        records = battle_view(battle).spatial_turn
+
+        assert records[0].action_type == int(SpatialActionType.MOVE)
+        assert records[0].order_rank == 0.25
+
     def test_protocol_line_capture_is_opt_in_and_survives_idempotent_install(self) -> None:
         poke_env_patches.uninstall_for_tests()
         without_capture = DoubleBattle(

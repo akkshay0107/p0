@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 
 import numpy as np
 import numpy.typing as npt
@@ -30,6 +32,8 @@ from p0.runtime.poke_env_battle_adapter import battle_view, current_battle_view
 from p0.teams.source import TeamSource
 
 ACT_SIZE = FORMAT.action_size
+DECISION_STEP_LIMIT = 198
+CLIENT_STOP_TIMEOUT = 2.0
 
 
 def get_action_mask(battle: AbstractBattle) -> list[int]:
@@ -48,8 +52,14 @@ def _get_current_action_mask(battle: AbstractBattle) -> list[int]:
     return action_mask(current_battle_view(battle).decision).reshape(-1).astype(np.int64).tolist()
 
 
+def _stop_player(player: Player) -> None:
+    asyncio.run_coroutine_threadsafe(
+        player.ps_client.stop_listening(), player.ps_client.loop
+    ).result(timeout=CLIENT_STOP_TIMEOUT)
+
+
 class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
-    """Custom PokeEnv subclass supporting doubles action spaces and mega evolution."""
+    """PokeEnv with doubles actions and Mega Evolution support."""
 
     action_to_order = staticmethod(action_to_order)
     get_action_mask = staticmethod(get_action_mask)
@@ -100,9 +110,6 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
         poke_env_patches.enable_environment_team_preview(self.agent1)
         poke_env_patches.enable_environment_team_preview(self.agent2)
 
-        self.fake = fake
-        self.strict = strict
-
         self.action_spaces = {
             agent: MultiDiscrete([ACT_SIZE, ACT_SIZE]) for agent in self.possible_agents
         }
@@ -110,9 +117,16 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
             agent: Box(low=-np.inf, high=np.inf, shape=(1,)) for agent in self.possible_agents
         }
 
+    def close(self, force: bool = True, wait: bool = True) -> None:
+        """Close the active battle and both player connections."""
+        with ExitStack() as stack:
+            for player in (self.agent1, self.agent2):
+                stack.callback(_stop_player, player)
+            super().close(force=force, wait=wait)
+
 
 class SimEnv(MegaEnv):
-    """High-performance simulation environment supporting observation target pre-allocation."""
+    """Live training environment with reusable observation outputs and Bo3 state."""
 
     get_action_mask = staticmethod(_get_current_action_mask)
 
@@ -152,7 +166,7 @@ class SimEnv(MegaEnv):
         return self._series_games_played
 
     def training_state(self) -> dict[str, object]:
-        """Capture stochastic and series state needed for deterministic PPO resume."""
+        """Return the random and series state needed to resume PPO training."""
         return {
             "agent_rng": self._agent_rng.getstate(),
             "opponent_rng": self._opponent_rng.getstate(),
@@ -239,7 +253,7 @@ class SimEnv(MegaEnv):
             self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng).packed)
 
         self._decision_steps = 0
-        # preemptively add the game that will be played
+        # Count the game that reset is about to start.
         if not preserve_restored_game or is_new_series or is_completed_series:
             self._series_games_played += 1
         return super().reset(seed=seed, options=options)
@@ -254,12 +268,9 @@ class SimEnv(MegaEnv):
         """
         if not battle.finished:
             return 0.0
-
         if battle.won:
             return 1.0
-        if battle.lost:
-            return -1.0
-        return 0.0
+        return -1.0 if battle.lost else 0.0
 
     def _record_game_result(self, battle: AbstractBattle) -> None:
         """Credit one finished game to the best-of-three score."""
@@ -278,16 +289,12 @@ class SimEnv(MegaEnv):
         # which is the only case whose value target should bootstrap.
         battle = self.battle1
         if battle is not None and battle.finished:
-            for agent in terminated:
-                terminated[agent] = True
-            for agent in truncated:
-                truncated[agent] = False
+            terminated = dict.fromkeys(terminated, True)
+            truncated = dict.fromkeys(truncated, False)
             self._record_game_result(battle)
-        elif self._decision_steps >= 198 and not any(truncated.values()):
-            for agent in truncated:
-                truncated[agent] = True
-            for agent in rewards:
-                rewards[agent] = 0.0
+        elif self._decision_steps >= DECISION_STEP_LIMIT and not any(truncated.values()):
+            truncated = dict.fromkeys(truncated, True)
+            rewards = dict.fromkeys(rewards, 0.0)
 
         return obs, rewards, terminated, truncated, info
 

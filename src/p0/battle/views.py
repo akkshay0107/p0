@@ -172,12 +172,10 @@ class TransformedPokemonView:
         self,
         base: PokemonView,
         target: PokemonView,
-        moves: Mapping[str, Any] | None = None,
     ) -> None:
         self._base = base
         self._target = target
-        source_moves = moves if moves is not None else target.moves
-        self._transformed_moves = {k: TransformedMoveView(v) for k, v in source_moves.items()}
+        self._transformed_moves = {k: TransformedMoveView(v) for k, v in base.moves.items()}
 
     def __hash__(self) -> int:
         return hash(self._base)

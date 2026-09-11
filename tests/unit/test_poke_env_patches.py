@@ -97,6 +97,50 @@ class TestPokeEnvPatches:
         finally:
             poke_env_patches.uninstall_for_tests()
 
+    def test_transform_keeps_the_form_copied_at_transform_time(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("transform-form", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
+            battle.parse_message(["", "switch", "p2a: Charizard", "Charizard, L50", "100/100"])
+            battle.parse_message(
+                ["", "-transform", "p1a: Ditto", "Charizard", "[from] ability: Imposter"]
+            )
+            battle.parse_message(["", "detailschange", "p2a: Charizard", "Charizard-Mega-Y, L50"])
+
+            transformed = battle_view(battle).active_pokemon[0]
+            target = battle.opponent_active_pokemon[0]
+            assert isinstance(transformed, TransformedPokemonView)
+            assert transformed.species == "charizard"
+            assert target is not None
+            assert target.species == "charizardmegay"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_transform_keeps_the_moves_known_at_transform_time(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("transform-moves", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
+            battle.parse_message(["", "switch", "p2a: Mew", "Mew, L50", "100/100"])
+            battle.parse_message(
+                ["", "-transform", "p1a: Ditto", "Mew", "[from] ability: Imposter"]
+            )
+            battle.parse_message(["", "move", "p2a: Mew", "Psychic", "p1a: Ditto"])
+
+            transformed = battle_view(battle).active_pokemon[0]
+            target = battle.opponent_active_pokemon[0]
+            assert isinstance(transformed, TransformedPokemonView)
+            assert "psychic" not in transformed.moves
+            assert target is not None
+            assert "psychic" in target.moves
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
     def test_copyboost_copies_receiver_from_donor(self, tmp_path: Path) -> None:
         poke_env_patches.install()
         try:

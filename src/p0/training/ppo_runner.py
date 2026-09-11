@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import logging
 from collections.abc import Callable, Mapping
@@ -57,24 +56,12 @@ def _emit_tensorboard(
 
 
 def _close_environments(envs: list[SimEnv]) -> None:
-    """Cleanly close a list of Pokemon Showdown simulation environments."""
+    """Close each Pokemon Showdown simulation environment."""
     for env in envs:
         try:
             env.close()
-            for player in (env.agent1, env.agent2):
-                asyncio.run_coroutine_threadsafe(
-                    player.ps_client.stop_listening(), player.ps_client.loop
-                ).result(timeout=2.0)
-        # Environment and client shutdown cross async/thread boundaries; cleanup
-        # must continue for the remaining environments after any one failure.
         except Exception:
             LOGGER.exception("Failed to close a simulation environment cleanly")
-
-
-def _close_vector_env(vector_env: ThreadVecEnv) -> None:
-    """Cleanly shutdown the vector environment pool and its underlying simulations."""
-    vector_env.shutdown()
-    _close_environments(vector_env.envs)
 
 
 def run_training(
@@ -247,6 +234,6 @@ def _run_training_loaded(
             if writer is not None:
                 writer.close()
             if vector_env is not None:
-                _close_vector_env(vector_env)
+                vector_env.shutdown()
             else:
                 _close_environments(envs)

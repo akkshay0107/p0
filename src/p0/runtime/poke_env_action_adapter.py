@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import numpy.typing as npt
 from poke_env.battle import DoubleBattle, Pokemon
@@ -18,6 +16,8 @@ from poke_env.player.battle_order import (
 from poke_env.player.player import Player
 
 from p0.battle.actions import (
+    FORCED_ACTION,
+    MEGA_FORCED_ACTION,
     ActionKind,
     SlotAction,
     canonical_team_actions,
@@ -114,10 +114,9 @@ def action_to_single_order(
             )
 
     if not fake:
-        valid_orders = {str(valid_order) for valid_order in battle.valid_orders[position]}
-        if str(order) not in valid_orders:
+        if str(order) not in map(str, battle.valid_orders[position]):
             raise ValueError(
-                f"Order {order} for action {action} is not in action space {valid_orders}"
+                f"Order {order} for action {action} is not valid for position {position}"
             )
 
     return order
@@ -178,9 +177,8 @@ def single_order_to_action(
         return np.int64(0)
 
     if not fake:
-        valid_orders = {str(valid_order) for valid_order in battle.valid_orders[position]}
-        if str(order) not in valid_orders:
-            raise ValueError(f"Order {order} is not in action space {valid_orders}")
+        if str(order) not in map(str, battle.valid_orders[position]):
+            raise ValueError(f"Order {order} is not valid for position {position}")
 
     if isinstance(order.order, Pokemon):
         species = tuple(pokemon.base_species for pokemon in battle.team.values())
@@ -192,10 +190,9 @@ def single_order_to_action(
 
     available = battle.available_moves[position]
     if len(available) == 1 and available[0].id in {"struggle", "recharge"}:
-        return np.int64(encode_action(decode_action(47 if order.mega else 48)))
+        return np.int64(MEGA_FORCED_ACTION if order.mega else FORCED_ACTION)
 
-    moves: tuple[Any, ...] = tuple(active.moves.values())
-    move_slot = tuple(move.id for move in moves).index(order.order.id)
+    move_slot = tuple(active.moves).index(order.order.id)
     return np.int64(
         encode_action(
             SlotAction(

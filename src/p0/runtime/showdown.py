@@ -1,4 +1,4 @@
-"""Deterministic lifecycle management for pinned local Showdown processes."""
+"""Start and stop pinned local Showdown processes."""
 
 from __future__ import annotations
 
@@ -29,25 +29,19 @@ def build_showdown(showdown_root: Path = DEFAULT_PATHS.showdown_root) -> None:
 
 
 def allocate_loopback_ports(count: int) -> tuple[int, ...]:
-    """Allocate loopback socket ports dynamically."""
+    """Find distinct free ports on the loopback interface."""
     if count < 1:
         raise ValueError("At least one Showdown port is required")
 
-    listeners: list[socket.socket] = []
-    try:
-        for _ in range(count):
-            listener = socket.socket()
-            listener.bind(("127.0.0.1", 0))
-            listeners.append(listener)
-
-        return tuple(int(listener.getsockname()[1]) for listener in listeners)
-    finally:
+    with contextlib.ExitStack() as stack:
+        listeners = [stack.enter_context(socket.socket()) for _ in range(count)]
         for listener in listeners:
-            listener.close()
+            listener.bind(("127.0.0.1", 0))
+        return tuple(int(listener.getsockname()[1]) for listener in listeners)
 
 
 class ShowdownServer:
-    """Own exactly one local Showdown subprocess with non-blocking file log output."""
+    """Manage one local Showdown process and its error log."""
 
     def __init__(
         self,
@@ -87,13 +81,18 @@ class ShowdownServer:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_file = self.log_path.open("a", encoding="utf-8")
 
-        self.process = subprocess.Popen(
-            command,
-            cwd=self.showdown_root,
-            stdout=subprocess.DEVNULL,
-            stderr=self._log_file,
-            text=True,
-        )
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=self.showdown_root,
+                stdout=subprocess.DEVNULL,
+                stderr=self._log_file,
+                text=True,
+            )
+        except Exception:
+            # Release the owned log before propagating any process-start failure.
+            self._close_log()
+            raise
         deadline = time.monotonic() + self.startup_timeout
 
         while time.monotonic() < deadline:
@@ -117,9 +116,7 @@ class ShowdownServer:
         code = self.process.returncode
         self.process = None
 
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
+        self._close_log()
 
         stderr = (
             self.log_path.read_text(encoding="utf-8")[-4000:] if self.log_path.is_file() else ""
@@ -138,9 +135,12 @@ class ShowdownServer:
                 process.kill()
                 process.wait(timeout=self.stop_timeout)
 
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
+        self._close_log()
+
+    def _close_log(self) -> None:
+        log_file, self._log_file = self._log_file, None
+        if log_file is not None:
+            log_file.close()
 
     def __enter__(self) -> ShowdownServer:
         self.start()
