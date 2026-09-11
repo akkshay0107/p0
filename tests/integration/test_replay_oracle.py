@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 import pytest
 from poke_env.battle import DoubleBattle
 
 from p0.model.resources import default_runtime_resources
 from p0.replays.protocol import parse_replay_payload
+from p0.replays.reconstruction.contract import SHOWDOWN_COMMIT, run_pinned_showdown_oracle
 from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import reduce_replay_state
-from p0.replays.release import SHOWDOWN_COMMIT, run_pinned_showdown_oracle
 
 
-class TestReplayReleaseIntegration:
+class TestReplayOracleIntegration:
+    @pytest.mark.integration
+    def test_oracle_accepts_relative_repository_root(self, monkeypatch) -> None:
+        root = Path.cwd()
+        monkeypatch.chdir(root.parent)
+
+        assert run_pinned_showdown_oracle(repository_root=root.name)
+
     @pytest.mark.integration
     def test_battlestream_oracle_emits_real_pinned_target_protocol(self) -> None:
         protocol_values: list[str] = []

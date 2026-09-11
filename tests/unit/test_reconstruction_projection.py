@@ -17,7 +17,7 @@ from p0.model.structured_observation import (
 from p0.replays.compile import compile_documents, compile_payloads, write_tensor_shards
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.projection import impute_replay_stats
-from tests.unit.replay_fixtures import decision_payload
+from tests.unit.replay_fixtures import decision_payload, golden_replay_payload
 
 _GOLDEN_REPLAY_DIRECTORY = (
     Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
@@ -42,6 +42,36 @@ class TestReconstructionProjection:
         assert second_active is not None
         assert first_active.member_id.side.value == "p1"
         assert second_active.member_id.side.value == "p2"
+
+    def test_preview_observation_excludes_executed_lead_choices(self) -> None:
+        first_payload = golden_replay_payload("preview-first")
+        second_payload = golden_replay_payload("preview-second")
+        second_payload["log"] = (
+            str(second_payload["log"])
+            .replace(
+                "|switch|p1a: Pikachu|Pikachu, L50|100/100",
+                "|switch|p1a: Raichu|Raichu, L50|100/100",
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu",
+                "|move|p1a: Raichu|Protect|p1a: Raichu",
+            )
+        )
+
+        first = compile_payloads((first_payload,), chunksize=0).games[0].perspectives[0]
+        second = compile_payloads((second_payload,), chunksize=0).games[0].perspectives[0]
+        first_preview = first.snapshots[0].view
+        second_preview = second.snapshots[0].view
+
+        assert first_preview.active_pokemon == second_preview.active_pokemon == (None, None)
+        assert (
+            tuple(member.selected_in_teampreview for member in first_preview.team.values())
+            == (None,) * 6
+        )
+        assert (
+            tuple(member.selected_in_teampreview for member in second_preview.team.values())
+            == (None,) * 6
+        )
 
     def test_replay_stats_are_explicit_for_both_sides_and_never_known(self) -> None:
         document = parse_replay_payload(decision_payload())

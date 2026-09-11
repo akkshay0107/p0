@@ -46,6 +46,7 @@ from p0.replays.reconstruction.decisions import (
     infer_decision_windows,
     reconstruct_decisions_from_trace,
 )
+from p0.replays.reconstruction.diagnostics import ReplayRejectionCategory
 from p0.replays.reconstruction.events import parse_protocol_event
 from p0.replays.reconstruction.projection import (
     ProjectedPerspective,
@@ -55,11 +56,6 @@ from p0.replays.reconstruction.projection import (
 )
 from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import reduce_replay_state
-from p0.replays.release import (
-    ReleaseGateReport,
-    ReleaseGateStatus,
-    evaluate_release_gates,
-)
 from p0.replays.schema import REPLAY_IR_SCHEMA_VERSION, DecisionType, LabelKind
 from p0.replays.shards import (
     BO3_COMPILATION_SEMANTICS,
@@ -88,7 +84,6 @@ _WORKER_DEX: Mapping[str, Any] | None = None
 class ShardBuildResult:
     manifest_path: Path
     manifest: ShardManifest
-    gate_report: ReleaseGateReport | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,10 +153,7 @@ def _runtime_hash(manifest_path: str | Path) -> str:
 
 
 def _source_series(result: CompilationResult) -> dict[str, tuple[str, ...]]:
-    return {
-        group.record.series_id: tuple(sorted(group.record.game_replay_ids))
-        for group in result.series
-    }
+    return {group.record.series_id: group.record.game_replay_ids for group in result.series}
 
 
 def _raw_replay_identities(
@@ -186,7 +178,7 @@ def _build_configuration(
     *,
     max_candidates: int,
     max_decisions_per_shard: int,
-    external_rejections: tuple[str, ...] = (),
+    external_rejections: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "parser_version": REPLAY_PARSER_VERSION,
@@ -200,7 +192,7 @@ def _build_configuration(
             "table_sha256": sha256_file(DEFAULT_SPREAD_TABLE_PATH),
         },
         "max_decisions_per_shard": max_decisions_per_shard,
-        "external_rejections": sorted(external_rejections),
+        "external_rejections": sorted(external_rejections or ()),
     }
 
 
@@ -218,7 +210,7 @@ def _dataset_hash(
             key=lambda replay: replay["replay_id"],
         ),
         "source_series": {
-            series_id: list(sorted(source_series[series_id])) for series_id in sorted(source_series)
+            series_id: list(source_series[series_id]) for series_id in sorted(source_series)
         },
         "source_format_id": source_format_id,
         "compilation_semantics": BO3_COMPILATION_SEMANTICS,
@@ -257,20 +249,7 @@ def _validate_existing_build(
         if not path.is_file() or sha256_file(path) != expected:
             raise ValueError(f"Existing dataset artifact failed validation: {path}")
 
-    gate_report: ReleaseGateReport | None = None
-    gate_path = root / "release_gate.json"
-    if gate_path.is_file():
-        try:
-            gate_data = orjson.loads(gate_path.read_bytes())
-            gate_report = ReleaseGateReport(
-                status=ReleaseGateStatus(gate_data["status"]),
-                checks=gate_data["checks"],
-                reasons=tuple(gate_data["reasons"]),
-            )
-        except Exception:
-            pass
-
-    return ShardBuildResult(root / "manifest.json", manifest, gate_report=gate_report)
+    return ShardBuildResult(root / "manifest.json", manifest)
 
 
 def _empty_scalar_values() -> dict[str, list[Any]]:
@@ -406,9 +385,7 @@ def write_tensor_shards(
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     max_candidates: int = 256,
-    raw_replays: Iterable[Mapping[str, str]] | None = None,
-    source_series: Mapping[str, tuple[str, ...]] | None = None,
-    external_rejections: tuple[str, ...] = (),
+    external_rejections: Mapping[str, str] | None = None,
 ) -> ShardBuildResult:
     """Persist compiled replays as immutable, runtime-bound tensor shards."""
     if max_decisions_per_shard <= 0:
@@ -421,8 +398,21 @@ def write_tensor_shards(
         max_decisions_per_shard=max_decisions_per_shard,
         external_rejections=external_rejections,
     )
-    identities = tuple(raw_replays or _raw_replay_identities(result))
-    memberships = dict(source_series or _source_series(result))
+    rejected = dict(external_rejections or {})
+    identities = (
+        *_raw_replay_identities(result),
+        *(
+            {"replay_id": replay_id, "content_sha256": digest}
+            for replay_id, digest in sorted(rejected.items())
+        ),
+    )
+    memberships = _source_series(result)
+    memberships.update(
+        {
+            f"rejected-{hashlib.sha256(replay_id.encode()).hexdigest()[:24]}": (replay_id,)
+            for replay_id in rejected
+        }
+    )
     games_by_series: dict[str, list[CompiledGame]] = {}
     for game in result.games:
         games_by_series.setdefault(game.series_id, []).append(game)
@@ -464,7 +454,7 @@ def write_tensor_shards(
     builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
-    diagnostics["rejected_input_files"] += len(external_rejections)
+    diagnostics["rejected_input_files"] += len(rejected)
     current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
     current_decisions = 0
     shard_index = 0
@@ -557,7 +547,7 @@ def write_tensor_shards(
 
         flush()
         artifact_hashes = {entry.filename: entry.sha256 for entry in entries}
-        source_games = diagnostics.get("replays", len(result.games)) + len(external_rejections)
+        source_games = diagnostics.get("replays", len(result.games)) + len(rejected)
         timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
         manifest = ShardManifest(
             global_contract_sha256=runtime_hash,
@@ -571,7 +561,7 @@ def write_tensor_shards(
             source_series=memberships,
             source_games=source_games,
             accepted_games=diagnostics.get("accepted_games", source_games),
-            rejected_games=diagnostics.get("rejected_games", 0) + len(external_rejections),
+            rejected_games=diagnostics.get("rejected_games", 0) + len(rejected),
             artifact_hashes=artifact_hashes,
             shards=tuple(entries),
             diagnostics={key: int(value) for key, value in diagnostics.items() if value >= 0},
@@ -580,33 +570,8 @@ def write_tensor_shards(
         validate_artifact_runtime_contract(manifest.to_dict(), manifest_path)
         atomic_json_save(root / "manifest.json", manifest.to_dict())
 
-        # Evaluate and record release publication gates
-        rejection_categories = [
-            key.removeprefix("rejected_reconstruction_")
-            for key in diagnostics
-            if key.startswith("rejected_reconstruction_") and diagnostics[key] > 0
-        ]
-        if external_rejections:
-            rejection_categories.append("INVALID_INPUT_CONTRACT")
-
-        all_label_kinds: list[LabelKind] = []
-        for game in result.games:
-            for perspective in game.perspectives:
-                for decision in perspective.decisions:
-                    all_label_kinds.append(decision.evidence.label_kind)
-
-        all_loss_masks = [1.0 if kind is not LabelKind.UNKNOWN else 0.0 for kind in all_label_kinds]
-        gate_report = evaluate_release_gates(
-            rejection_categories=rejection_categories,
-            label_kinds=all_label_kinds,
-            loss_masks=all_loss_masks,
-            sensitivity_data_configured=True,
-            sensitivity_evaluation_unchanged=True,
-        )
-        atomic_json_save(root / "release_gate.json", gate_report.to_dict())
-
         os.replace(root, destination)
-        return ShardBuildResult(destination / "manifest.json", manifest, gate_report=gate_report)
+        return ShardBuildResult(destination / "manifest.json", manifest)
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -813,7 +778,7 @@ def _compile_worker(
         tuple[int, int],
         int,
     ],
-) -> tuple[CompiledGame | None, str | None]:
+) -> tuple[CompiledGame | None, ReplayRejectionCategory | None]:
     document, series_id, game_number, roles, max_candidates = args
     runtime_dex = _WORKER_DEX
     if runtime_dex is None:
@@ -821,7 +786,7 @@ def _compile_worker(
 
     resolved = resolve_replay_events(document, dex=runtime_dex)
     if resolved.diagnostics:
-        return None, resolved.diagnostics[0].category.value
+        return None, resolved.diagnostics[0].category
     events = resolved.require_accepted()
 
     state = reduce_replay_state(
@@ -832,7 +797,7 @@ def _compile_worker(
     )
 
     if state.diagnostics:
-        return None, state.diagnostics[0].category.value
+        return None, state.diagnostics[0].category
 
     windows = infer_decision_windows(events)
     decisions = tuple(
@@ -852,7 +817,7 @@ def _compile_worker(
         diagnostic for result in decisions for diagnostic in result.diagnostics
     )
     if decision_diagnostics:
-        return None, decision_diagnostics[0].category.value
+        return None, decision_diagnostics[0].category
 
     perspectives = project_replay_perspectives(
         document,
@@ -919,7 +884,7 @@ def compile_documents(
         chunksize = max(1, len(jobs) // ((os.cpu_count() or 1) * 4))
 
     if not jobs:
-        results: Iterable[tuple[CompiledGame | None, str | None]] = ()
+        results: Iterable[tuple[CompiledGame | None, ReplayRejectionCategory | None]] = ()
     elif len(jobs) <= (os.cpu_count() or 1) or (chunksize is not None and chunksize <= 0):
         results = [_compile_worker(job) for job in jobs]
     else:
@@ -937,7 +902,7 @@ def compile_documents(
     for job, (compiled, reason) in zip(jobs, results, strict=True):
         series_id = job[1]
         if reason is not None:
-            counters[f"rejected_reconstruction_{reason}"] += 1
+            counters[f"rejected_reconstruction_{reason.value}"] += 1
             failed_series.add(series_id)
             continue
         if compiled is None:
@@ -1021,7 +986,7 @@ def compile_to_shards(
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     chunksize: int | None = None,
-    external_rejections: tuple[str, ...] = (),
+    external_rejections: Mapping[str, str] | None = None,
 ) -> ShardBuildResult:
     """Compile documents and write a validated tensor shard build."""
     result = compile_documents(

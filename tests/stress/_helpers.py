@@ -244,7 +244,12 @@ def stress_random_replay_teams(
     rng: random.Random,
 ) -> tuple[tuple[TeamMember, ...], tuple[TeamMember, ...]]:
     """Return two independent six-member teams for a synthetic replay payload."""
-    return _random_team_members(rng), _random_team_members(rng)
+    teams: list[tuple[TeamMember, ...]] = []
+    while len(teams) < 2:
+        team = _random_team_members(rng)
+        if all(member.ability.casefold() != "illusion" for member in team):
+            teams.append(team)
+    return teams[0], teams[1]
 
 
 def stress_series_id(parent: str, players: tuple[str, str] = ("Alice", "Bob")) -> str:

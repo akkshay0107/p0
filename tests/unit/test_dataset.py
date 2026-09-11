@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
@@ -135,3 +137,52 @@ class TestReplayDatasets:
         )
         with pytest.raises((ValueError, KeyError), match="duplicate|already|unique|invalid"):
             build_dataset_from_payloads(tmp_path / "duplicate", duplicate_payloads)
+
+    def test_dataset_rejects_nonchronological_game_summaries(self, tmp_path: Path) -> None:
+        built = write_dataset_replay_dataset(
+            tmp_path,
+            (sample_replay_payload("game-1"), sample_replay_payload("game-2")),
+        )
+        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
+        payload = torch.load(shard_path, weights_only=True, map_location="cpu")
+        summaries = payload["series_summaries"]
+        payload["series_summaries"] = [*summaries[2:4], *summaries[0:2]]
+        torch.save(payload, shard_path)
+
+        manifest = built.manifest.to_dict()
+        digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+        manifest["shards"][0]["sha256"] = digest
+        manifest["shards"][0]["byte_size"] = shard_path.stat().st_size
+        manifest["artifact_hashes"][built.manifest.shards[0].filename] = digest
+        altered = built.manifest_path.parent / "altered.json"
+        altered.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="not chronological"):
+            list(LazyReplayDataset(altered))
+
+    def test_dataset_rejects_semantically_duplicate_shards(self, tmp_path: Path) -> None:
+        built = build_dataset(tmp_path, 1)
+        entry = built.manifest.shards[0]
+        original = built.manifest_path.parent / entry.filename
+        duplicate = built.manifest_path.parent / "duplicate.pt"
+        payload = torch.load(original, weights_only=True, map_location="cpu")
+        payload["tensors"]["outcome"] = -payload["tensors"]["outcome"]
+        torch.save(payload, duplicate)
+        digest = hashlib.sha256(duplicate.read_bytes()).hexdigest()
+
+        manifest = built.manifest.to_dict()
+        duplicate_entry = dict(manifest["shards"][0])
+        duplicate_entry["filename"] = duplicate.name
+        duplicate_entry["sha256"] = digest
+        duplicate_entry["byte_size"] = duplicate.stat().st_size
+        manifest["shards"].append(duplicate_entry)
+        manifest["artifact_hashes"][duplicate.name] = digest
+        manifest["raw_replays"]["phantom"] = "a" * 64
+        manifest["source_series"]["phantom-series"] = ["phantom"]
+        manifest["source_games"] = 2
+        manifest["accepted_games"] = 2
+        altered = built.manifest_path.parent / "duplicate.json"
+        altered.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="spans multiple shards|cover every accepted replay"):
+            LazyReplayDataset(altered, verify_hashes=True)

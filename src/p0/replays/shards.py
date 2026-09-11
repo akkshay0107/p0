@@ -21,6 +21,7 @@ from p0.model.structured_observation import (
 from p0.replays.schema import (
     REPLAY_IR_SCHEMA_VERSION,
     DecisionType,
+    LabelKind,
     MaskProvenance,
     _is_sha256,
     _require_fields,
@@ -240,15 +241,22 @@ class ShardManifest:
         if len(self.raw_replays) != self.source_games:
             raise ValueError("ShardManifest.raw_replays must account for every source game")
 
+        if self.games != self.accepted_games * 2:
+            raise ValueError("Shard game counts must contain two perspectives per accepted game")
+
         for filename, digest in self.artifact_hashes.items():
             if not filename or not _is_sha256(digest):
                 raise ValueError("ShardManifest.artifact_hashes contains an invalid entry")
 
         seen: set[str] = set()
+        digests: set[str] = set()
         for entry in self.shards:
             if entry.filename in seen:
                 raise ValueError(f"Duplicate shard filename {entry.filename!r}")
+            if entry.sha256 in digests:
+                raise ValueError(f"Duplicate shard content {entry.sha256!r}")
             seen.add(entry.filename)
+            digests.add(entry.sha256)
 
         for key, count in self.diagnostics.items():
             if not isinstance(key, str) or type(count) is not int or count < 0:
@@ -387,6 +395,22 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
     decisions = tensors["loss_mask"].shape[0]
     candidate_offsets = tensors["candidate_offsets"]
 
+    if decisions == 0:
+        raise ValueError("Published replay shards must contain at least one decision")
+
+    decision_fields = {name for name, _, _ in observation_field_specs()} | {
+        "action_mask",
+        "mask_provenance",
+        "label_kind",
+        "label_confidence",
+        "loss_mask",
+        "decision_type",
+        "exact_action",
+        "outcome",
+    }
+    if any(tensors[name].shape[0] != decisions for name in decision_fields):
+        raise ValueError("Shard decision tensors must have the same leading dimension")
+
     if (
         candidate_offsets.shape != (decisions + 1,)
         or candidate_offsets[0].item() != 0
@@ -398,17 +422,22 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
     for name in ("game_offsets", "series_offsets"):
         offsets = tensors[name]
         if (
-            offsets[0].item() != 0
+            offsets.numel() < 2
+            or offsets.shape[0] > decisions + 1
+            or offsets[0].item() != 0
             or offsets[-1].item() != decisions
-            or torch.any(offsets[1:] < offsets[:-1])
+            or torch.any(offsets[1:] <= offsets[:-1])
         ):
-            raise ValueError(f"Shard {name} must be nondecreasing and end at decisions")
+            raise ValueError(f"Shard {name} must increase from zero to the decision count")
 
-    if decisions == 0:
-        raise ValueError("Published replay shards must contain at least one decision")
+    game_boundaries = set(tensors["game_offsets"].tolist())
+    if any(offset not in game_boundaries for offset in tensors["series_offsets"].tolist()):
+        raise ValueError("Shard series_offsets must fall on game boundaries")
 
     if not torch.isfinite(tensors["label_confidence"]).all():
         raise ValueError("Shard label_confidence contains non-finite values")
+    if torch.any((tensors["label_confidence"] < 0) | (tensors["label_confidence"] > 1)):
+        raise ValueError("Shard label_confidence must be in [0, 1]")
 
     if (
         not torch.isfinite(tensors["loss_mask"]).all()
@@ -430,9 +459,9 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
 
     label_kind = tensors["label_kind"]
     counts = candidate_offsets[1:] - candidate_offsets[:-1]
-    exact = label_kind == 1
-    partial = label_kind == 2
-    unknown = label_kind == 3
+    exact = label_kind == int(LabelKind.EXACT)
+    partial = label_kind == int(LabelKind.PARTIAL)
+    unknown = label_kind == int(LabelKind.UNKNOWN)
 
     if torch.any(~(exact | partial | unknown)):
         raise ValueError("Shard label_kind contains an unsupported value")
@@ -452,6 +481,8 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
         raise ValueError("Shard candidate action ids are outside the action contract")
 
     if candidates.numel():
+        if torch.any(tensors["exact_action"][exact] != candidates[candidate_offsets[:-1][exact]]):
+            raise ValueError("Shard exact actions must match their only candidate")
         owners = torch.repeat_interleave(torch.arange(decisions), counts)
         legal = action_mask[owners, 0, candidates[:, 0]] & action_mask[owners, 1, candidates[:, 1]]
 
@@ -476,3 +507,16 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
 
         if torch.any(~legal | same_switch | (mega_first & mega_second)):
             raise ValueError("Shard contains an illegal labeled candidate")
+
+    decision_type = tensors["decision_type"]
+    if torch.any(
+        ~torch.isin(
+            decision_type,
+            torch.tensor(
+                tuple(int(value) for value in DecisionType if value), device=decision_type.device
+            ),
+        )
+    ):
+        raise ValueError("Shard decision_type contains an unsupported value")
+    if torch.any((tensors["outcome"] < -1) | (tensors["outcome"] > 1)):
+        raise ValueError("Shard outcomes must be in [-1, 1]")

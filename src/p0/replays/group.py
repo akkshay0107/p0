@@ -70,26 +70,25 @@ def _time(document: ReplayDocument) -> datetime:
 
 def _team_hash(document: ReplayDocument, side: int) -> str:
     ots = document.ots[side]
-    members = []
-    for member in sorted(
-        ots.members,
-        key=lambda item: (
-            item.species.casefold(),
-            item.item.casefold(),
-            item.ability.casefold(),
-            item.nature.casefold(),
-            tuple(sorted(move.casefold() for move in item.moves)),
-        ),
-    ):
-        members.append(
-            {
-                "species": member.species.casefold(),
-                "item": member.item.casefold(),
-                "ability": member.ability.casefold(),
-                "nature": member.nature.casefold(),
-                "moves": sorted(move.casefold() for move in member.moves),
-            }
+    members = [
+        {
+            "species": member.species.casefold(),
+            "item": member.item.casefold(),
+            "ability": member.ability.casefold(),
+            "nature": member.nature.casefold(),
+            "moves": sorted(move.casefold() for move in member.moves),
+        }
+        for member in sorted(
+            ots.members,
+            key=lambda item: (
+                item.species.casefold(),
+                item.item.casefold(),
+                item.ability.casefold(),
+                item.nature.casefold(),
+                tuple(sorted(move.casefold() for move in item.moves)),
+            ),
         )
+    ]
     payload = orjson.dumps(members, option=orjson.OPT_SORT_KEYS)
     return hashlib.sha256(payload).hexdigest()
 
@@ -201,18 +200,7 @@ def _make_group(
     method: GroupingMethod,
     diagnostics: tuple[GroupingDiagnostic, ...] = (),
 ) -> GroupedSeries:
-    """
-    Forms a strict deterministic Series out of a collection of grouped games.
-
-    Arguments:
-        documents: A tuple of replay documents belonging to the same grouping bucket.
-        key: The grouping identifier key (e.g. parent room).
-        method: The method by which these games were grouped.
-        diagnostics: Any existing diagnostics to carry over.
-
-    Returns:
-        A strictly verified and deterministic GroupedSeries.
-    """
+    """Build one checked series from a grouping bucket."""
     if not documents:
         raise ValueError("Cannot group an empty replay collection")
 

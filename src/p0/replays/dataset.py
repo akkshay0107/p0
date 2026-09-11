@@ -306,6 +306,7 @@ class LazyReplayDataset(IterableDataset):
                 if assigned == split
             )
         )
+        self._accepted_series_ids = self._validate_shard_family()
 
     def __iter__(self) -> Iterator[ReplayGameChunk]:
         selected = self._selected_series
@@ -341,6 +342,29 @@ class LazyReplayDataset(IterableDataset):
                     game_offsets[game_index + 1],
                     is_series_end=int(item["game_number"]) == final_game_numbers[series_key],
                 )
+
+    def accepted_series_ids(self) -> tuple[str, ...]:
+        """Return series that have games in the shard payloads."""
+        return self._accepted_series_ids
+
+    def _validate_shard_family(self) -> tuple[str, ...]:
+        series_shards: dict[str, str] = {}
+        replay_counts: dict[str, int] = {}
+        for entry in self.manifest.shards:
+            _, summaries = self._load_shard(entry)
+            for item in summaries:
+                series_id = str(item["series_id"])
+                previous = series_shards.setdefault(series_id, entry.filename)
+                if previous != entry.filename:
+                    raise ValueError(f"Series {series_id!r} spans multiple shards")
+                replay_id = str(item["source_replay_id"])
+                replay_counts[replay_id] = replay_counts.get(replay_id, 0) + 1
+
+        if len(replay_counts) != self.manifest.accepted_games or any(
+            count != 2 for count in replay_counts.values()
+        ):
+            raise ValueError("Shard summaries do not cover every accepted replay exactly twice")
+        return tuple(sorted(series_shards))
 
     def _load_shard(
         self, entry: ShardIndexEntry
@@ -411,7 +435,74 @@ class LazyReplayDataset(IterableDataset):
         ):
             raise ValueError(f"Shard summaries must be objects in {path}")
 
+        self._validate_summaries(tensors, summaries, path)
+
+        if (
+            tensors["loss_mask"].shape[0] != entry.decisions
+            or len(summaries) != entry.games
+            or tensors["series_offsets"].numel() - 1 != entry.series
+        ):
+            raise ValueError(f"Shard payload counts do not match its index entry in {path}")
+
         return tensors, summaries
+
+    def _validate_summaries(
+        self,
+        tensors: Mapping[str, torch.Tensor],
+        summaries: list[Mapping[str, Any]],
+        path: Path,
+    ) -> None:
+        game_offsets = tensors["game_offsets"].tolist()
+        expected_series_offsets: list[int] = []
+        seen_series: set[str] = set()
+        last_series = ""
+        games: dict[tuple[str, int], list[tuple[int, int]]] = {}
+        sequences: dict[SeriesPerspectiveKey, list[int]] = {}
+
+        for index, item in enumerate(summaries):
+            series_id = item["series_id"]
+            replay_id = item["source_replay_id"]
+            game_number = item["game_number"]
+            player = item["player"]
+            canonical_player = item["canonical_player"]
+            if (
+                not isinstance(series_id, str)
+                or not isinstance(replay_id, str)
+                or type(game_number) is not int
+                or type(player) is not int
+                or type(canonical_player) is not int
+                or type(item["outcome_valid"]) is not bool
+                or player not in (0, 1)
+                or canonical_player not in (0, 1)
+            ):
+                raise ValueError(f"Shard summary has invalid field types in {path}")
+
+            replay_ids = self.manifest.source_series.get(series_id)
+            if (
+                replay_ids is None
+                or not 1 <= game_number <= len(replay_ids)
+                or replay_ids[game_number - 1] != replay_id
+            ):
+                raise ValueError(f"Shard summary does not match source series in {path}")
+
+            if series_id != last_series:
+                if series_id in seen_series:
+                    raise ValueError(f"Shard series summaries are not contiguous in {path}")
+                seen_series.add(series_id)
+                expected_series_offsets.append(game_offsets[index])
+                last_series = series_id
+
+            games.setdefault((series_id, game_number), []).append((player, canonical_player))
+            key = SeriesPerspectiveKey(series_id, canonical_player)
+            sequences.setdefault(key, []).append(game_number)
+
+        expected_series_offsets.append(game_offsets[-1])
+        if tensors["series_offsets"].tolist() != expected_series_offsets:
+            raise ValueError(f"Shard series offsets do not match summaries in {path}")
+        if any(sorted(rows) not in ([(0, 0), (1, 1)], [(0, 1), (1, 0)]) for rows in games.values()):
+            raise ValueError(f"Shard games must contain both player perspectives in {path}")
+        if any(numbers != list(range(1, len(numbers) + 1)) for numbers in sequences.values()):
+            raise ValueError(f"Shard game summaries are not chronological in {path}")
 
     @staticmethod
     def _chunk(

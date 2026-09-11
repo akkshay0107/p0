@@ -21,7 +21,7 @@ def _valid_shard_entry() -> ShardIndexEntry:
         filename="shard-00000.pt",
         sha256="a" * 64,
         decisions=10,
-        games=2,
+        games=4,
         series=1,
         byte_size=2048,
     )
@@ -108,7 +108,7 @@ class TestShardManifest:
         manifest = _valid_shard_manifest()
         assert ShardManifest.from_dict(manifest.to_dict()) == manifest
         assert manifest.decisions == 10
-        assert manifest.games == 2
+        assert manifest.games == 4
         assert manifest.series == 1
 
     def test_rejects_unsupported_schema(self) -> None:
@@ -164,4 +164,22 @@ class TestValidateShardTensors:
         tensors["candidate_values"] = torch.tensor([[7, 7], [0, 0]], dtype=torch.long)
         tensors["loss_mask"][0] = 1.0  # Should be 0.0
         with pytest.raises(ValueError, match="UNKNOWN labels must have zero loss"):
+            validate_shard_tensors(tensors)
+
+    def test_mismatched_decision_dimensions_raise(self) -> None:
+        tensors = _valid_tensors()
+        tensors["outcome"] = tensors["outcome"][:1]
+        with pytest.raises(ValueError, match="same leading dimension"):
+            validate_shard_tensors(tensors)
+
+    def test_exact_action_must_match_candidate(self) -> None:
+        tensors = _valid_tensors()
+        tensors["exact_action"][0] = torch.tensor([0, 0])
+        with pytest.raises(ValueError, match="exact actions must match"):
+            validate_shard_tensors(tensors)
+
+    def test_series_offsets_must_follow_game_boundaries(self) -> None:
+        tensors = _valid_tensors()
+        tensors["series_offsets"] = torch.tensor([0, 1, 2], dtype=torch.long)
+        with pytest.raises(ValueError, match="fall on game boundaries"):
             validate_shard_tensors(tensors)

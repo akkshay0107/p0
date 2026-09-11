@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,41 @@ SHOWDOWN_COMMIT = "8282e63102fa824fd2f7472778ec09793ceb7cac"
 CONTRACT_PATH = DEFAULT_PATHS.data_root / "replay_protocol_contract.json"
 RAW_INVENTORY_PATH = DEFAULT_PATHS.data_root / "showdown_raw_emission_inventory.json"
 DEX_PATH = DEFAULT_PATHS.data_root / "champions_dex.json"
+
+
+def run_pinned_showdown_oracle(
+    *,
+    repository_root: str | Path,
+    timeout_seconds: float = 10.0,
+) -> tuple[str, ...]:
+    """Run the local Showdown BattleStream reference check."""
+    root = Path(repository_root).resolve()
+    showdown_root = root / "pokemon-showdown"
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=showdown_root,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=timeout_seconds,
+        ).stdout.strip()
+        if revision != SHOWDOWN_COMMIT:
+            raise ValueError(f"Pinned Showdown commit mismatch: {revision!r}")
+        result = subprocess.run(
+            ["node", str(root / "scripts" / "showdown_battlestream_oracle.js")],
+            cwd=root,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise ValueError("Pinned Showdown BattleStream check failed") from exc
+    if payload.get("commit") != SHOWDOWN_COMMIT or not isinstance(payload.get("protocol"), list):
+        raise ValueError("BattleStream check returned an invalid pinned payload")
+    return tuple(str(line) for line in payload["protocol"])
 
 
 def load_protocol_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
@@ -266,6 +302,7 @@ __all__ = [
     "SHOWDOWN_COMMIT",
     "load_protocol_contract",
     "load_raw_emission_inventory",
+    "run_pinned_showdown_oracle",
     "validate_raw_emission_inventory",
     "validate_protocol_contract",
 ]

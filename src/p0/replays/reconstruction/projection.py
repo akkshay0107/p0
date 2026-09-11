@@ -37,7 +37,9 @@ _ENUM_ALIASES = {
     "wonderroom": "WONDER_ROOM",
     "toxicspikes": "TOXIC_SPIKES",
 }
-_SPECIES_INDEX_CACHE: tuple[Mapping[str, Any], dict[str, Mapping[str, Any]]] | None = None
+_DEX_INDEX_CACHE: tuple[Mapping[str, Any], dict[str, Mapping[str, Any]], dict[str, str]] | None = (
+    None
+)
 
 
 def _enum_name(value: str) -> str:
@@ -343,11 +345,20 @@ def _species_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return by_id
 
 
-def _cached_species_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    global _SPECIES_INDEX_CACHE
-    if _SPECIES_INDEX_CACHE is None or _SPECIES_INDEX_CACHE[0] is not dex:
-        _SPECIES_INDEX_CACHE = (dex, _species_index(dex))
-    return _SPECIES_INDEX_CACHE[1]
+def _cached_dex_indexes(
+    dex: Mapping[str, Any],
+) -> tuple[dict[str, Mapping[str, Any]], dict[str, str]]:
+    global _DEX_INDEX_CACHE
+    if _DEX_INDEX_CACHE is None or _DEX_INDEX_CACHE[0] is not dex:
+        move_categories = {
+            normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): str(
+                entry.get("category", "")
+            )
+            for entry in dex.get("moves", ())
+            if isinstance(entry, Mapping)
+        }
+        _DEX_INDEX_CACHE = (dex, _species_index(dex), move_categories)
+    return _DEX_INDEX_CACHE[1], _DEX_INDEX_CACHE[2]
 
 
 def impute_replay_stats(
@@ -357,14 +368,7 @@ def impute_replay_stats(
 ) -> tuple[ReplayStatValue, ...]:
     """Estimate every OTS member exactly once, retaining explicit unknowns."""
     table = load_spread_table_file()
-    species = _cached_species_index(dex)
-    move_categories = {
-        normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): str(
-            entry.get("category", "")
-        )
-        for entry in dex.get("moves", ())
-        if isinstance(entry, Mapping)
-    }
+    species, move_categories = _cached_dex_indexes(dex)
     estimates: list[ReplayStatValue] = []
     for sheet in document.ots:
         for member in sheet.members:
@@ -642,7 +646,7 @@ def project_replay_perspectives(
             window_events = event_tuple[window.start_line_index : window.end_line_index]
             preview = decision.decision_type is DecisionType.TEAM_PREVIEW
             if preview:
-                snapshot = snapshots[max(0, window.end_line_index - 1)]
+                snapshot = snapshots[decision.pre_line_index]
             else:
                 if decision.pre_line_index == 0:
                     raise ValueError("Non-preview decision cannot start at line zero")

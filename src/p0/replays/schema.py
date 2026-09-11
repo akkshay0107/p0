@@ -1,20 +1,4 @@
-"""
-Versioned replay intermediate representation and action-evidence labels.
-
-The raw layer beneath this schema is deliberately schema-free: scraped replay
-JSON is stored as verbatim immutable response bytes on disk
-(artifacts/replays/raw/<format_id>/<replay_id>.json.gz) and is never wrapped
-in a versioned record. The only structured raw-layer artifact is an
-append-only fetch index of FetchIndexEntry lines used for resume and
-deduplication. Every IR record here is derived from those raw bytes and fully
-regenerable, so bumping REPLAY_IR_SCHEMA_VERSION means re-running the parser
-over the cache, never re-scraping.
-
-The IR is also independent of the tensor observation schema: records store
-raw protocol text and action ids from the closed 49-action contract, never
-tensors or vocabulary ids, so vocabulary or observation changes never require
-re-parsing protocol structure.
-"""
+"""Versioned replay records and action labels derived from cached raw JSON."""
 
 from __future__ import annotations
 
@@ -510,18 +494,16 @@ def _is_sha256(value: Any) -> bool:
 
 def _require_iso_timestamp(value: str, owner: str) -> None:
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(f"{owner} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{owner} must include a timezone")
 
 
 @dataclass(frozen=True, slots=True)
 class FetchIndexEntry:
-    """
-    One line of the append-only raw-cache fetch index.
-
-    Knows nothing about replay content, so it survives every IR schema change.
-    """
+    """One entry in the append-only raw-cache fetch index."""
 
     replay_id: str
     format_id: str
@@ -581,14 +563,7 @@ class FetchIndexEntry:
 
 @dataclass(frozen=True, slots=True)
 class ActionEvidence:
-    """
-    Reconstructed joint-action supervision for one decision.
-
-    Candidates are explicit joint pairs at this layer; the flat
-    values-plus-offsets ragged encoding exists only in compiled tensor shards.
-    One representation covers all label kinds: EXACT stores exactly one
-    candidate, PARTIAL two or more, UNKNOWN none.
-    """
+    """Exact, partial, or unknown joint-action evidence for one decision."""
 
     label_kind: LabelKind
     candidates: tuple[tuple[int, int], ...]
@@ -657,13 +632,7 @@ class ActionEvidence:
 
 @dataclass(frozen=True, slots=True)
 class DecisionRecord:
-    """
-    One inferred decision request and its attached evidence.
-
-    Line indices bound the execution segment in the owning replay's
-    protocol_lines: the observation is captured before pre_line_index and the
-    evidence derives from lines [pre_line_index, post_line_index).
-    """
+    """One decision and the protocol range that supplies its evidence."""
 
     decision_index: int
     player: int
@@ -718,13 +687,7 @@ class DecisionRecord:
 
 @dataclass(frozen=True, slots=True)
 class ReplayDiagnostics:
-    """
-    Parser and reconstruction counters kept alongside the derived records.
-
-    Counter keys mirror EVENT_DIAGNOSTICS (oov_ids, missing_pre_hp,
-    grounding_misses) plus reconstruction-specific counts, so ambiguity and
-    loss masking stay visible in every compile report.
-    """
+    """Parser and reconstruction counters stored with derived records."""
 
     counters: Mapping[str, int]
     parse_errors: tuple[str, ...] = ()
@@ -800,13 +763,7 @@ class ReplayOutcome:
 
 @dataclass(frozen=True, slots=True)
 class SeriesRecord:
-    """
-    A grouped Bo3 series with ordered games and canonical player identity.
-
-    team_hashes are CanonicalTeam.team_hash values (order- and
-    spelling-independent), tying the series to corpus team identity.
-    game_player_roles maps each game's p1/p2 to the canonical player index.
-    """
+    """A grouped Bo3 series with ordered games and stable player identities."""
 
     series_id: str
     format_id: str

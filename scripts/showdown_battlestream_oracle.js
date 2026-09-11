@@ -1,11 +1,8 @@
-/* Emit a deterministic protocol trace from the pinned local Showdown engine.
- * This is deliberately a real BattleStream integration seam: no protocol
- * lines are fabricated and no battle state is mocked.
- */
+/* Emit a deterministic trace from the pinned local Showdown engine. */
 const path = require("node:path");
 const {BattleStream, Teams} = require(path.join(__dirname, "..", "pokemon-showdown", "dist", "sim"));
 
-// The Python release gate verifies the checkout before invoking this runner.
+// Python verifies this revision before running the check.
 const commit = "8282e63102fa824fd2f7472778ec09793ceb7cac";
 
 const species = ["Pikachu", "Eevee", "Raichu", "Jolteon", "Vaporeon", "Flareon"];
@@ -45,15 +42,14 @@ function handleChunk(chunk) {
     handleChunk(chunk);
     if (forceWinSent && protocol.some((line) => line.startsWith("|win|"))) break;
   }
-process.stdout.write(JSON.stringify({commit, protocol, teamMembers: species}) + "\n");
+  process.stdout.write(JSON.stringify({commit, protocol, teamMembers: species}) + "\n");
 })().catch((error) => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
 
 write(`>start ${JSON.stringify({formatid: "gen9championsvgc2026regmb"})}
 >player p1 ${JSON.stringify({name: "Alice", team})}
 >player p2 ${JSON.stringify({name: "Bob", team})}`);
 
-// Keep the short deterministic harness alive while BattleStream delivers its
-// asynchronous requests and updates.
+// Keep the process alive while BattleStream sends its updates.
 setTimeout(() => {
   if (!teamChosen.p1) write(">p1 team 1234");
   if (!teamChosen.p2) write(">p2 team 1234");

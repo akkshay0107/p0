@@ -125,6 +125,21 @@ class TestReplayScraping:
         with pytest.raises(ValueError, match="timeout_seconds must be positive"):
             ScrapeConfig(format_id="test", cache_dir=tmp_path, timeout_seconds=0.0)
 
+    def test_naive_cutoff_is_treated_as_utc(self, tmp_path: Path) -> None:
+        def transport(url: str, timeout: float) -> HttpResponse:
+            del url, timeout
+            body = json.dumps([{"id": "test-1", "formatid": "test", "uploadtime": 60}]).encode()
+            return HttpResponse(200, body)
+
+        config = ScrapeConfig(
+            format_id="test",
+            cache_dir=tmp_path,
+            cutoff="1970-01-01T00:02:00",
+            rate_limit_per_second=0,
+        )
+
+        assert ReplayFetcher(config, transport=transport).discover_ids() == ()
+
     def test_scrape_soft_limit_completes_the_final_linked_series(self, tmp_path: Path) -> None:
         """Verify scrape limit_games acts as a soft limit that finishes downloading the remaining sibling games of the current series."""
         format_id = FORMAT.bo3_format

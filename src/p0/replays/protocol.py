@@ -104,7 +104,7 @@ def _as_object(payload: bytes | str | Mapping[str, Any]) -> tuple[Mapping[str, A
 
 
 def _timestamp(value: Any) -> str:
-    if isinstance(value, (int, float)) and value >= 0:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
         return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
 
     if isinstance(value, str) and value:

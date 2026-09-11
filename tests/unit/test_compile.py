@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -54,6 +53,17 @@ class TestReplayCompiler:
 
         with pytest.raises(ValueError, match="incomplete chronological games"):
             write_dataset_replay_dataset(tmp_path, (third, second))
+
+    def test_source_series_preserves_game_number_order(self, tmp_path: Path) -> None:
+        first = sample_replay_payload("z-game", game_number=1)
+        second = sample_replay_payload("a-game", game_number=2)
+
+        built = write_dataset_replay_dataset(tmp_path, (second, first))
+        chunks = list(LazyReplayDataset(built.manifest_path))
+
+        series_id = chunks[0].series_id
+        assert built.manifest.source_series[series_id] == ("z-game", "a-game")
+        assert [chunk.game_number for chunk in chunks] == [1, 1, 2, 2]
 
     def test_compiler_retains_exact_partial_unknown_and_rejected_labels(self) -> None:
         """Verify compiler tracks counters for exact, partial, unknown, and rejected labels based on evidence and OTS validity."""
@@ -117,23 +127,42 @@ class TestReplayCompiler:
         assert own and None not in own
         assert own <= natures
 
-    def test_write_tensor_shards_evaluates_release_gates_and_writes_report(
-        self, tmp_path: Path
+    def test_external_rejections_keep_raw_identity_and_do_not_enter_dataset(
+        self,
+        tmp_path: Path,
     ) -> None:
-        """Verify write_tensor_shards creates release_gate.json and populates gate_report."""
-        payload = golden_replay_payload("gate-test", series_id="gate-series")
-        result = compile_payloads((payload,))
-        build_result = write_tensor_shards(
+        payload = golden_replay_payload("accepted", series_id="accepted-series")
+        result = compile_payloads((payload,), chunksize=0)
+        built = write_tensor_shards(
             result,
-            tmp_path / "dataset",
+            tmp_path,
+            created_at="2026-01-01T00:00:00Z",
+            external_rejections={"malformed": "a" * 64},
+        )
+        dataset = LazyReplayDataset(built.manifest_path)
+
+        assert built.manifest.source_games == 2
+        assert built.manifest.accepted_games == 1
+        assert built.manifest.rejected_games == 1
+        assert set(built.manifest.raw_replays) == {"accepted", "malformed"}
+        assert dataset.accepted_series_ids() == tuple(
+            sorted({chunk.series_id for chunk in dataset})
+        )
+
+    def test_existing_dataset_ignores_legacy_release_report(self, tmp_path: Path) -> None:
+        payload = golden_replay_payload("legacy-report", series_id="legacy-series")
+        result = compile_payloads((payload,), chunksize=0)
+        first = write_tensor_shards(
+            result,
+            tmp_path,
             created_at="2026-01-01T00:00:00Z",
         )
-        assert build_result.gate_report is not None
-        assert build_result.gate_report.checks["label_loss_contract"] is True
-        assert build_result.gate_report.checks["rejection_categories"] is True
+        (first.manifest_path.parent / "release_gate.json").write_text("not-json", encoding="utf-8")
 
-        gate_path = build_result.manifest_path.parent / "release_gate.json"
-        assert gate_path.is_file()
-        gate_data = json.loads(gate_path.read_text(encoding="utf-8"))
-        assert gate_data == build_result.gate_report.to_dict()
-        assert gate_data["checks"]["label_loss_contract"] is True
+        second = write_tensor_shards(
+            result,
+            tmp_path,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        assert second.manifest_path == first.manifest_path

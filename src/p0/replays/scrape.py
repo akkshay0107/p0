@@ -135,7 +135,6 @@ def _request_with_retry(
             if attempt < config.retries:
                 sleeper(config.backoff_seconds * (2 ** (attempt - 1)))
 
-    # error if hasnt returned a value yet
     raise ReplayFetchError(
         f"Replay request failed after {config.retries} attempts: {url}"
     ) from last_error
@@ -161,7 +160,10 @@ def _replay_id(item: object) -> str | None:
 
 
 def _cutoff_value(cutoff: str | None) -> datetime | None:
-    return None if cutoff is None else datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    if cutoff is None:
+        return None
+    value = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _upload_time(item: object) -> datetime | None:
@@ -172,7 +174,8 @@ def _upload_time(item: object) -> datetime | None:
         return datetime.fromtimestamp(value, UTC)
     if isinstance(value, str) and value:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
         except ValueError:
             return None
     return None
@@ -240,16 +243,7 @@ class ReplayFetcher:
         return tuple(sorted(discovered))
 
     def _write_immutable(self, replay_id: str, body: bytes) -> tuple[str, int]:
-        """
-        Atomically stores a raw replay in a content-addressed pool and links it to its ID.
-
-        Arguments:
-          replay_id: The unique string identifier for the replay.
-          body: The raw uncompressed JSON bytes of the replay fetched from the server.
-
-        Returns:
-          A tuple containing the SHA-256 digest string of the replay and its size in bytes.
-        """
+        """Store raw bytes once and link them to the replay ID."""
         if not re.fullmatch(r"[A-Za-z0-9_-]+", replay_id):
             raise ReplayFetchError(f"Replay id contains unsafe path characters: {replay_id!r}")
 
@@ -257,8 +251,6 @@ class ReplayFetcher:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{replay_id}.json.gz"
 
-        # assume first write authoritative
-        # if exists and is not corrupt, skip writes
         if path.exists():
             try:
                 with gzip.open(path, "rb") as stream:
@@ -289,8 +281,6 @@ class ReplayFetcher:
         try:
             os.link(canonical_path, path)
         except FileExistsError:
-            # another thread linked it just now.
-            # We already validated or wrote the canonical path, so we can trust the link.
             pass
 
         return digest, len(body)

@@ -861,36 +861,13 @@ def reconstruct_replay_decisions(
     max_candidates: int = 256,
     dex: Mapping[str, Any] | None = None,
 ) -> DecisionReconstruction:
-    """Resolve, reduce, and reconstruct one replay perspective in one pipeline."""
-    if perspective not in (0, 1):
-        raise ValueError("perspective must be 0 or 1")
-    if max_candidates < 1:
-        raise ValueError("max_candidates must be positive")
-    if dex is None:
-        dex = default_runtime_resources().dex
-    resolved = resolve_replay_events(document, dex=dex)
-    if resolved.diagnostics:
-        return DecisionReconstruction(
-            document.metadata.replay_id,
-            perspective,
-            (),
-            (),
-            resolved.diagnostics,
-        )
-    state = reduce_replay_state(
-        document.metadata.replay_id,
-        document.ots,
-        resolved.events,
-        dex=dex,
-    )
-    return reconstruct_decisions_from_trace(
+    """Resolve and reconstruct one replay perspective."""
+    return _reconstruct_perspectives(
         document,
-        resolved.events,
-        state,
-        perspective=perspective,
+        (perspective,),
         max_candidates=max_candidates,
         dex=dex,
-    )
+    )[0]
 
 
 def reconstruct_replay_decisions_both(
@@ -900,44 +877,72 @@ def reconstruct_replay_decisions_both(
     dex: Mapping[str, Any] | None = None,
 ) -> tuple[DecisionReconstruction, DecisionReconstruction]:
     """Resolve and reduce once, then reconstruct both player perspectives."""
+    results = _reconstruct_perspectives(
+        document,
+        (0, 1),
+        max_candidates=max_candidates,
+        dex=dex,
+    )
+    return results[0], results[1]
+
+
+def _reconstruct_perspectives(
+    document: ReplayDocument,
+    perspectives: tuple[int, ...],
+    *,
+    max_candidates: int,
+    dex: Mapping[str, Any] | None,
+) -> tuple[DecisionReconstruction, ...]:
+    if not perspectives or any(perspective not in (0, 1) for perspective in perspectives):
+        raise ValueError("perspective must be 0 or 1")
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
-    if dex is None:
-        dex = default_runtime_resources().dex
-    resolved = resolve_replay_events(document, dex=dex)
+    runtime_dex = default_runtime_resources().dex if dex is None else dex
+    resolved = resolve_replay_events(document, dex=runtime_dex)
     if resolved.diagnostics:
-        first = DecisionReconstruction(document.metadata.replay_id, 0, (), (), resolved.diagnostics)
-        second = DecisionReconstruction(
-            document.metadata.replay_id, 1, (), (), resolved.diagnostics
-        )
-        return (
-            first,
-            second,
+        return tuple(
+            DecisionReconstruction(
+                document.metadata.replay_id,
+                perspective,
+                (),
+                (),
+                resolved.diagnostics,
+            )
+            for perspective in perspectives
         )
     state = reduce_replay_state(
         document.metadata.replay_id,
         document.ots,
         resolved.events,
-        dex=dex,
+        dex=runtime_dex,
     )
-    return (
-        reconstruct_decisions_from_trace(
+
+    results: list[DecisionReconstruction] = []
+    windows: tuple[DecisionWindow, ...] | None = None
+    for perspective in perspectives:
+        result = reconstruct_decisions_from_trace(
             document,
             resolved.events,
             state,
-            perspective=0,
+            perspective=perspective,
             max_candidates=max_candidates,
-            dex=dex,
-        ),
-        reconstruct_decisions_from_trace(
-            document,
-            resolved.events,
-            state,
-            perspective=1,
-            max_candidates=max_candidates,
-            dex=dex,
-        ),
-    )
+            dex=runtime_dex,
+            windows=windows,
+        )
+        results.append(result)
+        if result.diagnostics:
+            return tuple(
+                DecisionReconstruction(
+                    document.metadata.replay_id,
+                    value,
+                    (),
+                    (),
+                    result.diagnostics,
+                )
+                for value in perspectives
+            )
+        windows = result.windows
+    return tuple(results)
 
 
 __all__ = [

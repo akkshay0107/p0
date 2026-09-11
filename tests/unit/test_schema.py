@@ -220,6 +220,16 @@ class TestReplaySchemas:
         """Verify SeriesRecord validates structural invariants on deserialization."""
         with pytest.raises(ValueError, match="two wins"):
             SeriesRecord.from_dict({**_series_record().to_dict(), "score": [1, 0]})
+        with pytest.raises(ValueError, match="include a timezone"):
+            FetchIndexEntry(
+                replay_id="r1",
+                format_id="format",
+                source_url="https://example.invalid/r1",
+                fetched_at="2026-07-17T00:00:00",
+                http_status=200,
+                content_sha256="d" * 64,
+                byte_size=1,
+            )
 
     def test_observation_specs_are_derived(self) -> None:
         """Verify public observation and shard specs expose the runtime tensor contract."""
@@ -275,7 +285,7 @@ class TestReplaySchemas:
         dex.write_text('{"pikachu":{"base_stats":{"hp":35}}}', encoding="utf-8")
         runtime = current_manifest(vocab_path=vocab, dex_path=dex)
 
-        entry = ShardIndexEntry("shard-000.pt", "c" * 64, 10, 2, 1, 100)
+        entry = ShardIndexEntry("shard-000.pt", "c" * 64, 10, 4, 1, 100)
         manifest = ShardManifest(
             global_contract_sha256=runtime.global_sha256,
             shards=(entry,),
