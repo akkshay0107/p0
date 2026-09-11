@@ -11,7 +11,7 @@ from torch.optim import Optimizer
 
 from p0.model.policy import PolicyNet
 from p0.persistence import atomic_json_save
-from p0.training.checkpoint import PolicyStore
+from p0.training.checkpoint import CheckpointStore
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import ppo_update
@@ -54,7 +54,7 @@ class PPOTrainer:
         self,
         *,
         policy: PolicyNet,
-        policy_store: PolicyStore,
+        policy_store: CheckpointStore,
         checkpoint_path: Path,
         collector: RolloutCollector,
         optimizer: Optimizer,

@@ -96,3 +96,31 @@ class TestSeriesHistory:
         fragments = state["active_fragments"]
         assert isinstance(fragments, tuple)
         torch.testing.assert_close(fragments[0], torch.arange(4, dtype=torch.float32).reshape(2, 2))
+
+    def test_series_history_store_perspective_key_checkpoint_round_trip(self) -> None:
+        """Verify SeriesPerspectiveKey is supported in checkpoint state capture and restore."""
+        store = SeriesHistoryStore(d_model=2)
+        key = SeriesPerspectiveKey("series_123", 1)
+        store.append(
+            key,
+            1,
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            is_game_end=True,
+            is_series_end=False,
+        )
+        store.append(
+            key,
+            2,
+            torch.tensor([[5.0, 6.0]]),
+            is_game_end=False,
+            is_series_end=False,
+        )
+
+        state = store.training_state()
+        restored = SeriesHistoryStore(d_model=2)
+        restored.restore_training_state(state)
+
+        snapshot = restored.snapshot(key)
+        assert len(snapshot) == 1
+        torch.testing.assert_close(snapshot[0], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+        assert restored.next_game_number(key) == 2

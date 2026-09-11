@@ -15,7 +15,7 @@ import torch
 from p0.evaluation.harness import EvaluationHarness
 from p0.format_config import load_active_runtime_manifest
 from p0.persistence import atomic_json_save
-from p0.training.checkpoint import DEFAULT_POLICY_STORE
+from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE
 from p0.training.config import load_config
 
 logger = logging.getLogger("p0.cli.eval")
@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.checkpoint is not None:
         logger.info("Loading policy under evaluation from: %s", args.checkpoint)
         try:
-            policy_a = DEFAULT_POLICY_STORE.load_policy(args.checkpoint, device)
+            policy_a = DEFAULT_CHECKPOINT_STORE.load_policy(args.checkpoint, device)
             policy_a.eval()
         except (OSError, KeyError, RuntimeError, TypeError, ValueError) as exc:
             logger.error("Failed to load policy checkpoint A: %s", exc)
@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.opponent_checkpoint is not None:
         logger.info("Loading opponent policy from: %s", args.opponent_checkpoint)
         try:
-            policy_b = DEFAULT_POLICY_STORE.load_policy(args.opponent_checkpoint, device)
+            policy_b = DEFAULT_CHECKPOINT_STORE.load_policy(args.opponent_checkpoint, device)
             policy_b.eval()
         except (OSError, KeyError, RuntimeError, TypeError, ValueError) as exc:
             logger.error("Failed to load policy checkpoint B: %s", exc)

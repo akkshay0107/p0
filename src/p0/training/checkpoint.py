@@ -1,4 +1,4 @@
-"""Atomic checkpoint persistence behind the injected policy-store boundary."""
+"""Atomic checkpoint saving and loading for policy and training state."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import random
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 
@@ -34,60 +34,8 @@ TRAINING_ARTIFACT = "training"
 LOGGER = logging.getLogger(__name__)
 
 
-class PolicyStore(Protocol):
-    """Protocol for external classes to use."""
-
-    def save_policy(
-        self,
-        path: Path,
-        policy: PolicyNet,
-        *,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> None: ...
-
-    def load_policy(
-        self,
-        path: Path,
-        device: torch.device | str,
-        *,
-        expected_metadata: Mapping[str, Any] | None = None,
-    ) -> PolicyNet: ...
-
-    def save_training_state(
-        self,
-        path: Path,
-        episode: int,
-        policy: PolicyNet,
-        *,
-        optimizer: Any = None,
-        scheduler: Any = None,
-        scaler: Any = None,
-        magnet: Any = None,
-        metadata: Mapping[str, Any] | None = None,
-        trainer_kind: str | None = None,
-    ) -> None: ...
-
-    def load_training_state(
-        self,
-        path: Path,
-        policy: PolicyNet,
-        *,
-        optimizer: Any = None,
-        scheduler: Any = None,
-        scaler: Any = None,
-        magnet: Any = None,
-        expected_trainer_kind: str | None = None,
-        expected_metadata: Mapping[str, Any] | None = None,
-        require_training_state: bool = False,
-    ) -> int: ...
-
-    def load_metadata(self, path: Path) -> Mapping[str, Any]: ...
-
-    def preflight(self, path: Path) -> ContractCompatibility: ...
-
-
 class CheckpointStore:
-    """The sole reader and writer for policy and training checkpoints."""
+    """Reader and writer for policy and training checkpoints."""
 
     def __init__(
         self,
@@ -98,21 +46,25 @@ class CheckpointStore:
         self.manifest_path = Path(manifest_path)
         if self.manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
             raise ValueError("CheckpointStore always uses the default global runtime manifest")
+        self._manifest = load_active_runtime_manifest(self.manifest_path)
         self._resources = resources
         self._reused_artifact: tuple[Path, Mapping[str, Any]] | None = None
 
     @contextmanager
     def reuse_artifact(self, path: Path) -> Iterator[None]:
-        """Reuse one validated deserialization during a startup sequence."""
-        artifact = self._read_artifact(path)
-        self._validate_envelope(artifact, path)
-        self._validate_checkpoint_contract(artifact, path)
+        """Cache a loaded checkpoint during initialization to avoid re-reading the file."""
+        artifact = self._load_artifact(path)
         previous = self._reused_artifact
         self._reused_artifact = (path.resolve(), artifact)
         try:
             yield
         finally:
             self._reused_artifact = previous
+
+    def preflight(self, path: Path) -> ContractCompatibility:
+        """Reject incompatible checkpoint contracts before setup begins."""
+        artifact = self._read_raw(path)
+        return self._validate_contract(artifact, path)
 
     def save_policy(
         self,
@@ -121,14 +73,9 @@ class CheckpointStore:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        artifact = self._policy_artifact(policy, POLICY_ARTIFACT, metadata)
+        """Atomically write a weights-only policy checkpoint."""
+        artifact = self._build_artifact(policy, POLICY_ARTIFACT, metadata)
         atomic_torch_save(path, artifact)
-
-    def preflight(self, path: Path) -> ContractCompatibility:
-        """Reject a major checkpoint contract difference before training setup begins."""
-        artifact = self._load_artifact(path)
-        self._validate_envelope(artifact, path)
-        return self._validate_checkpoint_contract(artifact, path)
 
     def load_policy(
         self,
@@ -137,18 +84,18 @@ class CheckpointStore:
         *,
         expected_metadata: Mapping[str, Any] | None = None,
     ) -> PolicyNet:
+        """Build and return a policy restored from a checkpoint."""
         artifact = self._load_artifact(path)
-        config = self._model_config(artifact, path)
-        self._validate_provenance(artifact, path, expected_metadata)
+        self._match_metadata(artifact, path, expected_metadata)
         try:
+            config = ModelConfig.from_dict(artifact["model_config"])
             policy = build_policy(config, self._runtime_resources()).to(device)
             load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
-        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            return policy
+        except Exception as exc:
             raise ValueError(f"Invalid policy state in checkpoint {path}") from exc
 
-        return policy
-
-    def save_training_state(
+    def save_training(
         self,
         path: Path,
         episode: int,
@@ -161,28 +108,27 @@ class CheckpointStore:
         metadata: Mapping[str, Any] | None = None,
         trainer_kind: str | None = None,
     ) -> None:
-        provenance = dict(metadata or {})
+        """Atomically write a full training checkpoint with optimizer and RNG states."""
+        lineage = dict(metadata or {})
         if trainer_kind is not None:
-            provenance["trainer_kind"] = trainer_kind
+            lineage["trainer_kind"] = trainer_kind
 
-        artifact = self._policy_artifact(policy, TRAINING_ARTIFACT, provenance)
-        training_state: dict[str, Any] = {"episode": int(episode)}
+        artifact = self._build_artifact(policy, TRAINING_ARTIFACT, lineage)
+        state: dict[str, Any] = {"episode": int(episode), "rng_state": _capture_rng()}
 
-        for name, service in (
+        for name, svc in (
             ("optimizer", optimizer),
             ("scheduler", scheduler),
             ("scaler", scaler),
             ("magnet", magnet),
         ):
-            if service is not None:
-                training_state[f"{name}_state_dict"] = service.state_dict()
+            if svc is not None:
+                state[f"{name}_state_dict"] = svc.state_dict()
 
-        training_state["rng_state"] = _capture_rng_state()
-
-        artifact["training_state"] = training_state
+        artifact["training_state"] = state
         atomic_torch_save(path, artifact)
 
-    def load_training_state(
+    def load_training(
         self,
         path: Path,
         policy: PolicyNet,
@@ -195,31 +141,29 @@ class CheckpointStore:
         expected_metadata: Mapping[str, Any] | None = None,
         require_training_state: bool = False,
     ) -> int:
+        """Restore policy weights and training services. Returns completed episode."""
         if not path.exists():
             return 0
 
         artifact = self._load_artifact(path)
-        expected = self._policy_config(policy).to_dict()
-        actual = self._model_config(artifact, path).to_dict()
-        if actual != expected:
+        if artifact["model_config"] != policy.config.to_dict():
             raise ValueError(f"Checkpoint {path} model configuration does not match the policy")
 
         if artifact["artifact_type"] == POLICY_ARTIFACT:
             if require_training_state:
                 raise ValueError(f"Checkpoint {path} is weights-only and cannot resume training")
-            # starting fresh from a weights-only checkpoint
+            load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
             return 0
 
-        trainer_kind = artifact["provenance"].get("trainer_kind")
-        if expected_trainer_kind is not None and trainer_kind != expected_trainer_kind:
-            raise ValueError(
-                f"Checkpoint {path} belongs to trainer {trainer_kind!r}, "
-                f"not {expected_trainer_kind!r}"
-            )
+        if expected_trainer_kind is not None:
+            trainer = artifact["provenance"].get("trainer_kind")
+            if trainer != expected_trainer_kind:
+                raise ValueError(
+                    f"Checkpoint {path} belongs to trainer {trainer!r}, "
+                    f"not {expected_trainer_kind!r}"
+                )
 
-        for key, expected_value in (expected_metadata or {}).items():
-            if artifact["provenance"].get(key) != expected_value:
-                raise ValueError(f"Checkpoint {path} provenance field {key!r} is incompatible")
+        self._match_metadata(artifact, path, expected_metadata)
 
         training_state = artifact.get("training_state")
         if not isinstance(training_state, Mapping):
@@ -227,49 +171,63 @@ class CheckpointStore:
 
         try:
             load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
-            for name, service in (
+            for name, svc in (
                 ("optimizer", optimizer),
                 ("scheduler", scheduler),
                 ("scaler", scaler),
             ):
                 key = f"{name}_state_dict"
-                if service is not None and key in training_state:
-                    service.load_state_dict(training_state[key])
+                if svc is not None and key in training_state:
+                    svc.load_state_dict(training_state[key])
 
             if magnet is not None:
-                # older checkpoints predate the magnet; treat resume as a refresh
-                # boundary and seed it from the freshly loaded live policy
                 if "magnet_state_dict" in training_state:
                     magnet.load_state_dict(training_state["magnet_state_dict"])
                 else:
                     magnet.refresh(policy)
-            episode = training_state["episode"]
 
+            episode = training_state["episode"]
             if type(episode) is not int or episode < 0:
                 raise ValueError("episode must be a non-negative integer")
 
-            rng_state = training_state.get("rng_state")
-            if isinstance(rng_state, Mapping):
-                _restore_rng_state(rng_state)
-
-        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            _restore_rng(training_state.get("rng_state"))
+            return episode
+        except Exception as exc:
             raise ValueError(f"Invalid training state in checkpoint {path}") from exc
 
-        return episode
+    save_training_state = save_training
+    load_training_state = load_training
 
-    def _policy_artifact(
+    def load_episode(self, path: Path) -> int:
+        """Read completed episode count from a checkpoint header without full restoration."""
+        if not path.exists():
+            return 0
+        artifact = self._load_artifact(path)
+        if artifact.get("artifact_type") == POLICY_ARTIFACT:
+            return 0
+        state = artifact.get("training_state")
+        if isinstance(state, Mapping) and isinstance(state.get("episode"), int):
+            return max(0, state["episode"])
+        return 0
+
+    load_checkpoint_episode = load_episode
+
+    def load_metadata(self, path: Path) -> Mapping[str, Any]:
+        """Return validated checkpoint metadata without constructing a policy."""
+        return self._load_artifact(path)["provenance"]
+
+    def _build_artifact(
         self,
         policy: PolicyNet,
         artifact_type: str,
-        metadata: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
-        manifest = load_active_runtime_manifest(self.manifest_path)
         return {
             "artifact_schema": CHECKPOINT_SCHEMA,
             "artifact_type": artifact_type,
-            "global_contract_sha256": manifest.global_sha256,
-            "global_contract": manifest.to_dict(),
-            "model_config": self._policy_config(policy).to_dict(),
+            "global_contract_sha256": self._manifest.global_sha256,
+            "global_contract": self._manifest.to_dict(),
+            "model_config": policy.config.to_dict(),
             "model_state_dict": canonical_policy_state_dict(policy),
             "provenance": dict(metadata or {}),
         }
@@ -278,105 +236,71 @@ class CheckpointStore:
         reused = self._reused_artifact
         if reused is not None and reused[0] == path.resolve():
             return reused[1]
-        artifact = self._read_artifact(path)
-        self._validate_envelope(artifact, path)
-        self._validate_checkpoint_contract(artifact, path)
-        self._model_config(artifact, path)
+        artifact = self._read_raw(path)
+        self._validate_contract(artifact, path)
+        try:
+            ModelConfig.from_dict(artifact["model_config"])
+        except Exception as exc:
+            raise ValueError(f"Invalid model configuration in checkpoint {path}") from exc
         return artifact
 
-    @staticmethod
-    def _read_artifact(path: Path) -> Mapping[str, Any]:
+    def _read_raw(self, path: Path) -> Mapping[str, Any]:
         try:
             artifact = torch.load(path, weights_only=True, map_location="cpu")
-        except (OSError, RuntimeError, EOFError, ValueError, IndexError) as exc:
+        except Exception as exc:
             raise ValueError(f"Unable to read checkpoint {path}") from exc
 
         if not isinstance(artifact, Mapping):
             raise ValueError(f"Malformed checkpoint {path}: expected a mapping")
 
-        return artifact
-
-    @staticmethod
-    def _validate_envelope(artifact: Mapping[str, Any], path: Path) -> None:
+        schema = artifact.get("artifact_schema")
         if (
             "runtime_manifest_sha256" in artifact
             or "runtime_contract_sha256" in artifact
-            or artifact.get("artifact_schema") is None
+            or schema != CHECKPOINT_SCHEMA
         ):
-            raise ValueError(
-                f"Unsupported legacy checkpoint format at {path}; "
-                f"expected artifact_schema={CHECKPOINT_SCHEMA!r}"
-            )
-
-        if artifact.get("artifact_schema") != CHECKPOINT_SCHEMA:
-            raise ValueError(
-                f"Unsupported checkpoint schema {artifact.get('artifact_schema')!r} at {path}"
-            )
-
+            raise ValueError(f"Unsupported checkpoint schema {schema!r} at {path}")
         if artifact.get("artifact_type") not in {POLICY_ARTIFACT, TRAINING_ARTIFACT}:
             raise ValueError(f"Unsupported checkpoint artifact type at {path}")
-
-        provenance = artifact.get("provenance")
-        if not isinstance(provenance, Mapping):
+        if not isinstance(artifact.get("provenance"), Mapping):
             raise ValueError(f"Checkpoint {path} provenance must be a mapping")
 
-    def _validate_checkpoint_contract(
-        self, artifact: Mapping[str, Any], path: Path
-    ) -> ContractCompatibility:
-        compatibility = checkpoint_contract_compatibility(artifact, self.manifest_path)
-        if not compatibility.is_compatible:
+        return artifact
+
+    def _validate_contract(self, artifact: Mapping[str, Any], path: Path) -> ContractCompatibility:
+        comp = checkpoint_contract_compatibility(artifact, self.manifest_path)
+        if not comp.is_compatible:
+            diffs = "; ".join(comp.major_differences)
             raise ValueError(
-                f"Checkpoint {path} is incompatible with the active global contract: "
-                + "; ".join(compatibility.major_differences)
+                f"Checkpoint {path} is incompatible with the active global contract: {diffs}"
             )
-        if compatibility.status == "warning":
+        if comp.status == "warning":
             LOGGER.warning(
-                "Checkpoint %s has non-breaking global contract differences: %s",
+                "Checkpoint %s has non-breaking contract differences: %s",
                 path,
-                "; ".join(compatibility.minor_differences),
+                "; ".join(comp.minor_differences),
             )
-        return compatibility
+        return comp
 
     def _runtime_resources(self) -> RuntimeResources:
         if self._resources is None:
             self._resources = RuntimeResources.from_manifest(self.manifest_path)
         return self._resources
 
-    def load_metadata(self, path: Path) -> Mapping[str, Any]:
-        """Return validated checkpoint provenance without constructing a policy."""
-        return self._load_artifact(path)["provenance"]
-
     @staticmethod
-    def _validate_provenance(
-        artifact: Mapping[str, Any],
-        path: Path,
-        expected_metadata: Mapping[str, Any] | None,
+    def _match_metadata(
+        artifact: Mapping[str, Any], path: Path, expected: Mapping[str, Any] | None
     ) -> None:
-        for key, expected in (expected_metadata or {}).items():
-            if artifact["provenance"].get(key) != expected:
-                raise ValueError(f"Checkpoint {path} provenance field {key!r} is incompatible")
-
-    @staticmethod
-    def _model_config(artifact: Mapping[str, Any], path: Path) -> ModelConfig:
-        try:
-            return ModelConfig.from_dict(artifact.get("model_config"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid model configuration in checkpoint {path}") from exc
-
-    @staticmethod
-    def _policy_config(policy: PolicyNet) -> ModelConfig:
-        config = policy.config
-        if not isinstance(config, ModelConfig):
-            raise ValueError("Only policies with a validated ModelConfig can be checkpointed")
-
-        return config
+        for k, v in (expected or {}).items():
+            if artifact["provenance"].get(k) != v:
+                raise ValueError(f"Checkpoint {path} provenance field {k!r} is incompatible")
 
 
-DEFAULT_POLICY_STORE = CheckpointStore()
+DEFAULT_CHECKPOINT_STORE = CheckpointStore()
+DEFAULT_POLICY_STORE = DEFAULT_CHECKPOINT_STORE
 
 
-def _capture_rng_state() -> dict[str, Any]:
-    """Capture process-level stochastic state for exact episode-boundary resume."""
+def _capture_rng() -> dict[str, Any]:
     state: dict[str, Any] = {
         "python": random.getstate(),
         "torch": torch.get_rng_state(),
@@ -386,12 +310,13 @@ def _capture_rng_state() -> dict[str, Any]:
     return state
 
 
-def _restore_rng_state(state: Mapping[str, Any]) -> None:
-    """Restore RNG state captured by _capture_rng_state when present."""
-    python_state = state.get("python")
+def _restore_rng(state: Any) -> None:
+    if not isinstance(state, Mapping):
+        return
+    py_state = state.get("python")
+    if py_state is not None:
+        random.setstate(py_state)
     torch_state = state.get("torch")
-    if python_state is not None:
-        random.setstate(python_state)
     if isinstance(torch_state, torch.Tensor):
         torch.set_rng_state(torch_state)
     cuda_state = state.get("cuda")

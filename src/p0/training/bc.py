@@ -38,7 +38,7 @@ from p0.training._bc_metrics import (
     _validate_objective_inputs,
     compute_bc_objective,
 )
-from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
+from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.config import BCConfig
 from p0.training.series_history import SeriesHistoryStore
 from p0.training.utils import select_optimization_precision
@@ -119,7 +119,7 @@ class BCTrainer:
         *,
         device: torch.device | str = "cpu",
         optimizer: torch.optim.Optimizer | None = None,
-        checkpoint_store: CheckpointStore = DEFAULT_POLICY_STORE,
+        checkpoint_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
         provenance: Mapping[str, object] | None = None,
         cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:

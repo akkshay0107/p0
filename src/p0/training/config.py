@@ -1,5 +1,7 @@
 """Typed, immutable application configuration loaded from YAML."""
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
@@ -12,28 +14,32 @@ from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS, ProjectPaths
 
 
-def _positive_ints(owner: str, *values: tuple[str, object]) -> None:
-    for name, value in values:
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError(f"{owner}.{name} must be a positive integer")
+def _positive_ints(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            raise ValueError(f"{type(obj).__name__}.{name} must be a positive integer")
 
 
-def _positive(owner: str, *values: tuple[str, float]) -> None:
-    for name, value in values:
-        if value <= 0:
-            raise ValueError(f"{owner}.{name} must be greater than zero")
+def _positive(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, (int, float)) or isinstance(val, bool) or val <= 0:
+            raise ValueError(f"{type(obj).__name__}.{name} must be greater than zero")
 
 
-def _non_negative(owner: str, *values: tuple[str, float]) -> None:
-    for name, value in values:
-        if value < 0:
-            raise ValueError(f"{owner}.{name} must not be negative")
+def _non_negative(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
+            raise ValueError(f"{type(obj).__name__}.{name} must not be negative")
 
 
-def _unit_interval(owner: str, *values: tuple[str, float]) -> None:
-    for name, value in values:
-        if not 0 <= value <= 1:
-            raise ValueError(f"{owner}.{name} must be between 0 and 1")
+def _unit_interval(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, (int, float)) or isinstance(val, bool) or not 0 <= val <= 1:
+            raise ValueError(f"{type(obj).__name__}.{name} must be between 0 and 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,43 +66,31 @@ class TrainingConfig:
 
     def __post_init__(self) -> None:
         _positive_ints(
-            type(self).__name__,
-            ("num_episodes", self.num_episodes),
-            ("n_envs", self.n_envs),
-            ("rollout_steps", self.rollout_steps),
-            ("batch_size", self.batch_size),
-            ("minibatch_size", self.minibatch_size),
-            ("ppo_epochs", self.ppo_epochs),
-            ("magnet_refresh_interval", self.magnet_refresh_interval),
+            self,
+            "num_episodes",
+            "n_envs",
+            "rollout_steps",
+            "batch_size",
+            "minibatch_size",
+            "ppo_epochs",
+            "magnet_refresh_interval",
         )
-
-        _unit_interval(
-            type(self).__name__,
-            ("gamma", self.gamma),
-            ("gae_lambda", self.gae_lambda),
-            ("ramp_up_phase", self.ramp_up_phase),
-        )
+        _unit_interval(self, "gamma", "gae_lambda", "ramp_up_phase")
         if self.gamma >= 1.0:
             raise ValueError("TrainingConfig.gamma must be less than 1")
 
         _non_negative(
-            type(self).__name__,
-            ("clip_range", self.clip_range),
-            ("value_coef", self.value_coef),
-            ("magnet_alpha", self.magnet_alpha),
-            ("entropy_coef", self.entropy_coef),
-            ("target_kl", self.target_kl),
+            self,
+            "clip_range",
+            "value_coef",
+            "magnet_alpha",
+            "entropy_coef",
+            "target_kl",
         )
-
-        _positive(
-            type(self).__name__,
-            ("lr", self.lr),
-            ("max_grad_norm", self.max_grad_norm),
-        )
+        _positive(self, "lr", "max_grad_norm")
 
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("training.seed must be a nonnegative integer")
-
         if not 0.0 < self.ramp_up_phase < 1.0:
             raise ValueError("training.ramp_up_phase must be strictly between 0 and 1")
 
@@ -105,7 +99,6 @@ class TrainingConfig:
             raise ValueError(
                 "training.ramp_up_phase must produce an endpoint before the final episode"
             )
-
         if self.magnet_refresh_interval > self.num_episodes:
             raise ValueError(
                 "training.magnet_refresh_interval must not exceed training.num_episodes"
@@ -140,6 +133,9 @@ class BotConfig:
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.team_files, tuple):
+            object.__setattr__(self, "team_files", tuple(self.team_files))
+
         if self.battle_format != FORMAT.bo3_format:
             raise ValueError(f"bot.battle_format must be the Bo3 format {FORMAT.bo3_format!r}")
 
@@ -150,21 +146,14 @@ class BotConfig:
             raise ValueError("bot.max_concurrent_battles is fixed at 1 for live Bo3 play")
 
 
-# The bc and evaluation sections are reserved here so their workstreams only
-# ever touch their own dataclass's field list; adding a new root section
-# requires editing GlobalConfig and load_config in one place.
 @dataclass(frozen=True, slots=True)
 class BCConfig:
     batch_decisions: int = 256
     max_chunk_size: int = 1024
     learning_rate: float = 3e-4
-    # These objective settings are copied from TrainingConfig when the full
-    # application configuration is built; BC and PPO must share them.
     gamma: float = 0.99
     value_coef: float = 0.5
     epochs: int = 1
-    # BC history state is chronological across shards; multiprocessing remains
-    # opt-in until an order-preserving prefetcher is available.
     num_workers: int = 0
     prefetch_factor: int = 2
     weight_decay: float = 0.0
@@ -177,29 +166,17 @@ class BCConfig:
     resume_checkpoint: Path | None = None
 
     def __post_init__(self) -> None:
-        _positive_ints(
-            type(self).__name__,
-            ("batch_decisions", self.batch_decisions),
-            ("max_chunk_size", self.max_chunk_size),
-            ("epochs", self.epochs),
-        )
-
+        _positive_ints(self, "batch_decisions", "max_chunk_size", "epochs")
         if self.num_workers < 0:
             raise ValueError("bc.num_workers must be non-negative")
-
         if self.prefetch_factor <= 0:
             raise ValueError("bc.prefetch_factor must be positive")
 
-        _positive(type(self).__name__, ("learning_rate", self.learning_rate))
-        _unit_interval(type(self).__name__, ("gamma", self.gamma))
+        _positive(self, "learning_rate", "max_grad_norm")
+        _unit_interval(self, "gamma")
         if self.gamma >= 1.0:
             raise ValueError("BCConfig.gamma must be less than 1")
-        _non_negative(
-            type(self).__name__,
-            ("value_coef", self.value_coef),
-            ("weight_decay", self.weight_decay),
-        )
-        _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))
+        _non_negative(self, "value_coef", "weight_decay")
 
         if type(self.seed) is not int:
             raise ValueError("bc.seed must be an integer")
@@ -220,8 +197,8 @@ class EvalConfig:
     report_dir: Path = Path("artifacts/eval")
 
     def __post_init__(self) -> None:
-        _positive_ints(type(self).__name__, ("episodes_per_matchup", self.episodes_per_matchup))
-        _non_negative(type(self).__name__, ("seed", self.seed))
+        _positive_ints(self, "episodes_per_matchup")
+        _non_negative(self, "seed")
 
         if not str(self.report_dir).strip():
             raise ValueError("evaluation.report_dir must not be empty")
@@ -249,88 +226,54 @@ def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root)
 
 
 def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
-    repository_root = _resolve_path(config.paths.repository_root)
-    paths = replace(
-        config.paths,
-        repository_root=repository_root,
-        data_root=_resolve_path(config.paths.data_root, repository_root),
-        teams_root=_resolve_path(config.paths.teams_root, repository_root),
-        artifacts_root=_resolve_path(config.paths.artifacts_root, repository_root),
-        showdown_root=_resolve_path(config.paths.showdown_root, repository_root),
-        checkpoint_path=_resolve_path(config.paths.checkpoint_path, repository_root),
-        runs_dir=_resolve_path(config.paths.runs_dir, repository_root),
-        replays_dir=_resolve_path(config.paths.replays_dir, repository_root),
-        log_path=_resolve_path(config.paths.log_path, repository_root),
-        resume_checkpoint=(
-            None
-            if config.paths.resume_checkpoint is None
-            else _resolve_path(config.paths.resume_checkpoint, repository_root)
-        ),
-        initial_policy_checkpoint=(
-            None
-            if config.paths.initial_policy_checkpoint is None
-            else _resolve_path(config.paths.initial_policy_checkpoint, repository_root)
-        ),
-    )
+    root = _resolve_path(config.paths.repository_root)
+
+    def _resolve(dc: Any, base: Path, path_field_names: set[str]) -> Any:
+        updates: dict[str, Any] = {}
+        for f in fields(dc):
+            if f.name in path_field_names:
+                val = getattr(dc, f.name)
+                if val is not None:
+                    updates[f.name] = _resolve_path(val, base)
+        return replace(dc, **updates)
+
+    path_fields = {f.name for f in fields(ProjectPaths)}
+    paths = _resolve(config.paths, root, path_fields)
     bot = replace(
         config.bot,
         checkpoint_path=(
-            None
-            if config.bot.checkpoint_path is None
-            else _resolve_path(config.bot.checkpoint_path, repository_root)
+            _resolve_path(config.bot.checkpoint_path, root)
+            if config.bot.checkpoint_path is not None
+            else None
         ),
-        team_files=tuple(_resolve_path(path, repository_root) for path in config.bot.team_files),
+        team_files=tuple(_resolve_path(p, root) for p in config.bot.team_files),
     )
-    teams = replace(
-        config.teams,
-        all=_resolve_path(config.teams.all, paths.teams_root),
-        reduced=_resolve_path(config.teams.reduced, paths.teams_root),
-    )
-    bc = replace(
+    teams = _resolve(config.teams, paths.teams_root, {"all", "reduced"})
+    bc = _resolve(
         config.bc,
-        shard_manifest=_resolve_path(config.bc.shard_manifest, repository_root),
-        split_manifest=_resolve_path(config.bc.split_manifest, repository_root),
-        output_dir=_resolve_path(config.bc.output_dir, repository_root),
-        resume_checkpoint=(
-            None
-            if config.bc.resume_checkpoint is None
-            else _resolve_path(config.bc.resume_checkpoint, repository_root)
-        ),
+        root,
+        {"shard_manifest", "split_manifest", "output_dir", "resume_checkpoint"},
     )
-    evaluation = replace(
-        config.evaluation,
-        report_dir=_resolve_path(config.evaluation.report_dir, repository_root),
-    )
+    evaluation = _resolve(config.evaluation, root, {"report_dir"})
 
-    return replace(
-        config,
-        paths=paths,
-        bot=bot,
-        teams=teams,
-        bc=bc,
-        evaluation=evaluation,
-    )
+    return replace(config, paths=paths, bot=bot, teams=teams, bc=bc, evaluation=evaluation)
 
 
-def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
+def _build_section(cls: type, values: Any) -> Any:
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} must be a mapping")
 
     names = {field.name for field in fields(cls)}
     unknown = set(values) - names
     if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unknown {cls.__name__} field(s): {names}")
-
-    values = dict(values)
-    if bot:
-        values["team_files"] = tuple(values["team_files"])
+        names_str = ", ".join(sorted(unknown))
+        raise ValueError(f"unknown {cls.__name__} field(s): {names_str}")
 
     return cls(**values)
 
 
 def load_config(config_path: str | Path | None = None) -> GlobalConfig:
-    """Load required config.yaml and apply its values to source defaults."""
+    """Load configuration from config.yaml and merge with source defaults."""
     path = (
         DEFAULT_PATHS.repository_root / "config.yaml" if config_path is None else Path(config_path)
     )
@@ -374,7 +317,7 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
             training=training,
             paths=_build_section(ProjectPaths, values["paths"]),
             teams=_build_section(TeamsConfig, values["teams"]),
-            bot=_build_section(BotConfig, values["bot"], bot=True),
+            bot=_build_section(BotConfig, values["bot"]),
             bc=_build_section(BCConfig, bc_values),
             evaluation=_build_section(EvalConfig, values["evaluation"]),
         )

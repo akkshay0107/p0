@@ -1,6 +1,10 @@
+"""Training utilities: precision selection, random seeding, schedules, and optimizers."""
+
+from __future__ import annotations
+
 import math
 import random
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -22,7 +26,7 @@ def default_device() -> torch.device:
 
 
 def seed_everything(seed: int) -> None:
-    """Seed process-level generators at a training composition root."""
+    """Seed random number generators for the training process."""
     if type(seed) is not int or seed < 0:
         raise ValueError("seed must be a nonnegative integer")
     random.seed(seed)
@@ -49,32 +53,22 @@ def select_optimization_precision(
 
 
 class PPOScheduler:
-    def __init__(self, config: TrainingConfig):
-        self.alpha_value = config.magnet_alpha
+    """Linear warmup followed by cosine learning rate decay."""
 
+    def __init__(self, config: TrainingConfig) -> None:
+        self.alpha_value = config.magnet_alpha
         self.lr_max = config.lr
         self.lr_min = 0.1 * config.lr
         self.ramp_up_end = int(config.ramp_up_phase * config.num_episodes)
         self.decay_len = config.num_episodes - 1 - self.ramp_up_end
 
     def alpha(self, t: int) -> float:
-        """
-        MMD magnet coefficient.
-
-        Annealing alpha downward late in training pushes the fixed point
-        toward Nash; Constant for a QRE fixed point.
-        """
+        """Return the magnet loss coefficient at episode t."""
         del t
         return self.alpha_value
 
     def state_dict(self) -> dict[str, float | int]:
-        """
-        Expose the PyTorch-standard state_dict interface for checkpointing.
-
-        Since this scheduler computes the learning rate dynamically based on the
-        episode 't' and has no mutable internal state, this just saves the static
-        configuration parameters into the checkpoint.
-        """
+        """Export scheduler parameters for checkpointing."""
         return {
             "alpha_value": self.alpha_value,
             "lr_max": self.lr_max,
@@ -84,39 +78,37 @@ class PPOScheduler:
         }
 
     def load_state_dict(self, value: dict[str, float | int]) -> None:
-        """
-        Restore the scheduler state from a checkpoint.
-
-        Because there is no mutable state to overwrite, this method acts purely as a
-        safeguard to ensure we don't accidentally resume a training run using a
-        completely different learning rate schedule than what it started with.
-        """
+        """Restore scheduler parameters and verify they match the active run."""
         if value != self.state_dict():
             raise ValueError("PPO scheduler configuration does not match the checkpoint")
 
-    def lr(self, t: int):
-        """
-        Start at the minimum LR, ramp linearly, then decay to the minimum.
-        """
+    def lr(self, t: int) -> float:
+        """Compute the learning rate at episode t."""
+        if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+            raise ValueError("episode t must be a non-negative integer")
+
         if t <= self.ramp_up_end:
-            prog = t / self.ramp_up_end
-            prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]
+            prog = min(max(t / self.ramp_up_end, 0.0), 1.0)
             return (1 - prog) * self.lr_min + prog * self.lr_max
 
-        prog = (t - self.ramp_up_end) / self.decay_len
-        prog = min(max(prog, 0.0), 1.0)  # clamp to [0, 1]
+        prog = min(max((t - self.ramp_up_end) / self.decay_len, 0.0), 1.0)
         delta = self.lr_max - self.lr_min
         return self.lr_min + 0.5 * delta * (1 + math.cos(math.pi * prog))
 
 
-def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
-    """Apply weight decay only to Linear weights."""
+def adamw_param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    """Apply weight decay only to Linear weights and skip frozen parameters."""
+    if weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
+
     linear_weights = {
         id(module.weight) for module in model.modules() if isinstance(module, nn.Linear)
     }
-    decay_params = []
-    no_decay_params = []
+    decay_params: list[nn.Parameter] = []
+    no_decay_params: list[nn.Parameter] = []
     for param in model.parameters():
+        if not param.requires_grad:
+            continue
         if id(param) in linear_weights:
             decay_params.append(param)
         else:

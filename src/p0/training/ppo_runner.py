@@ -21,7 +21,7 @@ from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
 from p0.runtime.showdown import start_showdown_servers
 from p0.teams.factory import build_team_source
-from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore, PolicyStore
+from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.config import GlobalConfig
 from p0.training.magnet import Magnet
 from p0.training.rollout import RolloutCollector
@@ -67,7 +67,7 @@ def _close_environments(envs: list[SimEnv]) -> None:
 def run_training(
     config: GlobalConfig,
     *,
-    policy_store: PolicyStore = DEFAULT_POLICY_STORE,
+    policy_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
     cancel_requested: Callable[[], bool] = lambda: False,
     agent_team_source: str = "all",
 ) -> None:
@@ -88,11 +88,7 @@ def run_training(
     if checkpoint_path is not None:
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"PPO checkpoint does not exist: {checkpoint_path}")
-        policy_context = (
-            policy_store.reuse_artifact(checkpoint_path)
-            if isinstance(policy_store, CheckpointStore)
-            else nullcontext()
-        )
+        policy_context = policy_store.reuse_artifact(checkpoint_path)
     else:
         policy_context = nullcontext()
 
@@ -109,7 +105,7 @@ def run_training(
 def _run_training_loaded(
     config: GlobalConfig,
     *,
-    policy_store: PolicyStore,
+    policy_store: CheckpointStore,
     cancel_requested: Callable[[], bool],
     agent_team_source: str,
     checkpoint_path: Path | None,

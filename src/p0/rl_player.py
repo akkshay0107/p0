@@ -36,7 +36,7 @@ from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.factory import build_team_source
 from p0.teams.source import FileTeamSource, TeamSource
-from p0.training.checkpoint import DEFAULT_POLICY_STORE, PolicyStore
+from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.config import load_config
 
 _LIVE_HISTORY_CAPACITY = 2 * HISTORY_WINDOW
@@ -455,7 +455,7 @@ def _resolve_checkpoint_path(root_dir: Path, checkpoint: Path | None) -> Path:
 def _load_policy(
     checkpoint_path: Path | None,
     allow_random_init: bool,
-    policy_store: PolicyStore = DEFAULT_POLICY_STORE,
+    policy_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
 ) -> PolicyNet:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -667,14 +667,14 @@ def _configure_logging(level: str) -> None:
 
 async def run_bot(
     config: RLBotConfig,
-    policy_store: PolicyStore = DEFAULT_POLICY_STORE,
+    policy_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
 ) -> None:
     """
     Boot and run the RL bot Showdown listener process.
 
     Arguments:
       config: RLBotConfig containing connection, policy, and team options
-      policy_store: PolicyStore implementation for checkpoint loading
+      policy_store: CheckpointStore implementation for checkpoint loading
 
     Returns:
       None
