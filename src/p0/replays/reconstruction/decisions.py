@@ -1,10 +1,4 @@
-"""
-Decision-window inference and action evidence for replay reconstruction v2.
-
-This module consumes resolved protocol events and immutable state snapshots. It
-keeps request-boundary inference separate from action extraction so execution
-lines cannot create policy decisions by themselves.
-"""
+"""Infer replay decisions from resolved events and immutable state."""
 
 from __future__ import annotations
 
@@ -665,19 +659,10 @@ def build_decision_view(
     )
 
 
-def _pre_state(
-    snapshots: tuple[ReplayBattleState, ...],
-    start_line_index: int,
-) -> ReplayBattleState | None:
-    if start_line_index == 0:
-        return None
-    return snapshots[start_line_index - 1]
-
-
 def _decision_for_window(
     window: DecisionWindow,
     events: tuple[ResolvedProtocolEvent, ...],
-    snapshots: tuple[ReplayBattleState, ...],
+    snapshots: Mapping[int, ReplayBattleState],
     document: ReplayDocument,
     perspective: int,
     max_candidates: int,
@@ -691,9 +676,8 @@ def _decision_for_window(
         DecisionType.PIVOT_SWITCH,
     } and not _has_player_policy_action(window_events, perspective):
         return None
-    pre_state = _pre_state(snapshots, window.start_line_index)
     if window.kind is BoundaryKind.TEAM_PREVIEW:
-        final_state = snapshots[-1]
+        final_state = snapshots[len(events) - 1]
         observed = _preview_actions(
             window_events, document.ots[perspective], final_state, perspective
         )
@@ -709,6 +693,7 @@ def _decision_for_window(
         tags = observed[2]
         unknown = not any(action is not None for action in observed[:2])
     else:
+        pre_state = None if window.start_line_index == 0 else snapshots[window.start_line_index - 1]
         if pre_state is None:
             raise ValueError("Policy decision window has no pre-decision state")
         observed = _observed_actions(window_events, pre_state, perspective, animation_targets)
@@ -791,12 +776,10 @@ def reconstruct_decisions_from_trace(
         )
     event_tuple = tuple(events)
     snapshots = state.require_accepted()
-    if len(event_tuple) != len(snapshots):
-        raise ValueError("Resolved events and state snapshots must have equal lengths")
-    if tuple(event.event.line_index for event in event_tuple) != tuple(
-        snapshot.line_index for snapshot in snapshots
-    ):
-        raise ValueError("Resolved events and state snapshots must have matching line indices")
+    snapshots_by_line = {snapshot.line_index: snapshot for snapshot in snapshots}
+    event_lines = {event.event.line_index for event in event_tuple}
+    if not snapshots_by_line.keys() <= event_lines:
+        raise ValueError("State snapshots must match resolved event line indices")
     if any(event.event.replay_id != document.metadata.replay_id for event in event_tuple):
         raise ValueError("Decision events must belong to the document replay")
 
@@ -816,7 +799,6 @@ def reconstruct_decisions_from_trace(
                 (),
                 (diagnostic,),
             )
-
     records: list[DecisionRecord] = []
     for window in windows:
         if not window.is_policy_request:
@@ -824,7 +806,7 @@ def reconstruct_decisions_from_trace(
         record = _decision_for_window(
             window,
             event_tuple,
-            snapshots,
+            snapshots_by_line,
             document,
             perspective,
             max_candidates,

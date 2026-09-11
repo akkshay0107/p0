@@ -182,6 +182,36 @@ def _resolved(
 
 
 class TestReconstructionState:
+    def test_requested_snapshots_still_apply_every_event(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-damage|p1a: Alpha|50/100",
+            "|-heal|p1a: Alpha|75/100",
+        )
+
+        snapshots = reduce_replay_state(
+            "state-test",
+            _complete_ots(),
+            events,
+            dex=_dex(),
+            snapshot_line_indices=(2,),
+        ).require_accepted()
+
+        assert tuple(snapshot.line_index for snapshot in snapshots) == (2,)
+        assert snapshots[0].member(ReplayMemberId(ReplaySide.P1, 0)).hp_fraction == 0.75
+
+    def test_snapshot_lines_must_belong_to_the_event_stream(self) -> None:
+        events = _resolved("|switch|p1a: Alpha|Alpha, L50|100/100")
+
+        with pytest.raises(ValueError, match="must belong"):
+            reduce_replay_state(
+                "state-test",
+                _complete_ots(),
+                events,
+                dex=_dex(),
+                snapshot_line_indices=(1,),
+            )
+
     def test_clearallboost_clears_every_active_boost(self) -> None:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",

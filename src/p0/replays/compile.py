@@ -51,6 +51,7 @@ from p0.replays.reconstruction.events import parse_protocol_event
 from p0.replays.reconstruction.projection import (
     ProjectedPerspective,
     ReplayStatValue,
+    _projection_snapshot_lines,
     impute_replay_stats,
     project_replay_perspectives,
 )
@@ -788,18 +789,19 @@ def _compile_worker(
     if resolved.diagnostics:
         return None, resolved.diagnostics[0].category
     events = resolved.require_accepted()
+    windows = infer_decision_windows(events)
 
     state = reduce_replay_state(
         document.metadata.replay_id,
         document.ots,
         events,
         dex=runtime_dex,
+        snapshot_line_indices=_projection_snapshot_lines(events, windows),
     )
 
     if state.diagnostics:
         return None, state.diagnostics[0].category
 
-    windows = infer_decision_windows(events)
     decisions = tuple(
         reconstruct_decisions_from_trace(
             document,

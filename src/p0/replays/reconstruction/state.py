@@ -425,7 +425,7 @@ class ReplayBattleState:
 
 @dataclass(frozen=True, slots=True)
 class ReconstructedReplayState:
-    """All line-indexed snapshots or a whole-replay rejection."""
+    """Selected line-indexed snapshots or a whole-replay rejection."""
 
     replay_id: str
     snapshots: tuple[ReplayBattleState, ...]
@@ -438,6 +438,9 @@ class ReconstructedReplayState:
             raise ValueError("Rejected state reconstruction cannot retain snapshots")
         if any(snapshot.replay_id != self.replay_id for snapshot in self.snapshots):
             raise ValueError("State reconstruction cannot contain another replay")
+        lines = tuple(snapshot.line_index for snapshot in self.snapshots)
+        if lines != tuple(sorted(set(lines))):
+            raise ValueError("State snapshots must have unique ascending line indices")
 
     def require_accepted(self) -> tuple[ReplayBattleState, ...]:
         """Return snapshots or raise the structured whole-replay rejection."""
@@ -2202,8 +2205,9 @@ def reduce_replay_state(
     events: Iterable[ResolvedProtocolEvent],
     *,
     dex: Mapping[str, Any],
+    snapshot_line_indices: Iterable[int] | None = None,
 ) -> ReconstructedReplayState:
-    """Apply resolved events once and emit immutable state at every replay cursor."""
+    """Apply all events and snapshot every line or the requested lines."""
     event_tuple = tuple(events)
     if tuple(sheet.side for sheet in ots) != (ReplaySide.P1, ReplaySide.P2):
         raise ValueError("OTS sheets must be ordered as p1 and p2")
@@ -2214,6 +2218,9 @@ def reduce_replay_state(
     line_indices = tuple(event.event.line_index for event in event_tuple)
     if line_indices != tuple(sorted(set(line_indices))):
         raise ValueError("Resolved events must have unique ascending line indices")
+    requested_lines = None if snapshot_line_indices is None else frozenset(snapshot_line_indices)
+    if requested_lines is not None and not requested_lines.issubset(line_indices):
+        raise ValueError("Snapshot line indices must belong to the resolved event stream")
     if not event_tuple:
         return ReconstructedReplayState(replay_id, ())
     try:
@@ -2229,7 +2236,8 @@ def reduce_replay_state(
     for resolved in event_tuple:
         try:
             reducer.apply(resolved)
-            snapshots.append(reducer.snapshot(resolved.event.line_index))
+            if requested_lines is None or resolved.event.line_index in requested_lines:
+                snapshots.append(reducer.snapshot(resolved.event.line_index))
         except _StateTransitionError as exc:
             return ReconstructedReplayState(
                 replay_id,

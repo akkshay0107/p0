@@ -12,7 +12,9 @@ from p0.model.tokenizer import tokenizer
 from p0.replays.identity import ReplayMemberId, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.decisions import (
+    BoundaryKind,
     DecisionReconstruction,
+    DecisionWindow,
     _mega_rules,
     build_decision_view,
 )
@@ -573,7 +575,7 @@ def _hp_before(
 def _spatial_records(
     document: ReplayDocument,
     events: tuple[ResolvedProtocolEvent, ...],
-    state: tuple[ReplayBattleState, ...],
+    state: Mapping[int, ReplayBattleState],
     *,
     perspective: int,
     starts: tuple[int, ...],
@@ -586,7 +588,7 @@ def _spatial_records(
             event = events[line_index]
             if event.event.tag == "turn":
                 recorder.reset_turn()
-            before = None if line_index == 0 else state[line_index - 1]
+            before = state.get(line_index - 1)
             recorder.apply_line(
                 document.protocol_lines[line_index].parts,
                 tokenizer,
@@ -595,6 +597,29 @@ def _spatial_records(
         records[start] = recorder.to_records()
         cursor = start
     return records
+
+
+def _projection_snapshot_lines(
+    events: tuple[ResolvedProtocolEvent, ...],
+    windows: tuple[DecisionWindow, ...],
+) -> frozenset[int]:
+    policy_windows = tuple(window for window in windows if window.is_policy_request)
+    last_start = max((window.start_line_index for window in policy_windows), default=0)
+    lines = {
+        len(events) - 1,
+        *(
+            window.start_line_index
+            if window.kind is BoundaryKind.TEAM_PREVIEW
+            else window.start_line_index - 1
+            for window in policy_windows
+        ),
+        *(
+            event.event.line_index - 1
+            for event in events[:last_start]
+            if event.event.line_index > 0 and event.event.tag in {"-damage", "-heal"}
+        ),
+    }
+    return frozenset(line for line in lines if line >= 0)
 
 
 def project_replay_perspectives(
@@ -608,27 +633,34 @@ def project_replay_perspectives(
     """Build p1 and p2 views from one shared immutable trace."""
     event_tuple = tuple(events)
     snapshots = state.require_accepted()
-    if len(event_tuple) != len(snapshots):
-        raise ValueError("Projection requires one state snapshot per resolved event")
     if any(result.diagnostics for result in decisions):
         raise ValueError("Projection requires accepted decision reconstruction")
+    snapshots_by_line = {snapshot.line_index: snapshot for snapshot in snapshots}
+    required_lines = _projection_snapshot_lines(event_tuple, decisions[0].windows)
+    missing_lines = required_lines - snapshots_by_line.keys()
+    if missing_lines:
+        raise ValueError(
+            f"State reconstruction is missing projection lines: {sorted(missing_lines)}"
+        )
 
     mega_rules = _mega_rules(dex)
     window_by_bounds = {
         (window.start_line_index, window.end_line_index): window for window in decisions[0].windows
     }
     starts = tuple(
-        dict.fromkeys(
-            decision.pre_line_index
-            for reconstruction in decisions
-            for decision in reconstruction.decisions
+        sorted(
+            {
+                decision.pre_line_index
+                for reconstruction in decisions
+                for decision in reconstruction.decisions
+            }
         )
     )
     spatial = tuple(
         _spatial_records(
             document,
             event_tuple,
-            snapshots,
+            snapshots_by_line,
             perspective=perspective,
             starts=starts,
         )
@@ -646,11 +678,11 @@ def project_replay_perspectives(
             window_events = event_tuple[window.start_line_index : window.end_line_index]
             preview = decision.decision_type is DecisionType.TEAM_PREVIEW
             if preview:
-                snapshot = snapshots[decision.pre_line_index]
+                snapshot = snapshots_by_line[decision.pre_line_index]
             else:
                 if decision.pre_line_index == 0:
                     raise ValueError("Non-preview decision cannot start at line zero")
-                snapshot = snapshots[decision.pre_line_index - 1]
+                snapshot = snapshots_by_line[decision.pre_line_index - 1]
             decision_view = build_decision_view(
                 snapshot,
                 document.ots[perspective],
