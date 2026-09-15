@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
@@ -24,14 +25,24 @@ def _positive_ints(obj: object, *names: str) -> None:
 def _positive(obj: object, *names: str) -> None:
     for name in names:
         val = getattr(obj, name)
-        if not isinstance(val, (int, float)) or isinstance(val, bool) or val <= 0:
+        if (
+            not isinstance(val, (int, float))
+            or isinstance(val, bool)
+            or not math.isfinite(val)
+            or val <= 0
+        ):
             raise ValueError(f"{type(obj).__name__}.{name} must be greater than zero")
 
 
 def _non_negative(obj: object, *names: str) -> None:
     for name in names:
         val = getattr(obj, name)
-        if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
+        if (
+            not isinstance(val, (int, float))
+            or isinstance(val, bool)
+            or not math.isfinite(val)
+            or val < 0
+        ):
             raise ValueError(f"{type(obj).__name__}.{name} must not be negative")
 
 

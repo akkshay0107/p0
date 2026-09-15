@@ -200,7 +200,7 @@ class TestTraining:
         torch.testing.assert_close(actual_advantages, (raw_flat - mean) / std)
         for batch, raw_advantage, value in zip(prepared, raw_advantages, values, strict=True):
             torch.testing.assert_close(batch.returns, raw_advantage + value)
-            assert batch.length == len(batch.rewards)
+            assert batch.length == len(batch.returns)
         assert sum(batch.length for batch in prepared) == sum(
             trajectory.length for trajectory in trajectories
         )

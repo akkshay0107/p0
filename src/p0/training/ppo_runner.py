@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import functools
 import logging
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import torch.optim as optim
@@ -36,12 +36,8 @@ from p0.training.utils import (
 from p0.training.vector_env import ThreadVecEnv
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _tensorboard_sink(writer: SummaryWriter):
-    """Create a metric sink callback for Tensorboard logging."""
-
-    return functools.partial(_emit_tensorboard, writer)
+PPO_WEIGHT_DECAY = 1e-4
+ADAM_EPSILON = 1e-6
 
 
 def _emit_tensorboard(
@@ -50,7 +46,7 @@ def _emit_tensorboard(
     step: int,
     phase: str,
 ) -> None:
-    """Write a metric mapping under a phase-specific Tensorboard namespace."""
+    """Log metrics to TensorBoard under the given phase."""
     for name, value in metrics.items():
         writer.add_scalar(f"{phase}/{name}", value, step)
 
@@ -72,7 +68,7 @@ def run_training(
     agent_team_source: str = "all",
 ) -> None:
     """
-    Build the self-play stack and run training to completion.
+    Set up self-play environments and run PPO training.
 
     Arguments:
         config: Validated global runtime and training configuration.
@@ -110,6 +106,19 @@ def _run_training_loaded(
     agent_team_source: str,
     checkpoint_path: Path | None,
 ) -> None:
+    """
+    Initialize policy, optimizer, environments, and trainer, then run training.
+
+    Arguments:
+        config: Validated application configuration.
+        policy_store: Checkpoint reader and writer.
+        cancel_requested: Cooperative cancellation callback.
+        agent_team_source: Selected training team pool name.
+        checkpoint_path: Resume or initialization artifact, when configured.
+
+    Returns:
+        None.
+    """
     training, paths = config.training, config.paths
     if agent_team_source == "all":
         agent_team_path = config.teams.all
@@ -145,14 +154,17 @@ def _run_training_loaded(
     else:
         policy = build_policy(ModelConfig.baseline(), resources).to(device)
 
-    optimizer = optim.AdamW(adamw_param_groups(policy, weight_decay=1e-4), lr=training.lr, eps=1e-6)
+    optimizer = optim.AdamW(
+        adamw_param_groups(policy, weight_decay=PPO_WEIGHT_DECAY),
+        lr=training.lr,
+        eps=ADAM_EPSILON,
+    )
     precision = select_optimization_precision(training.enable_optim, device)
     scaler = GradScaler(device.type, enabled=precision.grad_scaler)
     magnet = Magnet(policy)
     scheduler = PPOScheduler(training)
     resume_environment_state: object | None = None
     resume_collector_state: object | None = None
-
     start = (
         policy_store.load_training_state(
             paths.resume_checkpoint,
@@ -169,15 +181,19 @@ def _run_training_loaded(
     )
     if paths.resume_checkpoint is not None:
         resume_metadata = policy_store.load_metadata(paths.resume_checkpoint)
-        resume_environment_state = resume_metadata.get("environment_state")
-        resume_collector_state = resume_metadata.get("collector_state")
+        environment_state = resume_metadata.get("environment_state")
+        collector_state = resume_metadata.get("collector_state")
+        if isinstance(environment_state, (tuple, list)) and isinstance(collector_state, Mapping):
+            resume_environment_state = environment_state
+            resume_collector_state = collector_state
+        else:
+            LOGGER.warning("PPO checkpoint has incomplete rollout state; starting fresh series")
     policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
 
     agent_source = build_team_source(agent_team_path, expected_format_id=config.bot.battle_format)
     opponent_source = build_team_source(
         config.teams.all, expected_format_id=config.bot.battle_format
     )
-
     with start_showdown_servers(
         training.n_envs,
         showdown_root=paths.showdown_root,
@@ -196,21 +212,29 @@ def _run_training_loaded(
                         agent_team_source=agent_source,
                         opponent_team_source=opponent_source,
                         observation_builder=ObservationBuilder(resources=resources),
-                        agent_seed=index * 2,
-                        opponent_seed=index * 2 + 1,
+                        agent_seed=training.seed + index * 2,
+                        opponent_seed=training.seed + index * 2 + 1,
                     )
                 )
             vector_env = ThreadVecEnv(envs)
-            if isinstance(resume_environment_state, (tuple, list)):
-                vector_env.restore_training_state(resume_environment_state)
-            writer = SummaryWriter(log_dir=str(paths.runs_dir / "ppo_training"))
             collector = RolloutCollector(
                 vector_env,
                 policy,
                 training,
             )
-            if isinstance(resume_collector_state, Mapping):
-                collector.restore_training_state(resume_collector_state)
+            if resume_environment_state is not None and resume_collector_state is not None:
+                fresh_environment_state = vector_env.training_state()
+                try:
+                    vector_env.restore_training_state(resume_environment_state)
+                    collector.restore_training_state(resume_collector_state)
+                except (TypeError, ValueError) as exc:
+                    vector_env.restore_training_state(fresh_environment_state)
+                    collector = RolloutCollector(vector_env, policy, training)
+                    LOGGER.warning(
+                        "PPO checkpoint has malformed rollout state; starting fresh series: %s",
+                        exc,
+                    )
+            writer = SummaryWriter(log_dir=str(paths.runs_dir / "ppo_training"))
             trainer = PPOTrainer(
                 policy=policy,
                 policy_store=policy_store,
@@ -222,13 +246,16 @@ def _run_training_loaded(
                 scheduler=scheduler,
                 training_config=training,
                 metrics_path=paths.runs_dir / "ppo_training" / "metrics.json",
-                metric_sink=_tensorboard_sink(writer),
+                metric_sink=partial(_emit_tensorboard, writer),
                 cancel_requested=cancel_requested,
             )
             trainer.run(start)
         finally:
             if writer is not None:
-                writer.close()
+                try:
+                    writer.close()
+                except Exception:
+                    LOGGER.exception("Failed to close the PPO metric writer cleanly")
             if vector_env is not None:
                 vector_env.shutdown()
             else:

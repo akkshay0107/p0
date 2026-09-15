@@ -22,10 +22,6 @@ class Magnet:
         self.policy = deepcopy(policy).to(policy.device).eval()
         self.policy.requires_grad_(False)
 
-    @property
-    def device(self) -> torch.device:
-        return self.policy.device
-
     def refresh(self, policy: PolicyNet) -> None:
         """
         Reload the magnet weights from the live policy (state-dict copy only).

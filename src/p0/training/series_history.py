@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -21,6 +20,7 @@ SeriesStateSnapshot = tuple[
 ]
 
 _SPK_PREFIX = "__spk__:"
+_EMPTY_STATE: SeriesStateSnapshot = (), None, (), False
 
 
 def _norm_key(key: SeriesHistoryKey) -> str:
@@ -31,12 +31,38 @@ def _norm_key(key: SeriesHistoryKey) -> str:
     raise ValueError("Series history keys must be non-empty strings or perspective keys")
 
 
-@dataclass(slots=True)
-class _SeriesState:
-    completed_games: list[tuple[int, Tensor]] = field(default_factory=list)
-    active_game_number: int | None = None
-    active_fragments: list[Tensor] = field(default_factory=list)
-    ended: bool = False
+def advance_series_state(
+    state: SeriesStateSnapshot,
+    game_number: int,
+    values: Tensor,
+    *,
+    is_game_end: bool,
+    is_series_end: bool,
+    max_games: int = MAX_PRIOR_GAMES,
+) -> SeriesStateSnapshot:
+    """Advance series history state for a game step or boundary."""
+    completed_games, active_game_number, active_fragments, ended = state
+    if ended:
+        raise ValueError("A perspective-series cannot receive data after it ended")
+    if is_series_end and not is_game_end:
+        raise ValueError("A series can end only at a game boundary")
+
+    if active_game_number is None:
+        expected = completed_games[-1][0] + 1 if completed_games else 1
+        if game_number != expected:
+            raise ValueError("Game numbers must be consecutive within a perspective-series")
+        active_game_number = game_number
+    elif game_number != active_game_number:
+        raise ValueError("A perspective-game changed before its previous game ended")
+
+    if is_series_end:
+        return (), None, (), True
+    if not is_game_end:
+        return completed_games, active_game_number, (*active_fragments, values), False
+
+    completed_game = torch.cat((*active_fragments, values), dim=0) if active_fragments else values
+    completed_games = (*completed_games, (game_number, completed_game))[-max_games:]
+    return completed_games, None, (), False
 
 
 class SeriesHistoryStore:
@@ -49,40 +75,54 @@ class SeriesHistoryStore:
             )
         self.d_model = d_model
         self.max_games = max_games
-        self._states: dict[str, _SeriesState] = {}
+        self._states: dict[str, SeriesStateSnapshot] = {}
 
     @property
     def has_partial_games(self) -> bool:
         """Return whether any series currently has an unfinished game."""
-        return any(s.active_game_number is not None for s in self._states.values())
+        return any(state[1] is not None for state in self._states.values())
 
     def next_game_number(self, key: SeriesHistoryKey) -> int:
         """Return the game number expected for the next fragment under key."""
         state = self._states.get(_norm_key(key))
         if state is None:
             return 1
-        if state.active_game_number is not None:
-            return state.active_game_number
-        return (state.completed_games[-1][0] + 1) if state.completed_games else 1
+        completed, active_game, _, _ = state
+        if active_game is not None:
+            return active_game
+        return (completed[-1][0] + 1) if completed else 1
 
     def snapshot(self, key: SeriesHistoryKey) -> SeriesHistorySnapshot:
         """Return prior completed games in chronological order as immutable references."""
         state = self._states.get(_norm_key(key))
-        if state is None or state.ended:
+        if state is None or state[3]:
             return ()
-        return tuple(val for _, val in state.completed_games[-self.max_games :])
+        return tuple(values for _, values in state[0][-self.max_games :])
 
     def planning_state(self, key: SeriesHistoryKey) -> SeriesStateSnapshot:
         """Return state views for prior-game simulation."""
-        state = self._states.get(_norm_key(key))
-        if state is None:
-            return (), None, (), False
-        return (
-            tuple(state.completed_games),
-            state.active_game_number,
-            tuple(state.active_fragments),
-            state.ended,
-        )
+        return self._states.get(_norm_key(key), _EMPTY_STATE)
+
+    def snapshot_keys(
+        self,
+        keys: Iterable[SeriesHistoryKey],
+    ) -> dict[str, SeriesStateSnapshot | None]:
+        """Snapshot history states for selected series keys for rollback."""
+        snapshots: dict[str, SeriesStateSnapshot | None] = {}
+        for key in keys:
+            normalized = _norm_key(key)
+            if normalized in snapshots:
+                continue
+            snapshots[normalized] = self._states.get(normalized)
+        return snapshots
+
+    def restore_keys(self, snapshots: Mapping[str, SeriesStateSnapshot | None]) -> None:
+        """Restore series history states from a snapshot."""
+        for key, snapshot in snapshots.items():
+            if snapshot is None:
+                self._states.pop(key, None)
+            else:
+                self._states[key] = snapshot
 
     def append(
         self,
@@ -103,35 +143,21 @@ class SeriesHistoryStore:
         if is_series_end and not is_game_end:
             raise ValueError("A series can end only at a game boundary")
 
-        state = self._states.setdefault(norm_key, _SeriesState())
-        if state.ended:
-            raise ValueError("A perspective-series cannot receive data after it ended")
-
-        if state.active_game_number is None:
-            expected = state.completed_games[-1][0] + 1 if state.completed_games else 1
-            if game_number != expected:
-                raise ValueError("Game numbers must be consecutive within a perspective-series")
-            state.active_game_number = game_number
-        elif game_number != state.active_game_number:
-            raise ValueError("A perspective-game changed before its previous game ended")
-
-        detached = (
-            values.detach().clone()
-            if (values.device.type == "cpu" and values.dtype == torch.float32)
-            else values.detach().to(device="cpu", dtype=torch.float32).clone()
+        retained = values
+        if not is_series_end:
+            retained = (
+                values.detach().clone()
+                if (values.device.type == "cpu" and values.dtype == torch.float32)
+                else values.detach().to(device="cpu", dtype=torch.float32).clone()
+            )
+        self._states[norm_key] = advance_series_state(
+            self._states.get(norm_key, _EMPTY_STATE),
+            game_number,
+            retained,
+            is_game_end=is_game_end,
+            is_series_end=is_series_end,
+            max_games=self.max_games,
         )
-        state.active_fragments.append(detached)
-
-        if is_game_end:
-            completed = torch.cat(state.active_fragments, dim=0)
-            state.completed_games.append((game_number, completed))
-            state.completed_games = state.completed_games[-self.max_games :]
-            state.active_game_number = None
-            state.active_fragments.clear()
-
-        if is_series_end:
-            state.completed_games.clear()
-            state.ended = True
 
     def drop(self, key: SeriesHistoryKey) -> None:
         """Remove one series while existing snapshots remain valid by reference."""
@@ -143,25 +169,24 @@ class SeriesHistoryStore:
 
     def discard_active_games(self) -> None:
         """Discard unfinished games while retaining completed prior-game histories."""
-        for state in self._states.values():
-            state.active_game_number = None
-            state.active_fragments.clear()
+        for key, (completed, _, _, ended) in self._states.items():
+            self._states[key] = completed, None, (), ended
 
     def training_state(self) -> dict[str, dict[str, object]]:
         """Capture series history for checkpointing."""
         return {
             key: {
-                "completed_games": tuple((n, t.clone()) for n, t in s.completed_games),
-                "active_game_number": s.active_game_number,
-                "active_fragments": tuple(t.clone() for t in s.active_fragments),
-                "ended": s.ended,
+                "completed_games": tuple((number, values.clone()) for number, values in completed),
+                "active_game_number": active_game,
+                "active_fragments": tuple(values.clone() for values in fragments),
+                "ended": ended,
             }
-            for key, s in self._states.items()
+            for key, (completed, active_game, fragments, ended) in self._states.items()
         }
 
     def restore_training_state(self, state: Mapping[str, object]) -> None:
         """Restore series history captured by training_state."""
-        restored: dict[str, _SeriesState] = {}
+        restored: dict[str, SeriesStateSnapshot] = {}
         for raw_key, raw_val in state.items():
             if not isinstance(raw_key, str) or not raw_key:
                 raise ValueError("Series history checkpoint keys must be non-empty strings")
@@ -215,11 +240,11 @@ class SeriesHistoryStore:
             elif fragments:
                 raise ValueError("Series history has active fragments without an active game")
 
-            restored[raw_key] = _SeriesState(
-                completed_games=completed,
-                active_game_number=raw_active_number,
-                active_fragments=fragments,
-                ended=raw_ended,
+            restored[raw_key] = (
+                tuple(completed),
+                raw_active_number,
+                tuple(fragments),
+                raw_ended,
             )
         self._states = restored
 

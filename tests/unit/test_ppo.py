@@ -19,6 +19,57 @@ from p0.training.trajectory import (
 
 
 class TestPPO:
+    def test_update_honors_batch_size_without_mutating_input_order(self) -> None:
+        torch.manual_seed(3)
+        policy = build_policy(
+            ModelConfig(d_model=32, nhead=4, reducer_layers=1, dim_feedforward=64),
+            default_runtime_resources(),
+        )
+        collected = [
+            CollectedTrajectory(
+                observations=StructuredObservation.empty_batch(1),
+                action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
+                actions=torch.tensor([[1, 2]], dtype=torch.long),
+                log_probs=torch.zeros(1),
+                values=torch.zeros(1),
+                rewards=torch.tensor([float(index - 3)]),
+                dones=torch.ones(1),
+                length=1,
+                bootstrap_value=0.0,
+                series_history=(),
+            )
+            for index in range(7)
+        ]
+        prepared = prepare_trajectory_batches(
+            collected, torch.device("cpu"), gamma=0.99, gae_lambda=0.95
+        )
+        original_order = tuple(id(trajectory) for trajectory in prepared)
+        config = TrainingConfig(
+            num_episodes=20,
+            n_envs=1,
+            rollout_steps=1,
+            batch_size=3,
+            minibatch_size=2,
+            ppo_epochs=1,
+            target_kl=1.0e9,
+            enable_optim=False,
+        )
+
+        stats = ppo_update(
+            prepared,
+            policy,
+            Magnet(policy),
+            torch.optim.SGD(policy.parameters(), lr=1e-3),
+            torch.amp.GradScaler("cpu", enabled=False),
+            config,
+            episode=0,
+            alpha=0.0,
+            cancel_requested=lambda: False,
+        )
+
+        assert stats["optimizer_updates"] == 3
+        assert tuple(id(trajectory) for trajectory in prepared) == original_order
+
     def test_ppo_recomputes_prior_game_series_context_with_live_gradients(self) -> None:
         """Verify PPO updates the live series resampler from detached prior-game histories."""
         torch.manual_seed(4)

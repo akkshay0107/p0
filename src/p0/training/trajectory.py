@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import MAX_PRIOR_GAMES
+from p0.model.architecture_contract import HISTORY_WINDOW, MAX_PRIOR_GAMES
 from p0.model.structured_observation import StructuredObservation
 from p0.training.series_history import SeriesHistorySnapshot
 
@@ -76,56 +76,39 @@ class CollectedTrajectory:
 
 @dataclass(frozen=True, slots=True)
 class PreparedTrajectory:
-    """Validated trajectory with mandatory PPO returns, advantages, and history."""
+    """Trajectory prepared with returns and advantages for PPO."""
 
     observations: StructuredObservation
     action_masks: torch.Tensor
     actions: torch.Tensor
     log_probs: torch.Tensor
-    values: torch.Tensor
-    rewards: torch.Tensor
-    dones: torch.Tensor
     length: int
-    bootstrap_value: float
     series_history: SeriesHistorySnapshot
     returns: torch.Tensor
     advantages: torch.Tensor
     explained_variance: float
+    truncated: bool
 
     def __post_init__(self) -> None:
-        _validate_trajectory(
-            self.observations,
-            self.action_masks,
-            self.actions,
-            self.log_probs,
-            self.values,
-            self.rewards,
-            self.dones,
-            self.length,
-        )
-        if self.returns.size(0) != self.length or self.advantages.size(0) != self.length:
+        if type(self.length) is not int or self.length <= 0:
+            raise ValueError("Prepared trajectories must contain at least one step")
+        if any(
+            tensor.size(0) != self.length
+            for tensor in (
+                self.action_masks,
+                self.actions,
+                self.log_probs,
+                self.returns,
+                self.advantages,
+            )
+        ):
             raise ValueError("Prepared trajectory target lengths do not match")
+        self.observations.validate(batch_rank=1)
         if not isinstance(self.explained_variance, float):
             raise ValueError("explained_variance must be a float")
+        if type(self.truncated) is not bool:
+            raise ValueError("truncated must be a bool")
         _validate_series_snapshot(self.series_history)
-
-    def to_ppo_device(self, device: torch.device | str) -> PreparedTrajectory:
-        """Move only PPO tensors to the target device and retain history references."""
-        return PreparedTrajectory(
-            observations=self.observations.to(device),
-            action_masks=self.action_masks.to(device),
-            actions=self.actions.to(device),
-            log_probs=self.log_probs.to(device),
-            values=self.values,
-            rewards=self.rewards,
-            dones=self.dones,
-            length=self.length,
-            bootstrap_value=self.bootstrap_value,
-            series_history=self.series_history,
-            returns=self.returns.to(device),
-            advantages=self.advantages.to(device),
-            explained_variance=self.explained_variance,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,42 +121,45 @@ class TrajectoryStorage:
     rewards: torch.Tensor
     dones: torch.Tensor
     action_masks: torch.Tensor
-    max_steps: int
+    history_tokens: torch.Tensor
+    history_offsets: torch.Tensor
 
     @classmethod
     def allocate(
         cls,
         n_envs: int,
         max_steps: int,
-        device: torch.device | str = "cpu",
+        d_model: int,
+        history_device: torch.device | str,
     ) -> TrajectoryStorage:
-        if n_envs <= 0 or max_steps <= 0:
-            raise ValueError("n_envs and max_steps must be positive")
+        if n_envs <= 0 or max_steps <= 0 or d_model <= 0:
+            raise ValueError("Trajectory dimensions must be positive")
 
-        flat = StructuredObservation.empty_batch(n_envs * max_steps).to(device)
+        flat = StructuredObservation.empty_batch(n_envs * max_steps)
         observations = StructuredObservation._from_values(
             [value.reshape(n_envs, max_steps, *value.shape[1:]) for value in flat.tensors()]
         )
         return cls(
-            step_counts=torch.zeros(n_envs, dtype=torch.long, device=device),
+            step_counts=torch.zeros(n_envs, dtype=torch.long),
             observations=observations,
-            actions=torch.zeros((n_envs, max_steps, 2), dtype=torch.long, device=device),
-            log_probs=torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
-            values=torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
-            rewards=torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
-            dones=torch.zeros((n_envs, max_steps), dtype=torch.float32, device=device),
-            action_masks=torch.zeros(
-                (n_envs, max_steps, 2, FORMAT.action_size), dtype=torch.bool, device=device
+            actions=torch.zeros((n_envs, max_steps, 2), dtype=torch.long),
+            log_probs=torch.zeros((n_envs, max_steps), dtype=torch.float32),
+            values=torch.zeros((n_envs, max_steps), dtype=torch.float32),
+            rewards=torch.zeros((n_envs, max_steps), dtype=torch.float32),
+            dones=torch.zeros((n_envs, max_steps), dtype=torch.float32),
+            action_masks=torch.zeros((n_envs, max_steps, 2, FORMAT.action_size), dtype=torch.bool),
+            history_tokens=torch.zeros(
+                (n_envs, max_steps, d_model), dtype=torch.float32, device=history_device
             ),
-            max_steps=max_steps,
+            history_offsets=torch.arange(-HISTORY_WINDOW, 0, device=history_device),
         )
 
     def ensure_capacity(self, env_ids: torch.Tensor) -> None:
-        overflowing = env_ids[self.step_counts[env_ids] >= self.max_steps]
+        max_steps = self.actions.size(1)
+        overflowing = env_ids[self.step_counts[env_ids] >= max_steps]
         if overflowing.numel():
             raise OverflowError(
-                f"Trajectory exceeded {self.max_steps} steps for environments "
-                f"{overflowing.tolist()}"
+                f"Trajectory exceeded {max_steps} steps for environments {overflowing.tolist()}"
             )
 
     def record(
@@ -184,10 +170,15 @@ class TrajectoryStorage:
         log_probs: torch.Tensor,
         values: torch.Tensor,
         action_masks: torch.Tensor,
+        history_tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Store one decision for each selected environment and return its step indices."""
         self.ensure_capacity(env_ids)
         steps = self.step_counts[env_ids]
+        if history_tokens.shape != (env_ids.numel(), self.history_tokens.size(2)):
+            raise ValueError("History token batch does not match selected environments")
+        history_env_ids = env_ids.to(self.history_tokens.device)
+        history_steps = steps.to(self.history_tokens.device)
         for destination, source in zip(
             self.observations.tensors(), observations.tensors(), strict=True
         ):
@@ -196,8 +187,35 @@ class TrajectoryStorage:
         self.log_probs[env_ids, steps] = log_probs
         self.values[env_ids, steps] = values
         self.action_masks[env_ids, steps] = action_masks
+        self.history_tokens[history_env_ids, history_steps] = history_tokens.detach().to(
+            self.history_tokens
+        )
         self.step_counts[env_ids] += 1
         return steps
+
+    def history_inputs(
+        self,
+        env_ids: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return recent game history tokens and mask for selected environments."""
+        env_ids_cpu = env_ids.to(device="cpu", dtype=torch.long)
+        env_ids_device = env_ids_cpu.to(self.history_tokens.device)
+        lengths = self.step_counts[env_ids_cpu].to(self.history_tokens.device)
+        indices = lengths.unsqueeze(1) + self.history_offsets.unsqueeze(0)
+        mask = indices >= 0
+        history = self.history_tokens[
+            env_ids_device.unsqueeze(1), indices.clamp_min(0)
+        ].masked_fill(~mask.unsqueeze(-1), 0.0)
+        return history.to(device=device, dtype=dtype), mask.to(device)
+
+    def full_history(self, env_id: int) -> torch.Tensor | None:
+        """Return the full game history for an environment."""
+        length = int(self.step_counts[env_id].item())
+        if not length:
+            return None
+        return self.history_tokens[env_id, :length].unsqueeze(0)
 
     def complete(
         self,
@@ -210,8 +228,7 @@ class TrajectoryStorage:
         if length == 0:
             raise ValueError(f"Environment {env_id} has no trajectory steps to complete")
 
-        self.step_counts[env_id] = 0
-        return CollectedTrajectory(
+        trajectory = CollectedTrajectory(
             observations=self.observations[env_id, :length].clone(),
             actions=self.actions[env_id, :length].clone(),
             log_probs=self.log_probs[env_id, :length].clone(),
@@ -223,6 +240,8 @@ class TrajectoryStorage:
             bootstrap_value=bootstrap_value,
             series_history=series_history,
         )
+        self.step_counts[env_id] = 0
+        return trajectory
 
 
 def compute_gae_batch(
@@ -301,13 +320,8 @@ def prepare_trajectory_batches(
     mean = all_advantages.mean()
     std = all_advantages.std(unbiased=False).clamp_min(1e-8)
 
-    all_returns = torch.cat(
-        [
-            advantages[index, : trajectory.length] + trajectory.values
-            for index, trajectory in enumerate(trajectories)
-        ]
-    )
     all_values = torch.cat([trajectory.values for trajectory in trajectories])
+    all_returns = all_advantages + all_values
     var_y = torch.var(all_returns, unbiased=False)
     if var_y > 1e-8:
         explained_variance = float(
@@ -321,19 +335,16 @@ def prepare_trajectory_batches(
         advantage = advantages[index, : trajectory.length]
         prepared.append(
             PreparedTrajectory(
-                observations=trajectory.observations,
-                action_masks=trajectory.action_masks,
-                actions=trajectory.actions,
-                log_probs=trajectory.log_probs,
-                values=trajectory.values,
-                rewards=trajectory.rewards,
-                dones=trajectory.dones,
+                observations=trajectory.observations.to(device),
+                action_masks=trajectory.action_masks.to(device),
+                actions=trajectory.actions.to(device),
+                log_probs=trajectory.log_probs.to(device),
                 length=trajectory.length,
-                bootstrap_value=trajectory.bootstrap_value,
                 series_history=trajectory.series_history,
-                returns=advantage + trajectory.values,
-                advantages=(advantage - mean) / std,
+                returns=(advantage + trajectory.values).to(device),
+                advantages=((advantage - mean) / std).to(device),
                 explained_variance=explained_variance,
-            ).to_ppo_device(device)
+                truncated=not bool(trajectory.dones[-1].item()),
+            )
         )
     return prepared

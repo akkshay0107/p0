@@ -94,8 +94,8 @@ class TestTrajectory:
         assert prepared[0].returns.shape == (3,)
         assert prepared[0].advantages.shape == (3,)
 
-    def test_completed_batch_only_moves_ppo_inputs_to_target_device(self) -> None:
-        """Verify device transfer moves only policy gradient computation tensors to GPU while retaining tracking metrics on CPU."""
+    def test_completed_batch_only_retains_ppo_inputs_on_target_device(self) -> None:
+        """Verify preparation drops collection-only tensors and moves PPO inputs."""
         batch = CollectedTrajectory(
             observations=StructuredObservation.empty_batch(1),
             action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
@@ -117,9 +117,31 @@ class TestTrajectory:
         assert result.observations.categorical.device.type == "meta"
         assert result.returns.device.type == "meta"
         assert result.advantages.device.type == "meta"
-        assert result.values.device.type == "cpu"
-        assert result.rewards.device.type == "cpu"
-        assert result.dones.device.type == "cpu"
+        assert result.truncated is False
+        assert not hasattr(result, "values")
+        assert not hasattr(result, "rewards")
+        assert not hasattr(result, "dones")
+
+    def test_truncated_trajectory_bootstraps_its_return(self) -> None:
+        batch = CollectedTrajectory(
+            observations=StructuredObservation.empty_batch(1),
+            action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
+            actions=torch.zeros((1, 2), dtype=torch.long),
+            log_probs=torch.zeros(1),
+            values=torch.tensor([0.25]),
+            rewards=torch.tensor([0.5]),
+            dones=torch.zeros(1),
+            length=1,
+            bootstrap_value=0.75,
+            series_history=(),
+        )
+
+        result = prepare_trajectory_batches(
+            [batch], torch.device("cpu"), gamma=0.9, gae_lambda=0.95
+        )[0]
+
+        assert result.truncated is True
+        torch.testing.assert_close(result.returns, torch.tensor([0.5 + 0.9 * 0.75]))
 
     def test_preparing_no_trajectories_is_a_noop(self) -> None:
         """Verify prepare_trajectory_batches handles empty input gracefully."""

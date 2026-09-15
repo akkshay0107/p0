@@ -1,4 +1,4 @@
-"""Episode-level PPO training lifecycle."""
+"""PPO training loop and checkpoint management."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def _rollout_metrics(trajectories: list[PreparedTrajectory]) -> dict[str, float]
         raise ValueError("Cannot summarize an empty PPO rollout")
 
     lengths = [int(trajectory.length) for trajectory in trajectories]
-    truncated = sum(not bool(trajectory.dones[-1].item()) for trajectory in trajectories)
+    truncated = sum(trajectory.truncated for trajectory in trajectories)
     return {
         "mean_game_length": sum(lengths) / len(lengths),
         "timeout_or_truncation_rate": truncated / len(lengths),
@@ -93,12 +93,14 @@ class PPOTrainer:
             alpha = self.scheduler.alpha(episode)
             self.collector.reset_completed()
             self.policy.eval()
-            self.collector.collect()
+            self.collector.collect(self.cancel_requested)
             trajectories = self.collector.get_batches(self.policy.device)
+            if self.cancel_requested():
+                del trajectories
+                self._save(episode)
+                return
             if not trajectories:
-                LOGGER.warning("No trajectories collected, skipping update")
-                completed_episode = episode + 1
-                continue
+                raise RuntimeError("PPO rollout completed without a finished trajectory")
             trajectory_count = len(trajectories)
             rollout_metrics = _rollout_metrics(trajectories)
             try:
@@ -116,39 +118,37 @@ class PPOTrainer:
             finally:
                 # The next rollout does not need the previous update's GPU copies.
                 del trajectories
+            if self.cancel_requested() and int(stats["optimizer_updates"]) == 0:
+                self._save(episode)
+                return
+            if int(stats["optimizer_updates"]) == 0:
+                raise RuntimeError("PPO completed an episode without an optimizer update")
             if (episode + 1) % refresh_interval == 0:
                 self.magnet.refresh(self.policy)
                 LOGGER.info("Refreshed magnet at episode %s", episode + 1)
             metrics = {name: float(stats[name]) for name in PPO_BOARD_METRICS if name in stats}
             metrics.update(rollout_metrics)
             self._json_metrics.append(
-                {
-                    "episode": episode + 1,
-                    "trajectory_count": trajectory_count,
-                }
+                {"episode": episode + 1, "trajectory_count": trajectory_count, **metrics}
             )
             self.metric_sink(metrics, episode + 1, "train")
             completed_episode = episode + 1
+            if self.cancel_requested():
+                self._save(completed_episode)
+                return
             if (episode + 1) % 10 == 0:
                 self._save(episode + 1)
         if completed_episode % 10 != 0:
             self._save(completed_episode)
 
     def _save(self, episode: int) -> None:
-        prepare_checkpoint = getattr(self.collector, "prepare_for_checkpoint", None)
-        if callable(prepare_checkpoint):
-            prepare_checkpoint()
+        self.collector.prepare_for_checkpoint()
         metadata: dict[str, object] = {
             "gamma": self.training_config.gamma,
             "value_target_semantics": "discounted_terminal_outcome.v1",
+            "environment_state": self.collector.vector_env.training_state(),
+            "collector_state": self.collector.training_state(),
         }
-        vector_env = self.collector.vector_env
-        capture_state = getattr(vector_env, "training_state", None)
-        if callable(capture_state):
-            metadata["environment_state"] = capture_state()
-        capture_collector_state = getattr(self.collector, "training_state", None)
-        if callable(capture_collector_state):
-            metadata["collector_state"] = capture_collector_state()
         self.policy_store.save_training_state(
             self.checkpoint_path,
             episode,

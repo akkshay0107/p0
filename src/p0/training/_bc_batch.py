@@ -29,15 +29,13 @@ class BCGameWindow:
 
 @dataclass(frozen=True, slots=True)
 class BCDecisionBatch:
-    """Target decisions plus game-local context descriptions for one update."""
+    """Batched decisions and context tensors for behavior cloning."""
 
     observations: StructuredObservation
     context_action_mask: Tensor
     action_mask: Tensor
     label_kind: Tensor
-    label_confidence: Tensor
     loss_mask: Tensor
-    decision_type: Tensor
     exact_action: Tensor
     candidate_values: Tensor
     candidate_offsets: Tensor
@@ -94,9 +92,7 @@ def _collate_bc_window(
     context_action_masks: list[Tensor] = []
     action_masks: list[Tensor] = []
     label_kinds: list[Tensor] = []
-    label_confidences: list[Tensor] = []
     loss_masks: list[Tensor] = []
-    decision_types: list[Tensor] = []
     exact_actions: list[Tensor] = []
     candidate_values: list[Tensor] = []
     candidate_offsets = [0]
@@ -107,12 +103,14 @@ def _collate_bc_window(
     outcome_valids: list[Tensor] = []
     decision_indices: list[Tensor] = []
     game_lengths: list[Tensor] = []
+    history_offsets = torch.arange(-HISTORY_WINDOW, 0, dtype=torch.long).unsqueeze(0)
     candidate_base = 0
     context_base = 0
     batch_start = 0
 
     for game, start, stop in source_windows:
-        batch_stop = batch_start + stop - start
+        target_count = stop - start
+        batch_stop = batch_start + target_count
         context_start = max(0, start - HISTORY_WINDOW)
         context_length = stop - context_start
         relative_start = start - context_start
@@ -132,29 +130,23 @@ def _collate_bc_window(
 
         action_masks.append(game.action_mask[start:stop])
         label_kinds.append(game.label_kind[start:stop])
-        label_confidences.append(game.label_confidence[start:stop])
         loss_masks.append(game.loss_mask[start:stop])
-        decision_types.append(game.decision_type[start:stop])
         exact_actions.append(game.exact_action[start:stop])
         outcomes.append(game.outcome[start:stop])
-        outcome_valids.append(torch.full((stop - start,), game.outcome_valid, dtype=torch.bool))
+        outcome_valids.append(torch.full((target_count,), game.outcome_valid, dtype=torch.bool))
         decision_indices.append(torch.arange(start, stop, dtype=torch.long))
-        game_lengths.append(torch.full((stop - start,), game.length, dtype=torch.long))
+        game_lengths.append(torch.full((target_count,), game.length, dtype=torch.long))
 
         first_candidate = int(game.candidate_offsets[start])
         last_candidate = int(game.candidate_offsets[stop])
         candidate_values.append(game.candidate_values[first_candidate:last_candidate])
         local_offsets = game.candidate_offsets[start + 1 : stop + 1] - first_candidate
-        candidate_offsets.extend(candidate_base + int(offset) for offset in local_offsets)
+        candidate_offsets.extend(candidate_base + offset for offset in local_offsets.tolist())
         candidate_base += last_candidate - first_candidate
 
         local_targets = torch.arange(relative_start, relative_stop, dtype=torch.long)
         target_indices.append(context_base + local_targets)
-        local_history = local_targets.unsqueeze(1) + torch.arange(
-            -HISTORY_WINDOW,
-            0,
-            dtype=torch.long,
-        ).unsqueeze(0)
+        local_history = local_targets.unsqueeze(1) + history_offsets
         local_mask = local_history >= 0
         history_indices.append(torch.where(local_mask, context_base + local_history, 0))
         history_masks.append(local_mask)
@@ -167,9 +159,7 @@ def _collate_bc_window(
         context_action_mask=_compact_tensors(context_action_masks),
         action_mask=_compact_tensors(action_masks),
         label_kind=_compact_tensors(label_kinds),
-        label_confidence=_compact_tensors(label_confidences),
         loss_mask=_compact_tensors(loss_masks),
-        decision_type=_compact_tensors(decision_types),
         exact_action=_compact_tensors(exact_actions),
         candidate_values=_compact_tensors(candidate_values),
         candidate_offsets=torch.tensor(candidate_offsets, dtype=torch.long),
@@ -188,7 +178,7 @@ def collate_bc_batches(
     games: Iterable[ReplayGameChunk],
     batch_decisions: int,
 ) -> Iterator[BCDecisionBatch]:
-    """Fill a decision budget across game perspectives without crossing histories."""
+    """Batch decisions up to batch_decisions without crossing game boundaries."""
     if type(batch_decisions) is not int or batch_decisions <= 0:
         raise ValueError("batch_decisions must be a positive integer")
     windows: list[tuple[ReplayGameChunk, int, int]] = []
@@ -209,12 +199,30 @@ def collate_bc_batches(
         yield _collate_bc_window(windows)
 
 
-class BCBatchDataset(IterableDataset):
-    """Wrap collation so DataLoader workers yield pre-assembled batches."""
+class _BCUpdateDataset(IterableDataset):
+    """Group complete games into updates, then split them into model-sized batches."""
 
-    def __init__(self, dataset: Iterable[ReplayGameChunk], chunk_size: int) -> None:
+    def __init__(
+        self,
+        dataset: Iterable[ReplayGameChunk],
+        update_decisions: int,
+        chunk_size: int,
+    ) -> None:
         self.dataset = dataset
+        self.update_decisions = update_decisions
         self.chunk_size = chunk_size
 
-    def __iter__(self) -> Iterator[BCDecisionBatch]:
-        yield from collate_bc_batches(self.dataset, self.chunk_size)
+    def __iter__(self) -> Iterator[tuple[BCDecisionBatch, ...]]:
+        games: list[ReplayGameChunk] = []
+        decisions = 0
+
+        for game in self.dataset:
+            games.append(game)
+            decisions += game.length
+            if decisions >= self.update_decisions:
+                yield tuple(collate_bc_batches(games, self.chunk_size))
+                games = []
+                decisions = 0
+
+        if games:
+            yield tuple(collate_bc_batches(games, self.chunk_size))

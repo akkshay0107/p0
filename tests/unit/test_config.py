@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -144,3 +145,25 @@ class TestConfig:
 
         with pytest.raises(ValueError, match="bc.gamma must match training.gamma"):
             GlobalConfig(training=TrainingConfig(gamma=0.95), bc=BCConfig(gamma=0.9))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("learning_rate", float("nan")),
+            ("learning_rate", float("inf")),
+            ("max_grad_norm", float("nan")),
+            ("max_grad_norm", float("inf")),
+            ("value_coef", float("nan")),
+            ("value_coef", float("inf")),
+            ("weight_decay", float("nan")),
+            ("weight_decay", float("inf")),
+        ],
+    )
+    def test_bc_config_rejects_nonfinite_optimizer_values(
+        self,
+        field: str,
+        value: float,
+    ) -> None:
+        values: dict[str, Any] = {field: value}
+        with pytest.raises(ValueError, match=field):
+            BCConfig(**values)

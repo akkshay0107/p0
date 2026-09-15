@@ -1,9 +1,8 @@
-"""Pure planning helpers for BC prior-game context."""
+"""History helpers for behavior cloning prior-game context."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import NamedTuple
 
 import torch
 from torch import Tensor
@@ -16,55 +15,13 @@ from p0.model.architecture_contract import (
     SERIES_TOKENS_PER_GAME,
 )
 from p0.training._bc_batch import BCGameWindow
-from p0.training.series_history import SeriesHistoryStore, SeriesStateSnapshot
+from p0.training.series_history import (
+    SeriesHistoryStore,
+    SeriesStateSnapshot,
+    advance_series_state,
+)
 
 SeriesResampler = Callable[[Tensor, Tensor], Tensor]
-
-
-class _BCHistoryUpdate(NamedTuple):
-    series_key: SeriesPerspectiveKey
-    game_number: int
-    tokens: Tensor
-    is_game_end: bool
-    is_series_end: bool
-
-
-def _advance_state(
-    state: SeriesStateSnapshot,
-    game_number: int,
-    tokens: Tensor,
-    *,
-    is_game_end: bool,
-    is_series_end: bool,
-) -> SeriesStateSnapshot:
-    completed_games, active_game_number, active_fragments, ended = state
-    if ended:
-        raise ValueError("A BC perspective-series contains data after it ended")
-    if is_series_end and not is_game_end:
-        raise ValueError("A BC series can end only at a game boundary")
-
-    completed = list(completed_games)
-    fragments = list(active_fragments)
-    if active_game_number is None:
-        expected_game_number = completed[-1][0] + 1 if completed else 1
-        if game_number != expected_game_number:
-            raise ValueError("BC game numbers must be consecutive within a perspective-series")
-        active_game_number = game_number
-    elif game_number != active_game_number:
-        raise ValueError("A BC perspective-game changed before its previous game ended")
-
-    fragments.append(tokens)
-    if is_game_end:
-        completed.append((game_number, torch.cat(fragments, dim=0)))
-        completed = completed[-MAX_PRIOR_GAMES:]
-        active_game_number = None
-        fragments = []
-
-    if is_series_end:
-        completed = []
-        ended = True
-
-    return tuple(completed), active_game_number, tuple(fragments), ended
 
 
 def prepare_series_context(
@@ -72,13 +29,12 @@ def prepare_series_context(
     windows: tuple[BCGameWindow, ...],
     target_tokens: Tensor,
     resample_game: SeriesResampler,
-) -> tuple[Tensor, Tensor, tuple[_BCHistoryUpdate, ...]]:
-    """Plan BC history updates and resample only detached completed games."""
+) -> tuple[Tensor, Tensor]:
+    """Prepare prior-game series tokens and mask for a batch of windows."""
     working_states: dict[SeriesPerspectiveKey, SeriesStateSnapshot] = {}
     histories: list[Tensor] = []
     history_rows: dict[int, int] = {}
     window_history_rows: list[tuple[int, ...]] = []
-    updates: list[_BCHistoryUpdate] = []
 
     for window in windows:
         state = working_states.get(window.series_key)
@@ -103,21 +59,13 @@ def prepare_series_context(
         window_history_rows.append(tuple(prior_rows))
 
         token_chunk = target_tokens[window.batch_start : window.batch_stop]
-        working_states[window.series_key] = _advance_state(
+        working_states[window.series_key] = advance_series_state(
             state,
             window.game_number,
             token_chunk,
             is_game_end=window.is_game_end,
             is_series_end=window.is_series_end,
-        )
-        updates.append(
-            _BCHistoryUpdate(
-                series_key=window.series_key,
-                game_number=window.game_number,
-                tokens=token_chunk,
-                is_game_end=window.is_game_end,
-                is_series_end=window.is_series_end,
-            )
+            max_games=store.max_games,
         )
 
     summaries = _resample_histories(histories, target_tokens, resample_game)
@@ -127,21 +75,22 @@ def prepare_series_context(
         summaries,
         target_tokens,
     )
-    return series_tokens, series_mask, tuple(updates)
+    return series_tokens, series_mask
 
 
 def commit_history_updates(
     store: SeriesHistoryStore,
-    updates: tuple[_BCHistoryUpdate, ...],
+    windows: tuple[BCGameWindow, ...],
+    target_tokens: Tensor,
 ) -> None:
-    """Commit planned BC fragments only after their graph has been backpropagated."""
-    for update in updates:
+    """Append completed window tokens to the series history store."""
+    for window in windows:
         store.append(
-            update.series_key,
-            update.game_number,
-            update.tokens,
-            is_game_end=update.is_game_end,
-            is_series_end=update.is_series_end,
+            window.series_key,
+            window.game_number,
+            target_tokens[window.batch_start : window.batch_stop],
+            is_game_end=window.is_game_end,
+            is_series_end=window.is_series_end,
         )
 
 

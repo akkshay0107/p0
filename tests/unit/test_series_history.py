@@ -124,3 +124,18 @@ class TestSeriesHistory:
         assert len(snapshot) == 1
         torch.testing.assert_close(snapshot[0], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
         assert restored.next_game_number(key) == 2
+
+    def test_selected_key_snapshot_restores_existing_and_absent_states(self) -> None:
+        store = SeriesHistoryStore(d_model=2)
+        values = torch.ones(1, 2)
+        store.append("existing", 1, values, is_game_end=True, is_series_end=False)
+        rollback = store.snapshot_keys(("existing", "new", "existing"))
+
+        store.append("existing", 2, values, is_game_end=True, is_series_end=True)
+        store.append("new", 1, values, is_game_end=True, is_series_end=True)
+        store.restore_keys(rollback)
+
+        assert len(store.snapshot("existing")) == 1
+        assert store.next_game_number("existing") == 2
+        store.append("existing", 2, values, is_game_end=True, is_series_end=True)
+        store.append("new", 1, values, is_game_end=True, is_series_end=True)
