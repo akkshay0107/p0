@@ -164,7 +164,7 @@ class TestBCRunner:
         )
         assert result["final_training"]["exact_joint_accuracy"] >= 0.9
 
-    def test_noop_resume_in_another_output_reports_original_existing_artifacts(
+    def test_resume_restores_selected_policy_and_metrics_without_external_files(
         self,
         tmp_path: Path,
     ) -> None:
@@ -238,8 +238,8 @@ class TestBCRunner:
 
         assert resumed["completed_epoch"] == 1
         assert resumed["latest_training_checkpoint"] == str(first_latest)
-        assert resumed["best_policy_checkpoint"] == str(first_best)
-        assert resumed["metrics_path"] is None
+        assert Path(resumed["best_policy_checkpoint"]).is_file()
+        assert json.loads(Path(resumed["metrics_path"]).read_text())["completed_step"] == 1
         assert first_latest.is_file()
         assert first_best.is_file()
         evaluation = evaluate_bc(first_config, first_best, split="validation", device="cpu")
@@ -351,26 +351,30 @@ class TestBCRunner:
                 device="cpu",
             )
 
-        best_bytes = first_best.read_bytes()
-        first_best.write_bytes(best_bytes + b"interrupted replacement")
-        with pytest.raises(ValueError, match="does not match its saved digest"):
-            train_bc(
-                replace(
-                    first_config,
-                    output_dir=tmp_path / "digest-output",
-                    resume_checkpoint=first_latest,
-                ),
-                device="cpu",
-            )
-        first_best.write_bytes(best_bytes)
-
+        # The inference file is replaceable; recovery comes from the training checkpoint.
+        first_best.write_bytes(b"interrupted replacement")
+        recovered = train_bc(
+            replace(first_config, epochs=2, resume_checkpoint=first_latest),
+            device="cpu",
+        )
+        assert recovered["completed_epoch"] == 2
+        best = torch.load(first_best, weights_only=True)
+        torch.testing.assert_close(
+            best["model_state_dict"],
+            continued_artifact["training_state"]["run"]["best_policy"]["model_state_dict"],
+        )
         first_best.unlink()
-        with pytest.raises(ValueError, match="selected policy artifact is missing"):
-            train_bc(
-                replace(
-                    first_config,
-                    output_dir=tmp_path / "third-output",
-                    resume_checkpoint=first_latest,
-                ),
-                device="cpu",
-            )
+        portable = tmp_path / "moved.pt"
+        portable.write_bytes(first_latest.read_bytes())
+        restored = train_bc(
+            replace(
+                first_config,
+                epochs=2,
+                output_dir=tmp_path / "third-output",
+                resume_checkpoint=portable,
+            ),
+            device="cpu",
+        )
+        assert Path(restored["best_policy_checkpoint"]).is_file()
+        history = json.loads(Path(restored["metrics_path"]).read_text())["metrics"]
+        assert [record["step"] for record in history] == [1, 2]

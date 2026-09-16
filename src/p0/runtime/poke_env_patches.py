@@ -52,8 +52,8 @@ class _TeamPreviewEnvPlayer(_EnvPlayer):
         self, battle: AbstractBattle, maybe_default_order: bool = False
     ) -> None:
         if battle.teampreview:
-            await self.battle_queue.async_put(battle)
-            order = await self.order_queue.async_get()
+            # The inherited method also tracks the battle needed by reset/forfeit.
+            order = await self._choose_move(battle)
             await self.ps_client.send_message(order.message, battle.battle_tag)
             return
 

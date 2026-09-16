@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Iterator, Mapping
+from copy import copy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from pickle import UnpicklingError
@@ -307,6 +308,20 @@ class LazyReplayDataset(IterableDataset):
             )
         )
         self._accepted_series_ids = self._validate_shard_family()
+
+    def for_split(self, split: str) -> LazyReplayDataset:
+        """Reuse a validated dataset without rescanning every shard."""
+        if split not in SPLITS or self.split_manifest is None:
+            raise ValueError("A valid split and split manifest are required")
+        dataset = copy(self)
+        dataset.split = split
+        dataset.verify_hashes = False
+        dataset._selected_series = frozenset(
+            series
+            for series, assigned in self.split_manifest.assignments.items()
+            if assigned == split
+        )
+        return dataset
 
     def __iter__(self) -> Iterator[ReplayGameChunk]:
         selected = self._selected_series

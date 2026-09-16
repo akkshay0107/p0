@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Callable, Iterable, Mapping
-from pathlib import Path
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import numpy as np
@@ -37,7 +36,6 @@ from p0.training._bc_metrics import (
     _validate_objective_inputs,
     compute_bc_objective,
 )
-from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.config import BCConfig
 from p0.training.series_history import SeriesHistoryStore
 from p0.training.utils import select_optimization_precision
@@ -127,8 +125,6 @@ class BCTrainer:
         *,
         device: torch.device | str = "cpu",
         optimizer: torch.optim.Optimizer | None = None,
-        checkpoint_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
-        provenance: Mapping[str, object] | None = None,
         cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self.policy = policy.to(device)
@@ -143,8 +139,6 @@ class BCTrainer:
         )
         self.precision = select_optimization_precision(config.enable_optim, self.device)
         self.scaler = GradScaler(device=self.device.type, enabled=self.precision.grad_scaler)
-        self.checkpoint_store = checkpoint_store
-        self.provenance = dict(provenance or {})
         self.batch_decisions = config.batch_decisions
         self._series_history = SeriesHistoryStore(policy.d_model)
         self.cancel_requested = cancel_requested
@@ -248,52 +242,6 @@ class BCTrainer:
             "games": int(totals["games"]),
             "decisions": int(totals["decisions"]),
         }
-
-    def save_checkpoint(
-        self,
-        path: str | Path,
-        *,
-        epoch: int,
-        selection_state: Mapping[str, object] | None = None,
-    ) -> None:
-        """Save policy and optimizer state to a checkpoint."""
-        metadata = dict(self.provenance)
-        if selection_state is not None:
-            metadata["selection_state"] = dict(selection_state)
-        self.checkpoint_store.save_training_state(
-            Path(path),
-            epoch,
-            self.policy,
-            optimizer=self.optimizer,
-            scaler=self.scaler,
-            metadata=metadata,
-            trainer_kind="bc",
-        )
-
-    def load_checkpoint(
-        self,
-        path: str | Path,
-        *,
-        expected_metadata: Mapping[str, object] | None = None,
-    ) -> int:
-        """Restore a BC training state and return its completed epoch."""
-        return self.checkpoint_store.load_training_state(
-            Path(path),
-            self.policy,
-            optimizer=self.optimizer,
-            scaler=self.scaler,
-            expected_trainer_kind="bc",
-            expected_metadata=(self.provenance if expected_metadata is None else expected_metadata),
-            require_training_state=True,
-        )
-
-    def load_selection_state(self, path: str | Path) -> Mapping[str, object]:
-        """Load best-policy selection metrics from a checkpoint."""
-        metadata = self.checkpoint_store.load_metadata(Path(path))
-        state = metadata.get("selection_state", {})
-        if not isinstance(state, Mapping):
-            raise ValueError("BC checkpoint selection_state must be a mapping")
-        return state
 
     def _prepare_model_inputs(
         self, batch: BCDecisionBatch

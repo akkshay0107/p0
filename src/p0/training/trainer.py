@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
-from pathlib import Path
+from collections.abc import Callable
 
 from torch.amp import GradScaler
 from torch.optim import Optimizer
 
 from p0.model.policy import PolicyNet
-from p0.persistence import atomic_json_save
-from p0.training.checkpoint import CheckpointStore
 from p0.training.config import TrainingConfig
+from p0.training.files import TrainingRun
 from p0.training.magnet import Magnet
 from p0.training.ppo import ppo_update
 from p0.training.rollout import RolloutCollector
 from p0.training.trajectory import PreparedTrajectory
 from p0.training.utils import PPOScheduler
 
-MetricSink = Callable[[Mapping[str, float], int, str], None]
 LOGGER = logging.getLogger(__name__)
 
 PPO_BOARD_METRICS = (
@@ -54,31 +51,24 @@ class PPOTrainer:
         self,
         *,
         policy: PolicyNet,
-        policy_store: CheckpointStore,
-        checkpoint_path: Path,
+        files: TrainingRun,
         collector: RolloutCollector,
         optimizer: Optimizer,
         scaler: GradScaler,
         magnet: Magnet,
         scheduler: PPOScheduler,
         training_config: TrainingConfig,
-        metrics_path: Path | None = None,
-        metric_sink: MetricSink = lambda metrics, step, phase: None,
         cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self.policy = policy
-        self.policy_store = policy_store
-        self.checkpoint_path = checkpoint_path
+        self.files = files
         self.collector = collector
         self.optimizer = optimizer
         self.scaler = scaler
         self.magnet = magnet
         self.scheduler = scheduler
         self.training_config = training_config
-        self.metrics_path = metrics_path
-        self.metric_sink = metric_sink
         self.cancel_requested = cancel_requested
-        self._json_metrics: list[dict[str, float | int]] = []
 
     def run(self, start_episode: int = 0) -> None:
         self.collector.vector_env.reset()
@@ -128,17 +118,16 @@ class PPOTrainer:
                 LOGGER.info("Refreshed magnet at episode %s", episode + 1)
             metrics = {name: float(stats[name]) for name in PPO_BOARD_METRICS if name in stats}
             metrics.update(rollout_metrics)
-            self._json_metrics.append(
-                {"episode": episode + 1, "trajectory_count": trajectory_count, **metrics}
+            self.files.record(
+                episode + 1, {"trajectory_count": trajectory_count, **metrics}, {"train": metrics}
             )
-            self.metric_sink(metrics, episode + 1, "train")
             completed_episode = episode + 1
             if self.cancel_requested():
                 self._save(completed_episode)
                 return
             if (episode + 1) % 10 == 0:
                 self._save(episode + 1)
-        if completed_episode % 10 != 0:
+        if completed_episode > start_episode and completed_episode % 10 != 0:
             self._save(completed_episode)
 
     def _save(self, episode: int) -> None:
@@ -149,8 +138,7 @@ class PPOTrainer:
             "environment_state": self.collector.vector_env.training_state(),
             "collector_state": self.collector.training_state(),
         }
-        self.policy_store.save_training_state(
-            self.checkpoint_path,
+        self.files.save(
             episode,
             self.policy,
             optimizer=self.optimizer,
@@ -158,13 +146,4 @@ class PPOTrainer:
             scaler=self.scaler,
             magnet=self.magnet,
             metadata=metadata,
-            trainer_kind="ppo",
         )
-        if self.metrics_path is not None:
-            atomic_json_save(
-                self.metrics_path,
-                {
-                    "completed_episode": episode,
-                    "metrics": self._json_metrics,
-                },
-            )

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import signal
-import threading
 
 from p0.training.config import load_config
+from p0.training.files import cancellation_signals
 from p0.training.ppo_runner import run_training
 
 
@@ -24,17 +23,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    stop = threading.Event()
-    previous = {
-        name: signal.signal(name, lambda *_: stop.set()) for name in (signal.SIGINT, signal.SIGTERM)
-    }
-    try:
+    with cancellation_signals() as cancel_requested:
         run_training(
             load_config(args.config),
-            cancel_requested=stop.is_set,
+            cancel_requested=cancel_requested,
             agent_team_source=args.agent_team_source,
         )
-    finally:
-        for name, handler in previous.items():
-            signal.signal(name, handler)
     return 0

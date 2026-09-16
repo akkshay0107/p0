@@ -120,7 +120,38 @@ PPO TensorBoard tracks policy loss, value loss, KL divergence, clipping, normali
 entropy, explained variance, MAGNET KL, gradient norm, mean game length, and the
 timeout/truncation rate. Rollout trajectory counts are written to
 `artifacts/runs/ppo_training/metrics.json`. View the board with
-`tensorboard --logdir ./artifacts/runs/ppo_training/`.
+`tensorboard --logdir ./artifacts/runs/ppo_training/tensorboard/`.
+
+### Saving and resuming training
+
+BC and PPO share one saving implementation. Each keeps a rolling training checkpoint
+with model and optimizer state, random generators, effective training settings,
+metric history, an installed Python source hash, and the SHA-256 of the input checkpoint. The input's filename is
+informational; recovery never follows it. Source-policy details retain BC dataset
+and split identities when PPO starts from BC. Parents are audit records, not an
+automatically retained checkpoint archive. Copy a checkpoint yourself to retain it.
+
+BC also stores the selected best policy inside its training checkpoint. The separate
+`bc_best_policy.pt`, `metrics.json`, and TensorBoard events are display/inference
+copies: resume rebuilds them from the checkpoint, including in a new output directory.
+BC no longer writes `metrics.jsonl`. PPO metric history now survives each resume.
+The checkpoint commits first; interruption while writing the copies cannot destroy
+recoverable training state. JSON and checkpoint replacement synchronize both the
+file and its parent directory on POSIX. Training output locks require a POSIX host.
+
+Resume rejects missing requested optimizer/scheduler/scaler/magnet state and changed
+training settings. BC can increase its epoch budget. PPO keeps its original schedule
+and budget; use policy initialization for a new schedule. PPO saves every ten outer
+iterations and on cancellation/completion; BC saves completed epochs. Both CLI
+commands handle SIGINT/SIGTERM cooperatively. PPO still discards unfinished games at
+save boundaries and warns/starts fresh series if rollout state cannot be restored.
+This does not promise identical simulator randomness across restarts.
+
+Resuming requires a training checkpoint generated with run metadata and embedded state;
+weights-only or legacy checkpoints without embedded state cannot be resumed. Choose an
+empty output directory for new runs or when resuming into a fresh workspace.
+
+See [the training file design](docs/training-files.md) for file ownership and tradeoffs.
 
 ### Replay BC pilot
 
@@ -153,8 +184,20 @@ You would have to move the trained model to a specific location and have the inf
 
 ## Utility Scripts
 
-- **`cleanup.sh`**: Deletes all generated artifacts (such as TensorBoard runs, locally saved replays, checkpoints, and `.log` files) to start fresh.
-- **`export_training.py`**: Exports the current training artifacts, runtime contracts, and active `config.yaml` snapshot into a `tar.gz` archive.
+- **`cleanup.sh`**: Clears the default runs, replays, checkpoints, and selected log files. It does not follow custom output paths or delete compiled datasets.
+- **`export_training.py`**: Exports one new-format training checkpoint with its recorded inputs and runtime resources. It writes a checked archive atomically and generates a resume configuration from saved settings, without reading the current `config.yaml`.
+
+```bash
+uv run p0-export-training --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --output training_export.tar.gz
+```
+
+Extract into a compatible p0 checkout, then run `p0-train --config run/config.yaml
+--agent-team-source reduced` for PPO, or `p0-bc train --config run/config.yaml` for BC
+(add `--overfit` when resuming an overfit run). BC exports include the referenced
+shards and split; PPO exports include both team pools. Inputs must still match the
+saved identities. The archive contains checksums, but does not include Python/Node
+installations, the p0 source checkout, or Showdown. Those must be supplied separately.
+New outputs go under `artifacts/resumed`; use a fresh output path for each import.
 
 The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.example.yaml`.
 

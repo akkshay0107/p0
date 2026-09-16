@@ -429,7 +429,15 @@ class TestBCTrainer:
         assert metrics["games"] == 4
         assert torch.isfinite(torch.tensor(metrics["overall_nll"]))
         checkpoint = tmp_path / "bc.pt"
-        trainer.save_checkpoint(checkpoint, epoch=1)
+        store = CheckpointStore()
+        store.save_training(
+            checkpoint,
+            1,
+            trainer.policy,
+            optimizer=trainer.optimizer,
+            scaler=trainer.scaler,
+            trainer_kind="bc",
+        )
 
         restored = build_policy(trainer.policy.config, default_runtime_resources())
         restored_trainer = BCTrainer(
@@ -438,7 +446,17 @@ class TestBCTrainer:
             trainer.config,
             device="cpu",
         )
-        assert restored_trainer.load_checkpoint(checkpoint) == 1
+        assert (
+            store.load_training(
+                checkpoint,
+                restored_trainer.policy,
+                optimizer=restored_trainer.optimizer,
+                scaler=restored_trainer.scaler,
+                expected_trainer_kind="bc",
+                require_training_state=True,
+            )
+            == 1
+        )
         for name, parameter in trainer.policy.state_dict().items():
             torch.testing.assert_close(parameter, restored_trainer.policy.state_dict()[name])
 

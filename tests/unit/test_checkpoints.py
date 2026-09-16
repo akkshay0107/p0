@@ -353,3 +353,45 @@ class TestCheckpoints:
                 restored,
                 expected_metadata={"dataset_hash": "wrong"},
             )
+
+
+class TestStrictTrainingResume:
+    def test_missing_optimizer_state_fails_before_weights_change(self, tmp_path: Path) -> None:
+        store = CheckpointStore()
+        path = tmp_path / "missing-optimizer.pt"
+        store.save_training(path, 1, _small_policy())
+        target = _small_policy()
+        before = next(target.parameters()).detach().clone()
+        optimizer = torch.optim.AdamW(target.parameters())
+        with pytest.raises(ValueError, match="missing required training state"):
+            store.load_training(path, target, optimizer=optimizer, require_training_state=True)
+        torch.testing.assert_close(next(target.parameters()), before)
+
+    def test_resume_restores_all_cpu_random_generators(self, tmp_path: Path) -> None:
+        import random
+
+        import numpy as np
+
+        store = CheckpointStore()
+        path = tmp_path / "rng.pt"
+        policy = _small_policy()
+        store.save_training(path, 1, policy)
+        expected = (random.random(), np.random.random(), torch.rand(4))
+        store.load_training(path, policy, require_training_state=True)
+        assert random.random() == expected[0]
+        assert np.random.random() == expected[1]
+        torch.testing.assert_close(torch.rand(4), expected[2], rtol=0, atol=0)
+
+    def test_loaded_input_survives_atomic_replacement(self, tmp_path: Path) -> None:
+        import hashlib
+
+        store = CheckpointStore()
+        path = tmp_path / "input.pt"
+        policy = _small_policy()
+        store.save_training(path, 1, policy)
+        expected_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        loaded = store.read(path)
+        store.save_training(path, 2, policy)
+        assert loaded.sha256 == expected_hash
+        assert store.load_episode(loaded) == 1
+        assert store.load_episode(path) == 2

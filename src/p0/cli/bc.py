@@ -9,6 +9,7 @@ from pathlib import Path
 
 from p0.training.bc_runner import evaluate_bc, train_bc
 from p0.training.config import BCConfig, load_config
+from p0.training.files import cancellation_signals
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -62,7 +63,10 @@ def main(argv: list[str] | None = None) -> None:
     config = _resolved_config(args)
 
     if args.command == "train":
-        result = train_bc(config, overfit=args.overfit, device=args.device)
+        with cancellation_signals() as cancel_requested:
+            result = train_bc(
+                config, overfit=args.overfit, device=args.device, cancel_requested=cancel_requested
+            )
     else:
         result = evaluate_bc(
             config,
