@@ -10,6 +10,7 @@ from p0.teams.source import FixedTeamSource
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
+@pytest.mark.heavy
 class TestEvaluation:
     @pytest.mark.integration
     @pytest.mark.asyncio

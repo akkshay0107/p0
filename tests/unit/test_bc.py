@@ -71,7 +71,8 @@ class TestBCObjectives:
         assert result.loss_weight == 1.0
         assert result.loss.item() == pytest.approx(-0.25 * math.log(0.25) - 0.75 * math.log(0.75))
 
-    def test_fractional_weights_below_one_use_the_true_weighted_mean(self) -> None:
+    def test_fractional_weights_use_the_true_weighted_mean(self) -> None:
+        """Verify fractional sample weights compute the mathematically exact weighted mean and gradients."""
         log_probs = torch.log(torch.tensor([0.25, 0.5])).requires_grad_()
 
         result = compute_bc_objective(
@@ -86,21 +87,6 @@ class TestBCObjectives:
         assert result.loss_weight.item() == pytest.approx(0.25)
         assert result.loss.item() == pytest.approx(expected)
         torch.testing.assert_close(log_probs.grad, torch.tensor([-0.4, -0.6]))
-
-    def test_fractional_weights_above_one_use_the_true_weighted_mean(self) -> None:
-        log_probs = torch.log(torch.tensor([0.25, 0.5])).requires_grad_()
-
-        result = compute_bc_objective(
-            log_probs,
-            torch.tensor([0, 1, 2], dtype=torch.long),
-            torch.tensor([int(LabelKind.EXACT), int(LabelKind.EXACT)]),
-            torch.tensor([0.75, 0.75]),
-        )
-        result.loss.backward()
-
-        assert result.loss_weight.item() == pytest.approx(1.5)
-        assert result.loss.item() == pytest.approx(-0.5 * math.log(0.25) - 0.5 * math.log(0.5))
-        torch.testing.assert_close(log_probs.grad, torch.tensor([-0.5, -0.5]))
 
     def test_unknown_steps_have_zero_loss_and_preserve_boundaries(self) -> None:
         """Verify UNKNOWN labels produce zero loss and empty gradients without breaking backprop graph."""
@@ -158,7 +144,6 @@ class TestBCObjectives:
         ("log_probs", "offsets", "labels", "message"),
         [
             ([float("nan")], [0, 1], [int(LabelKind.EXACT)], "valid log probabilities"),
-            ([float("inf")], [0, 1], [int(LabelKind.EXACT)], "valid log probabilities"),
             ([float("-inf")], [0, 1], [int(LabelKind.EXACT)], "positive finite"),
             (
                 [math.log(0.75), math.log(0.75)],

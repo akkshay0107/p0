@@ -16,6 +16,7 @@ from p0.training.vector_env import ThreadVecEnv
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
+@pytest.mark.heavy
 class TestPpoSimulation:
     @pytest.mark.integration
     def test_two_simulated_bo3_series_run_concurrently(self, showdown_server, model_policy) -> None:

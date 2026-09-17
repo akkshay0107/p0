@@ -20,6 +20,7 @@ from p0.training.ppo_runner import run_training
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
+@pytest.mark.heavy
 class TestTrainingResume:
     @pytest.mark.integration
     def test_ppo_resume_preserves_history_and_parent(self, tmp_path: Path) -> None:

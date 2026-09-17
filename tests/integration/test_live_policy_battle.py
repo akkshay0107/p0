@@ -8,6 +8,7 @@ from p0.model.structured_observation import StructuredObservation
 from tests.integration.helpers import capture_showdown_decisions, integration_count
 
 
+@pytest.mark.heavy
 class TestLivePolicyBattle:
     @pytest.mark.integration
     @pytest.mark.asyncio

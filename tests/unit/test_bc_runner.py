@@ -84,6 +84,7 @@ class TestBCRunner:
         with pytest.raises(ValueError, match="train split has no accepted series"):
             train_bc(config, device="cpu")
 
+    @pytest.mark.heavy
     def test_overfit_runner_reaches_its_bounded_acceptance_target(self, tmp_path: Path) -> None:
         compiled = compile_payloads(
             (
@@ -164,6 +165,7 @@ class TestBCRunner:
         )
         assert result["final_training"]["exact_joint_accuracy"] >= 0.9
 
+    @pytest.mark.heavy
     def test_resume_restores_selected_policy_and_metrics_without_external_files(
         self,
         tmp_path: Path,

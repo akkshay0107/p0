@@ -77,13 +77,15 @@ exclude = ["pokemon-showdown"]
 select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.pytest.ini_options]
-addopts = "-m 'not network and not stress'"
+addopts = "-m 'not network and not stress and not heavy'"
 testpaths = ["tests/unit", "tests/integration"]
 markers = [
     "integration: requires a built local Showdown server",
     "network: requires access to the public replay endpoint",
     "stress: runs large random input tests",
+    "heavy: memory- or CPU-intensive simulations (live PPO loops, multi-series, overfit loops)",
 ]
+
 
 [dependency-groups]
 dev = [

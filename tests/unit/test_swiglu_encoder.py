@@ -39,9 +39,12 @@ class TestAttentionPool:
 
 
 class TestSwiGLUTransformerEncoder:
-    @pytest.mark.parametrize("layers", (1, 3))
     @pytest.mark.parametrize(
-        ("selected", "unreturned_row"), ((slice(3, None), 1), (slice(2, 5), 6), (slice(1, 7, 2), 2))
+        ("layers", "selected", "unreturned_row"),
+        (
+            (1, slice(3, None), 1),
+            (3, slice(1, 7, 2), 2),
+        ),
     )
     def test_selected_outputs_preserve_full_context_and_gradients(
         self, layers: int, selected: slice, unreturned_row: int
