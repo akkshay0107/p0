@@ -10,7 +10,7 @@ import torch
 
 from p0.format_config import (
     current_manifest,
-    load_runtime_manifest,
+    load_global_contract,
 )
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
@@ -133,7 +133,7 @@ def _series_record() -> SeriesRecord:
 
 
 def _shard_manifest_fixture_unit() -> ShardManifest:
-    active_contract = load_runtime_manifest().global_sha256
+    active_contract = load_global_contract().global_sha256
     entry = ShardIndexEntry(
         filename="shard-000.pt", sha256="c" * 64, decisions=10, games=2, series=1, byte_size=1024
     )

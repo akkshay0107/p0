@@ -842,7 +842,7 @@ class TestBCTrainer:
         store = CheckpointStore()
         training_path = tmp_path / "bc-training.pt"
         policy_path = tmp_path / "bc-policy.pt"
-        store.save_training_state(
+        store.save_training(
             training_path,
             1,
             policy,
@@ -853,14 +853,14 @@ class TestBCTrainer:
         restored = store.load_policy(policy_path, "cpu")
 
         with pytest.raises(ValueError, match="trainer"):
-            store.load_training_state(
+            store.load_training(
                 training_path,
                 restored,
                 expected_trainer_kind="ppo",
                 require_training_state=True,
             )
         with pytest.raises(ValueError, match="weights-only"):
-            store.load_training_state(
+            store.load_training(
                 policy_path,
                 restored,
                 expected_trainer_kind="ppo",

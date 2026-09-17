@@ -111,7 +111,7 @@ class TeamPlayerMixin:
         if resample_team and self.team_source is not None:
             self.update_team(self.team_source.sample(self.team_rng).packed)
 
-        battle_id = getattr(battle, "battle_tag", None) or getattr(battle, "tag", None)
+        battle_id = getattr(battle, "battle_tag", None)
         battles = getattr(self, "_battles", None)
         if battle_id and battles is not None:
             battles.pop(battle_id, None)
@@ -173,7 +173,7 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     @staticmethod
     def _battle_key(battle: DoubleBattle) -> str:
-        key = getattr(battle, "battle_tag", None) or getattr(battle, "tag", None)
+        key = getattr(battle, "battle_tag", None)
         if not key:
             raise ValueError("Live battle has no stable battle identifier")
         return str(key)
@@ -374,7 +374,7 @@ def load_player_policy(
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
     policy = policy_store.load_policy(checkpoint_path, device)
-    episode = policy_store.load_training_state(checkpoint_path, policy)
+    episode = policy_store.load_training(checkpoint_path, policy)
     LOGGER.info(
         "Loaded checkpoint from %s (episode %d)",
         checkpoint_path,

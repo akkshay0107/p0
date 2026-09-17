@@ -11,7 +11,7 @@ import torch
 
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
-    load_active_runtime_manifest,
+    load_active_global_contract,
 )
 from p0.replays.dataset import (
     LazyReplayDataset,
@@ -33,7 +33,7 @@ from tests.unit.replay_fixtures import (
 class TestReplayDatasets:
     def test_split_assignment_is_order_independent_and_round_trips(self, tmp_path: Path) -> None:
         """Verify series split hashing produces deterministic train/val/test splits regardless of input series ID ordering."""
-        global_hash = load_active_runtime_manifest(DEFAULT_RUNTIME_MANIFEST).global_sha256
+        global_hash = load_active_global_contract(DEFAULT_RUNTIME_MANIFEST).global_sha256
         first = assign_series_splits(
             ("series-b", "series-a"),
             seed=17,

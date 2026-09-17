@@ -9,7 +9,7 @@ import pytest
 
 from p0.format_config import (
     ACTION_CONTRACT,
-    RuntimeManifest,
+    GlobalContract,
     active_global_contract,
     canonical_json_sha256,
     checkpoint_contract_compatibility,
@@ -35,10 +35,10 @@ def _resources(
 
 class TestFormatConfig:
     def test_runtime_manifest_round_trips_one_readable_contract(self, tmp_path: Path) -> None:
-        """Verify RuntimeManifest serializes and deserializes losslessly while preserving ABI invariants and contract hashes."""
+        """Verify GlobalContract serializes and deserializes losslessly while preserving ABI invariants and contract hashes."""
         vocab, dex = _resources(tmp_path)
         manifest = current_manifest(vocab_path=vocab, dex_path=dex)
-        restored = RuntimeManifest.from_dict(json.loads(json.dumps(manifest.to_dict())))
+        restored = GlobalContract.from_dict(json.loads(json.dumps(manifest.to_dict())))
 
         assert restored == manifest
         assert restored.action == ACTION_CONTRACT
@@ -113,7 +113,7 @@ class TestFormatConfig:
         assert bumped.subsystem("resources").minor_version == 0
 
     def test_global_contract_rejects_hash_valid_but_malformed_subsystem_payload(self) -> None:
-        """Verify RuntimeManifest.create validates non-empty payloads for all registered subsystems."""
+        """Verify GlobalContract.create validates non-empty payloads for all registered subsystems."""
         contract = active_global_contract()
         contracts = {
             name: {
@@ -124,7 +124,7 @@ class TestFormatConfig:
         }
         contracts["actions"]["major"] = {}
         with pytest.raises(ValueError, match="actions major payload"):
-            RuntimeManifest.create(contracts, contract.subsystems)
+            GlobalContract.create(contracts, contract.subsystems)
 
     def test_artifact_validation_uses_only_the_active_global_contract(self) -> None:
         """Verify validate_artifact_runtime_contract accepts artifacts matching current global contract and rejects mismatches."""

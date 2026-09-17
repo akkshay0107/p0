@@ -125,7 +125,7 @@ def run_training(
         resume_environment_state: object | None = None
         resume_collector_state: object | None = None
         start = (
-            policy_store.load_training_state(
+            policy_store.load_training(
                 files.source,
                 policy,
                 optimizer=optimizer,

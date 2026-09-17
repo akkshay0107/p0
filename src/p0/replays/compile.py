@@ -27,7 +27,7 @@ from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     FORMAT,
     canonical_json_sha256,
-    load_active_runtime_manifest,
+    load_active_global_contract,
     sha256_file,
     validate_artifact_runtime_contract,
 )
@@ -143,7 +143,7 @@ class CompilationResult:
 
 
 def _runtime_hash(manifest_path: str | Path) -> str:
-    return load_active_runtime_manifest(manifest_path).global_sha256
+    return load_active_global_contract(manifest_path).global_sha256
 
 
 def _source_series(result: CompilationResult) -> dict[str, tuple[str, ...]]:

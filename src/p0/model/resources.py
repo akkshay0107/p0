@@ -9,7 +9,7 @@ from typing import Any
 
 import orjson
 
-from p0.format_config import load_active_runtime_manifest
+from p0.format_config import load_active_global_contract
 from p0.model.tokenizer import PokemonTokenizer, tokenizer
 from p0.paths import DEFAULT_PATHS
 
@@ -33,7 +33,7 @@ class RuntimeResources:
     @classmethod
     def from_manifest(cls, manifest_path: str | Path) -> RuntimeResources:
         path = Path(manifest_path)
-        load_active_runtime_manifest(path)
+        load_active_global_contract(path)
         vocab_path = path.with_name("vocab.json")
         dex_path = path.with_name("champions_dex.json")
         # Dex and Showdown identities are provenance. Updated mechanics remain loadable
@@ -80,7 +80,7 @@ class RuntimeResources:
 @lru_cache(maxsize=1)
 def default_runtime_resources() -> RuntimeResources:
     manifest_path = DEFAULT_PATHS.data_root / "runtime_manifest.json"
-    load_active_runtime_manifest(manifest_path)
+    load_active_global_contract(manifest_path)
     dex_path = manifest_path.with_name("champions_dex.json")
     dex = orjson.loads(dex_path.read_bytes())
     return RuntimeResources.from_data(tokenizer.vocab, dex, shared_tokenizer=tokenizer)

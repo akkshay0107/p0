@@ -30,15 +30,7 @@ from p0.teams.spread_usage import cosmetic_forme_aliases, load_spread_table_file
 from p0.teams.stat_points import BaseStats, calculate_stats
 
 _STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
-_IMPUTATION_SOURCE_VERSION = 2
-_ENUM_ALIASES = {
-    "raindance": "RAINDANCE",
-    "sunnyday": "SUNNYDAY",
-    "trickroom": "TRICK_ROOM",
-    "magicroom": "MAGIC_ROOM",
-    "wonderroom": "WONDER_ROOM",
-    "toxicspikes": "TOXIC_SPIKES",
-}
+_IMPUTATION_SOURCE_VERSION = 1
 _DEX_INDEX_CACHE: tuple[Mapping[str, Any], dict[str, Mapping[str, Any]], dict[str, str]] | None = (
     None
 )
@@ -46,8 +38,7 @@ _DEX_INDEX_CACHE: tuple[Mapping[str, Any], dict[str, Mapping[str, Any]], dict[st
 
 def _enum_name(value: str) -> str:
     """Return the enum-like spelling expected by the observation tokenizer."""
-    normalized = normalize_showdown_id(value)
-    return _ENUM_ALIASES.get(normalized, normalized.upper())
+    return normalize_showdown_id(value).upper()
 
 
 class ReplayNamedValue(NamedTuple):

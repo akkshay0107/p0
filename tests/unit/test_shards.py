@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from p0.battle.actions import ACT_SIZE
-from p0.format_config import load_active_runtime_manifest
+from p0.format_config import load_active_global_contract
 from p0.replays.schema import MaskProvenance
 from p0.replays.shards import (
     ShardIndexEntry,
@@ -28,7 +28,7 @@ def _valid_shard_entry() -> ShardIndexEntry:
 
 
 def _valid_shard_manifest() -> ShardManifest:
-    global_sha = load_active_runtime_manifest().global_sha256
+    global_sha = load_active_global_contract().global_sha256
     return ShardManifest(
         global_contract_sha256=global_sha,
         shards=(_valid_shard_entry(),),

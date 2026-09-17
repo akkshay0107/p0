@@ -19,10 +19,9 @@ class _EnumIdTable(dict[NamedEffectView | str, int]):
     and caller-owned enum-like objects are not retained by the table.
     """
 
-    def __init__(self, table: dict[str, int], aliases: dict[str, str] | None = None):
+    def __init__(self, table: dict[str, int]):
         super().__init__()
         self._table = table
-        self._aliases = aliases or {}
 
     def __missing__(self, member: NamedEffectView | str) -> int:
         name = member if isinstance(member, str) else member.name
@@ -34,11 +33,10 @@ class _EnumIdTable(dict[NamedEffectView | str, int]):
         if cached is not None:
             return cached
 
-        lookup_key = self._aliases.get(normalized, normalized)
-        if lookup_key not in self._table:
+        if normalized not in self._table:
             return 0
 
-        value = self._table[lookup_key]
+        value = self._table[normalized]
         self[normalized] = value
         return value
 
@@ -96,29 +94,12 @@ class PokemonTokenizer:
         for nature in ("serious", "bashful", "docile", "hardy", "quirky"):
             self.natures[nature] = 0
 
-        self.aliases = {
-            "weathers": {
-                "rain": "raindance",
-                "sun": "sunnyday",
-                "sand": "sandstorm",
-                "snow": "snowscape",
-            },
-            "status": {
-                "burn": "brn",
-                "freeze": "frz",
-                "paralysis": "par",
-                "poison": "psn",
-                "sleep": "slp",
-                "toxic": "tox",
-            },
-        }
-
         # Enum members resolve lazily from their normalized names.
         self.volatiles = _EnumIdTable(vocab.get("volatiles", {}))
         self.side_conditions = _EnumIdTable(vocab.get("side_conditions", {}))
-        self.weathers = _EnumIdTable(vocab.get("weathers", {}), self.aliases["weathers"])
+        self.weathers = _EnumIdTable(vocab.get("weathers", {}))
         self.fields = _EnumIdTable(vocab.get("fields", {}))
-        self.status = _EnumIdTable(vocab.get("status", {}), self.aliases["status"])
+        self.status = _EnumIdTable(vocab.get("status", {}))
         self.types = _EnumIdTable(vocab.get("types", {}))
         self.categories = _EnumIdTable(vocab.get("categories", {}))
 
@@ -182,9 +163,6 @@ class PokemonTokenizer:
             return 0, Resolution.UNKNOWN
 
         key = self.normalize_id(name)
-        table_aliases = self.aliases.get(table, {})
-        key = table_aliases.get(key, key)
-
         if key not in vocab_table:
             return 0, Resolution.OOV
 
@@ -198,7 +176,7 @@ class PokemonTokenizer:
     def species_id(self, pokemon: PokemonView | None) -> int:
         if pokemon is None:
             return 0
-        species = pokemon.species or getattr(pokemon, "base_species", None)
+        species = pokemon.species or pokemon.base_species
         if not species:
             return 0
         return self.species.get(self.normalize_id(species), 0)

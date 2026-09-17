@@ -12,7 +12,7 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import load_active_runtime_manifest, sha256_file
+from p0.format_config import load_active_global_contract, sha256_file
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_output
 from p0.replays.dataset import LazyReplayDataset
@@ -45,7 +45,7 @@ def export_checkpoint(checkpoint: Path, output: Path) -> None:
         files[f"data/{name}"] = DEFAULT_PATHS.data_root / name
     expected = {name: sha256_file(path) for name, path in files.items()}
     expected["run/checkpoint.pt"] = loaded.sha256
-    contract = load_active_runtime_manifest()
+    contract = load_active_global_contract()
     if loaded.artifact["global_contract_sha256"] != contract.global_sha256:
         raise ValueError("Export requires the checkpoint's original runtime resources")
     settings, inputs = run["settings"], run["inputs"]

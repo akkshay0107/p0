@@ -66,8 +66,6 @@ POKEMON_TYPE_SLOTS = 2
 
 # 0-11 pokemon tokens (one fused token per Pokemon)
 # 12 Global-field, 13 Ally-side, 14 Opponent-side (one fused token per owner)
-_POKE_POS = POKEMON_TOKENS
-_OWNER_POS = OWNER_TOKENS
 
 # pp fraction, last-move flag, legal-this-step, legality-proven gate
 MOVE_DYNAMIC_WIDTH = 4
@@ -589,7 +587,7 @@ class FusedTokenEncoder(nn.Module):
             dtype=self.action_mask_token.dtype,
         )
 
-        n_poke = len(_POKE_POS)
+        n_poke = len(POKEMON_TOKENS)
         poke_cats = categorical[:, :n_poke, :].flatten(0, 1)
         poke_nums = numerical[:, :n_poke, :].flatten(0, 1)
         poke_out, all_move_embs = self._embed_pokemon_components(poke_cats, poke_nums)
@@ -599,7 +597,7 @@ class FusedTokenEncoder(nn.Module):
         # keys; the records already carry pp/legality state, so no extra patch
         aux_moves = all_move_embs.unflatten(0, (batch_size, n_poke))[:, :2]
 
-        n_owner = len(_OWNER_POS)
+        n_owner = len(OWNER_TOKENS)
         owner_end = n_poke + n_owner
         # field / ally-side / opponent-side owners: one fused token each, from
         # the owner's typed effects plus its own scalars

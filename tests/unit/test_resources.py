@@ -20,7 +20,7 @@ from p0.cli.build_vocab import build
 from p0.format_config import (
     ACTION_CONTRACT,
     FORMAT,
-    RuntimeManifest,
+    GlobalContract,
 )
 from p0.model.architecture_contract import SERIES_SLOTS, SERIES_TOKENS_PER_GAME
 from p0.model.fused_token_encoder import (
@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class TestRuntimeResources:
     def test_active_contract_is_reg_m_b_and_manifest_matches_sources(self) -> None:
         """Verify default runtime_manifest matches Champions Regulation M-B battle formats and action contract."""
-        manifest = RuntimeManifest.from_dict(
+        manifest = GlobalContract.from_dict(
             json.loads((ROOT / "data/runtime_manifest.json").read_text())
         )
         assert FORMAT.battle_format == "gen9championsvgc2026regmb"

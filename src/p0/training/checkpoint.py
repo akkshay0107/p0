@@ -16,7 +16,7 @@ from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     ContractCompatibility,
     checkpoint_contract_compatibility,
-    load_active_runtime_manifest,
+    load_active_global_contract,
 )
 from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
@@ -29,7 +29,6 @@ from p0.model.policy import PolicyNet
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.persistence import atomic_torch_save
 
-CHECKPOINT_SCHEMA = CHECKPOINT_ARTIFACT_SCHEMA
 POLICY_ARTIFACT = "policy"
 TRAINING_ARTIFACT = "training"
 LOGGER = logging.getLogger(__name__)
@@ -56,7 +55,7 @@ class CheckpointStore:
         self.manifest_path = Path(manifest_path)
         if self.manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
             raise ValueError("CheckpointStore always uses the default global runtime manifest")
-        self._manifest = load_active_runtime_manifest(self.manifest_path)
+        self._manifest = load_active_global_contract(self.manifest_path)
         self._resources = resources
 
     def read(self, path: Path) -> LoadedCheckpoint:
@@ -224,9 +223,6 @@ class CheckpointStore:
         except Exception as exc:
             raise ValueError(f"Invalid training state in checkpoint {path}") from exc
 
-    save_training_state = save_training
-    load_training_state = load_training
-
     def load_episode(self, path: Path | LoadedCheckpoint) -> int:
         """Read saved progress without constructing a policy."""
         if isinstance(path, Path) and not path.exists():
@@ -239,8 +235,6 @@ class CheckpointStore:
             return max(0, state["episode"])
         return 0
 
-    load_checkpoint_episode = load_episode
-
     def load_metadata(self, path: Path | LoadedCheckpoint) -> Mapping[str, Any]:
         """Return validated checkpoint metadata without constructing a policy."""
         return self._load_artifact(path)["provenance"]
@@ -252,7 +246,7 @@ class CheckpointStore:
         metadata: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         return {
-            "artifact_schema": CHECKPOINT_SCHEMA,
+            "artifact_schema": CHECKPOINT_ARTIFACT_SCHEMA,
             "artifact_type": artifact_type,
             "global_contract_sha256": self._manifest.global_sha256,
             "global_contract": self._manifest.to_dict(),
@@ -269,11 +263,7 @@ class CheckpointStore:
             raise ValueError(f"Malformed checkpoint {path}: expected a mapping")
 
         schema = artifact.get("artifact_schema")
-        if (
-            "runtime_manifest_sha256" in artifact
-            or "runtime_contract_sha256" in artifact
-            or schema != CHECKPOINT_SCHEMA
-        ):
+        if schema != CHECKPOINT_ARTIFACT_SCHEMA:
             raise ValueError(f"Unsupported checkpoint schema {schema!r} at {path}")
         if artifact.get("artifact_type") not in {POLICY_ARTIFACT, TRAINING_ARTIFACT}:
             raise ValueError(f"Unsupported checkpoint artifact type at {path}")
@@ -318,7 +308,6 @@ class CheckpointStore:
 
 
 DEFAULT_CHECKPOINT_STORE = CheckpointStore()
-DEFAULT_POLICY_STORE = DEFAULT_CHECKPOINT_STORE
 
 
 def _capture_rng() -> dict[str, Any]:

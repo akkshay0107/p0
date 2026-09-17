@@ -8,10 +8,10 @@ from pathlib import Path
 from poke_env.battle.status import Status
 
 from p0.format_config import (
-    RuntimeManifest,
+    GlobalContract,
     active_global_contract,
     current_manifest,
-    load_runtime_manifest,
+    load_global_contract,
     sha256_file,
 )
 from p0.model.tokenizer import PokemonTokenizer, Resolution
@@ -60,12 +60,12 @@ class TestTokenizerContracts:
             key: reordered["contracts"]["actions"]["major"][key]
             for key in reversed(tuple(reordered["contracts"]["actions"]["major"]))
         }
-        assert RuntimeManifest.from_dict(reordered) == manifest
+        assert GlobalContract.from_dict(reordered) == manifest
         path = tmp_path / "runtime_manifest.json"
         path.write_text(json.dumps(reordered), encoding="utf-8")
-        assert load_runtime_manifest(path) == manifest
+        assert load_global_contract(path) == manifest
 
-    def test_tokenizer_aliases_and_resolution_keep_unknown_zero_distinct_from_known_none(
+    def test_tokenizer_resolution_keeps_unknown_zero_distinct_from_known_none(
         self,
     ) -> None:
         """Verify tokenizer distinguishes between KNOWN, KNOWN_NONE (valid empty entity), OOV, and UNKNOWN."""
@@ -78,24 +78,24 @@ class TestTokenizerContracts:
         )
         assert tokenizer_instance.id_for("moves", "U-turn") == 7
         assert tokenizer_instance.effect_id_for("status", "status: brn") == 5
-        assert tokenizer_instance.resolve("weathers", "rain") == (4, Resolution.KNOWN)
-        assert tokenizer_instance.resolve("status", "burn") == (5, Resolution.KNOWN)
+        assert tokenizer_instance.resolve("weathers", "raindance") == (4, Resolution.KNOWN)
+        assert tokenizer_instance.resolve("status", "brn") == (5, Resolution.KNOWN)
         assert tokenizer_instance.resolve("status", "not-a-status") == (0, Resolution.OOV)
         assert tokenizer_instance.resolve("status", None) == (0, Resolution.KNOWN_NONE)
         assert tokenizer_instance.resolve("missing", "rain") == (0, Resolution.UNKNOWN)
 
-    def test_enum_like_tables_lazy_cache_alias_and_missing_member_results(self) -> None:
-        """Verify lazy alias dictionary caching on enum-like tables (weathers, status)."""
+    def test_enum_like_tables_lazy_cache_and_missing_member_results(self) -> None:
+        """Verify lazy dictionary caching on enum-like tables (weathers, status)."""
         tokenizer_instance = PokemonTokenizer({"weathers": {"raindance": 4}, "status": {"brn": 5}})
-        assert tokenizer_instance.weathers["R-a-i-n"] == 4
-        assert tokenizer_instance.weathers["rain"] == 4
-        assert tokenizer_instance.weathers == {"rain": 4}
+        assert tokenizer_instance.weathers["R-a-i-n-d-a-n-c-e"] == 4
+        assert tokenizer_instance.weathers["raindance"] == 4
+        assert tokenizer_instance.weathers == {"raindance": 4}
         assert tokenizer_instance.weathers["unknown-weather"] == 0
         assert "unknownweather" not in tokenizer_instance.weathers
-        assert tokenizer_instance.status["burn"] == 5
         assert tokenizer_instance.status[Status.BRN] == 5
+        assert tokenizer_instance.status["brn"] == 5
         assert tokenizer_instance.status["unknown-status"] == 0
-        assert tokenizer_instance.status == {"burn": 5, "brn": 5}
+        assert tokenizer_instance.status == {"brn": 5}
         assert all(isinstance(key, str) for key in tokenizer_instance.status)
 
     def test_active_contract_rejects_an_unrecorded_spread_table(self) -> None:

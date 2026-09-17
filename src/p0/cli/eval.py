@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 from p0.evaluation.harness import EvaluationHarness, MatchupResult
-from p0.format_config import load_active_runtime_manifest
+from p0.format_config import load_active_global_contract
 from p0.persistence import atomic_json_save
 from p0.runtime.showdown import start_showdown_servers
 from p0.teams.corpus import CorpusSplit
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     try:
-        manifest = load_active_runtime_manifest(config.paths.data_root / "runtime_manifest.json")
+        manifest = load_active_global_contract(config.paths.data_root / "runtime_manifest.json")
     except (OSError, KeyError, TypeError, ValueError) as exc:
         logger.error("Could not validate runtime contract: %s", exc)
         return 1

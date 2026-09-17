@@ -14,8 +14,7 @@ import orjson
 
 from p0.paths import DEFAULT_PATHS
 
-RUNTIME_MANIFEST_SCHEMA = 1
-GLOBAL_CONTRACT_SCHEMA = RUNTIME_MANIFEST_SCHEMA
+GLOBAL_CONTRACT_SCHEMA = 1
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SUBSYSTEM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -26,7 +25,7 @@ DEFAULT_RUNTIME_MANIFEST = DEFAULT_PATHS.data_root / "runtime_manifest.json"
 
 @dataclass(frozen=True, slots=True)
 class FormatSpec:
-    """Format metadata projected from the resources contract for legacy callers."""
+    """Format metadata projected from the runtime resources and actions contract."""
 
     battle_format: str
     bo3_format: str
@@ -276,9 +275,6 @@ class GlobalContract:
             global_sha256=value["global_sha256"],
             manifest_schema=value["manifest_schema"],
         )
-
-
-RuntimeManifest = GlobalContract
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,9 +625,6 @@ def load_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> GlobalC
     return GlobalContract.from_dict(value)
 
 
-load_runtime_manifest = load_global_contract
-
-
 def load_active_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> GlobalContract:
     """Load a contract and verify its resources match the active runtime files."""
     manifest_path = Path(path)
@@ -667,9 +660,6 @@ def load_active_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> 
             "Global contract does not describe active resources: " + "; ".join(mismatches)
         )
     return contract
-
-
-load_active_runtime_manifest = load_active_global_contract
 
 
 @lru_cache(maxsize=1)
@@ -726,7 +716,7 @@ def _format_spec_from_contract(contract: GlobalContract) -> FormatSpec:
 _active = active_global_contract()
 FORMAT = _format_spec_from_contract(_active)
 
-# Compatibility exports are projections of the loaded global contract.
+# Runtime contract projections.
 ACTION_CONTRACT = dict(_active.payload("actions", "major"))
 
 

@@ -20,24 +20,14 @@ from torch.distributions import Categorical
 
 from p0.battle.actions import (
     ACT_SIZE,
+    FORCED_ACTION,
+    MEGA_FORCED_ACTION,
+    MEGA_MOVE_END,
+    MEGA_MOVE_START,
     MOVE_END,
     MOVE_START,
+    PASS_ACTION,
     SWITCH_START,
-)
-from p0.battle.actions import (
-    FORCED_ACTION as STRUGGLE_START,
-)
-from p0.battle.actions import (
-    MEGA_FORCED_ACTION as MEGA_STRUGGLE_START,
-)
-from p0.battle.actions import (
-    MEGA_MOVE_END as MEGA_END,
-)
-from p0.battle.actions import (
-    MEGA_MOVE_START as MEGA_START,
-)
-from p0.battle.actions import (
-    PASS_ACTION as PASS_START,
 )
 from p0.model.architecture_contract import (
     HISTORY_WINDOW,
@@ -347,7 +337,7 @@ class ActorPolicy(nn.Module):
         # ally rows (orig ratio 0), which would otherwise land on the pass slot.
         logits = torch.zeros((B, self.act_size + 1), device=device)
 
-        logits[:, PASS_START] = ((q_pass * self.pass_key).sum(dim=-1) / pointer_scale).to(
+        logits[:, PASS_ACTION] = ((q_pass * self.pass_key).sum(dim=-1) / pointer_scale).to(
             logits.dtype
         )
 
@@ -380,14 +370,14 @@ class ActorPolicy(nn.Module):
         )
         mega_scores = torch.einsum("bd,bnd->bn", q_move, mega_action_keys) / pointer_scale
 
-        logits[:, MEGA_START:MEGA_END] = mega_scores.to(logits.dtype)
+        logits[:, MEGA_MOVE_START:MEGA_MOVE_END] = mega_scores.to(logits.dtype)
 
         mega_struggle_key = self.struggle_key + self.mega_emb
-        logits[:, MEGA_STRUGGLE_START] = (
+        logits[:, MEGA_FORCED_ACTION] = (
             (q_move * mega_struggle_key).sum(dim=-1) / pointer_scale
         ).to(logits.dtype)
 
-        logits[:, STRUGGLE_START] = ((q_move * self.struggle_key).sum(dim=-1) / pointer_scale).to(
+        logits[:, FORCED_ACTION] = ((q_move * self.struggle_key).sum(dim=-1) / pointer_scale).to(
             logits.dtype
         )
 
@@ -429,8 +419,8 @@ class ActorPolicy(nn.Module):
         move_key = outputs.move_keys[batch_indices, move_index]
         key = torch.where(move[:, None], move_key, key)
 
-        mega_move = (actions >= MEGA_START) & (actions < MEGA_END)
-        mega_index = (actions - MEGA_START).clamp(0, MEGA_END - MEGA_START - 1)
+        mega_move = (actions >= MEGA_MOVE_START) & (actions < MEGA_MOVE_END)
+        mega_index = (actions - MEGA_MOVE_START).clamp(0, MEGA_MOVE_END - MEGA_MOVE_START - 1)
         mega_key = outputs.mega_move_keys[batch_indices, mega_index]
         key = torch.where(mega_move[:, None], mega_key, key)
 
@@ -439,13 +429,13 @@ class ActorPolicy(nn.Module):
         tp_key = outputs.tp_pair_keys[batch_indices, tp_index]
         key = torch.where(tp[:, None], tp_key, key)
 
-        mega_struggle = actions == MEGA_STRUGGLE_START
+        mega_struggle = actions == MEGA_FORCED_ACTION
         key = torch.where(
             mega_struggle[:, None],
             (self.struggle_key + self.mega_emb).unsqueeze(0),
             key,
         )
-        struggle = actions == STRUGGLE_START
+        struggle = actions == FORCED_ACTION
         return torch.where(struggle[:, None], self.struggle_key.unsqueeze(0), key)
 
     @staticmethod
@@ -767,9 +757,9 @@ class ActorPolicy(nn.Module):
         )  # batch by team preview action count
         mask2[:, :TP_END] = mask2[:, :TP_END] & ~(is_tp[:, None] & tp_overlap)
 
-        # Forced-action edge cases need PASS_START as a total fallback.
+        # Forced-action edge cases need PASS_ACTION as a total fallback.
         no_valid = mask2.sum(-1) == 0
-        mask2[no_valid, 0] = True
+        mask2[no_valid, PASS_ACTION] = True
 
         l1 = logits[:, 0].masked_fill(action_mask[:, 0] == 0, float("-inf"))
         l2 = logits[:, 1].masked_fill(~mask2, float("-inf"))
