@@ -45,8 +45,7 @@ I also plan on hopefully releasing a larger article detailing the rationale behi
 - **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
 - **Automatic Mixed Precision & Compilation**: With optimizations enabled, training prefers BF16, falls back to scaled FP16, and otherwise uses FP32. CUDA execution also enables optional `torch.compile` acceleration.
 
-The current baseline, initialization, positional signals, precision policy, and PPO objective are
-documented in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md).
+Model contracts and dimensional hyperparameters are defined in `src/p0/model/architecture_contract.py`.
 
 ---
 
@@ -54,14 +53,20 @@ documented in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md).
 
 ### 1. `src/p0/` (Source)
 
-- **`model/`**: Defines the tokenizer, structured observations, encoder, and actor-critic policy.
-- **`training/`**: Contains fixed-memory PPO rollout, optimization, vector-environment, and magnet services.
+- **`battle/`**: Event definitions, action legality, and battle view abstractions.
+- **`cli/`**: Installed entry points for training, evaluation, replay compilation, and live bot execution.
+- **`evaluation/`**: Matchup harness and reporting against checkpoints or baseline heuristics.
+- **`model/`**: Tokenizer, observation builder, encoders, and pointer actor-critic policy.
+- **`replays/`**: OTS parsing, replay reconstruction, decision inference, and shard compilation.
+- **`runtime/`**: Showdown process management, live event capture, and poke-env environment adapters.
+- **`teams/`**: Team validation, stat point imputation from usage priors, and corpus sampling.
+- **`training/`**: Behavioral cloning (BC), PPO self-play with magnetic regularization, and checkpoint file I/O.
 
-### 2. `bench/` (Benchmarks)
+### 2. `tests/` (Tests)
 
-Scripts to benchmark system and model performance, including inference and encoder throughput.
-
-### 3. `tests/` (Tests)
+- **`unit/`**: Fast, self-contained unit tests across all library submodules.
+- **`integration/`**: End-to-end integration tests using local Showdown server instances.
+- **`stress/`**: Randomized and large-scale workload simulations (opt-in via pytest markers).
 
 ## Workflow Guide
 
@@ -151,8 +156,6 @@ Resuming requires a training checkpoint generated with run metadata and embedded
 weights-only or legacy checkpoints without embedded state cannot be resumed. Choose an
 empty output directory for new runs or when resuming into a fresh workspace.
 
-See [the training file design](docs/training-files.md) for file ownership and tradeoffs.
-
 ### Replay BC pilot
 
 The replay collector searches only the configured Champions Bo3 OTS format. The
@@ -176,9 +179,21 @@ Raw response bytes remain immutable even when parsing or OTS checks fail. Derive
 shards are published atomically under the runtime and dataset hashes, and
 `replay-quality-manifest.json` records every accepted or rejected source replay.
 
-### 3. Local Play
+### 3. Local Play & Bot Runner
 
-You would have to move the trained model to a specific location and have the infra and client (which are slightly outdated since they were meant for v1) setup in order to play against the model locally with the usual showdown interface. Unfortunately, this part is slightly flaky since I haven't worked on it recently. See [p0-infra](https://github.com/akkshay0107/p0-infra) for more details.
+Run the trained policy as an active bot on a local or remote Pokémon Showdown server using `p0-play`:
+
+```bash
+uv run p0-play --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --username MyBot --team-pool all
+```
+
+Supported options include:
+- `--checkpoint`: Path to policy checkpoint (or `--allow-random-init` to run with untrained weights).
+- `--server`: Target server specified as `'<websocket_url>,<authentication_url>'` (defaults to localhost:8000).
+- `--team-pool`: Named team pool (`all` or `reduced`) or repeatable `--team-file` paths.
+- `--top-p`: Top-p sampling threshold (default: `0.9`).
+- `--challenge-limit`: Number of challenges to accept before cleanly exiting.
+- `--opponent`: Restrict accepted challenges to a specific opponent username.
 
 ---
 
@@ -202,12 +217,6 @@ New outputs go under `artifacts/resumed`; use a fresh output path for each impor
 The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.example.yaml`.
 
 ### Runtime compatibility
-
-The reducer-depth benchmark measures baseline and deeper fixed memory-reducer variants using the project baseline model dimensions by default, on the project default device. Device and model dimensions have optional overrides. Timing, batch, depth, dtype, and seed inputs have practical defaults; optional BC validation requires a compatible checkpoint and tensor artifact.
-
-For a default-sized run:
-
-    uv run python bench/benchmark_reducer_depth.py --dtype float32 --seed 7 --warmup 2 --iterations 5 --repeats 5 --batch-size 2 --time-steps 4 --deep-reducer-layers 3
 
 `data/runtime_manifest.json` is the sole runtime contract. It contains versioned major/minor
 identities for actions, model layout, resources, replays, checkpoints, and team corpora. Every
@@ -247,12 +256,6 @@ BC TensorBoard logs the selected NLL, validation, legality, label-quality, value
 gradient, and learning-rate metrics. Its update, game, and decision counts remain
 in the JSON metrics artifacts rather than the board.
 
-Run the memory-channel performance baseline with:
-
-```bash
-uv run python bench/benchmark_memory_channel.py --batch-size 8 --iterations 20
-```
-
 The installed command-line interfaces include `p0-train`, `p0-bc`, `p0-replays`,
 `p0-corpus`, `p0-eval`, `p0-play`, `p0-build-vocab`, `p0-build-spreads`, and
 `p0-export-training`.
@@ -273,9 +276,7 @@ This project was heavily inspired by the work of the devs behind the following r
 
 ## Contributing
 
-Contributions are very welcome! If you are interested in this project, have any feedback or queries, want to help implement new features, or can provide resources to train larger models, please reach out.
-
-Please refer to [TODO.md](TODO.md) for the roadmap of features I plan on implementing.
+Contributions are very welcome! If you are interested in this project, have any feedback or queries, want to help implement new features, or can provide resources to train larger models, please reach out or open an issue on GitHub.
 
 ---
 
