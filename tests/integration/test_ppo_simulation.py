@@ -5,7 +5,6 @@ from urllib.parse import urlparse
 import pytest
 from poke_env import AccountConfiguration
 
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.model.observation_builder import ObservationBuilder
 from p0.runtime import poke_env_patches
 from p0.runtime.composition import build_sim_env
@@ -14,6 +13,7 @@ from p0.teams.source import FixedTeamSource
 from p0.training.config import TrainingConfig
 from p0.training.rollout import RolloutCollector
 from p0.training.vector_env import ThreadVecEnv
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 class TestPpoSimulation:

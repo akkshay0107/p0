@@ -7,12 +7,12 @@ import pytest
 from poke_env import AccountConfiguration
 from poke_env.player import RandomPlayer
 
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.rl_player import RLPlayer
 from p0.runtime import poke_env_patches
 from p0.teams.source import FixedTeamSource
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 class TestLiveBo3:

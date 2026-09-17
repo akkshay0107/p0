@@ -26,7 +26,6 @@ def _parser() -> argparse.ArgumentParser:
 
     train = subparsers.choices["train"]
     train.add_argument("--resume-checkpoint", type=Path, default=None)
-    train.add_argument("--overfit", action="store_true")
 
     evaluate = subparsers.choices["evaluate"]
     evaluate.add_argument("--checkpoint", type=Path, required=True)
@@ -65,7 +64,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "train":
         with cancellation_signals() as cancel_requested:
             result = train_bc(
-                config, overfit=args.overfit, device=args.device, cancel_requested=cancel_requested
+                config, overfit=False, device=args.device, cancel_requested=cancel_requested
             )
     else:
         result = evaluate_bc(

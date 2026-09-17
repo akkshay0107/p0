@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from p0.cli.corpus import main as corpus_main
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT, current_manifest
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
@@ -24,6 +23,7 @@ from p0.teams.corpus import (
 from p0.teams.corpus_source import CorpusTeamPool, CorpusTeamSource
 from p0.teams.factory import build_team_source
 from p0.teams.source import FileTeamSource
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 def _make_entry(

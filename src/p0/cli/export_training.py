@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Export failed: {exc}", file=sys.stderr)
         return 1
     print(f"Exported {args.output}. Extract into a compatible p0 checkout.")
-    print("Resume BC with p0-bc train --config run/config.yaml (add --overfit for an overfit run).")
+    print("Resume BC with p0-bc train --config run/config.yaml.")
     print("Resume PPO with p0-train --config run/config.yaml --agent-team-source reduced.")
     return 0
 

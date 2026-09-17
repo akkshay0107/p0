@@ -12,7 +12,6 @@ import pytest
 import torch
 
 from p0.cli.export_training import export_checkpoint
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import sha256_file
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
@@ -23,6 +22,7 @@ from p0.teams.factory import build_team_source
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import TrainingConfig, load_config
 from p0.training.files import training_run
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 from tests.unit.replay_fixtures import sample_replay_payload
 
 

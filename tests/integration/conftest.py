@@ -6,13 +6,13 @@ import pytest
 import torch
 from poke_env import LocalhostServerConfiguration, ServerConfiguration
 
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 from p0.teams.source import ValidatedTeam
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 @pytest.fixture(scope="session")

@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
@@ -18,6 +17,7 @@ from p0.paths import DEFAULT_PATHS
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import GlobalConfig, TeamsConfig, TrainingConfig
 from p0.training.ppo_runner import run_training
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 class TestTrainingResume:

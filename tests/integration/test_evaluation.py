@@ -4,12 +4,10 @@ import urllib.parse
 
 import pytest
 
-from p0.evaluation.harness import (
-    DEFAULT_TEST_TEAM,
-    EvaluationHarness,
-)
+from p0.evaluation.harness import EvaluationHarness
 from p0.runtime import poke_env_patches
 from p0.teams.source import FixedTeamSource
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 class TestEvaluation:
@@ -171,3 +169,37 @@ class TestEvaluation:
                 and stats["win_rate"] == pytest.approx(stats["wins"] / stats["games"])
                 for stats in stats_by_team.values()
             )
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("opponent_type", ("max_power", "simple_heuristics"))
+    async def test_live_evaluation_runs_against_heuristic_opponents(
+        self,
+        showdown_server,
+        model_policy,
+        opponent_type: str,
+    ) -> None:
+        """Verify live evaluation completes matchups against MaxBasePowerPlayer and SimpleHeuristicsPlayer."""
+        parsed = urllib.parse.urlparse(showdown_server.websocket_url)
+        assert parsed.port is not None
+
+        poke_env_patches.install()
+        try:
+            harness = EvaluationHarness(episodes_per_matchup=1, seed=42, port=parsed.port)
+            result = await harness.run_matchup(
+                name_a="ModelPlayer",
+                policy_a=model_policy,
+                name_b=f"Opponent_{opponent_type}",
+                policy_b=opponent_type,
+                team_category="test_heuristics",
+                team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
+                server_configuration=showdown_server,
+            )
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+        assert result.policy_a == "ModelPlayer"
+        assert result.policy_b == f"Opponent_{opponent_type}"
+        assert result.total_games >= 1
+        assert result.wins_a + result.wins_b + result.ties == result.total_games
+        assert 0.0 <= result.win_rate_a <= 1.0

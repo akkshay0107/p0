@@ -10,7 +10,6 @@ from poke_env import AccountConfiguration
 from poke_env.player import RandomPlayer
 from poke_env.player.battle_order import DoubleBattleOrder, SingleBattleOrder
 
-from p0.evaluation.harness import DEFAULT_TEST_TEAM
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
@@ -18,6 +17,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import order_to_action, single_order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,49 +1,43 @@
-"""Tests for evaluation harness construction and result serialization."""
+"""Tests for evaluation harness construction, player instantiation, and result serialization."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import random
 from pathlib import Path
 
+import pytest
+from poke_env import AccountConfiguration, LocalhostServerConfiguration
+
 from p0.evaluation.harness import (
+    EvalMaxBasePowerPlayer,
+    EvalPlayer,
+    EvalRandomPlayer,
+    EvalSimpleHeuristicsPlayer,
     EvaluationHarness,
     MatchupResult,
-    hashlib_team,
+    create_eval_player,
     wilson_score_interval,
 )
 from p0.format_config import FORMAT, current_manifest
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
+from p0.model.resources import default_runtime_resources
 from p0.teams.corpus import CorpusEntry, CorpusSplit, TeamCorpusManifest, corpus_content_hash
 from p0.teams.corpus_source import CorpusTeamSource
 from p0.teams.source import FixedTeamSource
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 class TestEvaluationHarness:
-    def test_evaluation_harness_falls_back_without_corpus_repeatably(self, tmp_path: Path) -> None:
-        """Verify EvaluationHarness falls back to deterministic built-in team pools when corpus file is missing."""
-        first = EvaluationHarness(
-            teams_path=tmp_path / "missing",
-            episodes_per_matchup=5,
-            seed=91,
-            smoke_test=True,
+    def test_evaluation_harness_fails_fast_when_teams_path_missing(self, tmp_path: Path) -> None:
+        """Verify EvaluationHarness fails fast with FileNotFoundError when teams path does not exist."""
+        harness = EvaluationHarness(
+            teams_path=tmp_path / "missing", episodes_per_matchup=5, seed=91
         )
-        second = EvaluationHarness(
-            teams_path=tmp_path / "missing",
-            episodes_per_matchup=5,
-            seed=91,
-            smoke_test=True,
-        )
-        first_sources = first.build_team_sources()
-        second_sources = second.build_team_sources()
-        assert len(first_sources) == 3
-        assert tuple(first_sources) == tuple(second_sources)
-        for key, source in first_sources.items():
-            assert isinstance(source, FixedTeamSource)
-            assert first.category_metadata[key]["fallback"] is True
-            first_team = source.sample(first.rng)
-            second_team = second_sources[key].sample(second.rng)
-            assert "Pikachu" in first_team.packed
-            assert first_team.packed == second_team.packed
+        with pytest.raises(FileNotFoundError):
+            harness.build_team_sources()
 
     def test_evaluation_harness_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
         entries = tuple(
@@ -71,9 +65,71 @@ class TestEvaluationHarness:
         )
 
         harness = EvaluationHarness(teams_path=pool_dir, format_id=FORMAT.bo3_format)
-        sources = harness.build_team_sources()
-        assert set(sources) == {"seen", "validation_unseen_canonical", "test_unseen_canonical"}
-        assert all(isinstance(source, CorpusTeamSource) for source in sources.values())
+        source = harness.build_team_source()
+        assert isinstance(source, CorpusTeamSource)
+
+    def test_create_eval_player_constructs_supported_opponents(self) -> None:
+        """Verify create_eval_player instantiates the expected baseline or policy players."""
+        team_source = FixedTeamSource(DEFAULT_TEST_TEAM)
+        rng = random.Random(42)
+        server_config = LocalhostServerConfiguration
+        account_config = AccountConfiguration("evaluser", None)
+
+        random_player = create_eval_player(
+            "random",
+            team_rng=rng,
+            team_source=team_source,
+            battle_format=FORMAT.bo3_format,
+            server_configuration=server_config,
+            account_configuration=account_config,
+            start_listening=False,
+        )
+        assert isinstance(random_player, EvalRandomPlayer)
+
+        max_power_player = create_eval_player(
+            "max_power",
+            team_rng=rng,
+            team_source=team_source,
+            battle_format=FORMAT.bo3_format,
+            server_configuration=server_config,
+            account_configuration=account_config,
+            start_listening=False,
+        )
+        assert isinstance(max_power_player, EvalMaxBasePowerPlayer)
+
+        heuristics_player = create_eval_player(
+            "simple_heuristics",
+            team_rng=rng,
+            team_source=team_source,
+            battle_format=FORMAT.bo3_format,
+            server_configuration=server_config,
+            account_configuration=account_config,
+            start_listening=False,
+        )
+        assert isinstance(heuristics_player, EvalSimpleHeuristicsPlayer)
+
+        policy = build_policy(ModelConfig.baseline(), default_runtime_resources())
+        policy_player = create_eval_player(
+            policy,
+            team_rng=rng,
+            team_source=team_source,
+            battle_format=FORMAT.bo3_format,
+            server_configuration=server_config,
+            account_configuration=account_config,
+            start_listening=False,
+        )
+        assert isinstance(policy_player, EvalPlayer)
+
+        with pytest.raises(ValueError, match="Unknown evaluation opponent"):
+            create_eval_player(
+                "unsupported_player",
+                team_rng=rng,
+                team_source=team_source,
+                battle_format=FORMAT.bo3_format,
+                server_configuration=server_config,
+                account_configuration=account_config,
+                start_listening=False,
+            )
 
     def test_evaluation_confidence_intervals_and_matchup_serialization_are_deterministic(
         self,
@@ -82,8 +138,7 @@ class TestEvaluationHarness:
         assert wilson_score_interval(0, 0) == (0.0, 0.0)
         lower, upper = wilson_score_interval(3, 5)
         assert 0.0 < lower < 0.6 < upper < 1.0
-        team_hash = hashlib_team("team-data")
-        assert team_hash == hashlib_team("team-data")
+        team_hash = hashlib.sha256(b"team-data").hexdigest()[:8]
         result = MatchupResult(
             policy_a="live",
             policy_b="random",
