@@ -16,14 +16,11 @@ from typing import Any, Mapping
 
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
-    active_global_contract,
     canonical_json_sha256,
     validate_artifact_runtime_contract,
 )
 
-CORPUS_MANIFEST_SCHEMA = active_global_contract().payload("teams", "major")[
-    "corpus_manifest_schema"
-]
+CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v1"
 
 
 class CorpusSplit(IntEnum):

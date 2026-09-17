@@ -26,7 +26,4 @@ REDUCER_MAX_LENGTH = SERIES_SLOTS + HISTORY_WINDOW + CURRENT_REDUCER_TOKEN_COUNT
 # sequence position and therefore cannot drift when observation rows change.
 SELF_TARGET_SENTINEL = _MODEL_CONTRACT["self_target_sentinel"]
 
-OBSERVATION_SCHEMA_VERSION = _MODEL_CONTRACT["observation_schema_version"]
-CHECKPOINT_ARTIFACT_SCHEMA = active_global_contract().payload("checkpoints", "major")[
-    "artifact_schema"
-]
+CHECKPOINT_ARTIFACT_SCHEMA = "p0.policy_checkpoint.v1"

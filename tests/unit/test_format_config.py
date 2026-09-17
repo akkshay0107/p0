@@ -9,8 +9,6 @@ import pytest
 
 from p0.format_config import (
     ACTION_CONTRACT,
-    RESOURCE_FEATURE_ABI,
-    TENSOR_ABI,
     RuntimeManifest,
     active_global_contract,
     canonical_json_sha256,
@@ -43,8 +41,6 @@ class TestFormatConfig:
         restored = RuntimeManifest.from_dict(json.loads(json.dumps(manifest.to_dict())))
 
         assert restored == manifest
-        assert restored.tensor_abi == TENSOR_ABI
-        assert restored.resource_feature_abi == RESOURCE_FEATURE_ABI
         assert restored.action == ACTION_CONTRACT
         assert restored.global_sha256 == manifest.global_sha256
 
@@ -94,10 +90,10 @@ class TestFormatConfig:
             == contract.subsystem("resources").minor_version + 1
         )
 
-        # Major subsystem update alters tensor ABI, bumps major version, and recomputes global SHA-256
+        # Major subsystem update alters observation dimensions, bumps major version, and recomputes global SHA-256
         changed_major = contract.with_subsystem_update(
             "model",
-            major_payload={**contract.payload("model", "major"), "tensor_abi": "next"},
+            major_payload={**contract.payload("model", "major"), "pokemon_count": 14},
         )
         assert changed_major.global_sha256 != contract.global_sha256
         assert (
@@ -106,14 +102,14 @@ class TestFormatConfig:
         )
 
         # Major subsystem bump resets minor version counter to 0
-        bumped = contract.with_subsystem_update(
+        bumped = changed_minor.with_subsystem_update(
             "resources",
             major_payload={
-                **contract.payload("resources", "major"),
-                "resource_feature_abi": "next",
+                **changed_minor.payload("resources", "major"),
+                "vocabulary_sha256": "0" * 64,
             },
         )
-        assert contract.subsystem("resources").minor_version > 0
+        assert changed_minor.subsystem("resources").minor_version > 0
         assert bumped.subsystem("resources").minor_version == 0
 
     def test_global_contract_rejects_hash_valid_but_malformed_subsystem_payload(self) -> None:
@@ -164,7 +160,7 @@ class TestFormatConfig:
         # Major difference yields incompatible
         major_bump = active.with_subsystem_update(
             "model",
-            major_payload={**active.payload("model", "major"), "tensor_abi": "next"},
+            major_payload={**active.payload("model", "major"), "pokemon_count": 14},
         )
         compat_major = compare_global_contracts(major_bump, active)
         assert not compat_major.is_compatible

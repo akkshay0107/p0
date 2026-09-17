@@ -17,7 +17,6 @@ from torch.utils.data import IterableDataset, get_worker_info
 from p0.battle.series import SeriesPerspectiveKey
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
-    active_global_contract,
     validate_artifact_runtime_contract,
 )
 from p0.model.structured_observation import StructuredObservation
@@ -32,9 +31,7 @@ from p0.replays.shards import (
     validate_shard_tensors,
 )
 
-SPLIT_ARTIFACT_SCHEMA = active_global_contract().payload("replays", "major")[
-    "split_artifact_schema"
-]
+SPLIT_ARTIFACT_SCHEMA = "p0.replay_split.v1"
 SPLITS = frozenset({"train", "validation", "test"})
 
 

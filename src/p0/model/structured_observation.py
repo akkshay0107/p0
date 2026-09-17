@@ -23,11 +23,8 @@ from p0.battle.events import (
 from p0.format_config import active_global_contract, canonical_json_sha256
 from p0.model.architecture_contract import (
     OBSERVATION_ENTITY_COUNT,
-    OBSERVATION_SCHEMA_VERSION,
     SELF_TARGET_SENTINEL,
 )
-
-__all__ = ["OBSERVATION_SCHEMA_VERSION"]
 
 # every entity (Pokemon, global field, ally side, opponent side) is one
 # fused token; its categorical and numerical features live on the same row index.

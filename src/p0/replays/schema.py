@@ -8,12 +8,7 @@ from enum import IntEnum
 from typing import Any, Mapping
 
 from p0.battle.actions import ACT_SIZE
-from p0.format_config import active_global_contract
 from p0.replays.identity import ReplayMemberId, ReplaySide
-
-REPLAY_IR_SCHEMA_VERSION = active_global_contract().payload("replays", "major")[
-    "replay_ir_schema_version"
-]
 
 
 class GroupingMethod(IntEnum):
@@ -477,13 +472,6 @@ def _require_fields(value: Mapping[str, Any], expected: frozenset[str], owner: s
         raise ValueError(f"Invalid {owner} fields; missing={missing}, unknown={unknown}")
 
 
-def _require_ir_schema(value: Any, owner: str) -> None:
-    if value != REPLAY_IR_SCHEMA_VERSION:
-        raise ValueError(
-            f"Unsupported {owner} ir_schema {value!r}; expected {REPLAY_IR_SCHEMA_VERSION}"
-        )
-
-
 def _is_sha256(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -775,7 +763,6 @@ class SeriesRecord:
     score: tuple[int, int]
     grouping_method: GroupingMethod
     grouping_confidence: float
-    ir_schema: int = REPLAY_IR_SCHEMA_VERSION
 
     _FIELDS = frozenset(
         {
@@ -789,12 +776,10 @@ class SeriesRecord:
             "score",
             "grouping_method",
             "grouping_confidence",
-            "ir_schema",
         }
     )
 
     def __post_init__(self) -> None:
-        _require_ir_schema(self.ir_schema, "SeriesRecord")
         if not self.series_id or not self.format_id:
             raise ValueError("SeriesRecord requires series_id and format_id")
         if len(self.players) != 2 or not all(self.players):
@@ -831,13 +816,11 @@ class SeriesRecord:
             "score": list(self.score),
             "grouping_method": int(self.grouping_method),
             "grouping_confidence": self.grouping_confidence,
-            "ir_schema": self.ir_schema,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SeriesRecord:
         _require_fields(value, cls._FIELDS, "SeriesRecord")
-        _require_ir_schema(value["ir_schema"], "SeriesRecord")
         try:
             players = tuple(str(name) for name in value["players"])
             team_hashes = tuple(str(digest) for digest in value["team_hashes"])
@@ -855,7 +838,6 @@ class SeriesRecord:
                 score=(score[0], score[1]),
                 grouping_method=GroupingMethod(value["grouping_method"]),
                 grouping_confidence=float(value["grouping_confidence"]),
-                ir_schema=int(value["ir_schema"]),
             )
         except (IndexError, TypeError) as exc:
             raise ValueError(f"Invalid serialized SeriesRecord: {exc}") from exc

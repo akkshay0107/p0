@@ -14,12 +14,12 @@ import orjson
 
 from p0.paths import DEFAULT_PATHS
 
-RUNTIME_MANIFEST_SCHEMA = 3
+RUNTIME_MANIFEST_SCHEMA = 1
 GLOBAL_CONTRACT_SCHEMA = RUNTIME_MANIFEST_SCHEMA
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SUBSYSTEM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-_SUBSYSTEM_NAMES = frozenset({"actions", "model", "resources", "replays", "checkpoints", "teams"})
+_SUBSYSTEM_NAMES = frozenset({"actions", "model", "resources"})
 
 DEFAULT_RUNTIME_MANIFEST = DEFAULT_PATHS.data_root / "runtime_manifest.json"
 
@@ -159,20 +159,12 @@ class GlobalContract:
         object.__setattr__(self, "contracts", _freeze(self.contracts))
 
     @property
-    def tensor_abi(self) -> str:
-        return self.payload("model", "major")["tensor_abi"]
-
-    @property
     def vocabulary_sha256(self) -> str:
         return self.payload("resources", "major")["vocabulary_sha256"]
 
     @property
     def action(self) -> Mapping[str, Any]:
         return self.payload("actions", "major")
-
-    @property
-    def resource_feature_abi(self) -> str:
-        return self.payload("resources", "major")["resource_feature_abi"]
 
     @property
     def champions_dex_sha256(self) -> str:
@@ -418,10 +410,9 @@ _SUBSYSTEM_MAJOR_SCHEMAS: dict[
     str, tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]
 ] = {
     "model": (
-        frozenset({"tensor_abi", "structured_observation_abi"}),
+        frozenset(),
         frozenset(
             {
-                "observation_schema_version",
                 "observation_entity_count",
                 "pokemon_count",
                 "owner_count",
@@ -437,37 +428,10 @@ _SUBSYSTEM_MAJOR_SCHEMAS: dict[
         frozenset({"observation_layout_sha256"}),
     ),
     "resources": (
-        frozenset({"resource_feature_abi"}),
+        frozenset(),
         frozenset(),
         frozenset(),
         frozenset({"vocabulary_sha256"}),
-    ),
-    "replays": (
-        frozenset(
-            {
-                "shard_artifact_schema",
-                "split_artifact_schema",
-                "compilation_semantics",
-                "imputation_algorithm",
-            }
-        ),
-        frozenset(
-            {
-                "replay_ir_schema_version",
-                "parser_version",
-                "compiler_version",
-                "imputation_version",
-            }
-        ),
-        frozenset(),
-        frozenset(),
-    ),
-    "checkpoints": (frozenset({"artifact_schema"}), frozenset(), frozenset(), frozenset()),
-    "teams": (
-        frozenset({"corpus_manifest_schema"}),
-        frozenset({"stat_point_imputer_version"}),
-        frozenset(),
-        frozenset(),
     ),
 }
 
@@ -763,8 +727,6 @@ _active = active_global_contract()
 FORMAT = _format_spec_from_contract(_active)
 
 # Compatibility exports are projections of the loaded global contract.
-TENSOR_ABI = _active.payload("model", "major")["tensor_abi"]
-RESOURCE_FEATURE_ABI = _active.payload("resources", "major")["resource_feature_abi"]
 ACTION_CONTRACT = dict(_active.payload("actions", "major"))
 
 

@@ -1,5 +1,5 @@
 {
-  "manifest_schema": 3,
+  "manifest_schema": 1,
   "subsystems": {
     "actions": {
       "major_sha256": "cea4d0ef89979d9824b0341b801f3f4d04770dca51b38aa1bb0ae0c08fb610f9",
@@ -7,34 +7,16 @@
       "major_version": 1,
       "minor_version": 0
     },
-    "checkpoints": {
-      "major_sha256": "6ba650d7a497aec7b528f784d9e98c3b3ec50b1b5bf8e57e86ddd223c778bbf9",
-      "minor_sha256": "b6b01ab583748e30ec268dc7265013bdaddc4e47c781e458fc1f20d8fc651672",
-      "major_version": 1,
-      "minor_version": 0
-    },
     "model": {
-      "major_sha256": "e201c8f29366dfe1d5c7b107171f0df10d234c302a302934b24155027c1d308b",
-      "minor_sha256": "d2da9f253bf85def0c3349029ee836a07074500a19dc746bb93aec6a43e18fb8",
-      "major_version": 4,
-      "minor_version": 0
-    },
-    "replays": {
-      "major_sha256": "7c971b7087a05eb2d528c7fd9591408459f86e6156535758712165b8db94a5a5",
-      "minor_sha256": "b0fa8e43c556b4089a639bdc7f45f455299907f1f043ea11f5b954a893eb6464",
-      "major_version": 3,
+      "major_sha256": "9d934f21a310eba855de0790774f2e9f3b6d79cca82340758ae37508a27cdd30",
+      "minor_sha256": "6dddc7ed920c121280752a3c41bad4b9a4ec90c4d0e88547d138b7367cbd3cc3",
+      "major_version": 1,
       "minor_version": 0
     },
     "resources": {
-      "major_sha256": "a8f003cc0298e8b2eba0c45fb40883177e57ffea9586bb1b68ec868345d58647",
-      "minor_sha256": "d1f9454b6d646c800f16a65cfbdcdf8ea8741bb56c1cbce8d8ffbacdb4d5facd",
+      "major_sha256": "44b742aab01b1856bf0ab36e8b4cf42c74782dff9c021efa6c086ba6916aaeb6",
+      "minor_sha256": "7e7dabe3c280099d2597c82f2ee07f5cd0e3259f386145df450d5d1580d8aacb",
       "major_version": 1,
-      "minor_version": 1
-    },
-    "teams": {
-      "major_sha256": "85885b2d8481db81103b57d7a8829dc0ee6c2b26d341fcc55fe9072f6bd87a90",
-      "minor_sha256": "925f6215846af3685d9385cf38ea9be5837093af4860b4b9126936b5276baf58",
-      "major_version": 3,
       "minor_version": 0
     }
   },
@@ -104,12 +86,6 @@
       },
       "minor": {}
     },
-    "checkpoints": {
-      "major": {
-        "artifact_schema": "p0.policy_checkpoint.v4"
-      },
-      "minor": {}
-    },
     "model": {
       "major": {
         "event_raw_width": 128,
@@ -117,34 +93,17 @@
         "max_prior_games": 2,
         "observation_entity_count": 15,
         "observation_layout_sha256": "79171e049cd869a519cb1522b0ee71641f86c8c093dfc7dbd3a9e4871dafca20",
-        "observation_schema_version": 7,
         "owner_count": 3,
         "pokemon_count": 12,
         "pooled_event_count": 4,
         "raw_event_count": 4,
         "self_target_sentinel": -1,
-        "series_tokens_per_game": 4,
-        "structured_observation_abi": "structured-observation-layout-v2",
-        "tensor_abi": "champions-memory-channel-v2"
-      },
-      "minor": {}
-    },
-    "replays": {
-      "major": {
-        "compilation_semantics": "canonical_player_bo3_history.v1",
-        "compiler_version": 7,
-        "imputation_algorithm": "usage_prior_stat_point_imputation",
-        "imputation_version": 2,
-        "parser_version": 2,
-        "replay_ir_schema_version": 2,
-        "shard_artifact_schema": "p0.replay_shard.v5",
-        "split_artifact_schema": "p0.replay_split.v2"
+        "series_tokens_per_game": 4
       },
       "minor": {}
     },
     "resources": {
       "major": {
-        "resource_feature_abi": "champions-dex-features-v1",
         "vocabulary_sha256": "b8380f7f6324664087d88c9ab62a27d5185602d46ad001de05627a3a18f3e752"
       },
       "minor": {
@@ -154,14 +113,7 @@
         "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac",
         "spread_usage_sha256": "dd7336d665a33febee43bc6250c812400541b52eefc8a4ffbcaabd034b757ad3"
       }
-    },
-    "teams": {
-      "major": {
-        "corpus_manifest_schema": "p0.team_corpus.v2",
-        "stat_point_imputer_version": 2
-      },
-      "minor": {}
     }
   },
-  "global_sha256": "519c36ecf3976b84df6b3a47b637ab39278185fe3492a60fc9a66fc4dd3ed9d0"
+  "global_sha256": "54dfb2920ce86ee1a66be2d195f258a78cc2e11f30a47beb8197a7c002387f78"
 }

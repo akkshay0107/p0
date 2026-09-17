@@ -26,7 +26,6 @@ from p0.battle.legality import (
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     FORMAT,
-    active_global_contract,
     canonical_json_sha256,
     load_active_runtime_manifest,
     sha256_file,
@@ -57,9 +56,8 @@ from p0.replays.reconstruction.projection import (
 )
 from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import reduce_replay_state
-from p0.replays.schema import REPLAY_IR_SCHEMA_VERSION, DecisionType, LabelKind
+from p0.replays.schema import DecisionType, LabelKind
 from p0.replays.shards import (
-    BO3_COMPILATION_SEMANTICS,
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
     ShardIndexEntry,
@@ -71,11 +69,6 @@ from p0.runtime.process_context import PROCESS_CONTEXT
 from p0.teams.spread_usage import DEFAULT_SPREAD_TABLE_PATH
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
-_REPLAY_CONTRACT = active_global_contract().payload("replays", "major")
-REPLAY_PARSER_VERSION = _REPLAY_CONTRACT["parser_version"]
-REPLAY_COMPILER_VERSION = _REPLAY_CONTRACT["compiler_version"]
-IMPUTATION_ALGORITHM = _REPLAY_CONTRACT["imputation_algorithm"]
-IMPUTATION_VERSION = _REPLAY_CONTRACT["imputation_version"]
 
 _SUPPORTED_FORMATS = frozenset({FORMAT.battle_format, FORMAT.bo3_format})
 _WORKER_DEX: Mapping[str, Any] | None = None
@@ -182,17 +175,10 @@ def _build_configuration(
     external_rejections: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
-        "parser_version": REPLAY_PARSER_VERSION,
-        "replay_ir_version": REPLAY_IR_SCHEMA_VERSION,
-        "compiler_version": REPLAY_COMPILER_VERSION,
         "artifact_schema": SHARD_ARTIFACT_SCHEMA,
         "max_candidates": max_candidates,
-        "imputation": {
-            "algorithm": IMPUTATION_ALGORITHM,
-            "version": IMPUTATION_VERSION,
-            "table_sha256": sha256_file(DEFAULT_SPREAD_TABLE_PATH),
-        },
         "max_decisions_per_shard": max_decisions_per_shard,
+        "spread_table_sha256": sha256_file(DEFAULT_SPREAD_TABLE_PATH),
         "external_rejections": sorted(external_rejections or ()),
     }
 
@@ -214,7 +200,6 @@ def _dataset_hash(
             series_id: list(source_series[series_id]) for series_id in sorted(source_series)
         },
         "source_format_id": source_format_id,
-        "compilation_semantics": BO3_COMPILATION_SEMANTICS,
         "build_config": dict(build_config),
         "global_contract_sha256": runtime_hash,
     }

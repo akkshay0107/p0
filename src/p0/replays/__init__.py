@@ -14,7 +14,6 @@ from p0.replays.protocol import (
     parse_replay_payload,
 )
 from p0.replays.schema import (
-    REPLAY_IR_SCHEMA_VERSION,
     ActionEvidence,
     DecisionRecord,
     DecisionType,
@@ -35,7 +34,6 @@ from p0.replays.schema import (
 )
 
 __all__ = [
-    "REPLAY_IR_SCHEMA_VERSION",
     "ActionEvidence",
     "DecisionRecord",
     "DecisionType",

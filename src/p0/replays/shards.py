@@ -11,15 +11,10 @@ import torch
 from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
-    active_global_contract,
     validate_artifact_runtime_contract,
 )
-from p0.model.structured_observation import (
-    OBSERVATION_SCHEMA_VERSION,
-    StructuredObservation,
-)
+from p0.model.structured_observation import StructuredObservation
 from p0.replays.schema import (
-    REPLAY_IR_SCHEMA_VERSION,
     DecisionType,
     LabelKind,
     MaskProvenance,
@@ -28,12 +23,7 @@ from p0.replays.schema import (
     _require_iso_timestamp,
 )
 
-SHARD_ARTIFACT_SCHEMA = active_global_contract().payload("replays", "major")[
-    "shard_artifact_schema"
-]
-BO3_COMPILATION_SEMANTICS = active_global_contract().payload("replays", "major")[
-    "compilation_semantics"
-]
+SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v1"
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
 # T is the shard's decision count and C its total candidate count. Candidates
@@ -147,17 +137,13 @@ class ShardManifest:
     accepted_games: int
     rejected_games: int
     artifact_hashes: Mapping[str, str]
-    compilation_semantics: str = BO3_COMPILATION_SEMANTICS
     artifact_schema: str = SHARD_ARTIFACT_SCHEMA
-    observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
-    replay_ir_schema_version: int = REPLAY_IR_SCHEMA_VERSION
 
     _FIELDS = frozenset(
         {
             "global_contract_sha256",
             "dataset_hash",
             "source_format_id",
-            "compilation_semantics",
             "build_config",
             "raw_replays",
             "source_series",
@@ -169,8 +155,6 @@ class ShardManifest:
             "diagnostics",
             "created_at",
             "artifact_schema",
-            "observation_schema_version",
-            "replay_ir_schema_version",
         }
     )
 
@@ -180,19 +164,6 @@ class ShardManifest:
                 f"Unsupported shard artifact schema {self.artifact_schema!r}; "
                 f"expected {SHARD_ARTIFACT_SCHEMA}"
             )
-
-        for name, declared, expected in (
-            (
-                "observation_schema_version",
-                self.observation_schema_version,
-                OBSERVATION_SCHEMA_VERSION,
-            ),
-            ("replay_ir_schema_version", self.replay_ir_schema_version, REPLAY_IR_SCHEMA_VERSION),
-        ):
-            if declared != expected:
-                raise ValueError(
-                    f"ShardManifest.{name} {declared!r} does not match the active {expected}"
-                )
 
         if not _is_sha256(self.global_contract_sha256):
             raise ValueError(
@@ -204,9 +175,6 @@ class ShardManifest:
 
         if not self.source_format_id:
             raise ValueError("ShardManifest.source_format_id must be non-empty")
-
-        if self.compilation_semantics != BO3_COMPILATION_SEMANTICS:
-            raise ValueError(f"Unsupported compilation semantics {self.compilation_semantics!r}")
 
         if not isinstance(self.build_config, Mapping):
             raise ValueError("ShardManifest.build_config must be a mapping")
@@ -283,7 +251,6 @@ class ShardManifest:
             "global_contract_sha256": self.global_contract_sha256,
             "dataset_hash": self.dataset_hash,
             "source_format_id": self.source_format_id,
-            "compilation_semantics": self.compilation_semantics,
             "build_config": dict(self.build_config),
             "raw_replays": {
                 replay_id: self.raw_replays[replay_id] for replay_id in sorted(self.raw_replays)
@@ -299,8 +266,6 @@ class ShardManifest:
                 filename: self.artifact_hashes[filename]
                 for filename in sorted(self.artifact_hashes)
             },
-            "observation_schema_version": self.observation_schema_version,
-            "replay_ir_schema_version": self.replay_ir_schema_version,
             "shards": [entry.to_dict() for entry in self.shards],
             "diagnostics": {key: self.diagnostics[key] for key in sorted(self.diagnostics)},
             "created_at": self.created_at,
@@ -333,7 +298,6 @@ class ShardManifest:
             global_contract_sha256=str(value["global_contract_sha256"]),
             dataset_hash=str(value["dataset_hash"]),
             source_format_id=str(value["source_format_id"]),
-            compilation_semantics=str(value["compilation_semantics"]),
             build_config=dict(build_config),
             raw_replays={str(replay_id): str(digest) for replay_id, digest in raw_replays.items()},
             source_series={
@@ -346,8 +310,6 @@ class ShardManifest:
             artifact_hashes={
                 str(filename): str(digest) for filename, digest in artifact_hashes.items()
             },
-            observation_schema_version=int(value["observation_schema_version"]),
-            replay_ir_schema_version=int(value["replay_ir_schema_version"]),
             shards=tuple(ShardIndexEntry.from_dict(entry) for entry in value["shards"]),
             diagnostics={str(key): int(count) for key, count in diagnostics.items()},
             created_at=str(value["created_at"]),

@@ -11,7 +11,7 @@ from typing import Mapping, cast
 import orjson
 
 from p0.format_config import FORMAT
-from p0.teams.stat_points import STAT_POINT_IMPUTER_VERSION, StatPoints
+from p0.teams.stat_points import StatPoints
 
 
 def normalize_id(value: str) -> str:
@@ -175,7 +175,6 @@ class TeamRecord:
     spreads: tuple[StatPoints, ...]
     metadata: TeamMetadata
     spread_provenance: str = "imputed"
-    imputer_version: int = STAT_POINT_IMPUTER_VERSION
     validator_version: str = FORMAT.showdown_commit
 
     def __post_init__(self) -> None:
@@ -195,7 +194,6 @@ class TeamRecord:
             "spreads": [spread.as_dict() for _, spread in pairs],
             "metadata": self.metadata.to_dict(),
             "spread_provenance": self.spread_provenance,
-            "imputer_version": self.imputer_version,
             "validator_version": self.validator_version,
         }
 
@@ -206,7 +204,6 @@ class TeamRecord:
             "spreads",
             "metadata",
             "spread_provenance",
-            "imputer_version",
             "validator_version",
         }
         if set(value) != expected:
@@ -221,7 +218,6 @@ class TeamRecord:
                 spreads=spreads,
                 metadata=TeamMetadata.from_dict(cast(Mapping[str, object], value["metadata"])),
                 spread_provenance=str(value["spread_provenance"]),
-                imputer_version=int(cast(int, value["imputer_version"])),
                 validator_version=str(value["validator_version"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
