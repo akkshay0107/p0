@@ -5,12 +5,10 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
 from typing import Mapping, cast
 
 import orjson
 
-from p0.format_config import FORMAT
 from p0.teams.stat_points import StatPoints
 
 
@@ -112,70 +110,19 @@ class CanonicalTeam:
 
 @dataclass(frozen=True, slots=True)
 class TeamMetadata:
-    source_series: tuple[str, ...]
-    source_replays: tuple[str, ...]
-    first_seen: str
-    last_seen: str
     usage_count: int = 1
-    evidence_game: int = 0
-    evidence_event: int = 0
 
     def __post_init__(self) -> None:
-        if self.usage_count < 1 or self.evidence_game < 0 or self.evidence_event < 0:
-            raise ValueError("Usage count must be positive and evidence cutoff nonnegative")
-
-        for timestamp in (self.first_seen, self.last_seen):
-            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "source_series": list(self.source_series),
-            "source_replays": list(self.source_replays),
-            "first_seen": self.first_seen,
-            "last_seen": self.last_seen,
-            "usage_count": self.usage_count,
-            "evidence_game": self.evidence_game,
-            "evidence_event": self.evidence_event,
-        }
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, object]) -> TeamMetadata:
-        expected = {
-            "source_series",
-            "source_replays",
-            "first_seen",
-            "last_seen",
-            "usage_count",
-            "evidence_game",
-            "evidence_event",
-        }
-        if set(value) != expected:
-            raise ValueError("Invalid serialized team metadata fields")
-        try:
-            return cls(
-                source_series=tuple(
-                    str(item) for item in cast(list[object], value["source_series"])
-                ),
-                source_replays=tuple(
-                    str(item) for item in cast(list[object], value["source_replays"])
-                ),
-                first_seen=str(value["first_seen"]),
-                last_seen=str(value["last_seen"]),
-                usage_count=int(cast(int, value["usage_count"])),
-                evidence_game=int(cast(int, value["evidence_game"])),
-                evidence_event=int(cast(int, value["evidence_event"])),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Invalid serialized team metadata") from exc
+        if self.usage_count < 1:
+            raise ValueError("Usage count must be positive")
 
 
 @dataclass(frozen=True, slots=True)
 class TeamRecord:
     team: CanonicalTeam
     spreads: tuple[StatPoints, ...]
-    metadata: TeamMetadata
+    metadata: TeamMetadata = TeamMetadata()
     spread_provenance: str = "imputed"
-    validator_version: str = FORMAT.showdown_commit
 
     def __post_init__(self) -> None:
         if len(self.spreads) != len(self.team.members):
@@ -183,45 +130,6 @@ class TeamRecord:
 
         if self.spread_provenance != "imputed":
             raise ValueError("Reconstructed public teams must have spread_provenance='imputed'")
-
-    def to_dict(self) -> dict[str, object]:
-        pairs = sorted(
-            zip(self.team.members, self.spreads, strict=True),
-            key=lambda pair: normalize_id(pair[0].species),
-        )
-        return {
-            "team": CanonicalTeam(tuple(member for member, _ in pairs)).to_dict(),
-            "spreads": [spread.as_dict() for _, spread in pairs],
-            "metadata": self.metadata.to_dict(),
-            "spread_provenance": self.spread_provenance,
-            "validator_version": self.validator_version,
-        }
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, object]) -> TeamRecord:
-        expected = {
-            "team",
-            "spreads",
-            "metadata",
-            "spread_provenance",
-            "validator_version",
-        }
-        if set(value) != expected:
-            raise ValueError("Invalid serialized team record fields")
-        try:
-            spreads = tuple(
-                StatPoints.from_dict(cast(Mapping[str, int], spread))
-                for spread in cast(list[object], value["spreads"])
-            )
-            return cls(
-                team=CanonicalTeam.from_dict(cast(Mapping[str, object], value["team"])),
-                spreads=spreads,
-                metadata=TeamMetadata.from_dict(cast(Mapping[str, object], value["metadata"])),
-                spread_provenance=str(value["spread_provenance"]),
-                validator_version=str(value["validator_version"]),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Invalid serialized team record") from exc
 
 
 def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ...]:
@@ -248,17 +156,7 @@ def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ..
             continue
 
         metadata = TeamMetadata(
-            source_series=tuple(
-                sorted(set(previous.metadata.source_series + variant.metadata.source_series))
-            ),
-            source_replays=tuple(
-                sorted(set(previous.metadata.source_replays + variant.metadata.source_replays))
-            ),
-            first_seen=min(previous.metadata.first_seen, variant.metadata.first_seen),
-            last_seen=max(previous.metadata.last_seen, variant.metadata.last_seen),
             usage_count=previous.metadata.usage_count + variant.metadata.usage_count,
-            evidence_game=min(previous.metadata.evidence_game, variant.metadata.evidence_game),
-            evidence_event=min(previous.metadata.evidence_event, variant.metadata.evidence_event),
         )
         deduped[hash_key] = replace(previous, metadata=metadata)
 

@@ -19,7 +19,7 @@ from p0.teams.corpus_build import (
     build_corpus,
     write_corpus_manifest,
 )
-from p0.teams.factory import corpus_manifest_path
+from p0.teams.source import corpus_manifest_path
 from p0.teams.spread_usage import load_spread_table_file
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord, normalize_id
@@ -130,13 +130,7 @@ def _variants_from_showdown(
             spreads_list.append(estimate.points)
 
         spreads = tuple(spreads_list)
-        metadata = TeamMetadata(
-            source_series=(),
-            source_replays=(),
-            first_seen="2026-01-01T00:00:00Z",
-            last_seen="2026-01-01T00:00:00Z",
-            usage_count=usage,
-        )
+        metadata = TeamMetadata(usage_count=usage)
         variants.append(TeamRecord(team=team, spreads=spreads, metadata=metadata))
 
     return tuple(variants)
@@ -191,24 +185,6 @@ def _parser() -> argparse.ArgumentParser:
         default=FORMAT.battle_format,
         help="Battle format ID",
     )
-    build_parser.add_argument(
-        "--train-ratio",
-        type=float,
-        default=0.8,
-        help="Train split ratio",
-    )
-    build_parser.add_argument(
-        "--val-ratio",
-        type=float,
-        default=0.1,
-        help="Validation split ratio",
-    )
-    build_parser.add_argument(
-        "--test-ratio",
-        type=float,
-        default=0.1,
-        help="Test split ratio",
-    )
 
     audit_parser = subparsers.add_parser("audit")
     audit_parser.add_argument(
@@ -236,9 +212,6 @@ def main(argv: list[str] | None = None) -> None:
             validator=validate_many,
             global_contract_sha256=current_manifest().global_sha256,
             format_id=args.format_id,
-            ratio_train=args.train_ratio,
-            ratio_val=args.val_ratio,
-            ratio_test=args.test_ratio,
         )
         if not manifest.entries:
             raise ValueError(f"No admitted teams found in input path: {args.input}")

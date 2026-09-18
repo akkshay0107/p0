@@ -14,8 +14,7 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration, ServerC
 from p0.model.observation_builder import ObservationBuilder
 from p0.rl_player import DEFAULT_BATTLE_FORMAT, RLPlayer, load_player_policy
 from p0.runtime import poke_env_patches
-from p0.teams.factory import build_team_source
-from p0.teams.source import FileTeamSource
+from p0.teams.source import FileTeamSource, build_team_source
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.config import load_config
 

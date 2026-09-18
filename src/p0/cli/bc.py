@@ -63,9 +63,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "train":
         with cancellation_signals() as cancel_requested:
-            result = train_bc(
-                config, overfit=False, device=args.device, cancel_requested=cancel_requested
-            )
+            result = train_bc(config, device=args.device, cancel_requested=cancel_requested)
     else:
         result = evaluate_bc(
             config,

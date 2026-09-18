@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
-from enum import IntEnum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -21,14 +20,6 @@ from p0.format_config import (
 )
 
 CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v1"
-
-
-class CorpusSplit(IntEnum):
-    UNSPECIFIED = 0
-    TRAIN = 1
-    VALIDATION = 2
-    TEST = 3
-
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -56,7 +47,6 @@ class CorpusEntry:
     canonical_hash: str
     packed: str
     packed_sha256: str
-    split: CorpusSplit
     usage_count: int
     spread_provenance: str = "imputed"
 
@@ -65,7 +55,6 @@ class CorpusEntry:
             "canonical_hash",
             "packed",
             "packed_sha256",
-            "split",
             "usage_count",
             "spread_provenance",
         }
@@ -85,9 +74,6 @@ class CorpusEntry:
                 f"declared={self.packed_sha256}, actual={actual}"
             )
 
-        if self.split is CorpusSplit.UNSPECIFIED:
-            raise ValueError("CorpusEntry.split must be assigned before admission")
-
         if type(self.usage_count) is not int or self.usage_count < 1:
             raise ValueError("CorpusEntry.usage_count must be a positive integer")
 
@@ -99,7 +85,6 @@ class CorpusEntry:
             "canonical_hash": self.canonical_hash,
             "packed": self.packed,
             "packed_sha256": self.packed_sha256,
-            "split": int(self.split),
             "usage_count": self.usage_count,
             "spread_provenance": self.spread_provenance,
         }
@@ -111,7 +96,6 @@ class CorpusEntry:
             canonical_hash=str(value["canonical_hash"]),
             packed=str(value["packed"]),
             packed_sha256=str(value["packed_sha256"]),
-            split=CorpusSplit(value["split"]),
             usage_count=int(value["usage_count"]),
             spread_provenance=str(value["spread_provenance"]),
         )
@@ -219,23 +203,3 @@ def load_corpus_manifest(
     """Validate a corpus manifest against the active runtime before use."""
     validate_artifact_runtime_contract(value, manifest_path)
     return TeamCorpusManifest.from_dict(value)
-
-
-@dataclass(frozen=True, slots=True)
-class CorpusSourceSpec:
-    """Pinned constructor input for a corpus-backed TeamSource."""
-
-    corpus_path: str
-    corpus_hash: str
-    format_id: str
-    split: CorpusSplit
-
-    def __post_init__(self) -> None:
-        if not self.corpus_path or not self.format_id:
-            raise ValueError("CorpusSourceSpec requires corpus_path and format_id")
-
-        if not _is_sha256(self.corpus_hash):
-            raise ValueError("CorpusSourceSpec.corpus_hash must be a lowercase SHA-256 digest")
-
-        if self.split is CorpusSplit.UNSPECIFIED:
-            raise ValueError("CorpusSourceSpec.split must be specified")

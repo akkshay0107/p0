@@ -28,12 +28,10 @@ def _training_metadata(
     *,
     dataset_hash: str,
     split_manifest: Path,
-    overfit: bool,
 ) -> dict[str, Any]:
     trainer_config = asdict(config)
     for name in ("epochs", "shard_manifest", "split_manifest", "output_dir", "resume_checkpoint"):
         del trainer_config[name]
-    trainer_config["overfit"] = overfit
     return {
         "dataset_hash": dataset_hash,
         "split_manifest_sha256": sha256_file(split_manifest),
@@ -100,14 +98,6 @@ def _restore_best_policy(
     )
 
 
-def _overfit_succeeded(metrics: BCEvaluationMetrics | None, initial_nll: float) -> bool:
-    return bool(
-        metrics is not None
-        and metrics.overall_nll <= initial_nll * 0.2
-        and metrics.exact_joint_accuracy >= 0.9
-    )
-
-
 def _reported_path(path: Path | None) -> str | None:
     if path is None or not path.is_file():
         return None
@@ -117,7 +107,6 @@ def _reported_path(path: Path | None) -> str | None:
 def train_bc(
     config: BCConfig,
     *,
-    overfit: bool = False,
     device: torch.device | str | None = None,
     cancel_requested: Callable[[], bool] = lambda: False,
 ) -> dict[str, Any]:
@@ -126,7 +115,6 @@ def train_bc(
 
     Arguments:
         config: Behavior-cloning dataset, optimizer, and output configuration.
-        overfit: Use the bounded overfit mode intended for data-pipeline checks.
         device: Device override; the runtime default is used when omitted.
         cancel_requested: Callback polled between training units.
 
@@ -153,7 +141,6 @@ def train_bc(
         config,
         dataset_hash=shard_manifest.dataset_hash,
         split_manifest=config.split_manifest,
-        overfit=overfit,
     )
     with training_run(
         store,
@@ -190,10 +177,13 @@ def train_bc(
             cancel_requested=cancel_requested,
         )
         if files.source is not None:
+            source_metadata = store.load_metadata(files.source)
+            if source_metadata.get("trainer_config", {}).get("overfit") is True:
+                raise ValueError("Cannot resume an overfit training run")
             resume_metadata = {
                 key: value for key, value in metadata.items() if key != "epoch_budget"
             }
-            selection_state = dict(store.load_metadata(files.source).get("selection_state", {}))
+            selection_state = dict(source_metadata.get("selection_state", {}))
             completed_epoch = store.load_episode(files.source)
             _restore_best_policy(files, selection_state, completed_epoch, resume_metadata)
             # Restore randomness after constructing the selected-policy validation model.
@@ -220,19 +210,6 @@ def train_bc(
             raise RuntimeError(
                 "Initial BC training evaluation contains invalid predictions or values"
             )
-        if overfit and initial_training.exact_count == 0:
-            raise RuntimeError("BC overfit acceptance requires at least one exact policy label")
-        saved_initial_nll = selection_state.get("overfit_initial_nll")
-        initial_nll = (
-            float(saved_initial_nll)
-            if overfit
-            and isinstance(saved_initial_nll, (int, float))
-            and math.isfinite(float(saved_initial_nll))
-            else initial_training.overall_nll
-        )
-        final_training_evaluation: BCEvaluationMetrics | None = (
-            initial_training if overfit else None
-        )
         last_training_update: dict[str, float | int] | None = None
         final_validation: BCEvaluationMetrics | None = None
         files.start(completed_epoch)
@@ -251,10 +228,6 @@ def train_bc(
             validation = trainer.evaluate(validation_dataset)
             if _validation_is_failed(validation, require_policy_support=True):
                 raise RuntimeError(f"BC validation failed at epoch {epoch}")
-            if overfit:
-                final_training_evaluation = trainer.evaluate(train_dataset)
-                if _validation_is_failed(final_training_evaluation):
-                    raise RuntimeError(f"BC training evaluation failed at epoch {epoch}")
             last_training_update = training
             final_validation = validation
             if validation.overall_nll < selection_state.get("best_validation_nll", float("inf")):
@@ -271,17 +244,12 @@ def train_bc(
                     "best_validation_nll": validation.overall_nll,
                     "selected_epoch": epoch,
                 }
-            selection_state["overfit_initial_nll"] = initial_nll if overfit else None
             validation_values = validation.to_dict()
             record = {
                 "epoch": epoch,
                 "dataset_hash": shard_manifest.dataset_hash,
                 "train_update": training,
-                "training": (
-                    training
-                    if final_training_evaluation is None
-                    else final_training_evaluation.to_dict()
-                ),
+                "training": training,
                 "validation": validation_values,
             }
             files.record(
@@ -301,34 +269,19 @@ def train_bc(
             )
             latest_artifact = latest_path.resolve()
             completed_epoch = epoch
-            if overfit and _overfit_succeeded(final_training_evaluation, initial_nll):
-                break
-        overfit_passed = (
-            _overfit_succeeded(final_training_evaluation, initial_nll) if overfit else None
-        )
         result = {
             "dataset_hash": shard_manifest.dataset_hash,
             "global_hash": shard_manifest.global_contract_sha256,
             "completed_epoch": completed_epoch,
             "cancelled": cancelled,
-            "overfit_passed": overfit_passed,
             "initial_training": initial_training.to_dict(),
-            "final_training": (
-                last_training_update
-                if final_training_evaluation is None
-                else final_training_evaluation.to_dict()
-            ),
+            "final_training": ({} if last_training_update is None else last_training_update),
             "final_validation": (None if final_validation is None else final_validation.to_dict()),
             "latest_training_checkpoint": _reported_path(latest_artifact),
             "best_policy_checkpoint": _reported_path(best_path),
             "metrics_path": _reported_path(metrics_path),
         }
         atomic_json_save(dataset_output / "bc-result.json", result)
-        if overfit and not overfit_passed and not cancelled:
-            raise RuntimeError(
-                "BC overfit acceptance failed: training NLL did not fall by 80% "
-                "with at least 90% exact accuracy"
-            )
         return result
 
 

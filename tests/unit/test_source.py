@@ -1,29 +1,35 @@
-"""Tests for team sources and sampling."""
+"""Tests for team sources, sampling, and pool resolution."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import random
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from p0.cli.corpus import main as corpus_main
 from p0.format_config import FORMAT, current_manifest
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
-    CorpusSourceSpec,
-    CorpusSplit,
     TeamCorpusManifest,
     corpus_content_hash,
 )
-from p0.teams.corpus_source import CorpusTeamSource
-from p0.teams.source import ValidatedTeam
+from p0.teams.source import (
+    CorpusTeamSource,
+    FileTeamSource,
+    FixedTeamSource,
+    ValidatedTeam,
+    build_team_source,
+)
 from p0.teams.spread_usage import (
     SPREAD_USAGE_SCHEMA,
 )
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 def vocabulary() -> dict[str, dict[str, int]]:
@@ -81,7 +87,6 @@ def vocabulary() -> dict[str, dict[str, int]]:
 def _make_entry(
     index: int,
     canonical_index: int | None = None,
-    split: CorpusSplit = CorpusSplit.TRAIN,
     usage_count: int = 10,
 ) -> CorpusEntry:
     if canonical_index is None:
@@ -94,7 +99,6 @@ def _make_entry(
         canonical_hash=canonical_hash,
         packed=packed,
         packed_sha256=packed_sha256,
-        split=split,
         usage_count=usage_count,
         spread_provenance="imputed",
     )
@@ -150,7 +154,6 @@ def _corpus_entry(packed: str = "packed-team") -> CorpusEntry:
         canonical_hash=hashlib.sha256(packed.encode()).hexdigest(),
         packed=packed,
         packed_sha256=hashlib.sha256(packed.encode()).hexdigest(),
-        split=CorpusSplit.TRAIN,
         usage_count=3,
     )
 
@@ -172,13 +175,7 @@ class TestTeamSources:
         """Verify CorpusTeamSource samples legal teams and provides accurate metadata descriptions."""
         entries = tuple(_make_entry(i) for i in range(5))
         path, manifest = _write_manifest(tmp_path, entries)
-        spec = CorpusSourceSpec(
-            corpus_path=str(path),
-            corpus_hash=manifest.corpus_hash,
-            format_id=FORMAT.battle_format,
-            split=CorpusSplit.TRAIN,
-        )
-        source = CorpusTeamSource(spec)
+        source = CorpusTeamSource.from_path(path)
         rng = random.Random(42)
         sampled = source.sample(rng)
         assert isinstance(sampled, ValidatedTeam)
@@ -192,43 +189,15 @@ class TestTeamSources:
         assert isinstance(hashes, tuple)
         assert len(hashes) == 5
 
-    def test_corpus_source_validates_spec(self, tmp_path: Path) -> None:
-        """Verify CorpusTeamSource rejects mismatched corpus hashes and format IDs."""
-        entries = tuple(_make_entry(i) for i in range(3))
-        path, manifest = _write_manifest(tmp_path, entries)
+    def test_corpus_source_validates_path(self, tmp_path: Path) -> None:
+        """Verify CorpusTeamSource rejects nonexistent paths and empty manifests."""
+        nonexistent = tmp_path / "nonexistent.json"
+        with pytest.raises(FileNotFoundError):
+            CorpusTeamSource.from_path(nonexistent)
 
-        # Wrong corpus_hash raises ValueError
-        bad_spec = CorpusSourceSpec(
-            corpus_path=str(path),
-            corpus_hash="0" * 64,
-            format_id=FORMAT.battle_format,
-            split=CorpusSplit.TRAIN,
-        )
-        with pytest.raises(ValueError, match="does not match"):
-            CorpusTeamSource(bad_spec)
-
-        # Wrong format_id raises ValueError
-        bad_format = CorpusSourceSpec(
-            corpus_path=str(path),
-            corpus_hash=manifest.corpus_hash,
-            format_id="wrong-format",
-            split=CorpusSplit.TRAIN,
-        )
-        with pytest.raises(ValueError, match="format"):
-            CorpusTeamSource(bad_format)
-
-    def test_corpus_source_rejects_empty_filtered_pool(self, tmp_path: Path) -> None:
-        """Verify CorpusTeamSource raises ValueError when split filter produces 0 available entries."""
-        entries = tuple(_make_entry(i, split=CorpusSplit.TRAIN) for i in range(3))
-        path, manifest = _write_manifest(tmp_path, entries)
-        spec = CorpusSourceSpec(
-            corpus_path=str(path),
-            corpus_hash=manifest.corpus_hash,
-            format_id=FORMAT.battle_format,
-            split=CorpusSplit.TEST,
-        )
-        with pytest.raises(ValueError, match="No corpus entries match"):
-            CorpusTeamSource(spec)
+        path, _ = _write_manifest(tmp_path, ())
+        with pytest.raises(ValueError, match="no entries"):
+            CorpusTeamSource.from_path(path)
 
     def test_uniform_canonical_sampling(self, tmp_path: Path) -> None:
         """Verify uniform canonical sampling equalizes archetype probabilities regardless of variant counts per archetype."""
@@ -238,13 +207,7 @@ class TestTeamSources:
             _make_entry(i, canonical_index=2, usage_count=100) for i in range(91, 101)
         )
         path, manifest = _write_manifest(tmp_path, entries_1 + entries_2)
-        spec = CorpusSourceSpec(
-            corpus_path=str(path),
-            corpus_hash=manifest.corpus_hash,
-            format_id=FORMAT.battle_format,
-            split=CorpusSplit.TRAIN,
-        )
-        source = CorpusTeamSource(spec)
+        source = CorpusTeamSource.from_path(path)
         rng = random.Random(200)
         canonical_counts: dict[str, int] = {}
         for _ in range(600):
@@ -262,13 +225,7 @@ class TestTeamSources:
         e1 = _make_entry(1, canonical_index=1, usage_count=100)
         e2 = _make_entry(2, canonical_index=2, usage_count=100)
         path, manifest = _write_manifest(tmp_path, (e1, e2))
-        spec = CorpusSourceSpec(
-            corpus_path=str(path),
-            corpus_hash=manifest.corpus_hash,
-            format_id=FORMAT.battle_format,
-            split=CorpusSplit.TRAIN,
-        )
-        source = CorpusTeamSource(spec)
+        source = CorpusTeamSource.from_path(path)
         assert source.describe()["pool_size"] == 2
         rng = random.Random(700)
         assert source.sample(rng) is not None
@@ -277,3 +234,92 @@ class TestTeamSources:
         """Verify ValidatedTeam verifies SHA-256 hash length and formatting."""
         with pytest.raises(ValueError, match="SHA-256"):
             ValidatedTeam("packed", "short")
+
+    def test_fixed_team_source(self) -> None:
+        team = ValidatedTeam.from_showdown(DEFAULT_TEST_TEAM)
+        source = FixedTeamSource(team)
+        rng = random.Random(0)
+        assert source.sample(rng) == team
+        assert source.describe()["kind"] == "fixed"
+
+
+class TestBuildTeamSource:
+    def test_resolves_corpus_manifest(self, tmp_path: Path) -> None:
+        path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+        manifest_path = tmp_path / "corpus_manifest.json"
+        manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+
+        source = build_team_source(manifest_path)
+        assert isinstance(source, CorpusTeamSource)
+        assert source.describe()["kind"] == "corpus"
+
+    def test_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
+        path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+        source = build_team_source(path, expected_format_id=FORMAT.bo3_format)
+        assert isinstance(source, CorpusTeamSource)
+        assert source.describe()["format_id"] == manifest.format_id
+
+    def test_rejects_incompatible_manifest_format(self, tmp_path: Path) -> None:
+        path, manifest = _write_manifest(tmp_path, (_make_entry(1),))
+        incompatible = replace(manifest, format_id="unsupported-format")
+        path.write_text(json.dumps(incompatible.to_dict()), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Corpus format mismatch"):
+            build_team_source(path, expected_format_id=FORMAT.bo3_format)
+
+    def test_falls_back_to_file_source(self, tmp_path: Path) -> None:
+        pool_dir = tmp_path / "pool"
+        pool_dir.mkdir()
+        team_text = "\n\n".join(
+            f"Pikachu{i} @ Light Ball\nAbility: Static\nJolly Nature\n- Fake Out\n- Protect\n- Thunderbolt\n- Electroweb"
+            for i in range(1, 7)
+        )
+        (pool_dir / "team.txt").write_text(team_text, encoding="utf-8")
+        source = build_team_source(pool_dir)
+        assert isinstance(source, FileTeamSource)
+
+    def test_rejects_invalid_manifest(self, tmp_path: Path) -> None:
+        pool_dir = tmp_path / "pool"
+        pool_dir.mkdir()
+        (pool_dir / "corpus_manifest.json").write_text("{}", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Invalid corpus manifest"):
+            build_team_source(pool_dir)
+
+
+class TestCorpusCLI:
+    def test_cli_build_and_audit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        input_dir = tmp_path / "inputs"
+        input_dir.mkdir()
+        team_text_1 = DEFAULT_TEST_TEAM
+        team_text_2 = DEFAULT_TEST_TEAM.replace("Pikachu @ Light Ball", "Raichu @ Light Ball", 1)
+        (input_dir / "v1.txt").write_text(team_text_1, encoding="utf-8")
+        (input_dir / "v2.txt").write_text(team_text_2, encoding="utf-8")
+
+        all_dir = tmp_path / "pools" / "all"
+
+        corpus_main(
+            [
+                "build",
+                "--input",
+                str(input_dir),
+                "--output-dir",
+                str(all_dir),
+                "--format-id",
+                FORMAT.battle_format,
+            ]
+        )
+
+        assert (all_dir / "corpus_manifest.json").is_file()
+
+        captured = capsys.readouterr()
+        audit_data = json.loads(captured.out.split("\n")[-2]) if captured.out.strip() else {}
+        assert audit_data["admitted_count"] == 2
+        assert audit_data["rejected_count"] == 0
+
+        corpus_main(["audit", "--path", str(all_dir)])
+        audit_captured = capsys.readouterr()
+        re_audit_data = (
+            json.loads(audit_captured.out.split("\n")[-2]) if audit_captured.out.strip() else {}
+        )
+        assert re_audit_data["admitted_count"] == 2

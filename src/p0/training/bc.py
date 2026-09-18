@@ -114,6 +114,25 @@ def _discounted_outcome_targets(
     return torch.pow(gamma, exponent) * outcome
 
 
+def _prepare_value_targets(
+    batch: BCDecisionBatch,
+    device: torch.device,
+    gamma: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Prepare discounted outcome targets and value validity mask on device."""
+    outcome = batch.outcome.to(device=device, dtype=torch.float32)
+    decision_index = batch.decision_index.to(device)
+    game_length = batch.game_length.to(device)
+    value_mask = batch.outcome_valid.to(device)
+    value_targets = _discounted_outcome_targets(
+        outcome,
+        decision_index,
+        game_length,
+        gamma,
+    )
+    return value_targets, value_mask
+
+
 class BCTrainer:
     """Train a policy on complete games with gathered immutable history."""
 
@@ -361,16 +380,7 @@ class BCTrainer:
         value_predictions = value_predictions.float()
         marginal_log_probs = _ragged_logsumexp(log_probs, candidate_offsets)
         policy_sum, batch_policy_weight = _policy_loss_sum(marginal_log_probs, loss_mask)
-        outcome = batch.outcome.to(device=self.device, dtype=torch.float32)
-        decision_index = batch.decision_index.to(self.device)
-        game_length = batch.game_length.to(self.device)
-        value_mask = batch.outcome_valid.to(self.device)
-        value_targets = _discounted_outcome_targets(
-            outcome,
-            decision_index,
-            game_length,
-            self._gamma,
-        )
+        value_targets, value_mask = _prepare_value_targets(batch, self.device, self._gamma)
         value_error = value_predictions - value_targets
         batch_value_count = int(batch.outcome_valid.sum())
         value_sum = (
@@ -431,16 +441,7 @@ class BCTrainer:
                     action_mask,
                     encoded.numerical,
                 )
-                outcome = batch.outcome.to(device=self.device, dtype=torch.float32)
-                decision_index = batch.decision_index.to(self.device)
-                game_length = batch.game_length.to(self.device)
-                value_mask = batch.outcome_valid.to(self.device)
-                value_targets = _discounted_outcome_targets(
-                    outcome,
-                    decision_index,
-                    game_length,
-                    self._gamma,
-                )
+                value_targets, value_mask = _prepare_value_targets(batch, self.device, self._gamma)
                 masks = tuple(mask.to(self.device) for mask in validated_masks)
                 marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
                 greedy = self.policy.act(prepared, action_mask, deterministic=True)

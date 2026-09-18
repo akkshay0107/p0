@@ -24,9 +24,8 @@ from p0.format_config import FORMAT, current_manifest
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.teams.corpus import CorpusEntry, CorpusSplit, TeamCorpusManifest, corpus_content_hash
-from p0.teams.corpus_source import CorpusTeamSource
-from p0.teams.source import FixedTeamSource
+from p0.teams.corpus import CorpusEntry, TeamCorpusManifest, corpus_content_hash
+from p0.teams.source import CorpusTeamSource, FixedTeamSource
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
@@ -40,15 +39,13 @@ class TestEvaluationHarness:
             harness.build_team_sources()
 
     def test_evaluation_harness_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
-        entries = tuple(
+        entries = (
             CorpusEntry(
-                canonical_hash=hashlib.sha256(f"canonical-{split}".encode()).hexdigest(),
-                packed=f"packed-team-{split}",
-                packed_sha256=hashlib.sha256(f"packed-team-{split}".encode()).hexdigest(),
-                split=split,
+                canonical_hash=hashlib.sha256(b"canonical-1").hexdigest(),
+                packed="packed-team-1",
+                packed_sha256=hashlib.sha256(b"packed-team-1").hexdigest(),
                 usage_count=1,
-            )
-            for split in (CorpusSplit.TRAIN, CorpusSplit.VALIDATION, CorpusSplit.TEST)
+            ),
         )
         manifest = TeamCorpusManifest(
             global_contract_sha256=current_manifest().global_sha256,

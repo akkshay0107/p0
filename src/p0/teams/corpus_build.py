@@ -1,9 +1,8 @@
-"""Build, split, validate, and audit the immutable team corpus."""
+"""Build, validate, and audit the immutable team corpus."""
 
 from __future__ import annotations
 
 import hashlib
-import math
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +15,6 @@ from p0.persistence import atomic_json_save
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
-    CorpusSplit,
     TeamCorpusManifest,
     corpus_content_hash,
 )
@@ -25,106 +23,18 @@ from p0.teams.team import TeamRecord, deduplicate_variants
 from p0.teams.validation import AdmissionResult, validate_many
 
 
-def _validate_ratios(ratio_train: float, ratio_val: float, ratio_test: float) -> None:
-    ratios = (ratio_train, ratio_val, ratio_test)
-    if any(not math.isfinite(value) or value < 0 for value in ratios):
-        raise ValueError("Corpus split ratios must be finite and non-negative")
-    if not math.isclose(sum(ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
-        raise ValueError("Corpus split ratios must sum to one")
-
-
-def _split_for_key(
-    seed_key: str,
-    ratio_train: float,
-    ratio_val: float,
-    ratio_test: float,
-) -> CorpusSplit:
-    _validate_ratios(ratio_train, ratio_val, ratio_test)
-    digest = hashlib.sha256(seed_key.encode("utf-8")).hexdigest()
-    bucket = int(digest[:8], 16) % 10000
-    train_cutoff = round(ratio_train * 10000)
-    val_cutoff = train_cutoff + round(ratio_val * 10000)
-    if bucket < train_cutoff:
-        return CorpusSplit.TRAIN
-    if bucket < val_cutoff:
-        return CorpusSplit.VALIDATION
-    return CorpusSplit.TEST
-
-
-def _component_splits(
-    variants: Sequence[TeamRecord],
+def audit_corpus(
+    manifest: TeamCorpusManifest,
     *,
-    ratio_train: float,
-    ratio_val: float,
-    ratio_test: float,
-) -> tuple[CorpusSplit, ...]:
-    """Assign every connected source-series component one corpus split."""
-    _validate_ratios(ratio_train, ratio_val, ratio_test)
-
-    parents: dict[str, str] = {}
-
-    def find(value: str) -> str:
-        parent = parents.setdefault(value, value)
-        while parents[parent] != parent:
-            parents[parent] = parents[parents[parent]]
-            parent = parents[parent]
-        return parent
-
-    def union(first: str, second: str) -> None:
-        first_root, second_root = find(first), find(second)
-        if first_root != second_root:
-            parents[second_root] = first_root
-
-    for variant in variants:
-        series = variant.metadata.source_series
-        if series:
-            first = f"s:{series[0]}"
-            find(first)
-            for current in series[1:]:
-                union(first, f"s:{current}")
-
-    component_members: dict[str, list[int]] = {}
-    for index, variant in enumerate(variants):
-        if variant.metadata.source_series:
-            root = find(f"s:{variant.metadata.source_series[0]}")
-        else:
-            root = f"r:{variant.team.team_hash}"
-        component_members.setdefault(root, []).append(index)
-
-    component_assignments: dict[str, CorpusSplit] = {}
-    for root, indexes in component_members.items():
-        source_series = sorted(
-            series for index in indexes for series in variants[index].metadata.source_series
-        )
-        seed_key = ",".join(dict.fromkeys(source_series)) or variants[indexes[0]].team.team_hash
-        component_assignments[root] = _split_for_key(
-            seed_key,
-            ratio_train,
-            ratio_val,
-            ratio_test,
-        )
-
-    return tuple(
-        component_assignments[
-            find(f"s:{variant.metadata.source_series[0]}")
-            if variant.metadata.source_series
-            else f"r:{variant.team.team_hash}"
-        ]
-        for variant in variants
-    )
-
-
-def audit_corpus(manifest: TeamCorpusManifest) -> dict[str, Any]:
+    total_candidates: int | None = None,
+    rejections_by_reason: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """Compute exact content-coverage metrics across all entries in a manifest."""
     species_set: set[str] = set()
     move_set: set[str] = set()
     item_set: set[str] = set()
-    split_counts: dict[str, int] = {}
 
     for entry in manifest.entries:
-        split_name = entry.split.name
-        split_counts[split_name] = split_counts.get(split_name, 0) + 1
-
         parts = entry.packed.split("]")
         for part in parts:
             if not part:
@@ -141,15 +51,16 @@ def audit_corpus(manifest: TeamCorpusManifest) -> dict[str, Any]:
                     if move:
                         move_set.add(PokemonTokenizer.normalize_id(move))
 
+    admitted = len(manifest.entries)
+    total = admitted if total_candidates is None else total_candidates
     return {
-        "total_candidates": len(manifest.entries),
-        "admitted_count": len(manifest.entries),
-        "rejected_count": 0,
-        "rejections_by_reason": {},
+        "total_candidates": total,
+        "admitted_count": admitted,
+        "rejected_count": total - admitted,
+        "rejections_by_reason": dict(rejections_by_reason or {}),
         "species_coverage": tuple(sorted(species_set)),
         "move_coverage": tuple(sorted(move_set)),
         "item_coverage": tuple(sorted(item_set)),
-        "split_counts": split_counts,
     }
 
 
@@ -191,9 +102,6 @@ def build_corpus(
     validator: Callable[..., Sequence[AdmissionResult]] = validate_many,
     global_contract_sha256: str = "",
     format_id: str = FORMAT.battle_format,
-    ratio_train: float = 0.8,
-    ratio_val: float = 0.1,
-    ratio_test: float = 0.1,
     created_at: str | None = None,
 ) -> tuple[TeamCorpusManifest, dict[str, Any]]:
     """
@@ -205,9 +113,6 @@ def build_corpus(
         validator: Callable that validates the deduplicated candidates.
         global_contract_sha256: Global major-contract identity recorded in the manifest.
         format_id: Battle format associated with the corpus.
-        ratio_train: Fraction assigned to the training split.
-        ratio_val: Fraction assigned to the validation split.
-        ratio_test: Fraction assigned to the test split.
         created_at: Optional manifest timestamp.
 
     Returns:
@@ -226,12 +131,6 @@ def build_corpus(
     entries: list[CorpusEntry] = []
     rejections: dict[str, int] = {}
 
-    species_set: set[str] = set()
-    move_set: set[str] = set()
-    item_set: set[str] = set()
-    split_counts: dict[str, int] = {}
-
-    admitted: list[tuple[TeamRecord, AdmissionResult]] = []
     for variant, result in zip(deduped, validation_results, strict=True):
         if not result.valid or not result.packed_team:
             reason = "showdown_invalid"
@@ -250,15 +149,6 @@ def build_corpus(
             rejections[spread_reason] = rejections.get(spread_reason, 0) + 1
             continue
 
-        admitted.append((variant, result))
-
-    splits = _component_splits(
-        tuple(variant for variant, _ in admitted),
-        ratio_train=ratio_train,
-        ratio_val=ratio_val,
-        ratio_test=ratio_test,
-    )
-    for (variant, result), split in zip(admitted, splits, strict=True):
         packed = result.packed_team
         if not isinstance(packed, str):
             raise RuntimeError("Admitted team is missing its packed representation")
@@ -269,7 +159,6 @@ def build_corpus(
                 canonical_hash=variant.team.team_hash,
                 packed=packed,
                 packed_sha256=packed_sha256,
-                split=split,
                 usage_count=variant.metadata.usage_count,
                 spread_provenance=variant.spread_provenance,
             )
@@ -279,15 +168,6 @@ def build_corpus(
             continue
 
         entries.append(entry)
-        split_name = split.name
-        split_counts[split_name] = split_counts.get(split_name, 0) + 1
-
-        for member in variant.team.members:
-            species_set.add(PokemonTokenizer.normalize_id(member.species))
-            if member.item:
-                item_set.add(PokemonTokenizer.normalize_id(member.item))
-            for move in member.moves:
-                move_set.add(PokemonTokenizer.normalize_id(move))
 
     if created_at is None:
         created_at = datetime.now(timezone.utc).isoformat()
@@ -309,17 +189,11 @@ def build_corpus(
         },
     )
 
-    audit = {
-        "total_candidates": len(deduped),
-        "admitted_count": len(entries),
-        "rejected_count": len(deduped) - len(entries),
-        "rejections_by_reason": rejections,
-        "species_coverage": tuple(sorted(species_set)),
-        "move_coverage": tuple(sorted(move_set)),
-        "item_coverage": tuple(sorted(item_set)),
-        "split_counts": split_counts,
-    }
-
+    audit = audit_corpus(
+        manifest,
+        total_candidates=len(deduped),
+        rejections_by_reason=rejections,
+    )
     return manifest, audit
 
 

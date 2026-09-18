@@ -18,7 +18,7 @@ from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest, write_split_manifest
-from p0.teams.factory import build_team_source
+from p0.teams.source import build_team_source
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import TrainingConfig, load_config
 from p0.training.files import training_run
@@ -101,7 +101,7 @@ class TestExportTraining:
             checkpoint,
             checkpoint.parent,
             trainer_kind="bc",
-            settings={"gamma": 0.99, "value_coef": 0.5, "overfit": False},
+            settings={"gamma": 0.99, "value_coef": 0.5},
         ) as run:
             run.metadata["inputs"] = {
                 "shard_manifest": str(built.manifest_path),

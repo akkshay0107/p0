@@ -6,7 +6,6 @@ import pytest
 
 from p0.format_config import FORMAT
 from p0.teams.validation import (
-    PersistentShowdownValidator,
     showdown_payload,
     validate_many_batched,
 )
@@ -63,30 +62,3 @@ class TestTeams:
         assert payload["format"] == FORMAT.bo3_format
         assert len(payload["team"]) == 6
         assert {"species", "moves", "evs", "ivs"} <= payload["team"][0].keys()
-
-    @pytest.mark.stress
-    def test_persistent_validator_handles_repeated_batches_and_closes_worker(
-        self, showdown_assets
-    ) -> None:
-        """Stress the persistent real Showdown validator across full and partial batches."""
-        del showdown_assets
-        batch_size = stress_count("P0_STRESS_PERSISTENT_TEAM_BATCH_SIZE", 32)
-        count = stress_count("P0_STRESS_PERSISTENT_TEAM_VARIANTS", 512)
-        if count % batch_size == 0:
-            count += 1
-        rng = stress_rng()
-        variants = tuple(
-            stress_random_team_record(rng, label=f"persistent-stress-{index}")
-            for index in range(count)
-        )
-
-        with PersistentShowdownValidator(format_id=FORMAT.bo3_format) as validator:
-            results = validator.validate_many(variants, batch_size=batch_size)
-
-        assert len(results) == count
-        assert [result.team_hash for result in results] == [
-            variant.team.team_hash for variant in variants
-        ]
-        assert all(result.valid for result in results)
-        with pytest.raises(RuntimeError, match="process is not open"):
-            validator.validate_many(variants[:1])

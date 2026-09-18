@@ -17,18 +17,10 @@ from p0.evaluation.harness import EvaluationHarness, MatchupResult
 from p0.format_config import load_active_global_contract
 from p0.persistence import atomic_json_save
 from p0.runtime.showdown import start_showdown_servers
-from p0.teams.corpus import CorpusSplit
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE
 from p0.training.config import load_config
 
 logger = logging.getLogger("p0.cli.eval")
-
-_VALID_SPLITS = {
-    "train": CorpusSplit.TRAIN,
-    "val": CorpusSplit.VALIDATION,
-    "validation": CorpusSplit.VALIDATION,
-    "test": CorpusSplit.TEST,
-}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,12 +38,6 @@ def _parser() -> argparse.ArgumentParser:
         help="Opponent policy checkpoint (overrides --opponent).",
     )
     parser.add_argument("--teams-path", type=Path, default=None, help="Team pool directory.")
-    parser.add_argument(
-        "--split",
-        choices=("train", "val", "validation", "test"),
-        default=None,
-        help="Corpus split to evaluate against.",
-    )
     parser.add_argument("--episodes", type=int, help="Number of episodes per matchup.")
     parser.add_argument("--seed", type=int, help="Random seed for evaluations.")
     parser.add_argument("--report-dir", type=Path, help="Directory to save evaluation reports.")
@@ -113,7 +99,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     teams_path = args.teams_path or config.teams.all
-    split_filter = _VALID_SPLITS.get(args.split) if args.split else None
 
     harness = EvaluationHarness(
         teams_path=teams_path,
@@ -121,7 +106,6 @@ def main(argv: list[str] | None = None) -> int:
         episodes_per_matchup=episodes,
         seed=seed,
         port=args.port,
-        split=split_filter,
     )
 
     try:

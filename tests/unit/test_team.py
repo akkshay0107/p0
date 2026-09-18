@@ -114,17 +114,7 @@ class TestCanonicalTeam:
 class TestTeamMetadata:
     def test_validation(self) -> None:
         with pytest.raises(ValueError, match="Usage count must be positive"):
-            TeamMetadata(
-                source_series=(),
-                source_replays=(),
-                first_seen="2026-01-01T00:00:00Z",
-                last_seen="2026-01-01T00:00:00Z",
-                usage_count=0,
-            )
-
-    def test_dict_roundtrip(self) -> None:
-        meta = metadata()
-        assert TeamMetadata.from_dict(meta.to_dict()) == meta
+            TeamMetadata(usage_count=0)
 
 
 class TestTeamRecord:
@@ -137,19 +127,21 @@ class TestTeamRecord:
                 metadata=variant.metadata,
             )
 
-    def test_serialization_round_trip_is_strict(self) -> None:
+    def test_invalid_spread_provenance_raises(self) -> None:
         variant = team_variant()
-        assert TeamRecord.from_dict(variant.to_dict()) == replace(
-            variant, team=variant.team.canonical()
-        )
-        with pytest.raises(ValueError, match="fields"):
-            TeamRecord.from_dict({**variant.to_dict(), "unexpected": True})
+        with pytest.raises(ValueError, match="spread_provenance='imputed'"):
+            TeamRecord(
+                team=variant.team,
+                spreads=variant.spreads,
+                metadata=variant.metadata,
+                spread_provenance="exact",
+            )
 
 
 class TestDeduplicateVariants:
     def test_merges_metadata_and_preserves_spread_variants(self) -> None:
         first = team_variant()
-        duplicate = replace(first, metadata=metadata("series-2", 2))
+        duplicate = replace(first, metadata=metadata(usage=2))
         alternate = replace(
             first,
             spreads=tuple(StatPoints(hp=32, defense=17, spd=17) for _ in first.spreads),
@@ -158,4 +150,3 @@ class TestDeduplicateVariants:
         assert len(result) == 2
         merged = next(item for item in result if item.spreads == first.spreads)
         assert merged.metadata.usage_count == 3
-        assert merged.metadata.source_series == ("series-1", "series-2")

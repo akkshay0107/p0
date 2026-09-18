@@ -17,7 +17,7 @@ from p0.model.resources import default_runtime_resources
 from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
 from p0.runtime.showdown import start_showdown_servers
-from p0.teams.factory import build_team_source
+from p0.teams.source import build_team_source
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.config import GlobalConfig
 from p0.training.files import training_run

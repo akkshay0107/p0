@@ -9,8 +9,6 @@ import pytest
 from p0.format_config import current_manifest
 from p0.teams.corpus import (
     CorpusEntry,
-    CorpusSourceSpec,
-    CorpusSplit,
     TeamCorpusManifest,
     corpus_content_hash,
     load_corpus_manifest,
@@ -19,7 +17,6 @@ from p0.teams.corpus import (
 
 def _sample_entry(
     packed: str = "packed-pikachu",
-    split: CorpusSplit = CorpusSplit.TRAIN,
     usage: int = 5,
     canonical_hash: str | None = None,
 ) -> CorpusEntry:
@@ -28,7 +25,6 @@ def _sample_entry(
         canonical_hash=canonical_hash or digest,
         packed=packed,
         packed_sha256=digest,
-        split=split,
         usage_count=usage,
     )
 
@@ -37,7 +33,6 @@ class TestCorpusEntry:
     def test_valid_entry(self) -> None:
         entry = _sample_entry()
         assert entry.spread_provenance == "imputed"
-        assert entry.split is CorpusSplit.TRAIN
         assert entry.usage_count == 5
 
     def test_packed_hash_mismatch_raises(self) -> None:
@@ -46,7 +41,6 @@ class TestCorpusEntry:
                 canonical_hash="a" * 64,
                 packed="my-team",
                 packed_sha256="b" * 64,
-                split=CorpusSplit.TRAIN,
                 usage_count=1,
             )
 
@@ -56,18 +50,6 @@ class TestCorpusEntry:
                 canonical_hash="a" * 64,
                 packed="",
                 packed_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                split=CorpusSplit.TRAIN,
-                usage_count=1,
-            )
-
-    def test_unspecified_split_raises(self) -> None:
-        digest = hashlib.sha256(b"team").hexdigest()
-        with pytest.raises(ValueError, match="split must be assigned"):
-            CorpusEntry(
-                canonical_hash=digest,
-                packed="team",
-                packed_sha256=digest,
-                split=CorpusSplit.UNSPECIFIED,
                 usage_count=1,
             )
 
@@ -78,7 +60,6 @@ class TestCorpusEntry:
                 canonical_hash=digest,
                 packed="team",
                 packed_sha256=digest,
-                split=CorpusSplit.TRAIN,
                 usage_count=0,
             )
 
@@ -89,7 +70,6 @@ class TestCorpusEntry:
                 canonical_hash=digest,
                 packed="team",
                 packed_sha256=digest,
-                split=CorpusSplit.TRAIN,
                 usage_count=1,
                 spread_provenance="unknown",
             )
@@ -166,33 +146,4 @@ class TestCorpusManifest:
                 created_at="2026-08-01T00:00:00Z",
                 sampling_metadata={},
                 artifact_schema="invalid_schema.v99",
-            )
-
-
-class TestCorpusSourceSpec:
-    def test_valid_spec(self) -> None:
-        spec = CorpusSourceSpec(
-            corpus_path="/path/to/manifest.json",
-            corpus_hash="a" * 64,
-            format_id="gen9championsvgc2026regmb",
-            split=CorpusSplit.TRAIN,
-        )
-        assert spec.split is CorpusSplit.TRAIN
-
-    def test_unspecified_split_raises(self) -> None:
-        with pytest.raises(ValueError, match="split must be specified"):
-            CorpusSourceSpec(
-                corpus_path="/path/to/manifest.json",
-                corpus_hash="a" * 64,
-                format_id="gen9championsvgc2026regmb",
-                split=CorpusSplit.UNSPECIFIED,
-            )
-
-    def test_invalid_hash_raises(self) -> None:
-        with pytest.raises(ValueError, match="lowercase SHA-256"):
-            CorpusSourceSpec(
-                corpus_path="/path/to/manifest.json",
-                corpus_hash="not-a-sha256",
-                format_id="gen9championsvgc2026regmb",
-                split=CorpusSplit.TRAIN,
             )

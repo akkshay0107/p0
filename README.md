@@ -171,8 +171,7 @@ uv run p0-replays create-splits \
 uv run p0-bc train \
   --config config.yaml \
   --shard-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/manifest.json \
-  --split-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/splits.json \
-  --overfit
+  --split-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/splits.json
 ```
 
 Raw response bytes remain immutable even when parsing or OTS checks fail. Derived
@@ -207,9 +206,8 @@ uv run p0-export-training --checkpoint artifacts/checkpoints/ppo_checkpoint.pt -
 ```
 
 Extract into a compatible p0 checkout, then run `p0-train --config run/config.yaml
---agent-team-source reduced` for PPO, or `p0-bc train --config run/config.yaml` for BC
-(add `--overfit` when resuming an overfit run). BC exports include the referenced
-shards and split; PPO exports include both team pools. Inputs must still match the
+--agent-team-source reduced` for PPO, or `p0-bc train --config run/config.yaml` for BC.
+BC exports include the referenced shards and split; PPO exports include both team pools. Inputs must still match the
 saved identities. The archive contains checksums, but does not include Python/Node
 installations, the p0 source checkout, or Showdown. Those must be supplied separately.
 New outputs go under `artifacts/resumed`; use a fresh output path for each import.

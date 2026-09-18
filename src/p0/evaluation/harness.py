@@ -21,9 +21,7 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.rl_player import RLPlayer, TeamPlayerMixin
 from p0.runtime import poke_env_patches
-from p0.teams.corpus import CorpusSplit
-from p0.teams.factory import build_team_source
-from p0.teams.source import TeamSource
+from p0.teams.source import TeamSource, build_team_source
 
 logger = logging.getLogger(__name__)
 
@@ -131,21 +129,6 @@ type EvalPlayerType = (
 )
 
 
-def _to_corpus_split(split: CorpusSplit | str | None) -> CorpusSplit:
-    if split is None:
-        return CorpusSplit.TRAIN
-    if isinstance(split, CorpusSplit):
-        return split
-    normalized = split.strip().lower()
-    if normalized in {"train", "seen"}:
-        return CorpusSplit.TRAIN
-    if normalized in {"val", "validation"}:
-        return CorpusSplit.VALIDATION
-    if normalized in {"test", "unseen"}:
-        return CorpusSplit.TEST
-    raise ValueError(f"Unknown corpus split: {split}")
-
-
 def create_eval_player(
     spec: PolicyNet | str | None,
     *,
@@ -242,7 +225,6 @@ class EvaluationHarness:
         episodes_per_matchup: int = 20,
         seed: int = 0,
         port: int = 8120,
-        split: CorpusSplit | str | None = None,
     ) -> None:
         if format_id != FORMAT.bo3_format:
             raise ValueError(
@@ -253,31 +235,23 @@ class EvaluationHarness:
         self.episodes_per_matchup = episodes_per_matchup
         self.seed = seed
         self.port = port
-        self.split = split
         self.rng = random.Random(seed)
 
-    def build_team_source(self, split: CorpusSplit | str | None = None) -> TeamSource:
+    def build_team_source(self) -> TeamSource:
         """Build team source from the configured teams path."""
         if self.teams_path is None:
             raise ValueError("Evaluation requires teams_path to build a team source")
         if not self.teams_path.exists():
             raise FileNotFoundError(f"Evaluation teams path not found: {self.teams_path}")
 
-        chosen_split = _to_corpus_split(split if split is not None else self.split)
         return build_team_source(
             self.teams_path,
-            split=chosen_split,
             expected_format_id=self.format_id,
         )
 
     def build_team_sources(self) -> dict[str, TeamSource]:
         """Build team sources mapping for evaluation."""
-        split_name = (
-            self.split.name.lower()
-            if isinstance(self.split, CorpusSplit)
-            else str(self.split or "default")
-        )
-        return {split_name: self.build_team_source()}
+        return {"default": self.build_team_source()}
 
     async def run_matchup(
         self,

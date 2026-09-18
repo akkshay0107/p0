@@ -231,12 +231,7 @@ def stress_random_team_record(rng: random.Random, *, label: str = "stress") -> T
     return TeamRecord(
         team=CanonicalTeam(members),
         spreads=tuple(_random_stat_points(rng) for _ in members),
-        metadata=TeamMetadata(
-            source_series=(label,),
-            source_replays=(f"{label}-game-1",),
-            first_seen="2026-01-01T00:00:00Z",
-            last_seen="2026-01-01T00:00:00Z",
-        ),
+        metadata=TeamMetadata(),
     )
 
 

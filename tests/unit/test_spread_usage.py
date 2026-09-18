@@ -15,7 +15,6 @@ from p0.format_config import FORMAT, current_manifest
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
-    CorpusSplit,
     TeamCorpusManifest,
     corpus_content_hash,
 )
@@ -89,7 +88,6 @@ def vocabulary() -> dict[str, dict[str, int]]:
 def _make_entry(
     index: int,
     canonical_index: int | None = None,
-    split: CorpusSplit = CorpusSplit.TRAIN,
     usage_count: int = 10,
 ) -> CorpusEntry:
     if canonical_index is None:
@@ -102,7 +100,6 @@ def _make_entry(
         canonical_hash=canonical_hash,
         packed=packed,
         packed_sha256=packed_sha256,
-        split=split,
         usage_count=usage_count,
         spread_provenance="imputed",
     )
@@ -158,7 +155,6 @@ def _corpus_entry(packed: str = "packed-team") -> CorpusEntry:
         canonical_hash=hashlib.sha256(packed.encode()).hexdigest(),
         packed=packed,
         packed_sha256=hashlib.sha256(packed.encode()).hexdigest(),
-        split=CorpusSplit.TRAIN,
         usage_count=3,
     )
 

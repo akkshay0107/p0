@@ -7,11 +7,11 @@ import pytest
 from p0.format_config import FORMAT
 from p0.teams.validation import (
     AdmissionResult,
-    PersistentShowdownValidator,
     _variant_dict,
     showdown_payload,
     validate_many,
     validate_many_batched,
+    validate_variant,
 )
 from tests.team_fixtures import team_variant
 
@@ -64,17 +64,10 @@ class TestValidationEmptyAndBounds:
             validate_many_batched((variant,), batch_size=-5)
 
 
-class TestPersistentValidatorLifecycle:
-    def test_validate_many_without_enter_raises(self) -> None:
-        validator = PersistentShowdownValidator()
+class TestValidationDispatch:
+    def test_validate_variant_delegates_to_batch(self) -> None:
         variant = team_variant()
-        with pytest.raises(RuntimeError, match="is not open"):
-            validator.validate_many((variant,))
-
-    def test_validate_many_empty_returns_empty(self) -> None:
-        validator = PersistentShowdownValidator()
-        # Mocking an open state is not allowed, but empty variants return before process check
-        # Wait, let's verify if empty returns before or after process check:
-        # In validate_many: process check is first, so empty check comes after.
-        with pytest.raises(RuntimeError, match="is not open"):
-            validator.validate_many(())
+        result = validate_variant(variant)
+        assert result.team_hash == variant.team.team_hash
+        assert result.valid is True
+        assert result.packed_team is not None

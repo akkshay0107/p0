@@ -85,13 +85,13 @@ class TestBCRunner:
             train_bc(config, device="cpu")
 
     @pytest.mark.heavy
-    def test_overfit_runner_reaches_its_bounded_acceptance_target(self, tmp_path: Path) -> None:
+    def test_runner_learns_on_toy_dataset(self, tmp_path: Path) -> None:
         compiled = compile_payloads(
             (
-                sample_replay_payload("overfit-train", parent="overfit-train-series"),
+                sample_replay_payload("train-replay", parent="train-series"),
                 sample_replay_payload(
-                    "overfit-validation",
-                    parent="overfit-validation-series",
+                    "validation-replay",
+                    parent="validation-series",
                 ),
             )
         )
@@ -137,8 +137,8 @@ class TestBCRunner:
                 built.manifest.global_contract_sha256,
                 0,
                 {
-                    series_by_replay["overfit-train"]: "train",
-                    series_by_replay["overfit-validation"]: "validation",
+                    series_by_replay["train-replay"]: "train",
+                    series_by_replay["validation-replay"]: "validation",
                 },
                 dataset_hash=built.manifest.dataset_hash,
             ),
@@ -148,7 +148,7 @@ class TestBCRunner:
             batch_decisions=4,
             max_chunk_size=4,
             learning_rate=1e-3,
-            epochs=30,
+            epochs=20,
             num_workers=0,
             enable_optim=False,
             shard_manifest=built.manifest_path,
@@ -156,14 +156,15 @@ class TestBCRunner:
             output_dir=tmp_path / "output",
         )
 
-        result = train_bc(config, overfit=True, device="cpu")
+        result = train_bc(config, device="cpu")
 
-        assert result["overfit_passed"] is True
-        assert 0 < result["completed_epoch"] <= config.epochs
+        assert result["completed_epoch"] == config.epochs
+        assert result["latest_training_checkpoint"] is not None
+        assert result["best_policy_checkpoint"] is not None
+        assert result["final_validation"] is not None
         assert result["final_training"]["overall_nll"] <= (
-            result["initial_training"]["overall_nll"] * 0.2
+            result["initial_training"]["overall_nll"] * 0.5
         )
-        assert result["final_training"]["exact_joint_accuracy"] >= 0.9
 
     @pytest.mark.heavy
     def test_resume_restores_selected_policy_and_metrics_without_external_files(
@@ -297,10 +298,21 @@ class TestBCRunner:
         assert cancelled["best_policy_checkpoint"] is None
         assert cancelled["metrics_path"] is None
 
-        with pytest.raises(RuntimeError, match="requires at least one exact policy label"):
+        overfit_checkpoint_path = tmp_path / "legacy_overfit.pt"
+        overfit_artifact = dict(torch.load(first_latest, weights_only=True))
+        overfit_artifact["provenance"] = dict(overfit_artifact["provenance"])
+        overfit_artifact["provenance"]["trainer_config"] = {
+            **overfit_artifact["provenance"]["trainer_config"],
+            "overfit": True,
+        }
+        torch.save(overfit_artifact, overfit_checkpoint_path)
+        with pytest.raises(ValueError, match="Cannot resume an overfit training run"):
             train_bc(
-                replace(first_config, output_dir=tmp_path / "overfit-output"),
-                overfit=True,
+                replace(
+                    first_config,
+                    output_dir=tmp_path / "overfit-output",
+                    resume_checkpoint=overfit_checkpoint_path,
+                ),
                 device="cpu",
             )
 

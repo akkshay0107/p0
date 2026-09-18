@@ -8,15 +8,9 @@ from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
 
 
-def metadata(source: str = "series-1", usage: int = 1) -> TeamMetadata:
-    """Build stable provenance metadata for a team fixture."""
-    return TeamMetadata(
-        source_series=(source,),
-        source_replays=(f"{source}-game-1",),
-        first_seen="2026-01-01T00:00:00Z",
-        last_seen="2026-01-02T00:00:00Z",
-        usage_count=usage,
-    )
+def metadata(usage: int = 1) -> TeamMetadata:
+    """Build stable metadata for a team fixture."""
+    return TeamMetadata(usage_count=usage)
 
 
 def team_variant(
@@ -79,14 +73,7 @@ def team_variant(
     return TeamRecord(
         team=CanonicalTeam(tuple(members)),
         spreads=spreads or tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
-        metadata=metadata
-        or TeamMetadata(
-            source_series=source_series,
-            source_replays=(f"{source_series[0] if source_series else 'series-1'}-game-1",),
-            first_seen="2026-01-01T00:00:00Z",
-            last_seen="2026-01-02T00:00:00Z",
-            usage_count=usage_count,
-        ),
+        metadata=metadata or TeamMetadata(usage_count=usage_count),
     )
 
 

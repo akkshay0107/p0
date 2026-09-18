@@ -16,7 +16,7 @@ from p0.format_config import load_active_global_contract, sha256_file
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_output
 from p0.replays.dataset import LazyReplayDataset
-from p0.teams.factory import build_team_source
+from p0.teams.source import build_team_source
 from p0.training.checkpoint import CheckpointStore
 
 
@@ -67,9 +67,7 @@ def export_checkpoint(checkpoint: Path, output: Path) -> None:
             files[name] = manifest_path.parent / entry.filename
             expected[name] = entry.sha256
         bc = {
-            name: value
-            for name, value in settings.items()
-            if name not in {"overfit", "gamma", "value_coef"}
+            name: value for name, value in settings.items() if name not in {"gamma", "value_coef"}
         }
         config = {
             "training": {"gamma": settings["gamma"], "value_coef": settings["value_coef"]},

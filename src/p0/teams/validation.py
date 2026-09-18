@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import selectors
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -67,40 +66,6 @@ def showdown_payload(
     return orjson.dumps(_variant_dict(variant, format_id=format_id)).decode("utf-8")
 
 
-def validate_variant(
-    variant: TeamRecord,
-    *,
-    timeout: float = 30.0,
-    repository_root: Path = DEFAULT_PATHS.repository_root,
-    format_id: str = FORMAT.battle_format,
-) -> AdmissionResult:
-    validator = repository_root / "scripts" / "validate_champions_team.js"
-    try:
-        process = subprocess.run(
-            ["node", str(validator)],
-            input=showdown_payload(variant, format_id=format_id),
-            text=True,
-            capture_output=True,
-            cwd=repository_root,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Pinned Showdown validator timed out after {timeout:g}s") from exc
-    if process.returncode:
-        raise RuntimeError(f"Pinned Showdown validator failed: {process.stderr.strip()}")
-    try:
-        result = orjson.loads(process.stdout)
-        return AdmissionResult(
-            team_hash=variant.team.team_hash,
-            valid=bool(result["valid"]),
-            packed_team=result["packedTeam"],
-            problems=tuple(result["problems"]),
-        )
-    except (KeyError, TypeError, orjson.JSONDecodeError) as exc:
-        raise RuntimeError("Pinned Showdown validator returned a malformed response") from exc
-
-
 def validate_many_batched(
     variants: Sequence[TeamRecord],
     *,
@@ -117,6 +82,7 @@ def validate_many_batched(
       batch_size: Maximum number of variants sent per Node subprocess call.
       timeout: Maximum execution duration allowed per batch subprocess.
       repository_root: Root path where validation scripts are located.
+      format_id: Target battle format ID.
 
     Returns:
       A tuple of admission results aligned exactly with input variants.
@@ -173,178 +139,31 @@ def validate_many_batched(
 def validate_many(
     variants: Sequence[TeamRecord],
     *,
-    timeout: float = 30.0,
+    batch_size: int = 256,
+    timeout: float = 60.0,
     repository_root: Path = DEFAULT_PATHS.repository_root,
     format_id: str = FORMAT.battle_format,
 ) -> tuple[AdmissionResult, ...]:
-    if not variants:
-        return ()
-    if len(variants) == 1:
-        return (
-            validate_variant(
-                variants[0],
-                timeout=timeout,
-                repository_root=repository_root,
-                format_id=format_id,
-            ),
-        )
     return validate_many_batched(
         variants,
+        batch_size=batch_size,
         timeout=timeout,
         repository_root=repository_root,
         format_id=format_id,
     )
 
 
-class PersistentShowdownValidator:
-    """
-    Persistent Node subprocess context manager for continuous validation.
-
-    Spawns a long-lived Node worker over stdio to validate large streams of
-    teams without per-batch startup overhead.
-    """
-
-    def __init__(
-        self,
-        *,
-        repository_root: Path = DEFAULT_PATHS.repository_root,
-        request_timeout: float = 30.0,
-        format_id: str = FORMAT.battle_format,
-    ) -> None:
-        self._repository_root = repository_root
-        self._process: subprocess.Popen[str] | None = None
-        self._request_timeout = request_timeout
-        self._format_id = format_id
-
-    def __enter__(self) -> PersistentShowdownValidator:
-        validator = self._repository_root / "scripts" / "validate_champions_batch.js"
-        self._process = subprocess.Popen(
-            ["node", str(validator), "--persistent"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            # Diagnostics are intentionally discarded here: the persistent
-            # protocol is line-oriented and an undrained stderr pipe can block
-            # the validator before it produces a response.
-            stderr=subprocess.DEVNULL,
-            text=True,
-            cwd=self._repository_root,
-        )
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: Any,
-    ) -> None:
-        self.close()
-
-    def close(self) -> None:
-        if self._process is not None:
-            try:
-                if self._process.stdin is not None:
-                    self._process.stdin.write(
-                        orjson.dumps({"command": "stop"}).decode("utf-8") + "\n"
-                    )
-                    self._process.stdin.flush()
-                    self._process.stdin.close()
-                self._process.wait(timeout=2.0)
-            except (BrokenPipeError, OSError, ValueError, subprocess.TimeoutExpired):
-                try:
-                    self._process.terminate()
-                    self._process.wait(timeout=1.0)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    try:
-                        self._process.kill()
-                    except (OSError, ValueError):
-                        pass
-                    try:
-                        self._process.wait(timeout=1.0)
-                    except (OSError, ValueError, subprocess.TimeoutExpired):
-                        pass
-            finally:
-                if self._process is not None:
-                    for stream in (self._process.stdout, self._process.stderr):
-                        if stream is not None:
-                            try:
-                                stream.close()
-                            except (OSError, RuntimeError, ValueError):
-                                pass
-                self._process = None
-
-    def _readline(self) -> str:
-        """Read one worker response with a bounded wait."""
-        if self._process is None or self._process.stdout is None:
-            raise RuntimeError("Persistent worker stdout is unavailable")
-        stream = self._process.stdout
-        with selectors.DefaultSelector() as selector:
-            selector.register(stream, selectors.EVENT_READ)
-            ready = selector.select(self._request_timeout)
-            if not ready:
-                raise TimeoutError(
-                    f"Persistent validator response timed out after {self._request_timeout:g}s"
-                )
-        return stream.readline()
-
-    def validate_many(
-        self,
-        variants: Sequence[TeamRecord],
-        *,
-        batch_size: int = 256,
-    ) -> tuple[AdmissionResult, ...]:
-        """
-        Validate variants through the active persistent worker.
-
-        Arguments:
-          variants: Sequence of team variants to validate.
-          batch_size: Maximum number of variants sent per stdio batch request.
-
-        Returns:
-          A tuple of admission results aligned exactly with input variants.
-        """
-        if self._process is None or self._process.stdin is None or self._process.stdout is None:
-            raise RuntimeError("PersistentShowdownValidator process is not open")
-        if not variants:
-            return ()
-        if batch_size < 1:
-            raise ValueError("batch_size must be a positive integer")
-        results: list[AdmissionResult] = []
-        for offset in range(0, len(variants), batch_size):
-            if self._process.poll() is not None:
-                raise RuntimeError("Persistent validator exited before completing the request")
-            chunk = variants[offset : offset + batch_size]
-            payload = orjson.dumps(
-                {"batch": [_variant_dict(variant, format_id=self._format_id) for variant in chunk]}
-            ).decode("utf-8")
-            try:
-                self._process.stdin.write(payload + "\n")
-                self._process.stdin.flush()
-                line = self._readline()
-                if not line:
-                    raise RuntimeError("Persistent worker closed stdout unexpectedly")
-                parsed = orjson.loads(line)
-                if parsed.get("status") != "ok":
-                    raise RuntimeError(f"Persistent worker error: {parsed.get('message')}")
-                items = parsed.get("results")
-                if not isinstance(items, list) or len(items) != len(chunk):
-                    raise ValueError("Response count mismatch")
-                for variant, item in zip(chunk, items, strict=True):
-                    results.append(
-                        AdmissionResult(
-                            team_hash=variant.team.team_hash,
-                            valid=bool(item["valid"]),
-                            packed_team=item["packedTeam"],
-                            problems=tuple(item["problems"]),
-                        )
-                    )
-            except (
-                BrokenPipeError,
-                OSError,
-                TimeoutError,
-                TypeError,
-                ValueError,
-                orjson.JSONDecodeError,
-                RuntimeError,
-            ) as exc:
-                raise RuntimeError(f"PersistentShowdownValidator failed: {exc}") from exc
-        return tuple(results)
+def validate_variant(
+    variant: TeamRecord,
+    *,
+    timeout: float = 30.0,
+    repository_root: Path = DEFAULT_PATHS.repository_root,
+    format_id: str = FORMAT.battle_format,
+) -> AdmissionResult:
+    results = validate_many(
+        (variant,),
+        timeout=timeout,
+        repository_root=repository_root,
+        format_id=format_id,
+    )
+    return results[0]

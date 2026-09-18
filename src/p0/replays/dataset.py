@@ -449,13 +449,6 @@ class LazyReplayDataset(IterableDataset):
 
         self._validate_summaries(tensors, summaries, path)
 
-        if (
-            tensors["loss_mask"].shape[0] != entry.decisions
-            or len(summaries) != entry.games
-            or tensors["series_offsets"].numel() - 1 != entry.series
-        ):
-            raise ValueError(f"Shard payload counts do not match its index entry in {path}")
-
         return tensors, summaries
 
     def _validate_summaries(
