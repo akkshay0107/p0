@@ -71,6 +71,9 @@ from p0.teams.spread_usage import DEFAULT_SPREAD_TABLE_PATH
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 
 _SUPPORTED_FORMATS = frozenset({FORMAT.battle_format, FORMAT.bo3_format})
+_BLOCKING_SERIES_DIAGNOSTICS = frozenset(
+    {"game_after_series_won", "team_identity_conflict", "too_many_games"}
+)
 _WORKER_DEX: Mapping[str, Any] | None = None
 
 
@@ -850,8 +853,18 @@ def compile_documents(
     _initialize_compile_worker(runtime_dex)
     grouping = group_replays(docs, format_id=format_id)
     counters = _initial_compilation_counters(grouping)
+    failed_series: set[str] = set()
+    for group in grouping.series:
+        blocking_codes = {d.code for d in group.diagnostics if d.code in _BLOCKING_SERIES_DIAGNOSTICS}
+        if blocking_codes:
+            failed_series.add(group.record.series_id)
+            for code in blocking_codes:
+                counters[f"rejected_{code}"] += 1
+
     jobs = []
     for group in grouping.series:
+        if group.record.series_id in failed_series:
+            continue
         membership_by_replay = {
             membership.replay_id: membership for membership in group.memberships
         }
@@ -884,7 +897,6 @@ def compile_documents(
             results = list(executor.map(_compile_worker, jobs, chunksize=chunksize))
 
     compiled_by_series: dict[str, list[CompiledGame]] = {}
-    failed_series: set[str] = set()
     confidence_sum = 0.0
     for job, (compiled, reason) in zip(jobs, results, strict=True):
         series_id = job[1]

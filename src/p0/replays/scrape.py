@@ -355,6 +355,32 @@ class ReplayFetcher:
     def acquire(self, replay_ids: Iterable[str] | None = None) -> tuple[FetchIndexEntry, ...]:
         existing = read_fetch_index(self.index_path)
         known = {entry.replay_id: entry for entry in existing}
+        metadata_dir = self.config.cache_dir / self.config.format_id / "metadata"
+        if metadata_dir.is_dir():
+            recovered = []
+            for meta_path in sorted(metadata_dir.glob("*.json")):
+                replay_id = meta_path.stem
+                raw_path = self._raw_path(replay_id)
+                if replay_id in known or not raw_path.is_file():
+                    continue
+                try:
+                    body = load_raw_replay(raw_path)
+                    meta = FetchMetadata.from_dict(orjson.loads(meta_path.read_bytes()))
+                    entry = FetchIndexEntry(
+                        replay_id=replay_id,
+                        format_id=self.config.format_id,
+                        source_url=meta.source_url,
+                        fetched_at=meta.fetched_at,
+                        http_status=meta.http_status,
+                        content_sha256=hashlib.sha256(body).hexdigest(),
+                        byte_size=len(body),
+                    )
+                    recovered.append(entry)
+                    known[replay_id] = entry
+                except (OSError, ValueError, orjson.JSONDecodeError):
+                    continue
+            if recovered:
+                self._append_index(recovered)
         known_keys = set(known.keys())
 
         if replay_ids is None and len(known_keys) >= self.config.limit_games:
@@ -394,6 +420,7 @@ class ReplayFetcher:
                         }
 
                         new_entries = []
+                        fetch_error: Exception | None = None
                         for replay_id in pending:
                             try:
                                 entry, links = futures[replay_id].result()
@@ -409,12 +436,19 @@ class ReplayFetcher:
                                     replay_id,
                                     exc,
                                 )
+                            except Exception as exc:
+                                # Defer raising so completed sibling futures in this batch are indexed first.
+                                if fetch_error is None:
+                                    fetch_error = exc
 
                     if new_entries:
                         for entry in new_entries:
                             known[entry.replay_id] = entry
                             known_keys.add(entry.replay_id)
                         self._append_index(new_entries)
+
+                    if fetch_error is not None:
+                        raise fetch_error
 
                 frontier = discovered - scanned
 

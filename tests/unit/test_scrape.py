@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from p0.replays.dataset import (
 )
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.protocol import ReplayInputContractError, parse_replay_payload
-from p0.replays.schema import LabelKind
+from p0.replays.schema import FetchMetadata, LabelKind
 from p0.replays.scrape import (
     HttpResponse,
     ReplayFetcher,
@@ -362,3 +363,36 @@ class TestReplayScraping:
         fetcher.index_path.write_bytes(b"not-json\n")
         with pytest.raises((ValueError, ReplayFetchError)):
             read_fetch_index(fetcher.index_path)
+
+    def test_fetcher_recovery(self, tmp_path: Path) -> None:
+        """Verify unindexed raw and metadata files are recovered and indexed without rewriting metadata."""
+        replay_id = "gen9stress-recover"
+        config = ScrapeConfig(format_id="gen9stress", cache_dir=tmp_path, retries=1, rate_limit_per_second=0)
+        raw_path = tmp_path / config.format_id / "raw" / f"{replay_id}.json.gz"
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_payload = json.dumps({"id": replay_id, "format": "gen9stress", "log": "|turn|1"}).encode()
+        raw_path.write_bytes(gzip.compress(raw_payload, mtime=0))
+
+        meta_path = tmp_path / config.format_id / "metadata" / f"{replay_id}.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = FetchMetadata(
+            source_url=f"https://replay.pokemonshowdown.com/{replay_id}.json",
+            fetched_at="2026-01-01T00:00:00Z",
+            http_status=200,
+            attempt=1,
+            retry_count=0,
+            elapsed_ms=42,
+        )
+        meta_bytes = json.dumps(meta.to_dict()).encode() + b"\n"
+        meta_path.write_bytes(meta_bytes)
+        initial_mtime = meta_path.stat().st_mtime_ns
+
+        fetcher = ReplayFetcher(config)
+        entries = fetcher.acquire((replay_id,))
+
+        assert len(entries) == 1
+        assert entries[0].replay_id == replay_id
+        assert entries[0].byte_size == len(raw_payload)
+        assert read_fetch_index(fetcher.index_path) == tuple(entries)
+        assert meta_path.read_bytes() == meta_bytes
+        assert meta_path.stat().st_mtime_ns == initial_mtime

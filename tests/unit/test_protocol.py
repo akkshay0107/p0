@@ -529,8 +529,8 @@ class TestReplayInputContract:
         assert not duplicate.record.is_complete
         assert "duplicate_game_number" in {diagnostic.code for diagnostic in duplicate.diagnostics}
 
-    def test_grouping_quarantines_games_after_a_series_clinch(self) -> None:
-        """Verify matches with extra games played after a 2-0 clinch are quarantined with game_after_series_clinch diagnostic."""
+    def test_grouping_quarantines_games_after_series_won(self) -> None:
+        """Verify matches with extra games played after a 2-0 win are quarantined with game_after_series_won diagnostic."""
         games = tuple(
             parse_replay_payload(sample_replay_payload(f"g{number}", game_number=number))
             for number in (1, 2, 3)
@@ -540,7 +540,7 @@ class TestReplayInputContract:
 
         assert group.record.score == (2, 0)
         assert not group.record.is_complete
-        assert "game_after_series_clinch" in {diagnostic.code for diagnostic in group.diagnostics}
+        assert "game_after_series_won" in {diagnostic.code for diagnostic in group.diagnostics}
         assert validated_bo3_series(games) == ()
 
     def test_grouping_quarantines_missing_outcomes_and_team_conflicts(self) -> None:

@@ -160,17 +160,17 @@ def _series_score(
     players: tuple[str, str],
 ) -> tuple[tuple[int, int], tuple[GroupingDiagnostic, ...]]:
     score = [0, 0]
-    games_after_clinch: list[str] = []
+    games_after_win: list[str] = []
     games_without_winner: list[str] = []
-    clinched = False
+    series_won = False
     for game in games:
-        if clinched:
-            games_after_clinch.append(game.metadata.replay_id)
+        if series_won:
+            games_after_win.append(game.metadata.replay_id)
             continue
         winner = game.outcome.winner
         if winner in (0, 1):
             score[_roles(game, players)[winner]] += 1
-            clinched = max(score) == 2
+            series_won = max(score) == 2
         else:
             games_without_winner.append(game.metadata.replay_id)
     diagnostics: list[GroupingDiagnostic] = []
@@ -182,12 +182,12 @@ def _series_score(
                 f"games have no public winner: {tuple(games_without_winner)}",
             )
         )
-    if games_after_clinch:
+    if games_after_win:
         diagnostics.append(
             GroupingDiagnostic(
-                "game_after_series_clinch",
+                "game_after_series_won",
                 tuple(game.metadata.replay_id for game in games),
-                f"games occur after the series was won: {tuple(games_after_clinch)}",
+                f"games occur after the series was won: {tuple(games_after_win)}",
             )
         )
     return (score[0], score[1]), tuple(diagnostics)
@@ -387,29 +387,34 @@ def group_replays(
             diagnostic = GroupingDiagnostic(
                 "too_many_games",
                 tuple(game.metadata.replay_id for game in games),
-                f"group contains {len(games)} games; retained first {max_games}",
+                f"group contains {len(games)} games; exceeds {max_games}",
             )
             diagnostics.append(diagnostic)
             group_diagnostics.append(diagnostic)
-            games = games[:max_games]
-        group = _make_group(
-            games,
-            key=bucket[1],
-            method=method,
-            diagnostics=tuple(group_diagnostics),
-        )
-        result.append(group)
-        diagnostics.extend(
-            diagnostic for diagnostic in group.diagnostics if diagnostic not in group_diagnostics
-        )
-        if not group.record.is_complete:
-            diagnostics.append(
-                GroupingDiagnostic(
-                    "incomplete_series",
-                    group.record.game_replay_ids,
-                    "series does not contain a validated two-win result",
-                )
+        batches = tuple(games[i : i + max_games] for i in range(0, len(games), max_games))
+        for batch_index, batch in enumerate(batches):
+            key_suffix = "" if batch_index == 0 else f":extra:{batch_index}"
+            group = _make_group(
+                batch,
+                key=f"{bucket[1]}{key_suffix}",
+                method=method,
+                diagnostics=tuple(group_diagnostics),
             )
+            result.append(group)
+            if batch_index == 0:
+                diagnostics.extend(
+                    diagnostic
+                    for diagnostic in group.diagnostics
+                    if diagnostic not in group_diagnostics
+                )
+                if not group.record.is_complete:
+                    diagnostics.append(
+                        GroupingDiagnostic(
+                            "incomplete_series",
+                            group.record.game_replay_ids,
+                            "series does not contain a validated two-win result",
+                        )
+                    )
     return GroupingResult(tuple(result), tuple(diagnostics))
 
 
@@ -447,7 +452,7 @@ def validated_bo3_series(
     blocking = {
         "duplicate_game_number",
         "fallback_team_conflict",
-        "game_after_series_clinch",
+        "game_after_series_won",
         "missing_game_number",
         "missing_outcome",
         "non_contiguous_game_numbers",

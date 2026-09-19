@@ -29,6 +29,7 @@ class TestReplayCompiler:
         second["game_number"] = 2
         second["p1"] = "Bob"
         second["p2"] = "Alice"
+        second["log"] = str(second["log"]).replace("p1", "TMP").replace("p2", "p1").replace("TMP", "p2")
 
         built = write_dataset_replay_dataset(tmp_path, (first, second))
         chunks = list(LazyReplayDataset(built.manifest_path))
@@ -166,3 +167,30 @@ class TestReplayCompiler:
         )
 
         assert second.manifest_path == first.manifest_path
+
+    def test_extra_game_after_series_won_rejected(self) -> None:
+        """Verify that a 2-0 series followed by a 3rd game is rejected under precision-first policy."""
+        games = tuple(sample_replay_payload(f"g{i}", game_number=i, winner="Alice") for i in (1, 2, 3))
+        result = compile_payloads(games)
+        assert len(result.games) == 0
+        assert result.metrics.counters["accepted_games"] == 0
+        assert result.metrics.counters["rejected_games"] == 3
+        assert result.metrics.counters["rejected_game_after_series_won"] == 1
+        assert result.series[0].record.game_replay_ids == ("g1", "g2", "g3")
+
+    def test_four_game_series_accounting(self, tmp_path: Path) -> None:
+        """Verify four same-parent inputs retain all four replay identities in source accounting while being rejected."""
+        valid = [sample_replay_payload(f"v{i}", parent="p-valid", game_number=i, winner="Alice") for i in (1, 2)]
+        four = [sample_replay_payload(f"f{i}", parent="p-four", game_number=i, winner="Alice") for i in (1, 2, 3, 4)]
+        result = compile_payloads((*valid, *four))
+
+        assert result.metrics.counters["accepted_games"] == 2
+        assert result.metrics.counters["rejected_games"] == 4
+        assert result.metrics.counters["rejected_too_many_games"] >= 1
+        assert {game.replay_id for game in result.games} == {"v1", "v2"}
+
+        built = write_tensor_shards(result, tmp_path / "shards")
+        assert built.manifest.source_games == 6
+        assert built.manifest.accepted_games == 2
+        assert built.manifest.rejected_games == 4
+        assert {"f1", "f2", "f3", "f4"} <= set(built.manifest.raw_replays)
