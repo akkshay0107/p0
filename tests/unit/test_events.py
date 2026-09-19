@@ -54,6 +54,36 @@ class TestEvents:
         recorder_p2.apply_line(["", "move", "p2b: Blastoise", "Surf", "p1a: Pikachu"], tokenizer)
         assert recorder_p2.slots[1].target_slot == int(SpatialTargetSlot.OPP_LEFT)
 
+    @pytest.mark.parametrize(
+        ("player_role", "actor", "slot_index"),
+        (
+            ("p1", "p1a: Amoonguss", 0),
+            ("p2", "p2b: Farigiraf", 1),
+        ),
+    )
+    def test_spatial_turn_recorder_self_target_mapping(
+        self,
+        player_role: str,
+        actor: str,
+        slot_index: int,
+    ) -> None:
+        """Verify an actor targeting its own slot is recorded as SELF."""
+        recorder = SpatialTurnRecorder(player_role=player_role)
+        recorder.apply_line(["", "move", actor, "Protect", actor], tokenizer)
+
+        records = recorder.to_records()
+        assert records[slot_index].target_slot == int(SpatialTargetSlot.SELF)
+
+    def test_spatial_turn_recorder_ally_target_is_not_self(self) -> None:
+        """Verify a different allied slot remains an ally target."""
+        recorder = SpatialTurnRecorder(player_role="p1")
+        recorder.apply_line(
+            ["", "move", "p1a: Amoonguss", "Pollen Puff", "p1b: Incineroar"], tokenizer
+        )
+
+        records = recorder.to_records()
+        assert records[0].target_slot == int(SpatialTargetSlot.ALLY_RIGHT)
+
     def test_spatial_turn_recorder_damage_and_crit_tracking(self) -> None:
         """Verify damage dealt accumulation and crit flags on attacker and defender."""
         recorder = SpatialTurnRecorder(player_role="p1")

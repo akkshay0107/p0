@@ -117,11 +117,13 @@ def _parse_slot_index(endpoint: str, perspective_role: str) -> int | None:
     return slot_offset if is_ally else 2 + slot_offset
 
 
-def _parse_target_slot(endpoint: str, perspective_role: str) -> int:
+def _parse_target_slot(endpoint: str, perspective_role: str, actor_slot: int) -> int:
     """Map a target endpoint to SpatialTargetSlot enum value."""
     slot_idx = _parse_slot_index(endpoint, perspective_role)
     if slot_idx is None:
         return int(SpatialTargetSlot.NONE)
+    if slot_idx == actor_slot:
+        return int(SpatialTargetSlot.SELF)
     if slot_idx == 0:
         return int(SpatialTargetSlot.ALLY_LEFT)
     if slot_idx == 1:
@@ -181,7 +183,7 @@ class SpatialTurnRecorder:
                         # Move name may be custom, malformed, or missing from vocabulary.
                         move_id = 0
                 target_slot = (
-                    _parse_target_slot(parts[4], self.player_role)
+                    _parse_target_slot(parts[4], self.player_role, actor)
                     if len(parts) >= 5
                     else int(SpatialTargetSlot.NONE)
                 )
