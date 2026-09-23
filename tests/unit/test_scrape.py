@@ -367,10 +367,14 @@ class TestReplayScraping:
     def test_fetcher_recovery(self, tmp_path: Path) -> None:
         """Verify unindexed raw and metadata files are recovered and indexed without rewriting metadata."""
         replay_id = "gen9stress-recover"
-        config = ScrapeConfig(format_id="gen9stress", cache_dir=tmp_path, retries=1, rate_limit_per_second=0)
+        config = ScrapeConfig(
+            format_id="gen9stress", cache_dir=tmp_path, retries=1, rate_limit_per_second=0
+        )
         raw_path = tmp_path / config.format_id / "raw" / f"{replay_id}.json.gz"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_payload = json.dumps({"id": replay_id, "format": "gen9stress", "log": "|turn|1"}).encode()
+        raw_payload = json.dumps(
+            {"id": replay_id, "format": "gen9stress", "log": "|turn|1"}
+        ).encode()
         raw_path.write_bytes(gzip.compress(raw_payload, mtime=0))
 
         meta_path = tmp_path / config.format_id / "metadata" / f"{replay_id}.json"

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, cast
 
@@ -13,6 +16,7 @@ from poke_env.environment.env import _EnvPlayer
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
 
+from p0.replays.reconstruction.contract import COPYABLE_VOLATILES
 from p0.runtime.live_event_capture import capture_message, transform_target_reference
 
 _ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
@@ -37,6 +41,62 @@ _CRITICAL_COPY_EFFECTS = (
 _MAX_G_MAX_CHI_STRIKE_LAYERS = 3
 _LEPPA_PP_RECOVERY = 10
 _RIPEN_LEPPA_PP_RECOVERY = 20
+_PARENT_RESULTS_CREATION_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class _ParentResults:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    completed_rooms: set[str] = field(default_factory=set)
+    waiters: list[tuple[int, Future[None]]] = field(default_factory=list)
+
+    def record(self, room: str) -> None:
+        with self.lock:
+            if room in self.completed_rooms:
+                return
+            self.completed_rooms.add(room)
+            remaining = []
+            for expected, waiter in self.waiters:
+                if len(self.completed_rooms) >= expected:
+                    if not waiter.done():
+                        waiter.set_result(None)
+                else:
+                    remaining.append((expected, waiter))
+            self.waiters[:] = remaining
+
+    def wait_for(self, expected: int) -> Future[None]:
+        waiter: Future[None] = Future()
+        with self.lock:
+            if len(self.completed_rooms) >= expected:
+                waiter.set_result(None)
+            else:
+                self.waiters.append((expected, waiter))
+        return waiter
+
+    def discard(self, waiter: Future[None]) -> None:
+        with self.lock:
+            self.waiters[:] = [entry for entry in self.waiters if entry[1] is not waiter]
+
+
+def _parent_results(client: PSClient) -> _ParentResults:
+    with _PARENT_RESULTS_CREATION_LOCK:
+        tracker = getattr(client, "_p0_parent_results", None)
+        if tracker is None:
+            tracker = _ParentResults()
+            client._p0_parent_results = tracker  # type: ignore[attr-defined]
+        return tracker
+
+
+async def wait_for_parent_results(client: PSClient, expected: int) -> None:
+    """Wait until the server has published the requested number of Bo3 results."""
+    if expected < 0:
+        raise ValueError("Expected parent result count must be non-negative")
+    tracker = _parent_results(client)
+    waiter = tracker.wait_for(expected)
+    try:
+        await asyncio.wrap_future(waiter)
+    finally:
+        tracker.discard(waiter)
 
 
 class _InactivePokemonFilter(logging.Filter):
@@ -119,17 +179,68 @@ def _restore_leppa_pp(battle: DoubleBattle, event: list[str]) -> None:
     move._current_pp = min(move._current_pp + restoration, move.max_pp)
 
 
+def _form_baselines(battle: DoubleBattle) -> dict[Pokemon, str]:
+    """Track Showdown's baseSpecies, which poke-env does not retain across forms."""
+    baselines = getattr(battle, "_p0_form_baselines", None)
+    if baselines is None:
+        baselines = {}
+        battle._p0_form_baselines = baselines  # type: ignore[attr-defined]
+    return baselines
+
+
 def _parse_message(self: DoubleBattle, split_message: list[str]):
     event_type = split_message[1] if len(split_message) >= 2 else None
     # Best-of rooms send this UI-only notification to the child battle room.
     # It is not a battle event and poke-env 0.15 raises NotImplementedError for it.
     if event_type in {"tempnotify", "tempnotifyoff"}:
         return None
+    outgoing = None
+    fainted = None
+    original_size = None
+    baselines = _form_baselines(self)
+    if event_type in {"switch", "drag", "replace"} and len(split_message) >= 3:
+        identifier = split_message[2]
+        role = identifier[:2]
+        slot = identifier[2:3]
+        if role in {"p1", "p2"} and slot in {"a", "b"}:
+            active = (
+                self.active_pokemon if role == self.player_role else self.opponent_active_pokemon
+            )
+            outgoing = active[0 if slot == "a" else 1]
+            if outgoing is not None:
+                captured = getattr(self, "_p0_transform_targets", {}).get(id(outgoing))
+                if captured is not None:
+                    original_size = (captured.original_height, captured.original_weight)
+    elif event_type == "faint" and len(split_message) >= 3:
+        fainted = self.get_pokemon(split_message[2])
+        captured = getattr(self, "_p0_transform_targets", {}).get(id(fainted))
+        if captured is not None:
+            original_size = (captured.original_height, captured.original_weight)
     capture_message(
         self,
         split_message,
         capture_protocol_line=_capture_protocol_lines,
     )
+    transferred_boosts: dict[str, int] | None = None
+    transferred_effects: dict[Effect, int] = {}
+    if event_type == "replace" and outgoing is not None:
+        transferred_boosts = dict(outgoing.boosts)
+        transferred_effects = dict(outgoing.effects)
+    if event_type == "switch" and len(split_message) >= 6:
+        causes = tuple(to_id_str(part.removeprefix("[from]")) for part in split_message[5:])
+        baton_pass = "batonpass" in causes or "movebatonpass" in causes
+        shed_tail = "moveshedtail" in causes or "shedtail" in causes
+        if baton_pass or shed_tail:
+            if outgoing is not None:
+                if baton_pass:
+                    transferred_boosts = dict(outgoing.boosts)
+                    transferred_effects = {
+                        effect: value
+                        for effect, value in outgoing.effects.items()
+                        if to_id_str(effect.name) in COPYABLE_VOLATILES
+                    }
+                elif Effect.SUBSTITUTE in outgoing.effects:
+                    transferred_effects = {Effect.SUBSTITUTE: outgoing.effects[Effect.SUBSTITUTE]}
     if event_type == "-copyboost" and len(split_message) >= 4:
         self._replay_data.append(split_message[:])
         receiver = self.get_pokemon(split_message[2])
@@ -152,16 +263,49 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
             target_reference = split_message[3]
         if target_reference != split_message[3]:
             split_message = [*split_message[:3], target_reference, *split_message[4:]]
-    return _ORIGINAL_PARSE_MESSAGE(self, split_message)
+    if event_type == "-formechange" and len(split_message) >= 4:
+        current = self.get_pokemon(split_message[2])
+        baselines.setdefault(current, current.species)
+    result = _ORIGINAL_PARSE_MESSAGE(self, split_message)
+    if fainted is not None:
+        # Showdown clears volatiles on faint; poke-env only clears a subset.
+        fainted.switch_out(self.fields)
+    if event_type in {"switch", "drag", "replace", "detailschange"} and len(split_message) >= 4:
+        current = self.get_pokemon(split_message[2])
+        baselines[current] = current.species
+    if event_type == "-start" and len(split_message) >= 5 and split_message[3] == "typeadd":
+        target = self.get_pokemon(split_message[2])
+        added_type = PokemonType.from_name(split_message[4])
+        current_types = target.types
+        if added_type not in current_types:
+            target._temporary_types = [*current_types, added_type]
+    cleared = fainted
+    if cleared is None and event_type in {"switch", "drag"}:
+        cleared = outgoing
+    if cleared is not None:
+        if original_size is not None:
+            cleared._heightm, cleared._weightkg = original_size
+        base_form = baselines.get(cleared)
+        if base_form is not None and cleared.species != base_form:
+            cleared.forme_change(base_form)
+    if transferred_boosts is not None or transferred_effects:
+        incoming = self.get_pokemon(split_message[2])
+        if transferred_boosts is not None:
+            incoming.boosts = transferred_boosts
+        incoming.effects.update(transferred_effects)
+    return result
 
 
 async def _handle_message(self: PSClient, message: str):
     # Showdown sends the Bo3 parent room as >game-bestof..., while poke-env only
     # understands >battle rooms and otherwise indexes a non-existent protocol field.
     if message.startswith(">game-"):
+        parent_room, _, body = message.partition("\n")
+        parent_room = parent_room[1:]
         if "I'm ready!</button>" in message:
-            parent_room = message.split("\n", 1)[0][1:]
             await self.send_message(f"/msgroom {parent_room},/confirmready")
+        if any(line.startswith("|win|") or line == "|tie" for line in body.splitlines()):
+            _parent_results(self).record(parent_room)
         return None
     return await _ORIGINAL_HANDLE_MESSAGE(self, message)
 

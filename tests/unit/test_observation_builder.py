@@ -383,9 +383,19 @@ class TestObservationBuilder:
         # Ally Side Token (index 13)
         assert obs.token_type_ids[TOKEN_IDX_ALLY_SIDE] == TokenType.FIELD
         assert obs.numerical[TOKEN_IDX_ALLY_SIDE, 4] == 1.0  # Ally mega available
-
-        # Opponent Side Token (index 14)
         assert obs.token_type_ids[TOKEN_IDX_OPPONENT_SIDE] == TokenType.FIELD
+        assert obs.numerical[TOKEN_IDX_OPPONENT_SIDE, 4] == 0.0
+
+    def test_opponent_mega_stone_does_not_claim_move_legality(self) -> None:
+        """An opponent's stone does not provide a request-backed Mega option."""
+        opponent = make_pokemon_view(species="mrrime", item="skarmorite")
+        battle = make_battle_view(
+            opponent_active_pokemon=[opponent, None], opponent_team=[opponent]
+        )
+
+        obs = _OBSERVATION_BUILDER.build(battle)
+
+        assert obs.numerical[6, NUM_IDX_CAN_MEGA] == 0.0
         assert obs.numerical[TOKEN_IDX_OPPONENT_SIDE, 4] == 0.0
 
     def test_effect_overflow_is_counted_and_enforced(self) -> None:

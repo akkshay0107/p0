@@ -13,6 +13,7 @@ from p0.replays.identity import ReplayMemberId, ReplaySide
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.decisions import build_decision_view
 from p0.replays.reconstruction.events import parse_protocol_events
+from p0.replays.reconstruction.projection import project_battle_view
 from p0.replays.reconstruction.resolution import resolve_protocol_events
 from p0.replays.reconstruction.state import (
     normalize_dynamic_effect,
@@ -314,7 +315,7 @@ class TestReconstructionState:
         ).require_accepted()[-1]
         assert final.member(ReplayMemberId(ReplaySide.P1, 0)).current_form == "Alpha-Mega"
 
-    def test_faint_preserves_transient_form(self) -> None:
+    def test_faint_restores_transient_form(self) -> None:
         p1 = _ots(
             ReplaySide.P1,
             ("Morpeko", "Pikachu", "Conkeldurr", "Gliscor", "Talonflame", "Cofagrigus"),
@@ -347,7 +348,21 @@ class TestReconstructionState:
         fainted = snapshots[-1].member(morpeko_id)
 
         assert fainted.fainted
-        assert fainted.current_form == "Morpeko-Hangry"
+        assert fainted.current_form == "Morpeko"
+
+    def test_faint_preserves_permanent_form(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|detailschange|p1a: Alpha|Alpha-Mega, L50",
+            "|-damage|p1a: Alpha|0 fnt",
+            "|faint|p1a: Alpha",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+
+        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).current_form == "Alpha-Mega"
 
     def test_mega_marks_the_side_as_having_mega_evolved(self) -> None:
         events = _resolved(
@@ -433,6 +448,19 @@ class TestReconstructionState:
 
         assert snapshots[-1].weather == ()
         assert snapshots[-1].fields == ()
+
+    def test_new_terrain_replaces_previous_terrain_without_fieldend(self) -> None:
+        events = _resolved(
+            "|-fieldstart|move: Gravity",
+            "|-fieldstart|move: Misty Terrain",
+            "|-fieldstart|move: Psychic Terrain",
+        )
+
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+
+        assert {name for name, _ in snapshots[-1].fields} == {"gravity", "psychicterrain"}
 
     def test_source_shaped_item_status_hp_transitions(self) -> None:
         events = _resolved(
@@ -711,6 +739,37 @@ class TestReconstructionState:
 
         assert earthquake.current_pp == earthquake.max_pp - 1
 
+    def test_single_target_move_does_not_charge_allied_pressure(self) -> None:
+        dex = default_runtime_resources().dex
+        p1 = _ots(
+            ReplaySide.P1,
+            ("Mew", "Mewtwo", "Pikachu", "Garchomp", "Incineroar", "Gholdengo"),
+            moves=("Helping Hand",),
+        )
+        p1 = replace(
+            p1,
+            members=tuple(
+                replace(member, ability="Pressure") if member.nickname == "Mewtwo" else member
+                for member in p1.members
+            ),
+        )
+        p2 = _ots(
+            ReplaySide.P2,
+            ("Charizard", "Rotom-Wash", "Tyranitar", "Excadrill", "Gallade", "Basculegion"),
+        )
+        sheets = (p1, p2)
+        events = _resolved(
+            "|switch|p1a: Mew|Mew, L50|100/100",
+            "|switch|p1b: Mewtwo|Mewtwo, L50|100/100",
+            "|switch|p2a: Charizard|Charizard, L50|100/100",
+            "|move|p1a: Mew|Helping Hand|p1b: Mewtwo",
+            ots=sheets,
+        )
+
+        final = reduce_replay_state("state-test", sheets, events, dex=dex).require_accepted()[-1]
+        move = final.member(ReplayMemberId(ReplaySide.P1, 0)).moves[0]
+        assert move.current_pp == move.max_pp - 1
+
     def test_named_pp_effects_follow_emitted_move_and_amount(self) -> None:
         dex = _dex()
         moves = cast(list[dict[str, object]], dex["moves"])
@@ -928,6 +987,7 @@ class TestReconstructionState:
             "|-transform|p1a: Alpha|Golf",
             "|detailschange|p2a: Golf|Golf-Mega, L50",
             "|move|p1a: Alpha|Tackle|p2a: Golf",
+            "|-start|p1a: Alpha|typechange|Water|[from] move: Soak",
             "|switch|p1a: Charlie|Charlie, L50|100/100",
         )
 
@@ -949,8 +1009,24 @@ class TestReconstructionState:
         assert tackle.current_pp == 4
         assert copied.source_member_id == ReplayMemberId(ReplaySide.P2, 0)
         assert snapshots[5].member(alpha_id).base_stats[0][1] != copied.non_hp_base_stats[0][1]
-        assert snapshots[6].member(alpha_id).transform is None
-        assert tuple(move.move_id for move in snapshots[6].member(alpha_id).moves) == (
+        changed = snapshots[6]
+        assert changed.member(alpha_id).current_types == ("Water",)
+        decision = build_decision_view(
+            changed,
+            _complete_ots()[0],
+            0,
+            (),
+            preview=False,
+            dex=_dex(),
+        )
+        view = project_battle_view(
+            changed, _complete_ots(), perspective=0, decision=decision, dex=_dex()
+        )
+        assert view.active_pokemon[0] is not None
+        assert tuple(value.name for value in view.active_pokemon[0].types) == ("Water",)
+        assert snapshots[7].member(alpha_id).transform is None
+        assert snapshots[7].member(alpha_id).current_types == ("Normal",)
+        assert tuple(move.move_id for move in snapshots[7].member(alpha_id).moves) == (
             "protect",
             "mimic",
         )

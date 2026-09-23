@@ -1,0 +1,135 @@
+{
+  "active": [
+    {
+      "moves": [
+        {
+          "move": "Dive",
+          "id": "dive"
+        }
+      ],
+      "trapped": true
+    },
+    {
+      "moves": [
+        {
+          "move": "Spicy Extract",
+          "id": "spicyextract",
+          "pp": 13,
+          "maxpp": 16,
+          "target": "normal",
+          "disabled": false
+        },
+        {
+          "move": "Fire Blast",
+          "id": "fireblast",
+          "pp": 3,
+          "maxpp": 8,
+          "target": "normal",
+          "disabled": false
+        }
+      ]
+    }
+  ],
+  "side": {
+    "name": "StressRandomB",
+    "id": "p2",
+    "pokemon": [
+      {
+        "ident": "p2: Espeon",
+        "details": "Espeon, L50, F",
+        "condition": "143/144",
+        "active": true,
+        "stats": {
+          "atk": 77,
+          "def": 108,
+          "spa": 154,
+          "spd": 120,
+          "spe": 142
+        },
+        "moves": [
+          "drainingkiss",
+          "charm",
+          "imprison",
+          "copycat"
+        ],
+        "baseAbility": "synchronize",
+        "item": "charizarditex",
+        "pokeball": "pokeball",
+        "ability": "synchronize",
+        "commanding": false,
+        "reviving": false
+      },
+      {
+        "ident": "p2: Scovillain",
+        "details": "Scovillain, L50, F",
+        "condition": "0 fnt",
+        "active": true,
+        "stats": {
+          "atk": 158,
+          "def": 89,
+          "spa": 147,
+          "spd": 92,
+          "spe": 95
+        },
+        "moves": [
+          "spicyextract",
+          "fireblast"
+        ],
+        "baseAbility": "moody",
+        "item": "lucarionite",
+        "pokeball": "pokeball",
+        "ability": "moody",
+        "commanding": false,
+        "reviving": false
+      },
+      {
+        "ident": "p2: Trevenant",
+        "details": "Trevenant, L50, M",
+        "condition": "0 fnt",
+        "active": false,
+        "stats": {
+          "atk": 124,
+          "def": 98,
+          "spa": 98,
+          "spd": 113,
+          "spe": 101
+        },
+        "moves": [
+          "shadowball",
+          "raindance"
+        ],
+        "baseAbility": "harvest",
+        "item": "metronome",
+        "pokeball": "pokeball",
+        "ability": "harvest",
+        "commanding": false,
+        "reviving": false
+      },
+      {
+        "ident": "p2: Milotic",
+        "details": "Milotic, L50, M",
+        "condition": "0 fnt",
+        "active": false,
+        "stats": {
+          "atk": 92,
+          "def": 100,
+          "spa": 121,
+          "spd": 149,
+          "spe": 116
+        },
+        "moves": [
+          "icywind",
+          "brutalswing",
+          "icebeam"
+        ],
+        "baseAbility": "marvelscale",
+        "item": "banettite",
+        "pokeball": "pokeball",
+        "ability": "marvelscale",
+        "commanding": false,
+        "reviving": false
+      }
+    ]
+  },
+  "rqid": 33
+}

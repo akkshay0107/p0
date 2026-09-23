@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
 
+import orjson
 import pytest
 import torch
 
@@ -242,6 +244,45 @@ class TestReplayInputContract:
 
         assert parse_replay_payload(payload).outcome.end_reason is GameEndReason.TIMEOUT
 
+    def test_terminal_result_rejects_a_second_result_or_battle_event(self) -> None:
+        payload = sample_replay_payload("input-conflicting-terminal")
+        for suffix in ("|win|Bob", "|tie", "|win|Alice", "|turn|99"):
+            invalid = {**payload, "log": f"{payload['log']}\n{suffix}"}
+            with pytest.raises(ReplayInputContractError, match="after terminal result"):
+                compile_payloads((invalid,), chunksize=0)
+
+        trailing_display = {
+            **payload,
+            "log": f"{payload['log']}\n|t:|1700000000\n|message|Battle ended.",
+        }
+        assert len(compile_payloads((trailing_display,), chunksize=0).games) == 1
+
+    def test_colliding_player_names_are_rejected_and_audited(self, tmp_path: Path) -> None:
+        invalid = sample_replay_payload("input-colliding-players", players=("Alice", "A lice"))
+        with pytest.raises(ReplayInputContractError, match="distinct players"):
+            parse_replay_payload(invalid)
+
+        valid = sample_replay_payload("input-valid-neighbor")
+        result = compile_payloads((valid,), chunksize=0)
+        invalid_hash = hashlib.sha256(
+            orjson.dumps(invalid, option=orjson.OPT_SORT_KEYS)
+        ).hexdigest()
+        published = write_tensor_shards(
+            result,
+            tmp_path,
+            external_rejections={"input-colliding-players": invalid_hash},
+            created_at="2026-01-01T00:00:00Z",
+        )
+        manifest = published.manifest
+        assert manifest.source_games == 2
+        assert manifest.accepted_games == 1
+        assert manifest.rejected_games == 1
+        assert set(manifest.raw_replays) == {
+            "input-colliding-players",
+            "input-valid-neighbor",
+        }
+        assert manifest.raw_replays["input-colliding-players"] == invalid_hash
+
     def test_malformed_metadata_and_complete_compile_contract_raise_named_errors(self) -> None:
         payload = sample_replay_payload("input-invalid")
         with pytest.raises(ReplayInputContractError, match="game_number"):
@@ -321,11 +362,10 @@ class TestReplayInputContract:
         payload = sample_replay_payload("chat-response")
         payload["log"] = "\n".join(
             [
-                str(payload["log"]),
+                str(payload["log"]).replace("|win|Alice", "|turn|2\n|win|Alice"),
                 "|c|☆Alice|!dt sharp break",
                 "'sharp break' has no exact match. Approximate match:",
                 "|c|☆Alice|/raw <ul>Sharp Beak</ul>",
-                "|turn|2",
             ]
         )
 

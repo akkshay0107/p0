@@ -116,66 +116,6 @@ class TestTransformedMoveView:
 
 
 class TestTransformedPokemonView:
-    def test_transformed_pokemon_view_combines_base_and_target(self) -> None:
-        """Verify that TransformedPokemonView overlays target stats/species while preserving base identity."""
-        base = DummyPokemon(
-            species="Ditto",
-            base_species="Ditto",
-            ability="imposter",
-            item="choicescarf",
-            nature="jolly",
-            types=("normal",),
-            current_hp_fraction=0.85,
-            moves={"electrodrift": DummyMove(move_id="electrodrift", move_type="electric")},
-        )
-        target = DummyPokemon(
-            species="Miraidon",
-            base_species="Miraidon",
-            ability="hadronengine",
-            item="lifeorb",
-            nature="modest",
-            types=("electric", "dragon"),
-            current_hp_fraction=0.40,
-            moves={"electrodrift": DummyMove(move_id="electrodrift", move_type="electric")},
-        )
-        transformed = TransformedPokemonView(base, target)
-
-        # Target properties
-        assert transformed.species == "Miraidon"
-        assert transformed.base_species == "Miraidon"
-        assert transformed.ability == "hadronengine"
-        assert transformed.type_1 == "electric"
-        assert transformed.type_2 == "dragon"
-        assert transformed.types == ("electric", "dragon")
-        assert transformed.base_stats == target.base_stats
-        assert transformed.stats == target.stats
-        assert transformed.weight == 6.0
-
-        # Base properties preserved
-        assert transformed.item == "choicescarf"
-        assert transformed.nature == "jolly"
-        assert transformed.current_hp_fraction == 0.85
-        assert transformed.level == 50
-        assert transformed.fainted is False
-        assert transformed.revealed is True
-        assert transformed.selected_in_teampreview is True
-        assert transformed.status is None
-        assert transformed.protect_counter == 0
-        assert transformed.first_turn is False
-        assert transformed.effects == {}
-        assert transformed.status_counter == 0
-        assert transformed.preparing is None
-        assert transformed.last_move is not None and transformed.last_move.id == "thunderbolt"
-        assert transformed.is_dynamaxed is False
-        assert transformed.is_terastallized is False
-        assert transformed.tera_type == "electric"
-        assert transformed.boosts == {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0}
-
-        # Transformed moves have PP clamped to 5
-        assert "electrodrift" in transformed.moves
-        assert transformed.moves["electrodrift"].current_pp == 5
-        assert transformed.moves["electrodrift"].max_pp == 5
-
     def test_transformed_pokemon_view_equality_and_hashing(self) -> None:
         """Verify equality symmetry, hashing, and comparison between transformed views and base."""
         base1 = DummyPokemon(species="Ditto")

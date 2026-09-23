@@ -25,6 +25,7 @@ from p0.replays.schema import OTSData, OTSMember
 _BOOST_NAMES = ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
 _STATUS_NAMES = frozenset({"brn", "frz", "par", "psn", "slp", "tox"})
 _STACKING_SIDE_CONDITIONS = frozenset({"spikes", "toxicspikes"})
+_TERRAIN_FIELDS = frozenset({"electricterrain", "grassyterrain", "mistyterrain", "psychicterrain"})
 # These four are emitted through -singleturn but are side conditions in the
 # simulator. Other ally-side conditions remain governed by the generated dex.
 _SIDE_GUARDS = frozenset({"craftyshield", "matblock", "quickguard", "wideguard"})
@@ -922,7 +923,7 @@ class _StateReducer:
         member.hp_fraction = 0.0
         member.fainted = True
         member.status = None
-        self._clear_battle_state(member, reset_form=False)
+        self._clear_battle_state(member, reset_form=True)
         self.active.pop(key)
 
     def _handle_move(self, resolved: ResolvedProtocolEvent) -> None:
@@ -1009,6 +1010,7 @@ class _StateReducer:
         return sum(
             normalize_showdown_id(self._current_ability(self.members[member_id])) == "pressure"
             for member_id in target_ids
+            if member_id.side is not source.member_id.side
         )
 
     def _schedule_delayed_move(
@@ -1461,6 +1463,7 @@ class _StateReducer:
             added_type=target_added_type,
         )
         member.boosts = dict(target.boosts)
+        member.current_types = target_types
 
     def _transform_target(
         self,
@@ -1825,7 +1828,10 @@ class _StateReducer:
     def _handle_minus_fieldstart(self, resolved: ResolvedProtocolEvent) -> None:
         effect = _required_effect(resolved).normalized
         self._validate_effect(effect, "field")
-        self.fields.setdefault(effect, self.turn)
+        if effect in _TERRAIN_FIELDS:
+            for terrain in _TERRAIN_FIELDS:
+                self.fields.pop(terrain, None)
+        self.fields[effect] = self.turn
 
     def _handle_minus_fieldend(self, resolved: ResolvedProtocolEvent) -> None:
         effect = _required_effect(resolved).normalized

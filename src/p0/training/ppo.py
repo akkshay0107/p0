@@ -344,6 +344,7 @@ def ppo_update(
 
             minibatch_steps = 0
             minibatch_kl = metric_zero.clone()
+            minibatch_metrics = torch.zeros_like(metric_totals)
             expected_minibatch_steps = sum(ep.length for ep in minibatch)
             should_skip = False
             cancelled = False
@@ -368,12 +369,13 @@ def ppo_update(
                     magnet_cache,
                 )
 
-                metric_totals += batch_metrics
+                minibatch_metrics += batch_metrics
                 minibatch_kl += batch_metrics[KL_METRIC_INDEX]
                 minibatch_steps += batch_steps
 
                 scaled_loss = batch_loss / expected_minibatch_steps
-                if bool(torch.isfinite(scaled_loss).item()):
+                chunk_is_finite = torch.isfinite(scaled_loss) & torch.isfinite(batch_metrics).all()
+                if bool(chunk_is_finite.item()):
                     scaler.scale(scaled_loss).backward()
                 else:
                     LOGGER.warning(
@@ -428,7 +430,8 @@ def ppo_update(
                 scaler.update()
                 if grad_norm_finite:
                     num_updates += 1
-            tot_steps += minibatch_steps
+                    metric_totals += minibatch_metrics
+                    tot_steps += minibatch_steps
 
     # No subsequent work consumes these gradients. Clear the final minibatch
     # gradient storage before the next rollout begins.

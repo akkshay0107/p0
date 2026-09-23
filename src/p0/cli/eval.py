@@ -146,7 +146,6 @@ def main(argv: list[str] | None = None) -> int:
             else f"Baseline:{args.opponent}"
         ),
         "teams_path": str(teams_path.resolve()) if teams_path else None,
-        "split": args.split or "default",
         "checkpoints": {
             "policy_a_sha256": (
                 hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()

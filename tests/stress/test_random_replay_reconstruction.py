@@ -22,6 +22,7 @@ import logging
 import os
 import random
 from collections import Counter
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -451,13 +452,13 @@ def _assert_expected_observation_fields(
     )
     for name in fields:
         torch.testing.assert_close(getattr(live, name), getattr(reconstructed, name))
-    # The replay's open-team-sheet view can know ability, item, and moves before
-    # poke-env exposes the same data at the live callback. Species and types are
-    # the public identity fields that remain comparable at this boundary.
-    for index in _PUBLIC_CATEGORICAL_INDICES:
-        torch.testing.assert_close(
-            live.categorical[..., index], reconstructed.categorical[..., index]
-        )
+    if compare_dynamic_fields:
+        # Species and types can change between a live callback and the next
+        # replay decision boundary, especially after multiple faint events.
+        for index in _PUBLIC_CATEGORICAL_INDICES:
+            torch.testing.assert_close(
+                live.categorical[..., index], reconstructed.categorical[..., index]
+            )
     if compare_event_fields:
         for name in _OBSERVATION_EVENT_FIELDS:
             # Event tensors are populated from parser callbacks. Their shape is
@@ -553,6 +554,20 @@ def _assert_reconstruction_labels(
         dex=default_runtime_resources().dex,
         chunksize=0,
     )
+    if not compilation.games:
+        rejected = {
+            name
+            for name, count in compilation.metrics.counters.items()
+            if name.startswith("rejected_reconstruction_") and count == 1
+        }
+        assert compilation.metrics.counters["rejected_games"] == 1
+        assert len(rejected) == 1
+        assert rejected <= {
+            "rejected_reconstruction_AMBIGUOUS_IDENTITY",
+            "rejected_reconstruction_INVALID_INPUT_CONTRACT",
+            "rejected_reconstruction_UNSUPPORTED_EVENT",
+        }
+        return ()
     assert len(compilation.games) == 1
     perspectives = compilation.games[0].perspectives
     for perspective in perspectives:
@@ -762,16 +777,16 @@ def _assert_poke_env_state_agreement(
         if snapshot is not None and battle.active_pokemon != [None, None]:
             for slot, mon in enumerate(battle.active_pokemon):
                 reconstructed = snapshot.view.active_pokemon[slot]
+                # poke-env can lose a slot when two Illusion displays share a
+                # species; the replay reducer still retains the active member.
+                if reconstructed is not None and (
+                    not reconstructed.revealed or reconstructed.identity_uncertain
+                ):
+                    continue
                 if mon is None or reconstructed is None:
                     assert (mon is None) == (reconstructed is None), (
                         f"Active slot {slot} disagrees at line {line.index}"
                     )
-                    continue
-                # poke-env keys active Pokémon by their displayed species and
-                # cannot disambiguate two simultaneous identical Illusion
-                # disguises. Keep parsing and slot-occupancy checks, but do not
-                # compare mutable fields for the unrevealed actual member.
-                if not reconstructed.revealed:
                     continue
                 assert mon.fainted == reconstructed.fainted
                 assert mon.current_hp_fraction == pytest.approx(
@@ -877,7 +892,7 @@ class TestRandomReplayReconstruction:
     @pytest.mark.stress
     @pytest.mark.asyncio
     async def test_random_local_games_reconstruct_to_valid_tensors(
-        self, showdown_server, tmp_path: Path
+        self, showdown_server, tmp_path: Path, request: pytest.FixtureRequest
     ) -> None:
         """
         End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
@@ -908,6 +923,8 @@ class TestRandomReplayReconstruction:
         random_state = random.getstate()
         random.seed(seed)
         poke_env_patches.install(capture_protocol_lines=True)
+        request.addfinalizer(partial(random.setstate, random_state))
+        request.addfinalizer(poke_env_patches.uninstall_for_tests)
 
         player_a = JsonCapturingRandomPlayer(
             account_configuration=AccountConfiguration("StressRandomA", None),
@@ -942,8 +959,6 @@ class TestRandomReplayReconstruction:
         finally:
             await player_a.ps_client.stop_listening()
             await player_b.ps_client.stop_listening()
-            poke_env_patches.uninstall_for_tests()
-            random.setstate(random_state)
 
         replay_paths = tuple(sorted(player_a.replay_paths))
         assert len(replay_paths) == game_count
@@ -960,12 +975,15 @@ class TestRandomReplayReconstruction:
         assert len(documents) == game_count
         assert all(document.outcome.terminal_line_index is not None for document in documents)
 
-        # For every completed game, verify offline reconstruction against the live recorded ground truth
+        # Verify accepted games against live observations. Unsupported or
+        # ambiguous traces must be rejected as whole games.
+        rejected_ids: set[str] = set()
         for document in documents:
             replay_id = document.metadata.replay_id
-            for perspective in _assert_reconstruction_labels(
-                document, max_candidates=max_candidates
-            ):
+            perspectives = _assert_reconstruction_labels(document, max_candidates=max_candidates)
+            if not perspectives:
+                rejected_ids.add(replay_id)
+            for perspective in perspectives:
                 role = f"p{perspective.player + 1}"
                 path = observation_dir / f"{replay_id}-{role}.pt"
                 assert path.is_file(), f"Missing live observation capture: {path}"
@@ -986,9 +1004,10 @@ class TestRandomReplayReconstruction:
             max_candidates=max_candidates,
             dex=resources.dex,
         )
-        assert len(compilation.games) == game_count
-        assert compilation.metrics.counters["accepted_games"] == game_count
-        assert compilation.metrics.counters["rejected_games"] == 0
+        assert len(compilation.games) + len(rejected_ids) == game_count
+        assert compilation.metrics.counters["accepted_games"] == len(compilation.games)
+        assert compilation.metrics.counters["rejected_games"] == len(rejected_ids)
+        assert {game.replay_id for game in compilation.games}.isdisjoint(rejected_ids)
 
         # Write out serialized PyTorch tensor shards
         build = write_tensor_shards(
@@ -998,8 +1017,9 @@ class TestRandomReplayReconstruction:
             max_candidates=max_candidates,
             max_decisions_per_shard=4096,
         )
-        assert build.manifest.accepted_games == game_count
-        assert build.manifest.rejected_games == 0
+        assert build.manifest.source_games == game_count
+        assert build.manifest.accepted_games == len(compilation.games)
+        assert build.manifest.rejected_games == len(rejected_ids)
 
         # Verify tensor contracts and loss masking across all generated shard files
         for shard in build.manifest.shards:

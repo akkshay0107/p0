@@ -178,6 +178,7 @@ async def run_bot(
 
     try:
         await bot_player.accept_challenges(args.opponent, args.challenge_limit)
+        await poke_env_patches.wait_for_parent_results(bot_player.ps_client, args.challenge_limit)
     except asyncio.CancelledError:
         logger.info("Bot listener received cancellation.")
     finally:

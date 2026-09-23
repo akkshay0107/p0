@@ -25,6 +25,7 @@ from p0.battle.actions import (
     encode_action,
     team_selection,
 )
+from p0.runtime.poke_env_battle_adapter import action_move_slots
 
 
 def action_to_order(
@@ -99,7 +100,7 @@ def action_to_single_order(
             order = Player.create_order(move, mega=semantic.mega)
 
         else:
-            moves = tuple(active.moves.values())
+            moves = action_move_slots(battle, position)
             try:
                 move = moves[semantic.move_slot]
             except IndexError as error:
@@ -192,7 +193,7 @@ def single_order_to_action(
     if len(available) == 1 and available[0].id in {"struggle", "recharge"}:
         return np.int64(MEGA_FORCED_ACTION if order.mega else FORCED_ACTION)
 
-    move_slot = tuple(active.moves).index(order.order.id)
+    move_slot = tuple(move.id for move in action_move_slots(battle, position)).index(order.order.id)
     return np.int64(
         encode_action(
             SlotAction(

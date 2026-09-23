@@ -36,6 +36,7 @@ from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save, atomic_torch_save
 from p0.replays.group import GroupedSeries, GroupingResult, group_replays
+from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import (
     ReplayDocument,
     ReplayInputContractError,
@@ -279,7 +280,9 @@ def _perspective_tensors(
         overrides: dict[Any, tuple[int, int, int, int, int, int] | None] = {}
         for pokemon in (*snapshot.view.team.values(), *snapshot.view.opponent_team.values()):
             try:
-                overrides[pokemon] = stat_overrides[pokemon.member_id]
+                overrides[pokemon] = (
+                    None if pokemon.identity_uncertain else stat_overrides[pokemon.member_id]
+                )
             except KeyError as exc:
                 raise ValueError("Replay stats are missing a roster member") from exc
         observation = builder.build(snapshot.view, overrides)
@@ -388,6 +391,11 @@ def write_tensor_shards(
         external_rejections=external_rejections,
     )
     rejected = dict(external_rejections or {})
+    retained_ids = {
+        document.metadata.replay_id for group in result.series for document in group.games
+    }
+    if retained_ids.intersection(rejected):
+        raise ValueError("Rejected replay ids overlap parsed source replay ids")
     identities = (
         *_raw_replay_identities(result),
         *(
@@ -789,7 +797,6 @@ def _compile_worker(
 
     if state.diagnostics:
         return None, state.diagnostics[0].category
-
     decisions = tuple(
         reconstruct_decisions_from_trace(
             document,
@@ -842,7 +849,15 @@ def compile_documents(
 ) -> CompilationResult:
     """Compile documents through event resolution, state reduction, decisions, and projection."""
     docs = tuple(documents)
+    replay_ids = [document.metadata.replay_id for document in docs]
+    if len(set(replay_ids)) != len(replay_ids):
+        raise ReplayInputContractError("Compilation input contains duplicate replay ids")
     for document in docs:
+        players = tuple(normalize_showdown_id(name) for name in document.metadata.player_names)
+        if not all(players) or players[0] == players[1]:
+            raise ReplayInputContractError(
+                f"Replay {document.metadata.replay_id!r} must name two distinct players"
+            )
         _validate_compile_input(document)
         if format_id is not None and document.metadata.format_id != format_id:
             raise ReplayInputContractError(
@@ -855,7 +870,9 @@ def compile_documents(
     counters = _initial_compilation_counters(grouping)
     failed_series: set[str] = set()
     for group in grouping.series:
-        blocking_codes = {d.code for d in group.diagnostics if d.code in _BLOCKING_SERIES_DIAGNOSTICS}
+        blocking_codes = {
+            d.code for d in group.diagnostics if d.code in _BLOCKING_SERIES_DIAGNOSTICS
+        }
         if blocking_codes:
             failed_series.add(group.record.series_id)
             for code in blocking_codes:

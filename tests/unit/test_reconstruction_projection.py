@@ -3,28 +3,165 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 from poke_env.battle import DoubleBattle
 
+from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CAT_IDX_STAT_PROVENANCE,
+    NUM_IDX_CAN_MEGA,
+    NUM_IDX_LEGALITY_UNKNOWN,
     StatProvenance,
 )
 from p0.replays.compile import compile_documents, compile_payloads, write_tensor_shards
 from p0.replays.protocol import parse_replay_payload
-from p0.replays.reconstruction.projection import impute_replay_stats
+from p0.replays.reconstruction.projection import impute_replay_stats, project_battle_view
+from p0.replays.reconstruction.resolution import resolve_replay_events
+from p0.replays.reconstruction.state import AbilityState, reduce_replay_state
 from tests.unit.replay_fixtures import decision_payload, golden_replay_payload
 
 _GOLDEN_REPLAY_DIRECTORY = (
     Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
 )
+_REPLAY_FIXTURE_DIRECTORY = Path(__file__).parents[1] / "fixtures" / "replays"
+_ILLUSION_REPLAY = _REPLAY_FIXTURE_DIRECTORY / "gen9championsvgc2026regmbbo3-2670656566.json"
+_STATE_REPLAY = _REPLAY_FIXTURE_DIRECTORY / "gen9championsvgc2026regmbbo3-2641278886.json"
 
 
 class TestReconstructionProjection:
+    def test_later_illusion_identity_cannot_change_prior_observation(self) -> None:
+        path = _ILLUSION_REPLAY
+        document = parse_replay_payload(path.read_bytes())
+        resources = default_runtime_resources()
+        events = resolve_replay_events(document, dex=resources.dex).require_accepted()
+        original = reduce_replay_state(
+            document.metadata.replay_id,
+            document.ots,
+            events,
+            dex=resources.dex,
+            snapshot_line_indices=(111,),
+        ).require_accepted()[0]
+        hidden_id = original.sides[1].active[0]
+        assert hidden_id is not None
+        hidden = original.member(hidden_id)
+        altered = replace(
+            hidden,
+            original_species="Zoroark",
+            current_form="Zoroark",
+            nature="Bold",
+            item="Choice Scarf",
+            ability=AbilityState("mystery"),
+            base_types=("Dark",),
+            current_types=("Dark",),
+            base_stats=tuple((name, 1) for name, _ in hidden.base_stats),
+            weight=1000.0,
+            moves=(),
+        )
+        changed = replace(
+            original,
+            members=tuple(
+                altered if member.member_id == hidden_id else member for member in original.members
+            ),
+        )
+        compiled = compile_payloads((path.read_bytes(),), chunksize=0)
+        decision = next(
+            item.view.decision
+            for item in compiled.games[0].perspectives[0].snapshots
+            if item.pre_line_index == 112
+        )
+        first_view = project_battle_view(
+            original, document.ots, perspective=0, decision=decision, dex=resources.dex
+        )
+        second_view = project_battle_view(
+            changed, document.ots, perspective=0, decision=decision, dex=resources.dex
+        )
+        builder = ObservationBuilder(resources)
+        first = builder.build(first_view)
+        second = builder.build(second_view)
+        for left, right in zip(first.tensors(), second.tensors(), strict=True):
+            torch.testing.assert_close(left, right)
+
+    def test_unrevealed_illusion_uses_displayed_public_fields(self) -> None:
+        path = _ILLUSION_REPLAY
+        result = compile_payloads((path.read_bytes(),), chunksize=0)
+        perspective = result.games[0].perspectives[0]
+        snapshot = next(
+            snapshot
+            for snapshot in perspective.snapshots
+            if any(
+                mon is not None and mon.identity_uncertain
+                for mon in snapshot.view.opponent_active_pokemon
+            )
+        )
+        disguised = snapshot.view.opponent_active_pokemon[0]
+        assert disguised is not None
+        assert disguised.species == "Venusaur"
+        assert disguised.base_species == "Venusaur"
+        assert disguised.ability == "unknown"
+        assert tuple(disguised.moves) == ()
+        assert tuple(value.name for value in disguised.types) == ("Grass", "Poison")
+        own_snapshot = next(
+            item
+            for item in result.games[0].perspectives[1].snapshots
+            if item.pre_line_index == snapshot.pre_line_index
+        )
+        own_active = own_snapshot.view.active_pokemon[0]
+        assert own_active is not None
+        assert own_active.species == "Zoroark-Hisui"
+
+        observation = ObservationBuilder(default_runtime_resources()).build(snapshot.view)
+        assert observation.numerical[6, 6].item() == pytest.approx(80 / 160)
+        assert observation.numerical[6, 26].item() == 0.0
+        assert observation.numerical[6, NUM_IDX_CAN_MEGA].item() == 0.0
+        assert observation.numerical[6, NUM_IDX_LEGALITY_UNKNOWN].item() == 1.0
+        assert observation.categorical[6, 5:9].count_nonzero().item() == 0
+
+    def test_illusion_does_not_replace_a_known_bench_member(self) -> None:
+        path = _ILLUSION_REPLAY
+        document = parse_replay_payload(path.read_bytes())
+        resources = default_runtime_resources()
+        events = resolve_replay_events(document, dex=resources.dex).require_accepted()
+        state = reduce_replay_state(
+            document.metadata.replay_id,
+            document.ots,
+            events,
+            dex=resources.dex,
+            snapshot_line_indices=(111,),
+        ).require_accepted()[0]
+        known_venusaur = state.sides[1].active[1]
+        assert known_venusaur is not None
+        bench_side = replace(state.sides[1], active=(state.sides[1].active[0], None))
+        bench_state = replace(state, sides=(state.sides[0], bench_side))
+        compiled = compile_payloads((path.read_bytes(),), chunksize=0)
+        decision = next(
+            item.view.decision
+            for item in compiled.games[0].perspectives[0].snapshots
+            if item.pre_line_index == 112
+        )
+
+        view = project_battle_view(
+            bench_state,
+            document.ots,
+            perspective=0,
+            decision=decision,
+            dex=resources.dex,
+        )
+
+        displayed = view.opponent_active_pokemon[0]
+        assert displayed is not None and displayed.identity_uncertain
+        assert displayed.species == "Venusaur"
+        bench = next(
+            member for member in view.opponent_team.values() if member.member_id == known_venusaur
+        )
+        assert bench.species == "Venusaur"
+        assert bench.revealed
+        assert not bench.identity_uncertain
+
     def test_production_compiler_projects_both_perspectives_from_one_compilation(self) -> None:
         result = compile_payloads((decision_payload(),), chunksize=0)
 
@@ -102,6 +239,10 @@ class TestReconstructionProjection:
         provenance = artifact["tensors"]["categorical"][:, :12, CAT_IDX_STAT_PROVENANCE]
         assert torch.all(provenance == int(StatProvenance.UNKNOWN))
 
+    @pytest.mark.skipif(
+        not tuple(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")),
+        reason="local golden replay corpus is not present",
+    )
     def test_golden_corpus_retains_only_resolved_illusion_histories(self) -> None:
         paths = tuple(sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")))
         documents = tuple(parse_replay_payload(path.read_bytes()) for path in paths)
@@ -120,7 +261,7 @@ class TestReconstructionProjection:
         )
 
     def test_state_matches_independent_poke_env_cursors(self) -> None:
-        path = sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json"))[0]
+        path = _STATE_REPLAY
         document = parse_replay_payload(path.read_bytes())
         result = compile_payloads((document.raw_payload,), chunksize=0)
         assert len(result.games) == 1

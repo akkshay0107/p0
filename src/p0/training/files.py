@@ -223,6 +223,18 @@ class TrainingRun:
         self, step: int, values: Mapping[str, Any], board: Mapping[str, Mapping[str, float | int]]
     ) -> None:
         """Record one completed training step and send its scalars to TensorBoard."""
+        if any(
+            not isinstance(phase, str)
+            or not isinstance(metrics, Mapping)
+            or any(
+                not isinstance(name, str)
+                or type(value) not in (int, float)
+                or not math.isfinite(value)
+                for name, value in metrics.items()
+            )
+            for phase, metrics in board.items()
+        ):
+            raise ValueError("Checkpoint board metrics must contain named finite scalars")
         self.state["metrics"].append(
             {
                 **values,

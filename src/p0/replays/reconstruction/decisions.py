@@ -430,8 +430,19 @@ def _observed_actions(
     tags: list[str] = []
     mega_slots: set[tuple[ReplaySide, int]] = set()
     generated_slots: set[tuple[ReplaySide, int]] = set()
+    encored_before_action: set[tuple[ReplaySide, int]] = set()
     for event in events:
         parsed = event.event
+        if parsed.tag == "-start" and len(parsed.arguments) >= 2:
+            actor = _reference(event, 0)
+            if (
+                actor is not None
+                and actor.pokemon_ref.active_slot is not None
+                and normalize_showdown_id(parsed.arguments[1]) == "encore"
+            ):
+                slot = actor.pokemon_ref.active_slot
+                if actor.pokemon_ref.side.side_index == perspective and observed[slot] is None:
+                    encored_before_action.add((actor.pokemon_ref.side, slot))
         if parsed.tag == "-mega":
             actor = _reference(event, 0)
             if actor is not None and actor.member_id is not None:
@@ -459,6 +470,9 @@ def _observed_actions(
         key = (actor.pokemon_ref.side, slot)
 
         if parsed.tag == "move":
+            if key in encored_before_action:
+                tags.append("mid_turn_encore_override")
+                continue
             if key in generated_slots:
                 generated_slots.remove(key)
                 tags.append("externally_generated_move")

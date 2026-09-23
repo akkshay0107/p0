@@ -40,6 +40,15 @@ def prepare_series_context(
         state = working_states.get(window.series_key)
         if state is None:
             state = store.planning_state(window.series_key)
+            state = (
+                state[0],
+                state[1],
+                tuple(
+                    fragment.to(device=target_tokens.device, dtype=target_tokens.dtype)
+                    for fragment in state[2]
+                ),
+                state[3],
+            )
             working_states[window.series_key] = state
 
         prior_rows: list[int] = []
@@ -50,7 +59,7 @@ def prepare_series_context(
                 row = len(histories)
                 history_rows[identity] = row
                 histories.append(
-                    prior_tokens.detach().to(
+                    prior_tokens.to(
                         device=target_tokens.device,
                         dtype=target_tokens.dtype,
                     )
@@ -155,6 +164,8 @@ def _pack_series_context(
         device=reference.device,
     )
     return (
-        torch.repeat_interleave(window_tokens, window_lengths, dim=0),
-        torch.repeat_interleave(series_mask, window_lengths, dim=0),
+        torch.repeat_interleave(
+            window_tokens, window_lengths, dim=0, output_size=reference.size(0)
+        ),
+        torch.repeat_interleave(series_mask, window_lengths, dim=0, output_size=reference.size(0)),
     )

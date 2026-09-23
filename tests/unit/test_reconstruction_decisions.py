@@ -7,6 +7,7 @@ import json
 import pytest
 
 from p0.model.resources import default_runtime_resources
+from p0.replays.compile import compile_payloads
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.decisions import (
     BoundaryKind,
@@ -17,7 +18,7 @@ from p0.replays.reconstruction.decisions import (
 from p0.replays.reconstruction.events import parse_replay_events
 from p0.replays.reconstruction.resolution import resolve_protocol_events
 from p0.replays.reconstruction.state import reduce_replay_state
-from tests.unit.replay_fixtures import decision_payload
+from tests.unit.replay_fixtures import decision_payload, sample_replay_payload
 
 
 def _decision_view_with_ots(
@@ -216,3 +217,31 @@ class TestDecisionTargets:
 
         assert result.decisions[-1].evidence.candidates
         assert "externally_generated_move" not in result.decisions[-1].evidence.tags
+
+    def test_mid_turn_encore_keeps_original_submitted_move_possible(self) -> None:
+        payload = sample_replay_payload("encore-override")
+        payload["log"] = str(payload["log"]).replace(
+            "|move|p1b: Eevee|Tackle|p2b: Charmander",
+            "|-start|p1b: Eevee|Encore\n|move|p1b: Eevee|Tackle|p2b: Charmander",
+        )
+
+        result = compile_payloads((payload,), chunksize=0)
+
+        assert result.metrics.counters["accepted_games"] == 1
+        affected = result.games[0].perspectives[0].decisions[-1]
+        assert (9, 13) in affected.evidence.candidates
+        assert (9, 11) in affected.evidence.candidates
+
+    def test_encore_after_actor_does_not_erase_observed_choice(self) -> None:
+        payload = sample_replay_payload("encore-after-actor")
+        payload["log"] = str(payload["log"]).replace(
+            "|move|p1b: Eevee|Tackle|p2b: Charmander",
+            "|move|p1b: Eevee|Tackle|p2b: Charmander\n|-start|p1b: Eevee|Encore",
+        )
+
+        result = compile_payloads((payload,), chunksize=0)
+
+        affected = result.games[0].perspectives[0].decisions[-1]
+        assert "mid_turn_encore_override" not in affected.evidence.tags
+        assert (9, 11) in affected.evidence.candidates
+        assert (9, 13) not in affected.evidence.candidates

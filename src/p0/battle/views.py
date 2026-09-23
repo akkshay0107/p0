@@ -127,7 +127,7 @@ class PokemonView(Protocol):
 
 
 class TransformedMoveView:
-    """Move view for a transformed Pokemon with PP clamped to 5."""
+    """Move view for a transformed Pokemon with its own five-PP move pool."""
 
     __slots__ = ("_base",)
 
@@ -148,7 +148,8 @@ class TransformedMoveView:
 
     @property
     def current_pp(self) -> int | None:
-        return 5
+        pp = self._base.current_pp
+        return None if pp is None else min(pp, 5)
 
     @property
     def max_pp(self) -> int | None:
@@ -166,16 +167,20 @@ class TransformedMoveView:
 class TransformedPokemonView:
     """Pokemon view overlay representing the target species while retaining user identity."""
 
-    __slots__ = ("_base", "_target", "_transformed_moves")
+    __slots__ = ("_base", "_target", "_transformed_moves", "_original_base_hp")
 
     def __init__(
         self,
         base: PokemonView,
         target: PokemonView,
+        original_base_hp: int | None = None,
     ) -> None:
         self._base = base
         self._target = target
         self._transformed_moves = {k: TransformedMoveView(v) for k, v in base.moves.items()}
+        self._original_base_hp = (
+            base.base_stats["hp"] if original_base_hp is None else original_base_hp
+        )
 
     def __hash__(self) -> int:
         return hash(self._base)
@@ -213,11 +218,11 @@ class TransformedPokemonView:
 
     @property
     def type_1(self) -> Any:
-        return self._target.type_1
+        return self._base.type_1
 
     @property
     def type_2(self) -> Any:
-        return self._target.type_2
+        return self._base.type_2
 
     @property
     def status(self) -> Any:
@@ -225,11 +230,15 @@ class TransformedPokemonView:
 
     @property
     def base_stats(self) -> Mapping[str, int]:
-        return self._target.base_stats
+        return {**self._target.base_stats, "hp": self._original_base_hp}
 
     @property
     def stats(self) -> Mapping[str, int | None] | None:
-        return self._target.stats
+        target_stats = self._target.stats
+        own_stats = self._base.stats
+        if target_stats is None:
+            return own_stats
+        return {**target_stats, "hp": None if own_stats is None else own_stats.get("hp")}
 
     @property
     def boosts(self) -> Mapping[str, int]:
@@ -299,8 +308,8 @@ class TransformedPokemonView:
 
     @property
     def types(self) -> Sequence[Any]:
-        """Expose the transformed target's effective types to move-target logic."""
-        return self._target.types
+        """Expose type changes applied after Transform to move-target logic."""
+        return self._base.types
 
 
 class FieldView(Protocol):

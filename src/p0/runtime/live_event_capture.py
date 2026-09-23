@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from copy import deepcopy
+from typing import NamedTuple
 
 from poke_env.battle import DoubleBattle, Pokemon
 
@@ -12,6 +13,13 @@ from p0.model.tokenizer import tokenizer
 from p0.replays.identity import normalize_showdown_id
 
 _EMPTY_SPATIAL_TURN = tuple(SpatialSlotRecord() for _ in range(SPATIAL_SLOT_COUNT))
+
+
+class CapturedTransform(NamedTuple):
+    target: Pokemon
+    original_base_hp: int
+    original_height: float
+    original_weight: float
 
 
 def _recorder_for(battle: DoubleBattle) -> SpatialTurnRecorder:
@@ -106,7 +114,9 @@ def capture_message(
                 targets = {}
                 battle._p0_transform_targets = targets  # type: ignore[attr-defined]
             # Keep the copied form independent of later target changes.
-            targets[id(base)] = deepcopy(target)
+            targets[id(base)] = CapturedTransform(
+                deepcopy(target), base.base_stats["hp"], base.height, base.weight
+            )
         except (AssertionError, IndexError, KeyError, ValueError):
             pass
 

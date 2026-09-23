@@ -9,7 +9,11 @@ from poke_env.battle import DoubleBattle
 
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.battle.views import TransformedPokemonView
-from p0.runtime.live_event_capture import captured_protocol_lines, last_move, spatial_turn
+from p0.runtime.live_event_capture import (
+    captured_protocol_lines,
+    last_move,
+    spatial_turn,
+)
 
 
 class PokeEnvBattleView:
@@ -143,6 +147,37 @@ class PokeEnvBattleView:
 _VIEWS: WeakKeyDictionary[DoubleBattle, PokeEnvBattleView] = WeakKeyDictionary()
 
 
+class _CalledMoveView:
+    """Show a sole called continuation in the action move slot for this request."""
+
+    __slots__ = ("_pokemon", "moves", "is_transformed")
+
+    def __init__(self, pokemon: Any, move: Any) -> None:
+        self._pokemon = pokemon
+        self.moves = {move.id: move}
+        self.is_transformed = isinstance(pokemon, TransformedPokemonView)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pokemon, name)
+
+    def __hash__(self) -> int:
+        return hash(self._pokemon)
+
+    def __eq__(self, other: Any) -> bool:
+        return self._pokemon == getattr(other, "_pokemon", other)
+
+
+def action_move_slots(battle: DoubleBattle, position: int) -> tuple[Any, ...]:
+    """Return move slots used by the current action request."""
+    active = battle.active_pokemon[position]
+    if active is None:
+        return ()
+    available = battle.available_moves[position]
+    if len(available) == 1 and available[0].id not in active.moves:
+        return (available[0],)
+    return tuple(active.moves.values())
+
+
 def battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
     """Return refreshed PokeEnvBattleView for the specified battle instance."""
     view = current_battle_view(battle)
@@ -169,10 +204,18 @@ def _transformed_active_pokemon(
     for index, pokemon in enumerate(active_list):
         if pokemon is None:
             continue
-        target = targets.get(id(pokemon))
-        if target is None:
-            continue
-        active_list[index] = TransformedPokemonView(pokemon, target)
+        captured = targets.get(id(pokemon))
+        if captured is not None:
+            pokemon = TransformedPokemonView(
+                pokemon,
+                captured.target,
+                original_base_hp=captured.original_base_hp,
+            )
+        if not opponent:
+            available = battle.available_moves[index]
+            if len(available) == 1 and available[0].id not in pokemon.moves:
+                pokemon = _CalledMoveView(pokemon, available[0])
+        active_list[index] = pokemon
     return active_list
 
 

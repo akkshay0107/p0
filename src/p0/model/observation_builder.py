@@ -61,8 +61,14 @@ from p0.teams.stat_points import BaseStats, calculate_stats
 FORMAT_LEVEL = 50
 
 _DEFAULT_RESOURCES = default_runtime_resources()
-_MEGA_ITEMS = _DEFAULT_RESOURCES.mega_items
 _MEGA_FORMS = _DEFAULT_RESOURCES.mega_forms
+_MEGA_SPECIES_BY_ITEM = {
+    PokemonTokenizer.normalize_id(item["id"]): frozenset(
+        PokemonTokenizer.normalize_id(species) for species in item["megaStone"]
+    )
+    for item in _DEFAULT_RESOURCES.dex["items"]
+    if item.get("megaStone")
+}
 
 # Named after the poke-env protocol enums the adapters hand over; matching on
 # member names keeps this module free of the poke-env dependency itself.
@@ -318,20 +324,14 @@ def _is_mega_form(pokemon: PokemonView | None) -> bool:
 
 
 def _holds_mega_stone(pokemon: PokemonView | None) -> bool:
+    """Whether the held stone can Mega Evolve this Pokémon's original species."""
     if pokemon is None:
         return False
-    item = pokemon.item
-    return bool(
-        item and PokemonTokenizer.normalize_id(item) in _MEGA_ITEMS and not _is_mega_form(pokemon)
-    )
-
-
-def _can_mega(pokemon: PokemonView | None, battle: Any, active_idx: int | None = None) -> bool:
-    if pokemon is None:
+    if not pokemon.item or _is_mega_form(pokemon):
         return False
-    if active_idx is not None:
-        return battle.can_mega_evolve[active_idx]
-    return _holds_mega_stone(pokemon)
+    item = PokemonTokenizer.normalize_id(pokemon.item)
+    species = PokemonTokenizer.normalize_id(pokemon.base_species)
+    return species in _MEGA_SPECIES_BY_ITEM.get(item, ())
 
 
 def _side_mega_available(
@@ -341,7 +341,7 @@ def _side_mega_available(
     selected_allies: set[Any] | None = None,
 ) -> tuple[bool, bool]:
     """
-    Whether the side still holds a mega stone, and whether that is knowable.
+    Whether the side still has a compatible Mega Stone, and whether that is knowable.
 
     A replay cannot see an unbrought reserve's item, so a side whose only mega-stone
     holder has not been revealed reports unknown instead of a false negative.
@@ -491,8 +491,9 @@ def _pokemon_categorical_into(
     if isinstance(pokemon, TransformedPokemonView) or getattr(pokemon, "is_transformed", False):
         row[CAT_IDX_MECHANIC_STATE] = MechanicState.TRANSFORMED
     elif (
-        PokemonTokenizer.normalize_id(pokemon.ability or "") == "illusion"
-        and base_species_id != "zoroark"
+        cond == 1
+        and PokemonTokenizer.normalize_id(pokemon.ability or "") == "illusion"
+        and PokemonTokenizer.normalize_id(pokemon.species or "") != base_species_id
     ):
         row[CAT_IDX_MECHANIC_STATE] = MechanicState.ILLUSION_DISGUISED
     else:
@@ -556,9 +557,17 @@ def _pokemon_numeric_into(
     row[27] = pokemon.fainted
     row[28] = cond == 1
     row[29] = cond == 2
-    mega_known = active_idx is None or battle.decision.slots[active_idx].legality_known
-    row[NUM_IDX_CAN_MEGA] = _can_mega(pokemon, battle, active_idx) if mega_known else 0.0
+    identity_uncertain = bool(getattr(pokemon, "identity_uncertain", False))
+    row[NUM_IDX_CAN_MEGA] = (
+        float(battle.can_mega_evolve[active_idx])
+        if active_idx is not None
+        and not identity_uncertain
+        and battle.decision.slots[active_idx].legality_known
+        else 0.0
+    )
     row[31] = _is_mega_form(pokemon)
+    if identity_uncertain:
+        row[NUM_IDX_LEGALITY_UNKNOWN] = 1.0
 
     last_move_id = None
     custom_last_move = battle.last_move(pokemon)

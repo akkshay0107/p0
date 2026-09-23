@@ -4,10 +4,44 @@ import pytest
 import torch
 
 from p0.battle.series import SeriesPerspectiveKey
+from p0.model.architecture_contract import SERIES_TOKENS_PER_GAME
+from p0.training._bc_batch import BCGameWindow
+from p0.training._bc_history import prepare_series_context
 from p0.training.series_history import SeriesHistoryStore
 
 
 class TestSeriesHistory:
+    @pytest.mark.parametrize(
+        "device",
+        ["cpu", "meta", *(["cuda"] if torch.cuda.is_available() else [])],
+    )
+    def test_active_cpu_fragment_joins_current_batch_device(self, device: str) -> None:
+        key = SeriesPerspectiveKey("fragmented-series", 0)
+        store = SeriesHistoryStore(d_model=2)
+        saved = torch.tensor([[1.0, 2.0]])
+        store.append(key, 1, saved, is_game_end=False, is_series_end=False)
+        current = torch.ones((2, 2), device=device, requires_grad=True)
+        windows = (
+            BCGameWindow(key, 1, 0, 1, True, False),
+            BCGameWindow(key, 2, 1, 2, False, False),
+        )
+
+        context, mask = prepare_series_context(
+            store,
+            windows,
+            current,
+            lambda values, present: values[:, 1:2].repeat(1, SERIES_TOKENS_PER_GAME, 1),
+        )
+
+        assert context.device.type == device
+        assert mask.device.type == device
+        assert store.planning_state(key)[2][0].device.type == "cpu"
+        if device == "cpu":
+            context[1].sum().backward()
+            assert current.grad is not None
+            assert current.grad[0].abs().sum() > 0
+            assert current.grad[1].abs().sum() == 0
+
     def test_series_history_store_commits_fragments_and_keeps_snapshots_after_drop(self) -> None:
         store = SeriesHistoryStore(d_model=3)
         first = torch.ones(2, 3, requires_grad=True)

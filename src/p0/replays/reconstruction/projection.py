@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
 from p0.battle.events import SpatialSlotRecord, SpatialTurnRecorder
 from p0.battle.legality import DecisionView
+from p0.model.resources import default_runtime_resources
 from p0.model.tokenizer import tokenizer
 from p0.replays.identity import ReplayMemberId, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
@@ -20,10 +21,12 @@ from p0.replays.reconstruction.decisions import (
 )
 from p0.replays.reconstruction.resolution import ResolvedProtocolEvent
 from p0.replays.reconstruction.state import (
+    AbilityState,
     MoveState,
     ReconstructedReplayState,
     ReplayBattleState,
     ReplayPokemonState,
+    _maximum_pp,
 )
 from p0.replays.schema import DecisionRecord, DecisionType, OTSData, ReplayDiagnostics
 from p0.teams.spread_usage import cosmetic_forme_aliases, load_spread_table_file
@@ -31,9 +34,15 @@ from p0.teams.stat_points import BaseStats, calculate_stats
 
 _STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
 _IMPUTATION_SOURCE_VERSION = 1
-_DEX_INDEX_CACHE: tuple[Mapping[str, Any], dict[str, Mapping[str, Any]], dict[str, str]] | None = (
-    None
-)
+_DEX_INDEX_CACHE: (
+    tuple[
+        Mapping[str, Any],
+        dict[str, Mapping[str, Any]],
+        dict[str, Mapping[str, Any]],
+        dict[str, str],
+    ]
+    | None
+) = None
 
 
 def _enum_name(value: str) -> str:
@@ -105,6 +114,7 @@ class ReplayPokemonView:
     _effects: Mapping[ReplayNamedValue, int]
     _transformed: bool
     _boosts: Mapping[str, int] = field(default_factory=_FrozenMapping, repr=False, compare=False)
+    identity_uncertain: bool = False
 
     @property
     def species(self) -> str:
@@ -340,18 +350,19 @@ def _species_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 
 def _cached_dex_indexes(
     dex: Mapping[str, Any],
-) -> tuple[dict[str, Mapping[str, Any]], dict[str, str]]:
+) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]], dict[str, str]]:
     global _DEX_INDEX_CACHE
     if _DEX_INDEX_CACHE is None or _DEX_INDEX_CACHE[0] is not dex:
-        move_categories = {
-            normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): str(
-                entry.get("category", "")
-            )
+        moves = {
+            normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): entry
             for entry in dex.get("moves", ())
             if isinstance(entry, Mapping)
         }
-        _DEX_INDEX_CACHE = (dex, _species_index(dex), move_categories)
-    return _DEX_INDEX_CACHE[1], _DEX_INDEX_CACHE[2]
+        move_categories = {
+            move_id: str(entry.get("category", "")) for move_id, entry in moves.items()
+        }
+        _DEX_INDEX_CACHE = (dex, _species_index(dex), moves, move_categories)
+    return _DEX_INDEX_CACHE[1], _DEX_INDEX_CACHE[2], _DEX_INDEX_CACHE[3]
 
 
 def impute_replay_stats(
@@ -361,7 +372,7 @@ def impute_replay_stats(
 ) -> tuple[ReplayStatValue, ...]:
     """Estimate every OTS member exactly once, retaining explicit unknowns."""
     table = load_spread_table_file()
-    species, move_categories = _cached_dex_indexes(dex)
+    species, _, move_categories = _cached_dex_indexes(dex)
     estimates: list[ReplayStatValue] = []
     for sheet in document.ots:
         for member in sheet.members:
@@ -425,7 +436,7 @@ def _pokemon_view(
     if transform is not None:
         species = transform.species
         ability = transform.ability
-        types = transform.types
+        types = member.current_types
         base_species = transform.species
     elif perspective == member.member_id.side.side_index or not active or member.revealed:
         species = member.current_form
@@ -457,6 +468,168 @@ def _pokemon_view(
     )
 
 
+def _mask_hidden_illusion(
+    state: ReplayBattleState,
+    ots: tuple[OTSData, OTSData],
+    perspective: int,
+    views: dict[ReplayMemberId, ReplayPokemonView],
+    dex: Mapping[str, Any],
+) -> dict[ReplayMemberId, ReplayPokemonView]:
+    """
+    Keep later identity resolution out of an opponent's earlier view.
+
+    Arguments:
+      state: replay state at the current decision boundary
+      ots: public open team sheets for both sides
+      perspective: observing player's side index
+      views: roster views to replace when a disguise has a public match
+      dex: pinned species and move data for public roster fields
+
+    Returns:
+      active views that show the disguise without exposing the true member
+    """
+    opponent = 1 - perspective
+    active_ids = state.sides[opponent].active
+    hidden = tuple(
+        member_id
+        for member_id in active_ids
+        if member_id is not None
+        and not (member := state.member(member_id)).revealed
+        and normalize_showdown_id(member.displayed_species)
+        != normalize_showdown_id(member.current_form)
+    )
+    if not hidden:
+        return {}
+
+    species_index, move_index, _ = _cached_dex_indexes(dex)
+    hidden_ids = set(hidden)
+    assigned = {member_id for member_id in active_ids if member_id is not None} - hidden_ids
+    active_overrides: dict[ReplayMemberId, ReplayPokemonView] = {}
+    for member_id in hidden:
+        member = state.member(member_id)
+        displayed_id = normalize_showdown_id(member.displayed_species)
+        candidate = next(
+            (
+                ots_member
+                for ots_member in ots[opponent].members
+                if normalize_showdown_id(ots_member.species) == displayed_id
+                and ots_member.member_id not in assigned
+                and ots_member.member_id not in hidden_ids
+                and not state.member(ots_member.member_id).revealed
+            ),
+            None,
+        )
+        displayed_species = species_index.get(displayed_id)
+        if displayed_species is None:
+            raise ValueError("Illusion display species is absent from the pinned dex")
+        true_sheet = ots[opponent].members[member_id.roster_index]
+        true_species = species_index.get(normalize_showdown_id(true_sheet.species))
+        if true_species is None:
+            raise ValueError("Illusion member species is absent from the pinned dex")
+
+        display_stats = tuple(
+            (name, int(displayed_species["baseStats"][name])) for name in _STAT_NAMES
+        )
+        true_stats = tuple((name, int(true_species["baseStats"][name])) for name in _STAT_NAMES)
+        display_types = tuple(str(value) for value in displayed_species["types"])
+        true_types = tuple(str(value) for value in true_species["types"])
+        public_moves = []
+        for move_name in true_sheet.moves:
+            move_id = normalize_showdown_id(move_name)
+            move_data = move_index[move_id]
+            base_pp = int(move_data["pp"])
+            max_pp = _maximum_pp(move_data, base_pp)
+            public_moves.append(
+                MoveState(
+                    move_id,
+                    str(move_data.get("name", move_name)),
+                    str(move_data["type"]),
+                    str(move_data["category"]),
+                    str(move_data["target"]),
+                    max_pp,
+                    max_pp,
+                )
+            )
+        public_effects = tuple(
+            (name, count) for name, count in member.effects if name != "illusion"
+        )
+        public_effect_names = {name for name, _ in public_effects}
+        displayed_state = replace(
+            member,
+            member_id=member_id if candidate is None else candidate.member_id,
+            nickname=member.displayed_species if candidate is None else candidate.nickname,
+            original_species=str(displayed_species.get("baseSpecies", member.displayed_species)),
+            current_form=member.displayed_species,
+            displayed_species=member.displayed_species,
+            nature="",
+            item=None,
+            ability=AbilityState("unknown"),
+            base_types=display_types,
+            current_types=display_types,
+            base_stats=display_stats,
+            weight=float(displayed_species["weightkg"]),
+            moves=(),
+            effects=public_effects,
+            effect_variants=tuple(
+                pair for pair in member.effect_variants if pair[0] in public_effect_names
+            ),
+            effect_sources=tuple(
+                pair for pair in member.effect_sources if pair[0] in public_effect_names
+            ),
+            tera_type=None,
+            transform=None,
+            revealed=True,
+            selected=None,
+            last_move=None,
+        )
+        static_state = replace(
+            member,
+            nickname=true_sheet.nickname,
+            original_species=str(true_species.get("baseSpecies", true_sheet.species)),
+            current_form=true_sheet.species,
+            displayed_species=true_sheet.species,
+            nature=true_sheet.nature,
+            hp_fraction=None,
+            status=None,
+            item=true_sheet.item,
+            ability=AbilityState(true_sheet.ability or member.ability.base),
+            base_types=true_types,
+            current_types=true_types,
+            base_stats=true_stats,
+            weight=float(true_species["weightkg"]),
+            moves=tuple(public_moves),
+            boosts=tuple((name, 0) for name, _ in member.boosts),
+            effects=(),
+            effect_variants=(),
+            effect_sources=(),
+            perish_count=None,
+            tera_type=None,
+            terastallized=False,
+            transform=None,
+            revealed=False,
+            selected=None,
+            fainted=False,
+            active_turns=0,
+            status_counter=0,
+            protect_counter=0,
+            preparing=None,
+            last_move=None,
+            added_type=None,
+            dragoncheer_has_dragon_type=False,
+        )
+        displayed_view = replace(
+            _pokemon_view(displayed_state, perspective=perspective, active=True),
+            identity_uncertain=True,
+        )
+        if candidate is not None:
+            views[candidate.member_id] = displayed_view
+            assigned.add(candidate.member_id)
+        views[member_id] = _pokemon_view(static_state, perspective=perspective, active=False)
+        active_overrides[member_id] = displayed_view
+
+    return active_overrides
+
+
 def _named_mapping(values: Iterable[tuple[str, int]]) -> Mapping[ReplayNamedValue, int]:
     return _FrozenMapping({ReplayNamedValue(_enum_name(name)): value for name, value in values})
 
@@ -469,6 +642,7 @@ def project_battle_view(
     decision: DecisionView,
     spatial_turn: tuple[SpatialSlotRecord, ...] = (),
     preview: bool = False,
+    dex: Mapping[str, Any] | None = None,
 ) -> ReplayBattleView:
     """Project one immutable public snapshot into the observation-facing contract."""
     if perspective not in (0, 1):
@@ -485,6 +659,13 @@ def project_battle_view(
         )
         for member in state.members
     }
+    active_overrides = _mask_hidden_illusion(
+        state,
+        ots,
+        perspective,
+        views,
+        default_runtime_resources().dex if dex is None else dex,
+    )
     teams = tuple(
         _FrozenMapping(
             {
@@ -497,7 +678,10 @@ def project_battle_view(
         for side in (0, 1)
     )
     active = tuple(
-        tuple(views.get(member_id) if member_id is not None else None for member_id in side.active)
+        tuple(
+            active_overrides.get(member_id, views.get(member_id)) if member_id is not None else None
+            for member_id in side.active
+        )
         for side in state.sides
     )
     own_active = (active[perspective][0], active[perspective][1])
@@ -696,6 +880,7 @@ def project_replay_perspectives(
                         decision=decision_view,
                         spatial_turn=spatial[perspective][decision.pre_line_index],
                         preview=preview,
+                        dex=dex,
                     ),
                     spatial[perspective][decision.pre_line_index],
                     tuple(

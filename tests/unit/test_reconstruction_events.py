@@ -25,7 +25,7 @@ from p0.replays.schema import OTSData, OTSMember, ProtocolLine
 
 _GOLDEN_REPLAY = (
     Path(__file__).parents[2]
-    / "src/p0/replays/reconstruction/golden_replays"
+    / "tests/fixtures/replays"
     / "gen9championsvgc2026regmbbo3-2641278886.json"
 )
 
@@ -589,7 +589,6 @@ class TestReconstructionEvents:
         assert result.events == ()
         assert result.diagnostics[0].reason.startswith("unresolved_illusion:")
 
-    @pytest.mark.skipif(not _GOLDEN_REPLAY.is_file(), reason="local golden replay is not present")
     def test_local_golden_replay_is_classified_once_without_rejections(self) -> None:
         document = parse_replay_payload(_GOLDEN_REPLAY.read_bytes())
         result = parse_protocol_events(document.metadata.replay_id, document.protocol_lines)

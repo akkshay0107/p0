@@ -16,11 +16,33 @@ from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
 
 from p0.battle.views import TransformedPokemonView
+from p0.model.observation_builder import ObservationBuilder
+from p0.model.resources import default_runtime_resources
+from p0.model.structured_observation import NUM_IDX_EFFECT_COUNT
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_battle_adapter import battle_view
 
 
 class TestPokeEnvPatches:
+    def test_illusion_reveal_retains_boosts_on_actual_pokemon(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-test", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p1a: Cofagrigus", "Cofagrigus, L50, M", "100/100"])
+            battle.parse_message(["", "-unboost", "p1a: Cofagrigus", "spa", "1"])
+            battle.parse_message(["", "-start", "p1a: Cofagrigus", "confusion"])
+            battle.parse_message(["", "replace", "p1a: Zoroark", "Zoroark, L50, F"])
+
+            revealed = battle.active_pokemon[0]
+            assert revealed is not None
+            assert revealed.species == "zoroark"
+            assert revealed.boosts["spa"] == -1
+            assert Effect.CONFUSION in revealed.effects
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
     def test_cached_battle_view_does_not_keep_battle_alive(self) -> None:
         battle = DoubleBattle("weak-view-test", "Alice", logging.getLogger("test"), gen=9)
         view = battle_view(battle)
@@ -138,6 +160,299 @@ class TestPokeEnvPatches:
             assert "psychic" not in transformed.moves
             assert target is not None
             assert "psychic" in target.moves
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_transform_retains_original_hp_and_tracks_pp_and_type_changes(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("transform-state", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"],
+                ["", "switch", "p2a: Roserade", "Roserade, L50", "100/100"],
+                ["", "move", "p2a: Roserade", "Giga Drain", "p1a: Ditto"],
+                ["", "-transform", "p1a: Ditto", "Roserade", "[from] ability: Imposter"],
+            ):
+                battle.parse_message(event)
+
+            transformed = battle_view(battle).active_pokemon[0]
+            assert isinstance(transformed, TransformedPokemonView)
+            assert transformed.species == "roserade"
+            assert transformed.base_stats["hp"] == 48
+            assert transformed.base_stats["spa"] == 125
+            assert transformed.moves["gigadrain"].current_pp == 5
+
+            battle.parse_message(["", "move", "p1a: Ditto", "Giga Drain", "p2a: Roserade"])
+            assert battle_view(battle).active_pokemon[0].moves["gigadrain"].current_pp == 4
+
+            battle.parse_message(
+                ["", "-start", "p1a: Ditto", "typechange", "Water", "[from] move: Soak"]
+            )
+            current = battle_view(battle).active_pokemon[0]
+            assert tuple(value.name for value in current.types) == ("WATER",)
+            assert current.base_stats["hp"] == 48
+            observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
+            assert observation.numerical[0, 6].item() == pytest.approx(48 / 160)
+            assert observation.numerical[0, 19].item() == pytest.approx(4 / 5)
+
+            battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
+            battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
+            returned = battle_view(battle).active_pokemon[0]
+            assert not isinstance(returned, TransformedPokemonView)
+            assert returned.species == "ditto"
+            assert returned.weight == pytest.approx(4.0)
+            assert returned.height == pytest.approx(0.3)
+            assert tuple(returned.moves) == ("transform",)
+            returned_observation = ObservationBuilder(default_runtime_resources()).build(
+                battle_view(battle)
+            )
+            assert returned_observation.numerical[0, 25].item() == 0.0
+            assert observation.numerical[0, 25].item() == pytest.approx(0.2)
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_faint_clears_transformed_types_and_size(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("transform-faint", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"],
+                ["", "switch", "p2a: Grimmsnarl", "Grimmsnarl, L50", "100/100"],
+                ["", "-transform", "p1a: Ditto", "Grimmsnarl", "[from] ability: Imposter"],
+            ):
+                battle.parse_message(event)
+            ditto = battle.active_pokemon[0]
+            assert ditto is not None
+            assert [value.name for value in ditto.types] == ["DARK", "FAIRY"]
+
+            battle.parse_message(["", "faint", "p1a: Ditto"])
+
+            assert ditto.fainted
+            assert [value.name for value in ditto.types] == ["NORMAL"]
+            assert ditto.weight == pytest.approx(4.0)
+            assert ditto.height == pytest.approx(0.3)
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_baton_pass_transfers_boosts_before_switch_cleanup(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("baton-pass", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Beedrill", "Beedrill, L50", "100/100"],
+                ["", "-boost", "p1a: Beedrill", "atk", "3"],
+                ["", "-unboost", "p1a: Beedrill", "spd", "1"],
+                ["", "move", "p1a: Beedrill", "Baton Pass", "p1a: Beedrill"],
+                [
+                    "",
+                    "switch",
+                    "p1a: Crabominable",
+                    "Crabominable, L50",
+                    "100/100",
+                    "[from] Baton Pass",
+                ],
+            ):
+                battle.parse_message(event)
+
+            recipient = battle_view(battle).active_pokemon[0]
+            assert recipient.boosts["atk"] == 3
+            assert recipient.boosts["spd"] == -1
+            observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
+            assert observation.numerical[0, 12].item() == pytest.approx(3 / 6)
+            assert observation.numerical[0, 15].item() == pytest.approx(-1 / 6)
+
+            for event in (
+                ["", "switch", "p2a: Sylveon", "Sylveon, L50", "100/100"],
+                ["", "-unboost", "p2a: Sylveon", "atk", "1"],
+                ["", "-unboost", "p2a: Sylveon", "spe", "2"],
+                ["", "move", "p2a: Sylveon", "Baton Pass", "p2a: Sylveon"],
+                [
+                    "",
+                    "switch",
+                    "p2a: Garchomp",
+                    "Garchomp, L50",
+                    "100/100",
+                    "[from] Baton Pass",
+                ],
+            ):
+                battle.parse_message(event)
+            observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
+            assert observation.numerical[6, 12].item() == pytest.approx(-1 / 6)
+            assert observation.numerical[6, 16].item() == pytest.approx(-2 / 6)
+
+            battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
+            assert battle_view(battle).active_pokemon[0].boosts["atk"] == 0
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_shed_tail_transfers_substitute_without_boosts(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("shed-tail", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Cyclizar", "Cyclizar, L50", "100/100"],
+                ["", "-boost", "p1a: Cyclizar", "atk", "2"],
+                ["", "-start", "p1a: Cyclizar", "Substitute"],
+                ["", "move", "p1a: Cyclizar", "Shed Tail", "p1a: Cyclizar"],
+                [
+                    "",
+                    "switch",
+                    "p1a: Pikachu",
+                    "Pikachu, L50",
+                    "100/100",
+                    "[from] Shed Tail",
+                ],
+            ):
+                battle.parse_message(event)
+
+            recipient = battle_view(battle).active_pokemon[0]
+            assert recipient.boosts["atk"] == 0
+            assert Effect.SUBSTITUTE in recipient.effects
+            observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
+            assert observation.numerical[0, 12].item() == 0.0
+            assert observation.numerical[0, NUM_IDX_EFFECT_COUNT].item() == 1
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_forecast_form_resets_when_castform_switches_out(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("forecast-switch", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p2a: Castform", "Castform, L50", "100/100"],
+                ["", "-ability", "p2a: Castform", "Forecast"],
+                [
+                    "",
+                    "-formechange",
+                    "p2a: Castform",
+                    "Castform-Rainy",
+                    "[from] ability: Forecast",
+                ],
+            ):
+                battle.parse_message(event)
+            active = battle.opponent_active_pokemon[0]
+            assert active is not None
+            assert active.species == "castformrainy"
+
+            battle.parse_message(["", "switch", "p2a: Pikachu", "Pikachu, L50", "100/100"])
+
+            castform = battle.opponent_team["p2: Castform"]
+            assert castform.species == "castform"
+            assert castform.type_1.name == "NORMAL"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_hunger_switch_form_resets_when_morpeko_switches_out(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("morpeko-switch", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Morpeko", "Morpeko, L50", "100/100"],
+                ["", "-formechange", "p1a: Morpeko", "Morpeko-Hangry"],
+            ):
+                battle.parse_message(event)
+            active = battle.active_pokemon[0]
+            assert active is not None and active.species == "morpekohangry"
+
+            battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
+
+            morpeko = battle.team["p1: Morpeko"]
+            assert morpeko.species == "morpeko"
+            assert morpeko.type_1.name == "ELECTRIC"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_stance_change_form_resets_when_aegislash_switches_out(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("aegislash-switch", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Aegislash", "Aegislash, L50", "100/100"],
+                ["", "-formechange", "p1a: Aegislash", "Aegislash-Blade"],
+            ):
+                battle.parse_message(event)
+            aegislash = battle.active_pokemon[0]
+            assert aegislash is not None and aegislash.species == "aegislashblade"
+
+            battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
+
+            assert aegislash.species == "aegislash"
+            assert aegislash.type_1.name == "STEEL"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_unlisted_temporary_form_resets_when_switching_out(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("cherrim-switch", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Cherrim", "Cherrim, L50", "100/100"],
+                ["", "-formechange", "p1a: Cherrim", "Cherrim-Sunshine"],
+            ):
+                battle.parse_message(event)
+            cherrim = battle.active_pokemon[0]
+            assert cherrim is not None and cherrim.species == "cherrimsunshine"
+
+            battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
+
+            assert cherrim.species == "cherrim"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_permanent_form_persists_when_switching_out(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("palafin-switch", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Palafin", "Palafin, L50", "100/100"],
+                ["", "detailschange", "p1a: Palafin", "Palafin-Hero, L50"],
+            ):
+                battle.parse_message(event)
+            palafin = battle.active_pokemon[0]
+            assert palafin is not None and palafin.species == "palafinhero"
+
+            battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
+
+            assert palafin.species == "palafinhero"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_typeadd_updates_live_types_until_switch_out(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("typeadd-test", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Typhlosion", "Typhlosion, L50", "100/100"],
+                ["", "-start", "p1a: Typhlosion", "typeadd", "Ghost"],
+            ):
+                battle.parse_message(event)
+            typhlosion = battle.active_pokemon[0]
+            assert typhlosion is not None
+            assert [value.name for value in typhlosion.types] == ["FIRE", "GHOST"]
+
+            battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
+
+            assert [value.name for value in typhlosion.types] == ["FIRE"]
         finally:
             poke_env_patches.uninstall_for_tests()
 

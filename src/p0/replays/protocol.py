@@ -32,6 +32,29 @@ from p0.replays.schema import (
     ReplayOutcome,
 )
 
+_TRAILING_RESULT_TAGS = frozenset(
+    {
+        "",
+        "t:",
+        "message",
+        "-message",
+        "raw",
+        "html",
+        "uhtml",
+        "uhtmlchange",
+        "allowleave",
+        "inactive",
+        "inactiveoff",
+        "j",
+        "l",
+        "player",
+        "c",
+        "chat",
+        "c:",
+        "chatmsg",
+    }
+)
+
 
 class ReplayParseError(ValueError):
     """Raised when a response is not a supported public replay payload."""
@@ -407,10 +430,15 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
     terminal: int | None = None
     players = tuple(normalize_showdown_id(name) for name in metadata.player_names)
     pending_message_reason: GameEndReason | None = None
+    result_seen = False
     for line in lines:
         if len(line.parts) < 2:
             continue
         tag = line.parts[1]
+        if result_seen and tag not in _TRAILING_RESULT_TAGS:
+            raise ReplayInputContractError(
+                f"Battle event after terminal result at index {line.index}"
+            )
         if tag in {"message", "-message"}:
             text = "|".join(line.parts[2:]).casefold()
             if (
@@ -434,10 +462,13 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
                 raise ReplayInputContractError(
                     f"Win line names an unknown player at index {line.index}"
                 )
+            result_seen = True
         elif tag == "tie":
             if len(line.parts) != 2:
                 raise ReplayInputContractError(f"Malformed tie line at index {line.index}")
             terminal = line.index
+            winner = -1
+            result_seen = True
         elif tag == "forfeit":
             if len(line.parts) != 3 or not line.parts[2]:
                 raise ReplayInputContractError(f"Malformed forfeit line at index {line.index}")
@@ -504,6 +535,11 @@ def parse_replay_payload(
     """Parse one public replay response without applying future protocol lines."""
     value, raw = _as_object(payload)
     metadata = _metadata(value, replay_id, format_id)
+    players = tuple(normalize_showdown_id(name) for name in metadata.player_names)
+    if not all(players) or players[0] == players[1]:
+        raise ReplayInputContractError(
+            f"Replay {metadata.replay_id!r} must name two distinct players"
+        )
     lines = _protocol_lines(value.get("log"))
     metadata = _bestof_metadata(metadata, lines)
     return ReplayDocument(metadata, lines, _ots(lines), _outcome(metadata, lines), raw)
