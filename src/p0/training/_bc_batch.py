@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 from torch import Tensor
@@ -15,8 +16,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.replays.dataset import ReplayGameChunk
 
 
-@dataclass(frozen=True, slots=True)
-class BCGameWindow:
+class BCGameWindow(NamedTuple):
     """Compact identity and target span for one perspective-game window."""
 
     series_key: SeriesPerspectiveKey

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import torch
+from poke_env import ServerConfiguration
 
 from p0.evaluation.harness import EvaluationHarness, MatchupResult
 from p0.format_config import load_active_global_contract
@@ -117,13 +118,18 @@ def main(argv: list[str] | None = None) -> int:
     async def run() -> MatchupResult:
         logger.info("Starting local Showdown server on port %d...", args.port)
         with start_showdown_servers(1, ports=(args.port,)) as servers:
+            server = servers[0]
+            server_configuration = ServerConfiguration(
+                websocket_url=server.websocket_url,
+                authentication_url="https://play.pokemonshowdown.com/action.php?",
+            )
             return await harness.run_matchup(
                 name_a="PlayerCheckpoint" if policy_a else "RandomA",
                 policy_a=policy_a,
                 name_b=opponent_name,
                 policy_b=policy_b if policy_b is not None else args.opponent,
                 team_source=source,
-                server_configuration=servers[0],
+                server_configuration=server_configuration,
             )
 
     try:

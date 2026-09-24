@@ -8,11 +8,12 @@ import logging
 import math
 import random
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from poke_env import AccountConfiguration
+from poke_env import AccountConfiguration, ServerConfiguration
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 
@@ -138,7 +139,7 @@ def create_eval_player(
     team_rng: random.Random,
     team_source: TeamSource,
     battle_format: str,
-    server_configuration: Any,
+    server_configuration: ServerConfiguration,
     account_configuration: AccountConfiguration,
     max_concurrent_battles: int = 1,
     **kwargs: Any,
@@ -262,25 +263,15 @@ class EvaluationHarness:
         policy_a: PolicyNet | str | None,
         name_b: str,
         policy_b: PolicyNet | str | None,
-        team_category: str | TeamSource = "default",
-        team_source: TeamSource | Any = None,
-        server_configuration: Any = None,
+        *,
+        team_source: TeamSource,
+        server_configuration: ServerConfiguration,
+        team_category: str = "default",
     ) -> MatchupResult:
         """Run a matchup between two players on the given team source."""
-        source: Any
-        if hasattr(team_category, "sample"):
-            server_config = team_source
-            source = team_category
-            category = "default"
-        else:
-            category = str(team_category)
-            source = team_source
-            server_config = server_configuration
-
-        if not hasattr(source, "sample"):
-            raise TypeError(
-                f"Expected TeamSource with .sample() method, got {type(source).__name__}"
-            )
+        source = team_source
+        category = team_category
+        server_config = server_configuration
 
         logger.info(
             "Starting matchup: %s vs %s (%d episodes)",
@@ -291,29 +282,31 @@ class EvaluationHarness:
         rng_a = random.Random(self.rng.randint(0, 1_000_000))
         rng_b = random.Random(self.rng.randint(0, 1_000_000))
 
-        account_config_a = AccountConfiguration(f"evala{self.rng.randint(1000, 9999)}", None)
-        player_a = create_eval_player(
-            policy_a,
-            team_rng=rng_a,
-            team_source=source,
-            battle_format=self.format_id,
-            server_configuration=server_config,
-            account_configuration=account_config_a,
-            max_concurrent_battles=1,
-        )
+        async with AsyncExitStack() as stack:
+            account_config_a = AccountConfiguration(f"evala{self.rng.randint(1000, 9999)}", None)
+            player_a = create_eval_player(
+                policy_a,
+                team_rng=rng_a,
+                team_source=source,
+                battle_format=self.format_id,
+                server_configuration=server_config,
+                account_configuration=account_config_a,
+                max_concurrent_battles=1,
+            )
+            stack.push_async_callback(player_a.ps_client.stop_listening)
 
-        account_config_b = AccountConfiguration(f"evalb{self.rng.randint(1000, 9999)}", None)
-        player_b = create_eval_player(
-            policy_b,
-            team_rng=rng_b,
-            team_source=source,
-            battle_format=self.format_id,
-            server_configuration=server_config,
-            account_configuration=account_config_b,
-            max_concurrent_battles=1,
-        )
+            account_config_b = AccountConfiguration(f"evalb{self.rng.randint(1000, 9999)}", None)
+            player_b = create_eval_player(
+                policy_b,
+                team_rng=rng_b,
+                team_source=source,
+                battle_format=self.format_id,
+                server_configuration=server_config,
+                account_configuration=account_config_b,
+                max_concurrent_battles=1,
+            )
+            stack.push_async_callback(player_b.ps_client.stop_listening)
 
-        try:
             for _ in range(self.episodes_per_matchup):
                 expected = len(player_a.history) + 1
                 team_a = player_a.current_team_packed
@@ -322,9 +315,6 @@ class EvaluationHarness:
                 winner = await self._wait_for_series_completion(player_a, player_b, expected)
                 player_a.history.append((team_a, winner == player_a.username.casefold()))
                 player_b.history.append((team_b, winner == player_b.username.casefold()))
-        finally:
-            await player_a.ps_client.stop_listening()
-            await player_b.ps_client.stop_listening()
 
         if len(player_a.history) != len(player_b.history):
             raise RuntimeError("Evaluation players reported different series counts")

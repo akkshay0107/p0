@@ -69,6 +69,46 @@ class TestSwiGLUTransformerEncoder:
         assert torch.count_nonzero(partial_gradients[0][:, unreturned_row]) > 0
         assert torch.count_nonzero(partial_gradients[0][:, 0]) == 0
 
+    def test_unmasked_call_uses_concrete_all_false_mask(self) -> None:
+        torch.manual_seed(37)
+        encoder = SwiGLUTransformerEncoder(16, 4, 64, 2).double()
+        source = torch.randn(2, 7, 16, dtype=torch.float64, requires_grad=True)
+        padding = torch.zeros(2, 7, dtype=torch.bool)
+
+        output = encoder(source, padding)
+        output.sum().backward()
+
+        assert output.shape == (2, 7, 16)
+        assert source.grad is not None
+        assert torch.isfinite(source.grad).all()
+
+    def test_all_keys_excluded_returns_finite_output_with_gradients(self) -> None:
+        torch.manual_seed(41)
+        encoder = SwiGLUTransformerEncoder(16, 4, 64, 2)
+        source = torch.randn(2, 7, 16, requires_grad=True)
+        padding = torch.ones(2, 7, dtype=torch.bool)
+
+        output = encoder(source, padding, output_slice=slice(4, 7))
+        output.square().mean().backward()
+
+        assert output.shape == (2, 3, 16)
+        assert torch.isfinite(output).all()
+        assert source.grad is not None
+        assert torch.isfinite(source.grad).all()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in encoder.parameters()
+        )
+
+    def test_mask_is_required_and_must_be_boolean(self) -> None:
+        encoder = SwiGLUTransformerEncoder(16, 4, 64, 1)
+        source = torch.randn(2, 7, 16)
+
+        with pytest.raises(TypeError):
+            encoder(source)
+        with pytest.raises(ValueError, match="boolean tensor"):
+            encoder(source, torch.zeros(2, 7, dtype=torch.uint8))
+
     def test_selected_outputs_compile_without_graph_breaks(self) -> None:
         torch.manual_seed(31)
         encoder = SwiGLUTransformerEncoder(16, 4, 64, 2)

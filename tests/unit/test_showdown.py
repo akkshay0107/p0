@@ -10,30 +10,43 @@ import pytest
 from p0.runtime import showdown
 
 
+def _log_is_open(path: Path) -> bool:
+    path_stat = path.stat()
+    return any(
+        entry.stat() == path_stat
+        for entry in Path("/proc/self/fd").iterdir()
+        if entry.exists() and entry.is_symlink()
+    )
+
+
 class TestShowdown:
     def test_start_closes_log_when_process_creation_fails(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "showdown.log"
         server = showdown.ShowdownServer(
             8000,
             showdown_root=tmp_path / "missing",
-            log_path=tmp_path / "showdown.log",
+            log_path=log_path,
         )
 
         with pytest.raises(FileNotFoundError):
             server.start()
 
-        assert server._log_file is None
+        assert log_path.is_file()
+        assert not _log_is_open(log_path)
 
     def test_start_closes_log_when_process_arguments_are_invalid(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "invalid.log"
         server = showdown.ShowdownServer(
             8000,
             showdown_root=Path(f"{tmp_path}\0"),
-            log_path=tmp_path / "invalid.log",
+            log_path=log_path,
         )
 
         with pytest.raises(ValueError):
             server.start()
 
-        assert server._log_file is None
+        assert log_path.is_file()
+        assert not _log_is_open(log_path)
 
     @pytest.mark.network
     def test_loopback_port_allocator_returns_distinct_reusable_ports(self) -> None:

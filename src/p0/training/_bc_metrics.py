@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import NamedTuple
 
 import torch
 from torch import Tensor
@@ -17,8 +18,7 @@ from p0.replays.schema import LabelKind
 LOG_PROBABILITY_TOLERANCE = 1e-6
 
 
-@dataclass(frozen=True, slots=True)
-class BCObjective:
+class BCObjective(NamedTuple):
     """Loss and detached reporting values for one candidate-scored batch."""
 
     loss: Tensor

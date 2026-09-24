@@ -80,4 +80,5 @@ class DynamicSeriesResampler(nn.Module):
             key_padding_mask=~history_mask,
             need_weights=False,
         )
-        return self.self_attn(queries + compressed)
+        summary_padding = torch.zeros(queries.shape[:2], dtype=torch.bool, device=queries.device)
+        return self.self_attn(queries + compressed, summary_padding)

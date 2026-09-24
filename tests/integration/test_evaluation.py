@@ -254,13 +254,13 @@ class TestEvaluation:
                 seed=23,
                 port=parsed.port,
             ).run_matchup(
-                name_a,
-                policy_a,
-                name_b,
-                policy_b,
-                "fallback",
-                FixedTeamSource(DEFAULT_TEST_TEAM),
-                showdown_server,
+                name_a=name_a,
+                policy_a=policy_a,
+                name_b=name_b,
+                policy_b=policy_b,
+                team_category="fallback",
+                team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
+                server_configuration=showdown_server,
             )
         finally:
             poke_env_patches.uninstall_for_tests()
@@ -285,13 +285,13 @@ class TestEvaluation:
         try:
             harness = EvaluationHarness(episodes_per_matchup=2, seed=17, port=parsed.port)
             result = await harness.run_matchup(
-                "random-a",
-                None,
-                "random-b",
-                None,
-                "fallback",
-                FixedTeamSource(DEFAULT_TEST_TEAM),
-                showdown_server,
+                name_a="random-a",
+                policy_a=None,
+                name_b="random-b",
+                policy_b=None,
+                team_category="fallback",
+                team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
+                server_configuration=showdown_server,
             )
         finally:
             poke_env_patches.uninstall_for_tests()

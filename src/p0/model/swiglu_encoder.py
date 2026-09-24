@@ -111,10 +111,20 @@ class SwiGLUEncoderLayer(nn.Module):
     def _self_attention(
         self,
         x: torch.Tensor,
-        src_key_padding_mask: torch.Tensor | None = None,
+        src_key_padding_mask: torch.BoolTensor,
         output_slice: slice = slice(None),
     ) -> torch.Tensor:
         batch, sequence, _ = x.shape
+        if (
+            src_key_padding_mask.shape != (batch, sequence)
+            or src_key_padding_mask.dtype is not torch.bool
+            or src_key_padding_mask.device != x.device
+        ):
+            raise ValueError(
+                f"src_key_padding_mask must be a boolean tensor with shape {(batch, sequence)} "
+                f"on {x.device}; got {tuple(src_key_padding_mask.shape)} of "
+                f"{src_key_padding_mask.dtype} on {src_key_padding_mask.device}"
+            )
 
         qkv = self.qkv_proj(x)
         qkv = qkv.view(batch, sequence, 3, self.nhead, self.head_dim)
@@ -122,9 +132,8 @@ class SwiGLUEncoderLayer(nn.Module):
         q, k, v = qkv.unbind(0)
         q = q[:, :, output_slice]
 
-        attn_mask = None
-        if src_key_padding_mask is not None:
-            attn_mask = ~src_key_padding_mask.view(batch, 1, 1, sequence)
+        # src_key_padding_mask uses PyTorch padding-mask polarity: True excludes a key.
+        attn_mask = ~src_key_padding_mask.view(batch, 1, 1, sequence)
 
         x = F.scaled_dot_product_attention(
             q,
@@ -145,7 +154,7 @@ class SwiGLUEncoderLayer(nn.Module):
     def forward(
         self,
         src: torch.Tensor,
-        src_key_padding_mask: torch.Tensor | None = None,
+        src_key_padding_mask: torch.BoolTensor,
         *,
         output_slice: slice = slice(None),
     ) -> torch.Tensor:
@@ -160,7 +169,8 @@ class SwiGLUTransformerEncoder(nn.Module):
     """
     Stack encoder layers and apply a final RMS normalization.
 
-    Inputs use batch-first layout with an optional key padding mask.
+    Inputs use batch-first layout. src_key_padding_mask has shape
+    (batch, sequence), uses True=excluded polarity, and is always concrete.
     """
 
     def __init__(
@@ -202,7 +212,7 @@ class SwiGLUTransformerEncoder(nn.Module):
     def forward(
         self,
         src: torch.Tensor,
-        src_key_padding_mask: torch.Tensor | None = None,
+        src_key_padding_mask: torch.BoolTensor,
         *,
         output_slice: slice = slice(None),
     ) -> torch.Tensor:

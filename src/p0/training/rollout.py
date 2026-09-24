@@ -1,8 +1,7 @@
 """Self-play rollout collection with history memory."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import cast
+from typing import NamedTuple, cast
 
 import numpy as np
 import torch
@@ -42,8 +41,7 @@ def _terminal_action_mask(
     return mask
 
 
-@dataclass(frozen=True, slots=True)
-class _SeatRollout:
+class _SeatRollout(NamedTuple):
     trajectories: TrajectoryStorage
     series_tokens: SeriesTokenStore
     series_history: SeriesHistoryStore

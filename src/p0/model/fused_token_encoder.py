@@ -508,7 +508,10 @@ class FusedTokenEncoder(nn.Module):
             + self.event_slot_emb.weight
             + self.event_type_token
         )
-        return self.event_encoder(event_tokens)
+        event_padding = torch.zeros(
+            event_tokens.shape[:2], dtype=torch.bool, device=event_tokens.device
+        )
+        return self.event_encoder(event_tokens, event_padding)
 
     def _append_action_mask_token(
         self,
