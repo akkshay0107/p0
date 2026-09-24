@@ -73,14 +73,27 @@ STATEFUL_TRANSITION_TESTS = {
 
 def main() -> None:
     raw_inventory_path = DATA_ROOT / "showdown_raw_emission_inventory.json"
-    raw_entries = json.loads(raw_inventory_path.read_text(encoding="utf-8"))["entries"]
+    raw_inventory = json.loads(raw_inventory_path.read_text(encoding="utf-8"))
+    raw_entries = raw_inventory["entries"]
     source_by_tag = {}
     raw_witnesses = []
     for raw in raw_entries:
         tag = raw.get("tag")
         if tag and raw.get("reachability") != "excluded":
             source_by_tag.setdefault(tag, raw)
-        if raw.get("reachability") in {"reachable-potential", "reachable-resolved"}:
+        if raw.get("reachability") in {"reachable-potential", "reachable-resolved", "unresolved"}:
+            tags = ([tag] if tag is not None else raw.get("resolved_tags", []))
+            dispositions = {
+                CLASSIFICATION_REGISTRY[item].classification.value
+                for item in tags
+                if item in CLASSIFICATION_REGISTRY
+            }
+            if tags == [""]:
+                disposition = "no_state_change"
+            elif len(dispositions) == 1 and all(item in CLASSIFICATION_REGISTRY for item in tags):
+                disposition = next(iter(dispositions))
+            else:
+                disposition = "unresolved"
             raw_witnesses.append(
                 {
                     "id": f"{raw['path']}:{raw['line']}:{raw['call']}",
@@ -91,13 +104,7 @@ def main() -> None:
                     "resolved_tags": raw.get("resolved_tags", []),
                     "arguments": raw.get("arguments", []),
                     "reachability": raw["reachability"],
-                    "disposition": (
-                        CLASSIFICATION_REGISTRY[raw["tag"]].classification.value
-                        if raw.get("tag") in CLASSIFICATION_REGISTRY
-                        else CLASSIFICATION_REGISTRY[raw["resolved_tags"][0]].classification.value
-                        if raw.get("resolved_tags")
-                        else "no_state_change"
-                    ),
+                    "disposition": disposition,
                     "normalized_effects": sorted(
                         {
                             normalize_showdown_id(argument.strip("'\"").split(":", 1)[-1])
@@ -159,7 +166,12 @@ def main() -> None:
         "formats": ["gen9championsvgc2026regmb", "gen9championsvgc2026regmbbo3"],
         "unsupported_tags": sorted(UNSUPPORTED_TAGS),
         "unsupported_predicates": [list(item) for item in sorted(UNSUPPORTED_PREDICATES)],
-        "review_status": "source_inventory_reachable_sites_resolved",
+        "review_status": (
+            "source_inventory_reachable_sites_resolved"
+            if raw_inventory.get("review_status") == "raw_inventory_reachable_sites_classified"
+            and all(row["disposition"] != "unresolved" for row in raw_witnesses)
+            else "source_inventory_unresolved_sites"
+        ),
         "obligations": ["pressure_additional_target_pp", "source_shaped_stateful_transition_tests"],
         "raw_witnesses": raw_witnesses,
         "test_nodes": test_nodes,

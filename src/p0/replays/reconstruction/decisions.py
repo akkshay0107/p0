@@ -433,13 +433,13 @@ def _observed_actions(
     encored_before_action: set[tuple[ReplaySide, int]] = set()
     for event in events:
         parsed = event.event
-        if parsed.tag == "-start" and len(parsed.arguments) >= 2:
+        if (
+            parsed.tag == "-start"
+            and len(parsed.arguments) >= 2
+            and normalize_showdown_id(parsed.arguments[1]) == "encore"
+        ):
             actor = _reference(event, 0)
-            if (
-                actor is not None
-                and actor.pokemon_ref.active_slot is not None
-                and normalize_showdown_id(parsed.arguments[1]) == "encore"
-            ):
+            if actor is not None and actor.pokemon_ref.active_slot is not None:
                 slot = actor.pokemon_ref.active_slot
                 if actor.pokemon_ref.side.side_index == perspective and observed[slot] is None:
                     encored_before_action.add((actor.pokemon_ref.side, slot))

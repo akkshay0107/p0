@@ -39,15 +39,15 @@ def prepare_series_context(
     for window in windows:
         state = working_states.get(window.series_key)
         if state is None:
-            state = store.planning_state(window.series_key)
+            games, tokens, fragments, active = store.planning_state(window.series_key)
             state = (
-                state[0],
-                state[1],
+                games,
+                tokens,
                 tuple(
                     fragment.to(device=target_tokens.device, dtype=target_tokens.dtype)
-                    for fragment in state[2]
+                    for fragment in fragments
                 ),
-                state[3],
+                active,
             )
             working_states[window.series_key] = state
 

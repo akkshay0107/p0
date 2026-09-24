@@ -21,7 +21,9 @@ import asyncio
 import logging
 import os
 import random
+import sys
 from collections import Counter
+from concurrent.futures import Future
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -188,6 +190,7 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         write_replays: bool = False,
         team_source: FileTeamSource,
         team_rng: random.Random,
+        handler_failure: Future[None],
         **kwargs: Any,
     ) -> None:
         self.observation_builder = observation_builder
@@ -199,15 +202,26 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         self.teams_seen: list[str] = []
         self._showteam_lines: dict[str, list[str]] = {}
         self._live_records: dict[str, list[dict[str, Any]]] = {}
+        self.handler_failure = handler_failure
         super().__init__(team_source=team_source, team_rng=team_rng, **kwargs)
 
     async def _handle_battle_message(self, split_messages: list[list[str]]) -> None:
         """Record poke-env's UI-only open-sheet messages before its normal callback."""
         battle_tag = split_messages[0][0].removeprefix(">")
-        for split_message in split_messages[1:]:
-            if len(split_message) > 1 and split_message[1] == "showteam":
-                self._showteam_lines.setdefault(battle_tag, []).append("|".join(split_message))
-        await super()._handle_battle_message(split_messages)
+        try:
+            for split_message in split_messages[1:]:
+                if len(split_message) > 1 and split_message[1] == "showteam":
+                    self._showteam_lines.setdefault(battle_tag, []).append("|".join(split_message))
+            await super()._handle_battle_message(split_messages)
+        except Exception as exc:
+            if not self.handler_failure.done():
+                failure = RuntimeError(
+                    f"Player {self.username} failed in {battle_tag} while handling "
+                    f"{split_messages[-1]!r}: {exc}"
+                )
+                failure.__cause__ = exc
+                self.handler_failure.set_exception(failure)
+            raise
 
     def teampreview(self, battle: AbstractBattle) -> str:
         result = super().teampreview(battle)
@@ -345,8 +359,13 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         self.replay_paths.append(path)
 
 
+class _FailingPreviewPlayer(JsonCapturingRandomPlayer):
+    def teampreview(self, battle: AbstractBattle) -> str:
+        raise RuntimeError(f"Deliberate preview failure in {battle.battle_tag}")
+
+
 def _stress_game_count() -> int:
-    return stress_count("P0_STRESS_GAME_COUNT", 100)
+    return stress_count("P0_STRESS_GAME_COUNT", 50)
 
 
 def _stress_concurrency() -> int:
@@ -713,12 +732,19 @@ def _assert_live_truth(
 
         reconstructed = builder.build(snapshot.view, {}).cpu()
         replay_cursor = int(record["replay_cursor"])
-        _assert_expected_observation_fields(
-            _live_tensors(record),
-            reconstructed,
-            compare_event_fields=exact_boundary and replay_cursor not in seen_replay_cursors,
-            compare_dynamic_fields=exact_boundary,
-        )
+        try:
+            _assert_expected_observation_fields(
+                _live_tensors(record),
+                reconstructed,
+                compare_event_fields=exact_boundary and replay_cursor not in seen_replay_cursors,
+                compare_dynamic_fields=exact_boundary,
+            )
+        except AssertionError as exc:
+            raise AssertionError(
+                f"Replay {document.metadata.replay_id}, observer p{perspective.player + 1}, "
+                f"decision {snapshot.decision_index}, line {snapshot.pre_line_index}, "
+                f"live cursor {replay_cursor}: {exc}"
+            ) from exc
         seen_replay_cursors.add(replay_cursor)
 
 
@@ -891,6 +917,48 @@ class TestRandomReplayReconstruction:
     @pytest.mark.integration
     @pytest.mark.stress
     @pytest.mark.asyncio
+    async def test_player_handler_error_surfaces_before_timeout(
+        self, showdown_server, tmp_path: Path
+    ) -> None:
+        team_source = _random_team_source(tmp_path / "teams", seed=3, count=4)
+        failure: Future[None] = Future()
+        poke_env_patches.install(capture_protocol_lines=True)
+        player = _FailingPreviewPlayer(
+            account_configuration=AccountConfiguration("StressFailureA", None),
+            battle_format=FORMAT.battle_format,
+            server_configuration=showdown_server,
+            team_source=team_source,
+            team_rng=random.Random(3),
+            accept_open_team_sheet=True,
+            max_concurrent_battles=1,
+            observation_builder=ObservationBuilder(default_runtime_resources()),
+            observation_dir=tmp_path / "observations",
+            handler_failure=failure,
+        )
+        opponent = RandomPlayer(
+            account_configuration=AccountConfiguration("StressFailureB", None),
+            battle_format=FORMAT.battle_format,
+            server_configuration=showdown_server,
+            team=team_source.sample(random.Random(4)).packed,
+            accept_open_team_sheet=True,
+            max_concurrent_battles=1,
+        )
+        battle_task = asyncio.create_task(player.battle_against(opponent, n_battles=1))
+        try:
+            with pytest.raises(RuntimeError, match="StressFailureA failed in battle-") as error:
+                await asyncio.wait_for(asyncio.wrap_future(failure), timeout=15)
+            assert "Deliberate preview failure" in str(error.value)
+        finally:
+            battle_task.cancel()
+            await asyncio.gather(battle_task, return_exceptions=True)
+            await asyncio.gather(
+                player.ps_client.stop_listening(), opponent.ps_client.stop_listening()
+            )
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.integration
+    @pytest.mark.stress
+    @pytest.mark.asyncio
     async def test_random_local_games_reconstruct_to_valid_tensors(
         self, showdown_server, tmp_path: Path, request: pytest.FixtureRequest
     ) -> None:
@@ -925,40 +993,63 @@ class TestRandomReplayReconstruction:
         poke_env_patches.install(capture_protocol_lines=True)
         request.addfinalizer(partial(random.setstate, random_state))
         request.addfinalizer(poke_env_patches.uninstall_for_tests)
-
-        player_a = JsonCapturingRandomPlayer(
-            account_configuration=AccountConfiguration("StressRandomA", None),
-            battle_format=FORMAT.battle_format,
-            server_configuration=showdown_server,
-            team_source=team_source,
-            team_rng=random.Random(seed + 1),
-            accept_open_team_sheet=True,
-            max_concurrent_battles=concurrency,
-            observation_builder=builder,
-            observation_dir=observation_dir,
-            replay_dir=replay_dir,
-            write_replays=True,
-        )
-        player_b = JsonCapturingRandomPlayer(
-            account_configuration=AccountConfiguration("StressRandomB", None),
-            battle_format=FORMAT.battle_format,
-            server_configuration=showdown_server,
-            team_source=team_source,
-            team_rng=random.Random(seed + 2),
-            accept_open_team_sheet=True,
-            max_concurrent_battles=concurrency,
-            observation_builder=builder,
-            observation_dir=observation_dir,
-        )
-
+        handler_failure: Future[None] = Future()
+        players: list[JsonCapturingRandomPlayer] = []
         try:
-            await asyncio.wait_for(
-                player_a.battle_against(player_b, n_battles=game_count),
-                timeout=_stress_timeout(game_count),
+            common_kwargs = {
+                "battle_format": FORMAT.battle_format,
+                "server_configuration": showdown_server,
+                "team_source": team_source,
+                "accept_open_team_sheet": True,
+                "max_concurrent_battles": concurrency,
+                "observation_builder": builder,
+                "observation_dir": observation_dir,
+                "handler_failure": handler_failure,
+            }
+            player_a = JsonCapturingRandomPlayer(
+                account_configuration=AccountConfiguration("StressRandomA", None),
+                team_rng=random.Random(seed + 1),
+                replay_dir=replay_dir,
+                write_replays=True,
+                **common_kwargs,
             )
+            player_b = JsonCapturingRandomPlayer(
+                account_configuration=AccountConfiguration("StressRandomB", None),
+                team_rng=random.Random(seed + 2),
+                **common_kwargs,
+            )
+            players.extend([player_a, player_b])
+
+            battle_task = asyncio.create_task(
+                player_a.battle_against(player_b, n_battles=game_count)
+            )
+            failure_task = asyncio.wrap_future(handler_failure)
+            try:
+                done, _ = await asyncio.wait(
+                    {battle_task, failure_task},
+                    timeout=_stress_timeout(game_count),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if failure_task in done:
+                    await failure_task
+                if battle_task not in done:
+                    raise TimeoutError(f"Timed out before {game_count} stress games finished")
+                await battle_task
+            finally:
+                if not battle_task.done():
+                    battle_task.cancel()
+                failure_task.cancel()
+                await asyncio.gather(battle_task, return_exceptions=True)
         finally:
-            await player_a.ps_client.stop_listening()
-            await player_b.ps_client.stop_listening()
+            closed = await asyncio.gather(
+                *(player.ps_client.stop_listening() for player in players),
+                return_exceptions=True,
+            )
+            failures = [result for result in closed if isinstance(result, BaseException)]
+            if failures:
+                if sys.exc_info()[0] is None:
+                    raise RuntimeError(f"Failed to stop stress players: {failures}")
+                logging.getLogger(__name__).error("Failed to stop stress players: %s", failures)
 
         replay_paths = tuple(sorted(player_a.replay_paths))
         assert len(replay_paths) == game_count

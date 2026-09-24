@@ -1,17 +1,166 @@
 from __future__ import annotations
 
+import json
+import os
+import random
+import signal
+import socket
+import subprocess
+import time
 import urllib.parse
 
 import pytest
+from poke_env import AccountConfiguration, ServerConfiguration
+from poke_env.player import DefaultBattleOrder
 
-from p0.evaluation.harness import EvaluationHarness
+from p0.evaluation.harness import EvalRandomPlayer, EvaluationHarness
+from p0.format_config import FORMAT
+from p0.paths import DEFAULT_PATHS
 from p0.runtime import poke_env_patches
+from p0.runtime.showdown import allocate_loopback_ports
 from p0.teams.source import FixedTeamSource
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
+@pytest.fixture(scope="module")
+def forced_result_server(showdown_assets, tmp_path_factory: pytest.TempPathFactory):
+    """Run one isolated local server with result commands enabled for tie tests."""
+    del showdown_assets
+    directory = tmp_path_factory.mktemp("forced-results")
+    preload = directory / "allow-forced-results.cjs"
+    config_path = DEFAULT_PATHS.showdown_root / "config/config.js"
+    preload.write_text(
+        f"const config = require({json.dumps(str(config_path))});\n"
+        "config.bindaddress = '127.0.0.1';\n"
+        "const originalStartup = config.startuphook;\n"
+        "config.startuphook = () => {\n"
+        "  if (originalStartup) originalStartup();\n"
+        "  global.Config.groups[' '].forcewin = true;\n"
+        "};\n"
+    )
+    port = allocate_loopback_ports(1)[0]
+    server_log = directory / "showdown.log"
+    with server_log.open("w") as output:
+        process = subprocess.Popen(
+            [
+                "node",
+                "--require",
+                str(preload),
+                "pokemon-showdown",
+                "start",
+                "--no-security",
+                "--skip-build",
+                str(port),
+            ],
+            cwd=DEFAULT_PATHS.showdown_root,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"Forced-result Showdown did not start: {server_log.read_text()}"
+                        )
+                    time.sleep(0.05)
+            yield ServerConfiguration(
+                f"ws://127.0.0.1:{port}/showdown/websocket",
+                "https://play.pokemonshowdown.com/action.php?",
+            )
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+
+
+class _ResultDrivingPlayer(EvalRandomPlayer):
+    """Send result commands through real child battles on the isolated server."""
+
+    def __init__(self, *, outcomes: tuple[str, ...], **kwargs) -> None:
+        self.outcomes = outcomes
+        self.commanded_games: set[str] = set()
+        super().__init__(**kwargs)
+
+    async def choose_move(self, battle):  # pyright: ignore[reportIncompatibleMethodOverride]
+        if battle.teampreview or not any(battle.active_pokemon):
+            return DefaultBattleOrder()
+        if battle.battle_tag not in self.commanded_games:
+            index = len(self.commanded_games)
+            self.commanded_games.add(battle.battle_tag)
+            outcome = self.outcomes[index]
+            command = "/forcetie" if outcome == "tie" else f"/forcewin {outcome}"
+            await self.ps_client.send_message(command, battle.battle_tag)
+        return super().choose_move(battle)
+
+
 @pytest.mark.heavy
 class TestEvaluation:
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcomes", "expected_winner"),
+        (
+            (("a", "tie", "tie"), "a"),
+            (("b", "tie", "tie"), "b"),
+            (("a", "b", "tie"), None),
+            (("a", "a"), "a"),
+            (("a", "b", "a"), "a"),
+        ),
+    )
+    async def test_parent_series_result_with_ties(
+        self, forced_result_server, outcomes: tuple[str, ...], expected_winner: str | None
+    ) -> None:
+        label = "".join(outcome[0] for outcome in outcomes)
+        name_a = f"TieA{label}"
+        name_b = f"TieB{label}"
+        commands = tuple(
+            name_a if outcome == "a" else name_b if outcome == "b" else "tie"
+            for outcome in outcomes
+        )
+        source = FixedTeamSource(DEFAULT_TEST_TEAM)
+        poke_env_patches.install()
+        first = _ResultDrivingPlayer(
+            outcomes=commands,
+            account_configuration=AccountConfiguration(name_a, None),
+            battle_format=FORMAT.bo3_format,
+            server_configuration=forced_result_server,
+            team_source=source,
+            team_rng=random.Random(0),
+            max_concurrent_battles=1,
+        )
+        second = EvalRandomPlayer(
+            account_configuration=AccountConfiguration(name_b, None),
+            battle_format=FORMAT.bo3_format,
+            server_configuration=forced_result_server,
+            team_source=source,
+            team_rng=random.Random(1),
+            max_concurrent_battles=1,
+        )
+        try:
+            await first.battle_against(second, n_battles=1)
+            winner = await EvaluationHarness._wait_for_series_completion(
+                first, second, 1, timeout=30
+            )
+            expected = (
+                name_a.casefold()
+                if expected_winner == "a"
+                else name_b.casefold()
+                if expected_winner == "b"
+                else None
+            )
+            assert winner == expected
+            assert len(first.commanded_games) == len(outcomes)
+        finally:
+            await first.ps_client.stop_listening()
+            await second.ps_client.stop_listening()
+            poke_env_patches.uninstall_for_tests()
+
     @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_evaluation_harness_completes_matchup(self, showdown_server) -> None:

@@ -83,14 +83,14 @@ class PPOTrainer:
             alpha = self.scheduler.alpha(episode)
             self.collector.reset_completed()
             self.policy.eval()
-            self.collector.collect(self.cancel_requested)
-            trajectories = self.collector.get_batches(self.policy.device)
-            if self.cancel_requested():
-                del trajectories
-                self._save(episode)
-                return
-            if not trajectories:
-                raise RuntimeError("PPO rollout completed without a finished trajectory")
+            while True:
+                self.collector.collect(self.cancel_requested)
+                if self.cancel_requested():
+                    self._save(episode)
+                    return
+                trajectories = self.collector.get_batches(self.policy.device)
+                if trajectories:
+                    break
             trajectory_count = len(trajectories)
             rollout_metrics = _rollout_metrics(trajectories)
             try:

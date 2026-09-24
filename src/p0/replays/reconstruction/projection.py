@@ -527,29 +527,22 @@ def _mask_hidden_illusion(
         if true_species is None:
             raise ValueError("Illusion member species is absent from the pinned dex")
 
-        display_stats = tuple(
-            (name, int(displayed_species["baseStats"][name])) for name in _STAT_NAMES
-        )
-        true_stats = tuple((name, int(true_species["baseStats"][name])) for name in _STAT_NAMES)
-        display_types = tuple(str(value) for value in displayed_species["types"])
-        true_types = tuple(str(value) for value in true_species["types"])
-        public_moves = []
-        for move_name in true_sheet.moves:
-            move_id = normalize_showdown_id(move_name)
-            move_data = move_index[move_id]
-            base_pp = int(move_data["pp"])
-            max_pp = _maximum_pp(move_data, base_pp)
-            public_moves.append(
-                MoveState(
-                    move_id,
-                    str(move_data.get("name", move_name)),
-                    str(move_data["type"]),
-                    str(move_data["category"]),
-                    str(move_data["target"]),
-                    max_pp,
-                    max_pp,
-                )
+        display_stats = tuple((k, int(displayed_species["baseStats"][k])) for k in _STAT_NAMES)
+        true_stats = tuple((k, int(true_species["baseStats"][k])) for k in _STAT_NAMES)
+        display_types = tuple(str(v) for v in displayed_species["types"])
+        true_types = tuple(str(v) for v in true_species["types"])
+        public_moves = tuple(
+            MoveState(
+                (m_id := normalize_showdown_id(name)),
+                str((data := move_index[m_id]).get("name", name)),
+                str(data["type"]),
+                str(data["category"]),
+                str(data["target"]),
+                (max_pp := _maximum_pp(data, int(data["pp"]))),
+                max_pp,
             )
+            for name in true_sheet.moves
+        )
         public_effects = tuple(
             (name, count) for name, count in member.effects if name != "illusion"
         )
@@ -570,12 +563,8 @@ def _mask_hidden_illusion(
             weight=float(displayed_species["weightkg"]),
             moves=(),
             effects=public_effects,
-            effect_variants=tuple(
-                pair for pair in member.effect_variants if pair[0] in public_effect_names
-            ),
-            effect_sources=tuple(
-                pair for pair in member.effect_sources if pair[0] in public_effect_names
-            ),
+            effect_variants=tuple(p for p in member.effect_variants if p[0] in public_effect_names),
+            effect_sources=tuple(p for p in member.effect_sources if p[0] in public_effect_names),
             tera_type=None,
             transform=None,
             revealed=True,
@@ -597,7 +586,7 @@ def _mask_hidden_illusion(
             current_types=true_types,
             base_stats=true_stats,
             weight=float(true_species["weightkg"]),
-            moves=tuple(public_moves),
+            moves=public_moves,
             boosts=tuple((name, 0) for name, _ in member.boosts),
             effects=(),
             effect_variants=(),

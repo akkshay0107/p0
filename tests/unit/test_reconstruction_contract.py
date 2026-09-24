@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 from p0.replays.reconstruction.classification import (
     CLASSIFICATION_REGISTRY,
     EventClassification,
@@ -60,6 +62,21 @@ class TestReplayProtocolContract:
 
     def test_raw_inventory_contains_source_shaped_witnesses(self) -> None:
         validate_raw_emission_inventory()
+        witnesses = {
+            f"{entry['path']}:{entry['line']}:{entry['call']}": entry
+            for entry in RAW_EMISSION_INVENTORY["entries"]
+        }
+        preview = witnesses["sim/battle.ts:1393:add"]
+        species_rule = witnesses["data/rulesets.ts:793:add"]
+        assert preview["resolved_tags"] == ["teampreview"]
+        assert preview["reachability"] == "reachable-resolved"
+        assert species_rule["tag"] == "rule"
+        assert species_rule["reachability"] == "reachable-potential"
+        assert {row["id"] for row in PROTOCOL_CONTRACT["raw_witnesses"]} >= {
+            "sim/battle.ts:1393:add",
+            "data/rulesets.ts:793:add",
+        }
+        assert witnesses["data/mods/champions/rulesets.ts:49:add"]["reachability"] == "excluded"
         ohko = [entry for entry in RAW_EMISSION_INVENTORY["entries"] if entry["tag"] == "-ohko"]
         assert any(entry["arguments"] == ["'-ohko'"] for entry in ohko)
         pressure = [
@@ -75,6 +92,27 @@ class TestReplayProtocolContract:
             entry["data_owner"] == "spite" and entry["reachability"] != "excluded"
             for entry in spite
         )
+
+    def test_missing_source_file_and_unresolved_site_fail_coverage(self) -> None:
+        missing_file = deepcopy(RAW_EMISSION_INVENTORY)
+        missing_file["files"] = [
+            item for item in missing_file["files"] if item["path"] != "data/rulesets.ts"
+        ]
+        with pytest.raises(ValueError, match="source files"):
+            validate_raw_emission_inventory(missing_file)
+
+        unresolved = deepcopy(RAW_EMISSION_INVENTORY)
+        unresolved["entries"][0]["reachability"] = "unresolved"
+        unresolved["reachability_counts"]["unresolved"] = 1
+        with pytest.raises(ValueError, match="unresolved|counts disagree"):
+            validate_raw_emission_inventory(unresolved)
+
+        missing_witness = deepcopy(PROTOCOL_CONTRACT)
+        missing_witness["raw_witnesses"] = [
+            row for row in missing_witness["raw_witnesses"] if row["id"] != "sim/battle.ts:1393:add"
+        ]
+        with pytest.raises(ValueError, match="source witnesses"):
+            validate_protocol_contract(missing_witness)
 
     def test_compiled_volatile_metadata_checks_existence_and_copy_hooks(self) -> None:
         rows = {row["id"]: row for row in RAW_EMISSION_INVENTORY["volatile_conditions"]}

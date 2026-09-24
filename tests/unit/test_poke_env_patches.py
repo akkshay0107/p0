@@ -10,7 +10,7 @@ import weakref
 from pathlib import Path
 
 import pytest
-from poke_env.battle import DoubleBattle, Effect, Pokemon
+from poke_env.battle import DoubleBattle, Effect, Pokemon, PokemonType
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
@@ -24,6 +24,81 @@ from p0.runtime.poke_env_battle_adapter import battle_view
 
 
 class TestPokeEnvPatches:
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_illusion_duplicate_display_keeps_both_slots_active(self, role: str) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("duplicate-illusion", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.get_pokemon(f"{role}: Zoroark", details="Zoroark, L50")
+            battle.parse_message(["", "switch", f"{role}a: Staraptor", "Staraptor, L50", "68/100"])
+            battle.parse_message(["", "switch", f"{role}b: Staraptor", "Staraptor, L50", "87/100"])
+
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            first, second = active
+            assert first is not None and second is not None
+            assert first is not second
+            assert first.current_hp == 68
+            assert second.current_hp == 87
+            battle.parse_message(["", "-unboost", f"{role}b: Staraptor", "atk", "2"])
+            assert first.boosts["atk"] == 0
+            assert second.boosts["atk"] == -2
+
+            battle.parse_message(["", "replace", f"{role}a: Zoroark", "Zoroark, L50"])
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            first, second = active
+            assert first is not None and first.species == "zoroark"
+            assert first.current_hp == 68
+            assert first.boosts["atk"] == 0
+            assert second is not None and second.species == "staraptor"
+            assert second.current_hp == 87
+            assert second.boosts["atk"] == -2
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.parametrize("role,row", (("p1", 0), ("p2", 6)))
+    def test_temporary_form_resets_in_bench_and_return_observations(
+        self, role: str, row: int
+    ) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("form-observation", "Alice", logging.getLogger("test"), gen=9)
+            builder = ObservationBuilder(default_runtime_resources())
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", f"{role}a: Castform", "Castform, L50", "100/100"])
+            battle.parse_message(
+                [
+                    "",
+                    "-formechange",
+                    f"{role}a: Castform",
+                    "Castform-Rainy",
+                    "[from] ability: Forecast",
+                ]
+            )
+            rainy = builder.build(battle_view(battle))
+            assert rainy.categorical[row, 0].item() == builder.tokenizer.id_for(
+                "species", "castformrainy"
+            )
+
+            battle.parse_message(["", "switch", f"{role}a: Pikachu", "Pikachu, L50", "100/100"])
+            benched = builder.build(battle_view(battle))
+            bench_row = row + 2
+            assert benched.categorical[bench_row, 0].item() == builder.tokenizer.id_for(
+                "species", "castform"
+            )
+            assert benched.categorical[bench_row, 3].item() == builder.tokenizer.type_id(
+                PokemonType.NORMAL
+            )
+
+            battle.parse_message(["", "switch", f"{role}a: Castform", "Castform, L50", "100/100"])
+            returned = builder.build(battle_view(battle))
+            assert returned.categorical[row, 0].item() == benched.categorical[bench_row, 0].item()
+            assert returned.categorical[row, 3].item() == benched.categorical[bench_row, 3].item()
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
     def test_illusion_reveal_retains_boosts_on_actual_pokemon(self) -> None:
         poke_env_patches.install()
         try:
@@ -432,6 +507,11 @@ class TestPokeEnvPatches:
             battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
 
             assert palafin.species == "palafinhero"
+            builder = ObservationBuilder(default_runtime_resources())
+            benched = builder.build(battle_view(battle))
+            assert benched.categorical[2, 0].item() == builder.tokenizer.id_for(
+                "species", "palafinhero"
+            )
         finally:
             poke_env_patches.uninstall_for_tests()
 

@@ -228,7 +228,7 @@ class TrainingRun:
             or not isinstance(metrics, Mapping)
             or any(
                 not isinstance(name, str)
-                or type(value) not in (int, float)
+                or not isinstance(value, (int, float))
                 or not math.isfinite(value)
                 for name, value in metrics.items()
             )

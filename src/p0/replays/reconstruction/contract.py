@@ -79,7 +79,7 @@ def load_raw_emission_inventory(path: Path = RAW_INVENTORY_PATH) -> dict[str, An
 
 
 def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None:
-    """Verify revision and source hashes against the current Showdown checkout."""
+    """Verify the pinned source scan is complete and every site is classified."""
     if value is None:
         value = RAW_EMISSION_INVENTORY
     showdown_root = DEFAULT_PATHS.showdown_root
@@ -93,11 +93,57 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
     )
     if revision != SHOWDOWN_COMMIT:
         raise ValueError("checked-out Showdown revision does not match protocol inventory")
-    for item in value.get("files", ()):
+
+    expected_files = {
+        "config/formats.ts",
+        "server/room-battle.ts",
+        *(f"data/{name}.ts" for name in ("moves", "abilities", "items", "conditions", "rulesets")),
+        *(
+            source.relative_to(showdown_root).as_posix()
+            for source in (showdown_root / "sim").rglob("*.ts")
+        ),
+        *(
+            source.relative_to(showdown_root).as_posix()
+            for source in (showdown_root / "data/mods/champions").rglob("*.ts")
+        ),
+    }
+    files = value.get("files")
+    if not isinstance(files, list) or {item["path"] for item in files} != expected_files:
+        raise ValueError("raw emission inventory omits or adds Showdown source files")
+    if len(files) != len(expected_files):
+        raise ValueError("raw emission inventory contains duplicate source files")
+    for item in files:
         source = showdown_root / item["path"]
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         if digest != item["sha256"]:
             raise ValueError(f"Showdown source drifted: {item['path']}")
+
+    entries = value.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("raw emission inventory entries must be a list")
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if entry.get("path") not in expected_files:
+            raise ValueError("raw emission inventory entry has no scanned source file")
+        reachability = entry.get("reachability")
+        counts[reachability] = counts.get(reachability, 0) + 1
+    if counts != value.get("reachability_counts"):
+        raise ValueError("raw emission inventory reachability counts disagree")
+    if (
+        counts.get("unresolved")
+        or value.get("review_status") != "raw_inventory_reachable_sites_classified"
+    ):
+        raise ValueError("raw emission inventory has unresolved source sites")
+    required = {"sim/battle.ts:1393:add", "data/rulesets.ts:793:add"}
+    covered = {
+        f"{entry['path']}:{entry['line']}:{entry['call']}"
+        for entry in entries
+        if entry.get("reachability") in {"reachable-potential", "reachable-resolved"}
+    }
+    if not required <= covered:
+        raise ValueError(
+            f"raw emission inventory is missing source witnesses: {sorted(required - covered)}"
+        )
 
 
 PROTOCOL_CONTRACT = load_protocol_contract()
@@ -189,9 +235,18 @@ def validate_protocol_contract(contract: dict[str, Any] = PROTOCOL_CONTRACT) -> 
         raise ValueError("protocol contract unsupported predicate set drifted")
     if contract.get("review_status") != "source_inventory_reachable_sites_resolved":
         raise ValueError("protocol contract contains unresolved source emission sites")
+    if RAW_EMISSION_INVENTORY.get("review_status") != "raw_inventory_reachable_sites_classified":
+        raise ValueError("raw emission inventory has unresolved source sites")
     witnesses = contract.get("raw_witnesses")
     if not isinstance(witnesses, list):
         raise ValueError("protocol contract must include raw source witnesses")
+    expected_witness_ids = {
+        f"{entry['path']}:{entry['line']}:{entry['call']}"
+        for entry in RAW_EMISSION_INVENTORY["entries"]
+        if entry.get("reachability") in {"reachable-potential", "reachable-resolved"}
+    }
+    if {witness.get("id") for witness in witnesses} != expected_witness_ids:
+        raise ValueError("protocol contract source witnesses disagree with raw inventory")
     for witness in witnesses:
         tags_for_witness = ([witness["tag"]] if witness.get("tag") is not None else []) + list(
             witness.get("resolved_tags", ())

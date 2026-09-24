@@ -10,8 +10,14 @@ const ROOT = path.resolve(__dirname, '..', 'pokemon-showdown');
 const DATA_ROOT = path.resolve(ROOT, '..', 'data');
 const EXPECTED = '8282e63102fa824fd2f7472778ec09793ceb7cac';
 const DIRECTORIES = ['config/formats.ts', 'data/mods/champions', 'sim', 'data'];
-const DATA_FILES = new Set(['moves.ts', 'abilities.ts', 'items.ts', 'conditions.ts']);
+const DATA_FILES = new Set(['moves.ts', 'abilities.ts', 'items.ts', 'conditions.ts', 'rulesets.ts']);
+const FORMATS = ['gen9championsvgc2026regmb', 'gen9championsvgc2026regmbbo3'];
 const CALLS = new Set(['add', 'addMove', 'addSplit', 'attrLastMove', 'retargetLastMove']);
+const {Dex} = require('../pokemon-showdown/dist/sim/dex');
+const ACTIVE_RULES = new Set(FORMATS.flatMap(id => {
+  const format = Dex.formats.get(id);
+  return [...Dex.formats.getRuleTable(format).keys()];
+}));
 
 function filesUnder(relative) {
   const full = path.join(ROOT, relative);
@@ -69,6 +75,41 @@ function dataOwner(node, source) {
   return keys.length ? keys[keys.length - 1] : null;
 }
 
+function templatePrefix(node) {
+  if (ts.isTemplateExpression(node)) return node.head.text;
+  if (ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  return null;
+}
+
+function localStringLiteral(node, name) {
+  for (let current = node.parent; current; current = current.parent) {
+    if (!ts.isMethodDeclaration(current) && !ts.isFunctionDeclaration(current)) continue;
+    if (!current.body) return null;
+    const values = [];
+    function visit(child) {
+      if (ts.isVariableDeclaration(child) && child.name.getText() === name &&
+          child.initializer && ts.isStringLiteralLike(child.initializer)) values.push(child.initializer.text);
+      ts.forEachChild(child, visit);
+    }
+    visit(current.body);
+    return values.length === 1 ? values[0] : null;
+  }
+  return null;
+}
+
+function guardedByInactiveRule(node, activeRules) {
+  for (let current = node.parent; current; current = current.parent) {
+    if (!ts.isIfStatement(current)) continue;
+    const condition = current.expression;
+    if (!ts.isCallExpression(condition) ||
+        condition.expression.getText() !== 'this.ruleTable.has' ||
+        condition.arguments.length !== 1) continue;
+    const rule = condition.arguments[0];
+    if (ts.isStringLiteralLike(rule) && !activeRules.has(rule.text)) return true;
+  }
+  return false;
+}
+
 function scan(file) {
   const text = fs.readFileSync(file, 'utf8');
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
@@ -84,12 +125,22 @@ function scan(file) {
         const first = node.arguments[0];
         const literal = first && ts.isStringLiteralLike(first) ? first.text : null;
         const wireTag = literal && literal.startsWith('|') ? literal.split('|')[1] : literal;
+        const split = name === 'addSplit' ? node.arguments[1] : null;
+        const splitFirst = split && ts.isArrayLiteralExpression(split) ? split.elements[0] : null;
+        const splitText = splitFirst && ts.isStringLiteralLike(splitFirst) ? splitFirst.text
+          : splitFirst && ts.isIdentifier(splitFirst) ? localStringLiteral(node, splitFirst.text) : null;
+        const splitTag = splitText?.split('|', 1)[0] || null;
+        const prefix = first ? templatePrefix(first) : null;
+        const inactiveRuleGuard = guardedByInactiveRule(node, ACTIVE_RULES);
         entries.push({
           path: path.relative(ROOT, file).replaceAll(path.sep, '/'),
           line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1,
           call: name,
           tag: wireTag,
+          ...(splitTag ? {split_tag: splitTag} : {}),
+          ...(prefix !== null ? {template_prefix: prefix} : {}),
           dynamic_tag_expression: literal === null && first ? first.getText(source) : null,
+          ...(inactiveRuleGuard ? {inactive_rule_guard: true} : {}),
           arguments: args,
           enclosing: enclosingName(node),
           enclosing_key: enclosingKey(node),
@@ -196,27 +247,45 @@ function main() {
   for (const entry of entries) {
     const ownerKind = ['moves', 'items', 'abilities'].find(kind => entry.path === `data/${kind}.ts`);
     const illegalOwner = ownerKind && entry.data_owner && !legal.get(ownerKind).has(entry.data_owner);
-    const inactiveFormat = entry.path === 'config/formats.ts' && !['gen9championsvgc2026regmb', 'gen9championsvgc2026regmbbo3'].includes(entry.data_owner);
+    const inactiveFormat = entry.path === 'config/formats.ts' && !FORMATS.includes(entry.data_owner);
+    const inactiveRuleset = entry.path.endsWith('/rulesets.ts') && !ACTIVE_RULES.has(entry.data_owner);
+    const serverOnly = entry.path.startsWith('server/') || entry.path === 'sim/battle-stream.ts';
+    const genericSplit = entry.path === 'sim/battle.ts' &&
+      (entry.enclosing === 'addSplit' || entry.enclosing === 'add');
+    const templateTag = entry.template_prefix?.replace(/^\|/, '').split('|', 1)[0];
     const dynamicTags = entry.dynamic_tag_expression === "isDrag ? 'drag' : 'switch'" ? ['drag', 'switch']
       : entry.dynamic_tag_expression === "this.battle.gen >= 5 ? '-fail' : '-notarget'" ? ['-fail', '-notarget']
-      : entry.dynamic_tag_expression?.startsWith('teampreview') ? ['teampreview']
+      : entry.split_tag ? [entry.split_tag]
+      : templateTag ? [templateTag]
       : entry.path.endsWith('/rulesets.ts') && entry.dynamic_tag_expression === '${buf}' ? ['clearpoke', 'poke', 'rule']
       : entry.dynamic_tag_expression === 'msg' ? ['-boost', '-unboost', '-setboost']
       : [];
     entry.resolved_tags = dynamicTags;
     const nonProtocolCall = entry.call === 'attrLastMove' || entry.call === 'retargetLastMove';
-    entry.reachability = nonProtocolCall
+    const excluded = nonProtocolCall || illegalOwner || inactiveFormat || inactiveRuleset ||
+      entry.inactive_rule_guard || serverOnly || genericSplit || impossible.has(entry.tag) ||
+      (entry.split_tag && impossible.has(entry.split_tag));
+    entry.reachability = excluded
       ? 'excluded'
       : entry.tag === null
-      ? (dynamicTags.length ? 'reachable-resolved' : 'excluded')
-      : impossible.has(entry.tag) || illegalOwner || inactiveFormat ? 'excluded' : 'reachable-potential';
-    entry.reachability_reason = entry.tag === null
-      ? (dynamicTags.length ? 'dynamic source expression exhaustively expanded from its finite call-site alternatives' : nonProtocolCall ? 'animation or target mutation, not a protocol emission' : 'server or format-only dynamic text outside the replay wire contract')
-      : impossible.has(entry.tag) ? 'impossible top-level tag under supported format contract' : illegalOwner ? `owner ${entry.data_owner} is absent from legal ${ownerKind} catalog` : inactiveFormat ? 'format block is outside the two supported formats' : 'source emission retained for exact format and effect review';
+      ? (dynamicTags.length ? 'reachable-resolved' : 'unresolved')
+      : 'reachable-potential';
+    entry.reachability_reason = nonProtocolCall ? 'animation or target mutation, not a protocol emission'
+      : illegalOwner ? `owner ${entry.data_owner} is absent from legal ${ownerKind} catalog`
+      : inactiveFormat ? 'format block is outside the two supported formats'
+      : inactiveRuleset ? `rule ${entry.data_owner} is absent from both supported rule tables`
+      : entry.inactive_rule_guard ? 'guarded by a rule absent from both supported rule tables'
+      : serverOnly ? 'server display or forwarding code, outside simulator replay output'
+      : genericSplit ? 'generic addSplit forwarding helper, covered at its call sites'
+      : impossible.has(entry.tag) || (entry.split_tag && impossible.has(entry.split_tag)) ? 'impossible top-level tag under supported format contract'
+      : entry.reachability === 'unresolved' ? 'dynamic source expression needs classification'
+      : dynamicTags.length ? 'source expression expanded from structural call-site values'
+      : 'source emission retained for exact format and effect review';
   }
   const output = {schema: 1, showdown_commit: revision, generated_by: 'TypeScript compiler AST', files, entries,
     reachability_counts: entries.reduce((counts, entry) => { counts[entry.reachability] = (counts[entry.reachability] || 0) + 1; return counts; }, {}),
-    review_status: 'raw_inventory_unreviewed_dynamic_sites_explicit',
+    review_status: entries.some(entry => entry.reachability === 'unresolved')
+      ? 'raw_inventory_unresolved_sites' : 'raw_inventory_reachable_sites_classified',
     activation_effects: [...new Set(['trickroom', 'protect', 'mummy', 'symbiosis', ...dynamicActivationEffects, ...entries.filter(entry => entry.tag === '-activate' && entry.reachability !== 'excluded').map(entry => entry.arguments[2] || entry.arguments[1]).filter(arg => arg && /^['"]/.test(arg)).map(arg => arg.replace(/^['"]|['"]$/g, '').replace(/^\[(move|ability|item)\]\s*/i, '').replace(/^(move|ability|item):\s*/i, '').toLowerCase().replace(/\s+/g, ''))])],
     volatile_conditions: volatileTable()};
   const destination = path.join(DATA_ROOT, 'showdown_raw_emission_inventory.json');

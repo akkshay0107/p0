@@ -162,6 +162,10 @@ class TestReconstructionProjection:
         assert bench.revealed
         assert not bench.identity_uncertain
 
+        observation = ObservationBuilder(resources).build(view)
+        displayed_species = observation.categorical[6, 0]
+        assert (observation.categorical[6:12, 0] == displayed_species).sum().item() == 1
+
     def test_production_compiler_projects_both_perspectives_from_one_compilation(self) -> None:
         result = compile_payloads((decision_payload(),), chunksize=0)
 

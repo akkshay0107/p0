@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 from concurrent.futures import Future
+from copy import deepcopy
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, cast
@@ -24,6 +25,7 @@ _ORIGINAL_STOP_LISTENING = PSClient.stop_listening
 _ORIGINAL_HANDLE_MESSAGE = PSClient._handle_message
 _ORIGINAL_SEND_MESSAGE = PSClient.send_message
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
+_ORIGINAL_GET_POKEMON = DoubleBattle.get_pokemon
 _ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
 _ORIGINAL_START_EFFECT = Pokemon.start_effect
@@ -47,22 +49,17 @@ _PARENT_RESULTS_CREATION_LOCK = threading.Lock()
 @dataclass(frozen=True, slots=True)
 class _ParentResults:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    completed_rooms: set[str] = field(default_factory=set)
+    completed_rooms: dict[str, str | None] = field(default_factory=dict)
     waiters: list[tuple[int, Future[None]]] = field(default_factory=list)
 
-    def record(self, room: str) -> None:
+    def record(self, room: str, winner: str | None) -> None:
         with self.lock:
-            if room in self.completed_rooms:
-                return
-            self.completed_rooms.add(room)
-            remaining = []
-            for expected, waiter in self.waiters:
-                if len(self.completed_rooms) >= expected:
-                    if not waiter.done():
+            if room not in self.completed_rooms:
+                self.completed_rooms[room] = winner
+                for expected, waiter in self.waiters:
+                    if len(self.completed_rooms) >= expected and not waiter.done():
                         waiter.set_result(None)
-                else:
-                    remaining.append((expected, waiter))
-            self.waiters[:] = remaining
+                self.waiters[:] = [w for w in self.waiters if len(self.completed_rooms) < w[0]]
 
     def wait_for(self, expected: int) -> Future[None]:
         waiter: Future[None] = Future()
@@ -75,16 +72,18 @@ class _ParentResults:
 
     def discard(self, waiter: Future[None]) -> None:
         with self.lock:
-            self.waiters[:] = [entry for entry in self.waiters if entry[1] is not waiter]
+            self.waiters[:] = [w for w in self.waiters if w[1] is not waiter]
+
+    def result_at(self, index: int) -> tuple[str, str | None]:
+        with self.lock:
+            return tuple(self.completed_rooms.items())[index]
 
 
 def _parent_results(client: PSClient) -> _ParentResults:
     with _PARENT_RESULTS_CREATION_LOCK:
-        tracker = getattr(client, "_p0_parent_results", None)
-        if tracker is None:
-            tracker = _ParentResults()
-            client._p0_parent_results = tracker  # type: ignore[attr-defined]
-        return tracker
+        if not hasattr(client, "_p0_parent_results"):
+            client._p0_parent_results = _ParentResults()  # type: ignore[attr-defined]
+        return client._p0_parent_results  # type: ignore[attr-defined]
 
 
 async def wait_for_parent_results(client: PSClient, expected: int) -> None:
@@ -97,6 +96,14 @@ async def wait_for_parent_results(client: PSClient, expected: int) -> None:
         await asyncio.wrap_future(waiter)
     finally:
         tracker.discard(waiter)
+
+
+async def wait_for_parent_result(client: PSClient, expected: int) -> tuple[str, str | None]:
+    """Return the server's result for the requested Bo3 series."""
+    if expected <= 0:
+        raise ValueError("Expected parent result count must be positive")
+    await wait_for_parent_results(client, expected)
+    return _parent_results(client).result_at(expected - 1)
 
 
 class _InactivePokemonFilter(logging.Filter):
@@ -211,6 +218,24 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
                 captured = getattr(self, "_p0_transform_targets", {}).get(id(outgoing))
                 if captured is not None:
                     original_size = (captured.original_height, captured.original_weight)
+            if event_type in {"switch", "drag"}:
+                active_by_slot = (
+                    self._active_pokemon
+                    if role == self.player_role
+                    else self._opponent_active_pokemon
+                )
+                incoming = _ORIGINAL_GET_POKEMON(self, identifier, details=split_message[3])
+                other_slot = f"{role}{'b' if slot == 'a' else 'a'}"
+                if active_by_slot.get(other_slot) is incoming:
+                    # In Illusion, two active slots may show the same species. poke-env
+                    # would assign the same Pokemon object to both slots; clone it for the partner.
+                    duplicate = deepcopy(incoming)
+                    active_by_slot[other_slot] = duplicate
+                    aliases = getattr(self, "_p0_duplicate_active", None)
+                    if aliases is None:
+                        aliases = {}
+                        self._p0_duplicate_active = aliases  # type: ignore[attr-defined]
+                    aliases[other_slot] = duplicate
     elif event_type == "faint" and len(split_message) >= 3:
         fainted = self.get_pokemon(split_message[2])
         captured = getattr(self, "_p0_transform_targets", {}).get(id(fainted))
@@ -267,6 +292,8 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
         current = self.get_pokemon(split_message[2])
         baselines.setdefault(current, current.species)
     result = _ORIGINAL_PARSE_MESSAGE(self, split_message)
+    if event_type in {"switch", "drag", "replace"} and len(split_message) >= 3:
+        getattr(self, "_p0_duplicate_active", {}).pop(split_message[2][:3], None)
     if fainted is not None:
         # Showdown clears volatiles on faint; poke-env only clears a subset.
         fainted.switch_out(self.fields)
@@ -296,6 +323,21 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     return result
 
 
+def _get_pokemon(
+    self: DoubleBattle,
+    identifier: str,
+    force_self_team: bool = False,
+    details: str = "",
+    request: dict[str, Any] | None = None,
+) -> Pokemon:
+    """Resolve a duplicated Illusion display by its active slot."""
+    if not force_self_team and len(identifier) >= 5 and identifier[3:5] == ": ":
+        alias = getattr(self, "_p0_duplicate_active", {}).get(identifier[:3])
+        if alias is not None and alias.identifies_as(identifier[5:]):
+            return alias
+    return _ORIGINAL_GET_POKEMON(self, identifier, force_self_team, details, request)
+
+
 async def _handle_message(self: PSClient, message: str):
     # Showdown sends the Bo3 parent room as >game-bestof..., while poke-env only
     # understands >battle rooms and otherwise indexes a non-existent protocol field.
@@ -304,8 +346,11 @@ async def _handle_message(self: PSClient, message: str):
         parent_room = parent_room[1:]
         if "I'm ready!</button>" in message:
             await self.send_message(f"/msgroom {parent_room},/confirmready")
-        if any(line.startswith("|win|") or line == "|tie" for line in body.splitlines()):
-            _parent_results(self).record(parent_room)
+        for line in body.splitlines():
+            if line.startswith("|win|"):
+                _parent_results(self).record(parent_room, line.removeprefix("|win|"))
+            elif line == "|tie":
+                _parent_results(self).record(parent_room, None)
         return None
     return await _ORIGINAL_HANDLE_MESSAGE(self, message)
 
@@ -380,6 +425,7 @@ def install(
     PSClient._handle_message = _handle_message
     PSClient.send_message = _send_message
     DoubleBattle.parse_message = _parse_message
+    DoubleBattle.get_pokemon = _get_pokemon
     Pokemon.forme_change = _forme_change
     Pokemon._update_from_teambuilder = _update_from_teambuilder
     Pokemon.start_effect = _start_effect
@@ -401,6 +447,7 @@ def uninstall_for_tests() -> None:
         PSClient._handle_message = _ORIGINAL_HANDLE_MESSAGE
         PSClient.send_message = _ORIGINAL_SEND_MESSAGE
         DoubleBattle.parse_message = _ORIGINAL_PARSE_MESSAGE
+        DoubleBattle.get_pokemon = _ORIGINAL_GET_POKEMON
         Pokemon.forme_change = _ORIGINAL_FORME_CHANGE
         Pokemon._update_from_teambuilder = _ORIGINAL_UPDATE_FROM_TEAMBUILDER
         Pokemon.start_effect = _ORIGINAL_START_EFFECT

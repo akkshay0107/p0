@@ -47,10 +47,12 @@ class _EvaluationSeriesState:
     games_played: int = 0
     wins: int = 0
     losses: int = 0
+    ties: int = 0
 
     @property
     def complete(self) -> bool:
-        return self.wins >= 2 or self.losses >= 2 or self.games_played >= 3
+        threshold = (3 - self.ties) // 2 + 1
+        return self.wins >= threshold or self.losses >= threshold or self.games_played >= 3
 
 
 class EvalPlayerMixin:
@@ -84,10 +86,11 @@ class EvalPlayerMixin:
             state.wins += 1
         elif battle.lost:
             state.losses += 1
+        else:
+            state.ties += 1
 
         self._evaluation_resample_team = state.complete
         if state.complete:
-            self.history.append((getattr(self, "current_team_packed", None), state.wins >= 2))
             self._evaluation_series.pop(opponent_id, None)
 
         super()._battle_finished_callback(battle)  # type: ignore
@@ -313,8 +316,12 @@ class EvaluationHarness:
         try:
             for _ in range(self.episodes_per_matchup):
                 expected = len(player_a.history) + 1
+                team_a = player_a.current_team_packed
+                team_b = player_b.current_team_packed
                 await player_a.battle_against(player_b, n_battles=1)
-                await self._wait_for_series_completion(player_a, player_b, expected)
+                winner = await self._wait_for_series_completion(player_a, player_b, expected)
+                player_a.history.append((team_a, winner == player_a.username.casefold()))
+                player_b.history.append((team_b, winner == player_b.username.casefold()))
         finally:
             await player_a.ps_client.stop_listening()
             await player_b.ps_client.stop_listening()
@@ -373,13 +380,20 @@ class EvaluationHarness:
         player_b: EvalPlayerType,
         expected_series_count: int,
         timeout: float = 120.0,
-    ) -> None:
-        """Wait until both players finish the requested series count."""
-        deadline = asyncio.get_running_loop().time() + timeout
-        while (
-            len(player_a.history) < expected_series_count
-            or len(player_b.history) < expected_series_count
-        ):
-            if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError(f"Timed out waiting for series to complete after {timeout:.0f}s")
-            await asyncio.sleep(0.05)
+    ) -> str | None:
+        """Wait for both clients to receive the same parent-series result."""
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                poke_env_patches.wait_for_parent_result(player_a.ps_client, expected_series_count),
+                poke_env_patches.wait_for_parent_result(player_b.ps_client, expected_series_count),
+            ),
+            timeout=timeout,
+        )
+        if results[0] != results[1]:
+            raise RuntimeError(f"Evaluation clients received different parent results: {results}")
+        _, winner = results[0]
+        if winner is not None:
+            winner = winner.casefold()
+            if winner not in {player_a.username.casefold(), player_b.username.casefold()}:
+                raise RuntimeError(f"Unexpected parent-series winner {winner!r}")
+        return winner

@@ -23,6 +23,56 @@ from tests.team_fixtures import DEFAULT_TEST_TEAM
 @pytest.mark.heavy
 class TestTrainingResume:
     @pytest.mark.integration
+    def test_short_rollout_windows_reach_updates_and_resume(self, tmp_path: Path) -> None:
+        team = tmp_path / "team.txt"
+        team.write_text(DEFAULT_TEST_TEAM)
+        store = CheckpointStore()
+        initial = tmp_path / "initial.pt"
+        policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
+        store.save_policy(
+            initial,
+            policy,
+            metadata={"gamma": 0.99, "value_target_semantics": "discounted_terminal_outcome.v1"},
+        )
+        paths = replace(
+            DEFAULT_PATHS,
+            initial_policy_checkpoint=initial,
+            checkpoint_path=tmp_path / "checkpoints" / "ppo.pt",
+            runs_dir=tmp_path / "runs",
+        )
+        training = TrainingConfig(
+            num_episodes=3,
+            n_envs=1,
+            rollout_steps=1,
+            batch_size=256,
+            minibatch_size=256,
+            ppo_epochs=1,
+            enable_optim=False,
+            ramp_up_phase=0.34,
+            magnet_refresh_interval=1,
+        )
+        config = GlobalConfig(
+            training=training, paths=paths, teams=TeamsConfig(all=team, reduced=team)
+        )
+
+        run_training(config)
+
+        saved = store.read(paths.checkpoint_path)
+        assert store.load_episode(saved) == 3
+        metrics = saved.artifact["training_state"]["run"]["metrics"]
+        assert [record["step"] for record in metrics] == [1, 2, 3]
+        assert all(record["trajectory_count"] > 0 for record in metrics)
+
+        resumed = replace(
+            config,
+            paths=replace(
+                paths, initial_policy_checkpoint=None, resume_checkpoint=paths.checkpoint_path
+            ),
+        )
+        run_training(resumed)
+        assert store.load_episode(paths.checkpoint_path) == 3
+
+    @pytest.mark.integration
     def test_ppo_resume_preserves_history_and_parent(self, tmp_path: Path) -> None:
         team = tmp_path / "team.txt"
         team.write_text(DEFAULT_TEST_TEAM)
