@@ -11,6 +11,7 @@ from p0.replays.schema import MaskProvenance
 from p0.replays.shards import (
     ShardIndexEntry,
     ShardManifest,
+    final_observation_field_specs,
     observation_field_specs,
     validate_shard_tensors,
 )
@@ -70,6 +71,8 @@ def _valid_tensors(decisions: int = 2) -> dict[str, torch.Tensor]:
     tensors["game_offsets"] = torch.tensor([0, decisions], dtype=torch.long)
     tensors["series_offsets"] = torch.tensor([0, decisions], dtype=torch.long)
     tensors["outcome"] = torch.tensor([1.0, -1.0], dtype=torch.float32)
+    for name, shape, dtype in final_observation_field_specs():
+        tensors[name] = torch.zeros((1, *shape[1:]), dtype=dtype)
     return tensors
 
 

@@ -6,7 +6,7 @@ import torch
 from p0.battle.series import SeriesPerspectiveKey
 from p0.model.architecture_contract import SERIES_TOKENS_PER_GAME
 from p0.training._bc_batch import BCGameWindow
-from p0.training._bc_history import prepare_series_context
+from p0.training._bc_history import prepare_series_context, window_history_tokens
 from p0.training.series_history import SeriesHistoryStore
 
 
@@ -22,13 +22,14 @@ class TestSeriesHistory:
         store.append(key, 1, saved, is_game_end=False, is_series_end=False)
         current = torch.ones((2, 2), device=device, requires_grad=True)
         windows = (
-            BCGameWindow(key, 1, 0, 1, True, False),
-            BCGameWindow(key, 2, 1, 2, False, False),
+            BCGameWindow(key, 1, 0, 1, True, False, 1),
+            BCGameWindow(key, 2, 1, 2, False, False, 2),
         )
 
         context, mask = prepare_series_context(
             store,
             windows,
+            (current[0:1], current[1:2]),
             current,
             lambda values, present: values[:, 1:2].repeat(1, SERIES_TOKENS_PER_GAME, 1),
         )
@@ -41,6 +42,21 @@ class TestSeriesHistory:
             assert current.grad is not None
             assert current.grad[0].abs().sum() > 0
             assert current.grad[1].abs().sum() == 0
+
+    def test_only_a_game_ending_window_adds_the_final_board_summary(self) -> None:
+        key = SeriesPerspectiveKey("final-board", 0)
+        # Context rows: game 1 targets 0-1, its final board 2, then game 2's target 3.
+        context = torch.arange(8.0).reshape(4, 2)
+        targets = context[[0, 1, 3]]
+        windows = (
+            BCGameWindow(key, 1, 0, 2, True, False, 2),
+            BCGameWindow(key, 2, 2, 3, False, False, 4),
+        )
+
+        first, second = window_history_tokens(windows, targets, context)
+
+        torch.testing.assert_close(first, torch.tensor([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]))
+        torch.testing.assert_close(second, torch.tensor([[6.0, 7.0]]))
 
     def test_series_history_store_commits_fragments_and_keeps_snapshots_after_drop(self) -> None:
         store = SeriesHistoryStore(d_model=3)

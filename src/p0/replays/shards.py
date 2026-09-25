@@ -67,6 +67,20 @@ def observation_field_specs() -> tuple[tuple[str, tuple[int, ...], torch.dtype],
     )
 
 
+# Each game perspective's board after its last line, stacked along a leading
+# game axis under these prefixed names. It feeds series memory only and has no
+# label, mask or outcome.
+FINAL_OBSERVATION_PREFIX = "final_"
+
+
+def final_observation_field_specs() -> tuple[tuple[str, tuple[int, ...], torch.dtype], ...]:
+    """Final-observation tensors stacked along a leading game axis."""
+    return tuple(
+        (f"{FINAL_OBSERVATION_PREFIX}{name}", shape, dtype)
+        for name, shape, dtype in observation_field_specs()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ShardIndexEntry:
     filename: str
@@ -333,7 +347,11 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
     """
     expected = {
         name: (shape, dtype)
-        for name, shape, dtype in (*observation_field_specs(), *SHARD_TENSOR_SPECS)
+        for name, shape, dtype in (
+            *observation_field_specs(),
+            *final_observation_field_specs(),
+            *SHARD_TENSOR_SPECS,
+        )
     }
 
     if set(tensors) != set(expected):
@@ -391,6 +409,10 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
             or torch.any(offsets[1:] <= offsets[:-1])
         ):
             raise ValueError(f"Shard {name} must increase from zero to the decision count")
+
+    games = tensors["game_offsets"].numel() - 1
+    if any(tensors[name].shape[0] != games for name, _, _ in final_observation_field_specs()):
+        raise ValueError("Shard final observations must hold exactly one row per game")
 
     game_boundaries = set(tensors["game_offsets"].tolist())
     if any(offset not in game_boundaries for offset in tensors["series_offsets"].tolist()):

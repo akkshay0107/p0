@@ -18,12 +18,13 @@ from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
 from p0.battle.events import (
-    SPATIAL_CATEGORICAL_WIDTH,
-    SPATIAL_NUMERICAL_WIDTH,
-    SPATIAL_SLOT_COUNT,
-    SpatialActionType,
-    SpatialSlotRecord,
-    SpatialTargetSlot,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EVENT_RECORDS,
+    EventDetail,
+    EventKind,
+    EventPosition,
+    EventRecord,
 )
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.battle.views import FixtureBattleView
@@ -476,40 +477,41 @@ class TestObservationBuilder:
         assert EffectNamespace.FIELD in namespaces
         assert EffectNamespace.WEATHER in namespaces
 
-    def test_spatial_events_ground_to_slots(self) -> None:
-        """Verify spatial turn records write to spatial_cat and spatial_num tensors accurately."""
-        turn_records = (
-            SpatialSlotRecord(
-                action_type=int(SpatialActionType.MOVE),
-                move_id=15,
-                target_slot=int(SpatialTargetSlot.OPP_LEFT),
-                order_rank=0.25,
-                damage_dealt=0.55,
-                landed_crit=1.0,
+    def test_spatial_events_are_written_in_order_with_padding(self) -> None:
+        """Verify ordered event records fill the leading rows and the rest are NONE padding."""
+        records = (
+            EventRecord(EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15),
+            EventRecord(
+                EventKind.DAMAGE,
+                EventPosition.OWN_LEFT,
+                EventPosition.OPPONENT_LEFT,
+                amount=-0.5,
+                amount_known=1.0,
             ),
-            SpatialSlotRecord(action_type=int(SpatialActionType.SWITCH)),
-            SpatialSlotRecord(
-                action_type=int(SpatialActionType.MOVE),
-                move_id=42,
-                target_slot=int(SpatialTargetSlot.ALLY_LEFT),
-                order_rank=0.50,
-                hp_delta=-0.55,
-                took_crit=1.0,
+            EventRecord(
+                EventKind.BOOST,
+                EventPosition.OPPONENT_RIGHT,
+                EventPosition.OWN_RIGHT,
+                detail=EventDetail.SPE,
+                amount=-0.25,
+                amount_known=1.0,
             ),
-            SpatialSlotRecord(action_type=int(SpatialActionType.NONE)),
         )
         fixture = _legality_fixture_view(DecisionView(slots=(SlotDecision(), SlotDecision())))
-        fixture.spatial_turn = turn_records
+        fixture.spatial_events = records
         builder = ObservationBuilder(default_runtime_resources())
         obs = builder.build(fixture)
 
-        assert obs.spatial_cat.shape == (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH)
-        assert obs.spatial_num.shape == (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH)
-        assert obs.spatial_cat[0, 0].item() == int(SpatialActionType.MOVE)
-        assert obs.spatial_cat[0, 1].item() == 15
-        assert obs.spatial_cat[0, 2].item() == int(SpatialTargetSlot.OPP_LEFT)
-        assert obs.spatial_num[0, 4].item() == 1.0  # landed_crit
-        assert obs.spatial_num[2, 5].item() == 1.0  # took_crit
+        assert obs.spatial_cat.shape == (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH)
+        assert obs.spatial_num.shape == (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
+        assert obs.spatial_cat[:3].tolist() == [
+            [1, 0, 2, 15, 0],
+            [5, 0, 2, 0, 0],
+            [7, 3, 1, 0, 5],
+        ]
+        assert obs.spatial_num[:3].tolist() == [[0.0, 0.0], [-0.5, 1.0], [-0.25, 1.0]]
+        assert not obs.spatial_cat[3:].any()
+        assert not obs.spatial_num[3:].any()
 
     def test_from_battle_into_overwrites_and_validates_output_buffer(self) -> None:
         """Verify from_battle_into performs in-place tensor writing into pre-allocated memory buffers without stale artifact leakage."""
@@ -703,8 +705,8 @@ class TestObservationBuilderLegalityAndState:
             output.validate(batch_rank=0)
             output.validate_overflow_contract()
             assert all(torch.isfinite(tensor).all() for tensor in output.tensors())
-            assert output.spatial_cat.shape == (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH)
-            assert output.spatial_num.shape == (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH)
+            assert output.spatial_cat.shape == (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH)
+            assert output.spatial_num.shape == (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
             assert not torch.any(output.spatial_cat == 99)
             assert not torch.any(output.spatial_num == 99.0)
             assert output.token_type_ids[0].item() == int(TokenType.POKEMON)
@@ -750,3 +752,19 @@ class TestObservationBuilderLegalityAndState:
         # Global field token turn count is normalized by 24 (12 / 24 = 0.5)
         assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, 3].item() == pytest.approx(12.0 / 24.0)
         assert all(torch.isfinite(t).all() for t in obs.tensors())
+
+    def test_spatial_events_exceeding_capacity_are_truncated_safely(self) -> None:
+        """Verify views with more than MAX_EVENT_RECORDS do not crash observation building."""
+        from p0.battle.events import EventKind, EventRecord
+
+        mon = make_pokemon_view(species="pikachu")
+        extra_records = tuple(
+            EventRecord(EventKind.MOVE, 0, 2, 1) for _ in range(MAX_EVENT_RECORDS + 5)
+        )
+        battle = make_battle_view(active_pokemon=[mon, None], team=[mon])
+        battle.spatial_events = extra_records
+
+        obs = _OBSERVATION_BUILDER.build(battle)
+        assert obs.spatial_cat.shape == (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH)
+        assert obs.spatial_num.shape == (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
+        assert (obs.spatial_cat[:, 0] == int(EventKind.MOVE)).all()

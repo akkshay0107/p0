@@ -14,11 +14,12 @@ from typing import Any, ClassVar
 import torch
 
 from p0.battle.events import (
-    SPATIAL_CATEGORICAL_WIDTH,
-    SPATIAL_NUMERICAL_WIDTH,
-    SPATIAL_SLOT_COUNT,
-    SpatialActionType,
-    SpatialTargetSlot,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EVENT_RECORDS,
+    EventDetail,
+    EventKind,
+    EventPosition,
 )
 from p0.format_config import active_global_contract, canonical_json_sha256
 from p0.model.architecture_contract import (
@@ -172,9 +173,9 @@ def _observation_layout_descriptor() -> dict[str, object]:
             "width": NUMERICAL_WIDTH,
         },
         "spatial_events": {
-            "count": SPATIAL_SLOT_COUNT,
-            "categorical_width": SPATIAL_CATEGORICAL_WIDTH,
-            "numerical_width": SPATIAL_NUMERICAL_WIDTH,
+            "count": MAX_EVENT_RECORDS,
+            "categorical_width": EVENT_CATEGORICAL_WIDTH,
+            "numerical_width": EVENT_NUMERICAL_WIDTH,
         },
         "tokens": {
             "global_field": TOKEN_IDX_GLOBAL_FIELD,
@@ -215,12 +216,9 @@ def _observation_layout_descriptor() -> dict[str, object]:
             "mechanic_state": {member.name.lower(): member.value for member in MechanicState},
             "effect_namespace": {member.name.lower(): member.value for member in EffectNamespace},
             "counter_kind": {member.name.lower(): member.value for member in CounterKind},
-            "spatial_action_type": {
-                member.name.lower(): member.value for member in SpatialActionType
-            },
-            "spatial_target_slot": {
-                member.name.lower(): member.value for member in SpatialTargetSlot
-            },
+            "event_kind": {member.name.lower(): member.value for member in EventKind},
+            "event_position": {member.name.lower(): member.value for member in EventPosition},
+            "event_detail": {member.name.lower(): member.value for member in EventDetail},
         },
     }
 
@@ -265,8 +263,8 @@ class StructuredObservation:
         ("slot_ids", (SEQUENCE_LENGTH,), torch.long),
         ("categorical", (SEQUENCE_LENGTH, CATEGORICAL_WIDTH), torch.long),
         ("numerical", (SEQUENCE_LENGTH, NUMERICAL_WIDTH), torch.float32),
-        ("spatial_cat", (SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH), torch.long),
-        ("spatial_num", (SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH), torch.float32),
+        ("spatial_cat", (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH), torch.long),
+        ("spatial_num", (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH), torch.float32),
     )
 
     _FIELD_NAMES: ClassVar[tuple[str, ...]] = tuple(name for name, _, _ in _FIELD_SPECS)

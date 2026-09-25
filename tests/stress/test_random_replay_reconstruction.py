@@ -61,7 +61,7 @@ from p0.replays.schema import LabelKind
 from p0.replays.shards import validate_shard_tensors
 from p0.rl_player import TeamPlayerMixin
 from p0.runtime import poke_env_patches
-from p0.runtime.live_event_capture import captured_protocol_lines
+from p0.runtime.live_event_capture import captured_protocol_lines, consume_events
 from p0.runtime.poke_env_action_adapter import order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import FileTeamSource
@@ -260,7 +260,17 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         active_members = tuple(
             None if pokemon is None else str(pokemon.species) for pokemon in battle.active_pokemon
         )
-        self._live_records.setdefault(battle.battle_tag, []).append(
+        records = self._live_records.setdefault(battle.battle_tag, [])
+        replay_cursor = len(
+            tuple(
+                line
+                for line in _battle_log_lines(view.protocol_lines)
+                if _message_tag(line) != "showteam"
+            )
+        )
+        # Like RLPlayer, submitting this order closes the event interval it observed.
+        consume_events(battle)
+        records.append(
             {
                 "turn": int(battle.turn),
                 "teampreview": bool(battle.teampreview),
@@ -274,13 +284,9 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
                 # shared boundary: reconstruction reaches the same line index when it
                 # segments the log, so the two sides are matched exactly rather than
                 # by a turn heuristic.
-                "replay_cursor": len(
-                    tuple(
-                        line
-                        for line in _battle_log_lines(view.protocol_lines)
-                        if _message_tag(line) != "showteam"
-                    )
-                ),
+                "replay_cursor": replay_cursor,
+                # Where this decision's event interval began: the previous submission.
+                "interval_start_cursor": records[-1]["replay_cursor"] if records else 0,
                 # Save the individual pre-fusion fields, not a fused model input.
                 "tensors": [tensor.clone() for tensor in observation.tensors()],
             }
@@ -461,6 +467,7 @@ def _assert_expected_observation_fields(
     reconstructed: StructuredObservation,
     *,
     compare_event_fields: bool = True,
+    compare_event_values: bool = False,
     compare_dynamic_fields: bool = True,
 ) -> None:
     """Compare every field a public replay can reproduce at a shared boundary."""
@@ -484,6 +491,12 @@ def _assert_expected_observation_fields(
             # part of the observation ABI, but their exact values can differ
             # when a callback lands inside a websocket message batch.
             assert getattr(live, name).shape == getattr(reconstructed, name).shape
+    if compare_event_values:
+        # Both sides read the same protocol lines between the same two decisions, so the
+        # categorical record columns (kind, source, target, move, detail) must agree.
+        # Amounts are excluded: live pre-event HP comes from poke-env, replay HP from
+        # public damage text.
+        torch.testing.assert_close(live.spatial_cat, reconstructed.spatial_cat)
 
     if not compare_dynamic_fields:
         return
@@ -698,8 +711,22 @@ def _assert_live_truth(
     live_records: tuple[dict[str, Any], ...],
     document: ReplayDocument,
     builder: ObservationBuilder,
-) -> None:
+) -> int:
+    """Check matched live decisions against replay and return how many event intervals agreed."""
+    # A rejected order is retried before any new battle line arrives, so every
+    # retry of one request observes the events its first attempt observed.
+    first_events: dict[int, torch.Tensor] = {}
+    for record in live_records:
+        events = _live_tensors(record).spatial_cat
+        torch.testing.assert_close(
+            events, first_events.setdefault(int(record["replay_cursor"]), events)
+        )
+
+    compared_intervals = 0
     seen_replay_cursors: set[int] = set()
+    splice_index, splice_count = _showteam_offset(document)
+    starts = tuple(snapshot.pre_line_index for snapshot in perspective.snapshots)
+    replay_interval_starts = dict(zip(starts, (0, *starts[:-1]), strict=True))
     for snapshot, record, exact_boundary in _match_live_records(
         perspective, live_records, document
     ):
@@ -732,11 +759,22 @@ def _assert_live_truth(
 
         reconstructed = builder.build(snapshot.view, {}).cpu()
         replay_cursor = int(record["replay_cursor"])
+        # Live play consumes events at every submitted order and replay at every
+        # reconstructed decision; the intervals agree when both of their ends do.
+        live_interval_start = _live_boundary(
+            {"replay_cursor": record["interval_start_cursor"]}, splice_index, splice_count
+        )
+        same_interval = (
+            exact_boundary
+            and replay_cursor not in seen_replay_cursors
+            and live_interval_start == replay_interval_starts[snapshot.pre_line_index]
+        )
         try:
             _assert_expected_observation_fields(
                 _live_tensors(record),
                 reconstructed,
                 compare_event_fields=exact_boundary and replay_cursor not in seen_replay_cursors,
+                compare_event_values=same_interval,
                 compare_dynamic_fields=exact_boundary,
             )
         except AssertionError as exc:
@@ -746,6 +784,8 @@ def _assert_live_truth(
                 f"live cursor {replay_cursor}: {exc}"
             ) from exc
         seen_replay_cursors.add(replay_cursor)
+        compared_intervals += same_interval
+    return compared_intervals
 
 
 _ORACLE_SKIPPED_TAGS = frozenset({"", "t:", "expire", "uhtmlchange", "showteam", "win", "tie"})
@@ -1069,6 +1109,7 @@ class TestRandomReplayReconstruction:
         # Verify accepted games against live observations. Unsupported or
         # ambiguous traces must be rejected as whole games.
         rejected_ids: set[str] = set()
+        compared_intervals = 0
         for document in documents:
             replay_id = document.metadata.replay_id
             perspectives = _assert_reconstruction_labels(document, max_candidates=max_candidates)
@@ -1086,7 +1127,10 @@ class TestRandomReplayReconstruction:
                 # Verify agreement with poke-env oracle battle state
                 _assert_poke_env_state_agreement(perspective, document)
                 # Verify reconstructed structured observations match live pre-fusion observation tensors
-                _assert_live_truth(perspective, artifact["records"], document, builder)
+                compared_intervals += _assert_live_truth(
+                    perspective, artifact["records"], document, builder
+                )
+        assert compared_intervals > 0
 
         # Compile replay documents into training dataset representation
         compilation = compile_documents(

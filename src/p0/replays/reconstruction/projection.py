@@ -6,8 +6,8 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple
 
-from p0.battle.events import SpatialSlotRecord, SpatialTurnRecorder
-from p0.battle.legality import DecisionView
+from p0.battle.events import EventRecord, SpatialEventRecorder
+from p0.battle.legality import GAME_END_DECISION, DecisionView
 from p0.model.resources import default_runtime_resources
 from p0.model.tokenizer import tokenizer
 from p0.replays.identity import ReplayMemberId, normalize_showdown_id
@@ -262,7 +262,7 @@ class ReplayBattleView:
     opponent_used_mega_evolve: bool
     decision: DecisionView
     identifiers: Mapping[str, ReplayPokemonView]
-    spatial_turn: tuple[SpatialSlotRecord, ...] = ()
+    spatial_events: tuple[EventRecord, ...] = ()
     stat_cache: dict[Any, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def get_pokemon(self, identifier: str) -> ReplayPokemonView:
@@ -299,14 +299,13 @@ class ReplayStatValue:
 
 @dataclass(frozen=True, slots=True)
 class ProjectedSnapshot:
-    """One pre-decision causal view and its preceding spatial history."""
+    """One pre-decision causal view, including the events since the previous decision."""
 
     decision_index: int
     turn: int
     pre_line_index: int
     post_line_index: int
     view: ReplayBattleView
-    spatial_turn: tuple[SpatialSlotRecord, ...]
     raw_lines: tuple[str, ...]
 
 
@@ -319,6 +318,9 @@ class ProjectedPerspective:
     snapshots: tuple[ProjectedSnapshot, ...]
     decisions: tuple[DecisionRecord, ...]
     diagnostics: ReplayDiagnostics
+    # The board after the last line with the events since this player's last
+    # decision; it feeds series memory and is never a labeled decision.
+    final_view: ReplayBattleView
 
     def __post_init__(self) -> None:
         if not self.game_id or self.player not in (0, 1):
@@ -629,7 +631,7 @@ def project_battle_view(
     *,
     perspective: int,
     decision: DecisionView,
-    spatial_turn: tuple[SpatialSlotRecord, ...] = (),
+    spatial_events: tuple[EventRecord, ...] = (),
     preview: bool = False,
     dex: Mapping[str, Any] | None = None,
 ) -> ReplayBattleView:
@@ -717,7 +719,7 @@ def project_battle_view(
         opponent_used_mega_evolve=state.sides[opponent].used_mega,
         decision=decision,
         identifiers=_FrozenMapping(identifiers),
-        spatial_turn=spatial_turn,
+        spatial_events=spatial_events,
     )
 
 
@@ -743,22 +745,21 @@ def _spatial_records(
     *,
     perspective: int,
     starts: tuple[int, ...],
-) -> dict[int, tuple[SpatialSlotRecord, ...]]:
-    recorder = SpatialTurnRecorder(player_role=f"p{perspective + 1}")
-    records: dict[int, tuple[SpatialSlotRecord, ...]] = {}
+) -> dict[int, tuple[EventRecord, ...]]:
+    """Return the events each of this player's decisions observed, keyed by decision start."""
+    recorder = SpatialEventRecorder(player_role=f"p{perspective + 1}")
+    records: dict[int, tuple[EventRecord, ...]] = {}
     cursor = 0
     for start in starts:
         for line_index in range(cursor, start):
             event = events[line_index]
-            if event.event.tag == "turn":
-                recorder.reset_turn()
             before = state.get(line_index - 1)
             recorder.apply_line(
                 document.protocol_lines[line_index].parts,
                 tokenizer,
                 lambda _identifier, before=before, event=event: _hp_before(before, event),
             )
-        records[start] = recorder.to_records()
+        records[start] = recorder.consume()
         cursor = start
     return records
 
@@ -768,7 +769,6 @@ def _projection_snapshot_lines(
     windows: tuple[DecisionWindow, ...],
 ) -> frozenset[int]:
     policy_windows = tuple(window for window in windows if window.is_policy_request)
-    last_start = max((window.start_line_index for window in policy_windows), default=0)
     lines = {
         len(events) - 1,
         *(
@@ -779,7 +779,7 @@ def _projection_snapshot_lines(
         ),
         *(
             event.event.line_index - 1
-            for event in events[:last_start]
+            for event in events
             if event.event.line_index > 0 and event.event.tag in {"-damage", "-heal"}
         ),
     }
@@ -811,24 +811,22 @@ def project_replay_perspectives(
     window_by_bounds = {
         (window.start_line_index, window.end_line_index): window for window in decisions[0].windows
     }
-    starts = tuple(
-        sorted(
-            {
-                decision.pre_line_index
-                for reconstruction in decisions
-                for decision in reconstruction.decisions
-            }
-        )
-    )
+    # Each player's interval closes only at that player's own decisions; a
+    # waiting side keeps accumulating until it next chooses. The final interval
+    # runs to the last line.
+    final_start = len(event_tuple)
     spatial = tuple(
         _spatial_records(
             document,
             event_tuple,
             snapshots_by_line,
             perspective=perspective,
-            starts=starts,
+            starts=(
+                *(decision.pre_line_index for decision in reconstruction.decisions),
+                final_start,
+            ),
         )
-        for perspective in (0, 1)
+        for perspective, reconstruction in enumerate(decisions)
     )
 
     projected: list[ProjectedPerspective] = []
@@ -867,11 +865,10 @@ def project_replay_perspectives(
                         document.ots,
                         perspective=perspective,
                         decision=decision_view,
-                        spatial_turn=spatial[perspective][decision.pre_line_index],
+                        spatial_events=spatial[perspective][decision.pre_line_index],
                         preview=preview,
                         dex=dex,
                     ),
-                    spatial[perspective][decision.pre_line_index],
                     tuple(
                         line.raw
                         for line in document.protocol_lines[
@@ -891,6 +888,14 @@ def project_replay_perspectives(
                     parse_errors=tuple(
                         diagnostic.reason for diagnostic in reconstruction.diagnostics
                     ),
+                ),
+                project_battle_view(
+                    snapshots_by_line[final_start - 1],
+                    document.ots,
+                    perspective=perspective,
+                    decision=GAME_END_DECISION,
+                    spatial_events=spatial[perspective][final_start],
+                    dex=dex,
                 ),
             )
         )

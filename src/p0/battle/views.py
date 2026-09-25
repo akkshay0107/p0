@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from p0.battle.events import SpatialSlotRecord
+from p0.battle.events import EventRecord
 from p0.battle.legality import DecisionView
 
 
@@ -382,7 +382,7 @@ class BattleView(FieldView, Protocol):
     def stat_cache(self) -> dict[Any, Any]: ...
 
     @property
-    def spatial_turn(self) -> Sequence[SpatialSlotRecord]: ...
+    def spatial_events(self) -> Sequence[EventRecord]: ...
 
     def get_pokemon(self, identifier: str) -> Any: ...
 
@@ -415,9 +415,7 @@ class FixtureBattleView:
     opponent_used_mega_evolve: bool
     decision: DecisionView
     identifiers: Mapping[str, Any] = field(default_factory=dict)
-    spatial_turn: Sequence[SpatialSlotRecord] = field(
-        default_factory=lambda: tuple(SpatialSlotRecord() for _ in range(4))
-    )
+    spatial_events: Sequence[EventRecord] = ()
     stat_cache: dict[Any, Any] = field(default_factory=dict)
 
     def get_pokemon(self, identifier: str) -> Any:

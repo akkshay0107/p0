@@ -231,6 +231,7 @@ def _chunk(
         candidate_values=torch.tensor(candidate_values, dtype=torch.long).reshape(-1, 2),
         candidate_offsets=torch.tensor(offsets, dtype=torch.long),
         outcome=torch.ones(length),
+        final_observation=StructuredObservation.empty_batch(1),
         is_series_end=is_series_end,
     )
 
@@ -697,11 +698,14 @@ class TestBCTrainer:
         batch = next(collate_bc_batches((first, second), 4))
 
         assert all(isinstance(window, BCGameWindow) for window in batch.windows)
-        assert batch.target_indices.tolist() == [0, 1, 2, 3]
+        # Each finished game's final board follows its targets: context rows 2 and 5.
+        assert batch.target_indices.tolist() == [0, 1, 3, 4]
+        assert [window.final_index for window in batch.windows] == [2, 5]
         # Decision 2 (start of second game) must not attend to history from first game
         assert not torch.any(batch.history_mask[2])
-        assert batch.history_indices[3, -1] == 2
+        assert batch.history_indices[3, -1] == 3
         assert batch.history_mask[3, -1]
+        assert not torch.any(batch.history_indices[batch.history_mask] == 2)
         for tensor in batch.observations.tensors():
             assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
 
@@ -717,7 +721,9 @@ class TestBCTrainer:
 
         assert not first.windows[0].is_game_end
         assert second.windows[0].is_game_end
-        assert second.observations.categorical.size(0) == HISTORY_WINDOW + length - 64
+        # The last window also carries the game's final board after its targets.
+        assert first.observations.categorical.size(0) == 64
+        assert second.observations.categorical.size(0) == HISTORY_WINDOW + length - 64 + 1
 
     def test_multi_epoch_training_rejects_one_shot_dataset(self) -> None:
         chunk = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1])

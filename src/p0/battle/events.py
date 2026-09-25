@@ -1,93 +1,95 @@
-"""Turn event recorder and slot records for the 4 active battlefield positions."""
+"""Ordered battle event records addressed by the four active battlefield positions."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+import logging
+from collections.abc import Callable, Sequence
 from enum import IntEnum
-from typing import Any
+from typing import TYPE_CHECKING, NamedTuple
+
+from p0.model.architecture_contract import RAW_EVENT_COUNT
+
+if TYPE_CHECKING:
+    from p0.model.tokenizer import PokemonTokenizer
+
+LOGGER = logging.getLogger(__name__)
 
 
-class SpatialActionType(IntEnum):
-    NONE = 0
+class EventKind(IntEnum):
+    NONE = 0  # padding row
     MOVE = 1
     SWITCH = 2
-    PASS = 3
-    FAINT = 4
-    CANT = 5
+    FAINT = 3
+    CANT = 4
+    DAMAGE = 5
+    HEAL = 6
+    BOOST = 7
+    CRIT = 8
+    FAIL = 9
+    ACTIVATE = 10  # a move effect such as Protect or Wide Guard blocked or triggered
+    ITEM = 11
+    SWAP = 12
 
 
-class SpatialTargetSlot(IntEnum):
-    SELF = 0
-    ALLY_LEFT = 1
-    ALLY_RIGHT = 2
-    OPP_LEFT = 3
-    OPP_RIGHT = 4
-    ALL = 5
-    NONE = 6
+class EventPosition(IntEnum):
+    OWN_LEFT = 0
+    OWN_RIGHT = 1
+    OPPONENT_LEFT = 2
+    OPPONENT_RIGHT = 3
+    NONE = 4
+
+
+class EventDetail(IntEnum):
+    NONE = 0
+    ATK = 1
+    DEF = 2
+    SPA = 3
+    SPD = 4
+    SPE = 5
+    ACCURACY = 6
+    EVASION = 7
+    FLINCH = 8
+    ITEM_REVEALED = 9
+    ITEM_REMOVED = 10
 
 
 SPATIAL_SLOT_COUNT = 4
-SPATIAL_CATEGORICAL_WIDTH = 3  # [action_type, move_id, target_slot]
-SPATIAL_NUMERICAL_WIDTH = 8  # [order_rank, hp_delta, damage_dealt, net_boost_delta, landed_crit, took_crit, move_failed, item_consumed]
-NUM_ACTION_TYPES = len(SpatialActionType)
-NUM_TARGET_SLOTS = len(SpatialTargetSlot)
-
-FLAG_LANDED_CRIT = 1
-FLAG_TOOK_CRIT = 2
-FLAG_MOVE_FAILED = 4
-FLAG_ITEM_CONSUMED = 8
-
+MAX_EVENT_RECORDS = RAW_EVENT_COUNT
+EVENT_CATEGORICAL_WIDTH = 5  # [kind, source, target, move_id, detail]
+EVENT_NUMERICAL_WIDTH = 2  # [amount, amount_known]
+NUM_EVENT_KINDS = len(EventKind)
+NUM_EVENT_POSITIONS = len(EventPosition)
+NUM_EVENT_DETAILS = len(EventDetail)
 
 MAX_BOOST_STAGES = 6.0
 _HP_STRIP_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ% "
+_STAT_DETAILS = {
+    "atk": EventDetail.ATK,
+    "def": EventDetail.DEF,
+    "spa": EventDetail.SPA,
+    "spd": EventDetail.SPD,
+    "spe": EventDetail.SPE,
+    "accuracy": EventDetail.ACCURACY,
+    "evasion": EventDetail.EVASION,
+}
+# Showdown prints "-ability|holder|Name|boost" before the stat changes an ability
+# causes (Intimidate, Moxie). These tags continue that ability's attribution.
+_ABILITY_CHAIN_TAGS = frozenset({"-ability", "-boost", "-unboost", "-fail", "-immune"})
 
 
-@dataclass(frozen=True, slots=True)
-class SpatialSlotRecord:
-    """Battlefield slot record tracking actions, targets, damage, and stat changes."""
+class EventRecord(NamedTuple):
+    """
+    One observed event. source is the position that acted or caused it, and
+    target is the position it affected; either may be NONE.
+    """
 
-    action_type: int = int(SpatialActionType.NONE)
+    kind: int
+    source: int = EventPosition.NONE
+    target: int = EventPosition.NONE
     move_id: int = 0
-    target_slot: int = int(SpatialTargetSlot.NONE)
-    order_rank: float = 0.0
-    hp_delta: float = 0.0
-    damage_dealt: float = 0.0
-    net_boost_delta: float = 0.0
-    landed_crit: float = 0.0
-    took_crit: float = 0.0
-    move_failed: float = 0.0
-    item_consumed: float = 0.0
-
-    def copy_with(
-        self,
-        *,
-        action_type: int | None = None,
-        move_id: int | None = None,
-        target_slot: int | None = None,
-        order_rank: float | None = None,
-        hp_delta: float | None = None,
-        damage_dealt: float | None = None,
-        net_boost_delta: float | None = None,
-        landed_crit: float | None = None,
-        took_crit: float | None = None,
-        move_failed: float | None = None,
-        item_consumed: float | None = None,
-    ) -> SpatialSlotRecord:
-        """Return a new SpatialSlotRecord with specified fields updated."""
-        return SpatialSlotRecord(
-            self.action_type if action_type is None else action_type,
-            self.move_id if move_id is None else move_id,
-            self.target_slot if target_slot is None else target_slot,
-            self.order_rank if order_rank is None else order_rank,
-            self.hp_delta if hp_delta is None else hp_delta,
-            self.damage_dealt if damage_dealt is None else damage_dealt,
-            self.net_boost_delta if net_boost_delta is None else net_boost_delta,
-            self.landed_crit if landed_crit is None else landed_crit,
-            self.took_crit if took_crit is None else took_crit,
-            self.move_failed if move_failed is None else move_failed,
-            self.item_consumed if item_consumed is None else item_consumed,
-        )
+    detail: int = EventDetail.NONE
+    amount: float = 0.0
+    amount_known: float = 0.0
 
 
 def get_hp_fraction(hp_status: str) -> float:
@@ -103,180 +105,238 @@ def get_hp_fraction(hp_status: str) -> float:
         return 0.0
 
 
-def _parse_slot_index(endpoint: str, perspective_role: str) -> int | None:
-    """Map a Showdown entity string (e.g. 'p1a: Pikachu') to perspective slot 0..3."""
+def _position(endpoint: str, player_role: str) -> int:
+    """Map a Showdown entity string (e.g. 'p1a: Pikachu') to a perspective position."""
     if len(endpoint) < 3 or endpoint[0] != "p":
-        return None
+        return EventPosition.NONE
     player_num = endpoint[1]
     slot_letter = endpoint[2].lower()
     if player_num not in ("1", "2") or slot_letter not in ("a", "b"):
-        return None
+        return EventPosition.NONE
 
-    is_ally = endpoint.startswith(perspective_role)
-    slot_offset = 0 if slot_letter == "a" else 1
-    return slot_offset if is_ally else 2 + slot_offset
-
-
-def _parse_target_slot(endpoint: str, perspective_role: str, actor_slot: int) -> int:
-    """Map a target endpoint to SpatialTargetSlot enum value."""
-    slot_idx = _parse_slot_index(endpoint, perspective_role)
-    if slot_idx is None:
-        return int(SpatialTargetSlot.NONE)
-    if slot_idx == actor_slot:
-        return int(SpatialTargetSlot.SELF)
-    if slot_idx == 0:
-        return int(SpatialTargetSlot.ALLY_LEFT)
-    if slot_idx == 1:
-        return int(SpatialTargetSlot.ALLY_RIGHT)
-    if slot_idx == 2:
-        return int(SpatialTargetSlot.OPP_LEFT)
-    if slot_idx == 3:
-        return int(SpatialTargetSlot.OPP_RIGHT)
-
-    return int(SpatialTargetSlot.NONE)
+    side_offset = 0 if endpoint.startswith(player_role) else 2
+    return side_offset + (0 if slot_letter == "a" else 1)
 
 
-class SpatialTurnRecorder:
-    """Records turn events for the four active battlefield slots (P1A, P1B, P2A, P2B)."""
+def _of_position(parts: Sequence[str], player_role: str) -> int | None:
+    """Return the position named by a trailing '[of]' tag, if the line has one."""
+    for part in parts[3:]:
+        if part.startswith("[of] "):
+            return _position(part.removeprefix("[of] "), player_role)
+    return None
 
-    __slots__ = ("player_role", "slots", "_action_order", "_last_attacker")
+
+def _move_id(resolver: PokemonTokenizer, name: str) -> int:
+    move_id, _ = resolver.resolve("moves", name)
+    return move_id
+
+
+class SpatialEventRecorder:
+    """Collect ordered event records until the owning player consumes them at a decision."""
+
+    __slots__ = (
+        "player_role",
+        "records",
+        "dropped",
+        "consumed",
+        "_move_source",
+        "_ability_source",
+    )
 
     def __init__(self, player_role: str = "p1") -> None:
         self.player_role = player_role
-        self.slots: list[SpatialSlotRecord] = [
-            SpatialSlotRecord() for _ in range(SPATIAL_SLOT_COUNT)
-        ]
-        self._action_order = 0
-        self._last_attacker: int | None = None
+        self.records: list[EventRecord] = []
+        self.dropped = 0
+        # True from a decision until the next protocol line; a decision requested
+        # in between retries a rejected choice and observes the same interval.
+        self.consumed = False
+        self._move_source = EventPosition.NONE
+        self._ability_source: int | None = None
 
-    def reset_turn(self) -> None:
-        self.slots = [SpatialSlotRecord() for _ in range(SPATIAL_SLOT_COUNT)]
-        self._action_order = 0
-        self._last_attacker = None
+    def pending(self) -> tuple[EventRecord, ...]:
+        """Return the records of the interval that the next decision observes."""
+        return tuple(self.records)
+
+    def consume(self) -> tuple[EventRecord, ...]:
+        """
+        Close the interval that the owning player's decision observed and return its records.
+
+        The records are cleared when the next protocol line arrives, not here, so a
+        retried decision observes and consumes the same interval again.
+        """
+        if self.dropped:
+            LOGGER.warning(
+                "Dropped %d event records beyond the %d-record capacity for %s",
+                self.dropped,
+                MAX_EVENT_RECORDS,
+                self.player_role,
+            )
+        self.dropped = 0
+        self.consumed = True
+        return tuple(self.records)
+
+    def _add(self, record: EventRecord) -> None:
+        # Keep the earliest records: they hold action order and direct move outcomes.
+        if len(self.records) == MAX_EVENT_RECORDS:
+            self.dropped += 1
+            return
+        self.records.append(record)
 
     def apply_line(
         self,
         parts: Sequence[str],
-        resolver: Any | None = None,
-        hp_for: Any | None = None,
+        resolver: PokemonTokenizer,
+        hp_for: Callable[[str], float | None],
     ) -> None:
+        """
+        Append the records one protocol line produces, if any.
+
+        Arguments:
+          parts: the split protocol line, starting with the empty leading field
+          resolver: vocabulary used to encode move names
+          hp_for: HP fraction of an identifier before this line, or None if unknown
+
+        Returns:
+          None; records accumulate until consume is called.
+        """
         if len(parts) < 2:
             return
 
+        if self.consumed:
+            self.records.clear()
+            self.consumed = False
+
         tag = parts[1]
+        role = self.player_role
+        if tag not in _ABILITY_CHAIN_TAGS:
+            self._ability_source = None
 
         if tag in ("turn", "upkeep"):
-            self._last_attacker = None
-            return
+            self._move_source = EventPosition.NONE
 
-        if tag == "move" and len(parts) >= 4:
-            actor = _parse_slot_index(parts[2], self.player_role)
-            if actor is not None:
-                self._action_order += 1
-                self._last_attacker = actor
-                move_id = 0
-                if resolver is not None:
-                    try:
-                        resolved, _ = resolver.resolve("moves", parts[3])
-                        move_id = resolved
-                    except Exception:
-                        # Move name may be custom, malformed, or missing from vocabulary.
-                        move_id = 0
-                target_slot = (
-                    _parse_target_slot(parts[4], self.player_role, actor)
-                    if len(parts) >= 5
-                    else int(SpatialTargetSlot.NONE)
-                )
-                self.slots[actor] = self.slots[actor].copy_with(
-                    action_type=int(SpatialActionType.MOVE),
-                    move_id=move_id,
-                    target_slot=target_slot,
-                    order_rank=min(1.0, self._action_order / float(SPATIAL_SLOT_COUNT)),
-                )
+        elif tag == "move" and len(parts) >= 4:
+            actor = _position(parts[2], role)
+            self._move_source = actor
+            target = _position(parts[4], role) if len(parts) >= 5 else EventPosition.NONE
+            self._add(EventRecord(EventKind.MOVE, actor, target, _move_id(resolver, parts[3])))
 
         elif tag in ("switch", "drag") and len(parts) >= 3:
-            slot = _parse_slot_index(parts[2], self.player_role)
-            if slot is not None:
-                self.slots[slot] = self.slots[slot].copy_with(
-                    action_type=int(SpatialActionType.SWITCH),
-                    move_id=0,
-                    target_slot=int(SpatialTargetSlot.NONE),
-                )
+            self._move_source = EventPosition.NONE
+            self._add(EventRecord(EventKind.SWITCH, target=_position(parts[2], role)))
+
+        elif tag == "swap" and len(parts) >= 4:
+            source = _position(parts[2], role)
+            if source == EventPosition.NONE or parts[3] not in ("0", "1"):
+                target = EventPosition.NONE
+            else:
+                side_offset = 0 if source < EventPosition.OPPONENT_LEFT else 2
+                target = side_offset + int(parts[3])
+            self._add(EventRecord(EventKind.SWAP, source, target))
 
         elif tag == "faint" and len(parts) >= 3:
-            slot = _parse_slot_index(parts[2], self.player_role)
-            if slot is not None:
-                self.slots[slot] = self.slots[slot].copy_with(
-                    action_type=int(SpatialActionType.FAINT)
-                )
+            self._add(EventRecord(EventKind.FAINT, target=_position(parts[2], role)))
 
         elif tag == "cant" and len(parts) >= 3:
-            slot = _parse_slot_index(parts[2], self.player_role)
-            if slot is not None:
-                self.slots[slot] = self.slots[slot].copy_with(
-                    action_type=int(SpatialActionType.CANT)
+            attempted = _move_id(resolver, parts[4]) if len(parts) >= 5 else 0
+            detail = (
+                EventDetail.FLINCH if len(parts) >= 4 and parts[3] == "flinch" else EventDetail.NONE
+            )
+            self._add(
+                EventRecord(
+                    EventKind.CANT, _position(parts[2], role), move_id=attempted, detail=detail
                 )
+            )
 
         elif tag in ("-damage", "-heal") and len(parts) >= 4:
-            target = _parse_slot_index(parts[2], self.player_role)
-            if target is not None:
-                new_hp = get_hp_fraction(parts[3])
-                pre_hp = hp_for(parts[2]) if hp_for is not None else None
-                delta = (new_hp - pre_hp) if pre_hp is not None else 0.0
-                self.slots[target] = self.slots[target].copy_with(
-                    hp_delta=self.slots[target].hp_delta + delta
-                )
-                if tag == "-damage" and self._last_attacker is not None and delta < 0:
-                    att = self.slots[self._last_attacker]
-                    self.slots[self._last_attacker] = att.copy_with(
-                        damage_dealt=att.damage_dealt + abs(delta)
-                    )
+            of_source = _of_position(parts, role)
+            if of_source is not None:
+                source = of_source
+            elif any(part.startswith("[from]") for part in parts[4:]):
+                source = EventPosition.NONE
+            else:
+                source = self._move_source
 
-        elif tag == "-crit" and len(parts) >= 3:
-            target = _parse_slot_index(parts[2], self.player_role)
-            if target is not None:
-                self.slots[target] = self.slots[target].copy_with(took_crit=1.0)
-            if self._last_attacker is not None:
-                att = self.slots[self._last_attacker]
-                self.slots[self._last_attacker] = att.copy_with(landed_crit=1.0)
+            pre_hp = hp_for(parts[2])
+            amount = 0.0 if pre_hp is None else get_hp_fraction(parts[3]) - pre_hp
+            kind = EventKind.DAMAGE if tag == "-damage" else EventKind.HEAL
+            self._add(
+                EventRecord(
+                    kind,
+                    source,
+                    _position(parts[2], role),
+                    amount=amount,
+                    amount_known=float(pre_hp is not None),
+                )
+            )
 
         elif tag in ("-boost", "-unboost") and len(parts) >= 5:
-            slot = _parse_slot_index(parts[2], self.player_role)
-            if slot is not None:
-                amount = int(parts[4]) / MAX_BOOST_STAGES
-                delta = amount if tag == "-boost" else -amount
-                self.slots[slot] = self.slots[slot].copy_with(
-                    net_boost_delta=self.slots[slot].net_boost_delta + delta
+            target = _position(parts[2], role)
+            of_source = _of_position(parts, role)
+            if of_source is not None:
+                source = of_source
+            elif self._ability_source is not None:
+                source = self._ability_source
+            elif any(part.startswith("[from]") for part in parts[5:]):
+                source = target
+            else:
+                source = self._move_source
+
+            try:
+                stages = int(parts[4]) / MAX_BOOST_STAGES
+            except ValueError:
+                return
+            self._add(
+                EventRecord(
+                    EventKind.BOOST,
+                    source,
+                    target,
+                    detail=_STAT_DETAILS.get(parts[3], EventDetail.NONE),
+                    amount=stages if tag == "-boost" else -stages,
+                    amount_known=1.0,
                 )
+            )
 
-        elif tag in ("-fail", "-miss", "-immune"):
-            if self._last_attacker is not None:
-                att = self.slots[self._last_attacker]
-                self.slots[self._last_attacker] = att.copy_with(move_failed=1.0)
+        elif tag == "-ability" and len(parts) >= 3:
+            self._ability_source = _position(parts[2], role)
 
-        elif tag in ("-enditem", "-item") and len(parts) >= 3:
-            slot = _parse_slot_index(parts[2], self.player_role)
-            if slot is not None:
-                self.slots[slot] = self.slots[slot].copy_with(item_consumed=1.0)
+        elif tag == "-crit" and len(parts) >= 3:
+            self._add(EventRecord(EventKind.CRIT, self._move_source, _position(parts[2], role)))
 
-    def to_records(self) -> tuple[SpatialSlotRecord, ...]:
-        return tuple(self.slots)
+        elif tag == "-miss" and len(parts) >= 3:
+            target = _position(parts[3], role) if len(parts) >= 4 else EventPosition.NONE
+            self._add(EventRecord(EventKind.FAIL, _position(parts[2], role), target))
+
+        elif tag in ("-fail", "-immune") and len(parts) >= 3:
+            self._add(EventRecord(EventKind.FAIL, self._move_source, _position(parts[2], role)))
+
+        elif tag == "-activate" and len(parts) >= 4 and parts[3].startswith("move: "):
+            self._add(
+                EventRecord(
+                    EventKind.ACTIVATE,
+                    self._move_source,
+                    _position(parts[2], role),
+                    _move_id(resolver, parts[3].removeprefix("move: ")),
+                )
+            )
+
+        elif tag in ("-item", "-enditem") and len(parts) >= 3:
+            detail = EventDetail.ITEM_REVEALED if tag == "-item" else EventDetail.ITEM_REMOVED
+            self._add(EventRecord(EventKind.ITEM, target=_position(parts[2], role), detail=detail))
 
 
 __all__ = [
-    "FLAG_ITEM_CONSUMED",
-    "FLAG_LANDED_CRIT",
-    "FLAG_MOVE_FAILED",
-    "FLAG_TOOK_CRIT",
+    "EVENT_CATEGORICAL_WIDTH",
+    "EVENT_NUMERICAL_WIDTH",
     "MAX_BOOST_STAGES",
-    "NUM_ACTION_TYPES",
-    "NUM_TARGET_SLOTS",
-    "SPATIAL_CATEGORICAL_WIDTH",
-    "SPATIAL_NUMERICAL_WIDTH",
+    "MAX_EVENT_RECORDS",
+    "NUM_EVENT_DETAILS",
+    "NUM_EVENT_KINDS",
+    "NUM_EVENT_POSITIONS",
     "SPATIAL_SLOT_COUNT",
-    "SpatialActionType",
-    "SpatialSlotRecord",
-    "SpatialTargetSlot",
-    "SpatialTurnRecorder",
+    "EventDetail",
+    "EventKind",
+    "EventPosition",
+    "EventRecord",
+    "SpatialEventRecorder",
     "get_hp_fraction",
 ]

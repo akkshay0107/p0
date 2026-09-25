@@ -10,10 +10,13 @@ import torch
 from torch import Tensor
 from torch.utils.data import IterableDataset
 
+from p0.battle.legality import GAME_END_DECISION, action_mask
 from p0.battle.series import SeriesPerspectiveKey
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.structured_observation import StructuredObservation
 from p0.replays.dataset import ReplayGameChunk
+
+_GAME_END_MASK = torch.from_numpy(action_mask(GAME_END_DECISION)).unsqueeze(0)
 
 
 class BCGameWindow(NamedTuple):
@@ -25,6 +28,8 @@ class BCGameWindow(NamedTuple):
     batch_stop: int
     is_game_end: bool
     is_series_end: bool
+    # Context row of the game's final observation; read only when is_game_end.
+    final_index: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +120,7 @@ def _collate_bc_window(
         context_length = stop - context_start
         relative_start = start - context_start
         relative_stop = stop - context_start
+        is_game_end = stop == game.length
         observations.append(game.observations[context_start:stop])
         context_action_masks.append(game.action_mask[context_start:stop])
         windows.append(
@@ -123,8 +129,9 @@ def _collate_bc_window(
                 game_number=game.game_number,
                 batch_start=batch_start,
                 batch_stop=batch_stop,
-                is_game_end=stop == game.length,
-                is_series_end=stop == game.length and game.is_series_end,
+                is_game_end=is_game_end,
+                is_series_end=is_game_end and game.is_series_end,
+                final_index=context_base + context_length,
             )
         )
 
@@ -151,6 +158,11 @@ def _collate_bc_window(
         history_indices.append(torch.where(local_mask, context_base + local_history, 0))
         history_masks.append(local_mask)
 
+        if is_game_end:
+            # The final board follows every target, so no target row reads it as history.
+            observations.append(game.final_observation)
+            context_action_masks.append(_GAME_END_MASK)
+            context_length += 1
         context_base += context_length
         batch_start = batch_stop
 

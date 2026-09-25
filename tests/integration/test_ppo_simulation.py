@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 import pytest
 from poke_env import AccountConfiguration
 
+from p0.battle.actions import PASS_ACTION
 from p0.model.observation_builder import ObservationBuilder
 from p0.runtime import poke_env_patches
 from p0.runtime.composition import build_sim_env
@@ -12,6 +13,7 @@ from p0.runtime.env import SimEnv
 from p0.teams.source import FixedTeamSource
 from p0.training.config import TrainingConfig
 from p0.training.rollout import RolloutCollector
+from p0.training.trajectory import CollectedTrajectory
 from p0.training.vector_env import ThreadVecEnv
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
@@ -61,23 +63,67 @@ class TestPpoSimulation:
                 TrainingConfig(n_envs=2, rollout_steps=1),
             )
 
+            uneven_game = False
+            previous_games: dict[int, tuple[str, tuple[CollectedTrajectory, ...]]] = {}
+            final_entry_checks = 0
             for _ in range(1_200):
                 active_series_ids = tuple(
                     str(info["series_id"]) for info in (vector_env.last_infos or ())
                 )
+                completed_before = len(collector.completed_trajectories)
                 collector.collect()
                 infos = vector_env.last_infos
                 if infos is None:
                     raise AssertionError("ThreadVecEnv did not publish battle metadata")
+                # Games finishing in one step are completed in environment order,
+                # seat 1 then seat 2.
+                new_trajectories = collector.completed_trajectories[completed_before:]
+                finished = [
+                    index for index, info in enumerate(infos) if "terminal_observation1" in info
+                ]
+                for index, seats in zip(
+                    finished,
+                    zip(new_trajectories[::2], new_trajectories[1::2], strict=True),
+                    strict=True,
+                ):
+                    previous = previous_games.get(index)
+                    if previous is not None and previous[0] == active_series_ids[index]:
+                        for prior, current in zip(previous[1], seats, strict=True):
+                            # A finished game adds its final board after the recorded
+                            # decisions; a truncated game adds nothing.
+                            final_entries = int(prior.dones[-1].item())
+                            assert current.series_history[-1].size(0) == (
+                                prior.length + final_entries
+                            )
+                            final_entry_checks += final_entries
+                    previous_games[index] = (active_series_ids[index], seats)
                 for index, info in enumerate(infos):
                     if info.get("series_complete"):
                         completed_series.add(index)
                         completed_series_ids.add(active_series_ids[index])
-                if completed_series == {0, 1}:
+                # Each game appends seat 1 then seat 2. Opponent-only replacements give
+                # the seats different decision counts, which game completion must accept;
+                # keep playing until at least one such game has finished.
+                trajectories = collector.completed_trajectories
+                uneven_game = any(
+                    first.length != second.length
+                    for first, second in zip(trajectories[::2], trajectories[1::2], strict=True)
+                )
+                if completed_series == {0, 1} and uneven_game:
                     break
 
             assert completed_series == {0, 1}
-            assert len(collector.completed_trajectories) >= 8
+            assert uneven_game
+            assert final_entry_checks > 0
+            trajectories = collector.completed_trajectories
+            assert len(trajectories) >= 8
+            for trajectory in trajectories:
+                # A waiting seat's double-pass step is not a decision and is never recorded.
+                pass_only = trajectory.action_masks[..., PASS_ACTION] & (
+                    trajectory.action_masks.sum(-1) == 1
+                )
+                assert not pass_only.all(dim=-1).any()
+                assert not trajectory.rewards[:-1].any()
             collector_state = collector.training_state()
             store1 = collector_state["series_store1"]
             store2 = collector_state["series_store2"]

@@ -26,6 +26,7 @@ from p0.training._bc_batch import (
 from p0.training._bc_history import (
     commit_history_updates,
     prepare_series_context,
+    window_history_tokens,
 )
 from p0.training._bc_metrics import (
     BCEvaluationMetrics,
@@ -264,7 +265,7 @@ class BCTrainer:
 
     def _prepare_model_inputs(
         self, batch: BCDecisionBatch
-    ) -> tuple[PreparedDecision, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[PreparedDecision, Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         observations = batch.observations.to(self.device)
         context_action_mask = batch.context_action_mask.to(self.device)
         encoded = self.policy.encode(observations, context_action_mask)
@@ -287,9 +288,11 @@ class BCTrainer:
         )
         candidate_values = candidate_values.to(self.device)
         candidate_offsets = candidate_offsets.to(self.device)
+        window_tokens = window_history_tokens(batch.windows, target_local_tokens, local_tokens)
         series_tokens, series_mask = prepare_series_context(
             self._series_history,
             batch.windows,
+            window_tokens,
             target_local_tokens,
             self.policy.series,
         )
@@ -304,7 +307,7 @@ class BCTrainer:
             batch.action_mask.to(self.device),
             candidate_values,
             candidate_offsets,
-            target_local_tokens,
+            window_tokens,
         )
 
     def _step_optimizer(self) -> float:
@@ -365,7 +368,7 @@ class BCTrainer:
             enabled=self.precision.autocast,
             dtype=self.precision.dtype,
         ):
-            prepared, action_mask, candidate_values, candidate_offsets, history_tokens = (
+            prepared, action_mask, candidate_values, candidate_offsets, window_tokens = (
                 self._prepare_model_inputs(batch)
             )
             log_probs = self.policy.score_candidates(
@@ -396,7 +399,7 @@ class BCTrainer:
                 raise FloatingPointError("BC update has a non-finite loss and was discarded")
             self.scaler.scale(total_loss).backward()
 
-        commit_history_updates(self._series_history, batch.windows, history_tokens)
+        commit_history_updates(self._series_history, batch.windows, window_tokens)
         return policy_sum.detach()
 
     @torch.inference_mode()
@@ -424,7 +427,7 @@ class BCTrainer:
                     action_mask,
                     candidate_values,
                     candidate_offsets,
-                    history_tokens,
+                    window_tokens,
                 ) = self._prepare_model_inputs(batch)
                 encoded = prepared.encoded
                 reduced = prepared.reduced
@@ -455,7 +458,7 @@ class BCTrainer:
                     team_preview=encoded.phase,
                 )
                 accumulator.add_value(value_predictions, value_targets, value_mask)
-                commit_history_updates(self._series_history, batch.windows, history_tokens)
+                commit_history_updates(self._series_history, batch.windows, window_tokens)
 
             metrics = accumulator.finalize()
         finally:

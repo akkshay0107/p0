@@ -169,8 +169,8 @@ class TestCudaTraining:
         current = torch.randn((2, policy.d_model), device=cuda_device, dtype=dtype)
         current.requires_grad_()
         windows = (
-            BCGameWindow(key, 1, 0, 1, True, False),
-            BCGameWindow(key, 2, 1, 2, False, False),
+            BCGameWindow(key, 1, 0, 1, True, False, 1),
+            BCGameWindow(key, 2, 1, 2, False, False, 2),
         )
 
         with torch.amp.autocast(
@@ -178,7 +178,9 @@ class TestCudaTraining:
             enabled=dtype is not torch.float32,
             dtype=dtype if dtype is not torch.float32 else torch.float16,
         ):
-            context, mask = prepare_series_context(store, windows, current, policy.series)
+            context, mask = prepare_series_context(
+                store, windows, (current[0:1], current[1:2]), current, policy.series
+            )
             loss = context[1].float().square().sum()
         loss.backward()
         torch.cuda.synchronize()

@@ -6,7 +6,6 @@ from poke_env.battle import Pokemon
 from poke_env.battle.move import Move
 from poke_env.teambuilder.teambuilder import TeambuilderPokemon
 
-from p0.battle.events import SpatialSlotRecord
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.battle.views import (
     BattleView,
@@ -119,5 +118,4 @@ class TestFixtureBattleView:
         assert _type_check_views(view, view, p1, p1.moves["fakeout"])
         assert view.get_pokemon("p1: Incineroar") is p1
         assert view.last_move(p1) is None
-        assert len(view.spatial_turn) == 4
-        assert all(isinstance(record, SpatialSlotRecord) for record in view.spatial_turn)
+        assert view.spatial_events == ()

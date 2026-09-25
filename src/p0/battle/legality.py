@@ -48,6 +48,11 @@ class DecisionView:
     team_size: int = 6
 
 
+# A finished game has no pending request, so its final observation proves no legality.
+_NO_CHOICE_SLOT = SlotDecision(active=False, legality_known=False)
+GAME_END_DECISION = DecisionView(slots=(_NO_CHOICE_SLOT, _NO_CHOICE_SLOT))
+
+
 _TEAM_PREVIEW_CACHE: dict[int, tuple[int, ...]] = {}
 _TEAM_PREVIEW_JOINT_MASKS: dict[tuple[int, int], npt.NDArray[np.bool_]] = {}
 

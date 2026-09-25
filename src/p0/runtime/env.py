@@ -27,6 +27,7 @@ from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.structured_observation import StructuredObservation
 from p0.runtime import poke_env_patches
+from p0.runtime.live_event_capture import consume_events, is_retry
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view, current_battle_view
 from p0.teams.source import TeamSource
@@ -165,6 +166,18 @@ class SimEnv(MegaEnv):
         """Number of games played so far in the current best-of-three series."""
         return self._series_games_played
 
+    @property
+    def retrying(self) -> tuple[bool, bool]:
+        """Whether each seat is about to decide again because its last choice was rejected."""
+        return (
+            self.agent1_to_move
+            and isinstance(self.battle1, DoubleBattle)
+            and is_retry(self.battle1),
+            self.agent2_to_move
+            and isinstance(self.battle2, DoubleBattle)
+            and is_retry(self.battle2),
+        )
+
     def training_state(self) -> dict[str, object]:
         """Return the random and series state needed to resume PPO training."""
         return {
@@ -281,6 +294,14 @@ class SimEnv(MegaEnv):
 
     def step(self, actions):
         self._decision_steps += 1
+        # A seat's event interval closes only when its order is submitted; a
+        # waiting seat keeps accumulating events until its next decision.
+        for battle, to_move in (
+            (self.battle1, self.agent1_to_move),
+            (self.battle2, self.agent2_to_move),
+        ):
+            if to_move and isinstance(battle, DoubleBattle):
+                consume_events(battle)
         obs, rewards, terminated, truncated, info = super().step(actions)
 
         # poke-env reports termination only when exactly one side is wiped out,

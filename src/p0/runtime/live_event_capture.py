@@ -8,11 +8,9 @@ from typing import NamedTuple
 
 from poke_env.battle import DoubleBattle, Pokemon
 
-from p0.battle.events import SPATIAL_SLOT_COUNT, SpatialSlotRecord, SpatialTurnRecorder
+from p0.battle.events import EventRecord, SpatialEventRecorder
 from p0.model.tokenizer import tokenizer
 from p0.replays.identity import normalize_showdown_id
-
-_EMPTY_SPATIAL_TURN = tuple(SpatialSlotRecord() for _ in range(SPATIAL_SLOT_COUNT))
 
 
 class CapturedTransform(NamedTuple):
@@ -22,12 +20,12 @@ class CapturedTransform(NamedTuple):
     original_weight: float
 
 
-def _recorder_for(battle: DoubleBattle) -> SpatialTurnRecorder:
+def _recorder_for(battle: DoubleBattle) -> SpatialEventRecorder:
     try:
         return battle._p0_spatial_recorder  # type: ignore[attr-defined]
     except AttributeError:
         role = battle.player_role or "p1"
-        recorder = SpatialTurnRecorder(player_role=role)
+        recorder = SpatialEventRecorder(player_role=role)
         battle._p0_spatial_recorder = recorder  # type: ignore[attr-defined]
         return recorder
 
@@ -93,7 +91,7 @@ def capture_message(
     *,
     capture_protocol_line: bool = False,
 ) -> None:
-    """Update the battle's turn records from one Showdown protocol message."""
+    """Update the battle's pending event records from one Showdown protocol message."""
     if capture_protocol_line:
         protocol_lines = getattr(battle, "_p0_protocol_lines", None)
         if protocol_lines is None:
@@ -102,9 +100,6 @@ def capture_message(
         protocol_lines.append(tuple(split_message))
 
     recorder = _recorder_for(battle)
-    if len(split_message) >= 2 and split_message[1] == "turn":
-        recorder.reset_turn()
-
     if len(split_message) >= 4 and split_message[1] == "-transform":
         try:
             base = battle.get_pokemon(split_message[2])
@@ -172,10 +167,29 @@ def capture_message(
     recorder.apply_line(split_message, tokenizer, pre_hp_for)
 
 
-def spatial_turn(battle: DoubleBattle) -> tuple[SpatialSlotRecord, ...]:
-    """Return the current turn records without storing a copy after every message."""
-    recorder = getattr(battle, "_p0_spatial_recorder", None)
-    return _EMPTY_SPATIAL_TURN if recorder is None else recorder.to_records()
+def pending_events(battle: DoubleBattle) -> tuple[EventRecord, ...]:
+    """Return the records of the interval that this player's next decision observes."""
+    return _recorder_for(battle).pending()
+
+
+def consume_events(battle: DoubleBattle) -> None:
+    """
+    Close the event interval when this player submits a decision.
+
+    Showdown sends no battle events between a request and the player's choice,
+    so the records consumed here are exactly those the decision observed.
+    """
+    _recorder_for(battle).consume()
+
+
+def is_retry(battle: DoubleBattle) -> bool:
+    """
+    Return whether a decision requested now retries this player's previous one.
+
+    Showdown answers every accepted choice with battle lines before the next
+    request, so no line since the last submission means the choice was rejected.
+    """
+    return _recorder_for(battle).consumed
 
 
 def captured_protocol_lines(battle: DoubleBattle) -> tuple[str, ...]:

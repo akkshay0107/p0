@@ -36,7 +36,7 @@ from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save, atomic_torch_save
 from p0.replays.group import GroupedSeries, GroupingResult, group_replays
-from p0.replays.identity import normalize_showdown_id
+from p0.replays.identity import ReplayMemberId, normalize_showdown_id
 from p0.replays.protocol import (
     ReplayDocument,
     ReplayInputContractError,
@@ -50,6 +50,7 @@ from p0.replays.reconstruction.diagnostics import ReplayRejectionCategory
 from p0.replays.reconstruction.events import parse_protocol_event
 from p0.replays.reconstruction.projection import (
     ProjectedPerspective,
+    ReplayBattleView,
     ReplayStatValue,
     _projection_snapshot_lines,
     impute_replay_stats,
@@ -59,6 +60,7 @@ from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import reduce_replay_state
 from p0.replays.schema import DecisionType, LabelKind
 from p0.replays.shards import (
+    FINAL_OBSERVATION_PREFIX,
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
     ShardIndexEntry,
@@ -257,13 +259,31 @@ def _empty_scalar_values() -> dict[str, list[Any]]:
     }
 
 
+def _replay_observation(
+    view: ReplayBattleView,
+    builder: ObservationBuilder,
+    stat_overrides: Mapping[ReplayMemberId, tuple[int, int, int, int, int, int] | None],
+) -> StructuredObservation:
+    """Build one replay observation with the imputed stats of every identified member."""
+    view.stat_cache.clear()
+    overrides: dict[Any, tuple[int, int, int, int, int, int] | None] = {}
+    for pokemon in (*view.team.values(), *view.opponent_team.values()):
+        try:
+            overrides[pokemon] = (
+                None if pokemon.identity_uncertain else stat_overrides[pokemon.member_id]
+            )
+        except KeyError as exc:
+            raise ValueError("Replay stats are missing a roster member") from exc
+    return builder.build(view, overrides)
+
+
 def _perspective_tensors(
     game: CompiledGame,
     perspective: ProjectedPerspective,
     *,
     builder: ObservationBuilder,
     stat_estimates: tuple[ReplayStatValue, ...],
-) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
+) -> tuple[dict[str, list[Any]], dict[str, list[Any]], StructuredObservation]:
     """Convert a single perspective's snapshots into observation and scalar lists."""
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
@@ -276,16 +296,7 @@ def _perspective_tensors(
     outcome = 0.0 if winner < 0 else (1.0 if winner == perspective.player else -1.0)
 
     for snapshot, decision in zip(perspective.snapshots, perspective.decisions, strict=True):
-        snapshot.view.stat_cache.clear()
-        overrides: dict[Any, tuple[int, int, int, int, int, int] | None] = {}
-        for pokemon in (*snapshot.view.team.values(), *snapshot.view.opponent_team.values()):
-            try:
-                overrides[pokemon] = (
-                    None if pokemon.identity_uncertain else stat_overrides[pokemon.member_id]
-                )
-            except KeyError as exc:
-                raise ValueError("Replay stats are missing a roster member") from exc
-        observation = builder.build(snapshot.view, overrides)
+        observation = _replay_observation(snapshot.view, builder, stat_overrides)
 
         for name, tensor in zip(
             StructuredObservation._FIELD_NAMES, observation.tensors(), strict=True
@@ -307,7 +318,7 @@ def _perspective_tensors(
         values["candidate_values"].extend(evidence.candidates)
         values["candidate_offsets"].append(len(values["candidate_values"]))
         values["outcome"].append(outcome)
-    return fields, values
+    return fields, values, _replay_observation(perspective.final_view, builder, stat_overrides)
 
 
 def _tensorize_values(
@@ -413,6 +424,7 @@ def write_tensor_shards(
     games_by_series: dict[str, list[CompiledGame]] = {}
     for game in result.games:
         games_by_series.setdefault(game.series_id, []).append(game)
+    unpublished_series: set[str] = set()
     for series_id, replay_ids in memberships.items():
         games = games_by_series.get(series_id, [])
         if not games:
@@ -423,12 +435,16 @@ def write_tensor_shards(
         numbers = tuple(sorted(game.game_number for game in games))
         expected = tuple(range(1, len(replay_ids) + 1))
         if numbers != expected:
-            raise ValueError(
-                f"Series {series_id!r} has duplicate or incomplete chronological games: "
-                f"expected {expected!r}, got {numbers!r}"
-            )
+            # Series memory needs games 1..n, so a series missing an earlier game
+            # or repeating one is left out like any other rejected series.
+            unpublished_series.add(series_id)
+    published_games = tuple(
+        game for game in result.games if game.series_id not in unpublished_series
+    )
+    if not published_games:
+        raise ValueError("No replay games passed the quality gates; nothing was published")
     source_format_id = next(
-        (game.document.metadata.format_id for game in result.games),
+        (game.document.metadata.format_id for game in published_games),
         FORMAT.bo3_format,
     )
     dataset_hash = _dataset_hash(
@@ -452,6 +468,9 @@ def write_tensor_shards(
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     diagnostics["rejected_input_files"] += len(rejected)
+    diagnostics["accepted_games"] -= len(result.games) - len(published_games)
+    diagnostics["rejected_games"] += sum(len(memberships[series]) for series in unpublished_series)
+    diagnostics["rejected_non_contiguous_game_numbers"] += len(unpublished_series)
     current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
     current_decisions = 0
     shard_index = 0
@@ -461,18 +480,20 @@ def write_tensor_shards(
         if not current_games:
             return
         field_values = {name: [] for name, _, _ in observation_field_specs()}
+        final_observations: list[StructuredObservation] = []
         scalar_values = _empty_scalar_values()
         game_offsets = [0]
         series_offsets = [0]
         summaries: list[dict[str, Any]] = []
         last_series_id: str | None = None
         for game, perspective in current_games:
-            fields, values = _perspective_tensors(
+            fields, values, final_observation = _perspective_tensors(
                 game,
                 perspective,
                 builder=builder,
                 stat_estimates=game.stat_estimates,
             )
+            final_observations.append(final_observation)
 
             if last_series_id is not None and game.series_id != last_series_id:
                 series_offsets.append(game_offsets[-1])
@@ -505,6 +526,16 @@ def write_tensor_shards(
             )
         series_offsets.append(game_offsets[-1])
         tensors = _tensorize_values(field_values, scalar_values)
+        tensors.update(
+            {
+                f"{FINAL_OBSERVATION_PREFIX}{name}": tensor
+                for name, tensor in zip(
+                    StructuredObservation._FIELD_NAMES,
+                    StructuredObservation.stack(final_observations).tensors(),
+                    strict=True,
+                )
+            }
+        )
         tensors["game_offsets"] = torch.tensor(game_offsets, dtype=torch.long)
         tensors["series_offsets"] = torch.tensor(series_offsets, dtype=torch.long)
         entries.append(
@@ -524,7 +555,7 @@ def write_tensor_shards(
     try:
         current_series_id = None
         for game in sorted(
-            result.games,
+            published_games,
             key=lambda item: (item.series_id, item.game_number, item.replay_id),
         ):
             game_items = [(game, perspective) for perspective in game.perspectives]

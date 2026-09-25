@@ -24,19 +24,39 @@ from p0.training.series_history import (
 SeriesResampler = Callable[[Tensor, Tensor], Tensor]
 
 
+def window_history_tokens(
+    windows: tuple[BCGameWindow, ...],
+    target_tokens: Tensor,
+    context_tokens: Tensor,
+) -> tuple[Tensor, ...]:
+    """Return the local summaries each window adds to its game history, final board included."""
+    return tuple(
+        torch.cat(
+            (
+                target_tokens[window.batch_start : window.batch_stop],
+                context_tokens[window.final_index : window.final_index + 1],
+            )
+        )
+        if window.is_game_end
+        else target_tokens[window.batch_start : window.batch_stop]
+        for window in windows
+    )
+
+
 def prepare_series_context(
     store: SeriesHistoryStore,
     windows: tuple[BCGameWindow, ...],
+    window_tokens: tuple[Tensor, ...],
     target_tokens: Tensor,
     resample_game: SeriesResampler,
 ) -> tuple[Tensor, Tensor]:
-    """Prepare prior-game series tokens and mask for a batch of windows."""
+    """Prepare prior-game series tokens and mask for the target rows of a batch of windows."""
     working_states: dict[SeriesPerspectiveKey, SeriesStateSnapshot] = {}
     histories: list[Tensor] = []
     history_rows: dict[int, int] = {}
     window_history_rows: list[tuple[int, ...]] = []
 
-    for window in windows:
+    for window, chunk in zip(windows, window_tokens, strict=True):
         state = working_states.get(window.series_key)
         if state is None:
             games, tokens, fragments, active = store.planning_state(window.series_key)
@@ -67,11 +87,10 @@ def prepare_series_context(
             prior_rows.append(row)
         window_history_rows.append(tuple(prior_rows))
 
-        token_chunk = target_tokens[window.batch_start : window.batch_stop]
         working_states[window.series_key] = advance_series_state(
             state,
             window.game_number,
-            token_chunk,
+            chunk,
             is_game_end=window.is_game_end,
             is_series_end=window.is_series_end,
             max_games=store.max_games,
@@ -90,14 +109,14 @@ def prepare_series_context(
 def commit_history_updates(
     store: SeriesHistoryStore,
     windows: tuple[BCGameWindow, ...],
-    target_tokens: Tensor,
+    window_tokens: tuple[Tensor, ...],
 ) -> None:
     """Append completed window tokens to the series history store."""
-    for window in windows:
+    for window, chunk in zip(windows, window_tokens, strict=True):
         store.append(
             window.series_key,
             window.game_number,
-            target_tokens[window.batch_start : window.batch_stop],
+            chunk,
             is_game_end=window.is_game_end,
             is_series_end=window.is_series_end,
         )

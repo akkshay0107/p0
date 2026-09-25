@@ -49,7 +49,11 @@ from p0.model.structured_observation import (
     StructuredObservation,
     is_teampreview,
 )
-from p0.model.swiglu_encoder import MODEL_INIT_STD, initialize_module
+from p0.model.swiglu_encoder import (
+    MODEL_INIT_STD,
+    SwiGLUTransformerEncoder,
+    initialize_module,
+)
 
 # Only these entities are ever pointed at: the 6 allies (switch/TP/ally targets)
 # and the 2 opponent actives (move targets). Opponent bench rows get no keys.
@@ -786,6 +790,15 @@ class PolicyNet(nn.Module):
             config.dim_feedforward,
             self.resources,
         )
+        # One layer lets board, legality and event tokens read each other before the
+        # local summary is archived. It reads no history or series memory, so the
+        # archived summary stays independent of memory.
+        self.local_mixer = SwiGLUTransformerEncoder(
+            config.d_model,
+            config.nhead,
+            config.dim_feedforward,
+            num_layers=1,
+        )
         self.actor = ActorPolicy(
             config.d_model,
             config.nhead,
@@ -815,6 +828,9 @@ class PolicyNet(nn.Module):
         if obs.categorical.dim() != 3:
             raise ValueError("PolicyNet.encode expects a batched StructuredObservation.")
         tokens, aux = self.encoder(obs, action_mask)
+        tokens = self.local_mixer(
+            tokens, torch.zeros(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
+        )
         return EncodedObs(
             tokens=tokens,
             aux=aux,

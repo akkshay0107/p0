@@ -11,10 +11,13 @@ import torch
 import torch.nn as nn
 
 from p0.battle.events import (
-    NUM_ACTION_TYPES,
-    NUM_TARGET_SLOTS,
-    SPATIAL_NUMERICAL_WIDTH,
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EVENT_RECORDS,
+    NUM_EVENT_DETAILS,
+    NUM_EVENT_KINDS,
+    NUM_EVENT_POSITIONS,
     SPATIAL_SLOT_COUNT,
+    EventKind,
 )
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import EVENT_RAW_WIDTH
@@ -348,11 +351,15 @@ class FusedTokenEncoder(nn.Module):
         # could not prove. Keeps unknown as a distinct state instead of a mask value.
         self.unknown_legality_emb = nn.Parameter(torch.empty(2, d_model))
 
-        # Spatial interaction token builder (4 slots: P1A, P1B, P2A, P2B)
-        self.spatial_action_emb = nn.Embedding(NUM_ACTION_TYPES, d_model)
-        self.spatial_target_emb = nn.Embedding(NUM_TARGET_SLOTS, d_model)
+        # Ordered event records since this player's previous decision. One learned
+        # query per active position (own left/right, opponent left/right) reads them.
+        self.event_kind_emb = nn.Embedding(NUM_EVENT_KINDS, d_model)
+        self.event_source_emb = nn.Embedding(NUM_EVENT_POSITIONS, d_model)
+        self.event_target_emb = nn.Embedding(NUM_EVENT_POSITIONS, d_model)
+        self.event_detail_emb = nn.Embedding(NUM_EVENT_DETAILS, d_model)
+        self.event_order_emb = nn.Embedding(MAX_EVENT_RECORDS, d_model)
         self.spatial_move_proj = nn.Linear(d_raw, d_model)
-        self.spatial_num_proj = nn.Linear(SPATIAL_NUMERICAL_WIDTH, d_model)
+        self.spatial_num_proj = nn.Linear(EVENT_NUMERICAL_WIDTH, d_model)
         self.event_slot_emb = nn.Embedding(SPATIAL_SLOT_COUNT, d_model)
         self.event_type_token = nn.Parameter(torch.empty(d_model))
         self.event_encoder = SwiGLUTransformerEncoder(
@@ -496,22 +503,31 @@ class FusedTokenEncoder(nn.Module):
     def _encode_events(self, obs: StructuredObservation, device: torch.device) -> torch.Tensor:
         spatial_cat = obs.spatial_cat.long().to(device)
         spatial_num = obs.spatial_num.float().to(device)
-        action_emb = self.spatial_action_emb(spatial_cat[..., 0])
-        move_emb = self.spatial_move_proj(self.move_emb(spatial_cat[..., 1]))
-        target_emb = self.spatial_target_emb(spatial_cat[..., 2])
-        num_emb = self.spatial_num_proj(spatial_num)
-        event_tokens = (
-            action_emb
-            + move_emb
-            + target_emb
-            + num_emb
-            + self.event_slot_emb.weight
-            + self.event_type_token
+        records = (
+            self.event_kind_emb(spatial_cat[..., 0])
+            + self.event_source_emb(spatial_cat[..., 1])
+            + self.event_target_emb(spatial_cat[..., 2])
+            + self.spatial_move_proj(self.move_emb(spatial_cat[..., 3]))
+            + self.event_detail_emb(spatial_cat[..., 4])
+            + self.spatial_num_proj(spatial_num)
+            + self.event_order_emb.weight
         )
-        event_padding = torch.zeros(
-            event_tokens.shape[:2], dtype=torch.bool, device=event_tokens.device
+        batch = records.size(0)
+        queries = (self.event_slot_emb.weight + self.event_type_token).expand(batch, -1, -1)
+
+        # The query rows are never padded, so an empty interval still has valid keys.
+        padding = torch.cat(
+            (
+                torch.zeros(batch, SPATIAL_SLOT_COUNT, dtype=torch.bool, device=device),
+                spatial_cat[..., 0] == EventKind.NONE,
+            ),
+            dim=1,
         )
-        return self.event_encoder(event_tokens, event_padding)
+        return self.event_encoder(
+            torch.cat((queries, records), dim=1),
+            padding,
+            output_slice=slice(0, SPATIAL_SLOT_COUNT),
+        )
 
     def _append_action_mask_token(
         self,

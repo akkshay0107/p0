@@ -7,12 +7,12 @@ from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from poke_env.battle import DoubleBattle
 
-from p0.battle.legality import DecisionView, SlotDecision
+from p0.battle.legality import GAME_END_DECISION, DecisionView, SlotDecision
 from p0.battle.views import TransformedPokemonView
 from p0.runtime.live_event_capture import (
     captured_protocol_lines,
     last_move,
-    spatial_turn,
+    pending_events,
 )
 
 
@@ -130,12 +130,14 @@ class PokeEnvBattleView:
     @property
     def decision(self) -> DecisionView:
         if self._decision is None:
-            self._decision = decision_view(self._battle)
+            battle = self._battle
+            # The last request of a finished battle no longer describes a choice.
+            self._decision = GAME_END_DECISION if battle.finished else decision_view(battle)
         return self._decision
 
     @property
-    def spatial_turn(self):
-        return spatial_turn(self._battle)
+    def spatial_events(self):
+        return pending_events(self._battle)
 
     def get_pokemon(self, identifier: str):
         return self._battle.get_pokemon(identifier)

@@ -10,6 +10,8 @@ import pytest
 import torch
 from poke_env.battle import DoubleBattle
 
+from p0.battle.events import EventKind
+from p0.battle.legality import GAME_END_DECISION
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
@@ -305,3 +307,54 @@ class TestReconstructionProjection:
                 oracle.parse_message(list(line.parts))
             except (AssertionError, IndexError, KeyError, NotImplementedError, ValueError) as exc:
                 pytest.fail(f"poke-env rejected {line.raw!r}: {exc}")
+
+
+class TestSpatialEventIntervals:
+    def test_each_player_sees_every_move_since_its_own_previous_decision(self) -> None:
+        """A waiting player's interval spans the opponent's decision instead of resetting."""
+        payload = _STATE_REPLAY.read_bytes()
+        raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
+        perspectives = compile_payloads((payload,), chunksize=0).games[0].perspectives
+        starts = [[snapshot.pre_line_index for snapshot in item.snapshots] for item in perspectives]
+
+        spans_opponent_decision = 0
+        for perspective in (0, 1):
+            opponent_starts = set(starts[1 - perspective])
+            previous = 0
+            for snapshot in perspectives[perspective].snapshots:
+                start = snapshot.pre_line_index
+                interval = raw_lines[previous:start]
+                recorded = [record.kind for record in snapshot.view.spatial_events]
+
+                assert recorded.count(EventKind.MOVE) == sum(
+                    line.startswith("|move|") for line in interval
+                )
+                if any(previous < line < start for line in opponent_starts):
+                    spans_opponent_decision += 1
+                previous = start
+
+        assert spans_opponent_decision > 0
+
+    def test_final_view_holds_the_exchange_after_each_players_last_decision(self) -> None:
+        """The last exchange has no request; the final view keeps it with no choice."""
+        payload = _STATE_REPLAY.read_bytes()
+        raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
+        perspectives = compile_payloads((payload,), chunksize=0).games[0].perspectives
+
+        for perspective in perspectives:
+            final_interval = raw_lines[perspective.snapshots[-1].pre_line_index :]
+            recorded = [record.kind for record in perspective.final_view.spatial_events]
+
+            assert perspective.final_view.decision == GAME_END_DECISION
+            assert recorded.count(EventKind.MOVE) == sum(
+                line.startswith("|move|") for line in final_interval
+            )
+            assert recorded.count(EventKind.FAINT) == sum(
+                line.startswith("|faint|") for line in final_interval
+            )
+            assert EventKind.MOVE in recorded
+            damage_events = [
+                r for r in perspective.final_view.spatial_events if r.kind == EventKind.DAMAGE
+            ]
+            assert damage_events
+            assert all(r.amount_known == 1.0 and r.amount < 0.0 for r in damage_events)

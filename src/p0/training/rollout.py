@@ -33,7 +33,7 @@ def _terminal_action_mask(
     """Return one validated two-slot mask saved before a vector-env reset."""
     raw_mask = info.get(key)
     if raw_mask is None:
-        raise RuntimeError(f"Truncated rollout info is missing {key}")
+        raise RuntimeError(f"Completed rollout info is missing {key}")
 
     mask = torch.as_tensor(raw_mask, device=device, dtype=torch.bool)
     if mask.shape != (2, ACT_SIZE):
@@ -118,6 +118,12 @@ class RolloutCollector:
             if len(infos) != n_envs:
                 raise ValueError(f"Expected {n_envs} environment infos, got {len(infos)}")
             series_ids = [str(info["series_id"]) for info in infos]
+            to_move = torch.tensor([cast(tuple[bool, bool], info["to_move"]) for info in infos])
+            retry = torch.tensor([cast(tuple[bool, bool], info["retry"]) for info in infos])
+            for seat_index, seat in enumerate(self._seats):
+                # A seat whose choice was rejected decides the same request again; its
+                # new decision replaces the rejected one in history and trajectory.
+                seat.trajectories.step_counts[retry[:, seat_index]] -= 1
             series_inputs = [
                 seat.series_tokens.get_tokens(series_ids, device) for seat in self._seats
             ]
@@ -147,27 +153,21 @@ class RolloutCollector:
             log_probs = current_out.log_probs.to(device="cpu", dtype=torch.float32).chunk(2)
             values = current_out.value.to(device="cpu", dtype=torch.float32).chunk(2)
             observations = vec_env.obs1_buffers, vec_env.obs2_buffers
-            steps = tuple(
+            # Both seats are always evaluated so the batch shape stays fixed, but a
+            # seat is recorded only when it acts. A waiting seat's forced double
+            # pass is never sent, and live play and replays give it no decision.
+            for seat_index, seat in enumerate(self._seats):
+                acting = to_move[:, seat_index]
+                env_ids = idx_all[acting]
                 seat.trajectories.record(
-                    idx_all,
-                    observation,
-                    action,
-                    log_prob,
-                    value,
-                    torch.from_numpy(mask).to(torch.bool),
-                    history_token,
+                    env_ids,
+                    observations[seat_index][env_ids],
+                    actions[seat_index][env_ids],
+                    log_probs[seat_index][env_ids],
+                    values[seat_index][env_ids],
+                    torch.from_numpy(masks[seat_index]).to(torch.bool)[env_ids],
+                    history_tokens[seat_index][acting.to(device)],
                 )
-                for seat, observation, action, log_prob, value, mask, history_token in zip(
-                    self._seats,
-                    observations,
-                    actions,
-                    log_probs,
-                    values,
-                    masks,
-                    history_tokens,
-                    strict=True,
-                )
-            )
 
             env_actions = [
                 {
@@ -184,11 +184,16 @@ class RolloutCollector:
             # RL non-terminal masking only cares if the episode naturally terminated.
             # Status 1 is Terminated, Status 2 is Truncated.
             game_done = (done_status == 1).astype(np.float32)
-            for seat, rewards, step_indices in zip(
-                self._seats, (rewards1, rewards2), steps, strict=True
-            ):
-                seat.trajectories.rewards[idx_all, step_indices] = torch.from_numpy(rewards)
-                seat.trajectories.dones[idx_all, step_indices] = torch.from_numpy(game_done)
+            for seat, rewards in zip(self._seats, (rewards1, rewards2), strict=True):
+                # Rewards are terminal-only, so each step's outcome belongs to the
+                # seat's latest recorded decision even when it did not act this step.
+                last_steps = seat.trajectories.step_counts - 1
+                if (last_steps < 0).any():
+                    raise RuntimeError(
+                        "A seat reached an environment step with no recorded decision"
+                    )
+                seat.trajectories.rewards[idx_all, last_steps] = torch.from_numpy(rewards)
+                seat.trajectories.dones[idx_all, last_steps] = torch.from_numpy(game_done)
 
             for i in range(n_envs):
                 if done_status[i]:
@@ -227,21 +232,28 @@ class RolloutCollector:
         policy = self.policy
         device = policy.device
         snapshots = tuple(seat.series_history.snapshot(series_id) for seat in self._seats)
+        terminal_observations: list[StructuredObservation] = []
+        for key in ("terminal_observation1", "terminal_observation2"):
+            observation = info.get(key)
+            if not isinstance(observation, StructuredObservation):
+                raise RuntimeError(f"Completed rollout info is missing {key}")
+            terminal_observations.append(observation.unsqueeze(0).to(device))
+        terminal_obs = StructuredObservation.cat(terminal_observations)
+        terminal_mask = torch.stack(
+            tuple(
+                _terminal_action_mask(info, f"terminal_action_mask{seat_index}", device)
+                for seat_index in (1, 2)
+            )
+        )
+        with torch.amp.autocast(
+            device_type=device.type,
+            enabled=precision.autocast,
+            dtype=precision.dtype,
+        ):
+            terminal_encoded = policy.encode(terminal_obs, terminal_mask)
+
         bootstrap_values = (0.0, 0.0)
         if done_status == 2:
-            terminal_observations: list[StructuredObservation] = []
-            for key in ("terminal_observation1", "terminal_observation2"):
-                observation = info.get(key)
-                if not isinstance(observation, StructuredObservation):
-                    raise RuntimeError(f"Truncated rollout info is missing {key}")
-                terminal_observations.append(observation.unsqueeze(0).to(device))
-            terminal_obs = StructuredObservation.cat(terminal_observations)
-            terminal_mask = torch.stack(
-                tuple(
-                    _terminal_action_mask(info, f"terminal_action_mask{seat_index}", device)
-                    for seat_index in (1, 2)
-                )
-            )
             env_index = torch.tensor([env_id], dtype=torch.long)
             history_inputs = [
                 seat.trajectories.history_inputs(env_index, device, torch.float32)
@@ -262,7 +274,7 @@ class RolloutCollector:
                 dtype=precision.dtype,
             ):
                 values = policy.act(
-                    policy.prepare(policy.encode(terminal_obs, terminal_mask), memory),
+                    policy.prepare(terminal_encoded, memory),
                     terminal_mask,
                 ).value
             bootstrap_values = float(values[0].item()), float(values[1].item())
@@ -271,17 +283,28 @@ class RolloutCollector:
         if any(history is None for history in histories):
             raise RuntimeError("A completed game has no policy history")
         complete_histories = cast(tuple[torch.Tensor, ...], histories)
+        if done_status == 1:
+            # The final exchange arrives after the last decision; its board summary
+            # joins the series history but is never a trajectory row.
+            complete_histories = tuple(
+                torch.cat((history, final.to(history).view(1, 1, -1)), dim=1)
+                for history, final in zip(
+                    complete_histories, terminal_encoded.local_history_token, strict=True
+                )
+            )
 
         if info.get("series_complete"):
             for seat in self._seats:
                 seat.series_tokens.drop(series_id)
                 seat.series_history.drop(series_id)
         else:
-            game_history = torch.cat(complete_histories)
-            game_mask = torch.ones(
-                game_history.shape[:2], dtype=torch.bool, device=game_history.device
+            # Seats record different decision counts, so pad to a shared length.
+            lengths = torch.tensor([history.size(1) for history in complete_histories])
+            game_history = torch.nn.utils.rnn.pad_sequence(
+                [history[0] for history in complete_histories], batch_first=True
             )
-            summary_tokens = policy.series(game_history, game_mask)
+            game_mask = torch.arange(game_history.size(1)).unsqueeze(0) < lengths.unsqueeze(1)
+            summary_tokens = policy.series(game_history, game_mask.to(game_history.device))
             for seat, history, summary in zip(
                 self._seats, complete_histories, summary_tokens, strict=True
             ):

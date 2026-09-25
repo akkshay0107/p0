@@ -11,11 +11,16 @@ import torch
 
 from p0.battle.actions import encode_team_pair
 from p0.battle.events import (
-    SPATIAL_CATEGORICAL_WIDTH,
-    SPATIAL_NUMERICAL_WIDTH,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EVENT_RECORDS,
+    NUM_EVENT_DETAILS,
+    NUM_EVENT_KINDS,
+    NUM_EVENT_POSITIONS,
     SPATIAL_SLOT_COUNT,
-    SpatialActionType,
-    SpatialTargetSlot,
+    EventDetail,
+    EventKind,
+    EventPosition,
 )
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import (
@@ -48,6 +53,7 @@ from p0.model.structured_observation import (
     NUM_IDX_ORIG_IDX_RATIO,
     NUM_IDX_TEAM_PREVIEW,
     NUMERICAL_WIDTH,
+    POKEMON_TOKENS,
     SEQUENCE_LENGTH,
     TOKEN_IDX_GLOBAL_FIELD,
     SideId,
@@ -174,12 +180,18 @@ def dummy_obs() -> StructuredObservation:
 
     numerical[:, 12, 2] = 1.0
 
-    spatial_cat = torch.zeros((B, SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH), dtype=torch.long)
-    spatial_cat[..., 0] = torch.randint(0, len(SpatialActionType), (B, SPATIAL_SLOT_COUNT))
-    spatial_cat[..., 1] = torch.randint(0, 100, (B, SPATIAL_SLOT_COUNT))
-    spatial_cat[..., 2] = torch.randint(0, len(SpatialTargetSlot), (B, SPATIAL_SLOT_COUNT))
-
-    spatial_num = torch.randn((B, SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH))
+    records = (B, MAX_EVENT_RECORDS)
+    spatial_cat = torch.stack(
+        (
+            torch.randint(0, NUM_EVENT_KINDS, records),
+            torch.randint(0, NUM_EVENT_POSITIONS, records),
+            torch.randint(0, NUM_EVENT_POSITIONS, records),
+            torch.randint(0, 100, records),
+            torch.randint(0, NUM_EVENT_DETAILS, records),
+        ),
+        dim=-1,
+    )
+    spatial_num = torch.randn((B, MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH))
 
     return StructuredObservation(
         token_type_ids=token_type_ids,
@@ -214,6 +226,7 @@ class TestPolicyArchitecture:
         assert policy.encoder.move_pos_emb.num_embeddings == 4
         assert policy.encoder.entity_position_emb.num_embeddings == SEQUENCE_LENGTH
         assert policy.encoder.event_slot_emb.num_embeddings == SPATIAL_SLOT_COUNT
+        assert policy.encoder.event_order_emb.num_embeddings == MAX_EVENT_RECORDS
         assert policy.actor.reducer.memory_position_emb.num_embeddings == REDUCER_MAX_LENGTH
 
 
@@ -463,33 +476,43 @@ class TestPolicy:
         )
         assert reduced.pokemon.shape == (2, 12, 32)
 
-    def test_spatial_event_slot_encoding_distinguishes_slots(self, policy_net: PolicyNet) -> None:
-        """Verify spatial event encoder distinguishes between different spatial slots and action targets."""
+    def test_event_tokens_depend_on_record_order_and_positions(self, policy_net: PolicyNet) -> None:
+        """Verify event tokens distinguish record order and source/target positions."""
         from p0.battle.actions import ACT_SIZE
 
-        def encode_spatial(slot_idx: int, target_slot: int) -> torch.Tensor:
+        def encode_record(row: int, target: int) -> torch.Tensor:
             obs = StructuredObservation.empty_batch(1)
-            obs.spatial_cat[0, slot_idx, 0] = int(SpatialActionType.MOVE)
-            obs.spatial_cat[0, slot_idx, 1] = 10
-            obs.spatial_cat[0, slot_idx, 2] = target_slot
+            obs.spatial_cat[0, row] = torch.tensor(
+                [EventKind.MOVE, EventPosition.OWN_LEFT, target, 10, EventDetail.NONE]
+            )
             action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
             with torch.no_grad():
                 tokens, _ = policy_net.encoder(obs, action_mask)
-            # Spatial event tokens are at positions 16..19
-            return tokens[0, 16 + slot_idx]
+            # The four event tokens are the last current tokens, positions 16..19.
+            return tokens[0, 16:20]
 
-        slot0_target_opp_left = encode_spatial(
-            slot_idx=0, target_slot=int(SpatialTargetSlot.OPP_LEFT)
-        )
-        slot0_target_opp_right = encode_spatial(
-            slot_idx=0, target_slot=int(SpatialTargetSlot.OPP_RIGHT)
-        )
-        slot1_target_opp_left = encode_spatial(
-            slot_idx=1, target_slot=int(SpatialTargetSlot.OPP_LEFT)
-        )
+        first_at_left = encode_record(0, EventPosition.OPPONENT_LEFT)
+        first_at_right = encode_record(0, EventPosition.OPPONENT_RIGHT)
+        second_at_left = encode_record(1, EventPosition.OPPONENT_LEFT)
 
-        assert not torch.allclose(slot0_target_opp_left, slot0_target_opp_right, atol=1e-6)
-        assert not torch.allclose(slot0_target_opp_left, slot1_target_opp_left, atol=1e-6)
+        assert not torch.allclose(first_at_left, first_at_right, atol=1e-6)
+        assert not torch.allclose(first_at_left, second_at_left, atol=1e-6)
+
+    def test_padding_records_do_not_change_event_tokens(self, policy_net: PolicyNet) -> None:
+        """Verify rows marked EventKind.NONE are ignored whatever their other fields hold."""
+        from p0.battle.actions import ACT_SIZE
+
+        obs = StructuredObservation.empty_batch(1)
+        obs.spatial_cat[0, 0] = torch.tensor([EventKind.MOVE, 0, 2, 10, 0])
+        noisy = obs.clone()
+        noisy.spatial_cat[0, 1:, 1:] = 3
+        noisy.spatial_num[0, 1:] = 0.9
+        action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
+        with torch.no_grad():
+            clean_tokens, _ = policy_net.encoder(obs, action_mask)
+            noisy_tokens, _ = policy_net.encoder(noisy, action_mask)
+
+        torch.testing.assert_close(clean_tokens, noisy_tokens)
 
     def test_gradient_flow(self, dummy_obs: StructuredObservation) -> None:
         """Verify loss backpropagation computes non-zero gradients across encoder, actor reducer, query projections, and critic head."""
@@ -854,15 +877,15 @@ class TestPolicy:
         assert (high > low).all()
 
     def test_fixed_memory_and_observation_contract(self) -> None:
-        """Verify architecture contract constants (SEQUENCE_LENGTH=15, SPATIAL_SLOT_COUNT=4, HISTORY_WINDOW=48, SERIES_SLOTS=8)."""
+        """Verify architecture contract constants (SEQUENCE_LENGTH=15, 32 event records, HISTORY_WINDOW=48, SERIES_SLOTS=8)."""
         observation = StructuredObservation.empty_batch(2)
         assert SEQUENCE_LENGTH == 15
         assert CATEGORICAL_WIDTH == 60
         assert NUMERICAL_WIDTH == 116
-        assert SPATIAL_SLOT_COUNT == 4
+        assert (SPATIAL_SLOT_COUNT, MAX_EVENT_RECORDS) == (4, 32)
         assert observation.token_type_ids.shape == (2, 15)
-        assert observation.spatial_cat.shape == (2, 4, SPATIAL_CATEGORICAL_WIDTH)
-        assert observation.spatial_num.shape == (2, 4, SPATIAL_NUMERICAL_WIDTH)
+        assert observation.spatial_cat.shape == (2, 32, EVENT_CATEGORICAL_WIDTH)
+        assert observation.spatial_num.shape == (2, 32, EVENT_NUMERICAL_WIDTH)
         assert set(TokenType) == {TokenType.POKEMON, TokenType.FIELD, TokenType.EVENT}
         assert (CURRENT_TOKEN_COUNT, CURRENT_REDUCER_TOKEN_COUNT, REDUCER_MAX_LENGTH) == (
             20,
@@ -883,38 +906,45 @@ class TestPolicy:
         torch.testing.assert_close(first, second)
 
     def test_spatial_event_channels_remain_observable(self, policy: PolicyNet) -> None:
-        """Verify public policy encoding responds to each spatial event channel."""
+        """Verify public policy encoding responds to each event record channel."""
         base = StructuredObservation.empty_batch(1)
-        base.spatial_cat[0, 0, 0] = int(SpatialActionType.MOVE)
-        base.spatial_cat[0, 0, 1] = 10
-        base.spatial_cat[0, 0, 2] = int(SpatialTargetSlot.OPP_LEFT)
-        base.spatial_num[0, 0, 0] = 0.25
+        base.spatial_cat[0, 0] = torch.tensor(
+            [
+                EventKind.BOOST,
+                EventPosition.OWN_LEFT,
+                EventPosition.OPPONENT_LEFT,
+                0,
+                EventDetail.ATK,
+            ]
+        )
+        base.spatial_num[0, 0] = torch.tensor([-1 / 6, 1.0])
 
-        target_swap = base.clone()
-        target_swap.spatial_cat[0, 0, 2] = int(SpatialTargetSlot.OPP_RIGHT)
-
-        action_swap = base.clone()
-        action_swap.spatial_cat[0, 0, 0] = int(SpatialActionType.SWITCH)
-
-        damage_change = base.clone()
-        damage_change.spatial_num[0, 0, 2] = 0.75
-
-        crit_change = base.clone()
-        crit_change.spatial_num[0, 0, 4] = 1.0
+        variants = []
+        for column, value in (
+            (0, EventKind.DAMAGE),
+            (1, EventPosition.NONE),
+            (2, EventPosition.OPPONENT_RIGHT),
+            (3, 10),
+            (4, EventDetail.SPE),
+        ):
+            variant = base.clone()
+            variant.spatial_cat[0, 0, column] = value
+            variants.append(variant)
+        for column, value in ((0, -2 / 6), (1, 0.0)):
+            variant = base.clone()
+            variant.spatial_num[0, 0, column] = value
+            variants.append(variant)
 
         mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
-        outputs = [
-            policy.encode(item, mask).tokens[:, 16:20]
-            for item in (base, target_swap, action_swap, damage_change, crit_change)
-        ]
+        outputs = [policy.encode(item, mask).tokens[:, 16:20] for item in (base, *variants)]
         assert all(not torch.allclose(outputs[0], other) for other in outputs[1:])
 
     def test_event_compression_has_gradient_paths(self, policy: PolicyNet) -> None:
         """Verify spatial event tokens participate in the public policy computation graph."""
         obs = StructuredObservation.empty_batch(2)
-        obs.spatial_cat[:, 0, 0] = int(SpatialActionType.MOVE)
-        obs.spatial_cat[:, 0, 1] = 15
-        obs.spatial_cat[:, 0, 2] = int(SpatialTargetSlot.OPP_LEFT)
+        obs.spatial_cat[:, 0] = torch.tensor(
+            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15, 0]
+        )
         action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.bool)
         output = policy.encode(obs, action_mask).tokens[:, 16:20]
         output.square().mean().backward()
@@ -922,6 +952,66 @@ class TestPolicy:
             parameter.grad is not None and torch.isfinite(parameter.grad).all()
             for parameter in policy.parameters()
         )
+
+    def test_event_only_change_reaches_board_tokens_before_the_local_summary(
+        self, policy: PolicyNet
+    ) -> None:
+        """Board tokens are built without events; the local mixer lets them read events."""
+        base = StructuredObservation.empty_batch(1)
+        with_event = base.clone()
+        with_event.spatial_cat[0, 0] = torch.tensor(
+            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 10, 0]
+        )
+        mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
+
+        with torch.no_grad():
+            fused_base, _ = policy.encoder(base, mask)
+            fused_event, _ = policy.encoder(with_event, mask)
+            mixed_base = policy.encode(base, mask).tokens
+            mixed_event = policy.encode(with_event, mask).tokens
+
+        pokemon = slice(0, len(POKEMON_TOKENS))
+        torch.testing.assert_close(fused_base[:, pokemon], fused_event[:, pokemon])
+        assert not torch.allclose(mixed_base[:, pokemon], mixed_event[:, pokemon])
+
+    def test_local_summary_is_unchanged_by_history_and_series_inputs(
+        self, policy: PolicyNet
+    ) -> None:
+        """The archived summary reads current tokens only, while the readout reads memory."""
+        torch.manual_seed(5)
+        obs = StructuredObservation.empty_batch(1)
+        mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
+        empty = _empty_memory(policy, 1)
+        filled = MemoryInputs(
+            series_tokens=torch.randn(1, SERIES_SLOTS, policy.d_model),
+            series_mask=torch.ones((1, SERIES_SLOTS), dtype=torch.bool),
+            history_tokens=torch.randn(1, HISTORY_WINDOW, policy.d_model),
+            history_mask=torch.ones((1, HISTORY_WINDOW), dtype=torch.bool),
+        )
+
+        with torch.no_grad():
+            encoded = policy.encode(obs, mask)
+            without_memory = policy.act(policy.prepare(encoded, empty), mask, deterministic=True)
+            with_memory = policy.act(policy.prepare(encoded, filled), mask, deterministic=True)
+
+        torch.testing.assert_close(without_memory.history_token, with_memory.history_token)
+        torch.testing.assert_close(with_memory.history_token, encoded.local_history_token)
+        assert not torch.allclose(without_memory.value, with_memory.value)
+
+    def test_local_mixer_receives_gradients_from_the_local_summary(self, policy: PolicyNet) -> None:
+        obs = StructuredObservation.empty_batch(2)
+        obs.spatial_cat[:, 0] = torch.tensor(
+            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15, 0]
+        )
+        mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.bool)
+
+        policy.encode(obs, mask).local_history_token.square().sum().backward()
+
+        gradients = [parameter.grad for parameter in policy.local_mixer.parameters()]
+        assert all(
+            gradient is not None and torch.isfinite(gradient).all() for gradient in gradients
+        )
+        assert any(gradient is not None and gradient.abs().sum() > 0 for gradient in gradients)
 
     def test_reducer_uses_fixed_padding_only_memory_attention(self) -> None:
         """Verify MemoryReducer ignores masked padding tokens in series and history memory banks."""

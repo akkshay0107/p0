@@ -44,18 +44,22 @@ class TestReplayCompiler:
             (2, 1, 0),
         ]
 
-    def test_downstream_shards_reject_noncontiguous_source_game_numbers(
+    def test_series_missing_its_first_game_is_rejected_without_blocking_publication(
         self,
         tmp_path: Path,
     ) -> None:
-        """Reject shard publication when a series has a missing first game."""
-        second = sample_replay_payload("game-2")
-        second["game_number"] = 2
-        third = sample_replay_payload("game-3")
-        third["game_number"] = 3
+        """A series without game 1 cannot seed series memory, so only that series is dropped."""
+        second = sample_replay_payload("game-2", parent="missing-first", game_number=2)
+        third = sample_replay_payload("game-3", parent="missing-first", game_number=3)
+        complete = sample_replay_payload("game-1", parent="complete", game_number=1)
 
-        with pytest.raises(ValueError, match="incomplete chronological games"):
-            write_dataset_replay_dataset(tmp_path, (third, second))
+        built = write_dataset_replay_dataset(tmp_path, (third, second, complete))
+
+        assert built.manifest.accepted_games == 1
+        assert built.manifest.rejected_games == 2
+        assert built.manifest.diagnostics["rejected_non_contiguous_game_numbers"] == 1
+        chunks = list(LazyReplayDataset(built.manifest_path))
+        assert {chunk.game_number for chunk in chunks} == {1}
 
     def test_source_series_preserves_game_number_order(self, tmp_path: Path) -> None:
         first = sample_replay_payload("z-game", game_number=1)

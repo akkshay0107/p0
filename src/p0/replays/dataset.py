@@ -26,6 +26,7 @@ from p0.replays.shards import (
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
     ShardIndexEntry,
+    final_observation_field_specs,
     load_shard_manifest,
     observation_field_specs,
     validate_shard_tensors,
@@ -214,6 +215,8 @@ class ReplayGameChunk:
     candidate_values: torch.Tensor
     candidate_offsets: torch.Tensor
     outcome: torch.Tensor
+    # One-row board after the game's last line; it feeds series memory only.
+    final_observation: StructuredObservation
     is_series_end: bool = False
     outcome_valid: bool = False
 
@@ -248,6 +251,7 @@ class ReplayGameChunk:
             candidate_values=self.candidate_values.to(device),
             candidate_offsets=self.candidate_offsets.to(device),
             outcome=self.outcome.to(device),
+            final_observation=self.final_observation.to(device),
             outcome_valid=self.outcome_valid,
         )
 
@@ -350,6 +354,7 @@ class LazyReplayDataset(IterableDataset):
                 yield self._chunk(
                     tensors,
                     item,
+                    game_index,
                     game_offsets[game_index],
                     game_offsets[game_index + 1],
                     is_series_end=int(item["game_number"]) == final_game_numbers[series_key],
@@ -513,6 +518,7 @@ class LazyReplayDataset(IterableDataset):
     def _chunk(
         tensors: Mapping[str, torch.Tensor],
         item: Mapping[str, Any],
+        game_index: int,
         start: int,
         end: int,
         *,
@@ -541,6 +547,12 @@ class LazyReplayDataset(IterableDataset):
             candidate_values=tensors["candidate_values"][candidate_start:candidate_end].clone(),
             candidate_offsets=candidate_offsets,
             outcome=tensors["outcome"][start:end].clone(),
+            final_observation=StructuredObservation._from_values(
+                [
+                    tensors[name][game_index : game_index + 1].clone()
+                    for name, *_ in final_observation_field_specs()
+                ]
+            ),
             is_series_end=is_series_end,
             outcome_valid=bool(item["outcome_valid"]),
         )

@@ -8,11 +8,11 @@ import pytest
 import torch
 
 from p0.battle.events import (
-    SPATIAL_CATEGORICAL_WIDTH,
-    SPATIAL_NUMERICAL_WIDTH,
-    SPATIAL_SLOT_COUNT,
-    SpatialActionType,
-    SpatialTargetSlot,
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EVENT_RECORDS,
+    NUM_EVENT_DETAILS,
+    NUM_EVENT_KINDS,
+    NUM_EVENT_POSITIONS,
 )
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import (
@@ -164,12 +164,18 @@ def dummy_obs() -> StructuredObservation:
 
     numerical[:, 12, 2] = 1.0
 
-    spatial_cat = torch.zeros((B, SPATIAL_SLOT_COUNT, SPATIAL_CATEGORICAL_WIDTH), dtype=torch.long)
-    spatial_cat[..., 0] = torch.randint(0, len(SpatialActionType), (B, SPATIAL_SLOT_COUNT))
-    spatial_cat[..., 1] = torch.randint(0, 100, (B, SPATIAL_SLOT_COUNT))
-    spatial_cat[..., 2] = torch.randint(0, len(SpatialTargetSlot), (B, SPATIAL_SLOT_COUNT))
-
-    spatial_num = torch.randn((B, SPATIAL_SLOT_COUNT, SPATIAL_NUMERICAL_WIDTH))
+    records = (B, MAX_EVENT_RECORDS)
+    spatial_cat = torch.stack(
+        (
+            torch.randint(0, NUM_EVENT_KINDS, records),
+            torch.randint(0, NUM_EVENT_POSITIONS, records),
+            torch.randint(0, NUM_EVENT_POSITIONS, records),
+            torch.randint(0, 100, records),
+            torch.randint(0, NUM_EVENT_DETAILS, records),
+        ),
+        dim=-1,
+    )
+    spatial_num = torch.randn((B, MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH))
 
     return StructuredObservation(
         token_type_ids=token_type_ids,

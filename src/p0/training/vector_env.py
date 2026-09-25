@@ -15,6 +15,13 @@ ACT_SIZE = FORMAT.action_size
 LOGGER = logging.getLogger(__name__)
 
 
+def _publish_seats(info: dict[str, object], env: SimEnv) -> None:
+    # False for a seat that is waiting or whose opponent is retrying a choice:
+    # its next observation is not a decision and its action will not be sent.
+    info["to_move"] = (env.agent1_to_move, env.agent2_to_move)
+    info["retry"] = env.retrying
+
+
 class ThreadVecEnv:
     def __init__(self, envs: list[SimEnv]):
         self.envs = envs
@@ -46,6 +53,7 @@ class ThreadVecEnv:
 
         mask1 = np.reshape(obs[agent1]["action_mask"], (2, ACT_SIZE))
         mask2 = np.reshape(obs[agent2]["action_mask"], (2, ACT_SIZE))
+        _publish_seats(info, env)
 
         return mask1, mask2, info
 
@@ -80,17 +88,13 @@ class ThreadVecEnv:
 
         if done_status > 0:
             series_complete = max(env.series_scores) >= 2 or env.series_games_played >= 3
-            terminal_obs1 = None
-            terminal_obs2 = None
-            terminal_mask1 = None
-            terminal_mask2 = None
-            if is_truncated:
-                terminal_obs1 = self.obs1_buffers[env_id].clone()
-                terminal_obs2 = self.obs2_buffers[env_id].clone()
-                # Preserve the mask paired with the terminal observations before the
-                # automatic reset replaces the current observation state.
-                terminal_mask1 = mask1.copy()
-                terminal_mask2 = mask2.copy()
+            # Preserve the final observations and masks before the automatic reset
+            # replaces them: truncation bootstraps from them, and a finished game
+            # adds their summaries to the series history.
+            terminal_obs1 = self.obs1_buffers[env_id].clone()
+            terminal_obs2 = self.obs2_buffers[env_id].clone()
+            terminal_mask1 = mask1.copy()
+            terminal_mask2 = mask2.copy()
 
             mask1, mask2, _ = self._reset_env(env_id, env)
             info["series_id"] = env.series_id
@@ -99,10 +103,12 @@ class ThreadVecEnv:
             info["terminal_observation2"] = terminal_obs2
             info["terminal_action_mask1"] = terminal_mask1
             info["terminal_action_mask2"] = terminal_mask2
+            _publish_seats(info, env)
             return mask1, mask2, reward1, reward2, done_status, info
 
         info["series_id"] = env.series_id
         info["series_complete"] = False
+        _publish_seats(info, env)
         return mask1, mask2, reward1, reward2, done_status, info
 
     def step(self, actions: list[dict[str, np.ndarray]]):

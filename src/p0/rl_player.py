@@ -28,6 +28,7 @@ from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.model.token_store import SeriesTokenStore
 from p0.runtime import poke_env_patches
+from p0.runtime.live_event_capture import consume_events, is_retry
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import TeamSource
@@ -222,7 +223,8 @@ class RLPlayer(TeamPlayerMixin, Player):
             (1, 0, self.policy.d_model), device=self.policy.device
         )
 
-    def _memory_inputs(self, battle: DoubleBattle) -> MemoryInputs:
+    def memory_inputs(self, battle: DoubleBattle) -> MemoryInputs:
+        """Return the history and series memory that the battle's next decision reads."""
         if (
             id(self.policy) != self._memory_model_id
             or self._empty_history_tensor.device != self.policy.device
@@ -262,6 +264,12 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     def _get_action(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
+        history = self._battle_histories.get(self._battle_key(battle))
+        if history is not None and history.tokens and is_retry(battle):
+            # A rejected choice is decided again from the same observation, so the
+            # retry replaces that decision's history entry instead of adding one.
+            history.tokens.pop()
+
         view = battle_view(battle)
         obs = self.observation_builder.build(view)
         mask = torch.from_numpy(action_mask(view.decision))
@@ -271,12 +279,14 @@ class RLPlayer(TeamPlayerMixin, Player):
 
         with torch.no_grad():
             encoded = self.policy.encode(obs, mask)
-            prepared = self.policy.prepare(encoded, self._memory_inputs(battle))
+            prepared = self.policy.prepare(encoded, self.memory_inputs(battle))
             out = self.policy.act(prepared, mask, top_p=self.top_p)
 
         # Waiting requests return before action selection; every token appended here
-        # therefore corresponds to an actual policy decision.
+        # therefore corresponds to an actual policy decision, which also closes the
+        # event interval that this observation read.
         self._append_history(battle, out.history_token[0])
+        consume_events(battle)
         return out.actions[0].cpu().numpy()
 
     def choose_move(self, battle: AbstractBattle):
@@ -314,6 +324,16 @@ class RLPlayer(TeamPlayerMixin, Player):
 
         history = self._battle_histories.pop(battle_key, None)
         if history is not None:
+            # The final exchange arrives after the last request; summarize the
+            # finished board so the series memory keeps it, with no action taken.
+            view = battle_view(battle)
+            mask = torch.from_numpy(action_mask(view.decision)).unsqueeze(0)
+            with torch.no_grad():
+                encoded = self.policy.encode(
+                    self.observation_builder.build(view).unsqueeze(0).to(self.policy.device),
+                    mask.to(self.policy.device),
+                )
+            history.append(encoded.local_history_token[0], self.policy.device)
             values = history.complete_values(self.policy.device)
             with torch.no_grad():
                 values_mask = torch.ones(values.shape[:2], dtype=torch.bool, device=values.device)

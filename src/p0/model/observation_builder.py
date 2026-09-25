@@ -12,9 +12,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from p0.battle.events import (
-    SPATIAL_SLOT_COUNT,
-)
+from p0.battle.events import EVENT_CATEGORICAL_WIDTH, MAX_EVENT_RECORDS
 from p0.battle.views import BattleView, MoveView, PokemonView, TransformedPokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
@@ -693,26 +691,11 @@ def _write_spatial_events(
     spatial_cat.fill(0)
     spatial_num.fill(0)
 
-    turn_records = getattr(battle, "spatial_turn", None)
-    if turn_records is None:
-        return
-
-    for slot_idx, record in enumerate(turn_records[:SPATIAL_SLOT_COUNT]):
-        spatial_cat[slot_idx] = (
-            record.action_type,
-            record.move_id,
-            record.target_slot,
-        )
-        spatial_num[slot_idx] = (
-            record.order_rank,
-            record.hp_delta,
-            record.damage_dealt,
-            record.net_boost_delta,
-            record.landed_crit,
-            record.took_crit,
-            record.move_failed,
-            record.item_consumed,
-        )
+    # Records are left-aligned in arrival order; zero rows are EventKind.NONE padding.
+    records = battle.spatial_events[:MAX_EVENT_RECORDS]
+    if records:
+        spatial_cat[: len(records)] = [record[:EVENT_CATEGORICAL_WIDTH] for record in records]
+        spatial_num[: len(records)] = [record[EVENT_CATEGORICAL_WIDTH:] for record in records]
 
 
 def _write_observation(

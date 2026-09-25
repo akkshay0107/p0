@@ -13,6 +13,10 @@ from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     load_active_global_contract,
 )
+from p0.model.structured_observation import (
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    TOKEN_IDX_ALLY_SIDE,
+)
 from p0.replays.dataset import (
     LazyReplayDataset,
     SeriesSplitManifest,
@@ -102,6 +106,26 @@ class TestReplayDatasets:
         assert [chunk.is_series_end for chunk in chunks] == [False, False, True, True]
         assert all(chunk.length == 2 for chunk in chunks)
         assert chunks[2].candidate_offsets.tolist() == [0, 12, 15]
+
+    def test_each_game_perspective_carries_one_final_board_with_unknown_legality(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        built = write_dataset_replay_dataset(
+            tmp_path, (sample_replay_payload("game-1"), sample_replay_payload("game-2"))
+        )
+        chunks = list(LazyReplayDataset(built.manifest_path))
+
+        for chunk in chunks:
+            final = chunk.final_observation
+            assert final.categorical.shape[0] == 1
+            slot_unknown = final.numerical[
+                0,
+                TOKEN_IDX_ALLY_SIDE,
+                NUM_IDX_SLOT_LEGALITY_UNKNOWN : NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2,
+            ]
+            assert slot_unknown.tolist() == [1.0, 1.0]
+            assert not torch.equal(final.numerical[0], chunk.observations.numerical[-1])
 
     def test_dataset_rejects_tampered_golden_shard(self, tmp_path: Path) -> None:
         """Verify LazyReplayDataset raises ValueError on tampered golden replay shards when verify_hashes=True."""
