@@ -167,16 +167,32 @@ uv run p0-replays build-shards \
   --cache-dir artifacts/replays \
   --output-dir artifacts/shards
 uv run p0-replays create-splits \
-  --shard-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/manifest.json
+  --shard-manifest artifacts/shards/<global-contract-hash>/<dataset-hash>/manifest.json
 uv run p0-bc train \
   --config config.yaml \
-  --shard-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/manifest.json \
-  --split-manifest artifacts/shards/<runtime-hash>/<dataset-hash>/splits.json
+  --shard-manifest artifacts/shards/<global-contract-hash>/<dataset-hash>/manifest.json \
+  --split-manifest artifacts/shards/<global-contract-hash>/<dataset-hash>/splits.json
 ```
 
+There is no fixed shard manifest path. `build-shards` writes the build to
+`<output-dir>/<global-contract-hash>/<dataset-hash>/` and prints a JSON summary whose
+`manifest_path` field is the manifest to use. `create-splits` writes `splits.json`
+next to that manifest unless `--output` is given. Pass both paths to `p0-bc` with
+`--shard-manifest` and `--split-manifest`, or copy them into `bc.shard_manifest` and
+`bc.split_manifest` in `config.yaml`. The defaults in `config.example.yaml` are
+placeholders and must be replaced. Relative paths in `config.yaml` are resolved
+against `paths.repository_root`.
+
 Raw response bytes remain immutable even when parsing or OTS checks fail. Derived
-shards are published atomically under the runtime and dataset hashes, and
-`replay-quality-manifest.json` records every accepted or rejected source replay.
+shards are published atomically under the global contract and dataset hashes. The
+shard `manifest.json` records the content hash of every source replay, the series
+membership, and accepted/rejected counts with rejection reasons in `diagnostics`.
+
+If a build with the same dataset hash already exists, `build-shards` validates it and
+returns it without compiling again. The dataset hash covers the source replays, build
+settings and global contract hash, but not the replay reconstruction code. After a
+change to reconstruction, delete the old `<dataset-hash>` directory before running
+`build-shards`, or the old shards are reused.
 
 ### 3. Local Play & Bot Runner
 
@@ -198,8 +214,8 @@ Supported options include:
 
 ## Utility Scripts
 
-- **`cleanup.sh`**: Clears the default runs, replays, checkpoints, and selected log files. It does not follow custom output paths or delete compiled datasets.
-- **`export_training.py`**: Exports one new-format training checkpoint with its recorded inputs and runtime resources. It writes a checked archive atomically and generates a resume configuration from saved settings, without reading the current `config.yaml`.
+- **`scripts/cleanup.sh`**: Clears the default runs, replays, checkpoints, and selected log files. It does not follow custom output paths or delete compiled datasets.
+- **`scripts/export_training.py`** (installed as `p0-export-training`): Exports one new-format training checkpoint with its recorded inputs and runtime resources. It writes a checked archive atomically and generates a resume configuration from saved settings, without reading the current `config.yaml`.
 
 ```bash
 uv run p0-export-training --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --output training_export.tar.gz
@@ -216,35 +232,95 @@ The former `.ppoconfig` format is no longer accepted; migrate its flat keys into
 
 ### Runtime compatibility
 
-`data/runtime_manifest.json` is the sole runtime contract. It contains versioned major/minor
-identities for actions, model layout, resources, replays, checkpoints, and team corpora. Every
-major identity contributes to `global_sha256`; a breaking change must update that subsystem's
-major payload, increment its major version, reset its minor version, and therefore change the
-global hash. A nonbreaking change increments only the subsystem's minor version and updates its
-minor payload and hash.
+`data/runtime_manifest.json` is the sole runtime contract. It has three subsystems:
 
-Generated replay, split, and corpus artifacts reference `global_contract_sha256`. Checkpoints
-also embed an immutable global-contract snapshot: a major mismatch fails before training setup,
-while a minor mismatch is logged as a warning. Vocabulary and dex identities are validated when the
-active global contract is loaded. Legacy artifacts and checkpoints using the former runtime-contract
-reference are intentionally unsupported; rebuild generated artifacts from this clean slate.
+- `actions`: the flat action layout, joint-action constraints and team preview encoding.
+- `model`: tensor layout constants and `observation_layout_sha256`, the hash of the
+  structured observation layout. Importing the model fails if the code layout does not
+  match this hash.
+- `resources`: the vocabulary hash (major), and the Champions dex and spread usage
+  hashes (minor).
+
+Each subsystem has a major and a minor payload, each with a version number and a SHA-256.
+The major hashes of all subsystems make up `global_sha256`.
+
+Generated replay shards, splits and team corpus manifests store `global_contract_sha256`
+and must match the active `global_sha256` exactly. Checkpoints embed a full copy of the
+contract: a major version or hash difference fails before training setup, and a minor
+difference is logged as a warning. Vocabulary and dex identities are validated when the
+active contract is loaded.
+
+Development versioning rule: while the project is in development, contract version
+numbers stay fixed (all subsystems are at 1.0). When behavior or layout changes, only
+the affected hashes are refreshed. Because the checks compare hashes, a refreshed hash
+still rejects old checkpoints and shards, even though the version numbers match. Matching
+version numbers never mean that an old checkpoint or shard build is compatible. Some
+changes, such as replay reconstruction fixes, change no hash at all; see the migration
+notes below.
+
+### Migration notes
+
+These changes on the current development line are not caught by version numbers:
+
+- **Event layout (T4)**: the event token layout changed and the model layout hash was
+  refreshed. Checkpoints and shard builds from before this change are incompatible.
+  Retrain or re-import policies, and rebuild shards.
+- **Ally-or-self target labels (R1)**: for moves that target an adjacent ally or the
+  user, a replay decision aimed at the user is now labelled with the same own-side
+  target code as live play (-1 or -2) instead of 0. Shards built before this change
+  carry the old labels; rebuild them, and do not compare BC results across the change.
+- **Reconstruction changes in general**: the dataset hash does not cover replay
+  reconstruction code. After any reconstruction change, delete the old dataset directory
+  (`artifacts/shards/<global-contract-hash>/<dataset-hash>/`) before `build-shards`, or
+  the old shards are reused. Then run `create-splits` again and update the paths in
+  `config.yaml`.
+- **Shard manifest path**: `bc.shard_manifest` and `bc.split_manifest` no longer have a
+  working default. Set them to the paths printed by `build-shards` and `create-splits`.
 
 The standalone artifact verification command is intentionally deferred until checkpoint, model,
 replay-shard, dataset, and resource verification can share one interface.
 
 ## Development verification
 
-Run the standard checkpoint gates from the repository root:
+Run the standard checks from the repository root:
 
 ```bash
 uv run ruff check src tests
+uv run ruff format --check src tests
 uv run pyright
 uv run pytest -q
+uv run pytest -q -m heavy
+git diff --check
 uv build
 ```
 
-The default pytest command runs unit and local integration tests. Network and
-stress suites are opt-in and must be selected explicitly.
+The default pytest command discovers only `tests/unit` and `tests/integration` and
+deselects the `heavy`, `stress`, `network` and `gpu` markers. Local integration tests
+need the built Showdown submodule (`pokemon-showdown` with `npm install` done) and
+loopback sockets. The default and heavy suites must both pass before a commit.
+
+Opt-in groups:
+
+| Group | Command | Needs |
+| --- | --- | --- |
+| heavy | `uv run pytest -q -m heavy` | Showdown, several minutes of CPU, more memory |
+| stress | `P0_STRESS_GAME_COUNT=50 uv run pytest tests/stress -q -m stress` | Showdown and Node.js; long run |
+| network | `uv run pytest -q -m network` | Access to the public Showdown replay endpoint |
+| gpu | `uv run pytest tests/gpu -q -m gpu` | A CUDA device |
+
+Notes:
+
+- `pytest -m stress` alone finds no stress tests, because `tests/stress` is not in the
+  default test paths. Pass the directory as shown.
+- Keep `P0_STRESS_GAME_COUNT` at 50 or less per run (50 is the default); 100 games
+  in one process has exhausted host memory. `P0_STRESS_SEED` changes the random
+  replay seed.
+- `P0_INTEGRATION_DEVICES` and `P0_STRESS_DEVICES` (default `cpu,cuda`) choose the
+  devices; CUDA is used only when it is available.
+- Without CUDA every GPU test is skipped. A skipped GPU run is not hardware
+  validation.
+- Setting `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2` keeps the heavy and stress suites from
+  oversubscribing CPU threads.
 
 The BC `batch_decisions` setting is an explicit target-window budget. Each window
 recomputes its local context under current weights before updating, while retaining

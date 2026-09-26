@@ -390,7 +390,41 @@ def write_tensor_shards(
     max_candidates: int = 256,
     external_rejections: Mapping[str, str] | None = None,
 ) -> ShardBuildResult:
-    """Persist compiled replays as immutable, runtime-bound tensor shards."""
+    """
+    Persist compiled replays as immutable, runtime-bound tensor shards.
+
+    The build is written to output_dir/<global contract hash>/<dataset hash>/.
+    The dataset hash covers the source replay identities, series membership,
+    format, build configuration and runtime contract hash. It does not cover
+    reconstruction code. If that directory already exists, the existing build is
+    validated and returned and no shards are written. A series whose retained
+    game numbers are not 1..n is left out and counted as rejected. Shards are
+    split only at series boundaries, so one series can exceed the shard limit.
+    Files are written to a temporary directory and moved into place at the
+    end; on any failure the temporary directory is removed.
+
+    Raises ValueError when max_decisions_per_shard is not positive, when no
+    games passed the quality gates or none remain after removing incomplete
+    series, when a rejected replay id is also a compiled replay id, or when an
+    existing build at the destination fails validation.
+
+    Arguments:
+        result: Output of compile_documents.
+        output_dir: Root directory for shard builds.
+        max_decisions_per_shard: Target decision count per shard; must be positive.
+        manifest_path: Global runtime contract manifest the shards are bound to.
+        resources: Runtime resources for the observation builder; None uses the defaults.
+        created_at: ISO timestamp for the manifest; None uses the current UTC time.
+        max_candidates: Candidate cap recorded in the build configuration. It
+            should match the value passed to compile_documents; this function
+            does not apply it.
+        external_rejections: Replay id to content SHA-256 for replays rejected
+            before compilation. They are recorded in the manifest and counted
+            as rejected games.
+
+    Returns:
+        ShardBuildResult with the path to manifest.json and the manifest.
+    """
     if max_decisions_per_shard <= 0:
         raise ValueError("max_decisions_per_shard must be positive")
     if not result.games:
@@ -878,7 +912,34 @@ def compile_documents(
     dex: Mapping[str, Any] | None = None,
     chunksize: int | None = None,
 ) -> CompilationResult:
-    """Compile documents through event resolution, state reduction, decisions, and projection."""
+    """
+    Compile documents through event resolution, state reduction, decisions, and projection.
+
+    Documents are grouped into Bo3 series and each game is compiled on its own,
+    in worker processes when there are more jobs than CPUs. Series are
+    all-or-nothing: if a series has a blocking grouping diagnostic, or any of
+    its games fails reconstruction or a quality gate, or a game is missing,
+    every game in that series is dropped. Dropped games are counted in the
+    metrics under rejected_* keys; they do not raise.
+
+    Raises ReplayInputContractError, before any compilation, for duplicate
+    replay ids; a replay without two distinct players, complete six-member OTS
+    or a terminal line; an unsupported format or one that differs from
+    format_id; or an unusable or non-matching dex.
+
+    Arguments:
+        documents: Parsed replay documents. Replay ids must be unique.
+        format_id: Required format for every document; None accepts any supported format.
+        max_candidates: Maximum joint-action candidates kept per reconstructed decision.
+        dex: Runtime dex; None uses the pinned default. A custom dex must match
+            the pinned one.
+        chunksize: Jobs per worker task; None picks one from the job and CPU
+            counts. A value of zero or less compiles in this process.
+
+    Returns:
+        CompilationResult with all grouped series, the accepted games ordered
+        by series and game number, and the compilation metrics.
+    """
     docs = tuple(documents)
     replay_ids = [document.metadata.replay_id for document in docs]
     if len(set(replay_ids)) != len(replay_ids):

@@ -268,7 +268,37 @@ class EvaluationHarness:
         server_configuration: ServerConfiguration,
         team_category: str = "default",
     ) -> MatchupResult:
-        """Run a matchup between two players on the given team source."""
+        """
+        Run a matchup between two players on the given team source.
+
+        Plays episodes_per_matchup Bo3 series one after another, one battle
+        at a time, and scores each series by the parent-series winner that
+        both clients receive. Counts and win rates are per series, not per
+        game. Team seeds come from the evaluator RNG, so a fixed evaluator
+        seed repeats the team draws. Both player connections are closed on
+        exit, including on failure.
+
+        Raises ValueError when a policy name is not a supported built-in
+        opponent. Raises RuntimeError when the two clients report different
+        series results or counts, or the winner is neither player. Raises
+        TimeoutError when a series result does not arrive within 120 seconds.
+
+        Arguments:
+            name_a: Label for player A in the result.
+            policy_a: Policy network for player A, or a built-in opponent name
+                ("random", "max_power", "simple_heuristics"); None means "random".
+            name_b: Label for player B in the result.
+            policy_b: Policy network or built-in opponent name for player B.
+            team_source: Source both players sample their teams from.
+            server_configuration: Showdown server both players connect to.
+            team_category: Label stored in the result for this team source.
+
+        Returns:
+            MatchupResult with series counts, ties, player A's win rate and
+            Wilson confidence interval, and win counts keyed by the first 8 hex
+            characters of each packed team's SHA-256, for team pairs and for
+            each side's teams.
+        """
         source = team_source
         category = team_category
         server_config = server_configuration

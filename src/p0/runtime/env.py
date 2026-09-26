@@ -254,9 +254,13 @@ class SimEnv(MegaEnv):
             self._opponent_rng.seed(seed + 1)
 
         is_new_series = sum(self._series_scores) == 0 and self._series_games_played == 0
-        is_completed_series = max(self._series_scores) >= 2 or self._series_games_played >= 3
         preserve_restored_game = self._resume_reset_pending
         self._resume_reset_pending = False
+        # A replaced game is still active, so its count does not end the series:
+        # the game count includes the active game, which can be the third one.
+        is_completed_series = max(self._series_scores) >= 2 or (
+            self._series_games_played >= 3 and not preserve_restored_game
+        )
 
         if is_completed_series or is_new_series:
             self._series_scores = [0, 0]
