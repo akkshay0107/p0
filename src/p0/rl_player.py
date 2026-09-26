@@ -213,18 +213,15 @@ class RLPlayer(TeamPlayerMixin, Player):
             self._series_by_opponent.pop(state.opponent_id, None)
 
     def invalidate_memory_for_model_reload(self) -> None:
-        """Drop per-battle memory when a policy artifact is replaced."""
+        """Drop model-dependent tokens while preserving the current series score."""
         self._battle_histories.clear()
-        self._series_store.clear()
-        self._series_by_opponent.clear()
-        self._series_by_battle.clear()
+        self._series_store = SeriesTokenStore(self.policy.d_model)
         self._memory_model_id = id(self.policy)
         self._empty_history_tensor = torch.zeros(
             (1, 0, self.policy.d_model), device=self.policy.device
         )
 
-    def memory_inputs(self, battle: DoubleBattle) -> MemoryInputs:
-        """Return the history and series memory that the battle's next decision reads."""
+    def _validate_memory_model(self) -> None:
         if (
             id(self.policy) != self._memory_model_id
             or self._empty_history_tensor.device != self.policy.device
@@ -232,6 +229,9 @@ class RLPlayer(TeamPlayerMixin, Player):
         ):
             self.invalidate_memory_for_model_reload()
 
+    def memory_inputs(self, battle: DoubleBattle) -> MemoryInputs:
+        """Return the history and series memory that the battle's next decision reads."""
+        self._validate_memory_model()
         key = self._battle_key(battle)
         history = self._battle_histories.get(key)
         values = (
@@ -315,6 +315,7 @@ class RLPlayer(TeamPlayerMixin, Player):
         if not isinstance(battle, DoubleBattle):
             raise TypeError(f"RLPlayer requires DoubleBattle, got {type(battle).__name__}")
 
+        self._validate_memory_model()
         battle_key = self._battle_key(battle)
         state = self._series_by_battle.pop(battle_key, None)
         if state is None:

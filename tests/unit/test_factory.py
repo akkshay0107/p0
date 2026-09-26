@@ -172,6 +172,7 @@ def dummy_obs() -> StructuredObservation:
             torch.randint(0, NUM_EVENT_POSITIONS, records),
             torch.randint(0, 100, records),
             torch.randint(0, NUM_EVENT_DETAILS, records),
+            *[torch.zeros(records, dtype=torch.long) for _ in range(4)],
         ),
         dim=-1,
     )

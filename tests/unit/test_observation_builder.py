@@ -505,9 +505,9 @@ class TestObservationBuilder:
         assert obs.spatial_cat.shape == (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH)
         assert obs.spatial_num.shape == (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
         assert obs.spatial_cat[:3].tolist() == [
-            [1, 0, 2, 15, 0],
-            [5, 0, 2, 0, 0],
-            [7, 3, 1, 0, 5],
+            [1, 0, 2, 15, 0, 0, 0, 0, 0],
+            [5, 0, 2, 0, 0, 0, 0, 0, 0],
+            [7, 3, 1, 0, 5, 0, 0, 0, 0],
         ]
         assert obs.spatial_num[:3].tolist() == [[0.0, 0.0], [-0.5, 1.0], [-0.25, 1.0]]
         assert not obs.spatial_cat[3:].any()

@@ -8,6 +8,7 @@ import pytest
 
 from p0.battle.events import (
     MAX_EVENT_RECORDS,
+    EffectNamespace,
     EventDetail,
     EventKind,
     EventPosition,
@@ -147,7 +148,7 @@ class TestSpatialEventRecorder:
 
         residual = recorder.pending()[1:]
         assert [(record.source, record.target) for record in residual] == [
-            (EventPosition.NONE, EventPosition.OPPONENT_LEFT),
+            (EventPosition.OPPONENT_LEFT, EventPosition.OPPONENT_LEFT),
             (EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT),
         ]
 
@@ -175,7 +176,18 @@ class TestSpatialEventRecorder:
         )
         recorder.apply_line(["", "-unboost", "p2a: Incineroar", "spa", "1"], tokenizer, _no_hp)
 
+        assert recorder.pending()[1] == EventRecord(
+            EventKind.ABILITY,
+            EventPosition.OPPONENT_LEFT,
+            detail=EventDetail.ABILITY_REPORTED,
+            ability_id=tokenizer.id_for("abilities", "Intimidate"),
+        )
         boosts = [record for record in recorder.pending() if record.kind == EventKind.BOOST]
+        assert [r.ability_id for r in boosts] == [
+            tokenizer.id_for("abilities", "Intimidate"),
+            tokenizer.id_for("abilities", "Intimidate"),
+            0,
+        ]
         assert [(r.source, r.target, r.detail, r.amount) for r in boosts] == [
             (EventPosition.OPPONENT_LEFT, EventPosition.OWN_LEFT, EventDetail.ATK, -1 / 6),
             (EventPosition.OPPONENT_LEFT, EventPosition.OWN_RIGHT, EventDetail.ATK, -1 / 6),
@@ -240,7 +252,9 @@ class TestSpatialEventRecorder:
         recorder.apply_line(["", "cant", "p1a: Pikachu"], tokenizer, _no_hp)
 
         assert recorder.pending() == (
-            EventRecord(EventKind.CANT, EventPosition.OWN_LEFT, detail=EventDetail.NONE),
+            EventRecord(
+                EventKind.CANT, target=EventPosition.OWN_LEFT, detail=EventDetail.CANT_OTHER
+            ),
         )
 
     def test_boost_with_invalid_stage_is_ignored(self) -> None:
@@ -259,9 +273,12 @@ class TestSpatialEventRecorder:
         )
 
         assert recorder.pending() == (
-            EventRecord(EventKind.CANT, EventPosition.OWN_RIGHT, detail=EventDetail.FLINCH),
+            EventRecord(EventKind.CANT, target=EventPosition.OWN_RIGHT, detail=EventDetail.FLINCH),
             EventRecord(
-                EventKind.CANT, EventPosition.OPPONENT_LEFT, move_id=_move_id("Trick Room")
+                EventKind.CANT,
+                target=EventPosition.OPPONENT_LEFT,
+                move_id=_move_id("Trick Room"),
+                detail=EventDetail.CANT_TAUNT,
             ),
         )
 
@@ -274,8 +291,8 @@ class TestSpatialEventRecorder:
         )
 
         assert [(r.target, r.detail) for r in recorder.pending()] == [
-            (EventPosition.OPPONENT_LEFT, EventDetail.ITEM_REVEALED),
-            (EventPosition.OWN_LEFT, EventDetail.ITEM_REMOVED),
+            (EventPosition.OPPONENT_LEFT, EventDetail.ITEM_PRESENT),
+            (EventPosition.OWN_LEFT, EventDetail.ITEM_EATEN),
         ]
 
     def test_overflow_keeps_the_earliest_records_and_warns(
@@ -294,3 +311,252 @@ class TestSpatialEventRecorder:
         assert "Dropped 4 event records" in caplog.text
         recorder.apply_line(["", "faint", "p1a: Pikachu"], tokenizer, _no_hp)
         assert len(recorder.pending()) == 1
+
+    @pytest.mark.parametrize(
+        ("reason", "detail"),
+        [
+            ("par", EventDetail.CANT_PARALYSIS),
+            ("slp", EventDetail.CANT_SLEEP),
+            ("frz", EventDetail.CANT_FREEZE),
+            ("recharge", EventDetail.CANT_RECHARGE),
+            ("nopp", EventDetail.CANT_NO_PP),
+            ("Attract", EventDetail.CANT_ATTRACT),
+            ("Disable", EventDetail.CANT_DISABLE),
+            ("Focus Punch", EventDetail.CANT_FOCUS_PUNCH),
+            ("Shell Trap", EventDetail.CANT_SHELL_TRAP),
+            ("move: Gravity", EventDetail.CANT_GRAVITY),
+            ("move: Heal Block", EventDetail.CANT_HEAL_BLOCK),
+            ("move: Imprison", EventDetail.CANT_IMPRISON),
+            ("move: Throat Chop", EventDetail.CANT_THROAT_CHOP),
+            ("unexpected", EventDetail.CANT_OTHER),
+        ],
+    )
+    def test_cant_reasons(self, reason: str, detail: EventDetail) -> None:
+        recorder = SpatialEventRecorder()
+        recorder.apply_line(f"|cant|p1b: X|{reason}|Protect".split("|"), tokenizer, _no_hp)
+        assert recorder.pending() == (
+            EventRecord(
+                EventKind.CANT,
+                target=EventPosition.OWN_RIGHT,
+                move_id=_move_id("Protect"),
+                detail=detail,
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "ability", ["Armor Tail", "Damp", "Dazzling", "Queenly Majesty", "Truant"]
+    )
+    def test_cant_ability_participants(self, ability: str) -> None:
+        recorder = SpatialEventRecorder()
+        line = f"|cant|p2a: X|ability: {ability}"
+        if ability != "Truant":
+            line += "|Quick Attack|[of] p1b: Y"
+        recorder.apply_line(line.split("|"), tokenizer, _no_hp)
+        assert recorder.pending() == (
+            EventRecord(
+                EventKind.CANT,
+                EventPosition.OPPONENT_LEFT,
+                EventPosition.OPPONENT_LEFT if ability == "Truant" else EventPosition.OWN_RIGHT,
+                0 if ability == "Truant" else _move_id("Quick Attack"),
+                EventDetail.CANT_ABILITY,
+                ability_id=tokenizer.id_for("abilities", ability),
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("line", "detail", "source", "move", "ability", "item"),
+        [
+            (
+                "|-item|p2a: X|Leftovers|[from] ability: Frisk|[of] p1b: Y",
+                EventDetail.ITEM_PRESENT,
+                EventPosition.OWN_RIGHT,
+                "",
+                "Frisk",
+                "Leftovers",
+            ),
+            (
+                "|-enditem|p2a: X|Leftovers|[from] move: Knock Off|[of] p1b: Y",
+                EventDetail.ITEM_REMOVED_BY_MOVE,
+                EventPosition.OWN_RIGHT,
+                "Knock Off",
+                "",
+                "Leftovers",
+            ),
+            (
+                "|-item|p2a: X|Leftovers|[from] move: Thief|[of] p1b: Y",
+                EventDetail.ITEM_PRESENT,
+                EventPosition.OPPONENT_LEFT,
+                "Thief",
+                "",
+                "Leftovers",
+            ),
+            (
+                "|-item|p2a: X|Leftovers|[from] ability: Pickpocket|[of] p1b: Y",
+                EventDetail.ITEM_PRESENT,
+                EventPosition.OPPONENT_LEFT,
+                "",
+                "Pickpocket",
+                "Leftovers",
+            ),
+            (
+                "|-enditem|p2a: X|Sitrus Berry|[eat]",
+                EventDetail.ITEM_EATEN,
+                EventPosition.OPPONENT_LEFT,
+                "",
+                "",
+                "Sitrus Berry",
+            ),
+            (
+                "|-enditem|p2a: X|Occa Berry|[weaken]",
+                EventDetail.ITEM_USED,
+                EventPosition.OPPONENT_LEFT,
+                "",
+                "",
+                "Occa Berry",
+            ),
+            (
+                "|-enditem|p2a: X|Normal Gem|[from] gem",
+                EventDetail.ITEM_USED,
+                EventPosition.OPPONENT_LEFT,
+                "",
+                "",
+                "Normal Gem",
+            ),
+            (
+                "|-enditem|p2a: X|Focus Sash",
+                EventDetail.ITEM_ENDED,
+                EventPosition.NONE,
+                "",
+                "",
+                "Focus Sash",
+            ),
+            (
+                "|-enditem|p2a: X|Sitrus Berry|[from] stealeat|[move] Bug Bite|[of] p1b: Y",
+                EventDetail.ITEM_STOLEN_AND_EATEN,
+                EventPosition.OWN_RIGHT,
+                "Bug Bite",
+                "",
+                "Sitrus Berry",
+            ),
+        ],
+    )
+    def test_item_identity_and_cause(
+        self,
+        line: str,
+        detail: EventDetail,
+        source: EventPosition,
+        move: str,
+        ability: str,
+        item: str,
+    ) -> None:
+        recorder = SpatialEventRecorder()
+        recorder.apply_line(line.split("|"), tokenizer, _no_hp)
+        assert recorder.pending() == (
+            EventRecord(
+                EventKind.ITEM,
+                source,
+                EventPosition.OPPONENT_LEFT,
+                tokenizer.id_for("moves", move),
+                detail,
+                tokenizer.id_for("items", item),
+                tokenizer.id_for("abilities", ability),
+            ),
+        )
+
+    def test_trick_keeps_only_reported_item_results(self) -> None:
+        recorder = SpatialEventRecorder()
+        for line in (
+            "|move|p1a: X|Trick|p2a: Y",
+            "|-item|p2a: Y|Choice Scarf|[from] move: Trick",
+            "|-item|p1a: X|Leftovers|[from] move: Trick",
+        ):
+            recorder.apply_line(line.split("|"), tokenizer, _no_hp)
+        assert [r.kind for r in recorder.pending()] == [
+            EventKind.MOVE,
+            EventKind.ITEM,
+            EventKind.ITEM,
+        ]
+        assert [(r.source, r.target, r.item_id) for r in recorder.pending()[1:]] == [
+            (
+                EventPosition.NONE,
+                EventPosition.OPPONENT_LEFT,
+                tokenizer.id_for("items", "Choice Scarf"),
+            ),
+            (EventPosition.NONE, EventPosition.OWN_LEFT, tokenizer.id_for("items", "Leftovers")),
+        ]
+
+    def test_ability_outcomes_preserve_identity_without_extra_announcements(self) -> None:
+        recorder = SpatialEventRecorder()
+        for line in (
+            "|move|p1a: X|Tackle|p2a: Y",
+            "|-damage|p2a: Y|80/100",
+            "|-damage|p1a: X|90/100|[from] ability: Rough Skin|[of] p2a: Y",
+            "|-heal|p1b: Z|90/100|[from] ability: Poison Heal",
+            "|-boost|p1b: Z|spe|1|[from] ability: Speed Boost",
+            "|-immune|p2b: W|[from] ability: Levitate",
+            "|-activate|p2a: Y|ability: Storm Drain",
+        ):
+            recorder.apply_line(line.split("|"), tokenizer, _no_hp)
+        records = recorder.pending()
+        assert [r.ability_id for r in records] == [
+            0,
+            0,
+            *[
+                tokenizer.id_for("abilities", name)
+                for name in ("Rough Skin", "Poison Heal", "Speed Boost", "Levitate", "Storm Drain")
+            ],
+        ]
+        assert [(r.source, r.target) for r in records[2:]] == [
+            (2, 0),
+            (1, 1),
+            (1, 1),
+            (3, 3),
+            (2, 4),
+        ]
+        assert all(r.move_id == 0 for r in records[1:])
+        assert [r.detail for r in records[4:]] == [
+            EventDetail.SPE,
+            EventDetail.IMMUNE,
+            EventDetail.ABILITY_ACTIVATED,
+        ]
+
+    def test_condition_transitions_keep_namespaces_and_explicit_sources(self) -> None:
+        recorder = SpatialEventRecorder(player_role="p2")
+        for line in (
+            "|-weather|SunnyDay|[from] ability: Drought|[of] p1b: X",
+            "|-weather|SunnyDay|[upkeep]",
+            "|-fieldstart|move: Trick Room|[of] p2a: Y",
+            "|-sidestart|p1: Opponent|move: Tailwind",
+            "|-sideend|p1: Opponent|move: Tailwind",
+            "|-fieldend|move: Trick Room",
+            "|-weather|none",
+            "|-swapsideconditions",
+        ):
+            recorder.apply_line(line.split("|"), tokenizer, _no_hp)
+        records = recorder.pending()
+        assert [
+            (r.kind, r.source, r.target, r.condition_namespace, r.condition_id) for r in records
+        ] == [
+            (EventKind.CONDITION_SET, 3, 7, EffectNamespace.WEATHER, 8),
+            (EventKind.CONDITION_SET, 0, 7, EffectNamespace.FIELD, 12),
+            (EventKind.CONDITION_SET, 4, 6, EffectNamespace.SIDE, 20),
+            (EventKind.CONDITION_END, 4, 6, EffectNamespace.SIDE, 20),
+            (EventKind.CONDITION_END, 4, 7, EffectNamespace.FIELD, 12),
+            (EventKind.CONDITION_END, 4, 7, EffectNamespace.WEATHER, 0),
+            (EventKind.SIDE_CONDITIONS_SWAPPED, 4, 8, EffectNamespace.NONE, 0),
+        ]
+        assert records[0].ability_id == tokenizer.id_for("abilities", "Drought")
+        assert all(r.move_id == 0 for r in records)
+        recorder.consume()
+        recorder.apply_line("|-weather|SunnyDay|[upkeep]".split("|"), tokenizer, _no_hp)
+        assert recorder.pending() == ()
+
+    def test_unknown_identity_keeps_event_and_reports_diagnostic(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = SpatialEventRecorder()
+        with caplog.at_level(logging.WARNING, logger="p0.battle.events"):
+            recorder.apply_line("|-item|p1a: X|Unlisted Item".split("|"), tokenizer, _no_hp)
+        assert recorder.pending()[0].kind == EventKind.ITEM
+        assert recorder.pending()[0].item_id == 0
+        assert "Unlisted Item" in caplog.text

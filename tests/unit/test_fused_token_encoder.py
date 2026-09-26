@@ -61,3 +61,74 @@ class TestDeepSetEncoder:
 
         with pytest.raises(ValueError):
             encoder(members, mask)
+
+
+class TestEventPositions:
+    @pytest.mark.parametrize(
+        ("endpoint", "board_row", "special_row"),
+        [
+            (0, 0, -1),
+            (1, 1, -1),
+            (2, 6, -1),
+            (3, 7, -1),
+            (4, -1, 0),
+            (5, 13, -1),
+            (6, 14, -1),
+            (7, 12, -1),
+            (8, -1, 1),
+        ],
+    )
+    def test_event_addresses_share_board_parameters(
+        self, endpoint: int, board_row: int, special_row: int
+    ) -> None:
+        from p0.battle.events import EventKind
+        from p0.format_config import FORMAT
+        from p0.model.fused_token_encoder import FusedTokenEncoder
+        from p0.model.resources import default_runtime_resources
+        from p0.model.structured_observation import StructuredObservation
+
+        torch.manual_seed(41)
+        encoder = FusedTokenEncoder(32, 4, 64, default_runtime_resources())
+        obs = StructuredObservation.empty_batch(1)
+        obs.spatial_cat[0, 0] = torch.tensor([EventKind.MOVE, endpoint, endpoint, 1, 0, 0, 0, 0, 0])
+        mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+        tokens, _ = encoder(obs, mask)
+        board_grad = torch.autograd.grad(
+            tokens[:, :15].square().sum(), encoder.entity_position_emb.weight, retain_graph=True
+        )[0]
+        event_grad, special_grad = torch.autograd.grad(
+            tokens[:, -4:].square().sum(),
+            (encoder.entity_position_emb.weight, encoder.event_special_position_emb.weight),
+        )
+
+        expected_rows = {0, 1, 6, 7}  # The four queries always read these board positions.
+        if board_row >= 0:
+            expected_rows.add(board_row)
+            assert board_grad[board_row].abs().sum() > 0
+        assert set(event_grad.abs().sum(-1).nonzero().flatten().tolist()) == expected_rows
+        assert set(special_grad.abs().sum(-1).nonzero().flatten().tolist()) == (
+            {special_row} if special_row >= 0 else set()
+        )
+        assert torch.isfinite(event_grad).all()
+
+    def test_reversing_participants_and_condition_namespace_changes_events(self) -> None:
+        from p0.battle.events import EventKind
+        from p0.format_config import FORMAT
+        from p0.model.fused_token_encoder import FusedTokenEncoder
+        from p0.model.resources import default_runtime_resources
+        from p0.model.structured_observation import StructuredObservation
+
+        torch.manual_seed(43)
+        encoder = FusedTokenEncoder(32, 4, 64, default_runtime_resources())
+        obs = StructuredObservation.empty_batch(3)
+        obs.spatial_cat[:, 0] = torch.tensor(
+            [
+                [EventKind.CONDITION_SET, 0, 2, 0, 0, 0, 0, 3, 1],
+                [EventKind.CONDITION_SET, 2, 0, 0, 0, 0, 0, 3, 1],
+                [EventKind.CONDITION_SET, 0, 2, 0, 0, 0, 0, 4, 1],
+            ]
+        )
+        with torch.no_grad():
+            tokens, _ = encoder(obs, torch.ones((3, 2, FORMAT.action_size), dtype=torch.bool))
+        assert not torch.allclose(tokens[0, -4:], tokens[1, -4:])
+        assert not torch.allclose(tokens[0, -4:], tokens[2, -4:])

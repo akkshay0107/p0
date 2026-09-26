@@ -17,9 +17,11 @@ from p0.battle.events import (
     EVENT_CATEGORICAL_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     MAX_EVENT_RECORDS,
+    EffectNamespace,
     EventDetail,
     EventKind,
     EventPosition,
+    EventRecord,
 )
 from p0.format_config import active_global_contract, canonical_json_sha256
 from p0.model.architecture_contract import (
@@ -128,14 +130,6 @@ class MechanicState(IntEnum):
     TRANSFORMED = 2
 
 
-class EffectNamespace(IntEnum):
-    NONE = 0
-    POKEMON = 1
-    SIDE = 2
-    FIELD = 3
-    WEATHER = 4
-
-
 class CounterKind(IntEnum):
     PRESENCE_ONLY = 0
     TURN_AGE = 1
@@ -175,6 +169,7 @@ def _observation_layout_descriptor() -> dict[str, object]:
         "spatial_events": {
             "count": MAX_EVENT_RECORDS,
             "categorical_width": EVENT_CATEGORICAL_WIDTH,
+            "categorical_fields": EventRecord._fields[:EVENT_CATEGORICAL_WIDTH],
             "numerical_width": EVENT_NUMERICAL_WIDTH,
         },
         "tokens": {

@@ -188,6 +188,7 @@ def dummy_obs() -> StructuredObservation:
             torch.randint(0, NUM_EVENT_POSITIONS, records),
             torch.randint(0, 100, records),
             torch.randint(0, NUM_EVENT_DETAILS, records),
+            *[torch.zeros(records, dtype=torch.long) for _ in range(4)],
         ),
         dim=-1,
     )
@@ -225,7 +226,6 @@ class TestPolicyArchitecture:
         assert not any(isinstance(module, torch.nn.LayerNorm) for module in policy.modules())
         assert policy.encoder.move_pos_emb.num_embeddings == 4
         assert policy.encoder.entity_position_emb.num_embeddings == SEQUENCE_LENGTH
-        assert policy.encoder.event_slot_emb.num_embeddings == SPATIAL_SLOT_COUNT
         assert policy.encoder.event_order_emb.num_embeddings == MAX_EVENT_RECORDS
         assert policy.actor.reducer.memory_position_emb.num_embeddings == REDUCER_MAX_LENGTH
 
@@ -483,7 +483,7 @@ class TestPolicy:
         def encode_record(row: int, target: int) -> torch.Tensor:
             obs = StructuredObservation.empty_batch(1)
             obs.spatial_cat[0, row] = torch.tensor(
-                [EventKind.MOVE, EventPosition.OWN_LEFT, target, 10, EventDetail.NONE]
+                [EventKind.MOVE, EventPosition.OWN_LEFT, target, 10, EventDetail.NONE, 0, 0, 0, 0]
             )
             action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
             with torch.no_grad():
@@ -503,7 +503,7 @@ class TestPolicy:
         from p0.battle.actions import ACT_SIZE
 
         obs = StructuredObservation.empty_batch(1)
-        obs.spatial_cat[0, 0] = torch.tensor([EventKind.MOVE, 0, 2, 10, 0])
+        obs.spatial_cat[0, 0] = torch.tensor([EventKind.MOVE, 0, 2, 10, 0, 0, 0, 0, 0])
         noisy = obs.clone()
         noisy.spatial_cat[0, 1:, 1:] = 3
         noisy.spatial_num[0, 1:] = 0.9
@@ -915,6 +915,10 @@ class TestPolicy:
                 EventPosition.OPPONENT_LEFT,
                 0,
                 EventDetail.ATK,
+                0,
+                0,
+                4,
+                1,
             ]
         )
         base.spatial_num[0, 0] = torch.tensor([-1 / 6, 1.0])
@@ -926,6 +930,10 @@ class TestPolicy:
             (2, EventPosition.OPPONENT_RIGHT),
             (3, 10),
             (4, EventDetail.SPE),
+            (5, 1),
+            (6, 1),
+            (7, 3),
+            (8, 2),
         ):
             variant = base.clone()
             variant.spatial_cat[0, 0, column] = value
@@ -943,7 +951,7 @@ class TestPolicy:
         """Verify spatial event tokens participate in the public policy computation graph."""
         obs = StructuredObservation.empty_batch(2)
         obs.spatial_cat[:, 0] = torch.tensor(
-            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15, 0]
+            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15, 0, 0, 0, 0, 0]
         )
         action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.bool)
         output = policy.encode(obs, action_mask).tokens[:, 16:20]
@@ -960,7 +968,7 @@ class TestPolicy:
         base = StructuredObservation.empty_batch(1)
         with_event = base.clone()
         with_event.spatial_cat[0, 0] = torch.tensor(
-            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 10, 0]
+            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 10, 0, 0, 0, 0, 0]
         )
         mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
 
@@ -1001,7 +1009,7 @@ class TestPolicy:
     def test_local_mixer_receives_gradients_from_the_local_summary(self, policy: PolicyNet) -> None:
         obs = StructuredObservation.empty_batch(2)
         obs.spatial_cat[:, 0] = torch.tensor(
-            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15, 0]
+            [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15, 0, 0, 0, 0, 0]
         )
         mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.bool)
 

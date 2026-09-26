@@ -8,8 +8,8 @@
       "minor_version": 0
     },
     "model": {
-      "major_sha256": "f0da42d8a06cc1ee233829bc387f428e1f2153964e5805004a5500dabd05325b",
-      "minor_sha256": "48233d73e7a40893708021f7da3693430ddfa2330cd8d78b52034c92c2b3924b",
+      "major_sha256": "fd534c7610d847cb44aa32bf0b0f661632d2a05b794623effd1e233312ec8e4a",
+      "minor_sha256": "85c1e35b7e7a53145ef7c77fd4415f122bdffa7dddfd52df5bef22f98c5326bd",
       "major_version": 1,
       "minor_version": 0
     },
@@ -92,7 +92,7 @@
         "history_window": 48,
         "max_prior_games": 2,
         "observation_entity_count": 15,
-        "observation_layout_sha256": "11bf7282030691aef0b83f9d692119f5c9da62660d69253426f7bd4769371891",
+        "observation_layout_sha256": "7dca9c231a7dfc3ee26646e5ccbbd6885b90b29293b8257683275d6c4f05c51a",
         "owner_count": 3,
         "pokemon_count": 12,
         "pooled_event_count": 4,
@@ -115,5 +115,5 @@
       }
     }
   },
-  "global_sha256": "f6f88c8a54514c97276bd0f73241c30791ce6d9eb723d009df9711d584723bd1"
+  "global_sha256": "042c8da2c24089610824da03aae059179bd481fcfb8c5525a1b69688a20a26ef"
 }

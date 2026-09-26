@@ -7,15 +7,17 @@ scalars (turn, team-preview flag, fainted counts), entity rows, and pooled battl
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from p0.battle.events import (
     EVENT_NUMERICAL_WIDTH,
     MAX_EVENT_RECORDS,
     NUM_EVENT_DETAILS,
     NUM_EVENT_KINDS,
-    NUM_EVENT_POSITIONS,
     SPATIAL_SLOT_COUNT,
     EventKind,
 )
@@ -49,6 +51,8 @@ from p0.model.structured_observation import (
     POKEMON_TOKENS,
     SEQUENCE_LENGTH,
     TOKEN_IDX_ALLY_SIDE,
+    TOKEN_IDX_GLOBAL_FIELD,
+    TOKEN_IDX_OPPONENT_SIDE,
     IdentityKnownness,
     MechanicState,
     PresenceStatus,
@@ -250,6 +254,7 @@ class DeepSetEncoder(nn.Module):
 
 class FusedTokenEncoder(nn.Module):
     # Buffers registered dynamically by torch need explicit declarations for Pyright.
+    _event_address_rows: Annotated[torch.Tensor, "event_positions"]
     _pokemon_scalar_idx: torch.Tensor
     _species_statics: torch.Tensor
     _move_statics: torch.Tensor
@@ -354,13 +359,36 @@ class FusedTokenEncoder(nn.Module):
         # Ordered event records since this player's previous decision. One learned
         # query per active position (own left/right, opponent left/right) reads them.
         self.event_kind_emb = nn.Embedding(NUM_EVENT_KINDS, d_model)
-        self.event_source_emb = nn.Embedding(NUM_EVENT_POSITIONS, d_model)
-        self.event_target_emb = nn.Embedding(NUM_EVENT_POSITIONS, d_model)
+        self.event_source_proj = nn.Linear(d_model, d_model, bias=False)
+        self.event_target_proj = nn.Linear(d_model, d_model, bias=False)
+        self.event_special_position_emb = nn.Embedding(2, d_model)
+        # Event positions map to board rows; NONE and BOTH_SIDES follow the board.
+        self.register_buffer(
+            "_event_address_rows",
+            torch.tensor(
+                (
+                    0,
+                    1,
+                    6,
+                    7,
+                    SEQUENCE_LENGTH,
+                    TOKEN_IDX_ALLY_SIDE,
+                    TOKEN_IDX_OPPONENT_SIDE,
+                    TOKEN_IDX_GLOBAL_FIELD,
+                    SEQUENCE_LENGTH + 1,
+                )
+            ),
+            persistent=False,
+        )
         self.event_detail_emb = nn.Embedding(NUM_EVENT_DETAILS, d_model)
         self.event_order_emb = nn.Embedding(MAX_EVENT_RECORDS, d_model)
         self.spatial_move_proj = nn.Linear(d_raw, d_model)
         self.spatial_num_proj = nn.Linear(EVENT_NUMERICAL_WIDTH, d_model)
-        self.event_slot_emb = nn.Embedding(SPATIAL_SLOT_COUNT, d_model)
+        self.spatial_item_proj = nn.Linear(d_raw, d_model, bias=False)
+        self.spatial_ability_proj = nn.Linear(d_raw, d_model, bias=False)
+        self.spatial_condition_proj = nn.Linear(
+            d_raw + self.effect_namespace_emb.embedding_dim, d_model, bias=False
+        )
         self.event_type_token = nn.Parameter(torch.empty(d_model))
         self.event_encoder = SwiGLUTransformerEncoder(
             d_model=d_model,
@@ -503,17 +531,35 @@ class FusedTokenEncoder(nn.Module):
     def _encode_events(self, obs: StructuredObservation, device: torch.device) -> torch.Tensor:
         spatial_cat = obs.spatial_cat.long().to(device)
         spatial_num = obs.spatial_num.float().to(device)
+        addresses = torch.cat(
+            (self.entity_position_emb.weight, self.event_special_position_emb.weight)
+        )[self._event_address_rows]
+        # Project the nine addresses once, not every endpoint in every batch row.
+        sources = self.event_source_proj(addresses)
+        targets = self.event_target_proj(addresses)
+        conditions = torch.cat(
+            (
+                self.effect_emb(spatial_cat[..., 8]),
+                self.effect_namespace_emb(spatial_cat[..., 7]),
+            ),
+            dim=-1,
+        )
         records = (
             self.event_kind_emb(spatial_cat[..., 0])
-            + self.event_source_emb(spatial_cat[..., 1])
-            + self.event_target_emb(spatial_cat[..., 2])
+            + F.embedding(spatial_cat[..., 1], sources)
+            + F.embedding(spatial_cat[..., 2], targets)
             + self.spatial_move_proj(self.move_emb(spatial_cat[..., 3]))
             + self.event_detail_emb(spatial_cat[..., 4])
+            + self.spatial_item_proj(self.item_emb(spatial_cat[..., 5]))
+            * (spatial_cat[..., 5] != 0).unsqueeze(-1)
+            + self.spatial_ability_proj(self.ability_emb(spatial_cat[..., 6]))
+            * (spatial_cat[..., 6] != 0).unsqueeze(-1)
+            + self.spatial_condition_proj(conditions) * (spatial_cat[..., 7] != 0).unsqueeze(-1)
             + self.spatial_num_proj(spatial_num)
             + self.event_order_emb.weight
         )
         batch = records.size(0)
-        queries = (self.event_slot_emb.weight + self.event_type_token).expand(batch, -1, -1)
+        queries = (addresses[:SPATIAL_SLOT_COUNT] + self.event_type_token).expand(batch, -1, -1)
 
         # The query rows are never padded, so an empty interval still has valid keys.
         padding = torch.cat(
