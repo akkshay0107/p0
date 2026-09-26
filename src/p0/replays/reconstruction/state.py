@@ -1438,7 +1438,7 @@ class _StateReducer:
             if target.transform is not None
             else tuple((name, dict(target.base_stats)[name]) for name in _BOOST_NAMES[:5])
         )
-        target_ability = self._current_ability(target)
+        target_ability = self._held_ability(target)
         copied_moves = tuple(
             MoveState(
                 move.move_id,
@@ -1463,6 +1463,12 @@ class _StateReducer:
             added_type=target_added_type,
         )
         member.boosts = dict(target.boosts)
+        # Transform copies the target's types as the member's own, so later type
+        # additions and Roost's end build on them.
+        member.underlying_types = tuple(
+            type_name for type_name in target_types if type_name != target_added_type
+        )
+        member.added_type = target_added_type
         member.current_types = target_types
 
     def _transform_target(
@@ -1774,8 +1780,8 @@ class _StateReducer:
             raise _StateTransitionError("Skill Swap requires source and target references")
         source = self.members[_required_member(references[0])]
         target = self.members[_required_member(references[1])]
-        source_ability = self._current_ability(source)
-        target_ability = self._current_ability(target)
+        source_ability = self._held_ability(source)
+        target_ability = self._held_ability(target)
         arguments = resolved.event.arguments
         if len(arguments) >= 4 and arguments[2] and arguments[3]:
             target_ability = arguments[2]
@@ -1900,6 +1906,11 @@ class _StateReducer:
         )
         if "gastroacid" in member.effects and not ability_shield_active:
             return ""
+        return self._held_ability(member)
+
+    @staticmethod
+    def _held_ability(member: _MutablePokemon) -> str:
+        """Return the named ability, which Skill Swap and Transform copy even while suppressed."""
         return member.transform.ability if member.transform is not None else member.ability.current
 
     def _is_copyable_volatile(self, effect: str) -> bool:

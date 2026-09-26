@@ -54,6 +54,8 @@ _PIVOT_CAUSES = frozenset(
     }
 )
 _FORCED_MOVES = frozenset({"struggle", "recharge"})
+# Struggle is hidden from the request while an opposing Imprison disables moves.
+_FORCED_MOVES_UNDER_IMPRISON = frozenset({"recharge"})
 _SELF_TARGETS = frozenset(
     {
         "self",
@@ -74,13 +76,28 @@ _ALLY_TARGETS = frozenset({"adjacentally"})
 _ALLY_OR_SELF_TARGETS = frozenset({"adjacentallyorself"})
 
 
+def _opponent_imprison_active(state: ReplayBattleState, perspective: int) -> bool:
+    """
+    Whether an opposing Imprison hides disabled moves from the player's request.
+
+    The player then submits a move that Showdown replaces with Struggle, so an
+    observed Struggle does not show the submitted choice.
+    """
+    return any(
+        member_id is not None
+        and any(effect == "imprison" for effect, _ in state.member(member_id).effects)
+        for member_id in state.sides[1 - perspective].active
+    )
+
+
 def _target_codes(move_target: str, actor_slot: int) -> tuple[int, ...]:
     if move_target in _SELF_TARGETS:
         return (0,)
     if move_target in _ALLY_TARGETS:
         return (-2,) if actor_slot == 0 else (-1,)
     if move_target in _ALLY_OR_SELF_TARGETS:
-        return (0, -2) if actor_slot == 0 else (0, -1)
+        # Live orders name the user by its own slot, like poke-env: ally first, then self.
+        return (-2, -1) if actor_slot == 0 else (-1, -2)
     if move_target in _FOE_TARGETS:
         return (1, 2)
     if move_target in _NORMAL_TARGETS:
@@ -431,6 +448,7 @@ def _observed_actions(
     mega_slots: set[tuple[ReplaySide, int]] = set()
     generated_slots: set[tuple[ReplaySide, int]] = set()
     encored_before_action: set[tuple[ReplaySide, int]] = set()
+    hidden_disables = _opponent_imprison_active(state, perspective)
     for event in events:
         parsed = event.event
         if (
@@ -472,6 +490,13 @@ def _observed_actions(
         if parsed.tag == "move":
             if key in encored_before_action:
                 tags.append("mid_turn_encore_override")
+                continue
+            if (
+                hidden_disables
+                and len(parsed.arguments) >= 2
+                and normalize_showdown_id(parsed.arguments[1]) == "struggle"
+            ):
+                tags.append("hidden_disable_struggle")
                 continue
             if key in generated_slots:
                 generated_slots.remove(key)
@@ -633,12 +658,17 @@ def build_decision_view(
         and not member.fainted
         and (not selection_complete or member.selected is True)
     )
+    forced_moves = (
+        _FORCED_MOVES_UNDER_IMPRISON
+        if _opponent_imprison_active(state, perspective)
+        else _FORCED_MOVES
+    )
     forced_slots = frozenset(
         reference.pokemon_ref.active_slot
         for event in window_events
         if event.event.tag == "move"
         and len(event.event.arguments) >= 2
-        and normalize_showdown_id(event.event.arguments[1]) in _FORCED_MOVES
+        and normalize_showdown_id(event.event.arguments[1]) in forced_moves
         and (reference := _reference(event, 0)) is not None
         and reference.member_id is not None
         and reference.member_id.side.side_index == perspective

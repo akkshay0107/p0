@@ -1031,6 +1031,49 @@ class TestReconstructionState:
             "mimic",
         )
 
+    def test_type_added_after_transform_extends_the_copied_types(self) -> None:
+        dex = _dex()
+        cast(list[dict[str, object]], dex["species"])[6]["types"] = ["Electric"]
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-transform|p1a: Alpha|p2a: Golf|[from] ability: Imposter",
+            "|-start|p1a: Alpha|typeadd|Ghost|[from] move: Trick-or-Treat",
+        )
+
+        snapshots = reduce_replay_state("state-test", _complete_ots(), events, dex=dex)
+
+        alpha = snapshots.require_accepted()[3].member(ReplayMemberId(ReplaySide.P1, 0))
+        assert alpha.current_types == ("Electric", "Ghost")
+
+    def test_roost_ending_after_transform_restores_the_copied_types(self) -> None:
+        dex = _dex()
+        cast(list[dict[str, object]], dex["species"])[6]["types"] = ["Rock", "Flying"]
+        cast(list[dict[str, object]], dex["moves"]).append(
+            {
+                "id": "roost",
+                "name": "Roost",
+                "type": "Flying",
+                "category": "Status",
+                "target": "self",
+                "pp": 10,
+            }
+        )
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-transform|p1a: Alpha|p2a: Golf|[from] ability: Imposter",
+            "|-singleturn|p1a: Alpha|move: Roost",
+            "|upkeep",
+        )
+
+        snapshots = reduce_replay_state("state-test", _complete_ots(), events, dex=dex)
+
+        accepted = snapshots.require_accepted()
+        alpha_id = ReplayMemberId(ReplaySide.P1, 0)
+        assert accepted[3].member(alpha_id).current_types == ("Rock",)
+        assert accepted[4].member(alpha_id).current_types == ("Rock", "Flying")
+
     def test_declared_team_size_excludes_unselected_open_sheet_reserves(self) -> None:
         events = _resolved(
             "|teamsize|p2|4",
@@ -1071,6 +1114,37 @@ class TestReconstructionState:
         ).require_accepted()[-1]
         assert final.member(ReplayMemberId(ReplaySide.P1, 0)).ability.current == "Ability Golf"
         assert final.member(ReplayMemberId(ReplaySide.P2, 0)).ability.current == "Ability Alpha"
+
+    def test_ally_skill_swap_exchanges_an_ability_suppressed_by_gastro_acid(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p1b: Bravo|Bravo, L50|100/100",
+            "|-endability|p1b: Bravo",
+            "|-activate|p1b: Bravo|Skill Swap|||[of] p1a: Alpha",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        bravo = final.member(ReplayMemberId(ReplaySide.P1, 1))
+        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).ability.current == "Ability Bravo"
+        assert bravo.ability.current == "Ability Alpha"
+        assert "gastroacid" in dict(bravo.effects)
+
+    def test_transform_copies_an_ability_suppressed_by_gastro_acid(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-endability|p2a: Golf",
+            "|-transform|p1a: Alpha|p2a: Golf|[from] ability: Imposter",
+        )
+
+        final = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()[-1]
+        transform = final.member(ReplayMemberId(ReplaySide.P1, 0)).transform
+        assert transform is not None
+        assert transform.ability == "Ability Golf"
 
     def test_trace_source_reference_does_not_overwrite_the_target_ability(self) -> None:
         events = _resolved(

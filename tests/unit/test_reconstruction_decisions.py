@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from p0.battle.actions import ActionKind, SlotAction, encode_action
 from p0.model.resources import default_runtime_resources
 from p0.replays.compile import compile_payloads
 from p0.replays.protocol import parse_replay_payload
@@ -134,10 +135,27 @@ class TestDecisionTargets:
         assert view.slots[0].move_targets[1] == (-2, 1, 2)
         assert view.slots[1].move_targets[1] == (-1, 1, 2)
 
-    def test_adjacent_ally_or_self_targets_self_and_only_adjacent_ally(self) -> None:
+    def test_adjacent_ally_or_self_targets_ally_and_self_by_their_slots(self) -> None:
         view = _decision_view_with_ots(p1_moves=["Protect", "Acupressure"])
 
-        assert view.slots[0].move_targets[1] == (0, -2)
+        assert view.slots[0].move_targets[1] == (-2, -1)
+
+    def test_observed_self_target_label_matches_the_live_self_slot_order(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace('"moves":["Protect","Tackle"]', '"moves":["Protect","Acupressure"]', 1)
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu",
+                "|move|p1a: Pikachu|Acupressure|p1a: Pikachu",
+            )
+        )
+        document = parse_replay_payload(payload)
+
+        evidence = reconstruct_replay_decisions_both(document)[0].decisions[-1].evidence
+
+        live_self_order = encode_action(SlotAction(ActionKind.MOVE, move_slot=1, target=-1))
+        assert live_self_order in {candidate[0] for candidate in evidence.candidates}
 
     def test_curse_targets_self_for_non_ghost_and_any_for_ghost(self) -> None:
         normal = _decision_view_with_ots(p1_moves=["Protect", "Curse"])
@@ -231,6 +249,23 @@ class TestDecisionTargets:
         affected = result.games[0].perspectives[0].decisions[-1]
         assert (9, 13) in affected.evidence.candidates
         assert (9, 11) in affected.evidence.candidates
+
+    def test_struggle_under_opposing_imprison_keeps_submitted_moves_possible(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace("|turn|1", "|-start|p2a: Bulbasaur|move: Imprison\n|turn|1")
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu",
+                "|-activate|p1a: Pikachu|move: Struggle\n|move|p1a: Pikachu|Struggle|p2a: Bulbasaur",
+            )
+        )
+
+        result = reconstruct_replay_decisions_both(parse_replay_payload(payload))[0]
+
+        evidence = result.decisions[-1].evidence
+        assert "hidden_disable_struggle" in evidence.tags
+        assert (9, 13) in evidence.candidates
 
     def test_encore_after_actor_does_not_erase_observed_choice(self) -> None:
         payload = sample_replay_payload("encore-after-actor")

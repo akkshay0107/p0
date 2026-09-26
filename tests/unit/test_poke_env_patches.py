@@ -10,7 +10,7 @@ import weakref
 from pathlib import Path
 
 import pytest
-from poke_env.battle import DoubleBattle, Effect, Pokemon, PokemonType
+from poke_env.battle import DoubleBattle, Effect, Pokemon, PokemonType, SideCondition, Status
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
@@ -151,6 +151,7 @@ class TestPokeEnvPatches:
         original_stop = PSClient.stop_listening
         original_start_effect = Pokemon.start_effect
         original_copy_boosts = Pokemon.copy_boosts
+        original_parse_request = DoubleBattle.parse_request
         poke_env_patches.install()
         installed = DoubleBattle.parse_message
         poke_env_patches.install()
@@ -159,11 +160,13 @@ class TestPokeEnvPatches:
         assert PSClient.stop_listening is not original_stop
         assert Pokemon.start_effect is not original_start_effect
         assert Pokemon.copy_boosts is not original_copy_boosts
+        assert DoubleBattle.parse_request is not original_parse_request
         poke_env_patches.uninstall_for_tests()
         assert DoubleBattle.parse_message is original
         assert PSClient.stop_listening is original_stop
         assert Pokemon.start_effect is original_start_effect
         assert Pokemon.copy_boosts is original_copy_boosts
+        assert DoubleBattle.parse_request is original_parse_request
 
         target = logging.getLogger("test.poke-env")
         other = logging.getLogger("test.other")
@@ -285,6 +288,33 @@ class TestPokeEnvPatches:
             )
             assert returned_observation.numerical[0, 25].item() == 0.0
             assert observation.numerical[0, 25].item() == pytest.approx(0.2)
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_transform_copies_the_targets_changed_types(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("transform-protean", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Meowscarada", "Meowscarada, L50, F", "100/100"],
+                ["", "switch", "p2b: Ditto", "Ditto, L50", "100/100"],
+                [
+                    "",
+                    "-start",
+                    "p1a: Meowscarada",
+                    "typechange",
+                    "Normal",
+                    "[from] ability: Protean",
+                ],
+                ["", "-transform", "p2b: Ditto", "p1a: Meowscarada", "[from] ability: Imposter"],
+            ):
+                battle.parse_message(event)
+
+            transformed = battle_view(battle).opponent_active_pokemon[1]
+            assert isinstance(transformed, TransformedPokemonView)
+            assert tuple(value.name for value in transformed.types) == ("NORMAL",)
         finally:
             poke_env_patches.uninstall_for_tests()
 
@@ -446,6 +476,43 @@ class TestPokeEnvPatches:
             morpeko = battle.team["p1: Morpeko"]
             assert morpeko.species == "morpeko"
             assert morpeko.type_1.name == "ELECTRIC"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_temporary_form_resets_when_a_disguise_replaces_it_in_the_same_slot(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("morpeko-illusion", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p2b: Morpeko", "Morpeko, L50, F", "100/100"],
+                ["", "-formechange", "p2b: Morpeko", "Morpeko-Hangry"],
+                ["", "switch", "p2b: Morpeko", "Morpeko, L50, F", "64/100"],
+            ):
+                battle.parse_message(event)
+
+            shown = battle.opponent_active_pokemon[1]
+            assert shown is not None and shown.species == "morpeko"
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_form_change_clears_an_earlier_type_change(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("morpeko-soak", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Morpeko", "Morpeko, L50", "100/100"],
+                ["", "-start", "p1a: Morpeko", "typechange", "Water"],
+                ["", "-formechange", "p1a: Morpeko", "Morpeko-Hangry"],
+            ):
+                battle.parse_message(event)
+
+            morpeko = battle.active_pokemon[0]
+            assert morpeko is not None
+            assert morpeko.types == [PokemonType.ELECTRIC, PokemonType.DARK]
         finally:
             poke_env_patches.uninstall_for_tests()
 
@@ -758,3 +825,381 @@ class TestPokeEnvNaturePatch:
             poke_env_patches.uninstall_for_tests()
 
         assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET)).nature is None
+
+
+def _request_pokemon(ident: str, details: str, condition: str, active: bool) -> dict[str, object]:
+    return {
+        "ident": ident,
+        "details": details,
+        "condition": condition,
+        "active": active,
+        "stats": {"atk": 100, "def": 100, "spa": 100, "spd": 100, "spe": 100},
+        "moves": ["protect"],
+        "baseAbility": "illusion" if ident.endswith("Zoroark") else "noability",
+        "item": "",
+        "pokeball": "pokeball",
+        "ability": "illusion" if ident.endswith("Zoroark") else "noability",
+        "commanding": False,
+        "reviving": False,
+    }
+
+
+class TestIllusionTracking:
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_real_pokemon_entering_beside_its_disguise_has_no_disguise_boosts(
+        self, role: str
+    ) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-boosts", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", f"{role}b: Toxapex", "Toxapex, L50, M", "100/100"])
+            battle.parse_message(["", "-unboost", f"{role}b: Toxapex", "spe", "2"])
+            battle.parse_message(["", "switch", f"{role}a: Toxapex", "Toxapex, L50, M", "100/100"])
+
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            real, disguise = active
+            assert real is not None and disguise is not None
+            assert real.boosts["spe"] == 0
+            assert disguise.boosts["spe"] == -2
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_reveal_moves_the_disguise_status_to_the_illusion_user(self, role: str) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-status", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(
+                ["", "drag", f"{role}b: Primarina", "Primarina, L50, F", "56/100 par"]
+            )
+            battle.parse_message(["", "replace", f"{role}b: Zoroark", "Zoroark-Hisui, L50, M"])
+
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            revealed = active[1]
+            assert revealed is not None and revealed.species == "zoroarkhisui"
+            assert revealed.status == Status.PAR
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_reveal_leaves_the_active_real_pokemon_as_its_team_entry(self, role: str) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-reveal-team", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(
+                ["", "switch", f"{role}b: Glimmora", "Glimmora, L50, F", "100/100"]
+            )
+            battle.parse_message(
+                ["", "switch", f"{role}a: Glimmora", "Glimmora, L50, F", "100/100"]
+            )
+            battle.parse_message(["", "replace", f"{role}a: Zoroark", "Zoroark, L50, M"])
+
+            team = battle.team if role == "p1" else battle.opponent_team
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            glimmoras = [mon for mon in team.values() if mon.species == "glimmora"]
+            assert glimmoras == [active[1]]
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_revealed_zoroark_at_zero_hp_leaves_the_real_pokemon_as_its_team_entry(
+        self, role: str
+    ) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-zero-hp", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(
+                ["", "switch", f"{role}b: Victreebel", "Victreebel, L50, F", "60/100"]
+            )
+            battle.parse_message(
+                ["", "switch", f"{role}a: Victreebel", "Victreebel, L50, F", "14/100"]
+            )
+            battle.parse_message(["", "-damage", f"{role}a: Victreebel", "0 fnt"])
+            battle.parse_message(["", "replace", f"{role}a: Zoroark", "Zoroark-Hisui, L50, M"])
+            battle.parse_message(["", "faint", f"{role}a: Zoroark"])
+
+            team = battle.team if role == "p1" else battle.opponent_team
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            victreebels = [mon for mon in team.values() if mon.species == "victreebel"]
+            assert victreebels == [active[1]]
+            assert active[1] is not None and not active[1].fainted
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_disguise_switching_out_leaves_the_active_display_as_its_team_entry(
+        self, role: str
+    ) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-switch-out", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(
+                ["", "switch", f"{role}b: Spiritomb", "Spiritomb, L50, M", "100/100"]
+            )
+            battle.parse_message(
+                ["", "drag", f"{role}a: Spiritomb", "Spiritomb, L50, M", "100/100"]
+            )
+            battle.parse_message(
+                ["", "switch", f"{role}a: Eelektross", "Eelektross, L50, M", "84/100"]
+            )
+
+            team = battle.team if role == "p1" else battle.opponent_team
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            spiritombs = [mon for mon in team.values() if mon.species == "spiritomb"]
+            assert spiritombs == [active[1]]
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_display_fainting_leaves_the_active_display_as_its_team_entry(self, role: str) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-faint", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(
+                ["", "switch", f"{role}b: Corviknight", "Corviknight, L50, M", "85/100"]
+            )
+            battle.parse_message(
+                ["", "switch", f"{role}a: Corviknight", "Corviknight, L50, M", "53/100 par"]
+            )
+            battle.parse_message(["", "faint", f"{role}a: Corviknight"])
+
+            team = battle.team if role == "p1" else battle.opponent_team
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            corviknights = [mon for mon in team.values() if mon.species == "corviknight"]
+            assert corviknights == [active[1]]
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_fainted_display_returning_means_the_illusion_user_fainted(self, role: str) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-memento", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            zoroark = battle.get_pokemon(
+                f"{role}: Zoroark",
+                request=_request_pokemon(f"{role}: Zoroark", "Zoroark, L50, M", "100/100", False),
+            )
+            battle.parse_message(["", "switch", f"{role}b: Ditto", "Ditto, L50", "100/100"])
+            battle.parse_message(["", "faint", f"{role}b: Ditto"])
+            battle.parse_message(["", "switch", f"{role}b: Ditto", "Ditto, L50", "100/100"])
+
+            active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+            assert zoroark.fainted
+            assert active[1] is not None and active[1].species == "ditto"
+            assert not active[1].fainted
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_request_places_the_disguised_own_illusion_user_in_its_slot(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-request", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p1a: Hawlucha", "Hawlucha, L50, F", "165/165"])
+            battle.parse_message(["", "switch", "p1b: Farigiraf", "Farigiraf, L50, M", "201/201"])
+            battle.parse_request(
+                {
+                    "active": [{"moves": []}, {"moves": []}],
+                    "side": {
+                        "name": "Alice",
+                        "id": "p1",
+                        "pokemon": [
+                            _request_pokemon("p1: Hawlucha", "Hawlucha, L50, F", "165/165", True),
+                            _request_pokemon("p1: Farigiraf", "Farigiraf, L50, M", "201/201", True),
+                            _request_pokemon("p1: Zoroark", "Zoroark, L50, M", "159/159", False),
+                        ],
+                    },
+                    "rqid": 1,
+                }
+            )
+            battle.parse_message(["", "switch", "p1b: Farigiraf", "Farigiraf, L50, M", "159/159"])
+            battle.parse_message(["", "-boost", "p1b: Farigiraf", "atk", "1"])
+            battle.parse_message(["", "faint", "p1a: Hawlucha"])
+            battle.parse_request(
+                {
+                    "forceSwitch": [True, False],
+                    "side": {
+                        "name": "Alice",
+                        "id": "p1",
+                        "pokemon": [
+                            _request_pokemon("p1: Hawlucha", "Hawlucha, L50, F", "0 fnt", True),
+                            _request_pokemon("p1: Zoroark", "Zoroark, L50, M", "159/159", True),
+                            _request_pokemon(
+                                "p1: Farigiraf", "Farigiraf, L50, M", "201/201", False
+                            ),
+                        ],
+                    },
+                    "rqid": 2,
+                }
+            )
+
+            revealed = battle.active_pokemon[1]
+            assert revealed is not None and revealed.species == "zoroark"
+            assert revealed.boosts["atk"] == 1
+            assert not battle.team["p1: Farigiraf"].active
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_request_keeps_the_real_own_pokemon_beside_its_disguise(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("illusion-own-pair", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p1a: Toxapex", "Toxapex, L50, M", "157/157"])
+            battle.parse_message(["", "switch", "p1b: Hawlucha", "Hawlucha, L50, F", "165/165"])
+            battle.parse_request(
+                {
+                    "active": [{"moves": []}, {"moves": []}],
+                    "side": {
+                        "name": "Alice",
+                        "id": "p1",
+                        "pokemon": [
+                            _request_pokemon("p1: Toxapex", "Toxapex, L50, M", "157/157", True),
+                            _request_pokemon("p1: Hawlucha", "Hawlucha, L50, F", "165/165", True),
+                            _request_pokemon("p1: Zoroark", "Zoroark, L50, M", "159/159", False),
+                        ],
+                    },
+                    "rqid": 1,
+                }
+            )
+            battle.parse_message(["", "-unboost", "p1a: Toxapex", "spe", "2"])
+            battle.parse_message(["", "switch", "p1b: Toxapex", "Toxapex, L50, M", "159/159"])
+            battle.parse_message(["", "-boost", "p1b: Toxapex", "atk", "1"])
+            battle.parse_request(
+                {
+                    "active": [{"moves": []}, {"moves": []}],
+                    "side": {
+                        "name": "Alice",
+                        "id": "p1",
+                        "pokemon": [
+                            _request_pokemon("p1: Toxapex", "Toxapex, L50, M", "157/157", True),
+                            _request_pokemon("p1: Zoroark", "Zoroark, L50, M", "159/159", True),
+                            _request_pokemon("p1: Hawlucha", "Hawlucha, L50, F", "165/165", False),
+                        ],
+                    },
+                    "rqid": 2,
+                }
+            )
+
+            real, revealed = battle.active_pokemon
+            assert real is not None and revealed is not None
+            assert real is battle.team["p1: Toxapex"]
+            assert real.boosts["spe"] == -2
+            assert real.boosts["atk"] == 0
+            assert revealed is battle.team["p1: Zoroark"]
+            assert revealed.boosts["atk"] == 1
+            assert revealed.boosts["spe"] == 0
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+
+class TestSideGuards:
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_wide_guard_protects_its_side_until_upkeep(self, role: str) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("wide-guard", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", f"{role}a: Machamp", "Machamp, L50, M", "100/100"])
+            battle.parse_message(["", "-singleturn", f"{role}a: Machamp", "Wide Guard"])
+
+            conditions = battle.side_conditions if role == "p1" else battle.opponent_side_conditions
+            other = battle.opponent_side_conditions if role == "p1" else battle.side_conditions
+            machamp = battle.get_pokemon(f"{role}a: Machamp")
+            assert SideCondition.WIDE_GUARD in conditions
+            assert SideCondition.WIDE_GUARD not in other
+            assert Effect.WIDE_GUARD not in machamp.effects
+
+            battle.parse_message(["", "upkeep"])
+            assert SideCondition.WIDE_GUARD not in conditions
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_quick_guard_with_move_prefix_ends_at_the_next_turn(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("quick-guard", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p2b: Hitmontop", "Hitmontop, L50, M", "100/100"])
+            battle.parse_message(["", "-singleturn", "p2b: Hitmontop", "move: Quick Guard"])
+
+            assert SideCondition.QUICK_GUARD in battle.opponent_side_conditions
+
+            battle.parse_message(["", "turn", "2"])
+            assert SideCondition.QUICK_GUARD not in battle.opponent_side_conditions
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+
+class TestRoost:
+    def test_roost_removes_flying_until_upkeep(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("roost", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p2a: Dragonite", "Dragonite, L50, M", "100/100"])
+            battle.parse_message(["", "-singleturn", "p2a: Dragonite", "move: Roost"])
+
+            dragonite = battle.opponent_active_pokemon[0]
+            assert dragonite is not None
+            assert (dragonite.type_1, dragonite.type_2) == (PokemonType.DRAGON, None)
+
+            battle.parse_message(["", "upkeep"])
+            assert (dragonite.type_1, dragonite.type_2) == (PokemonType.DRAGON, PokemonType.FLYING)
+            assert Effect.ROOST not in dragonite.effects
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_roost_makes_a_pure_flying_pokemon_normal(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("roost-pure", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p1a: Tornadus", "Tornadus, L50, M", "155/155"])
+            battle.parse_message(["", "-singleturn", "p1a: Tornadus", "move: Roost"])
+
+            tornadus = battle.active_pokemon[0]
+            assert tornadus is not None
+            assert tornadus.types == [PokemonType.NORMAL]
+
+            battle.parse_message(["", "turn", "2"])
+            assert tornadus.types == [PokemonType.FLYING]
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+    def test_type_change_during_roost_outlasts_it(self) -> None:
+        poke_env_patches.install()
+        try:
+            battle = DoubleBattle("roost-soak", "Alice", logging.getLogger("test"), gen=9)
+            battle.parse_message(["", "player", "p1", "Alice", "", ""])
+            battle.parse_message(["", "player", "p2", "Bob", "", ""])
+            battle.parse_message(["", "switch", "p2a: Dragonite", "Dragonite, L50, M", "100/100"])
+            battle.parse_message(["", "-singleturn", "p2a: Dragonite", "move: Roost"])
+            battle.parse_message(["", "-start", "p2a: Dragonite", "typechange", "Water"])
+            battle.parse_message(["", "upkeep"])
+
+            dragonite = battle.opponent_active_pokemon[0]
+            assert dragonite is not None
+            assert dragonite.types == [PokemonType.WATER]
+        finally:
+            poke_env_patches.uninstall_for_tests()
