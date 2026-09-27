@@ -10,10 +10,9 @@ from typing import Any
 import numpy as np
 import torch
 from torch import Tensor
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 
-from p0.battle.actions import TEAM_SIZE
 from p0.model.policy import MemoryInputs, PolicyNet, PreparedDecision
 from p0.replays.dataset import LazyReplayDataset, ReplayGameChunk
 from p0.runtime.process_context import PROCESS_CONTEXT
@@ -34,6 +33,7 @@ from p0.training._bc_metrics import (
     _BCEvaluationAccumulator,
     _policy_loss_sum,
     _ragged_logsumexp,
+    _swap_preview_pair,
     _validate_objective_inputs,
     compute_bc_objective,
 )
@@ -67,8 +67,8 @@ def _expand_team_preview_orbits(
         for first, second in values[start:stop]:
             unique[(first, second)] = None
             if preview_rows[row]:
-                first_swap = (first % TEAM_SIZE) * TEAM_SIZE + first // TEAM_SIZE
-                second_swap = (second % TEAM_SIZE) * TEAM_SIZE + second // TEAM_SIZE
+                first_swap = _swap_preview_pair(first)
+                second_swap = _swap_preview_pair(second)
                 unique[(first_swap, second)] = None
                 unique[(first, second_swap)] = None
                 unique[(first_swap, second_swap)] = None
@@ -121,17 +121,13 @@ def _prepare_value_targets(
     gamma: Tensor,
 ) -> tuple[Tensor, Tensor]:
     """Prepare discounted outcome targets and value validity mask on device."""
-    outcome = batch.outcome.to(device=device, dtype=torch.float32)
-    decision_index = batch.decision_index.to(device)
-    game_length = batch.game_length.to(device)
-    value_mask = batch.outcome_valid.to(device)
     value_targets = _discounted_outcome_targets(
-        outcome,
-        decision_index,
-        game_length,
+        batch.outcome.to(device=device, dtype=torch.float32),
+        batch.decision_index.to(device),
+        batch.game_length.to(device),
         gamma,
     )
-    return value_targets, value_mask
+    return value_targets, batch.outcome_valid.to(device)
 
 
 class BCTrainer:
@@ -228,9 +224,9 @@ class BCTrainer:
         policy_weight = sum(float(batch.loss_mask.sum()) for batch in batches)
         value_count = sum(int(batch.outcome_valid.sum()) for batch in batches)
         try:
-            update_loss = self._backward_chunk(batches[0], policy_weight, value_count)
-            for batch in batches[1:]:
-                update_loss += self._backward_chunk(batch, policy_weight, value_count)
+            update_loss = sum(
+                self._backward_chunk(batch, policy_weight, value_count) for batch in batches
+            )
 
             grad_norm = 0.0
             if policy_weight or value_count:
@@ -279,15 +275,11 @@ class BCTrainer:
         history_indices = batch.history_indices.to(self.device)
         history_mask = batch.history_mask.to(self.device)
         history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
-        candidate_values = batch.candidate_values
-        candidate_offsets = batch.candidate_offsets
         candidate_values, candidate_offsets = _expand_team_preview_orbits(
-            candidate_values,
-            candidate_offsets,
+            batch.candidate_values,
+            batch.candidate_offsets,
             batch.observations.is_teampreview()[batch.target_indices],
         )
-        candidate_values = candidate_values.to(self.device)
-        candidate_offsets = candidate_offsets.to(self.device)
         window_tokens = window_history_tokens(batch.windows, target_local_tokens, local_tokens)
         series_tokens, series_mask = prepare_series_context(
             self._series_history,
@@ -305,8 +297,8 @@ class BCTrainer:
         return (
             self.policy.prepare(target_encoded, memory),
             batch.action_mask.to(self.device),
-            candidate_values,
-            candidate_offsets,
+            candidate_values.to(self.device),
+            candidate_offsets.to(self.device),
             window_tokens,
         )
 
@@ -363,11 +355,7 @@ class BCTrainer:
         ):
             raise ValueError("candidate action ids are outside the action contract")
         loss_mask = batch.loss_mask.to(self.device)
-        with autocast(
-            device_type=self.device.type,
-            enabled=self.precision.autocast,
-            dtype=self.precision.dtype,
-        ):
+        with self.precision.autocast_context(self.device):
             prepared, action_mask, candidate_values, candidate_offsets, window_tokens = (
                 self._prepare_model_inputs(batch)
             )
@@ -429,8 +417,6 @@ class BCTrainer:
                     candidate_offsets,
                     window_tokens,
                 ) = self._prepare_model_inputs(batch)
-                encoded = prepared.encoded
-                reduced = prepared.reduced
                 candidate_log_probs = self.policy.score_candidates(
                     prepared,
                     action_mask,
@@ -438,24 +424,23 @@ class BCTrainer:
                     candidate_offsets,
                     validated=True,
                 ).float()
-                value_predictions = self.policy.critic(reduced.cls).float()
+                value_predictions = self.policy.critic(prepared.reduced.cls).float()
                 accumulator.add_legality(
                     self.policy.unmasked_first_slot_logits(prepared),
                     action_mask,
-                    encoded.numerical,
+                    prepared.encoded.numerical,
                 )
                 value_targets, value_mask = _prepare_value_targets(batch, self.device, self._gamma)
                 masks = tuple(mask.to(self.device) for mask in validated_masks)
                 marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
                 greedy = self.policy.act(prepared, action_mask, deterministic=True)
-                predicted, best_scores = greedy.actions, greedy.log_probs
                 accumulator.add(
                     exact_actions=batch.exact_action.to(self.device),
                     masks=masks,  # pyright: ignore[reportArgumentType]
                     marginal_nll=marginal_nll,
-                    predicted=predicted,
-                    best_scores=best_scores,
-                    team_preview=encoded.phase,
+                    predicted=greedy.actions,
+                    best_scores=greedy.log_probs,
+                    team_preview=prepared.encoded.phase,
                 )
                 accumulator.add_value(value_predictions, value_targets, value_mask)
                 commit_history_updates(self._series_history, batch.windows, window_tokens)

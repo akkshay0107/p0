@@ -92,6 +92,19 @@ class ProtocolEvent:
         """Return a structured whole-replay rejection diagnostic when applicable."""
         if not self.classification.rejects_replay:
             return None
+        return self.rejection(
+            self.rejection_reason,
+            ReplayRejectionCategory.UNSUPPORTED_EVENT
+            if self.classification is EventClassification.UNSUPPORTED_STATE
+            else ReplayRejectionCategory.INVALID_INPUT_CONTRACT,
+        )
+
+    def rejection(
+        self,
+        reason: str,
+        category: ReplayRejectionCategory = ReplayRejectionCategory.INVALID_INPUT_CONTRACT,
+    ) -> ReplayEventDiagnostic:
+        """Return a diagnostic that rejects the whole replay at this line."""
         return ReplayEventDiagnostic(
             replay_id=self.replay_id,
             line_index=self.line_index,
@@ -99,12 +112,8 @@ class ProtocolEvent:
             normalized_effect="" if self.effect is None else self.effect.normalized,
             normalized_cause="" if self.cause is None else self.cause.normalized,
             raw_line=self.raw_line,
-            reason=self.rejection_reason,
-            category=(
-                ReplayRejectionCategory.UNSUPPORTED_EVENT
-                if self.classification is EventClassification.UNSUPPORTED_STATE
-                else ReplayRejectionCategory.INVALID_INPUT_CONTRACT
-            ),
+            reason=reason,
+            category=category,
         )
 
 
@@ -177,11 +186,7 @@ def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
     if (
         tag == "move"
         and len(arguments) == 2
-        and normalize_showdown_id(arguments[1])
-        in {
-            "doomdesire",
-            "futuresight",
-        }
+        and normalize_showdown_id(arguments[1]) in {"doomdesire", "futuresight"}
     ):
         return "delayed move requires an explicit target"
     if tag in {"turn", "gen"} and not arguments[0].isdigit():
@@ -203,38 +208,25 @@ def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
         return f"{tag} requires a p1/p2 side"
     if tag == "player" and (not arguments or arguments[0] not in {"p1", "p2"}):
         return "player requires a p1/p2 side"
-    if tag == "-activate" and len(arguments) > 1:
-        effect = _effect_reference(arguments[1])
-        catalog_kind = (
-            {
-                "item": "items",
-                "ability": "abilities",
-            }.get(effect.namespace)
-            if effect is not None
-            else None
-        )
+    effect = _effect_reference(arguments[1]) if tag == "-activate" and len(arguments) > 1 else None
+    if effect is not None:
+        catalog_kind = {"item": "items", "ability": "abilities"}.get(effect.namespace)
         catalog_effect = (
-            catalog_kind is not None
-            and effect is not None
-            and effect.normalized in LEGAL_EFFECT_IDS[catalog_kind]
+            catalog_kind is not None and effect.normalized in LEGAL_EFFECT_IDS[catalog_kind]
         )
-        if (
-            effect is not None
-            and effect.normalized not in KNOWN_ACTIVATION_EFFECTS
-            and not catalog_effect
-        ):
+        if effect.normalized not in KNOWN_ACTIVATION_EFFECTS and not catalog_effect:
             return f"unsupported -activate effect {effect.normalized!r}"
-        if effect is not None and effect.normalized in {"spite", "eeriespell"}:
-            if (
-                len(arguments) != 4
-                or not arguments[2]
-                or not arguments[3].isdigit()
-                or not 1 <= int(arguments[3]) <= (4 if effect.normalized == "spite" else 3)
-            ):
-                return "PP deduction activation requires a named move and bounded positive amount"
-        if effect is not None and effect.normalized == "leppaberry":
-            if len(arguments) < 4 or not arguments[2] or arguments[3] != "[consumed]":
-                return "Leppa activation requires a named move and [consumed] annotation"
+        if effect.normalized in {"spite", "eeriespell"} and (
+            len(arguments) != 4
+            or not arguments[2]
+            or not arguments[3].isdigit()
+            or not 1 <= int(arguments[3]) <= (4 if effect.normalized == "spite" else 3)
+        ):
+            return "PP deduction activation requires a named move and bounded positive amount"
+        if effect.normalized == "leppaberry" and (
+            len(arguments) < 4 or not arguments[2] or arguments[3] != "[consumed]"
+        ):
+            return "Leppa activation requires a named move and [consumed] annotation"
     if tag == "-sethp":
         # Showdown's sethp wire shape is exactly one target/HP pair plus
         # annotations. Annotation fields are never additional pairs.
@@ -353,17 +345,7 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
         )
 
     if tag == "":
-        if len(arguments) == 1 and arguments[0]:
-            return ProtocolEvent(
-                replay_id,
-                line.index,
-                line.turn,
-                tag,
-                arguments,
-                line.raw,
-                EventClassification.NO_STATE_CHANGE,
-                cause=cause,
-            )
+        is_message = len(arguments) == 1 and bool(arguments[0])
         return ProtocolEvent(
             replay_id,
             line.index,
@@ -371,9 +353,11 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
             tag,
             arguments,
             line.raw,
-            EventClassification.MALFORMED,
+            EventClassification.NO_STATE_CHANGE if is_message else EventClassification.MALFORMED,
             cause=cause,
-            rejection_reason="empty protocol tag is only valid for bare separators or text messages",
+            rejection_reason=""
+            if is_message
+            else "empty protocol tag is only valid for bare separators or text messages",
         )
 
     rule = CLASSIFICATION_REGISTRY.get(tag)
@@ -422,11 +406,14 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
         elif not cause.namespace and cause.normalized not in ALL_LEGAL_EFFECT_NAMES:
             reason = f"unsupported cause {cause.normalized!r}"
 
-    predicate = None
-    for candidate in (effect, cause):
-        if candidate and (tag, candidate.normalized) in UNSUPPORTED_PREDICATES:
-            predicate = candidate
-            break
+    predicate = next(
+        (
+            candidate
+            for candidate in (effect, cause)
+            if candidate and (tag, candidate.normalized) in UNSUPPORTED_PREDICATES
+        ),
+        None,
+    )
 
     if not reason and tag in UNSUPPORTED_TAGS:
         reason = f"protocol tag {tag!r} is unsupported by the reconstruction contract"

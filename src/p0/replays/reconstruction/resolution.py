@@ -81,20 +81,8 @@ class _HistoryCandidate(NamedTuple):
     displayed_member: ReplayMemberId
 
 
-class _ActiveHistory(NamedTuple):
-    history_id: int
-    side: ReplaySide
-    entry_event: ProtocolEvent
-    candidates: tuple[_HistoryCandidate, ...]
-    overlapping_history_ids: frozenset[int]
-    predecessor_history_id: int | None
-    revealed_member: ReplayMemberId | None
-    reveal_event: ProtocolEvent | None
-    faint_line_index: int | None
-
-
 @dataclass(slots=True)
-class _HistoryBuilder:
+class _ActiveHistory:
     history_id: int
     side: ReplaySide
     entry_event: ProtocolEvent
@@ -104,19 +92,6 @@ class _HistoryBuilder:
     revealed_member: ReplayMemberId | None = None
     reveal_event: ProtocolEvent | None = None
     faint_line_index: int | None = None
-
-    def freeze(self) -> _ActiveHistory:
-        return _ActiveHistory(
-            self.history_id,
-            self.side,
-            self.entry_event,
-            self.candidates,
-            frozenset(self.overlapping_history_ids),
-            self.predecessor_history_id,
-            self.revealed_member,
-            self.reveal_event,
-            self.faint_line_index,
-        )
 
 
 class _ResolutionError(Exception):
@@ -149,7 +124,7 @@ class _HistoryScanner:
         }
         self._active: dict[tuple[ReplaySide, int], int] = {}
         self._last_occupant: dict[tuple[ReplaySide, int], int] = {}
-        self._histories: list[_HistoryBuilder] = []
+        self._histories: list[_ActiveHistory] = []
         self.team_sizes = {sheet.side: min(4, len(sheet.members)) for sheet in ots}
 
     def scan(self, events: tuple[ProtocolEvent, ...]) -> tuple[_ActiveHistory, ...]:
@@ -164,7 +139,7 @@ class _HistoryScanner:
                 self._faint_history(event)
             elif event.tag == "swap":
                 self._swap_history(event)
-        return tuple(history.freeze() for history in self._histories)
+        return tuple(self._histories)
 
     def _set_team_size(self, event: ProtocolEvent) -> None:
         side = ReplaySide(event.arguments[0])
@@ -200,7 +175,7 @@ class _HistoryScanner:
             if active_side is side
         }
         history_id = len(self._histories)
-        history = _HistoryBuilder(
+        history = _ActiveHistory(
             history_id,
             side,
             event,
@@ -264,7 +239,7 @@ class _HistoryScanner:
         self,
         event: ProtocolEvent,
         reference: PokemonRefArgument,
-    ) -> _HistoryBuilder:
+    ) -> _ActiveHistory:
         slot = _required_active_slot(event, reference)
         key = (reference.pokemon_ref.side, slot)
         history_id = self._active.get(key, self._last_occupant.get(key))
@@ -559,18 +534,12 @@ class _IdentityResolver:
                 raise _ResolutionError(
                     event, "switch reference did not resolve to an active member"
                 )
-            occupied_elsewhere = any(
-                member_id == incoming
-                and key
-                != (
-                    incoming.side,
-                    switch_reference.pokemon_ref.active_slot,
-                )
-                for key, member_id in self._active.items()
-            )
-            if occupied_elsewhere:
-                raise _ResolutionError(event, "incoming member is already active in another slot")
             key = (incoming.side, switch_reference.pokemon_ref.active_slot)
+            if any(
+                member_id == incoming and other_key != key
+                for other_key, member_id in self._active.items()
+            ):
+                raise _ResolutionError(event, "incoming member is already active in another slot")
             self._active[key] = incoming
             self._last_occupant.pop(key, None)
         elif event.tag == "replace" and resolved:
@@ -697,23 +666,6 @@ class _IdentityResolver:
             self._active[source_key] = target_member
 
 
-def _diagnostic(
-    event: ProtocolEvent,
-    reason: str,
-    category: ReplayRejectionCategory = ReplayRejectionCategory.INVALID_INPUT_CONTRACT,
-) -> ReplayEventDiagnostic:
-    return ReplayEventDiagnostic(
-        replay_id=event.replay_id,
-        line_index=event.line_index,
-        tag=event.tag,
-        normalized_effect="" if event.effect is None else event.effect.normalized,
-        normalized_cause="" if event.cause is None else event.cause.normalized,
-        raw_line=event.raw_line,
-        reason=reason,
-        category=category,
-    )
-
-
 def resolve_protocol_events(
     replay_id: str,
     ots: tuple[OTSData, OTSData],
@@ -734,15 +686,13 @@ def resolve_protocol_events(
         if not event_tuple:
             raise ValueError("Identity resolution requires events and complete OTS")
         reason = "identity resolution requires complete OTS for both sides"
-        return ResolvedReplayEvents(replay_id, (), (_diagnostic(event_tuple[0], reason),))
+        return ResolvedReplayEvents(replay_id, (), (event_tuple[0].rejection(reason),))
 
     species_bases = _species_base_index({} if dex is None else dex)
     try:
         incoming_bindings = _resolve_incoming_histories(ots, event_tuple, species_bases)
     except _ResolutionError as exc:
-        return ResolvedReplayEvents(
-            replay_id, (), (_diagnostic(exc.event, str(exc), exc.category),)
-        )
+        return ResolvedReplayEvents(replay_id, (), (exc.event.rejection(str(exc), exc.category),))
 
     resolver = _IdentityResolver(ots, incoming_bindings, species_bases)
     resolved: list[ResolvedProtocolEvent] = []
@@ -750,11 +700,7 @@ def resolve_protocol_events(
         try:
             resolved.append(resolver.resolve(event))
         except _ResolutionError as exc:
-            return ResolvedReplayEvents(
-                replay_id,
-                (),
-                (_diagnostic(event, str(exc), exc.category),),
-            )
+            return ResolvedReplayEvents(replay_id, (), (event.rejection(str(exc), exc.category),))
     return ResolvedReplayEvents(replay_id, tuple(resolved))
 
 

@@ -8,6 +8,7 @@ all possible actions so training never rules out the demonstrator's action.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import numpy.typing as npt
@@ -53,40 +54,27 @@ _NO_CHOICE_SLOT = SlotDecision(active=False, legality_known=False)
 GAME_END_DECISION = DecisionView(slots=(_NO_CHOICE_SLOT, _NO_CHOICE_SLOT))
 
 
-_TEAM_PREVIEW_CACHE: dict[int, tuple[int, ...]] = {}
-_TEAM_PREVIEW_JOINT_MASKS: dict[tuple[int, int], npt.NDArray[np.bool_]] = {}
-
-
+@lru_cache(maxsize=None)
 def _get_team_preview(team_size: int) -> tuple[int, ...]:
     """Ordered distinct team-preview pair action IDs, in ascending roster order."""
-    cached = _TEAM_PREVIEW_CACHE.get(team_size)
-    if cached is None:
-        cached = tuple(
-            first * team_size + second
-            for first in range(team_size)
-            for second in range(team_size)
-            if first != second
-        )
-        _TEAM_PREVIEW_CACHE[team_size] = cached
-    return cached
+    return tuple(
+        first * team_size + second
+        for first in range(team_size)
+        for second in range(team_size)
+        if first != second
+    )
 
 
+@lru_cache(maxsize=None)
 def _get_team_preview_joint_mask(
     team_size: int, first_pair: tuple[int, int]
 ) -> npt.NDArray[np.bool_]:
     """Return precomputed boolean mask of valid second team-preview actions."""
-    key = (team_size, first_pair[0] * team_size + first_pair[1])
-    cached = _TEAM_PREVIEW_JOINT_MASKS.get(key)
-    if cached is None:
-        total = team_size * team_size
-        cached = np.zeros(total, dtype=np.bool_)
-        p0, p1 = first_pair
-        for second in range(total):
-            sf, ss = divmod(second, team_size)
-            if sf != ss and sf != p0 and sf != p1 and ss != p0 and ss != p1:
-                cached[second] = True
-        _TEAM_PREVIEW_JOINT_MASKS[key] = cached
-    return cached
+    mask = np.zeros(team_size * team_size, dtype=np.bool_)
+    for second in range(team_size * team_size):
+        sf, ss = divmod(second, team_size)
+        mask[second] = sf != ss and sf not in first_pair and ss not in first_pair
+    return mask
 
 
 def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:

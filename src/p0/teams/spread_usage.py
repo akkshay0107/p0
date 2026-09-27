@@ -150,36 +150,10 @@ def cosmetic_forme_aliases(dex: Mapping[str, Any]) -> dict[str, str]:
         normalize_id(str(entry.get("id", entry.get("name", "")))): entry for entry in entries
     }
 
-    def canonical_id(entry: Mapping[str, Any]) -> str:
-        """
-        Resolve one entry to the species whose priors it may share.
-
-        Anchored on baseSpecies rather than on whichever entry happens to list the
-        forme: Alcremie's variants each list all the others, so listing order would
-        otherwise decide the target and could alias two formes onto each other.
-        """
-        own_id = normalize_id(str(entry.get("id", entry.get("name", ""))))
-        base_id = normalize_id(str(entry.get("baseSpecies", "")))
-        if not base_id or base_id == own_id:
-            return own_id
-
-        base_entry = by_id.get(base_id)
-        if base_entry is None:
-            return own_id
-
-        own_stats = entry.get("baseStats")
-        base_stats = base_entry.get("baseStats")
-        if not isinstance(own_stats, Mapping) or not isinstance(base_stats, Mapping):
-            return own_id
-        if dict(own_stats) != dict(base_stats):
-            return own_id
-
-        return base_id
-
     aliases: dict[str, str] = {}
     for entry in entries:
         own_id = normalize_id(str(entry.get("id", entry.get("name", ""))))
-        target = canonical_id(entry)
+        target = _prior_species_id(entry, own_id, by_id)
         if target != own_id:
             aliases[own_id] = target
 
@@ -193,6 +167,32 @@ def cosmetic_forme_aliases(dex: Mapping[str, Any]) -> dict[str, str]:
                 aliases[forme_id] = target
 
     return aliases
+
+
+def _prior_species_id(
+    entry: Mapping[str, Any], own_id: str, by_id: Mapping[str, Mapping[str, Any]]
+) -> str:
+    """
+    Resolve one dex entry to the species whose priors it may share.
+
+    Anchored on baseSpecies rather than on whichever entry happens to list the
+    forme: Alcremie's variants each list all the others, so listing order would
+    otherwise decide the target and could alias two formes onto each other.
+    """
+    base_id = normalize_id(str(entry.get("baseSpecies", "")))
+    base_entry = by_id.get(base_id)
+    if not base_id or base_id == own_id or base_entry is None:
+        return own_id
+
+    own_stats = entry.get("baseStats")
+    base_stats = base_entry.get("baseStats")
+    if (
+        not isinstance(own_stats, Mapping)
+        or not isinstance(base_stats, Mapping)
+        or dict(own_stats) != dict(base_stats)
+    ):
+        return own_id
+    return base_id
 
 
 def parse_spread_key(key: str) -> tuple[str, StatPoints] | None:

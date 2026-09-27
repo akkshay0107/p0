@@ -233,11 +233,7 @@ def _start_roost(battle: DoubleBattle, mon: Pokemon) -> None:
     previous = mon._temporary_types
     roosted = [type_ for type_ in mon.types if type_ is not PokemonType.FLYING]
     mon._temporary_types = roosted or [PokemonType.NORMAL]
-    roosting = getattr(battle, "_p0_roosting", None)
-    if roosting is None:
-        roosting = {}
-        battle._p0_roosting = roosting  # type: ignore[attr-defined]
-    roosting[mon] = (previous, mon._temporary_types)
+    _battle_state(battle, "_p0_roosting")[mon] = (previous, mon._temporary_types)
 
 
 def _end_roost(battle: DoubleBattle) -> None:
@@ -250,13 +246,14 @@ def _end_roost(battle: DoubleBattle) -> None:
     roosting.clear()
 
 
+def _battle_state(battle: DoubleBattle, name: str) -> dict[Any, Any]:
+    """Return a patch-owned mapping stored on the battle, creating it on first use."""
+    return vars(battle).setdefault(name, {})
+
+
 def _form_baselines(battle: DoubleBattle) -> dict[Pokemon, str]:
     """Track Showdown's baseSpecies, which poke-env does not retain across forms."""
-    baselines = getattr(battle, "_p0_form_baselines", None)
-    if baselines is None:
-        baselines = {}
-        battle._p0_form_baselines = baselines  # type: ignore[attr-defined]
-    return baselines
+    return _battle_state(battle, "_p0_form_baselines")
 
 
 def _parse_message(self: DoubleBattle, split_message: list[str]):
@@ -313,11 +310,7 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
                     active_by_slot[other_slot] = duplicate
                     # The partner keeps the shown volatile state; the incoming Pokemon enters fresh.
                     incoming.switch_out(self.fields)
-                    aliases = getattr(self, "_p0_duplicate_active", None)
-                    if aliases is None:
-                        aliases = {}
-                        self._p0_duplicate_active = aliases  # type: ignore[attr-defined]
-                    aliases[other_slot] = duplicate
+                    _battle_state(self, "_p0_duplicate_active")[other_slot] = duplicate
     elif event_type == "faint" and len(split_message) >= 3:
         fainted = self.get_pokemon(split_message[2])
         captured = getattr(self, "_p0_transform_targets", {}).get(id(fainted))
@@ -548,6 +541,28 @@ async def _stop_listening_cleanly(self: PSClient) -> None:
         )
 
 
+# Every patched attribute with its original and its replacement. install sets the
+# replacements and uninstall_for_tests restores the originals.
+_PATCHES = (
+    (PSClient, "wait_for_login", _ORIGINAL_WAIT_FOR_LOGIN, _wait_for_login),
+    (PSClient, "stop_listening", _ORIGINAL_STOP_LISTENING, _stop_listening_cleanly),
+    (PSClient, "_handle_message", _ORIGINAL_HANDLE_MESSAGE, _handle_message),
+    (PSClient, "send_message", _ORIGINAL_SEND_MESSAGE, _send_message),
+    (DoubleBattle, "parse_message", _ORIGINAL_PARSE_MESSAGE, _parse_message),
+    (DoubleBattle, "get_pokemon", _ORIGINAL_GET_POKEMON, _get_pokemon),
+    (DoubleBattle, "parse_request", _ORIGINAL_PARSE_REQUEST, _parse_request),
+    (Pokemon, "forme_change", _ORIGINAL_FORME_CHANGE, _forme_change),
+    (
+        Pokemon,
+        "_update_from_teambuilder",
+        _ORIGINAL_UPDATE_FROM_TEAMBUILDER,
+        _update_from_teambuilder,
+    ),
+    (Pokemon, "start_effect", _ORIGINAL_START_EFFECT, _start_effect),
+    (Pokemon, "copy_boosts", _ORIGINAL_COPY_BOOSTS, _copy_boosts),
+)
+
+
 def install(
     logger: logging.Logger | None = None,
     *,
@@ -566,17 +581,8 @@ def install(
         return
 
     _capture_protocol_lines = capture_protocol_lines
-    PSClient.wait_for_login = _wait_for_login
-    PSClient.stop_listening = _stop_listening_cleanly
-    PSClient._handle_message = _handle_message
-    PSClient.send_message = _send_message
-    DoubleBattle.parse_message = _parse_message
-    DoubleBattle.get_pokemon = _get_pokemon
-    DoubleBattle.parse_request = _parse_request
-    Pokemon.forme_change = _forme_change
-    Pokemon._update_from_teambuilder = _update_from_teambuilder
-    Pokemon.start_effect = _start_effect
-    Pokemon.copy_boosts = _copy_boosts
+    for owner, name, _, patched in _PATCHES:
+        setattr(owner, name, patched)
     _installed = True
 
 
@@ -589,17 +595,8 @@ def uninstall_for_tests() -> None:
 
     _filtered_loggers.clear()
     if _installed:
-        PSClient.wait_for_login = _ORIGINAL_WAIT_FOR_LOGIN
-        PSClient.stop_listening = _ORIGINAL_STOP_LISTENING
-        PSClient._handle_message = _ORIGINAL_HANDLE_MESSAGE
-        PSClient.send_message = _ORIGINAL_SEND_MESSAGE
-        DoubleBattle.parse_message = _ORIGINAL_PARSE_MESSAGE
-        DoubleBattle.get_pokemon = _ORIGINAL_GET_POKEMON
-        DoubleBattle.parse_request = _ORIGINAL_PARSE_REQUEST
-        Pokemon.forme_change = _ORIGINAL_FORME_CHANGE
-        Pokemon._update_from_teambuilder = _ORIGINAL_UPDATE_FROM_TEAMBUILDER
-        Pokemon.start_effect = _ORIGINAL_START_EFFECT
-        Pokemon.copy_boosts = _ORIGINAL_COPY_BOOSTS
+        for owner, name, original, _ in _PATCHES:
+            setattr(owner, name, original)
         _installed = False
 
 

@@ -11,25 +11,8 @@ from p0.model.architecture_contract import HISTORY_WINDOW, MAX_PRIOR_GAMES
 from p0.model.structured_observation import StructuredObservation
 from p0.training.series_history import SeriesHistorySnapshot
 
-
-def _validate_trajectory(
-    observations: StructuredObservation,
-    action_masks: torch.Tensor,
-    actions: torch.Tensor,
-    log_probs: torch.Tensor,
-    values: torch.Tensor,
-    rewards: torch.Tensor,
-    dones: torch.Tensor,
-    length: int,
-) -> None:
-    if type(length) is not int or length <= 0:
-        raise ValueError("Completed trajectories must contain at least one step")
-    if any(
-        tensor.size(0) != length
-        for tensor in (action_masks, actions, log_probs, values, rewards, dones)
-    ):
-        raise ValueError("Trajectory tensor lengths do not match")
-    observations.validate(batch_rank=1)
+# Floor for the advantage standard deviation and the return variance.
+_VARIANCE_EPS = 1e-8
 
 
 def _validate_series_snapshot(series_history: SeriesHistorySnapshot) -> None:
@@ -61,16 +44,21 @@ class CollectedTrajectory:
     series_history: SeriesHistorySnapshot
 
     def __post_init__(self) -> None:
-        _validate_trajectory(
-            self.observations,
-            self.action_masks,
-            self.actions,
-            self.log_probs,
-            self.values,
-            self.rewards,
-            self.dones,
-            self.length,
-        )
+        if type(self.length) is not int or self.length <= 0:
+            raise ValueError("Completed trajectories must contain at least one step")
+        if any(
+            tensor.size(0) != self.length
+            for tensor in (
+                self.action_masks,
+                self.actions,
+                self.log_probs,
+                self.values,
+                self.rewards,
+                self.dones,
+            )
+        ):
+            raise ValueError("Trajectory tensor lengths do not match")
+        self.observations.validate(batch_rank=1)
         _validate_series_snapshot(self.series_history)
 
 
@@ -318,12 +306,12 @@ def prepare_trajectory_batches(
         [advantages[index, : trajectory.length] for index, trajectory in enumerate(trajectories)]
     )
     mean = all_advantages.mean()
-    std = all_advantages.std(unbiased=False).clamp_min(1e-8)
+    std = all_advantages.std(unbiased=False).clamp_min(_VARIANCE_EPS)
 
     all_values = torch.cat([trajectory.values for trajectory in trajectories])
     all_returns = all_advantages + all_values
     var_y = torch.var(all_returns, unbiased=False)
-    if var_y > 1e-8:
+    if var_y > _VARIANCE_EPS:
         explained_variance = float(
             (1.0 - torch.var(all_returns - all_values, unbiased=False) / var_y).item()
         )

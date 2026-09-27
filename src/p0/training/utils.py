@@ -20,6 +20,10 @@ class OptimizationPrecision(NamedTuple):
     autocast: bool
     grad_scaler: bool
 
+    def autocast_context(self, device: torch.device) -> torch.autocast:
+        """Return the autocast region for this precision on device."""
+        return torch.autocast(device_type=device.type, enabled=self.autocast, dtype=self.dtype)
+
 
 def default_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")

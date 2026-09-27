@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -11,6 +11,8 @@ import torch
 from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
+    is_sha256,
+    require_dataclass_fields,
     validate_artifact_runtime_contract,
 )
 from p0.model.structured_observation import StructuredObservation
@@ -18,8 +20,6 @@ from p0.replays.schema import (
     DecisionType,
     LabelKind,
     MaskProvenance,
-    _is_sha256,
-    _require_fields,
     _require_iso_timestamp,
 )
 
@@ -90,13 +90,11 @@ class ShardIndexEntry:
     series: int
     byte_size: int
 
-    _FIELDS = frozenset({"filename", "sha256", "decisions", "games", "series", "byte_size"})
-
     def __post_init__(self) -> None:
         if not self.filename:
             raise ValueError("ShardIndexEntry.filename must be non-empty")
 
-        if not _is_sha256(self.sha256):
+        if not is_sha256(self.sha256):
             raise ValueError("ShardIndexEntry.sha256 must be a lowercase SHA-256 digest")
 
         for name, count in (
@@ -110,19 +108,12 @@ class ShardIndexEntry:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the index entry to a JSON-serializable dictionary."""
-        return {
-            "filename": self.filename,
-            "sha256": self.sha256,
-            "decisions": self.decisions,
-            "games": self.games,
-            "series": self.series,
-            "byte_size": self.byte_size,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShardIndexEntry:
         """Parse a JSON dictionary into a ShardIndexEntry after validation."""
-        _require_fields(value, cls._FIELDS, "ShardIndexEntry")
+        require_dataclass_fields(value, cls)
 
         return cls(
             filename=str(value["filename"]),
@@ -153,25 +144,6 @@ class ShardManifest:
     artifact_hashes: Mapping[str, str]
     artifact_schema: str = SHARD_ARTIFACT_SCHEMA
 
-    _FIELDS = frozenset(
-        {
-            "global_contract_sha256",
-            "dataset_hash",
-            "source_format_id",
-            "build_config",
-            "raw_replays",
-            "source_series",
-            "source_games",
-            "accepted_games",
-            "rejected_games",
-            "artifact_hashes",
-            "shards",
-            "diagnostics",
-            "created_at",
-            "artifact_schema",
-        }
-    )
-
     def __post_init__(self) -> None:
         if self.artifact_schema != SHARD_ARTIFACT_SCHEMA:
             raise ValueError(
@@ -179,12 +151,12 @@ class ShardManifest:
                 f"expected {SHARD_ARTIFACT_SCHEMA}"
             )
 
-        if not _is_sha256(self.global_contract_sha256):
+        if not is_sha256(self.global_contract_sha256):
             raise ValueError(
                 "ShardManifest.global_contract_sha256 must be a lowercase SHA-256 digest"
             )
 
-        if not _is_sha256(self.dataset_hash):
+        if not is_sha256(self.dataset_hash):
             raise ValueError("ShardManifest.dataset_hash must be a lowercase SHA-256 digest")
 
         if not self.source_format_id:
@@ -194,7 +166,7 @@ class ShardManifest:
             raise ValueError("ShardManifest.build_config must be a mapping")
 
         for replay_id, digest in self.raw_replays.items():
-            if not replay_id or not _is_sha256(digest):
+            if not replay_id or not is_sha256(digest):
                 raise ValueError("ShardManifest.raw_replays contains an invalid identity")
 
         for series_id, replay_ids in self.source_series.items():
@@ -227,7 +199,7 @@ class ShardManifest:
             raise ValueError("Shard game counts must contain two perspectives per accepted game")
 
         for filename, digest in self.artifact_hashes.items():
-            if not filename or not _is_sha256(digest):
+            if not filename or not is_sha256(digest):
                 raise ValueError("ShardManifest.artifact_hashes contains an invalid entry")
 
         seen: set[str] = set()
@@ -288,7 +260,7 @@ class ShardManifest:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShardManifest:
         """Parse a JSON dictionary into a ShardManifest after validation."""
-        _require_fields(value, cls._FIELDS, "ShardManifest")
+        require_dataclass_fields(value, cls)
 
         diagnostics = value["diagnostics"]
         if not isinstance(diagnostics, Mapping):

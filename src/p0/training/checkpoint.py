@@ -14,7 +14,6 @@ import torch
 
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
-    ContractCompatibility,
     checkpoint_contract_compatibility,
     load_active_global_contract,
 )
@@ -31,7 +30,13 @@ from p0.persistence import atomic_torch_save
 
 POLICY_ARTIFACT = "policy"
 TRAINING_ARTIFACT = "training"
+VALUE_TARGET_SEMANTICS = "discounted_terminal_outcome.v1"
 LOGGER = logging.getLogger(__name__)
+
+
+def value_objective_metadata(gamma: float) -> dict[str, Any]:
+    """Return the checkpoint metadata that pins the value-target definition."""
+    return {"gamma": gamma, "value_target_semantics": VALUE_TARGET_SEMANTICS}
 
 
 class LoadedCheckpoint(NamedTuple):
@@ -75,8 +80,7 @@ class CheckpointStore:
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
         """Atomically write a weights-only policy checkpoint."""
-        artifact = self._build_artifact(policy, POLICY_ARTIFACT, metadata)
-        atomic_torch_save(path, artifact)
+        atomic_torch_save(path, self._build_artifact(policy, POLICY_ARTIFACT, metadata))
 
     def snapshot_policy(self, policy: PolicyNet, metadata: Mapping[str, Any]) -> dict[str, Any]:
         """Copy a selected policy to CPU so later updates cannot change it."""
@@ -276,7 +280,7 @@ class CheckpointStore:
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Invalid model configuration in checkpoint {path}") from exc
 
-    def _validate_contract(self, artifact: Mapping[str, Any], path: Path) -> ContractCompatibility:
+    def _validate_contract(self, artifact: Mapping[str, Any], path: Path) -> None:
         comp = checkpoint_contract_compatibility(artifact, self.manifest_path)
         if not comp.is_compatible:
             diffs = "; ".join(comp.major_differences)
@@ -289,7 +293,6 @@ class CheckpointStore:
                 path,
                 "; ".join(comp.minor_differences),
             )
-        return comp
 
     def _runtime_resources(self) -> RuntimeResources:
         if self._resources is None:

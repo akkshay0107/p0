@@ -6,9 +6,7 @@ import numpy as np
 import torch
 
 from p0.format_config import FORMAT
-from p0.model.structured_observation import (
-    StructuredObservation,
-)
+from p0.model.structured_observation import StructuredObservation
 from p0.runtime.env import SimEnv
 
 ACT_SIZE = FORMAT.action_size
@@ -86,28 +84,24 @@ class ThreadVecEnv:
         reward1 = rewards[agent1]
         reward2 = rewards[agent2] if agent2 in rewards else 0.0
 
+        series_complete = False
+        terminal: dict[str, object] = {}
         if done_status > 0:
             series_complete = max(env.series_scores) >= 2 or env.series_games_played >= 3
             # Preserve the final observations and masks before the automatic reset
             # replaces them: truncation bootstraps from them, and a finished game
             # adds their summaries to the series history.
-            terminal_obs1 = self.obs1_buffers[env_id].clone()
-            terminal_obs2 = self.obs2_buffers[env_id].clone()
-            terminal_mask1 = mask1.copy()
-            terminal_mask2 = mask2.copy()
-
+            terminal = {
+                "terminal_observation1": self.obs1_buffers[env_id].clone(),
+                "terminal_observation2": self.obs2_buffers[env_id].clone(),
+                "terminal_action_mask1": mask1.copy(),
+                "terminal_action_mask2": mask2.copy(),
+            }
             mask1, mask2, _ = self._reset_env(env_id, env)
-            info["series_id"] = env.series_id
-            info["series_complete"] = series_complete
-            info["terminal_observation1"] = terminal_obs1
-            info["terminal_observation2"] = terminal_obs2
-            info["terminal_action_mask1"] = terminal_mask1
-            info["terminal_action_mask2"] = terminal_mask2
-            _publish_seats(info, env)
-            return mask1, mask2, reward1, reward2, done_status, info
 
         info["series_id"] = env.series_id
-        info["series_complete"] = False
+        info["series_complete"] = series_complete
+        info.update(terminal)
         _publish_seats(info, env)
         return mask1, mask2, reward1, reward2, done_status, info
 

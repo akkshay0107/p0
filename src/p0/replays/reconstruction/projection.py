@@ -431,25 +431,17 @@ def _pokemon_view(
     moves = transform.moves if transform is not None else member.moves
     move_views = _FrozenMapping({move.move_id: _move_view(move) for move in moves})
     if transform is not None:
-        base_stats = dict(member.base_stats)
-        base_stats.update(dict(transform.non_hp_base_stats))
+        base_stats = {**dict(member.base_stats), **dict(transform.non_hp_base_stats)}
+        species = base_species = transform.species
+        ability = transform.ability
     else:
         base_stats = member.base_stats
-    if transform is not None:
-        species = transform.species
-        ability = transform.ability
-        types = member.current_types
-        base_species = transform.species
-    elif perspective == member.member_id.side.side_index or not active or member.revealed:
-        species = member.current_form
-        ability = member.ability.current
-        types = member.current_types
+        own_or_public = (
+            perspective == member.member_id.side.side_index or not active or member.revealed
+        )
+        species = member.current_form if own_or_public else member.displayed_species
         base_species = member.original_species
-    else:
-        species = member.displayed_species
         ability = member.ability.current
-        types = member.current_types
-        base_species = member.original_species
     effects = _FrozenMapping(
         {ReplayNamedValue(_enum_name(name)): value for name, value in member.effects}
     )
@@ -461,7 +453,7 @@ def _pokemon_view(
         species,
         base_species,
         ability,
-        tuple(ReplayNamedValue(value) for value in types),
+        tuple(ReplayNamedValue(value) for value in member.current_types),
         _FrozenMapping(base_stats),
         move_views,
         effects,

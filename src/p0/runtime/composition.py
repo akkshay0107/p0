@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import random
 
-from poke_env.ps_client import AccountConfiguration, ServerConfiguration
+from poke_env.ps_client import AccountConfiguration
 
 from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.runtime.env import SimEnv
 from p0.runtime.poke_env_battle_adapter import battle_view
+from p0.runtime.showdown import local_server_configuration
 from p0.teams.source import TeamSource
 
 
@@ -32,10 +33,7 @@ def build_sim_env(
     env = SimEnv(
         account_configuration1=account_configuration1,
         account_configuration2=account_configuration2,
-        server_configuration=ServerConfiguration(
-            f"ws://127.0.0.1:{server_port}/showdown/websocket",
-            "https://play.pokemonshowdown.com/action.php?",
-        ),
+        server_configuration=local_server_configuration(server_port),
         battle_format=FORMAT.battle_format,
         accept_open_team_sheet=True,
         start_timer_on_battle_start=False,

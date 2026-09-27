@@ -103,10 +103,6 @@ class PokemonTokenizer:
         self.types = _EnumIdTable(vocab.get("types", {}))
         self.categories = _EnumIdTable(vocab.get("categories", {}))
 
-        # pre-bake the trickroom token ID so _global_field_token never does a runtime vocab lookup
-        _trickroom_vocab = vocab.get("trickroom", {})
-        self.trickroom_id: int = _trickroom_vocab.get("trickroom", 0)
-
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> PokemonTokenizer:
         if path is None:

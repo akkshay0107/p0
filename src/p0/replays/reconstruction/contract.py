@@ -206,9 +206,6 @@ ALLOWED_EFFECTS_BY_TAG = {tag: frozenset(values) for tag, values in _EFFECTS_BY_
 ALLOWED_CAUSE_NAMESPACES = frozenset(
     {"move", "ability", "item", "condition", "status", "pokemon", "format", "gem"}
 )
-NO_COPY_VOLATILES = frozenset(
-    row["id"] for row in VOLATILE_CONDITIONS if row["exists"] and row["noCopy"]
-)
 
 
 def validate_protocol_contract(contract: dict[str, Any] = PROTOCOL_CONTRACT) -> None:
@@ -349,7 +346,6 @@ __all__ = [
     "LEGAL_PROTOCOL_STATUSES",
     "KNOWN_ACTIVATION_EFFECTS",
     "COPYABLE_VOLATILES",
-    "NO_COPY_VOLATILES",
     "PROTOCOL_CONTRACT",
     "RAW_EMISSION_INVENTORY",
     "RAW_INVENTORY_PATH",

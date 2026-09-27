@@ -32,14 +32,12 @@ class SeriesTokenStore:
         mask = torch.zeros((batch_size, SERIES_SLOTS), dtype=torch.bool, device=device)
 
         for i, key in enumerate(keys):
-            if key in self._store:
-                game_tokens = self._store[key]
-                for j, t in enumerate(game_tokens):
-                    start = j * SERIES_TOKENS_PER_GAME
-                    end = start + SERIES_TOKENS_PER_GAME
-                    if end <= SERIES_SLOTS:
-                        tokens[i, start:end] = t.to(device)
-                        mask[i, start:end] = True
+            for j, game_tokens in enumerate(self._store.get(key, ())):
+                start = j * SERIES_TOKENS_PER_GAME
+                end = start + SERIES_TOKENS_PER_GAME
+                if end <= SERIES_SLOTS:
+                    tokens[i, start:end] = game_tokens.to(device)
+                    mask[i, start:end] = True
 
         return tokens, mask
 

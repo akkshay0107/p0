@@ -182,8 +182,7 @@ def action_move_slots(battle: DoubleBattle, position: int) -> tuple[Any, ...]:
 
 def battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
     """Return refreshed PokeEnvBattleView for the specified battle instance."""
-    view = current_battle_view(battle)
-    return view.refresh()
+    return current_battle_view(battle).refresh()
 
 
 def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:

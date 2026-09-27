@@ -135,20 +135,21 @@ def export_checkpoint(checkpoint: Path, output: Path) -> None:
                     archive.addfile(info, stream)
                     hashes[name] = digest
             encoded = (json.dumps(config, indent=2) + "\n").encode()
-            info = tarfile.TarInfo("run/config.yaml")
-            info.size = len(encoded)
-            archive.addfile(info, io.BytesIO(encoded))
-            hashes[info.name] = hashlib.sha256(encoded).hexdigest()
-            encoded = json.dumps(hashes, indent=2).encode()
-            info = tarfile.TarInfo("run/checksums.json")
-            info.size = len(encoded)
-            archive.addfile(info, io.BytesIO(encoded))
+            _add_bytes(archive, "run/config.yaml", encoded)
+            hashes["run/config.yaml"] = hashlib.sha256(encoded).hexdigest()
+            _add_bytes(archive, "run/checksums.json", json.dumps(hashes, indent=2).encode())
         # Also detect inputs edited in place while they were copied.
         with tarfile.open(temporary, "r:gz") as archive:
             for name, digest in hashes.items():
                 stream: Any = archive.extractfile(name)
                 if stream is None or hashlib.file_digest(stream, "sha256").hexdigest() != digest:
                     raise ValueError(f"File changed during export: {name}")
+
+
+def _add_bytes(archive: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    archive.addfile(info, io.BytesIO(data))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -101,31 +101,30 @@ class EvalPlayer(EvalPlayerMixin, RLPlayer):
     """RLPlayer that tracks series history during evaluation."""
 
 
-class EvalRandomPlayer(EvalPlayerMixin, TeamPlayerMixin, RandomPlayer):
+class _BaselineClientMixin:
+    """Install the p0 poke-env patches on a baseline player's Bo3 client."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # The Player base class later in the MRO supplies the logger.
+        poke_env_patches.install(self.logger)  # type: ignore[attr-defined]
+        poke_env_patches.enable_forced_open_team_sheet(self)
+
+
+class EvalRandomPlayer(_BaselineClientMixin, EvalPlayerMixin, TeamPlayerMixin, RandomPlayer):
     """RandomPlayer that tracks series history and teams during evaluation."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        poke_env_patches.install(self.logger)
-        setattr(self.ps_client, "_p0_force_open_team_sheet", True)
 
-
-class EvalMaxBasePowerPlayer(EvalPlayerMixin, TeamPlayerMixin, MaxBasePowerPlayer):
+class EvalMaxBasePowerPlayer(
+    _BaselineClientMixin, EvalPlayerMixin, TeamPlayerMixin, MaxBasePowerPlayer
+):
     """MaxBasePowerPlayer that tracks series history and teams during evaluation."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        poke_env_patches.install(self.logger)
-        setattr(self.ps_client, "_p0_force_open_team_sheet", True)
 
-
-class EvalSimpleHeuristicsPlayer(EvalPlayerMixin, TeamPlayerMixin, SimpleHeuristicsPlayer):
+class EvalSimpleHeuristicsPlayer(
+    _BaselineClientMixin, EvalPlayerMixin, TeamPlayerMixin, SimpleHeuristicsPlayer
+):
     """SimpleHeuristicsPlayer that tracks series history and teams during evaluation."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        poke_env_patches.install(self.logger)
-        setattr(self.ps_client, "_p0_force_open_team_sheet", True)
 
 
 type EvalPlayerType = (
@@ -218,6 +217,15 @@ class MatchupResult:
         }
 
 
+def _record(store: dict[str, dict[str, Any]], key: str, won: bool) -> None:
+    """Count one series result for a team key and refresh its win rate."""
+    stats = store.setdefault(key, {"wins": 0, "games": 0, "win_rate": 0.0})
+    stats["games"] += 1
+    if won:
+        stats["wins"] += 1
+    stats["win_rate"] = stats["wins"] / stats["games"]
+
+
 class EvaluationHarness:
     """Coordinates and runs matchups between policies and baseline opponents."""
 
@@ -299,10 +307,6 @@ class EvaluationHarness:
             characters of each packed team's SHA-256, for team pairs and for
             each side's teams.
         """
-        source = team_source
-        category = team_category
-        server_config = server_configuration
-
         logger.info(
             "Starting matchup: %s vs %s (%d episodes)",
             name_a,
@@ -313,29 +317,22 @@ class EvaluationHarness:
         rng_b = random.Random(self.rng.randint(0, 1_000_000))
 
         async with AsyncExitStack() as stack:
-            account_config_a = AccountConfiguration(f"evala{self.rng.randint(1000, 9999)}", None)
-            player_a = create_eval_player(
-                policy_a,
-                team_rng=rng_a,
-                team_source=source,
-                battle_format=self.format_id,
-                server_configuration=server_config,
-                account_configuration=account_config_a,
-                max_concurrent_battles=1,
-            )
-            stack.push_async_callback(player_a.ps_client.stop_listening)
-
-            account_config_b = AccountConfiguration(f"evalb{self.rng.randint(1000, 9999)}", None)
-            player_b = create_eval_player(
-                policy_b,
-                team_rng=rng_b,
-                team_source=source,
-                battle_format=self.format_id,
-                server_configuration=server_config,
-                account_configuration=account_config_b,
-                max_concurrent_battles=1,
-            )
-            stack.push_async_callback(player_b.ps_client.stop_listening)
+            players: list[EvalPlayerType] = []
+            for label, policy, team_rng in (("a", policy_a, rng_a), ("b", policy_b, rng_b)):
+                player = create_eval_player(
+                    policy,
+                    team_rng=team_rng,
+                    team_source=team_source,
+                    battle_format=self.format_id,
+                    server_configuration=server_configuration,
+                    account_configuration=AccountConfiguration(
+                        f"eval{label}{self.rng.randint(1000, 9999)}", None
+                    ),
+                    max_concurrent_battles=1,
+                )
+                stack.push_async_callback(player.ps_client.stop_listening)
+                players.append(player)
+            player_a, player_b = players
 
             for _ in range(self.episodes_per_matchup):
                 expected = len(player_a.history) + 1
@@ -360,14 +357,6 @@ class EvaluationHarness:
         per_team: dict[str, dict[str, Any]] = {}
         per_team_a: dict[str, dict[str, Any]] = {}
         per_team_b: dict[str, dict[str, Any]] = {}
-
-        def _record(store: dict[str, dict[str, Any]], key: str, won: bool) -> None:
-            stats = store.setdefault(key, {"wins": 0, "games": 0, "win_rate": 0.0})
-            stats["games"] += 1
-            if won:
-                stats["wins"] += 1
-            stats["win_rate"] = stats["wins"] / stats["games"]
-
         for (team_a, won_a), (team_b, won_b) in zip(
             player_a.history, player_b.history, strict=True
         ):
@@ -387,9 +376,9 @@ class EvaluationHarness:
             ties=ties,
             win_rate_a=win_rate_a,
             confidence_interval_a=ci_a,
-            team_category=category,
+            team_category=team_category,
             per_team_results=per_team,
-            source_description=dict(source.describe()),
+            source_description=dict(team_source.describe()),
             per_team_a_results=per_team_a,
             per_team_b_results=per_team_b,
         )

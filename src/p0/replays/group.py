@@ -69,28 +69,38 @@ def _time(document: ReplayDocument) -> datetime:
 
 
 def _team_hash(document: ReplayDocument, side: int) -> str:
-    ots = document.ots[side]
-    members = [
-        {
-            "species": member.species.casefold(),
-            "item": member.item.casefold(),
-            "ability": member.ability.casefold(),
-            "nature": member.nature.casefold(),
-            "moves": sorted(move.casefold() for move in member.moves),
-        }
-        for member in sorted(
-            ots.members,
-            key=lambda item: (
-                item.species.casefold(),
-                item.item.casefold(),
-                item.ability.casefold(),
-                item.nature.casefold(),
-                tuple(sorted(move.casefold() for move in item.moves)),
-            ),
+    members = sorted(
+        (
+            member.species.casefold(),
+            member.item.casefold(),
+            member.ability.casefold(),
+            member.nature.casefold(),
+            tuple(sorted(move.casefold() for move in member.moves)),
         )
-    ]
-    payload = orjson.dumps(members, option=orjson.OPT_SORT_KEYS)
+        for member in document.ots[side].members
+    )
+    payload = orjson.dumps(
+        [
+            {"species": species, "item": item, "ability": ability, "nature": nature, "moves": moves}
+            for species, item, ability, nature, moves in members
+        ],
+        option=orjson.OPT_SORT_KEYS,
+    )
     return hashlib.sha256(payload).hexdigest()
+
+
+def _team_hashes(document: ReplayDocument, players: tuple[str, str]) -> tuple[str, str]:
+    """Return both canonical players' team hashes in canonical player order."""
+    roles = _roles(document, players)
+    return _team_hash(document, roles[0]), _team_hash(document, roles[1])
+
+
+def _incomplete_series(group: GroupedSeries) -> GroupingDiagnostic:
+    return GroupingDiagnostic(
+        "incomplete_series",
+        group.record.game_replay_ids,
+        "series does not contain a validated two-win result",
+    )
 
 
 def _series_id(format_id: str, key: str, players: tuple[str, str]) -> str:
@@ -214,17 +224,11 @@ def _make_group(
     numbering_diagnostics = _numbering_diagnostics(ordered, numbers)
     score, outcome_diagnostics = _series_score(ordered, players)
 
-    first_roles = _roles(ordered[0], players)
-    team_hashes = (_team_hash(ordered[0], first_roles[0]), _team_hash(ordered[0], first_roles[1]))
+    team_hashes = _team_hashes(ordered[0], players)
     conflicts = []
 
     for game in ordered[1:]:
-        roles = _roles(game, players)
-        game_hashes = (
-            _team_hash(game, roles[0]),
-            _team_hash(game, roles[1]),
-        )
-        if game_hashes != team_hashes:
+        if _team_hashes(game, players) != team_hashes:
             conflicts.append(
                 GroupingDiagnostic(
                     "team_identity_conflict",
@@ -241,15 +245,8 @@ def _make_group(
         and not any(diagnostic.code == "too_many_games" for diagnostic in diagnostics)
     )
     series_id = _series_id(format_id, key, players)
-    membership_diagnostics = tuple(
-        diagnostic.code
-        for diagnostic in (
-            *diagnostics,
-            *numbering_diagnostics,
-            *outcome_diagnostics,
-            *conflicts,
-        )
-    )
+    group_diagnostics = (*diagnostics, *numbering_diagnostics, *outcome_diagnostics, *conflicts)
+    membership_diagnostics = tuple(diagnostic.code for diagnostic in group_diagnostics)
 
     memberships = tuple(
         SeriesMembership(
@@ -276,14 +273,6 @@ def _make_group(
         grouping_method=method,
         grouping_confidence=1.0 if method is GroupingMethod.PARENT_ROOM else 0.5,
     )
-
-    group_diagnostics = (
-        *diagnostics,
-        *numbering_diagnostics,
-        *outcome_diagnostics,
-        *conflicts,
-    )
-
     return GroupedSeries(record, ordered, memberships, group_diagnostics)
 
 
@@ -351,8 +340,7 @@ def group_replays(
             chunks: list[list[ReplayDocument]] = [[]]
             previous_hashes: tuple[str, str] | None = None
             for game in games:
-                roles = _roles(game, bucket[2])
-                hashes = (_team_hash(game, roles[0]), _team_hash(game, roles[1]))
+                hashes = _team_hashes(game, bucket[2])
                 if previous_hashes is not None and hashes != previous_hashes:
                     diagnostics.append(
                         GroupingDiagnostic(
@@ -374,13 +362,7 @@ def group_replays(
                     result.append(group)
                     diagnostics.extend(group.diagnostics)
                     if not group.record.is_complete:
-                        diagnostics.append(
-                            GroupingDiagnostic(
-                                "incomplete_series",
-                                group.record.game_replay_ids,
-                                "series does not contain a validated two-win result",
-                            )
-                        )
+                        diagnostics.append(_incomplete_series(group))
                 continue
         group_diagnostics: list[GroupingDiagnostic] = []
         if len(games) > max_games:
@@ -408,13 +390,7 @@ def group_replays(
                     if diagnostic not in group_diagnostics
                 )
                 if not group.record.is_complete:
-                    diagnostics.append(
-                        GroupingDiagnostic(
-                            "incomplete_series",
-                            group.record.game_replay_ids,
-                            "series does not contain a validated two-win result",
-                        )
-                    )
+                    diagnostics.append(_incomplete_series(group))
     return GroupingResult(tuple(result), tuple(diagnostics))
 
 

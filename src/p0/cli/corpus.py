@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import random
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -55,12 +56,8 @@ def _variants_from_showdown(
     if len(blocks) % 6 != 0:
         raise ValueError(f"Showdown text contains {len(blocks)} blocks, not a multiple of 6")
 
-    team_strings = ["\n\n".join(blocks[i : i + 6]) for i in range(0, len(blocks), 6)]
-    team_counts: dict[str, int] = {}
-    for t in team_strings:
-        team_counts[t] = team_counts.get(t, 0) + 1
-
-    unique_teams = list(team_counts.keys())
+    team_counts = Counter("\n\n".join(blocks[i : i + 6]) for i in range(0, len(blocks), 6))
+    unique_teams = list(team_counts)
     unique_text = "\n\n\n".join(unique_teams)
     members = _PACKER.parse_showdown_team(unique_text)
 
@@ -100,10 +97,8 @@ def _variants_from_showdown(
         team = CanonicalTeam(team_members)
         usage = team_counts[unique_teams[i // 6]]
 
-        if team.team_hash in canonical_dict:
-            canonical_dict[team.team_hash] = (team, canonical_dict[team.team_hash][1] + usage)
-        else:
-            canonical_dict[team.team_hash] = (team, usage)
+        previous = canonical_dict.get(team.team_hash)
+        canonical_dict[team.team_hash] = (team, usage + (0 if previous is None else previous[1]))
 
     # Corpus teams sample the usage priors rather than taking the argmax, so generated
     # teams carry the meta's real spread variety. Seeded so builds stay reproducible.
@@ -129,9 +124,9 @@ def _variants_from_showdown(
                 continue
             spreads_list.append(estimate.points)
 
-        spreads = tuple(spreads_list)
-        metadata = TeamMetadata(usage_count=usage)
-        variants.append(TeamRecord(team=team, spreads=spreads, metadata=metadata))
+        variants.append(
+            TeamRecord(team=team, spreads=tuple(spreads_list), metadata=TeamMetadata(usage))
+        )
 
     return tuple(variants)
 
@@ -140,26 +135,18 @@ def _load_variants(path: Path, dex: Mapping[str, Any] | None = None) -> tuple[Te
     """Load variants from a file or directory of showdown exports."""
     if not path.exists():
         raise FileNotFoundError(f"Input path does not exist: {path}")
-    files: list[Path] = []
-    if path.is_dir():
-        files.extend(
-            sorted(f for f in path.rglob("*") if f.is_file() and not f.name.startswith("."))
-        )
-    else:
-        files.append(path)
-
-    texts: list[str] = []
-    for file_path in files:
-        if file_path.suffix == ".txt" or not file_path.suffix:
-            text = file_path.read_text(encoding="utf-8").strip()
-            if text:
-                texts.append(text)
-
-    if not texts:
-        return ()
-
-    combined_text = "\n\n".join(texts)
-    return _variants_from_showdown(combined_text, dex=dex)
+    files = (
+        sorted(f for f in path.rglob("*") if f.is_file() and not f.name.startswith("."))
+        if path.is_dir()
+        else [path]
+    )
+    texts = [
+        text
+        for file_path in files
+        if file_path.suffix in {".txt", ""}
+        and (text := file_path.read_text(encoding="utf-8").strip())
+    ]
+    return _variants_from_showdown("\n\n".join(texts), dex=dex) if texts else ()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -223,12 +210,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "audit":
-        manifest_path = corpus_manifest_path(args.path)
-        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest = TeamCorpusManifest.from_dict(raw)
-
-        audit = audit_corpus(manifest)
-        print(json.dumps(audit, sort_keys=True))
+        raw = json.loads(corpus_manifest_path(args.path).read_text(encoding="utf-8"))
+        print(json.dumps(audit_corpus(TeamCorpusManifest.from_dict(raw)), sort_keys=True))
         return
 
 

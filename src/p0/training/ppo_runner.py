@@ -18,7 +18,11 @@ from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
 from p0.runtime.showdown import start_showdown_servers
 from p0.teams.source import build_team_source
-from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
+from p0.training.checkpoint import (
+    DEFAULT_CHECKPOINT_STORE,
+    CheckpointStore,
+    value_objective_metadata,
+)
 from p0.training.config import GlobalConfig
 from p0.training.files import training_run
 from p0.training.magnet import Magnet
@@ -105,10 +109,7 @@ def run_training(
             policy_store.load_policy(
                 files.source,
                 device,
-                expected_metadata={
-                    "gamma": training.gamma,
-                    "value_target_semantics": "discounted_terminal_outcome.v1",
-                },
+                expected_metadata=value_objective_metadata(training.gamma),
             )
             if files.source is not None
             else build_policy(ModelConfig.baseline(), resources).to(device)
@@ -124,8 +125,9 @@ def run_training(
         scheduler = PPOScheduler(training)
         resume_environment_state: object | None = None
         resume_collector_state: object | None = None
-        start = (
-            policy_store.load_training(
+        start = 0
+        if paths.resume_checkpoint is not None and files.source is not None:
+            start = policy_store.load_training(
                 files.source,
                 policy,
                 optimizer=optimizer,
@@ -135,10 +137,6 @@ def run_training(
                 expected_trainer_kind="ppo",
                 require_training_state=True,
             )
-            if paths.resume_checkpoint is not None and files.source is not None
-            else 0
-        )
-        if paths.resume_checkpoint is not None and files.source is not None:
             resume_metadata = policy_store.load_metadata(files.source)
             environment_state = resume_metadata.get("environment_state")
             collector_state = resume_metadata.get("collector_state")

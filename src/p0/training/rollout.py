@@ -124,25 +124,9 @@ class RolloutCollector:
                 # A seat whose choice was rejected decides the same request again; its
                 # new decision replaces the rejected one in history and trajectory.
                 seat.trajectories.step_counts[retry[:, seat_index]] -= 1
-            series_inputs = [
-                seat.series_tokens.get_tokens(series_ids, device) for seat in self._seats
-            ]
-            history_inputs = [
-                seat.trajectories.history_inputs(idx_all, device, torch.float32)
-                for seat in self._seats
-            ]
-            current_memory = MemoryInputs(
-                series_tokens=torch.cat([value[0] for value in series_inputs]),
-                series_mask=torch.cat([value[1] for value in series_inputs]),
-                history_tokens=torch.cat([value[0] for value in history_inputs]),
-                history_mask=torch.cat([value[1] for value in history_inputs]),
-            )
+            current_memory = self._memory_inputs(idx_all, series_ids, device)
 
-            with torch.amp.autocast(
-                device_type=device.type,
-                enabled=precision.autocast,
-                dtype=precision.dtype,
-            ):
+            with precision.autocast_context(device):
                 current_out = policy.act(
                     policy.prepare(policy.encode(current_obs, current_mask), current_memory),
                     current_mask,
@@ -177,9 +161,7 @@ class RolloutCollector:
                 for i in range(n_envs)
             ]
 
-            next_masks1, next_masks2, rewards1, rewards2, done_status, infos = vec_env.step(
-                env_actions
-            )
+            masks1, masks2, rewards1, rewards2, done_status, infos = vec_env.step(env_actions)
 
             # RL non-terminal masking only cares if the episode naturally terminated.
             # Status 1 is Terminated, Status 2 is Truncated.
@@ -205,8 +187,20 @@ class RolloutCollector:
                         precision,
                     )
 
-            masks1 = next_masks1
-            masks2 = next_masks2
+    def _memory_inputs(
+        self, env_ids: torch.Tensor, series_ids: list[str], device: torch.device
+    ) -> MemoryInputs:
+        """Stack both seats' series and battle-history memory, seat 1 rows first."""
+        series_inputs = [seat.series_tokens.get_tokens(series_ids, device) for seat in self._seats]
+        history_inputs = [
+            seat.trajectories.history_inputs(env_ids, device, torch.float32) for seat in self._seats
+        ]
+        return MemoryInputs(
+            series_tokens=torch.cat([value[0] for value in series_inputs]),
+            series_mask=torch.cat([value[1] for value in series_inputs]),
+            history_tokens=torch.cat([value[0] for value in history_inputs]),
+            history_mask=torch.cat([value[1] for value in history_inputs]),
+        )
 
     def _finish_game(
         self,
@@ -245,34 +239,15 @@ class RolloutCollector:
                 for seat_index in (1, 2)
             )
         )
-        with torch.amp.autocast(
-            device_type=device.type,
-            enabled=precision.autocast,
-            dtype=precision.dtype,
-        ):
+        with precision.autocast_context(device):
             terminal_encoded = policy.encode(terminal_obs, terminal_mask)
 
         bootstrap_values = (0.0, 0.0)
         if done_status == 2:
-            env_index = torch.tensor([env_id], dtype=torch.long)
-            history_inputs = [
-                seat.trajectories.history_inputs(env_index, device, torch.float32)
-                for seat in self._seats
-            ]
-            series_inputs = [
-                seat.series_tokens.get_tokens([series_id], device) for seat in self._seats
-            ]
-            memory = MemoryInputs(
-                series_tokens=torch.cat([value[0] for value in series_inputs]),
-                series_mask=torch.cat([value[1] for value in series_inputs]),
-                history_tokens=torch.cat([value[0] for value in history_inputs]),
-                history_mask=torch.cat([value[1] for value in history_inputs]),
+            memory = self._memory_inputs(
+                torch.tensor([env_id], dtype=torch.long), [series_id], device
             )
-            with torch.amp.autocast(
-                device_type=device.type,
-                enabled=precision.autocast,
-                dtype=precision.dtype,
-            ):
+            with precision.autocast_context(device):
                 values = policy.act(
                     policy.prepare(terminal_encoded, memory),
                     terminal_mask,

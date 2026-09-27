@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,24 +130,17 @@ def build_corpus(
         raise RuntimeError("Validation result count does not match deduplicated variant count")
 
     entries: list[CorpusEntry] = []
-    rejections: dict[str, int] = {}
+    rejections: Counter[str] = Counter()
 
     for variant, result in zip(deduped, validation_results, strict=True):
         if not result.valid or not result.packed_team:
-            reason = "showdown_invalid"
-            if result.problems:
-                reason = f"showdown_invalid: {result.problems[0]}"
-            rejections[reason] = rejections.get(reason, 0) + 1
-            continue
-
-        oov_reason = _check_vocabulary(tokenizer, variant)
-        if oov_reason is not None:
-            rejections[oov_reason] = rejections.get(oov_reason, 0) + 1
-            continue
-
-        spread_reason = _check_spreads(variant)
-        if spread_reason is not None:
-            rejections[spread_reason] = rejections.get(spread_reason, 0) + 1
+            reason = (
+                f"showdown_invalid: {result.problems[0]}" if result.problems else "showdown_invalid"
+            )
+        else:
+            reason = _check_vocabulary(tokenizer, variant) or _check_spreads(variant)
+        if reason is not None:
+            rejections[reason] += 1
             continue
 
         packed = result.packed_team
@@ -163,8 +157,7 @@ def build_corpus(
                 spread_provenance=variant.spread_provenance,
             )
         except ValueError as exc:
-            reason = f"entry_error: {exc}"
-            rejections[reason] = rejections.get(reason, 0) + 1
+            rejections[f"entry_error: {exc}"] += 1
             continue
 
         entries.append(entry)

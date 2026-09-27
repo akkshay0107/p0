@@ -11,6 +11,7 @@ import orjson
 
 from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS
+from p0.teams.stat_points import STAT_NAMES
 from p0.teams.team import TeamRecord
 
 
@@ -49,7 +50,7 @@ def _variant_dict(
                 "moves": list(canon_member.moves),
                 "nature": canon_member.nature,
                 "evs": spread.as_dict(),
-                "ivs": {name: 31 for name in ("hp", "atk", "def", "spa", "spd", "spe")},
+                "ivs": dict.fromkeys(STAT_NAMES, 31),
                 "gender": canon_member.gender,
                 "level": canon_member.level,
             }
@@ -136,21 +137,8 @@ def validate_many_batched(
     return tuple(results)
 
 
-def validate_many(
-    variants: Sequence[TeamRecord],
-    *,
-    batch_size: int = 256,
-    timeout: float = 60.0,
-    repository_root: Path = DEFAULT_PATHS.repository_root,
-    format_id: str = FORMAT.battle_format,
-) -> tuple[AdmissionResult, ...]:
-    return validate_many_batched(
-        variants,
-        batch_size=batch_size,
-        timeout=timeout,
-        repository_root=repository_root,
-        format_id=format_id,
-    )
+# The default corpus validator; every validation goes through the batched path.
+validate_many = validate_many_batched
 
 
 def validate_variant(
@@ -160,10 +148,9 @@ def validate_variant(
     repository_root: Path = DEFAULT_PATHS.repository_root,
     format_id: str = FORMAT.battle_format,
 ) -> AdmissionResult:
-    results = validate_many(
+    return validate_many(
         (variant,),
         timeout=timeout,
         repository_root=repository_root,
         format_id=format_id,
-    )
-    return results[0]
+    )[0]

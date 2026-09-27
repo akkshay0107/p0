@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -11,12 +10,6 @@ import torch
 
 from p0.format_config import FORMAT
 from p0.replays.compile import ShardBuildResult, compile_payloads, write_tensor_shards
-
-
-def golden_series_id(parent: str) -> str:
-    """Return the independently calculated series identity for this fixture family."""
-    value = "\n".join((FORMAT.bo3_format, parent, "alice", "bob"))
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
 def golden_replay_payload(

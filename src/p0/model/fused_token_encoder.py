@@ -160,14 +160,12 @@ def _load_move_statics(resources: RuntimeResources) -> torch.Tensor:
         table[idx, 0] = float(move.get("basePower", 0)) / 150.0
         table[idx, 1] = float(move.get("pp", 0)) / 64.0
         table[idx, 2] = float(move.get("priority", 0)) / 5.0
+        # Showdown marks moves that cannot miss with accuracy true.
         accuracy = move.get("accuracy", 100)
         if accuracy is True:
-            accuracy_value = 1.0
+            table[idx, 3] = 1.0
         elif isinstance(accuracy, (int, float)):
-            accuracy_value = float(accuracy) / 100.0
-        else:
-            accuracy_value = 0.0
-        table[idx, 3] = accuracy_value
+            table[idx, 3] = float(accuracy) / 100.0
         target = str(move.get("target", "")).lower()
         target_class = _TARGET_CLASS_ALIASES.get(target, target)
         target_index = _TARGET_CLASS_INDEX.get(target_class)

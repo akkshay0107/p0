@@ -10,7 +10,21 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TextIO
 
+from poke_env.ps_client import ServerConfiguration
+
 from p0.paths import DEFAULT_PATHS
+
+LOOPBACK_HOST = "127.0.0.1"
+# Local servers run with --no-security, so this public endpoint is only a placeholder
+# for poke-env's required login URL.
+AUTHENTICATION_URL = "https://play.pokemonshowdown.com/action.php?"
+
+
+def local_server_configuration(port: int) -> ServerConfiguration:
+    """Return the poke-env connection settings for a local Showdown server on port."""
+    return ServerConfiguration(
+        f"ws://{LOOPBACK_HOST}:{port}/showdown/websocket", AUTHENTICATION_URL
+    )
 
 
 def build_showdown(showdown_root: Path = DEFAULT_PATHS.showdown_root) -> None:
@@ -36,7 +50,7 @@ def allocate_loopback_ports(count: int) -> tuple[int, ...]:
     with contextlib.ExitStack() as stack:
         listeners = [stack.enter_context(socket.socket()) for _ in range(count)]
         for listener in listeners:
-            listener.bind(("127.0.0.1", 0))
+            listener.bind((LOOPBACK_HOST, 0))
         return tuple(int(listener.getsockname()[1]) for listener in listeners)
 
 
@@ -62,7 +76,7 @@ class ShowdownServer:
 
     @property
     def websocket_url(self) -> str:
-        return f"ws://127.0.0.1:{self.port}/showdown/websocket"
+        return local_server_configuration(self.port).websocket_url
 
     def start(self) -> None:
         if self.process is not None:
@@ -100,7 +114,7 @@ class ShowdownServer:
                 self._raise_startup_failure(command)
 
             try:
-                with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
+                with socket.create_connection((LOOPBACK_HOST, self.port), timeout=0.2):
                     return
             except OSError:
                 time.sleep(0.05)

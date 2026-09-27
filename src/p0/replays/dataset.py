@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Iterator, Mapping
 from copy import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from pickle import UnpicklingError
 from typing import Any
@@ -17,11 +17,12 @@ from torch.utils.data import IterableDataset, get_worker_info
 from p0.battle.series import SeriesPerspectiveKey
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
+    is_sha256,
+    require_dataclass_fields,
     validate_artifact_runtime_contract,
 )
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save
-from p0.replays.schema import _is_sha256, _require_fields
 from p0.replays.shards import (
     SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
@@ -46,10 +47,6 @@ class SeriesSplitManifest:
     dataset_hash: str
     artifact_schema: str = SPLIT_ARTIFACT_SCHEMA
 
-    _FIELDS = frozenset(
-        {"artifact_schema", "global_contract_sha256", "dataset_hash", "seed", "assignments"}
-    )
-
     def __post_init__(self) -> None:
         if self.artifact_schema != SPLIT_ARTIFACT_SCHEMA:
             raise ValueError(
@@ -57,10 +54,10 @@ class SeriesSplitManifest:
                 f"expected {SPLIT_ARTIFACT_SCHEMA}"
             )
 
-        if not _is_sha256(self.global_contract_sha256):
+        if not is_sha256(self.global_contract_sha256):
             raise ValueError("SeriesSplitManifest.global_contract_sha256 must be a SHA-256 digest")
 
-        if not _is_sha256(self.dataset_hash):
+        if not is_sha256(self.dataset_hash):
             raise ValueError("SeriesSplitManifest.dataset_hash must be a SHA-256 digest")
 
         if type(self.seed) is not int:
@@ -86,7 +83,7 @@ class SeriesSplitManifest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SeriesSplitManifest:
-        _require_fields(value, cls._FIELDS, "SeriesSplitManifest")
+        require_dataclass_fields(value, cls)
         assignments = value["assignments"]
         if not isinstance(assignments, Mapping):
             raise ValueError("SeriesSplitManifest.assignments must be an object")
@@ -237,23 +234,11 @@ class ReplayGameChunk:
     def series_key(self) -> SeriesPerspectiveKey:
         return SeriesPerspectiveKey(self.series_id, self.canonical_player)
 
-    def to(self, device: torch.device | str) -> ReplayGameChunk:
-        return replace(
-            self,
-            observations=self.observations.to(device),
-            action_mask=self.action_mask.to(device),
-            mask_provenance=self.mask_provenance.to(device),
-            label_kind=self.label_kind.to(device),
-            label_confidence=self.label_confidence.to(device),
-            loss_mask=self.loss_mask.to(device),
-            decision_type=self.decision_type.to(device),
-            exact_action=self.exact_action.to(device),
-            candidate_values=self.candidate_values.to(device),
-            candidate_offsets=self.candidate_offsets.to(device),
-            outcome=self.outcome.to(device),
-            final_observation=self.final_observation.to(device),
-            outcome_valid=self.outcome_valid,
-        )
+
+def _series_in_split(manifest: SeriesSplitManifest, split: str) -> frozenset[str]:
+    return frozenset(
+        series for series, assigned in manifest.assignments.items() if assigned == split
+    )
 
 
 class LazyReplayDataset(IterableDataset):
@@ -300,13 +285,7 @@ class LazyReplayDataset(IterableDataset):
 
         # Resolving the selection here keeps the streaming loop free of split branching.
         self._selected_series: frozenset[str] | None = (
-            None
-            if split is None or loaded_split is None
-            else frozenset(
-                series_id
-                for series_id, assigned in loaded_split.assignments.items()
-                if assigned == split
-            )
+            None if split is None or loaded_split is None else _series_in_split(loaded_split, split)
         )
         self._accepted_series_ids = self._validate_shard_family()
 
@@ -317,11 +296,7 @@ class LazyReplayDataset(IterableDataset):
         dataset = copy(self)
         dataset.split = split
         dataset.verify_hashes = False
-        dataset._selected_series = frozenset(
-            series
-            for series, assigned in self.split_manifest.assignments.items()
-            if assigned == split
-        )
+        dataset._selected_series = _series_in_split(self.split_manifest, split)
         return dataset
 
     def __iter__(self) -> Iterator[ReplayGameChunk]:
@@ -386,13 +361,10 @@ class LazyReplayDataset(IterableDataset):
     def _load_shard(
         self, entry: ShardIndexEntry
     ) -> tuple[Mapping[str, torch.Tensor], list[Mapping[str, Any]]]:
-        path = self._root / entry.filename
-        root = self._root.resolve()
-        resolved_path = path.resolve()
-        if root not in resolved_path.parents:
+        path = (self._root / entry.filename).resolve()
+        if self._root.resolve() not in path.parents:
             raise ValueError(f"Shard filename escapes the manifest directory: {entry.filename!r}")
 
-        path = resolved_path
         if not path.is_file():
             raise ValueError(f"Shard file is missing: {path}")
 

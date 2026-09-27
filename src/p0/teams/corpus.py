@@ -8,7 +8,7 @@ and the packed Showdown string hash for runtime sampling.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,28 +16,12 @@ from typing import Any, Mapping
 from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     canonical_json_sha256,
+    is_sha256,
+    require_dataclass_fields,
     validate_artifact_runtime_contract,
 )
 
 CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v1"
-
-_HEX_DIGITS = frozenset("0123456789abcdef")
-
-
-def _require_fields(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
-    missing = sorted(expected - value.keys())
-    unknown = sorted(value.keys() - expected)
-
-    if missing or unknown:
-        raise ValueError(f"Invalid {owner} fields; missing={missing}, unknown={unknown}")
-
-
-def _is_sha256(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in _HEX_DIGITS for character in value)
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,18 +34,8 @@ class CorpusEntry:
     usage_count: int
     spread_provenance: str = "imputed"
 
-    _FIELDS = frozenset(
-        {
-            "canonical_hash",
-            "packed",
-            "packed_sha256",
-            "usage_count",
-            "spread_provenance",
-        }
-    )
-
     def __post_init__(self) -> None:
-        if not _is_sha256(self.canonical_hash):
+        if not is_sha256(self.canonical_hash):
             raise ValueError("CorpusEntry.canonical_hash must be a lowercase SHA-256 digest")
 
         if not self.packed:
@@ -81,17 +55,11 @@ class CorpusEntry:
             raise ValueError("CorpusEntry.spread_provenance must be 'imputed' or 'exact'")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "canonical_hash": self.canonical_hash,
-            "packed": self.packed,
-            "packed_sha256": self.packed_sha256,
-            "usage_count": self.usage_count,
-            "spread_provenance": self.spread_provenance,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CorpusEntry:
-        _require_fields(value, cls._FIELDS, "CorpusEntry")
+        require_dataclass_fields(value, cls)
         return cls(
             canonical_hash=str(value["canonical_hash"]),
             packed=str(value["packed"]),
@@ -119,18 +87,6 @@ class TeamCorpusManifest:
     sampling_metadata: Mapping[str, Any]
     artifact_schema: str = CORPUS_MANIFEST_SCHEMA
 
-    _FIELDS = frozenset(
-        {
-            "global_contract_sha256",
-            "format_id",
-            "corpus_hash",
-            "entries",
-            "created_at",
-            "sampling_metadata",
-            "artifact_schema",
-        }
-    )
-
     def __post_init__(self) -> None:
         if self.artifact_schema != CORPUS_MANIFEST_SCHEMA:
             raise ValueError(
@@ -138,7 +94,7 @@ class TeamCorpusManifest:
                 f"expected {CORPUS_MANIFEST_SCHEMA}"
             )
 
-        if not _is_sha256(self.global_contract_sha256):
+        if not is_sha256(self.global_contract_sha256):
             raise ValueError(
                 "TeamCorpusManifest.global_contract_sha256 must be a lowercase SHA-256 digest"
             )
@@ -182,7 +138,7 @@ class TeamCorpusManifest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TeamCorpusManifest:
-        _require_fields(value, cls._FIELDS, "TeamCorpusManifest")
+        require_dataclass_fields(value, cls)
         metadata = value["sampling_metadata"]
         if not isinstance(metadata, Mapping):
             raise ValueError("TeamCorpusManifest.sampling_metadata must be a JSON object")

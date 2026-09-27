@@ -23,12 +23,8 @@ class Magnet:
         self.policy.requires_grad_(False)
 
     def refresh(self, policy: PolicyNet) -> None:
-        """
-        Reload the magnet weights from the live policy (state-dict copy only).
-        """
-        load_canonical_policy_state_dict(self.policy, canonical_policy_state_dict(policy))
-        self.policy.eval()
-        self.policy.requires_grad_(False)
+        """Reload the magnet weights from the live policy (state-dict copy only)."""
+        self.load_state_dict(canonical_policy_state_dict(policy))
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         load_canonical_policy_state_dict(self.policy, state_dict)

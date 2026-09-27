@@ -17,7 +17,7 @@ from p0.model.resources import default_runtime_resources
 from p0.persistence import atomic_json_save
 from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest
 from p0.training.bc import BCCancelled, BCEvaluationMetrics, BCTrainer
-from p0.training.checkpoint import CheckpointStore, LoadedCheckpoint
+from p0.training.checkpoint import CheckpointStore, LoadedCheckpoint, value_objective_metadata
 from p0.training.config import BCConfig
 from p0.training.files import TrainingRun, training_run
 from p0.training.utils import default_device, seed_everything
@@ -37,19 +37,14 @@ def _training_metadata(
         "split_manifest_sha256": sha256_file(split_manifest),
         "trainer_config": trainer_config,
         "epoch_budget": config.epochs,
-        "gamma": config.gamma,
-        "value_target_semantics": "discounted_terminal_outcome.v1",
+        **value_objective_metadata(config.gamma),
     }
 
 
-def _validation_is_failed(
-    metrics: BCEvaluationMetrics,
-    *,
-    require_policy_support: bool = False,
-) -> bool:
+def _validation_is_failed(metrics: BCEvaluationMetrics) -> bool:
     return (
         metrics.non_finite_values > 0
-        or (require_policy_support and metrics.labeled_count == 0)
+        or metrics.labeled_count == 0
         or not all(math.isfinite(value) for value in metrics.to_dict().values())
     )
 
@@ -161,10 +156,7 @@ def train_bc(
             store.load_policy(
                 files.source,
                 selected_device,
-                expected_metadata={
-                    "gamma": config.gamma,
-                    "value_target_semantics": "discounted_terminal_outcome.v1",
-                },
+                expected_metadata=value_objective_metadata(config.gamma),
             )
             if files.source is not None
             else build_policy(ModelConfig.baseline(), default_runtime_resources())
@@ -206,7 +198,7 @@ def train_bc(
             enable=config.enable_optim and selected_device.type == "cuda",
         )
         initial_training = trainer.evaluate(train_dataset)
-        if _validation_is_failed(initial_training, require_policy_support=True):
+        if _validation_is_failed(initial_training):
             raise RuntimeError(
                 "Initial BC training evaluation contains invalid predictions or values"
             )
@@ -226,7 +218,7 @@ def train_bc(
             if training["updates"] == 0:
                 raise RuntimeError(f"BC training made no successful updates at epoch {epoch}")
             validation = trainer.evaluate(validation_dataset)
-            if _validation_is_failed(validation, require_policy_support=True):
+            if _validation_is_failed(validation):
                 raise RuntimeError(f"BC validation failed at epoch {epoch}")
             last_training_update = training
             final_validation = validation
@@ -296,15 +288,8 @@ def evaluate_bc(
     """Evaluate a weights-only or BC training checkpoint on one bound split."""
     selected_device = default_device() if device is None else torch.device(device)
     store = CheckpointStore()
-    objective = {
-        "gamma": config.gamma,
-        "value_target_semantics": "discounted_terminal_outcome.v1",
-    }
-    policy = store.load_policy(
-        checkpoint,
-        selected_device,
-        expected_metadata=objective,
-    )
+    objective = value_objective_metadata(config.gamma)
+    policy = store.load_policy(checkpoint, selected_device, expected_metadata=objective)
     dataset = LazyReplayDataset(
         config.shard_manifest, split_manifest=config.split_manifest, verify_hashes=True
     )
@@ -316,7 +301,7 @@ def evaluate_bc(
         raise ValueError(f"BC {split} split has no accepted series")
     trainer = BCTrainer(policy, dataset, config, device=selected_device)
     metrics = trainer.evaluate()
-    if _validation_is_failed(metrics, require_policy_support=True):
+    if _validation_is_failed(metrics):
         raise RuntimeError("BC evaluation contains invalid predictions or non-finite values")
     return {
         "dataset_hash": shard_manifest.dataset_hash,

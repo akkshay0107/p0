@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -59,8 +59,6 @@ def _default_paths() -> ProjectPaths:
 
     for data_root in candidates:
         if (data_root / "vocab.json").is_file():
-            from dataclasses import replace
-
             return replace(paths, data_root=data_root)
 
     return paths

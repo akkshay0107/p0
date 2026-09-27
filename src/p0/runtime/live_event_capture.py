@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from copy import deepcopy
+from functools import partial
 from typing import NamedTuple
 
 from poke_env.battle import DoubleBattle, Pokemon
@@ -93,23 +94,15 @@ def capture_message(
 ) -> None:
     """Update the battle's pending event records from one Showdown protocol message."""
     if capture_protocol_line:
-        protocol_lines = getattr(battle, "_p0_protocol_lines", None)
-        if protocol_lines is None:
-            protocol_lines = []
-            battle._p0_protocol_lines = protocol_lines  # type: ignore[attr-defined]
-        protocol_lines.append(tuple(split_message))
+        vars(battle).setdefault("_p0_protocol_lines", []).append(tuple(split_message))
 
     recorder = _recorder_for(battle)
     if len(split_message) >= 4 and split_message[1] == "-transform":
         try:
             base = battle.get_pokemon(split_message[2])
             target = _transform_target(battle, base, split_message[3])
-            targets = getattr(battle, "_p0_transform_targets", None)
-            if targets is None:
-                targets = {}
-                battle._p0_transform_targets = targets  # type: ignore[attr-defined]
             # Keep the copied form independent of later target changes.
-            targets[id(base)] = CapturedTransform(
+            vars(battle).setdefault("_p0_transform_targets", {})[id(base)] = CapturedTransform(
                 deepcopy(target), base.base_stats["hp"], base.height, base.weight
             )
         except (AssertionError, IndexError, KeyError, ValueError):
@@ -145,26 +138,28 @@ def capture_message(
         except (AssertionError, IndexError, KeyError, ValueError):
             pass
 
-    def pre_hp_for(identifier: str) -> float | None:
-        try:
-            return battle.get_pokemon(identifier).current_hp_fraction
-        except (AssertionError, IndexError, KeyError, ValueError):
-            pass
-
-        if ":" in identifier:
-            clean_id = identifier.split(":", 1)[-1].strip()
-            try:
-                return battle.get_pokemon(clean_id).current_hp_fraction
-            except (AssertionError, IndexError, KeyError, ValueError):
-                pass
-
-        return None
-
     role = battle.player_role
     if role and role != recorder.player_role:
         recorder.player_role = role
 
-    recorder.apply_line(split_message, tokenizer, pre_hp_for)
+    recorder.apply_line(split_message, tokenizer, partial(_hp_before, battle))
+
+
+def _hp_before(battle: DoubleBattle, identifier: str) -> float | None:
+    """Return a Pokemon's HP fraction before the current line, or None if unresolved."""
+    try:
+        return battle.get_pokemon(identifier).current_hp_fraction
+    except (AssertionError, IndexError, KeyError, ValueError):
+        pass
+
+    if ":" in identifier:
+        clean_id = identifier.split(":", 1)[-1].strip()
+        try:
+            return battle.get_pokemon(clean_id).current_hp_fraction
+        except (AssertionError, IndexError, KeyError, ValueError):
+            pass
+
+    return None
 
 
 def pending_events(battle: DoubleBattle) -> tuple[EventRecord, ...]:

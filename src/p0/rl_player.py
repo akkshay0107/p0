@@ -33,8 +33,10 @@ from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.source import TeamSource
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
+from p0.training.utils import default_device
 
 DEFAULT_BATTLE_FORMAT = FORMAT.bo3_format
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -156,7 +158,7 @@ class RLPlayer(TeamPlayerMixin, Player):
         poke_env_patches.install(self.logger)
         # Showdown's configured Bo3 format uses Force Open Team Sheets, so there
         # is no accept/reject command to send during battle creation.
-        setattr(self.ps_client, "_p0_force_open_team_sheet", True)
+        poke_env_patches.enable_forced_open_team_sheet(self)
         self.policy = policy
         self.observation_builder = observation_builder
 
@@ -164,10 +166,8 @@ class RLPlayer(TeamPlayerMixin, Player):
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
 
         self.top_p = top_p
-        self._memory_model_id = id(policy)
-        self._empty_history_tensor = torch.zeros((1, 0, policy.d_model), device=policy.device)
         self._battle_histories: dict[str, _LiveBattleHistory] = {}
-        self._series_store = SeriesTokenStore(policy.d_model)
+        self.invalidate_memory_for_model_reload()
         self._series_by_opponent: dict[str, _LiveSeriesState] = {}
         self._series_by_battle: dict[str, _LiveSeriesState] = {}
         self._series_sequence = 0
@@ -305,11 +305,8 @@ class RLPlayer(TeamPlayerMixin, Player):
 
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
-        key = self._battle_key(battle)
-        self._battle_histories.pop(key, None)
-        action = self._get_action(battle)
-        order = action_to_order(action, battle)
-        return order.message
+        self._battle_histories.pop(self._battle_key(battle), None)
+        return action_to_order(self._get_action(battle), battle).message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
         if not isinstance(battle, DoubleBattle):
@@ -334,9 +331,8 @@ class RLPlayer(TeamPlayerMixin, Player):
                     self.observation_builder.build(view).unsqueeze(0).to(self.policy.device),
                     mask.to(self.policy.device),
                 )
-            history.append(encoded.local_history_token[0], self.policy.device)
-            values = history.complete_values(self.policy.device)
-            with torch.no_grad():
+                history.append(encoded.local_history_token[0], self.policy.device)
+                values = history.complete_values(self.policy.device)
                 values_mask = torch.ones(values.shape[:2], dtype=torch.bool, device=values.device)
                 new_tokens = self.policy.series(values, values_mask)[0]
             # SeriesTokenStore synchronously detaches the completed summary to
@@ -360,9 +356,6 @@ class RLPlayer(TeamPlayerMixin, Player):
         )
 
 
-LOGGER = logging.getLogger(__name__)
-
-
 def load_player_policy(
     checkpoint_path: Path | None,
     allow_random_init: bool = False,
@@ -379,17 +372,14 @@ def load_player_policy(
     Returns:
         Evaluated, compiled policy network ready for inference.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
 
     if checkpoint_path is None:
         if not allow_random_init:
             raise ValueError("A checkpoint is required unless random init is explicitly allowed.")
 
         LOGGER.warning("Starting bot with randomly initialized policy weights.")
-        resources = default_runtime_resources()
-        policy = build_policy(ModelConfig.baseline(), resources).to(device)
-        policy.eval()
-        return policy
+        return build_policy(ModelConfig.baseline(), default_runtime_resources()).to(device).eval()
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")

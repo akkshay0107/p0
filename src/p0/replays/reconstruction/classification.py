@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from types import MappingProxyType
 from typing import Mapping
 
@@ -48,35 +49,8 @@ class EventRule:
             raise ValueError("EventRule.effect_argument must be -1 or nonnegative when present")
 
 
-def _no_state_change(
-    minimum: int,
-    maximum: int | None = None,
-    *,
-    required: tuple[int, ...] = (),
-) -> EventRule:
-    return EventRule(
-        EventClassification.NO_STATE_CHANGE,
-        minimum,
-        maximum,
-        required_nonempty=required,
-    )
-
-
-def _boundary(
-    minimum: int,
-    maximum: int | None = None,
-    *,
-    required: tuple[int, ...] = (),
-) -> EventRule:
-    return EventRule(
-        EventClassification.BOUNDARY_SIGNAL,
-        minimum,
-        maximum,
-        required_nonempty=required,
-    )
-
-
-def _state(
+def _rule(
+    classification: EventClassification,
     minimum: int,
     maximum: int | None = None,
     *,
@@ -86,7 +60,7 @@ def _state(
     effect: int | None = None,
 ) -> EventRule:
     return EventRule(
-        EventClassification.PUBLIC_STATE,
+        classification,
         minimum,
         maximum,
         required_nonempty=required,
@@ -96,24 +70,10 @@ def _state(
     )
 
 
-def _action(
-    minimum: int,
-    maximum: int | None = None,
-    *,
-    required: tuple[int, ...] = (),
-    pokemon_refs: tuple[int, ...] = (),
-    optional_pokemon_refs: tuple[int, ...] = (),
-    effect: int | None = None,
-) -> EventRule:
-    return EventRule(
-        EventClassification.ACTION_EXECUTION,
-        minimum,
-        maximum,
-        required_nonempty=required,
-        required_pokemon_refs=pokemon_refs,
-        optional_pokemon_refs=optional_pokemon_refs,
-        effect_argument=effect,
-    )
+_no_state_change = partial(_rule, EventClassification.NO_STATE_CHANGE)
+_boundary = partial(_rule, EventClassification.BOUNDARY_SIGNAL)
+_state = partial(_rule, EventClassification.PUBLIC_STATE)
+_action = partial(_rule, EventClassification.ACTION_EXECUTION)
 
 
 _RULES = {

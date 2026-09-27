@@ -201,19 +201,20 @@ def _observation_layout_descriptor() -> dict[str, object]:
             "slot_legality_unknown": NUM_IDX_SLOT_LEGALITY_UNKNOWN,
         },
         "enum_encodings": {
-            "token_type": {member.name.lower(): member.value for member in TokenType},
-            "side_id": {member.name.lower(): member.value for member in SideId},
-            "identity_knownness": {
-                member.name.lower(): member.value for member in IdentityKnownness
-            },
-            "stat_provenance": {member.name.lower(): member.value for member in StatProvenance},
-            "presence_status": {member.name.lower(): member.value for member in PresenceStatus},
-            "mechanic_state": {member.name.lower(): member.value for member in MechanicState},
-            "effect_namespace": {member.name.lower(): member.value for member in EffectNamespace},
-            "counter_kind": {member.name.lower(): member.value for member in CounterKind},
-            "event_kind": {member.name.lower(): member.value for member in EventKind},
-            "event_position": {member.name.lower(): member.value for member in EventPosition},
-            "event_detail": {member.name.lower(): member.value for member in EventDetail},
+            key: {member.name.lower(): member.value for member in encoding}
+            for key, encoding in (
+                ("token_type", TokenType),
+                ("side_id", SideId),
+                ("identity_knownness", IdentityKnownness),
+                ("stat_provenance", StatProvenance),
+                ("presence_status", PresenceStatus),
+                ("mechanic_state", MechanicState),
+                ("effect_namespace", EffectNamespace),
+                ("counter_kind", CounterKind),
+                ("event_kind", EventKind),
+                ("event_position", EventPosition),
+                ("event_detail", EventDetail),
+            )
         },
     }
 

@@ -244,19 +244,25 @@ def _validate_existing_build(
     return ShardBuildResult(root / "manifest.json", manifest)
 
 
+# Per-decision scalar columns in shard order; action masks are stacked separately.
+_SCALAR_DTYPES = {
+    "mask_provenance": torch.long,
+    "label_kind": torch.long,
+    "label_confidence": torch.float32,
+    "loss_mask": torch.float32,
+    "decision_type": torch.long,
+    "exact_action": torch.long,
+    "candidate_values": torch.long,
+    "candidate_offsets": torch.long,
+    "outcome": torch.float32,
+}
+
+
 def _empty_scalar_values() -> dict[str, list[Any]]:
-    return {
-        "action_mask": [],
-        "mask_provenance": [],
-        "label_kind": [],
-        "label_confidence": [],
-        "loss_mask": [],
-        "decision_type": [],
-        "exact_action": [],
-        "candidate_values": [],
-        "candidate_offsets": [0],
-        "outcome": [],
-    }
+    values: dict[str, list[Any]] = {"action_mask": []}
+    values.update((name, []) for name in _SCALAR_DTYPES)
+    values["candidate_offsets"].append(0)
+    return values
 
 
 def _replay_observation(
@@ -280,15 +286,13 @@ def _replay_observation(
 def _perspective_tensors(
     game: CompiledGame,
     perspective: ProjectedPerspective,
-    *,
     builder: ObservationBuilder,
-    stat_estimates: tuple[ReplayStatValue, ...],
 ) -> tuple[dict[str, list[Any]], dict[str, list[Any]], StructuredObservation]:
     """Convert a single perspective's snapshots into observation and scalar lists."""
     fields = {name: [] for name, _, _ in observation_field_specs()}
     values = _empty_scalar_values()
 
-    stat_overrides = {estimate.member_id: estimate.values for estimate in stat_estimates}
+    stat_overrides = {estimate.member_id: estimate.values for estimate in game.stat_estimates}
     if len(stat_overrides) != 12:
         raise ValueError("Replay stats must contain one result for every roster member")
 
@@ -326,23 +330,11 @@ def _tensorize_values(
 ) -> dict[str, torch.Tensor]:
     """Stack scalar lists and fields into batched PyTorch tensors for a single perspective."""
     tensors = {name: torch.stack(items) for name, items in fields.items()}
-
+    tensors["action_mask"] = torch.stack(values["action_mask"])
     tensors.update(
-        {
-            "action_mask": torch.stack(values["action_mask"]),
-            "mask_provenance": torch.tensor(values["mask_provenance"], dtype=torch.long),
-            "label_kind": torch.tensor(values["label_kind"], dtype=torch.long),
-            "label_confidence": torch.tensor(values["label_confidence"], dtype=torch.float32),
-            "loss_mask": torch.tensor(values["loss_mask"], dtype=torch.float32),
-            "decision_type": torch.tensor(values["decision_type"], dtype=torch.long),
-            "exact_action": torch.tensor(values["exact_action"], dtype=torch.long),
-            "candidate_values": torch.tensor(values["candidate_values"], dtype=torch.long).reshape(
-                -1, 2
-            ),
-            "candidate_offsets": torch.tensor(values["candidate_offsets"], dtype=torch.long),
-            "outcome": torch.tensor(values["outcome"], dtype=torch.float32),
-        }
+        (name, torch.tensor(values[name], dtype=dtype)) for name, dtype in _SCALAR_DTYPES.items()
     )
+    tensors["candidate_values"] = tensors["candidate_values"].reshape(-1, 2)
     return tensors
 
 
@@ -505,89 +497,9 @@ def write_tensor_shards(
     diagnostics["accepted_games"] -= len(result.games) - len(published_games)
     diagnostics["rejected_games"] += sum(len(memberships[series]) for series in unpublished_series)
     diagnostics["rejected_non_contiguous_game_numbers"] += len(unpublished_series)
-    current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
-    current_decisions = 0
-    shard_index = 0
-
-    def flush() -> None:
-        nonlocal current_games, current_decisions, shard_index
-        if not current_games:
-            return
-        field_values = {name: [] for name, _, _ in observation_field_specs()}
-        final_observations: list[StructuredObservation] = []
-        scalar_values = _empty_scalar_values()
-        game_offsets = [0]
-        series_offsets = [0]
-        summaries: list[dict[str, Any]] = []
-        last_series_id: str | None = None
-        for game, perspective in current_games:
-            fields, values, final_observation = _perspective_tensors(
-                game,
-                perspective,
-                builder=builder,
-                stat_estimates=game.stat_estimates,
-            )
-            final_observations.append(final_observation)
-
-            if last_series_id is not None and game.series_id != last_series_id:
-                series_offsets.append(game_offsets[-1])
-            last_series_id = game.series_id
-            for name in field_values:
-                field_values[name].extend(fields[name])
-            candidate_base = len(scalar_values["candidate_values"])
-            for name in scalar_values:
-                if name != "candidate_offsets":
-                    scalar_values[name].extend(values[name])
-            scalar_values["candidate_offsets"].extend(
-                candidate_base + offset for offset in values["candidate_offsets"][1:]
-            )
-            game_offsets.append(len(scalar_values["loss_mask"]))
-            summaries.append(
-                {
-                    "series_id": game.series_id,
-                    "game_number": game.game_number,
-                    "player": perspective.player,
-                    "canonical_player": game.canonical_player(perspective.player),
-                    "source_replay_id": game.replay_id,
-                    "outcome_valid": bool(
-                        game.document.outcome.winner in (0, 1)
-                        or any(
-                            len(line.parts) >= 2 and line.parts[1] == "tie"
-                            for line in game.document.protocol_lines
-                        )
-                    ),
-                }
-            )
-        series_offsets.append(game_offsets[-1])
-        tensors = _tensorize_values(field_values, scalar_values)
-        tensors.update(
-            {
-                f"{FINAL_OBSERVATION_PREFIX}{name}": tensor
-                for name, tensor in zip(
-                    StructuredObservation._FIELD_NAMES,
-                    StructuredObservation.stack(final_observations).tensors(),
-                    strict=True,
-                )
-            }
-        )
-        tensors["game_offsets"] = torch.tensor(game_offsets, dtype=torch.long)
-        tensors["series_offsets"] = torch.tensor(series_offsets, dtype=torch.long)
-        entries.append(
-            _save_shard(
-                root,
-                shard_index,
-                tensors,
-                summaries,
-                runtime_hash,
-                dataset_hash,
-            )
-        )
-        shard_index += 1
-        current_games = []
-        current_decisions = 0
-
     try:
-        current_series_id = None
+        current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
+        current_decisions = 0
         for game in sorted(
             published_games,
             key=lambda item: (item.series_id, item.game_number, item.replay_id),
@@ -595,19 +507,26 @@ def write_tensor_shards(
             game_items = [(game, perspective) for perspective in game.perspectives]
             game_decisions = sum(len(perspective.decisions) for _, perspective in game_items)
 
-            # Flush only at series boundaries to prevent temporal logic corruption
+            # Split only at series boundaries so series memory stays within one shard.
             if (
                 current_games
-                and (game.series_id != current_series_id)
-                and (current_decisions + game_decisions > max_decisions_per_shard)
+                and game.series_id != current_games[-1][0].series_id
+                and current_decisions + game_decisions > max_decisions_per_shard
             ):
-                flush()
+                entries.append(
+                    _write_shard(
+                        root, len(entries), current_games, builder, runtime_hash, dataset_hash
+                    )
+                )
+                current_games, current_decisions = [], 0
 
             current_games.extend(game_items)
             current_decisions += game_decisions
-            current_series_id = game.series_id
 
-        flush()
+        if current_games:
+            entries.append(
+                _write_shard(root, len(entries), current_games, builder, runtime_hash, dataset_hash)
+            )
         artifact_hashes = {entry.filename: entry.sha256 for entry in entries}
         source_games = diagnostics.get("replays", len(result.games)) + len(rejected)
         timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -637,6 +556,72 @@ def write_tensor_shards(
     except BaseException:
         shutil.rmtree(root, ignore_errors=True)
         raise
+
+
+def _write_shard(
+    root: Path,
+    index: int,
+    games: list[tuple[CompiledGame, ProjectedPerspective]],
+    builder: ObservationBuilder,
+    runtime_hash: str,
+    dataset_hash: str,
+) -> ShardIndexEntry:
+    """Tensorize the given game perspectives and save them as one shard."""
+    field_values = {name: [] for name, _, _ in observation_field_specs()}
+    final_observations: list[StructuredObservation] = []
+    scalar_values = _empty_scalar_values()
+    game_offsets = [0]
+    series_offsets = [0]
+    summaries: list[dict[str, Any]] = []
+    last_series_id: str | None = None
+    for game, perspective in games:
+        fields, values, final_observation = _perspective_tensors(game, perspective, builder)
+        final_observations.append(final_observation)
+
+        if last_series_id is not None and game.series_id != last_series_id:
+            series_offsets.append(game_offsets[-1])
+        last_series_id = game.series_id
+        for name in field_values:
+            field_values[name].extend(fields[name])
+        candidate_base = len(scalar_values["candidate_values"])
+        for name in scalar_values:
+            if name != "candidate_offsets":
+                scalar_values[name].extend(values[name])
+        scalar_values["candidate_offsets"].extend(
+            candidate_base + offset for offset in values["candidate_offsets"][1:]
+        )
+        game_offsets.append(len(scalar_values["loss_mask"]))
+        summaries.append(
+            {
+                "series_id": game.series_id,
+                "game_number": game.game_number,
+                "player": perspective.player,
+                "canonical_player": game.canonical_player(perspective.player),
+                "source_replay_id": game.replay_id,
+                "outcome_valid": bool(
+                    game.document.outcome.winner in (0, 1)
+                    or any(
+                        len(line.parts) >= 2 and line.parts[1] == "tie"
+                        for line in game.document.protocol_lines
+                    )
+                ),
+            }
+        )
+    series_offsets.append(game_offsets[-1])
+    tensors = _tensorize_values(field_values, scalar_values)
+    tensors.update(
+        {
+            f"{FINAL_OBSERVATION_PREFIX}{name}": tensor
+            for name, tensor in zip(
+                StructuredObservation._FIELD_NAMES,
+                StructuredObservation.stack(final_observations).tensors(),
+                strict=True,
+            )
+        }
+    )
+    tensors["game_offsets"] = torch.tensor(game_offsets, dtype=torch.long)
+    tensors["series_offsets"] = torch.tensor(series_offsets, dtype=torch.long)
+    return _save_shard(root, index, tensors, summaries, runtime_hash, dataset_hash)
 
 
 def _count_label(counters: Counter[str], kind: int) -> None:
@@ -733,11 +718,7 @@ def _quality_reasons(
             if perspective.diagnostics.counters.get(name, 0):
                 reasons.add(reason)
 
-        for snapshot, decision in zip(
-            perspective.snapshots,
-            perspective.decisions,
-            strict=True,
-        ):
+        for decision in perspective.decisions:
             evidence = decision.evidence
             candidate_count = len(evidence.candidates)
             if evidence.label_kind is LabelKind.EXACT and candidate_count != 1:
@@ -773,7 +754,7 @@ def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
         "accepted_games",
         "rejected_games",
     )
-    counters = Counter({k: 0 for k in zero_keys})
+    counters = Counter({key: 0 for key in zero_keys})
     counters.update(
         {
             "replays": replays,
@@ -989,15 +970,13 @@ def compile_documents(
                 )
             )
 
-    if chunksize is None and jobs:
-        chunksize = max(1, len(jobs) // ((os.cpu_count() or 1) * 4))
+    cpu_count = os.cpu_count() or 1
+    if chunksize is None:
+        chunksize = max(1, len(jobs) // (cpu_count * 4))
 
-    if not jobs:
-        results: Iterable[tuple[CompiledGame | None, ReplayRejectionCategory | None]] = ()
-    elif len(jobs) <= (os.cpu_count() or 1) or (chunksize is not None and chunksize <= 0):
+    if len(jobs) <= cpu_count or chunksize <= 0:
         results = [_compile_worker(job) for job in jobs]
     else:
-        assert chunksize is not None
         with concurrent.futures.ProcessPoolExecutor(
             mp_context=PROCESS_CONTEXT,
             initializer=_initialize_compile_worker,
@@ -1038,12 +1017,11 @@ def compile_documents(
         games.extend(sorted(retained, key=lambda game: game.game_number))
         for game in retained:
             for estimate in game.stat_estimates:
-                if isinstance(estimate, ReplayStatValue):
-                    if estimate.provenance == "IMPUTED":
-                        counters["imputations"] += 1
-                    elif estimate.provenance == "UNKNOWN":
-                        counters["imputation_unknown"] += 1
-                    confidence_sum += estimate.confidence
+                if estimate.provenance == "IMPUTED":
+                    counters["imputations"] += 1
+                else:
+                    counters["imputation_unknown"] += 1
+                confidence_sum += estimate.confidence
             counters["accepted_games"] += 1
             _measure_game(counters, game)
 
@@ -1116,13 +1094,6 @@ def compile_to_shards(
     )
 
 
-def write_compilation(result: CompilationResult, path: str | Path) -> None:
-    """Write a canonical JSON report suitable for deterministic regression checks."""
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(orjson.dumps(result.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n")
-
-
 __all__ = [
     "CompilationMetrics",
     "CompilationResult",
@@ -1132,5 +1103,4 @@ __all__ = [
     "compile_payloads",
     "compile_to_shards",
     "write_tensor_shards",
-    "write_compilation",
 ]

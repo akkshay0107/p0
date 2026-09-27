@@ -284,6 +284,16 @@ class SpatialEventRecorder:
             return
         self.records.append(record)
 
+    def _chained_source(self, of_source: int, cause: str, target: int) -> int:
+        """Return who caused a boost or failure: [of], the holder's own cause, an ability, or the move."""
+        if of_source != EventPosition.NONE:
+            return of_source
+        if cause:
+            return target if cause.startswith(("item: ", "ability: ")) else EventPosition.NONE
+        if self._ability_source != EventPosition.NONE:
+            return self._ability_source
+        return self._move_source
+
     def apply_line(
         self,
         parts: Sequence[str],
@@ -400,14 +410,7 @@ class SpatialEventRecorder:
 
         elif tag in ("-boost", "-unboost") and len(parts) >= 5:
             target = _position(parts[2], role)
-            if of_source != EventPosition.NONE:
-                source = of_source
-            elif cause:
-                source = target if cause.startswith(("item: ", "ability: ")) else EventPosition.NONE
-            elif self._ability_source != EventPosition.NONE:
-                source = self._ability_source
-            else:
-                source = self._move_source
+            source = self._chained_source(of_source, cause, target)
             if not cause:
                 ability_id = self._ability_id
 
@@ -456,13 +459,7 @@ class SpatialEventRecorder:
 
         elif tag in ("-fail", "-immune") and len(parts) >= 3:
             target = _position(parts[2], role)
-            source = self._move_source
-            if of_source != EventPosition.NONE:
-                source = of_source
-            elif cause:
-                source = target if cause.startswith(("item: ", "ability: ")) else EventPosition.NONE
-            elif self._ability_source != EventPosition.NONE:
-                source = self._ability_source
+            source = self._chained_source(of_source, cause, target)
             if not cause:
                 ability_id = self._ability_id
             self._add(

@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 
 from p0.model.architecture_contract import (
     HISTORY_WINDOW,
@@ -27,6 +27,15 @@ from p0.training.utils import OptimizationPrecision, select_optimization_precisi
 
 LOGGER = logging.getLogger(__name__)
 KL_METRIC_INDEX = 4
+_SUMMARY_METRICS = (
+    "policy_loss",
+    "value_loss",
+    "normalized_entropy",
+    "magnet_kl",
+    "kl_divergence",
+    "grad_norm",
+    "clip_fraction",
+)
 
 
 def magnet_kl_per_step(live_logits: torch.Tensor, magnet_logits: torch.Tensor) -> torch.Tensor:
@@ -156,14 +165,7 @@ def _compute_magnet_logits(
     action_masks = torch.cat([episode.action_masks for episode in episodes], dim=0)
     actions = torch.cat([episode.actions for episode in episodes], dim=0)
 
-    with (
-        torch.inference_mode(),
-        autocast(
-            device_type=device.type,
-            enabled=precision.autocast,
-            dtype=precision.dtype,
-        ),
-    ):
+    with torch.inference_mode(), precision.autocast_context(device):
         encoded = magnet.policy.encode(observations, action_masks)
         memory = _build_memory_inputs(magnet.policy, encoded, episodes, device)
         logits = magnet.policy.action_logits(
@@ -200,7 +202,7 @@ def _run_batched_ppo(
     device: torch.device,
     precision: OptimizationPrecision,
     alpha: float,
-    magnet_cache: dict[int, torch.Tensor] | None = None,
+    magnet_cache: dict[int, torch.Tensor],
 ) -> tuple[torch.Tensor, Tensor, int]:
     """
     Compute PPO losses and metrics for one minibatch.
@@ -228,22 +230,9 @@ def _run_batched_ppo(
     advantages = torch.cat([ep.advantages for ep in episodes])
     returns = torch.cat([ep.returns for ep in episodes])
 
-    if magnet_cache is None:
-        magnet_logits = _compute_magnet_logits(episodes, magnet, device, precision)
-    else:
-        magnet_logits = _cached_magnet_logits(
-            episodes,
-            magnet,
-            device,
-            precision,
-            magnet_cache,
-        )
+    magnet_logits = _cached_magnet_logits(episodes, magnet, device, precision, magnet_cache)
 
-    with autocast(
-        device_type=device.type,
-        enabled=precision.autocast,
-        dtype=precision.dtype,
-    ):
+    with precision.autocast_context(device):
         all_enc = policy.encode(all_obs, all_action_masks)
         live_memory = _build_memory_inputs(policy, all_enc, episodes, device)
         out = policy.evaluate(
@@ -416,15 +405,14 @@ def ppo_update(
                 )
                 scale_before_update = scaler.get_scale()
                 grad_norm_finite = bool(torch.isfinite(grad_norm).item())
-                if not grad_norm_finite:
+                if grad_norm_finite:
+                    tot_grad_norm += grad_norm.detach()
+                    scaler.step(optimizer)
+                else:
                     LOGGER.warning(
                         "Non-finite grad norm detected; discarding this step "
                         f"(loss scale={scale_before_update:.0f})"
                     )
-                else:
-                    tot_grad_norm += grad_norm.detach()
-                if grad_norm_finite:
-                    scaler.step(optimizer)
                 # GradScaler.update consumes the finite check recorded by
                 # unscale_, including the rejected norm-overflow case.
                 scaler.update()
@@ -439,13 +427,7 @@ def ppo_update(
 
     if tot_steps == 0:
         return {
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "normalized_entropy": 0.0,
-            "magnet_kl": 0.0,
-            "kl_divergence": 0.0,
-            "grad_norm": 0.0,
-            "clip_fraction": 0.0,
+            **dict.fromkeys(_SUMMARY_METRICS, 0.0),
             "explained_variance": 0.0,
             "optimizer_updates": 0,
         }
@@ -458,24 +440,8 @@ def ppo_update(
         .cpu()
         .tolist()
     )
-    (
-        policy_loss,
-        value_loss,
-        normalized_entropy,
-        magnet_kl,
-        kl_divergence,
-        grad_norm_value,
-        clip_fraction,
-    ) = summary
-
     return {
-        "policy_loss": policy_loss,
-        "value_loss": value_loss,
-        "normalized_entropy": normalized_entropy,
-        "magnet_kl": magnet_kl,
-        "kl_divergence": kl_divergence,
-        "grad_norm": grad_norm_value,
-        "clip_fraction": clip_fraction,
+        **dict(zip(_SUMMARY_METRICS, summary, strict=True)),
         "explained_variance": explained_var,
         "optimizer_updates": num_updates,
     }

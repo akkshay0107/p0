@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Iterable, Mapping, NamedTuple
 
@@ -91,17 +91,16 @@ def _opponent_imprison_active(state: ReplayBattleState, perspective: int) -> boo
 
 
 def _target_codes(move_target: str, actor_slot: int) -> tuple[int, ...]:
-    if move_target in _SELF_TARGETS:
-        return (0,)
+    ally, own = (-2, -1) if actor_slot == 0 else (-1, -2)
     if move_target in _ALLY_TARGETS:
-        return (-2,) if actor_slot == 0 else (-1,)
+        return (ally,)
     if move_target in _ALLY_OR_SELF_TARGETS:
         # Live orders name the user by its own slot, like poke-env: ally first, then self.
-        return (-2, -1) if actor_slot == 0 else (-1, -2)
+        return (ally, own)
     if move_target in _FOE_TARGETS:
         return (1, 2)
     if move_target in _NORMAL_TARGETS:
-        return ((-2,) if actor_slot == 0 else (-1,)) + (1, 2)
+        return (ally, 1, 2)
     return (0,)
 
 
@@ -186,19 +185,6 @@ class DecisionReconstruction:
             raise ValueError("Decision windows must be ordered")
 
 
-def _diagnostic(event: ResolvedProtocolEvent, reason: str) -> ReplayEventDiagnostic:
-    parsed = event.event
-    return ReplayEventDiagnostic(
-        replay_id=parsed.replay_id,
-        line_index=parsed.line_index,
-        tag=parsed.tag,
-        normalized_effect="" if parsed.effect is None else parsed.effect.normalized,
-        normalized_cause="" if parsed.cause is None else parsed.cause.normalized,
-        raw_line=parsed.raw_line,
-        reason=reason,
-    )
-
-
 def _reference(
     event: ResolvedProtocolEvent,
     argument_index: int,
@@ -258,9 +244,6 @@ def _update_blocks(
     events: tuple[ResolvedProtocolEvent, ...],
 ) -> tuple[tuple[int, int], ...]:
     """Split the resolved stream at Showdown's bare update separators."""
-    if not events:
-        return ()
-
     blocks: list[tuple[int, int]] = []
     start = 0
     for event in events:
@@ -461,21 +444,21 @@ def _observed_actions(
                 slot = actor.pokemon_ref.active_slot
                 if actor.pokemon_ref.side.side_index == perspective and observed[slot] is None:
                     encored_before_action.add((actor.pokemon_ref.side, slot))
-        if parsed.tag == "-mega":
-            actor = _reference(event, 0)
-            if actor is not None and actor.member_id is not None:
-                slot = actor.pokemon_ref.active_slot
-                if slot is not None:
-                    mega_slots.add((actor.pokemon_ref.side, slot))
-        elif parsed.tag == "-singleturn" and any(
-            normalize_showdown_id(argument).startswith("moveinstruct")
-            for argument in parsed.arguments
+        if parsed.tag == "-mega" or (
+            parsed.tag == "-singleturn"
+            and any(
+                normalize_showdown_id(argument).startswith("moveinstruct")
+                for argument in parsed.arguments
+            )
         ):
             actor = _reference(event, 0)
-            if actor is not None and actor.member_id is not None:
-                slot = actor.pokemon_ref.active_slot
-                if slot is not None:
-                    generated_slots.add((actor.pokemon_ref.side, slot))
+            if (
+                actor is not None
+                and actor.member_id is not None
+                and actor.pokemon_ref.active_slot is not None
+            ):
+                marked_slots = mega_slots if parsed.tag == "-mega" else generated_slots
+                marked_slots.add((actor.pokemon_ref.side, actor.pokemon_ref.active_slot))
 
         if parsed.tag not in _ACTION_TAGS:
             continue
@@ -734,12 +717,10 @@ def _decision_for_window(
             dex=dex,
             mega_rules=mega_rules,
         )
-        tags = observed[2]
-        unknown = not any(action is not None for action in observed[:2])
     else:
-        pre_state = None if window.start_line_index == 0 else snapshots[window.start_line_index - 1]
-        if pre_state is None:
+        if window.start_line_index == 0:
             raise ValueError("Policy decision window has no pre-decision state")
+        pre_state = snapshots[window.start_line_index - 1]
         observed = _observed_actions(window_events, pre_state, perspective, animation_targets)
         view = build_decision_view(
             pre_state,
@@ -750,22 +731,22 @@ def _decision_for_window(
             dex=dex,
             mega_rules=mega_rules,
         )
-        observed_slots = list(observed[:2])
-        tags = observed[2]
         if window.decision_type is DecisionType.FORCED_SWITCH and any(
-            action is not None for action in observed_slots
+            action is not None for action in observed[:2]
         ):
-            for slot, action in enumerate(observed_slots):
-                if action is None:
-                    observed_slots[slot] = ObservedAction(PASS_ACTION, tag="implicit_pass")
-            observed = (observed_slots[0], observed_slots[1], tags)
-            tags = tuple(dict.fromkeys((*tags, "implicit_pass")))
-        unknown = not any(action is not None for action in observed[:2])
+            implicit_pass = ObservedAction(PASS_ACTION, tag="implicit_pass")
+            observed = (
+                observed[0] or implicit_pass,
+                observed[1] or implicit_pass,
+                tuple(dict.fromkeys((*observed[2], "implicit_pass"))),
+            )
 
+    first, second, tags = observed
+    unknown = first is None and second is None
     evidence = extract_action_evidence(
         EvidenceRequest(
             view=view,
-            slots=(observed[0], observed[1]),
+            slots=(first, second),
             tags=tags,
             max_candidates=max_candidates,
             unknown=unknown,
@@ -834,14 +815,12 @@ def reconstruct_decisions_from_trace(
         try:
             windows = infer_decision_windows(event_tuple)
         except ValueError as exc:
-            first_event = event_tuple[0]
-            diagnostic = _diagnostic(first_event, str(exc))
             return DecisionReconstruction(
                 document.metadata.replay_id,
                 perspective,
                 (),
                 (),
-                (diagnostic,),
+                (event_tuple[0].event.rejection(str(exc)),),
             )
     records: list[DecisionRecord] = []
     for window in windows:
@@ -861,39 +840,13 @@ def reconstruct_decisions_from_trace(
         if record is not None:
             records.append(record)
 
-    decisions = tuple(
-        DecisionRecord(
-            decision_index=index,
-            player=record.player,
-            decision_type=record.decision_type,
-            pre_line_index=record.pre_line_index,
-            post_line_index=record.post_line_index,
-            evidence=record.evidence,
-        )
-        for index, record in enumerate(records)
-    )
+    decisions = tuple(replace(record, decision_index=index) for index, record in enumerate(records))
     return DecisionReconstruction(
         document.metadata.replay_id,
         perspective,
         windows,
         decisions,
     )
-
-
-def reconstruct_replay_decisions(
-    document: ReplayDocument,
-    *,
-    perspective: int,
-    max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
-) -> DecisionReconstruction:
-    """Resolve and reconstruct one replay perspective."""
-    return _reconstruct_perspectives(
-        document,
-        (perspective,),
-        max_candidates=max_candidates,
-        dex=dex,
-    )[0]
 
 
 def reconstruct_replay_decisions_both(
@@ -903,49 +856,18 @@ def reconstruct_replay_decisions_both(
     dex: Mapping[str, Any] | None = None,
 ) -> tuple[DecisionReconstruction, DecisionReconstruction]:
     """Resolve and reduce once, then reconstruct both player perspectives."""
-    results = _reconstruct_perspectives(
-        document,
-        (0, 1),
-        max_candidates=max_candidates,
-        dex=dex,
-    )
-    return results[0], results[1]
-
-
-def _reconstruct_perspectives(
-    document: ReplayDocument,
-    perspectives: tuple[int, ...],
-    *,
-    max_candidates: int,
-    dex: Mapping[str, Any] | None,
-) -> tuple[DecisionReconstruction, ...]:
-    if not perspectives or any(perspective not in (0, 1) for perspective in perspectives):
-        raise ValueError("perspective must be 0 or 1")
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
+    replay_id = document.metadata.replay_id
     runtime_dex = default_runtime_resources().dex if dex is None else dex
     resolved = resolve_replay_events(document, dex=runtime_dex)
     if resolved.diagnostics:
-        return tuple(
-            DecisionReconstruction(
-                document.metadata.replay_id,
-                perspective,
-                (),
-                (),
-                resolved.diagnostics,
-            )
-            for perspective in perspectives
-        )
-    state = reduce_replay_state(
-        document.metadata.replay_id,
-        document.ots,
-        resolved.events,
-        dex=runtime_dex,
-    )
+        return _rejected_perspectives(replay_id, resolved.diagnostics)
+    state = reduce_replay_state(replay_id, document.ots, resolved.events, dex=runtime_dex)
 
     results: list[DecisionReconstruction] = []
     windows: tuple[DecisionWindow, ...] | None = None
-    for perspective in perspectives:
+    for perspective in (0, 1):
         result = reconstruct_decisions_from_trace(
             document,
             resolved.events,
@@ -955,20 +877,20 @@ def _reconstruct_perspectives(
             dex=runtime_dex,
             windows=windows,
         )
-        results.append(result)
         if result.diagnostics:
-            return tuple(
-                DecisionReconstruction(
-                    document.metadata.replay_id,
-                    value,
-                    (),
-                    (),
-                    result.diagnostics,
-                )
-                for value in perspectives
-            )
+            return _rejected_perspectives(replay_id, result.diagnostics)
+        results.append(result)
         windows = result.windows
-    return tuple(results)
+    return results[0], results[1]
+
+
+def _rejected_perspectives(
+    replay_id: str, diagnostics: tuple[ReplayEventDiagnostic, ...]
+) -> tuple[DecisionReconstruction, DecisionReconstruction]:
+    return (
+        DecisionReconstruction(replay_id, 0, (), (), diagnostics),
+        DecisionReconstruction(replay_id, 1, (), (), diagnostics),
+    )
 
 
 __all__ = [
@@ -978,6 +900,5 @@ __all__ = [
     "build_decision_view",
     "infer_decision_windows",
     "reconstruct_decisions_from_trace",
-    "reconstruct_replay_decisions",
     "reconstruct_replay_decisions_both",
 ]

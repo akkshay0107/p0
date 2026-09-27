@@ -22,34 +22,28 @@ def _positive_ints(obj: object, *names: str) -> None:
             raise ValueError(f"{type(obj).__name__}.{name} must be a positive integer")
 
 
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _positive(obj: object, *names: str) -> None:
     for name in names:
         val = getattr(obj, name)
-        if (
-            not isinstance(val, (int, float))
-            or isinstance(val, bool)
-            or not math.isfinite(val)
-            or val <= 0
-        ):
+        if not _is_finite_number(val) or val <= 0:
             raise ValueError(f"{type(obj).__name__}.{name} must be greater than zero")
 
 
 def _non_negative(obj: object, *names: str) -> None:
     for name in names:
         val = getattr(obj, name)
-        if (
-            not isinstance(val, (int, float))
-            or isinstance(val, bool)
-            or not math.isfinite(val)
-            or val < 0
-        ):
+        if not _is_finite_number(val) or val < 0:
             raise ValueError(f"{type(obj).__name__}.{name} must not be negative")
 
 
 def _unit_interval(obj: object, *names: str) -> None:
     for name in names:
         val = getattr(obj, name)
-        if not isinstance(val, (int, float)) or isinstance(val, bool) or not 0 <= val <= 1:
+        if not _is_finite_number(val) or not 0 <= val <= 1:
             raise ValueError(f"{type(obj).__name__}.{name} must be between 0 and 1")
 
 
@@ -236,20 +230,20 @@ def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root)
     return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
+def _resolve_fields(section: Any, base: Path, path_field_names: set[str]) -> Any:
+    """Return the config section with its set path fields resolved against base."""
+    updates = {
+        name: _resolve_path(value, base)
+        for name in path_field_names
+        if (value := getattr(section, name)) is not None
+    }
+    return replace(section, **updates)
+
+
 def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
     root = _resolve_path(config.paths.repository_root)
-
-    def _resolve(dc: Any, base: Path, path_field_names: set[str]) -> Any:
-        updates: dict[str, Any] = {}
-        for f in fields(dc):
-            if f.name in path_field_names:
-                val = getattr(dc, f.name)
-                if val is not None:
-                    updates[f.name] = _resolve_path(val, base)
-        return replace(dc, **updates)
-
     path_fields = {f.name for f in fields(ProjectPaths)}
-    paths = _resolve(config.paths, root, path_fields)
+    paths = _resolve_fields(config.paths, root, path_fields)
     bot = replace(
         config.bot,
         checkpoint_path=(
@@ -259,13 +253,13 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
         ),
         team_files=tuple(_resolve_path(p, root) for p in config.bot.team_files),
     )
-    teams = _resolve(config.teams, paths.teams_root, {"all", "reduced"})
-    bc = _resolve(
+    teams = _resolve_fields(config.teams, paths.teams_root, {"all", "reduced"})
+    bc = _resolve_fields(
         config.bc,
         root,
         {"shard_manifest", "split_manifest", "output_dir", "resume_checkpoint"},
     )
-    evaluation = _resolve(config.evaluation, root, {"report_dir"})
+    evaluation = _resolve_fields(config.evaluation, root, {"report_dir"})
 
     return replace(config, paths=paths, bot=bot, teams=teams, bc=bc, evaluation=evaluation)
 

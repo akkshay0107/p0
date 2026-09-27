@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
@@ -184,17 +184,6 @@ def _metadata(
     if not isinstance(winner, str):
         raise ReplayParseError("Replay winner must be a string when present")
 
-    def _optional_int(field: str) -> int | None:
-        candidate = value.get(field)
-        if candidate in (None, ""):
-            return None
-        if isinstance(candidate, bool):
-            raise ReplayInputContractError(f"Replay metadata {field} must be an integer")
-        try:
-            return int(candidate)
-        except (TypeError, ValueError) as exc:
-            raise ReplayInputContractError(f"Replay metadata {field} must be an integer") from exc
-
     return ReplayMetadata(
         replay_id=replay_id,
         format_id=actual_format,
@@ -203,10 +192,22 @@ def _metadata(
         upload_time=_timestamp(value.get("uploadtime", value.get("upload_time"))),
         room_id=room_id,
         parent_room=parent_room,
-        game_number=_optional_int("game_number"),
-        rating=_optional_int("rating"),
-        views=_optional_int("views"),
+        game_number=_optional_int(value, "game_number"),
+        rating=_optional_int(value, "rating"),
+        views=_optional_int(value, "views"),
     )
+
+
+def _optional_int(value: Mapping[str, Any], field: str) -> int | None:
+    candidate = value.get(field)
+    if candidate in (None, ""):
+        return None
+    if isinstance(candidate, bool):
+        raise ReplayInputContractError(f"Replay metadata {field} must be an integer")
+    try:
+        return int(candidate)
+    except (TypeError, ValueError) as exc:
+        raise ReplayInputContractError(f"Replay metadata {field} must be an integer") from exc
 
 
 def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
@@ -441,12 +442,7 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
             )
         if tag in {"message", "-message"}:
             text = "|".join(line.parts[2:]).casefold()
-            if (
-                "timed out" in text
-                or "timeout" in text
-                or "inactive" in text
-                or "inactivity" in text
-            ):
+            if any(word in text for word in ("timed out", "timeout", "inactive", "inactivity")):
                 pending_message_reason = GameEndReason.TIMEOUT
             elif "forfeit" in text or "changing their name" in text or "inappropriate name" in text:
                 pending_message_reason = GameEndReason.FORFEIT
@@ -512,18 +508,7 @@ def _bestof_metadata(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) 
     if parent == metadata.parent_room and game_number == metadata.game_number:
         return metadata
 
-    return ReplayMetadata(
-        replay_id=metadata.replay_id,
-        format_id=metadata.format_id,
-        player_names=metadata.player_names,
-        winner=metadata.winner,
-        upload_time=metadata.upload_time,
-        room_id=metadata.room_id,
-        parent_room=parent,
-        game_number=game_number,
-        rating=metadata.rating,
-        views=metadata.views,
-    )
+    return replace(metadata, parent_room=parent, game_number=game_number)
 
 
 def parse_replay_payload(

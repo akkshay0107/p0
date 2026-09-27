@@ -60,6 +60,16 @@ class TestTrainingFiles:
             for record in json.loads((metrics_dir / "metrics.json").read_text())["metrics"]
         ] == [1, 2, 3]
 
+    def test_record_rejects_a_bool_metric_that_resume_would_reject(self, tmp_path: Path) -> None:
+        store = CheckpointStore()
+        with training_run(
+            store, tmp_path / "checkpoint.pt", tmp_path, trainer_kind="ppo", settings={}
+        ) as run:
+            run.start(0)
+            with pytest.raises(ValueError, match="named finite scalars"):
+                run.record(1, {}, {"train": {"early_stopped": True}})
+            assert run.state["metrics"] == []
+
     def test_output_lock_prevents_a_second_writer(self, tmp_path: Path) -> None:
         store = CheckpointStore()
         checkpoint = tmp_path / "checkpoint.pt"

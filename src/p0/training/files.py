@@ -9,7 +9,7 @@ import signal
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -89,14 +89,12 @@ def training_run(
                 and Path(saved_directory).resolve() == metrics_dir.resolve()
             )
             if occupied_metrics and not owns_metrics and old_run.get("id"):
-                try:
+                # Unreadable display files cannot prove ownership of a moved directory.
+                with suppress(OSError, orjson.JSONDecodeError):
                     metrics = orjson.loads((metrics_dir / "metrics.json").read_bytes())
                     owns_metrics = (
                         isinstance(metrics, dict) and metrics.get("run_id") == old_run["id"]
                     )
-                except (OSError, orjson.JSONDecodeError):
-                    # Unreadable display files cannot prove ownership of a moved directory.
-                    pass
         if (checkpoint_path.exists() and not same_output) or (
             occupied_metrics and not owns_metrics
         ):
@@ -109,6 +107,20 @@ def training_run(
             yield run
         finally:
             run.close()
+
+
+def _validate_board(board: Mapping[str, Any]) -> None:
+    """Require named finite int or float scalars; bools are rejected, as on resume."""
+    if any(
+        not isinstance(phase, str)
+        or not isinstance(metrics, Mapping)
+        or any(
+            not isinstance(name, str) or type(value) not in (int, float) or not math.isfinite(value)
+            for name, value in metrics.items()
+        )
+        for phase, metrics in board.items()
+    ):
+        raise ValueError("Checkpoint board metrics must contain named finite scalars")
 
 
 class TrainingRun:
@@ -170,7 +182,8 @@ class TrainingRun:
                 },
             }
         self.metadata = {
-            "id": old_run.get("id", str(uuid.uuid4())) if resume else str(uuid.uuid4()),
+            # A resumed run keeps the ID validated above.
+            "id": old_run["id"] if resume else str(uuid.uuid4()),
             "parent": parent,
             "source": origin,
             "settings": dict(settings),
@@ -199,18 +212,7 @@ class TrainingRun:
             board = record.get("board", {})
             if not isinstance(board, Mapping):
                 raise ValueError("Checkpoint board metrics must be a mapping")
-            for phase, values in board.items():
-                if (
-                    not isinstance(phase, str)
-                    or not isinstance(values, Mapping)
-                    or any(
-                        not isinstance(name, str)
-                        or type(value) not in (int, float)
-                        or not math.isfinite(value)
-                        for name, value in values.items()
-                    )
-                ):
-                    raise ValueError("Checkpoint board metrics must contain named finite scalars")
+            _validate_board(board)
         self.writer = SummaryWriter(log_dir=str(self.metrics_dir / "tensorboard"), purge_step=0)
         for record in records:
             self.write_scalars(record["step"], record.get("board", {}))
@@ -223,18 +225,8 @@ class TrainingRun:
         self, step: int, values: Mapping[str, Any], board: Mapping[str, Mapping[str, float | int]]
     ) -> None:
         """Record one completed training step and send its scalars to TensorBoard."""
-        if any(
-            not isinstance(phase, str)
-            or not isinstance(metrics, Mapping)
-            or any(
-                not isinstance(name, str)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                for name, value in metrics.items()
-            )
-            for phase, metrics in board.items()
-        ):
-            raise ValueError("Checkpoint board metrics must contain named finite scalars")
+        # Validate with the resume rule so every recorded step can be restored later.
+        _validate_board(board)
         self.state["metrics"].append(
             {
                 **values,

@@ -7,6 +7,7 @@ import random
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -14,12 +15,6 @@ from gymnasium.spaces import Box, MultiDiscrete
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.environment.env import PokeEnv
 from poke_env.player import Player
-from poke_env.ps_client import (
-    AccountConfiguration,
-    LocalhostServerConfiguration,
-    ServerConfiguration,
-)
-from poke_env.teambuilder import Teambuilder
 
 from p0.battle.legality import action_mask
 from p0.battle.views import BattleView
@@ -67,43 +62,17 @@ class MegaEnv(PokeEnv[npt.NDArray[np.int64]]):
 
     def __init__(
         self,
-        account_configuration1: AccountConfiguration | None = None,
-        account_configuration2: AccountConfiguration | None = None,
-        avatar: int | None = None,
+        *,
         battle_format: str = FORMAT.battle_format,
-        log_level: int | None = None,
-        save_replays: bool | str = False,
-        server_configuration: ServerConfiguration | None = LocalhostServerConfiguration,
         accept_open_team_sheet: bool | None = True,
-        start_timer_on_battle_start: bool = False,
-        start_listening: bool = True,
-        open_timeout: float | None = 10.0,
-        ping_interval: float | None = 20.0,
-        ping_timeout: float | None = 20.0,
-        challenge_timeout: float | None = 60.0,
-        team: str | Teambuilder | None = None,
-        fake: bool = False,
-        strict: bool = True,
+        **kwargs: Any,
     ):
+        """Forward PokeEnv keyword arguments with doubles defaults and policy team preview."""
         super().__init__(
-            account_configuration1=account_configuration1,
-            account_configuration2=account_configuration2,
-            avatar=avatar,
             battle_format=battle_format,
-            log_level=log_level,
-            save_replays=save_replays,
-            server_configuration=server_configuration,
             accept_open_team_sheet=accept_open_team_sheet,
-            start_timer_on_battle_start=start_timer_on_battle_start,
-            start_listening=start_listening,
-            open_timeout=open_timeout,
-            ping_interval=ping_interval,
-            ping_timeout=ping_timeout,
-            challenge_timeout=challenge_timeout,
-            team=team,
             choose_on_teampreview=True,
-            fake=fake,
-            strict=strict,
+            **kwargs,
         )
 
         poke_env_patches.install(self.agent1.logger)
@@ -133,7 +102,7 @@ class SimEnv(MegaEnv):
 
     def __init__(
         self,
-        *args,
+        *,
         observation_builder: ObservationBuilder,
         battle_view_factory: Callable[[DoubleBattle], BattleView],
         agent_team_source: TeamSource,
@@ -142,7 +111,7 @@ class SimEnv(MegaEnv):
         opponent_rng: random.Random,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(**kwargs)
         self._observation_targets: dict[str, StructuredObservation] = {}
         self._observation_builder = observation_builder
         self._battle_view_factory = battle_view_factory

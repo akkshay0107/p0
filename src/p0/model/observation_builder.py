@@ -301,11 +301,9 @@ def _get_pokemon_level_stats(
     is_opponent: bool,
     precomputed: tuple[int, int, int, int, int, int] | None,
 ) -> tuple[tuple[float, ...], StatProvenance]:
-    stats = pokemon.stats
-    if not is_opponent and stats is not None:
-        values = [stats.get(key) for key in _STAT_KEYS]
-        if all(value is not None for value in values):
-            return tuple(float(value) for value in values), StatProvenance.KNOWN  # type: ignore
+    if not is_opponent and _has_exact_stats(pokemon):
+        stats = pokemon.stats
+        return tuple(float(stats[key]) for key in _STAT_KEYS), StatProvenance.KNOWN  # type: ignore
 
     if precomputed is not None:
         return tuple(float(value) for value in precomputed), StatProvenance.IMPUTED
@@ -328,19 +326,16 @@ def _resolve_stats(
 
 
 def _is_mega_form(pokemon: PokemonView | None) -> bool:
-    if pokemon is None:
-        return False
-    species = pokemon.species
-    if not species:
-        return False
-    return PokemonTokenizer.normalize_id(species) in _MEGA_FORMS
+    return (
+        pokemon is not None
+        and bool(pokemon.species)
+        and PokemonTokenizer.normalize_id(pokemon.species) in _MEGA_FORMS
+    )
 
 
 def _holds_mega_stone(pokemon: PokemonView | None) -> bool:
     """Whether the held stone can Mega Evolve this Pokémon's original species."""
-    if pokemon is None:
-        return False
-    if not pokemon.item or _is_mega_form(pokemon):
+    if pokemon is None or not pokemon.item or _is_mega_form(pokemon):
         return False
     item = PokemonTokenizer.normalize_id(pokemon.item)
     species = PokemonTokenizer.normalize_id(pokemon.base_species)

@@ -9,6 +9,7 @@ from torch.amp import GradScaler
 from torch.optim import Optimizer
 
 from p0.model.policy import PolicyNet
+from p0.training.checkpoint import value_objective_metadata
 from p0.training.config import TrainingConfig
 from p0.training.files import TrainingRun
 from p0.training.magnet import Magnet
@@ -133,8 +134,7 @@ class PPOTrainer:
     def _save(self, episode: int) -> None:
         self.collector.prepare_for_checkpoint()
         metadata: dict[str, object] = {
-            "gamma": self.training_config.gamma,
-            "value_target_semantics": "discounted_terminal_outcome.v1",
+            **value_objective_metadata(self.training_config.gamma),
             "environment_state": self.collector.vector_env.training_state(),
             "collector_state": self.collector.training_state(),
         }

@@ -122,16 +122,17 @@ def calculate_stats(
 
     bases = base_stats.as_tuple()
     sps = points.as_tuple()
-    hp = (2 * bases[0] + 31 + max(2 * sps[0] - 1, 0)) * level // 100 + level + 10
+    hp = _level_stat(bases[0], sps[0], level) + level + 10
+    atk, defense, spa, spd, spe = (
+        _modify_nature(_level_stat(bases[i], sps[i], level) + 5, STAT_NAMES[i], nature)
+        for i in range(1, 6)
+    )
+    return (hp, atk, defense, spa, spd, spe)
 
-    def _stat(i: int) -> int:
-        return _modify_nature(
-            (2 * bases[i] + 31 + max(2 * sps[i] - 1, 0)) * level // 100 + 5,
-            STAT_NAMES[i],
-            nature,
-        )
 
-    return (hp, _stat(1), _stat(2), _stat(3), _stat(4), _stat(5))
+def _level_stat(base: int, stat_points: int, level: int) -> int:
+    """Return the shared base, IV and Stat Point term of the level-scaled stat formula."""
+    return (2 * base + 31 + max(2 * stat_points - 1, 0)) * level // 100
 
 
 MOVE_CATEGORY_PHYSICAL = "physical"

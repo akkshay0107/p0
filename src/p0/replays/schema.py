@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import IntEnum
 from typing import Any, Mapping
 
 from p0.battle.actions import ACT_SIZE
+from p0.format_config import is_sha256, require_dataclass_fields
 from p0.replays.identity import ReplayMemberId, ReplaySide
 
 
@@ -56,10 +57,6 @@ class FetchMetadata:
     retry_count: int
     elapsed_ms: int
 
-    _FIELDS = frozenset(
-        {"source_url", "fetched_at", "http_status", "attempt", "retry_count", "elapsed_ms"}
-    )
-
     def __post_init__(self) -> None:
         if not isinstance(self.source_url, str) or not self.source_url:
             raise ValueError("FetchMetadata.source_url must be non-empty")
@@ -79,18 +76,11 @@ class FetchMetadata:
             raise ValueError("FetchMetadata.retry_count must be less than attempt")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "source_url": self.source_url,
-            "fetched_at": self.fetched_at,
-            "http_status": self.http_status,
-            "attempt": self.attempt,
-            "retry_count": self.retry_count,
-            "elapsed_ms": self.elapsed_ms,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> FetchMetadata:
-        _require_fields(value, cls._FIELDS, "FetchMetadata")
+        require_dataclass_fields(value, cls)
         return cls(
             source_url=str(value["source_url"]),
             fetched_at=str(value["fetched_at"]),
@@ -115,21 +105,6 @@ class ReplayMetadata:
     game_number: int | None = None
     rating: int | None = None
     views: int | None = None
-
-    _FIELDS = frozenset(
-        {
-            "replay_id",
-            "format_id",
-            "player_names",
-            "winner",
-            "upload_time",
-            "room_id",
-            "parent_room",
-            "game_number",
-            "rating",
-            "views",
-        }
-    )
 
     def __post_init__(self) -> None:
         if (
@@ -167,7 +142,7 @@ class ReplayMetadata:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ReplayMetadata:
-        _require_fields(value, cls._FIELDS, "ReplayMetadata")
+        require_dataclass_fields(value, cls)
         players = tuple(str(player) for player in value["player_names"])
         if len(players) != 2:
             raise ValueError("ReplayMetadata.player_names must contain two names")
@@ -200,22 +175,6 @@ class OTSMember:
     level: int
     evs: str
     raw_packed_set: str
-
-    _FIELDS = frozenset(
-        {
-            "member_id",
-            "nickname",
-            "species",
-            "item",
-            "ability",
-            "moves",
-            "nature",
-            "gender",
-            "level",
-            "evs",
-            "raw_packed_set",
-        }
-    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.member_id, ReplayMemberId):
@@ -262,7 +221,7 @@ class OTSMember:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> OTSMember:
         """Deserialize one strict ordered member record."""
-        _require_fields(value, cls._FIELDS, "OTSMember")
+        require_dataclass_fields(value, cls)
         member_id = value["member_id"]
         if not isinstance(member_id, Mapping):
             raise ValueError("OTSMember.member_id must be an object")
@@ -307,8 +266,6 @@ class OTSData:
     raw_payload: str
     members: tuple[OTSMember, ...]
 
-    _FIELDS = frozenset({"side", "raw_payload", "members"})
-
     def __post_init__(self) -> None:
         if not isinstance(self.side, ReplaySide):
             raise TypeError("OTSData.side must be a ReplaySide")
@@ -341,7 +298,7 @@ class OTSData:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> OTSData:
         """Deserialize one ordered side sheet."""
-        _require_fields(value, cls._FIELDS, "OTSData")
+        require_dataclass_fields(value, cls)
         side = value["side"]
         members = value["members"]
         if not isinstance(side, str):
@@ -369,8 +326,6 @@ class ProtocolLine:
     parts: tuple[str, ...]
     turn: int | None = None
 
-    _FIELDS = frozenset({"index", "raw", "parts", "turn"})
-
     def __post_init__(self) -> None:
         if type(self.index) is not int or self.index < 0:
             raise ValueError("ProtocolLine.index must be nonnegative")
@@ -388,7 +343,7 @@ class ProtocolLine:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ProtocolLine:
-        _require_fields(value, cls._FIELDS, "ProtocolLine")
+        require_dataclass_fields(value, cls)
         parts = tuple(str(part) for part in value["parts"])
         return cls(
             index=int(value["index"]),
@@ -409,18 +364,6 @@ class SeriesMembership:
     grouping_method: GroupingMethod
     confidence: float
     diagnostics: tuple[str, ...] = ()
-
-    _FIELDS = frozenset(
-        {
-            "series_id",
-            "replay_id",
-            "game_number",
-            "canonical_player_roles",
-            "grouping_method",
-            "confidence",
-            "diagnostics",
-        }
-    )
 
     def __post_init__(self) -> None:
         if (
@@ -450,7 +393,7 @@ class SeriesMembership:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SeriesMembership:
-        _require_fields(value, cls._FIELDS, "SeriesMembership")
+        require_dataclass_fields(value, cls)
         roles = tuple(int(role) for role in value["canonical_player_roles"])
         if len(roles) != 2:
             raise ValueError("SeriesMembership roles must contain two entries")
@@ -463,21 +406,6 @@ class SeriesMembership:
             confidence=float(value["confidence"]),
             diagnostics=tuple(str(item) for item in value["diagnostics"]),
         )
-
-
-def _require_fields(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
-    missing = sorted(expected - value.keys())
-    unknown = sorted(value.keys() - expected)
-    if missing or unknown:
-        raise ValueError(f"Invalid {owner} fields; missing={missing}, unknown={unknown}")
-
-
-def _is_sha256(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
 
 
 def _require_iso_timestamp(value: str, owner: str) -> None:
@@ -501,43 +429,23 @@ class FetchIndexEntry:
     content_sha256: str
     byte_size: int
 
-    _FIELDS = frozenset(
-        {
-            "replay_id",
-            "format_id",
-            "source_url",
-            "fetched_at",
-            "http_status",
-            "content_sha256",
-            "byte_size",
-        }
-    )
-
     def __post_init__(self) -> None:
         if not self.replay_id or not self.format_id or not self.source_url:
             raise ValueError("Fetch index entries require replay_id, format_id, and source_url")
         _require_iso_timestamp(self.fetched_at, "FetchIndexEntry.fetched_at")
         if type(self.http_status) is not int or not 100 <= self.http_status <= 599:
             raise ValueError("FetchIndexEntry.http_status must be an HTTP status code")
-        if not _is_sha256(self.content_sha256):
+        if not is_sha256(self.content_sha256):
             raise ValueError("FetchIndexEntry.content_sha256 must be a lowercase SHA-256 digest")
         if type(self.byte_size) is not int or self.byte_size < 0:
             raise ValueError("FetchIndexEntry.byte_size must be a nonnegative integer")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "replay_id": self.replay_id,
-            "format_id": self.format_id,
-            "source_url": self.source_url,
-            "fetched_at": self.fetched_at,
-            "http_status": self.http_status,
-            "content_sha256": self.content_sha256,
-            "byte_size": self.byte_size,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> FetchIndexEntry:
-        _require_fields(value, cls._FIELDS, "FetchIndexEntry")
+        require_dataclass_fields(value, cls)
         return cls(
             replay_id=str(value["replay_id"]),
             format_id=str(value["format_id"]),
@@ -559,8 +467,6 @@ class ActionEvidence:
     mask_provenance: MaskProvenance
     tags: tuple[str, ...] = ()
 
-    _FIELDS = frozenset({"label_kind", "candidates", "confidence", "mask_provenance", "tags"})
-
     def __post_init__(self) -> None:
         if self.label_kind is LabelKind.UNSPECIFIED:
             raise ValueError("ActionEvidence.label_kind must be EXACT, PARTIAL, or UNKNOWN")
@@ -568,11 +474,10 @@ class ActionEvidence:
             raise ValueError("ActionEvidence.mask_provenance must be specified")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("ActionEvidence.confidence must be in [0, 1]")
-        expected = {LabelKind.EXACT: "exactly one candidate", LabelKind.PARTIAL: "two or more"}
         if self.label_kind is LabelKind.EXACT and len(self.candidates) != 1:
-            raise ValueError(f"EXACT evidence requires {expected[LabelKind.EXACT]}")
+            raise ValueError("EXACT evidence requires exactly one candidate")
         if self.label_kind is LabelKind.PARTIAL and len(self.candidates) < 2:
-            raise ValueError(f"PARTIAL evidence requires {expected[LabelKind.PARTIAL]} candidates")
+            raise ValueError("PARTIAL evidence requires two or more candidates")
         if self.label_kind is LabelKind.UNKNOWN and self.candidates:
             raise ValueError("UNKNOWN evidence must carry no candidates")
         seen: set[tuple[int, int]] = set()
@@ -603,7 +508,7 @@ class ActionEvidence:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ActionEvidence:
-        _require_fields(value, cls._FIELDS, "ActionEvidence")
+        require_dataclass_fields(value, cls)
         try:
             return cls(
                 label_kind=LabelKind(value["label_kind"]),
@@ -629,17 +534,6 @@ class DecisionRecord:
     post_line_index: int
     evidence: ActionEvidence
 
-    _FIELDS = frozenset(
-        {
-            "decision_index",
-            "player",
-            "decision_type",
-            "pre_line_index",
-            "post_line_index",
-            "evidence",
-        }
-    )
-
     def __post_init__(self) -> None:
         if type(self.decision_index) is not int or self.decision_index < 0:
             raise ValueError("DecisionRecord.decision_index must be a nonnegative integer")
@@ -662,7 +556,7 @@ class DecisionRecord:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> DecisionRecord:
-        _require_fields(value, cls._FIELDS, "DecisionRecord")
+        require_dataclass_fields(value, cls)
         return cls(
             decision_index=int(value["decision_index"]),
             player=int(value["player"]),
@@ -680,8 +574,6 @@ class ReplayDiagnostics:
     counters: Mapping[str, int]
     parse_errors: tuple[str, ...] = ()
 
-    _FIELDS = frozenset({"counters", "parse_errors"})
-
     def __post_init__(self) -> None:
         for key, count in self.counters.items():
             if not isinstance(key, str) or type(count) is not int or count < 0:
@@ -695,7 +587,7 @@ class ReplayDiagnostics:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ReplayDiagnostics:
-        _require_fields(value, cls._FIELDS, "ReplayDiagnostics")
+        require_dataclass_fields(value, cls)
         counters = value["counters"]
         if not isinstance(counters, Mapping):
             raise ValueError("ReplayDiagnostics.counters must be a JSON object")
@@ -713,8 +605,6 @@ class ReplayOutcome:
     end_reason: GameEndReason
     turns: int
     terminal_line_index: int | None
-
-    _FIELDS = frozenset({"winner", "end_reason", "turns", "terminal_line_index"})
 
     def __post_init__(self) -> None:
         if type(self.winner) is not int or self.winner not in (-1, 0, 1):
@@ -738,7 +628,7 @@ class ReplayOutcome:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ReplayOutcome:
-        _require_fields(value, cls._FIELDS, "ReplayOutcome")
+        require_dataclass_fields(value, cls)
         return cls(
             winner=int(value["winner"]),
             end_reason=GameEndReason(value["end_reason"]),
@@ -764,21 +654,6 @@ class SeriesRecord:
     grouping_method: GroupingMethod
     grouping_confidence: float
 
-    _FIELDS = frozenset(
-        {
-            "series_id",
-            "format_id",
-            "players",
-            "game_replay_ids",
-            "game_player_roles",
-            "team_hashes",
-            "is_complete",
-            "score",
-            "grouping_method",
-            "grouping_confidence",
-        }
-    )
-
     def __post_init__(self) -> None:
         if not self.series_id or not self.format_id:
             raise ValueError("SeriesRecord requires series_id and format_id")
@@ -791,7 +666,7 @@ class SeriesRecord:
         for roles in self.game_player_roles:
             if sorted(roles) != [0, 1]:
                 raise ValueError("Each game's roles must be a permutation of (0, 1)")
-        if len(self.team_hashes) != 2 or not all(_is_sha256(digest) for digest in self.team_hashes):
+        if len(self.team_hashes) != 2 or not all(is_sha256(digest) for digest in self.team_hashes):
             raise ValueError("SeriesRecord.team_hashes must be two lowercase SHA-256 digests")
         if len(self.score) != 2 or any(type(wins) is not int or wins < 0 for wins in self.score):
             raise ValueError("SeriesRecord.score must be two nonnegative win counts")
@@ -820,7 +695,7 @@ class SeriesRecord:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SeriesRecord:
-        _require_fields(value, cls._FIELDS, "SeriesRecord")
+        require_dataclass_fields(value, cls)
         try:
             players = tuple(str(name) for name in value["players"])
             team_hashes = tuple(str(digest) for digest in value["team_hashes"])

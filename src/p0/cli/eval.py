@@ -12,14 +12,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import torch
-from poke_env import ServerConfiguration
 
+from p0.cli import LOG_FORMAT
 from p0.evaluation.harness import EvaluationHarness, MatchupResult
 from p0.format_config import load_active_global_contract
+from p0.model.policy import PolicyNet
 from p0.persistence import atomic_json_save
-from p0.runtime.showdown import start_showdown_servers
+from p0.runtime.showdown import local_server_configuration, start_showdown_servers
+from p0.teams.source import TeamSource
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE
 from p0.training.config import load_config
+from p0.training.utils import default_device
 
 logger = logging.getLogger("p0.cli.eval")
 
@@ -47,6 +50,28 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _run_matchup(
+    harness: EvaluationHarness,
+    port: int,
+    source: TeamSource,
+    policy_a: PolicyNet | None,
+    opponent_name: str,
+    opponent: PolicyNet | str,
+) -> MatchupResult:
+    """Start one local Showdown server and play the configured matchup on it."""
+    logger.info("Starting local Showdown server on port %d...", port)
+    with start_showdown_servers(1, ports=(port,)) as servers:
+        server_configuration = local_server_configuration(servers[0].port)
+        return await harness.run_matchup(
+            name_a="PlayerCheckpoint" if policy_a else "RandomA",
+            policy_a=policy_a,
+            name_b=opponent_name,
+            policy_b=opponent,
+            team_source=source,
+            server_configuration=server_configuration,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run evaluation against baseline opponents or checkpoints and persist report."""
     args = _parser().parse_args(argv)
@@ -59,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT,
     )
 
     episodes = args.episodes or config.evaluation.episodes_per_matchup
@@ -71,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = default_device()
 
     try:
         manifest = load_active_global_contract(config.paths.data_root / "runtime_manifest.json")
@@ -115,31 +140,24 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("Evaluation team source is unavailable: %s", exc)
         return 1
 
-    async def run() -> MatchupResult:
-        logger.info("Starting local Showdown server on port %d...", args.port)
-        with start_showdown_servers(1, ports=(args.port,)) as servers:
-            server = servers[0]
-            server_configuration = ServerConfiguration(
-                websocket_url=server.websocket_url,
-                authentication_url="https://play.pokemonshowdown.com/action.php?",
-            )
-            return await harness.run_matchup(
-                name_a="PlayerCheckpoint" if policy_a else "RandomA",
-                policy_a=policy_a,
-                name_b=opponent_name,
-                policy_b=policy_b if policy_b is not None else args.opponent,
-                team_source=source,
-                server_configuration=server_configuration,
-            )
-
     try:
-        matchup_result = asyncio.run(run())
+        matchup_result = asyncio.run(
+            _run_matchup(
+                harness,
+                args.port,
+                source,
+                policy_a,
+                opponent_name,
+                policy_b if policy_b is not None else args.opponent,
+            )
+        )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         logger.exception("Evaluation execution failed: %s", exc)
         return 1
 
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / "evaluation_report.json"
+    matchup = matchup_result.to_dict()
     report = {
         "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "episodes": episodes,
@@ -164,8 +182,8 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             ),
         },
-        "matchup": matchup_result.to_dict(),
-        "matchups": [matchup_result.to_dict()],
+        "matchup": matchup,
+        "matchups": [matchup],
     }
 
     try:

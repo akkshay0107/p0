@@ -75,7 +75,8 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
         concurrency=args.concurrency,
     )
 
-    entries = ReplayFetcher(config).acquire(args.replay_id)
+    fetcher = ReplayFetcher(config)
+    entries = fetcher.acquire(args.replay_id)
     documents = []
     unparsed = 0
 
@@ -97,7 +98,7 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "format_id": FORMAT.bo3_format,
-        "index_path": str(ReplayFetcher(config).index_path.resolve()),
+        "index_path": str(fetcher.index_path.resolve()),
         "source_games": len(entries),
         "source_series": source_series,
         "accepted_games": None,

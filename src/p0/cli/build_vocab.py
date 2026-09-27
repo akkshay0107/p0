@@ -39,6 +39,18 @@ TABLES = (
     "types",
 )
 RESERVED_SEMANTICS = ("PAD", "UNKNOWN", "KNOWN_NONE", "OOV")
+POKEMON_TYPES = (
+    "Normal Fire Water Electric Grass Ice Fighting Poison Ground "
+    "Flying Psychic Bug Rock Ghost Dragon Dark Steel Fairy"
+).split()
+# Protocol-effect family, its vocabulary table, and the poke-env enum that names it.
+EFFECT_FAMILIES = {
+    "effect": ("volatiles", Effect),
+    "field": ("fields", Field),
+    "side_condition": ("side_conditions", SideCondition),
+    "weather": ("weathers", Weather),
+    "status": ("status", Status),
+}
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -87,47 +99,13 @@ def build(
     legal = dex.get("legality", {})
     for table in ("species", "items", "abilities", "moves"):
         append_keys(vocab[table], {normalize(identifier) for identifier in legal.get(table, [])})
-    append_keys(vocab["volatiles"], enum_keys(Effect))
-    append_keys(vocab["fields"], enum_keys(Field))
-    append_keys(vocab["status"], enum_keys(Status))
-    append_keys(vocab["side_conditions"], enum_keys(SideCondition))
-    append_keys(vocab["weathers"], enum_keys(Weather))
+    for table, enum in EFFECT_FAMILIES.values():
+        append_keys(vocab[table], enum_keys(enum))
     append_keys(vocab["trickroom"], {"trickroom"})
     append_keys(vocab["categories"], {"physical", "special", "status"})
-    append_keys(
-        vocab["types"],
-        {
-            normalize(entry)
-            for entry in (
-                "Normal",
-                "Fire",
-                "Water",
-                "Electric",
-                "Grass",
-                "Ice",
-                "Fighting",
-                "Poison",
-                "Ground",
-                "Flying",
-                "Psychic",
-                "Bug",
-                "Rock",
-                "Ghost",
-                "Dragon",
-                "Dark",
-                "Steel",
-                "Fairy",
-            )
-        },
-    )
+    append_keys(vocab["types"], {normalize(entry) for entry in POKEMON_TYPES})
 
-    effect_tables = {
-        "effect": "volatiles",
-        "field": "fields",
-        "side_condition": "side_conditions",
-        "weather": "weathers",
-        "status": "status",
-    }
+    effect_tables = {family: table for family, (table, _) in EFFECT_FAMILIES.items()}
     legal_effects = dex.get("legalProtocolEffects", {})
     for family, identifiers in legal_effects.items():
         table = effect_tables.get(family)
@@ -153,14 +131,7 @@ def build(
         if missing:
             missing_content[table] = missing
 
-    enum_families = {
-        "effect": enum_keys(Effect),
-        "field": enum_keys(Field),
-        "side_condition": enum_keys(SideCondition),
-        "weather": enum_keys(Weather),
-        "status": enum_keys(Status),
-    }
-    known_protocol_ids = set().union(*enum_families.values())
+    known_protocol_ids = set().union(*(enum_keys(enum) for _, enum in EFFECT_FAMILIES.values()))
     known_protocol_ids.update(
         normalize(identifier) for table in effect_tables.values() for identifier in vocab[table]
     )

@@ -97,13 +97,7 @@ def prepare_series_context(
         )
 
     summaries = _resample_histories(histories, target_tokens, resample_game)
-    series_tokens, series_mask = _pack_series_context(
-        windows,
-        window_history_rows,
-        summaries,
-        target_tokens,
-    )
-    return series_tokens, series_mask
+    return _pack_series_context(windows, window_history_rows, summaries, target_tokens)
 
 
 def commit_history_updates(

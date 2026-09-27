@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -95,10 +95,8 @@ class SubsystemContract:
     major_version: int
     minor_version: int
 
-    _FIELDS = frozenset({"major_sha256", "minor_sha256", "major_version", "minor_version"})
-
     def __post_init__(self) -> None:
-        if not _is_sha256(self.major_sha256) or not _is_sha256(self.minor_sha256):
+        if not is_sha256(self.major_sha256) or not is_sha256(self.minor_sha256):
             raise ValueError("Subsystem contract hashes must be lowercase SHA-256 digests")
         if type(self.major_version) is not int or self.major_version < 0:
             raise ValueError("Subsystem major_version must be a non-negative integer")
@@ -106,22 +104,12 @@ class SubsystemContract:
             raise ValueError("Subsystem minor_version must be a non-negative integer")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "major_sha256": self.major_sha256,
-            "minor_sha256": self.minor_sha256,
-            "major_version": self.major_version,
-            "minor_version": self.minor_version,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SubsystemContract:
-        _validate_exact_fields(value, cls._FIELDS, "subsystem contract")
-        return cls(
-            major_sha256=value["major_sha256"],
-            minor_sha256=value["minor_sha256"],
-            major_version=value["major_version"],
-            minor_version=value["minor_version"],
-        )
+        require_dataclass_fields(value, cls, "subsystem contract")
+        return cls(**value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +121,6 @@ class GlobalContract:
     global_sha256: str
     manifest_schema: int = GLOBAL_CONTRACT_SCHEMA
 
-    _FIELDS = frozenset({"manifest_schema", "subsystems", "contracts", "global_sha256"})
-
     def __post_init__(self) -> None:
         _validate_contract_structure(self.subsystems, self.contracts)
         if self.manifest_schema != GLOBAL_CONTRACT_SCHEMA:
@@ -142,7 +128,7 @@ class GlobalContract:
                 f"Unsupported global contract schema {self.manifest_schema!r}; "
                 f"expected {GLOBAL_CONTRACT_SCHEMA}"
             )
-        if not _is_sha256(self.global_sha256):
+        if not is_sha256(self.global_sha256):
             raise ValueError("global_sha256 must be a lowercase SHA-256 digest")
 
         expected = _build_subsystems(self.contracts, self.subsystems)
@@ -158,10 +144,6 @@ class GlobalContract:
         object.__setattr__(self, "contracts", _freeze(self.contracts))
 
     @property
-    def vocabulary_sha256(self) -> str:
-        return self.payload("resources", "major")["vocabulary_sha256"]
-
-    @property
     def action(self) -> Mapping[str, Any]:
         return self.payload("actions", "major")
 
@@ -172,10 +154,6 @@ class GlobalContract:
     @property
     def spread_usage_sha256(self) -> str:
         return self.payload("resources", "minor")["spread_usage_sha256"]
-
-    @property
-    def showdown_commit(self) -> str:
-        return self.payload("resources", "minor")["showdown_commit"]
 
     @property
     def battle_format(self) -> str:
@@ -254,7 +232,7 @@ class GlobalContract:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> GlobalContract:
-        _validate_exact_fields(value, cls._FIELDS, "global contract")
+        require_dataclass_fields(value, cls, "global contract")
         if value["manifest_schema"] != GLOBAL_CONTRACT_SCHEMA:
             raise ValueError(
                 f"Unsupported global contract schema {value['manifest_schema']!r}; "
@@ -290,15 +268,27 @@ class ContractCompatibility:
         return self.status != "incompatible"
 
 
-def _is_sha256(value: Any) -> bool:
+def is_sha256(value: Any) -> bool:
+    """Return whether value is a lowercase hexadecimal SHA-256 digest."""
     return isinstance(value, str) and bool(_SHA256_RE.fullmatch(value))
 
 
-def _validate_exact_fields(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
+def require_exact_fields(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
+    """Reject a serialized object whose keys are not exactly the expected fields."""
     missing = sorted(expected - value.keys())
     unknown = sorted(value.keys() - expected)
     if missing or unknown:
         raise ValueError(f"Invalid {owner} fields; missing={missing}, unknown={unknown}")
+
+
+@lru_cache(maxsize=None)
+def _dataclass_field_names(cls: type) -> frozenset[str]:
+    return frozenset(field.name for field in fields(cls))
+
+
+def require_dataclass_fields(value: Mapping[str, Any], cls: type, owner: str = "") -> None:
+    """Reject a serialized object whose keys are not exactly the dataclass's fields."""
+    require_exact_fields(value, _dataclass_field_names(cls), owner or cls.__name__)
 
 
 def _freeze(value: Any) -> Any:
@@ -328,7 +318,7 @@ def _require_non_empty_string(value: Any, owner: str) -> None:
 
 
 def _validate_actions_payload(payload: Mapping[str, Any]) -> None:
-    _validate_exact_fields(
+    require_exact_fields(
         payload,
         frozenset({"joint_width", "action_count", "ranges", "team_preview", "joint_constraints"}),
         "actions major payload",
@@ -362,7 +352,7 @@ def _validate_actions_payload(payload: Mapping[str, Any]) -> None:
         expected_fields = required_ranges.get(entry["meaning"])
         if expected_fields is None:
             raise ValueError(f"Unsupported actions major payload range {entry['meaning']!r}")
-        _validate_exact_fields(entry, expected_fields, f"actions major payload {entry['meaning']}")
+        require_exact_fields(entry, expected_fields, f"actions major payload {entry['meaning']}")
         for field in ("roster_slots", "move_slots"):
             if field in entry:
                 _require_positive_int(
@@ -387,7 +377,7 @@ def _validate_actions_payload(payload: Mapping[str, Any]) -> None:
     preview = payload["team_preview"]
     if not isinstance(preview, Mapping):
         raise ValueError("actions major payload team_preview must be an object")
-    _validate_exact_fields(
+    require_exact_fields(
         preview,
         frozenset({"encoding", "roster_size", "joint_unique"}),
         "actions major payload team_preview",
@@ -446,7 +436,7 @@ def _validate_fields(
 ) -> None:
     str_fields, pos_int_fields, int_fields, sha_fields = schema
     all_expected = str_fields | pos_int_fields | int_fields | sha_fields
-    _validate_exact_fields(payload, all_expected, owner)
+    require_exact_fields(payload, all_expected, owner)
     for field in str_fields:
         _require_non_empty_string(payload[field], f"{owner} {field}")
     for field in pos_int_fields:
@@ -455,7 +445,7 @@ def _validate_fields(
         if type(payload[field]) is not int:
             raise ValueError(f"{owner} {field} must be an integer")
     for field in sha_fields:
-        if not _is_sha256(payload[field]):
+        if not is_sha256(payload[field]):
             raise ValueError(f"{owner} {field} must be a SHA-256 digest")
 
 
@@ -470,7 +460,7 @@ def _validate_subsystem_payload(name: str, payloads: Mapping[str, Mapping[str, A
     if name == "resources":
         _validate_fields(minor, _RESOURCES_MINOR_SCHEMA, "resources minor payload")
     else:
-        _validate_exact_fields(minor, frozenset(), f"{name} minor payload")
+        require_exact_fields(minor, frozenset(), f"{name} minor payload")
 
 
 def _validate_contract_structure(
@@ -488,7 +478,7 @@ def _validate_contract_structure(
         if not isinstance(subsystems[name], SubsystemContract):
             raise ValueError(f"Subsystem {name!r} has an invalid fingerprint")
         payloads = contracts[name]
-        _validate_exact_fields(payloads, frozenset({"major", "minor"}), f"{name} payloads")
+        require_exact_fields(payloads, frozenset({"major", "minor"}), f"{name} payloads")
         _validate_json_value(payloads["major"], f"{name}.major")
         _validate_json_value(payloads["minor"], f"{name}.minor")
         _validate_subsystem_payload(name, payloads)
@@ -625,11 +615,16 @@ def load_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> GlobalC
     return GlobalContract.from_dict(value)
 
 
-def load_active_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> GlobalContract:
-    """Load a contract and verify its resources match the active runtime files."""
+def _require_default_manifest(path: str | Path) -> Path:
     manifest_path = Path(path)
     if manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
         raise ValueError("The active runtime contract is always the default global manifest")
+    return manifest_path
+
+
+def load_active_global_contract(path: str | Path = DEFAULT_RUNTIME_MANIFEST) -> GlobalContract:
+    """Load a contract and verify its resources match the active runtime files."""
+    manifest_path = _require_default_manifest(path)
     contract = load_global_contract(manifest_path)
     res_major = contract.payload("resources", "major")
     res_minor = contract.payload("resources", "minor")
@@ -672,10 +667,9 @@ def validate_artifact_runtime_contract(
     artifact: Mapping[str, Any], path: str | Path = DEFAULT_RUNTIME_MANIFEST
 ) -> GlobalContract:
     """Validate an artifact reference against the active global contract."""
-    if Path(path).resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
-        raise ValueError("The active runtime contract is always the default global manifest")
+    _require_default_manifest(path)
     reference = artifact.get("global_contract_sha256")
-    if not _is_sha256(reference):
+    if not is_sha256(reference):
         raise ValueError("Artifact has no valid global_contract_sha256 reference")
     contract = active_global_contract()
     if reference != contract.global_sha256:
@@ -690,11 +684,10 @@ def checkpoint_contract_compatibility(
     artifact: Mapping[str, Any], path: str | Path = DEFAULT_RUNTIME_MANIFEST
 ) -> ContractCompatibility:
     """Validate an embedded checkpoint snapshot against the active contract."""
-    if Path(path).resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
-        raise ValueError("The active runtime contract is always the default global manifest")
+    _require_default_manifest(path)
     reference = artifact.get("global_contract_sha256")
     snapshot = artifact.get("global_contract")
-    if not _is_sha256(reference) or not isinstance(snapshot, Mapping):
+    if not is_sha256(reference) or not isinstance(snapshot, Mapping):
         raise ValueError("Checkpoint has no valid embedded global contract snapshot")
     historical = GlobalContract.from_dict(snapshot)
     if historical.global_sha256 != reference:

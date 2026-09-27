@@ -7,24 +7,39 @@ import asyncio
 import logging
 import os
 import random
+import sys
 from pathlib import Path
 
 from poke_env import AccountConfiguration, LocalhostServerConfiguration, ServerConfiguration
 
+from p0.cli import LOG_FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.rl_player import DEFAULT_BATTLE_FORMAT, RLPlayer, load_player_policy
 from p0.runtime import poke_env_patches
 from p0.teams.source import FileTeamSource, build_team_source
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
-from p0.training.config import load_config
+from p0.training.config import BotConfig, GlobalConfig, load_config
 
 logger = logging.getLogger("p0.cli.play")
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    defaults = load_config()
-    bot = defaults.bot
+# Options that fall back to the same-named bot config field when neither the command
+# line nor the environment sets them.
+_BOT_CONFIG_OPTIONS = (
+    "websocket_url",
+    "authentication_url",
+    "username",
+    "password",
+    "battle_format",
+    "top_p",
+    "challenge_limit",
+    "opponent",
+    "log_level",
+)
 
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the parser without reading config.yaml; unset options come from it later."""
     parser = argparse.ArgumentParser(prog="p0-play", description="Run the Pokemon Showdown RL bot.")
     parser.add_argument(
         "--server",
@@ -33,39 +48,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--websocket-url",
-        default=os.getenv("SHOWDOWN_WS_URL", bot.websocket_url),
+        default=os.getenv("SHOWDOWN_WS_URL"),
         help="Showdown websocket URL.",
     )
     parser.add_argument(
         "--authentication-url",
-        default=os.getenv("SHOWDOWN_AUTH_URL", bot.authentication_url),
+        default=os.getenv("SHOWDOWN_AUTH_URL"),
         help="Showdown authentication URL.",
     )
     parser.add_argument(
         "--username",
-        default=os.getenv("SHOWDOWN_USERNAME", bot.username),
+        default=os.getenv("SHOWDOWN_USERNAME"),
         help="Showdown account username.",
     )
     parser.add_argument(
         "--password",
-        default=os.getenv("SHOWDOWN_PASSWORD")
-        or os.getenv("SHOWDOWN_BOT_PASSWORD")
-        or bot.password,
+        default=os.getenv("SHOWDOWN_PASSWORD") or os.getenv("SHOWDOWN_BOT_PASSWORD") or None,
         help="Showdown account password.",
     )
     parser.add_argument(
         "--format",
         dest="battle_format",
-        default=os.getenv("SHOWDOWN_BATTLE_FORMAT", bot.battle_format),
+        default=os.getenv("SHOWDOWN_BATTLE_FORMAT"),
         help="Battle format to queue and play.",
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=os.getenv(
-            "SHOWDOWN_CHECKPOINT",
-            str(bot.checkpoint_path) if bot.checkpoint_path else None,
-        ),
+        default=os.getenv("SHOWDOWN_CHECKPOINT"),
         help="Path to the policy checkpoint.",
     )
     parser.add_argument(
@@ -84,33 +94,45 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top-p",
         type=float,
-        default=float(os.getenv("SHOWDOWN_TOP_P", str(bot.top_p))),
+        default=os.getenv("SHOWDOWN_TOP_P"),
         help="Top-p sampling threshold.",
     )
     parser.add_argument(
         "--challenge-limit",
         type=int,
-        default=int(os.getenv("SHOWDOWN_CHALLENGE_LIMIT", str(bot.challenge_limit))),
+        default=os.getenv("SHOWDOWN_CHALLENGE_LIMIT"),
         help="Number of challenges to accept before exiting.",
     )
     parser.add_argument(
         "--opponent",
-        default=os.getenv("SHOWDOWN_ACCEPT_OPPONENT", bot.opponent),
+        default=os.getenv("SHOWDOWN_ACCEPT_OPPONENT"),
         help="Only accept challenges from this opponent username.",
     )
     parser.add_argument(
         "--allow-random-init",
         action="store_true",
-        default=os.getenv("SHOWDOWN_ALLOW_RANDOM_INIT", "").lower() in {"1", "true", "yes"}
-        or bot.allow_random_init,
+        default=True
+        if os.getenv("SHOWDOWN_ALLOW_RANDOM_INIT", "").lower() in {"1", "true", "yes"}
+        else None,
         help="Allow running with randomly initialized weights if no checkpoint exists.",
     )
     parser.add_argument(
         "--log-level",
-        default=os.getenv("SHOWDOWN_LOG_LEVEL", bot.log_level),
+        default=os.getenv("SHOWDOWN_LOG_LEVEL"),
         help="Logging level.",
     )
     return parser
+
+
+def _apply_bot_config(args: argparse.Namespace, bot: BotConfig) -> None:
+    """Fill options left unset on the command line and in the environment from config."""
+    for name in _BOT_CONFIG_OPTIONS:
+        if getattr(args, name) is None:
+            setattr(args, name, getattr(bot, name))
+    if args.checkpoint is None and bot.checkpoint_path is not None:
+        args.checkpoint = Path(bot.checkpoint_path)
+    if args.allow_random_init is None:
+        args.allow_random_init = bot.allow_random_init
 
 
 def _build_server_configuration(args: argparse.Namespace) -> ServerConfiguration:
@@ -126,11 +148,11 @@ def _build_server_configuration(args: argparse.Namespace) -> ServerConfiguration
 
 async def run_bot(
     args: argparse.Namespace,
+    app_config: GlobalConfig,
     policy_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
 ) -> None:
     """Boot and run the RL bot Showdown listener process."""
     poke_env_patches.install()
-    app_config = load_config()
 
     if args.battle_format != DEFAULT_BATTLE_FORMAT:
         raise ValueError(f"--format must match the RLPlayer Bo3 format {DEFAULT_BATTLE_FORMAT!r}.")
@@ -187,16 +209,21 @@ async def run_bot(
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for running the RL bot process."""
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = _build_parser().parse_args(argv)
+    try:
+        app_config = load_config()
+    except (OSError, ValueError) as exc:
+        print(f"Error loading configuration: {exc}", file=sys.stderr)
+        return 1
+    _apply_bot_config(args, app_config.bot)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT,
     )
 
     try:
-        asyncio.run(run_bot(args))
+        asyncio.run(run_bot(args, app_config))
     except (KeyboardInterrupt, SystemExit):
         logger.info("Exiting on user interrupt.")
         return 0

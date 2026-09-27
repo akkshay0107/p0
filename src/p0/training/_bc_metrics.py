@@ -51,6 +51,11 @@ class BCEvaluationMetrics:
         return asdict(self)
 
 
+def _swap_preview_pair[Action: (Tensor, int)](action: Action) -> Action:
+    """Return the team-preview action that names the same two Pokemon in the other order."""
+    return (action % TEAM_SIZE) * TEAM_SIZE + action // TEAM_SIZE
+
+
 def _validate_objective_inputs(
     candidate_count: int,
     candidate_offsets: Tensor,
@@ -247,8 +252,7 @@ class _BCEvaluationAccumulator:
 
     def add_legality(self, logits: Tensor, action_mask: Tensor, numerical: Tensor) -> None:
         """Accumulate probability mass on request-illegal first-slot actions."""
-        unknown = slot_legality_unknown(numerical)
-        proven = ~unknown
+        proven = ~slot_legality_unknown(numerical)
 
         # Only proven rows have an authoritative notion of illegal to measure against,
         # so they are weighted in rather than indexed out, which would force a sync.
@@ -273,14 +277,7 @@ class _BCEvaluationAccumulator:
     ) -> None:
         exact, partial, unknown, labeled = masks
         ordered_correct = torch.all(predicted == exact_actions, dim=1)
-        target_first, target_second = exact_actions.unbind(dim=-1)
-        swapped_target = torch.stack(
-            (
-                (target_first % TEAM_SIZE) * TEAM_SIZE + target_first // TEAM_SIZE,
-                (target_second % TEAM_SIZE) * TEAM_SIZE + target_second // TEAM_SIZE,
-            ),
-            dim=-1,
-        )
+        swapped_target = _swap_preview_pair(exact_actions)
         preview_correct = (
             (predicted[:, 0] == exact_actions[:, 0]) | (predicted[:, 0] == swapped_target[:, 0])
         ) & ((predicted[:, 1] == exact_actions[:, 1]) | (predicted[:, 1] == swapped_target[:, 1]))

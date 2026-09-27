@@ -108,13 +108,7 @@ class SeriesHistoryStore:
         keys: Iterable[SeriesHistoryKey],
     ) -> dict[str, SeriesStateSnapshot | None]:
         """Snapshot history states for selected series keys for rollback."""
-        snapshots: dict[str, SeriesStateSnapshot | None] = {}
-        for key in keys:
-            normalized = _norm_key(key)
-            if normalized in snapshots:
-                continue
-            snapshots[normalized] = self._states.get(normalized)
-        return snapshots
+        return {normalized: self._states.get(normalized) for normalized in map(_norm_key, keys)}
 
     def restore_keys(self, snapshots: Mapping[str, SeriesStateSnapshot | None]) -> None:
         """Restore series history states from a snapshot."""
