@@ -95,32 +95,28 @@ class TestBCRunner:
                 ),
             )
         )
-        exact_compiled = replace(
-            compiled,
-            games=tuple(
+        exact_series = []
+        for series in compiled.accepted_series:
+            game = series.games[0]
+            perspectives = tuple(
                 replace(
-                    game,
-                    perspectives=tuple(
+                    perspective,
+                    decisions=tuple(
                         replace(
-                            perspective,
-                            decisions=tuple(
-                                replace(
-                                    decision,
-                                    evidence=replace(
-                                        decision.evidence,
-                                        label_kind=LabelKind.EXACT,
-                                        candidates=(decision.evidence.candidates[0],),
-                                    ),
-                                )
-                                for decision in perspective.decisions
+                            decision,
+                            evidence=replace(
+                                decision.evidence,
+                                label_kind=LabelKind.EXACT,
+                                candidates=(decision.evidence.candidates[0],),
                             ),
                         )
-                        for perspective in game.perspectives
+                        for decision in perspective.decisions
                     ),
                 )
-                for game in compiled.games
-            ),
-        )
+                for perspective in game.perspectives
+            )
+            exact_series.append(replace(series, games=(replace(game, perspectives=perspectives),)))
+        exact_compiled = replace(compiled, accepted_series=tuple(exact_series))
         built = write_tensor_shards(
             exact_compiled,
             tmp_path / "shards",

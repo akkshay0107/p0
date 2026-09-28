@@ -40,13 +40,14 @@ from tests.unit.replay_fixtures import payload_with_ots_natures, sample_replay_p
 def _numerical_rows(result: CompilationResult) -> list[tuple[float, ...]]:
     builder = ObservationBuilder(default_runtime_resources())
     rows: list[tuple[float, ...]] = []
-    for game in result.games:
-        for perspective in game.perspectives:
-            for snapshot in perspective.snapshots:
-                observation = builder.build(snapshot.view)
-                rows.extend(
-                    tuple(float(value) for value in token) for token in observation.numerical
-                )
+    for series in result.accepted_series:
+        for game in series.games:
+            for perspective in game.perspectives:
+                for snapshot in perspective.snapshots:
+                    observation = builder.build(snapshot.view)
+                    rows.extend(
+                        tuple(float(value) for value in token) for token in observation.numerical
+                    )
     return rows
 
 
@@ -80,11 +81,11 @@ class TestReplayScraping:
             (DEFAULT_PATHS.data_root / "champions_dex.json").read_text(encoding="utf-8")
         )
         result = compile_payloads((payload_with_ots_natures("own-side"),), dex=dex)
-        assert result.games
+        assert result.accepted_series
 
         # Estimates cover every stable roster member, and both projected sides retain
         # the corresponding open team sheet nature.
-        for game in result.games:
+        for game in result.accepted_series[0].games:
             assert {estimate.member_id.side.side_index for estimate in game.stat_estimates} == {
                 0,
                 1,

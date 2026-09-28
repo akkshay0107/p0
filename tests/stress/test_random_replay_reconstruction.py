@@ -586,7 +586,7 @@ def _assert_reconstruction_labels(
         dex=default_runtime_resources().dex,
         chunksize=0,
     )
-    if not compilation.games:
+    if not compilation.accepted_series:
         rejected = {
             name
             for name, count in compilation.metrics.counters.items()
@@ -600,8 +600,8 @@ def _assert_reconstruction_labels(
             "rejected_reconstruction_UNSUPPORTED_EVENT",
         }
         return ()
-    assert len(compilation.games) == 1
-    perspectives = compilation.games[0].perspectives
+    assert len(compilation.accepted_series) == 1
+    perspectives = compilation.accepted_series[0].games[0].perspectives
     for perspective in perspectives:
         assert perspective.decisions
         assert len(perspective.snapshots) == len(perspective.decisions)
@@ -1139,10 +1139,13 @@ class TestRandomReplayReconstruction:
             max_candidates=max_candidates,
             dex=resources.dex,
         )
-        assert len(compilation.games) + len(rejected_ids) == game_count
-        assert compilation.metrics.counters["accepted_games"] == len(compilation.games)
+        accepted_count = sum(len(series.games) for series in compilation.accepted_series)
+        assert accepted_count + len(rejected_ids) == game_count
+        assert compilation.metrics.counters["accepted_games"] == accepted_count
         assert compilation.metrics.counters["rejected_games"] == len(rejected_ids)
-        assert {game.replay_id for game in compilation.games}.isdisjoint(rejected_ids)
+        assert {
+            game.replay_id for series in compilation.accepted_series for game in series.games
+        }.isdisjoint(rejected_ids)
 
         # Write out serialized PyTorch tensor shards
         build = write_tensor_shards(
@@ -1153,7 +1156,7 @@ class TestRandomReplayReconstruction:
             max_decisions_per_shard=4096,
         )
         assert build.manifest.source_games == game_count
-        assert build.manifest.accepted_games == len(compilation.games)
+        assert build.manifest.accepted_games == accepted_count
         assert build.manifest.rejected_games == len(rejected_ids)
 
         # Verify tensor contracts and loss masking across all generated shard files

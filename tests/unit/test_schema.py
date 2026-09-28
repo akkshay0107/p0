@@ -12,13 +12,10 @@ from p0.format_config import (
     current_manifest,
     load_global_contract,
 )
-from p0.model.observation_builder import ObservationBuilder
-from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     StructuredObservation,
 )
 from p0.replays.compile import (
-    CompilationResult,
     ShardBuildResult,
     compile_payloads,
     write_tensor_shards,
@@ -87,19 +84,6 @@ def _payload_with_ots_natures(replay_id: str) -> dict[str, object]:
         lines.append(line)
     payload["log"] = "\n".join(lines)
     return payload
-
-
-def _numerical_rows(result: CompilationResult) -> list[tuple[float, ...]]:
-    builder = ObservationBuilder(default_runtime_resources())
-    rows: list[tuple[float, ...]] = []
-    for game in result.games:
-        for perspective in game.perspectives:
-            for snapshot in perspective.snapshots:
-                observation = builder.build(snapshot.view)
-                rows.extend(
-                    tuple(float(value) for value in token) for token in observation.numerical
-                )
-    return rows
 
 
 def _evidence(kind: LabelKind) -> ActionEvidence:

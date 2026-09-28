@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -53,13 +54,45 @@ class TestReplayCompiler:
         third = sample_replay_payload("game-3", parent="missing-first", game_number=3)
         complete = sample_replay_payload("game-1", parent="complete", game_number=1)
 
-        built = write_dataset_replay_dataset(tmp_path, (third, second, complete))
+        compiled = compile_payloads((third, second, complete), chunksize=0)
+        built = write_tensor_shards(compiled, tmp_path, created_at="2026-01-01T00:00:00Z")
 
+        assert compiled.metrics.counters["accepted_games"] == 1
+        assert compiled.metrics.counters["rejected_games"] == 2
+        assert compiled.metrics.counters["decisions"] == 4
+        assert compiled.metrics.counters["rejected_non_contiguous_game_numbers"] == 1
         assert built.manifest.accepted_games == 1
         assert built.manifest.rejected_games == 2
         assert built.manifest.diagnostics["rejected_non_contiguous_game_numbers"] == 1
         chunks = list(LazyReplayDataset(built.manifest_path))
         assert {chunk.game_number for chunk in chunks} == {1}
+
+    def test_compiled_series_rejects_missing_or_reordered_members(self) -> None:
+        first = sample_replay_payload("member-1", parent="members", game_number=1)
+        second = sample_replay_payload("member-2", parent="members", game_number=2)
+        accepted = compile_payloads((second, first), chunksize=0).accepted_series[0]
+
+        with pytest.raises(ValueError, match="every source game"):
+            replace(accepted, games=accepted.games[:1])
+        with pytest.raises(ValueError, match="source membership in order"):
+            replace(accepted, games=tuple(reversed(accepted.games)))
+
+    def test_shard_limit_uses_incoming_series_first_game(self, tmp_path: Path) -> None:
+        single = sample_replay_payload("single-1", parent="single", game_number=1)
+        first = sample_replay_payload("valid-1", parent="valid", game_number=1)
+        second = sample_replay_payload("valid-2", parent="valid", game_number=2)
+        result = compile_payloads((first, second, single), chunksize=0)
+
+        built = write_tensor_shards(
+            result,
+            tmp_path,
+            max_decisions_per_shard=9,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        assert built.manifest.accepted_games == 3
+        assert len(built.manifest.shards) == 1
+        assert built.manifest.shards[0].decisions == 12
 
     def test_source_series_preserves_game_number_order(self, tmp_path: Path) -> None:
         first = sample_replay_payload("z-game", game_number=1)
@@ -117,11 +150,11 @@ class TestReplayCompiler:
         """Verify open team sheet natures are preserved for both projected sides."""
         payload = payload_with_ots_natures("ots-nature")
         result = compile_payloads((payload,))
-        assert result.games
+        assert result.accepted_series
 
         own: set[str | None] = set()
         opponent: set[str | None] = set()
-        for game in result.games:
+        for game in result.accepted_series[0].games:
             for perspective in game.perspectives:
                 for snapshot in perspective.snapshots:
                     own.update(mon.nature for mon in snapshot.view.team.values())
@@ -180,7 +213,7 @@ class TestReplayCompiler:
             sample_replay_payload(f"g{i}", game_number=i, winner="Alice") for i in (1, 2, 3)
         )
         result = compile_payloads(games)
-        assert len(result.games) == 0
+        assert not result.accepted_series
         assert result.metrics.counters["accepted_games"] == 0
         assert result.metrics.counters["rejected_games"] == 3
         assert result.metrics.counters["rejected_game_after_series_won"] == 1
@@ -201,7 +234,7 @@ class TestReplayCompiler:
         assert result.metrics.counters["accepted_games"] == 2
         assert result.metrics.counters["rejected_games"] == 4
         assert result.metrics.counters["rejected_too_many_games"] >= 1
-        assert {game.replay_id for game in result.games} == {"v1", "v2"}
+        assert {game.replay_id for game in result.accepted_series[0].games} == {"v1", "v2"}
 
         built = write_tensor_shards(result, tmp_path / "shards")
         assert built.manifest.source_games == 6

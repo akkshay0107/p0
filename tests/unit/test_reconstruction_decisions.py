@@ -246,7 +246,7 @@ class TestDecisionTargets:
         result = compile_payloads((payload,), chunksize=0)
 
         assert result.metrics.counters["accepted_games"] == 1
-        affected = result.games[0].perspectives[0].decisions[-1]
+        affected = result.accepted_series[0].games[0].perspectives[0].decisions[-1]
         assert (9, 13) in affected.evidence.candidates
         assert (9, 11) in affected.evidence.candidates
 
@@ -276,7 +276,7 @@ class TestDecisionTargets:
 
         result = compile_payloads((payload,), chunksize=0)
 
-        affected = result.games[0].perspectives[0].decisions[-1]
+        affected = result.accepted_series[0].games[0].perspectives[0].decisions[-1]
         assert "mid_turn_encore_override" not in affected.evidence.tags
         assert (9, 11) in affected.evidence.candidates
         assert (9, 13) not in affected.evidence.candidates

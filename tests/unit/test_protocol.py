@@ -15,10 +15,8 @@ from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     load_global_contract,
 )
-from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.replays.compile import (
-    CompilationResult,
     ShardBuildResult,
     compile_documents,
     compile_payloads,
@@ -103,19 +101,6 @@ def _payload_with_ots_natures(replay_id: str) -> dict[str, object]:
         lines.append(line)
     payload["log"] = "\n".join(lines)
     return payload
-
-
-def _numerical_rows(result: CompilationResult) -> list[tuple[float, ...]]:
-    builder = ObservationBuilder(default_runtime_resources())
-    rows: list[tuple[float, ...]] = []
-    for game in result.games:
-        for perspective in game.perspectives:
-            for snapshot in perspective.snapshots:
-                observation = builder.build(snapshot.view)
-                rows.extend(
-                    tuple(float(value) for value in token) for token in observation.numerical
-                )
-    return rows
 
 
 def _evidence(kind: LabelKind) -> ActionEvidence:
@@ -255,7 +240,7 @@ class TestReplayInputContract:
             **payload,
             "log": f"{payload['log']}\n|t:|1700000000\n|message|Battle ended.",
         }
-        assert len(compile_payloads((trailing_display,), chunksize=0).games) == 1
+        assert len(compile_payloads((trailing_display,), chunksize=0).accepted_series[0].games) == 1
 
     def test_colliding_player_names_are_rejected_and_audited(self, tmp_path: Path) -> None:
         invalid = sample_replay_payload("input-colliding-players", players=("Alice", "A lice"))
@@ -648,7 +633,7 @@ class TestReplayInputContract:
         second = sample_replay_payload("g2", winner="Bob")
         result = compile_payloads((first, second))
         assert result.to_dict() == compile_payloads((second, first)).to_dict()
-        game = result.games[0]
+        game = result.accepted_series[0].games[0]
         left, right = game.perspectives
         assert left.player == 0 and right.player == 1
         assert left.decisions[0].evidence.label_kind is LabelKind.PARTIAL

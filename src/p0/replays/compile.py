@@ -117,9 +117,37 @@ class CompiledGame:
 
 
 @dataclass(frozen=True, slots=True)
+class CompiledSeries:
+    group: GroupedSeries
+    games: tuple[CompiledGame, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.games
+            or len(self.games) != len(self.group.games)
+            or len(self.games) != len(self.group.memberships)
+            or len({game.replay_id for game in self.games}) != len(self.games)
+        ):
+            raise ValueError("Compiled series must contain every source game exactly once")
+        for number, (game, member, document) in enumerate(
+            zip(self.games, self.group.memberships, self.group.games, strict=True), 1
+        ):
+            if (
+                game.series_id != self.group.record.series_id
+                or game.game_number != number
+                or member.game_number != number
+                or game.replay_id != member.replay_id
+                or game.replay_id != document.metadata.replay_id
+                or game.replay_id != game.document.metadata.replay_id
+                or game.canonical_player_roles != member.canonical_player_roles
+            ):
+                raise ValueError("Compiled series games must match source membership in order")
+
+
+@dataclass(frozen=True, slots=True)
 class CompilationResult:
     series: tuple[GroupedSeries, ...]
-    games: tuple[CompiledGame, ...]
+    accepted_series: tuple[CompiledSeries, ...]
     metrics: CompilationMetrics
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,7 +170,8 @@ class CompilationResult:
                         for perspective in game.perspectives
                     ],
                 }
-                for game in self.games
+                for accepted in self.accepted_series
+                for game in accepted.games
             ],
             "metrics": self.metrics.to_dict(),
         }
@@ -385,20 +414,14 @@ def write_tensor_shards(
     """
     Persist compiled replays as immutable, runtime-bound tensor shards.
 
-    The build is written to output_dir/<global contract hash>/<dataset hash>/.
-    The dataset hash covers the source replay identities, series membership,
-    format, build configuration and runtime contract hash. It does not cover
-    reconstruction code. If that directory already exists, the existing build is
-    validated and returned and no shards are written. A series whose retained
-    game numbers are not 1..n is left out and counted as rejected. Shards are
-    split only at series boundaries, so one series can exceed the shard limit.
-    Files are written to a temporary directory and moved into place at the
-    end; on any failure the temporary directory is removed.
+    The dataset hash covers source replay identities, series membership, format,
+    build configuration, and the runtime contract, but not reconstruction code.
+    Existing builds are validated and reused. Shards split only between series,
+    even when one exceeds the limit.
+    Files are published atomically; failed builds are removed.
 
-    Raises ValueError when max_decisions_per_shard is not positive, when no
-    games passed the quality gates or none remain after removing incomplete
-    series, when a rejected replay id is also a compiled replay id, or when an
-    existing build at the destination fails validation.
+    Raises ValueError for invalid limits, no accepted series, overlapping rejected
+    replay ids, or an invalid existing build.
 
     Arguments:
         result: Output of compile_documents.
@@ -419,7 +442,7 @@ def write_tensor_shards(
     """
     if max_decisions_per_shard <= 0:
         raise ValueError("max_decisions_per_shard must be positive")
-    if not result.games:
+    if not result.accepted_series:
         raise ValueError("No replay games passed the quality gates; nothing was published")
     runtime_hash = _runtime_hash(manifest_path)
     build_config = _build_configuration(
@@ -447,32 +470,7 @@ def write_tensor_shards(
             for replay_id in rejected
         }
     )
-    games_by_series: dict[str, list[CompiledGame]] = {}
-    for game in result.games:
-        games_by_series.setdefault(game.series_id, []).append(game)
-    unpublished_series: set[str] = set()
-    for series_id, replay_ids in memberships.items():
-        games = games_by_series.get(series_id, [])
-        if not games:
-            # A rejected series remains in source_series for auditability and
-            # contributes to rejected_games; it must not block valid series
-            # from being published.
-            continue
-        numbers = tuple(sorted(game.game_number for game in games))
-        expected = tuple(range(1, len(replay_ids) + 1))
-        if numbers != expected:
-            # Series memory needs games 1..n, so a series missing an earlier game
-            # or repeating one is left out like any other rejected series.
-            unpublished_series.add(series_id)
-    published_games = tuple(
-        game for game in result.games if game.series_id not in unpublished_series
-    )
-    if not published_games:
-        raise ValueError("No replay games passed the quality gates; nothing was published")
-    source_format_id = next(
-        (game.document.metadata.format_id for game in published_games),
-        FORMAT.bo3_format,
-    )
+    source_format_id = result.accepted_series[0].games[0].document.metadata.format_id
     dataset_hash = _dataset_hash(
         raw_replays=identities,
         source_series=memberships,
@@ -494,25 +492,17 @@ def write_tensor_shards(
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     diagnostics["rejected_input_files"] += len(rejected)
-    diagnostics["accepted_games"] -= len(result.games) - len(published_games)
-    diagnostics["rejected_games"] += sum(len(memberships[series]) for series in unpublished_series)
-    diagnostics["rejected_non_contiguous_game_numbers"] += len(unpublished_series)
+    diagnostics.setdefault("rejected_non_contiguous_game_numbers", 0)
     try:
         current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
         current_decisions = 0
-        for game in sorted(
-            published_games,
-            key=lambda item: (item.series_id, item.game_number, item.replay_id),
+        for accepted in sorted(
+            result.accepted_series, key=lambda item: item.group.record.series_id
         ):
-            game_items = [(game, perspective) for perspective in game.perspectives]
-            game_decisions = sum(len(perspective.decisions) for _, perspective in game_items)
-
-            # Split only at series boundaries so series memory stays within one shard.
-            if (
-                current_games
-                and game.series_id != current_games[-1][0].series_id
-                and current_decisions + game_decisions > max_decisions_per_shard
-            ):
+            first_game_decisions = sum(
+                len(perspective.decisions) for perspective in accepted.games[0].perspectives
+            )
+            if current_games and current_decisions + first_game_decisions > max_decisions_per_shard:
                 entries.append(
                     _write_shard(
                         root, len(entries), current_games, builder, runtime_hash, dataset_hash
@@ -520,15 +510,17 @@ def write_tensor_shards(
                 )
                 current_games, current_decisions = [], 0
 
-            current_games.extend(game_items)
-            current_decisions += game_decisions
+            for game in accepted.games:
+                current_games.extend((game, perspective) for perspective in game.perspectives)
+                current_decisions += sum(
+                    len(perspective.decisions) for perspective in game.perspectives
+                )
 
         if current_games:
             entries.append(
                 _write_shard(root, len(entries), current_games, builder, runtime_hash, dataset_hash)
             )
         artifact_hashes = {entry.filename: entry.sha256 for entry in entries}
-        source_games = diagnostics.get("replays", len(result.games)) + len(rejected)
         timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
         manifest = ShardManifest(
             global_contract_sha256=runtime_hash,
@@ -540,8 +532,8 @@ def write_tensor_shards(
                 for identity in identities
             },
             source_series=memberships,
-            source_games=source_games,
-            accepted_games=diagnostics.get("accepted_games", source_games),
+            source_games=diagnostics["replays"] + len(rejected),
+            accepted_games=diagnostics["accepted_games"],
             rejected_games=diagnostics.get("rejected_games", 0) + len(rejected),
             artifact_hashes=artifact_hashes,
             shards=tuple(entries),
@@ -918,8 +910,7 @@ def compile_documents(
             counts. A value of zero or less compiles in this process.
 
     Returns:
-        CompilationResult with all grouped series, the accepted games ordered
-        by series and game number, and the compilation metrics.
+        CompilationResult with all source groups, accepted series, and metrics.
     """
     docs = tuple(documents)
     replay_ids = [document.metadata.replay_id for document in docs]
@@ -1004,17 +995,21 @@ def compile_documents(
 
         compiled_by_series.setdefault(series_id, []).append(compiled)
 
-    source_games_by_series = {group.record.series_id: len(group.games) for group in grouping.series}
-    games: list[CompiledGame] = []
+    accepted_series: list[CompiledSeries] = []
     for group in grouping.series:
         series_id = group.record.series_id
         retained = compiled_by_series.get(series_id, [])
+        retained.sort(key=lambda game: game.game_number)
         expected_numbers = tuple(sorted(membership.game_number for membership in group.memberships))
-        actual_numbers = tuple(sorted(game.game_number for game in retained))
+        actual_numbers = tuple(game.game_number for game in retained)
         if series_id in failed_series or actual_numbers != expected_numbers:
             failed_series.add(series_id)
             continue
-        games.extend(sorted(retained, key=lambda game: game.game_number))
+        if actual_numbers != tuple(range(1, len(group.games) + 1)):
+            failed_series.add(series_id)
+            counters["rejected_non_contiguous_game_numbers"] += 1
+            continue
+        accepted_series.append(CompiledSeries(group, tuple(retained)))
         for game in retained:
             for estimate in game.stat_estimates:
                 if estimate.provenance == "IMPUTED":
@@ -1026,9 +1021,7 @@ def compile_documents(
             _measure_game(counters, game)
 
     counters["rejected_games"] = sum(
-        source_games_by_series[series_id]
-        for series_id in failed_series
-        if series_id in source_games_by_series
+        len(group.games) for group in grouping.series if group.record.series_id in failed_series
     )
     counters["complete_series"] = sum(
         group.record.is_complete and group.record.series_id not in failed_series
@@ -1038,7 +1031,9 @@ def compile_documents(
 
     metric_values: dict[str, int | float] = dict(counters)
     metric_values["imputation_confidence_sum"] = confidence_sum
-    return CompilationResult(grouping.series, tuple(games), CompilationMetrics(metric_values))
+    return CompilationResult(
+        grouping.series, tuple(accepted_series), CompilationMetrics(metric_values)
+    )
 
 
 def compile_payloads(
@@ -1098,6 +1093,7 @@ __all__ = [
     "CompilationMetrics",
     "CompilationResult",
     "CompiledGame",
+    "CompiledSeries",
     "ShardBuildResult",
     "compile_documents",
     "compile_payloads",

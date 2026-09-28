@@ -70,10 +70,11 @@ class TestReconstructionProjection:
                 altered if member.member_id == hidden_id else member for member in original.members
             ),
         )
-        compiled = compile_payloads((path.read_bytes(),), chunksize=0)
+        first_game = replace(document, metadata=replace(document.metadata, game_number=1))
+        compiled = compile_documents((first_game,), chunksize=0)
         decision = next(
             item.view.decision
-            for item in compiled.games[0].perspectives[0].snapshots
+            for item in compiled.accepted_series[0].games[0].perspectives[0].snapshots
             if item.pre_line_index == 112
         )
         first_view = project_battle_view(
@@ -90,8 +91,10 @@ class TestReconstructionProjection:
 
     def test_unrevealed_illusion_uses_displayed_public_fields(self) -> None:
         path = _ILLUSION_REPLAY
-        result = compile_payloads((path.read_bytes(),), chunksize=0)
-        perspective = result.games[0].perspectives[0]
+        document = parse_replay_payload(path.read_bytes())
+        first_game = replace(document, metadata=replace(document.metadata, game_number=1))
+        result = compile_documents((first_game,), chunksize=0)
+        perspective = result.accepted_series[0].games[0].perspectives[0]
         snapshot = next(
             snapshot
             for snapshot in perspective.snapshots
@@ -109,7 +112,7 @@ class TestReconstructionProjection:
         assert tuple(value.name for value in disguised.types) == ("Grass", "Poison")
         own_snapshot = next(
             item
-            for item in result.games[0].perspectives[1].snapshots
+            for item in result.accepted_series[0].games[0].perspectives[1].snapshots
             if item.pre_line_index == snapshot.pre_line_index
         )
         own_active = own_snapshot.view.active_pokemon[0]
@@ -139,10 +142,11 @@ class TestReconstructionProjection:
         assert known_venusaur is not None
         bench_side = replace(state.sides[1], active=(state.sides[1].active[0], None))
         bench_state = replace(state, sides=(state.sides[0], bench_side))
-        compiled = compile_payloads((path.read_bytes(),), chunksize=0)
+        first_game = replace(document, metadata=replace(document.metadata, game_number=1))
+        compiled = compile_documents((first_game,), chunksize=0)
         decision = next(
             item.view.decision
-            for item in compiled.games[0].perspectives[0].snapshots
+            for item in compiled.accepted_series[0].games[0].perspectives[0].snapshots
             if item.pre_line_index == 112
         )
 
@@ -171,8 +175,7 @@ class TestReconstructionProjection:
     def test_production_compiler_projects_both_perspectives_from_one_compilation(self) -> None:
         result = compile_payloads((decision_payload(),), chunksize=0)
 
-        assert len(result.games) == 1
-        first, second = result.games[0].perspectives
+        first, second = result.accepted_series[0].games[0].perspectives
         assert first.player == 0
         assert second.player == 1
         assert first.snapshots[0].view.teampreview
@@ -201,8 +204,10 @@ class TestReconstructionProjection:
             )
         )
 
-        first = compile_payloads((first_payload,), chunksize=0).games[0].perspectives[0]
-        second = compile_payloads((second_payload,), chunksize=0).games[0].perspectives[0]
+        first_result = compile_payloads((first_payload,), chunksize=0)
+        second_result = compile_payloads((second_payload,), chunksize=0)
+        first = first_result.accepted_series[0].games[0].perspectives[0]
+        second = second_result.accepted_series[0].games[0].perspectives[0]
         first_preview = first.snapshots[0].view
         second_preview = second.snapshots[0].view
 
@@ -255,14 +260,15 @@ class TestReconstructionProjection:
         result = compile_documents(documents, chunksize=0)
 
         assert len(paths) == 51
-        assert result.metrics.counters["accepted_games"] == 34
-        assert result.metrics.counters["rejected_games"] == 17
+        assert result.metrics.counters["accepted_games"] == 33
+        assert result.metrics.counters["rejected_games"] == 18
         assert result.metrics.counters["rejected_reconstruction_AMBIGUOUS_IDENTITY"] == 11
         assert result.metrics.counters["complete_series"] == 11
-        assert len(result.games) == 34
+        assert result.metrics.counters["rejected_non_contiguous_game_numbers"] == 1
         assert all(
             len(perspective.snapshots) == len(perspective.decisions)
-            for game in result.games
+            for series in result.accepted_series
+            for game in series.games
             for perspective in game.perspectives
         )
 
@@ -270,8 +276,7 @@ class TestReconstructionProjection:
         path = _STATE_REPLAY
         document = parse_replay_payload(path.read_bytes())
         result = compile_payloads((document.raw_payload,), chunksize=0)
-        assert len(result.games) == 1
-        perspective = result.games[0].perspectives[0]
+        perspective = result.accepted_series[0].games[0].perspectives[0]
         boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
         oracle = DoubleBattle(
             document.metadata.replay_id,
@@ -314,7 +319,8 @@ class TestSpatialEventIntervals:
         """A waiting player's interval spans the opponent's decision instead of resetting."""
         payload = _STATE_REPLAY.read_bytes()
         raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
-        perspectives = compile_payloads((payload,), chunksize=0).games[0].perspectives
+        result = compile_payloads((payload,), chunksize=0)
+        perspectives = result.accepted_series[0].games[0].perspectives
         starts = [[snapshot.pre_line_index for snapshot in item.snapshots] for item in perspectives]
 
         spans_opponent_decision = 0
@@ -339,7 +345,8 @@ class TestSpatialEventIntervals:
         """The last exchange has no request; the final view keeps it with no choice."""
         payload = _STATE_REPLAY.read_bytes()
         raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
-        perspectives = compile_payloads((payload,), chunksize=0).games[0].perspectives
+        result = compile_payloads((payload,), chunksize=0)
+        perspectives = result.accepted_series[0].games[0].perspectives
 
         for perspective in perspectives:
             final_interval = raw_lines[perspective.snapshots[-1].pre_line_index :]

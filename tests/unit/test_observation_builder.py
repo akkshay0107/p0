@@ -691,7 +691,8 @@ class TestObservationBuilderLegalityAndState:
         from tests.unit.replay_fixtures import golden_replay_payload
 
         document = parse_replay_payload(golden_replay_payload("buffer-reuse"))
-        perspective = compile_documents((document,), chunksize=0).games[0].perspectives[0]
+        result = compile_documents((document,), chunksize=0)
+        perspective = result.accepted_series[0].games[0].perspectives[0]
         assert len(perspective.snapshots) >= 2
         builder = ObservationBuilder(default_runtime_resources())
         output = StructuredObservation.empty_batch(1)[0]

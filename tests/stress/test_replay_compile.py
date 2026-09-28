@@ -44,7 +44,7 @@ class TestReplayCompile:
 
         assert result.metrics.counters["replays"] == count
         assert result.metrics.counters["accepted_games"] == count
-        assert {game.replay_id for game in result.games} == {
+        assert {game.replay_id for series in result.accepted_series for game in series.games} == {
             f"stress-{index}" for index in range(count)
         }
 
@@ -95,7 +95,7 @@ class TestReplayCompile:
             )
         )
         result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
-        assert len(result.games) == len(payloads)
+        assert len(result.accepted_series) == series_count
 
         built = write_tensor_shards(
             result,
