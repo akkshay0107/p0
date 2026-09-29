@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, NamedTuple
 
+from p0.model.resources import cache_default_dex
 from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.classification import EventClassification
@@ -116,15 +117,6 @@ _TRANSIENT_ACTION_TAGS = frozenset(
     }
 )
 _INITIALIZATION_TAGS = frozenset({"player", "clearpoke", "poke", "showteam", "teamsize", "start"})
-_INDEX_CACHE: (
-    tuple[
-        Mapping[str, Any],
-        dict[str, _SpeciesData],
-        dict[str, Mapping[str, Any]],
-        dict[str, frozenset[str]],
-    ]
-    | None
-) = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1999,13 +1991,11 @@ def _legal_effect_index(dex: Mapping[str, Any]) -> dict[str, frozenset[str]]:
     }
 
 
+@cache_default_dex
 def _cached_indexes(
     dex: Mapping[str, Any],
 ) -> tuple[dict[str, _SpeciesData], dict[str, Mapping[str, Any]], dict[str, frozenset[str]]]:
-    global _INDEX_CACHE
-    if _INDEX_CACHE is None or _INDEX_CACHE[0] is not dex:
-        _INDEX_CACHE = (dex, _species_index(dex), _move_index(dex), _legal_effect_index(dex))
-    return _INDEX_CACHE[1:]
+    return _species_index(dex), _move_index(dex), _legal_effect_index(dex)
 
 
 def _maximum_pp(data: Mapping[str, Any], base_pp: int) -> int:

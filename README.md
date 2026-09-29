@@ -188,11 +188,15 @@ shards are published atomically under the global contract and dataset hashes. Th
 shard `manifest.json` records the content hash of every source replay, the series
 membership, and accepted/rejected counts with rejection reasons in `diagnostics`.
 
-If a build with the same dataset hash already exists, `build-shards` validates it and
-returns it without compiling again. The dataset hash covers the source replays, build
+For single-format inputs with default resources, `build-shards` validates existing
+output and returns before reconstruction. Mixed formats or custom resources use the
+normal compile/write path. The dataset hash covers the source replays, build
 settings and global contract hash, but not the replay reconstruction code. After a
 change to reconstruction, delete the old `<dataset-hash>` directory before running
 `build-shards`, or the old shards are reused.
+
+Default dex lookup tables are initialized lazily once per process. Restart the
+process after changing reference data; explicitly supplied custom tables are rebuilt.
 
 ### 3. Local Play & Bot Runner
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, NamedTuple
 
+from p0.model.resources import cache_default_dex
 from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.diagnostics import (
@@ -351,6 +352,7 @@ def _required_active_slot(event: ProtocolEvent, reference: PokemonRefArgument) -
     return slot
 
 
+@cache_default_dex
 def _species_base_index(dex: Mapping[str, Any]) -> dict[str, str]:
     index: dict[str, str] = {}
     for value in dex.get("species", ()):

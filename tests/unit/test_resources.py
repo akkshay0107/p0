@@ -26,7 +26,7 @@ from p0.model.architecture_contract import SERIES_SLOTS, SERIES_TOKENS_PER_GAME
 from p0.model.fused_token_encoder import (
     FusedTokenEncoder,
 )
-from p0.model.resources import RuntimeResources, default_runtime_resources
+from p0.model.resources import RuntimeResources, cache_default_dex, default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
 from p0.model.tokenizer import PokemonTokenizer, Resolution, tokenizer
@@ -35,6 +35,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestRuntimeResources:
+    def test_only_default_dex_tables_are_singletons(self) -> None:
+        lookup = cache_default_dex(dict)
+        dex = default_runtime_resources().dex
+        assert lookup(dex) is lookup(dex)
+        custom = {"species": "original"}
+        original = lookup(custom)
+        custom["species"] = "changed"
+        assert lookup(custom)["species"] == "changed"
+        assert original["species"] == "original"
+        assert lookup(dex) is lookup(dex)
+
     def test_active_contract_is_reg_m_b_and_manifest_matches_sources(self) -> None:
         """Verify default runtime_manifest matches Champions Regulation M-B battle formats and action contract."""
         manifest = GlobalContract.from_dict(

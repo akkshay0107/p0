@@ -9,6 +9,7 @@ import pytest
 
 from p0.replays.compile import (
     compile_payloads,
+    compile_to_shards,
     write_tensor_shards,
 )
 from p0.replays.dataset import LazyReplayDataset
@@ -199,13 +200,21 @@ class TestReplayCompiler:
         )
         (first.manifest_path.parent / "release_gate.json").write_text("not-json", encoding="utf-8")
 
-        second = write_tensor_shards(
-            result,
-            tmp_path,
-            created_at="2026-01-01T00:00:00Z",
-        )
+        document = result.series[0].games[0]
+        second = compile_to_shards(iter((document,)), tmp_path)
 
         assert second.manifest_path == first.manifest_path
+        write_tensor_shards(result, tmp_path, max_candidates=0)
+        with pytest.raises(ValueError, match="max_candidates must be positive"):
+            compile_to_shards((document,), tmp_path, max_candidates=0)
+        with pytest.raises(ReplayInputContractError, match="duplicate"):
+            compile_to_shards((document, document), tmp_path)
+        invalid = replace(document, outcome=replace(document.outcome, terminal_line_index=None))
+        with pytest.raises(ReplayInputContractError, match="terminal"):
+            compile_to_shards((invalid,), tmp_path)
+        (first.manifest_path.parent / first.manifest.shards[0].filename).write_bytes(b"corrupt")
+        with pytest.raises(ValueError, match="artifact failed validation"):
+            compile_to_shards((document,), tmp_path)
 
     def test_extra_game_after_series_won_rejected(self) -> None:
         """Verify that a 2-0 series followed by a 3rd game is rejected under precision-first policy."""

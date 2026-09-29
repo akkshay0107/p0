@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache, wraps
 from pathlib import Path
 from typing import Any
 
@@ -84,3 +85,22 @@ def default_runtime_resources() -> RuntimeResources:
     dex_path = manifest_path.with_name("champions_dex.json")
     dex = orjson.loads(dex_path.read_bytes())
     return RuntimeResources.from_data(tokenizer.vocab, dex, shared_tokenizer=tokenizer)
+
+
+def cache_default_dex[T](
+    build: Callable[[Mapping[str, Any]], T],
+) -> Callable[[Mapping[str, Any]], T]:
+    """Reuse fixed default-dex tables per process; rebuild tables for custom data."""
+    default = cache(lambda: build(default_runtime_resources().dex))
+
+    @wraps(build)
+    def lookup(dex: Mapping[str, Any]) -> T:
+        # Custom data must not load default resources or reuse their tables.
+        if (
+            default_runtime_resources.cache_info().currsize
+            and dex is default_runtime_resources().dex
+        ):
+            return default()
+        return build(dex)
+
+    return lookup

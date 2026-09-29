@@ -8,7 +8,7 @@ from typing import Any, NamedTuple
 
 from p0.battle.events import EventRecord, SpatialEventRecorder
 from p0.battle.legality import GAME_END_DECISION, DecisionView
-from p0.model.resources import default_runtime_resources
+from p0.model.resources import cache_default_dex, default_runtime_resources
 from p0.model.tokenizer import tokenizer
 from p0.replays.identity import ReplayMemberId, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
@@ -34,15 +34,6 @@ from p0.teams.stat_points import BaseStats, calculate_stats
 
 _STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
 _IMPUTATION_SOURCE_VERSION = 1
-_DEX_INDEX_CACHE: (
-    tuple[
-        Mapping[str, Any],
-        dict[str, Mapping[str, Any]],
-        dict[str, Mapping[str, Any]],
-        dict[str, str],
-    ]
-    | None
-) = None
 
 
 def _enum_name(value: str) -> str:
@@ -350,21 +341,17 @@ def _species_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return by_id
 
 
+@cache_default_dex
 def _cached_dex_indexes(
     dex: Mapping[str, Any],
 ) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]], dict[str, str]]:
-    global _DEX_INDEX_CACHE
-    if _DEX_INDEX_CACHE is None or _DEX_INDEX_CACHE[0] is not dex:
-        moves = {
-            normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): entry
-            for entry in dex.get("moves", ())
-            if isinstance(entry, Mapping)
-        }
-        move_categories = {
-            move_id: str(entry.get("category", "")) for move_id, entry in moves.items()
-        }
-        _DEX_INDEX_CACHE = (dex, _species_index(dex), moves, move_categories)
-    return _DEX_INDEX_CACHE[1], _DEX_INDEX_CACHE[2], _DEX_INDEX_CACHE[3]
+    moves = {
+        normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): entry
+        for entry in dex.get("moves", ())
+        if isinstance(entry, Mapping)
+    }
+    move_categories = {move_id: str(entry.get("category", "")) for move_id, entry in moves.items()}
+    return _species_index(dex), moves, move_categories
 
 
 def impute_replay_stats(

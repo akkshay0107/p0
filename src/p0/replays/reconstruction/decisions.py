@@ -17,7 +17,7 @@ from p0.battle.actions import (
     encode_team_pair,
 )
 from p0.battle.legality import DecisionView, SlotDecision
-from p0.model.resources import default_runtime_resources
+from p0.model.resources import cache_default_dex, default_runtime_resources
 from p0.replays.evidence import (
     EvidenceRequest,
     ObservedAction,
@@ -573,6 +573,7 @@ def _preview_actions(
     )
 
 
+@cache_default_dex
 def _mega_rules(dex: Mapping[str, Any]) -> _MegaRules:
     species_by_item: dict[str, set[str]] = {}
     for entry in dex.get("items", ()):
