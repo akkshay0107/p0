@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from p0.battle.events import EventRecord, SpatialEventRecorder
@@ -344,14 +345,18 @@ def _species_index(dex: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 @cache_default_dex
 def _cached_dex_indexes(
     dex: Mapping[str, Any],
-) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]], dict[str, str]]:
+) -> tuple[Mapping[str, Mapping[str, Any]], Mapping[str, Mapping[str, Any]], Mapping[str, str]]:
     moves = {
         normalize_showdown_id(str(entry.get("id", entry.get("name", "")))): entry
         for entry in dex.get("moves", ())
         if isinstance(entry, Mapping)
     }
     move_categories = {move_id: str(entry.get("category", "")) for move_id, entry in moves.items()}
-    return _species_index(dex), moves, move_categories
+    return (
+        MappingProxyType(_species_index(dex)),
+        MappingProxyType(moves),
+        MappingProxyType(move_categories),
+    )
 
 
 def impute_replay_stats(

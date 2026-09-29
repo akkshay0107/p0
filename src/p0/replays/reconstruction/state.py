@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from p0.model.resources import cache_default_dex
@@ -1994,8 +1995,14 @@ def _legal_effect_index(dex: Mapping[str, Any]) -> dict[str, frozenset[str]]:
 @cache_default_dex
 def _cached_indexes(
     dex: Mapping[str, Any],
-) -> tuple[dict[str, _SpeciesData], dict[str, Mapping[str, Any]], dict[str, frozenset[str]]]:
-    return _species_index(dex), _move_index(dex), _legal_effect_index(dex)
+) -> tuple[
+    Mapping[str, _SpeciesData], Mapping[str, Mapping[str, Any]], Mapping[str, frozenset[str]]
+]:
+    return (
+        MappingProxyType(_species_index(dex)),
+        MappingProxyType(_move_index(dex)),
+        MappingProxyType(_legal_effect_index(dex)),
+    )
 
 
 def _maximum_pp(data: Mapping[str, Any], base_pp: int) -> int:

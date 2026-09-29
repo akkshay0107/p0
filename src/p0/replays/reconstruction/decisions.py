@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, NamedTuple
 
 from p0.battle.actions import (
@@ -589,7 +590,7 @@ def _mega_rules(dex: Mapping[str, Any]) -> _MegaRules:
         if isinstance(entry, Mapping) and entry.get("zMove")
     )
     return _MegaRules(
-        {item: frozenset(species) for item, species in species_by_item.items()},
+        MappingProxyType({item: frozenset(species) for item, species in species_by_item.items()}),
         z_items,
     )
 

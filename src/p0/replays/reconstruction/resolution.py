@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, NamedTuple
 
 from p0.model.resources import cache_default_dex
@@ -353,7 +354,7 @@ def _required_active_slot(event: ProtocolEvent, reference: PokemonRefArgument) -
 
 
 @cache_default_dex
-def _species_base_index(dex: Mapping[str, Any]) -> dict[str, str]:
+def _species_base_index(dex: Mapping[str, Any]) -> Mapping[str, str]:
     index: dict[str, str] = {}
     for value in dex.get("species", ()):
         if not isinstance(value, Mapping):
@@ -364,7 +365,7 @@ def _species_base_index(dex: Mapping[str, Any]) -> dict[str, str]:
         if species_id and base_species:
             index[species_id] = base_species
             index[normalize_showdown_id(name)] = base_species
-    return index
+    return MappingProxyType(index)
 
 
 def _base_species_id(species: str, species_bases: Mapping[str, str]) -> str:

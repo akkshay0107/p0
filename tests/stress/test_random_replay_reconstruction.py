@@ -583,7 +583,6 @@ def _assert_reconstruction_labels(
     compilation = compile_documents(
         (document,),
         max_candidates=max_candidates,
-        dex=default_runtime_resources().dex,
         chunksize=0,
     )
     if not compilation.accepted_series:
@@ -1137,7 +1136,6 @@ class TestRandomReplayReconstruction:
             documents,
             format_id=FORMAT.battle_format,
             max_candidates=max_candidates,
-            dex=resources.dex,
         )
         accepted_count = sum(len(series.games) for series in compilation.accepted_series)
         assert accepted_count + len(rejected_ids) == game_count

@@ -15,7 +15,6 @@ from p0.format_config import (
     DEFAULT_RUNTIME_MANIFEST,
     load_global_contract,
 )
-from p0.model.resources import default_runtime_resources
 from p0.replays.compile import (
     ShardBuildResult,
     compile_documents,
@@ -280,14 +279,6 @@ class TestReplayInputContract:
 
         with pytest.raises(ReplayInputContractError, match="does not match requested"):
             compile_documents((document,), format_id="unsupported-format")
-
-    def test_changed_runtime_dex_is_rejected(self) -> None:
-        payload = sample_replay_payload("input-dex")
-        document = parse_replay_payload(payload)
-        dex = json.loads(json.dumps(default_runtime_resources().dex))
-        dex["moves"][0]["name"] = "Changed move name"
-        with pytest.raises(ReplayInputContractError, match="pinned Champions artifact"):
-            compile_documents((document,), dex=dex)
 
     def test_ots_preserves_duplicate_species_as_distinct_ordered_members(self) -> None:
         payload = sample_replay_payload("duplicate-species")

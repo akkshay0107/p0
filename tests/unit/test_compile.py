@@ -78,7 +78,7 @@ class TestReplayCompiler:
         with pytest.raises(ValueError, match="source membership in order"):
             replace(accepted, games=tuple(reversed(accepted.games)))
 
-    def test_shard_limit_uses_incoming_series_first_game(self, tmp_path: Path) -> None:
+    def test_shard_limit_uses_whole_incoming_series(self, tmp_path: Path) -> None:
         single = sample_replay_payload("single-1", parent="single", game_number=1)
         first = sample_replay_payload("valid-1", parent="valid", game_number=1)
         second = sample_replay_payload("valid-2", parent="valid", game_number=2)
@@ -92,8 +92,7 @@ class TestReplayCompiler:
         )
 
         assert built.manifest.accepted_games == 3
-        assert len(built.manifest.shards) == 1
-        assert built.manifest.shards[0].decisions == 12
+        assert [shard.decisions for shard in built.manifest.shards] == [4, 8]
 
     def test_source_series_preserves_game_number_order(self, tmp_path: Path) -> None:
         first = sample_replay_payload("z-game", game_number=1)
@@ -204,7 +203,8 @@ class TestReplayCompiler:
         second = compile_to_shards(iter((document,)), tmp_path)
 
         assert second.manifest_path == first.manifest_path
-        write_tensor_shards(result, tmp_path, max_candidates=0)
+        with pytest.raises(ValueError, match="max_candidates must be positive"):
+            write_tensor_shards(result, tmp_path, max_candidates=0)
         with pytest.raises(ValueError, match="max_candidates must be positive"):
             compile_to_shards((document,), tmp_path, max_candidates=0)
         with pytest.raises(ReplayInputContractError, match="duplicate"):

@@ -184,6 +184,8 @@ def _build_identity(
     manifest_path: str | Path,
     external_rejections: Mapping[str, str] | None,
 ) -> dict[str, Any]:
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
     if max_decisions_per_shard <= 0:
         raise ValueError("max_decisions_per_shard must be positive")
     rejected = external_rejections or {}
@@ -393,8 +395,9 @@ def write_tensor_shards(
 
     The dataset hash covers source replay identities, series membership, format,
     build configuration, and the runtime contract, but not reconstruction code.
-    Existing builds are validated and reused. Shards split only between series,
-    even when one exceeds the limit.
+    Existing builds are validated and reused. Shards split only between series;
+    a series goes to a new shard when the whole series would exceed the limit,
+    so only a series larger than the limit produces an oversized shard.
     Files are published atomically; failed builds are removed.
 
     Raises ValueError for invalid limits, no accepted series, overlapping rejected
@@ -407,9 +410,9 @@ def write_tensor_shards(
         manifest_path: Global runtime contract manifest the shards are bound to.
         resources: Runtime resources for the observation builder; None uses the defaults.
         created_at: ISO timestamp for the manifest; None uses the current UTC time.
-        max_candidates: Candidate cap recorded in the build configuration. It
-            should match the value passed to compile_documents; this function
-            does not apply it.
+        max_candidates: Candidate cap recorded in the build configuration; must
+            be positive. It should match the value passed to compile_documents;
+            this function does not apply it.
         external_rejections: Replay id to content SHA-256 for replays rejected
             before compilation. They are recorded in the manifest and counted
             as rejected games.
@@ -445,17 +448,17 @@ def write_tensor_shards(
     entries: list[ShardIndexEntry] = []
     diagnostics = Counter(result.metrics.counters)
     diagnostics["rejected_input_files"] += rejected_count
-    diagnostics.setdefault("rejected_non_contiguous_game_numbers", 0)
     try:
         current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
         current_decisions = 0
         for accepted in sorted(
             result.accepted_series, key=lambda item: item.group.record.series_id
         ):
-            first_game_decisions = sum(
-                len(perspective.decisions) for perspective in accepted.games[0].perspectives
-            )
-            if current_games and current_decisions + first_game_decisions > max_decisions_per_shard:
+            series_items = [
+                (game, perspective) for game in accepted.games for perspective in game.perspectives
+            ]
+            series_decisions = sum(len(perspective.decisions) for _, perspective in series_items)
+            if current_games and current_decisions + series_decisions > max_decisions_per_shard:
                 entries.append(
                     _write_shard(
                         root, len(entries), current_games, builder, runtime_hash, dataset_hash
@@ -463,11 +466,8 @@ def write_tensor_shards(
                 )
                 current_games, current_decisions = [], 0
 
-            for game in accepted.games:
-                current_games.extend((game, perspective) for perspective in game.perspectives)
-                current_decisions += sum(
-                    len(perspective.decisions) for perspective in game.perspectives
-                )
+            current_games.extend(series_items)
+            current_decisions += series_decisions
 
         if current_games:
             entries.append(
@@ -697,6 +697,7 @@ def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
         "imputation_confidence_sum",
         "accepted_games",
         "rejected_games",
+        "rejected_non_contiguous_game_numbers",
     )
     counters = Counter({key: 0 for key in zero_keys})
     counters.update(
@@ -711,30 +712,6 @@ def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
         }
     )
     return counters
-
-
-def _validate_runtime_dex(dex: Mapping[str, Any] | None) -> None:
-    """Validate the runtime dex before workers are started."""
-    if dex is None:
-        try:
-            default_runtime_resources()
-        except (OSError, ValueError, TypeError) as exc:
-            raise ReplayInputContractError("Pinned runtime dex is unusable") from exc
-        return
-    required = {"species", "items", "abilities", "moves", "transformations"}
-    if not required.issubset(dex):
-        missing = sorted(required - set(dex))
-        raise ReplayInputContractError(f"Runtime dex is missing required sections: {missing!r}")
-    pinned_dex = default_runtime_resources().dex
-    dex_hash = hashlib.sha256(orjson.dumps(dex, option=orjson.OPT_SORT_KEYS)).hexdigest()
-    pinned_hash = hashlib.sha256(orjson.dumps(pinned_dex, option=orjson.OPT_SORT_KEYS)).hexdigest()
-    if dex_hash != pinned_hash:
-        raise ReplayInputContractError("Runtime dex does not match the pinned Champions artifact")
-    declared_format = dex.get("format_id")
-    if declared_format is not None and declared_format not in _SUPPORTED_FORMATS:
-        raise ReplayInputContractError(
-            f"Runtime dex format does not match supported formats: {declared_format!r}"
-        )
 
 
 def _compile_worker(
@@ -812,7 +789,6 @@ def compile_documents(
     *,
     format_id: str | None = None,
     max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
     chunksize: int | None = None,
 ) -> CompilationResult:
     """
@@ -828,27 +804,24 @@ def compile_documents(
     Raises ReplayInputContractError, before any compilation, for duplicate
     replay ids; a replay without two distinct players, complete six-member OTS
     or a terminal line; an unsupported format or one that differs from
-    format_id; or an unusable or non-matching dex.
+    format_id.
 
     Arguments:
         documents: Parsed replay documents. Replay ids must be unique.
         format_id: Required format for every document; None accepts any supported format.
         max_candidates: Maximum joint-action candidates kept per reconstructed decision.
-        dex: Runtime dex; None uses the pinned default. A custom dex must match
-            the pinned one.
         chunksize: Jobs per worker task; None picks one from the job and CPU
             counts. A value of zero or less compiles in this process.
 
     Returns:
         CompilationResult with all source groups, accepted series, and metrics.
     """
-    return _compile_groups(_group_documents(documents, format_id, dex), max_candidates, chunksize)
+    return _compile_groups(_group_documents(documents, format_id), max_candidates, chunksize)
 
 
 def _group_documents(
     documents: Iterable[ReplayDocument],
     format_id: str | None,
-    dex: Mapping[str, Any] | None,
 ) -> GroupingResult:
     docs = tuple(documents)
     if len({document.metadata.replay_id for document in docs}) != len(docs):
@@ -874,7 +847,6 @@ def _group_documents(
             raise ReplayInputContractError(
                 f"Replay format {document.metadata.format_id!r} does not match requested {format_id!r}"
             )
-    _validate_runtime_dex(dex)
     return group_replays(docs, format_id=format_id)
 
 
@@ -892,6 +864,8 @@ def _compile_groups(
     Returns:
         Source groups, accepted series, and compilation metrics.
     """
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
     counters = _initial_compilation_counters(grouping)
     failed_series: set[str] = set()
     for group in grouping.series:
@@ -998,7 +972,6 @@ def compile_payloads(
     *,
     format_id: str | None = None,
     max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
     chunksize: int | None = None,
 ) -> CompilationResult:
     """Parse raw replay payloads and compile them through the replay pipeline."""
@@ -1007,7 +980,6 @@ def compile_payloads(
         documents,
         format_id=format_id,
         max_candidates=max_candidates,
-        dex=dex,
         chunksize=chunksize,
     )
 
@@ -1018,7 +990,6 @@ def compile_to_shards(
     *,
     format_id: str | None = None,
     max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
     max_decisions_per_shard: int = 4096,
     manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
     resources: RuntimeResources | None = None,
@@ -1026,13 +997,18 @@ def compile_to_shards(
     chunksize: int | None = None,
     external_rejections: Mapping[str, str] | None = None,
 ) -> ShardBuildResult:
-    """Compile documents and write a validated tensor shard build."""
-    if max_candidates < 1:
-        raise ValueError("max_candidates must be positive")
-    grouping = _group_documents(documents, format_id, dex)
+    """
+    Compile documents and write a validated tensor shard build.
+
+    With a single source format, the dataset hash is known before compilation,
+    so an existing build at that hash is validated and returned without
+    reconstructing any replay. This happens even if none of the documents
+    would pass the quality gates now. Mixed-format input is compiled first,
+    because the build's format is taken from the first accepted game.
+    """
+    grouping = _group_documents(documents, format_id)
     formats = {group.record.format_id for group in grouping.series}
-    # Mixed formats need admission to determine the first accepted game's format.
-    if len(formats) == 1 and resources is None:
+    if len(formats) == 1:
         identity = _build_identity(
             grouping.series,
             next(iter(formats)),

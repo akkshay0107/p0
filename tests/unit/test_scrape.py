@@ -10,11 +10,7 @@ import pytest
 
 from p0.battle.legality import DecisionView, SlotDecision
 from p0.format_config import FORMAT
-from p0.model.observation_builder import ObservationBuilder
-from p0.model.resources import default_runtime_resources
-from p0.paths import DEFAULT_PATHS
 from p0.replays.compile import (
-    CompilationResult,
     compile_payloads,
     compile_to_shards,
 )
@@ -37,50 +33,16 @@ from p0.replays.scrape import (
 from tests.unit.replay_fixtures import payload_with_ots_natures, sample_replay_payload
 
 
-def _numerical_rows(result: CompilationResult) -> list[tuple[float, ...]]:
-    builder = ObservationBuilder(default_runtime_resources())
-    rows: list[tuple[float, ...]] = []
-    for series in result.accepted_series:
-        for game in series.games:
-            for perspective in game.perspectives:
-                for snapshot in perspective.snapshots:
-                    observation = builder.build(snapshot.view)
-                    rows.extend(
-                        tuple(float(value) for value in token) for token in observation.numerical
-                    )
-    return rows
-
-
 class TestReplayScraping:
-    def test_replay_stat_imputation_is_consistent_with_runtime_dex(self) -> None:
-        """Verify explicit replay stat estimates are stable when the runtime dex is passed explicitly."""
-        dex = json.loads(
-            (DEFAULT_PATHS.data_root / "champions_dex.json").read_text(encoding="utf-8")
-        )
-        without = compile_payloads((payload_with_ots_natures("metrics-off"),))
-        with_dex = compile_payloads((payload_with_ots_natures("metrics-on"),), dex=dex)
+    def test_replay_stats_are_imputed_from_the_pinned_dex(self) -> None:
+        result = compile_payloads((payload_with_ots_natures("imputed"),))
 
-        assert _numerical_rows(without) == _numerical_rows(with_dex)
-
-        assert (
-            without.metrics.counters["imputations"] == with_dex.metrics.counters["imputations"] > 0
-        )
-        assert (
-            without.metrics.counters["imputation_unknown"]
-            == with_dex.metrics.counters["imputation_unknown"]
-        )
-        assert (
-            without.metrics.counters["imputation_confidence_sum"]
-            == with_dex.metrics.counters["imputation_confidence_sum"]
-        )
-        assert with_dex.metrics.counters["imputation_confidence_sum"] > 0.0
+        assert result.metrics.counters["imputations"] > 0
+        assert result.metrics.counters["imputation_confidence_sum"] > 0.0
 
     def test_replay_stats_are_applied_to_both_projected_sides(self) -> None:
         """Verify replay stat estimates cover both sides and projected natures remain explicit."""
-        dex = json.loads(
-            (DEFAULT_PATHS.data_root / "champions_dex.json").read_text(encoding="utf-8")
-        )
-        result = compile_payloads((payload_with_ots_natures("own-side"),), dex=dex)
+        result = compile_payloads((payload_with_ots_natures("own-side"),))
         assert result.accepted_series
 
         # Estimates cover every stable roster member, and both projected sides retain

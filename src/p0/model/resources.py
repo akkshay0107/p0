@@ -90,7 +90,7 @@ def default_runtime_resources() -> RuntimeResources:
 def cache_default_dex[T](
     build: Callable[[Mapping[str, Any]], T],
 ) -> Callable[[Mapping[str, Any]], T]:
-    """Reuse fixed default-dex tables per process; rebuild tables for custom data."""
+    """Reuse default-dex tables per process; build them read-only, since callers share them."""
     default = cache(lambda: build(default_runtime_resources().dex))
 
     @wraps(build)
