@@ -22,6 +22,9 @@ from p0.training.series_history import (
 )
 
 SeriesResampler = Callable[[Tensor, Tensor], Tensor]
+# Game number and detached CPU fragments of each unfinished game, kept for one
+# training update or evaluation pass; completed games move to the store.
+ActiveGames = dict[SeriesPerspectiveKey, tuple[int, tuple[Tensor, ...]]]
 
 
 def window_history_tokens(
@@ -45,6 +48,7 @@ def window_history_tokens(
 
 def prepare_series_context(
     store: SeriesHistoryStore,
+    active: ActiveGames,
     windows: tuple[BCGameWindow, ...],
     window_tokens: tuple[Tensor, ...],
     target_tokens: Tensor,
@@ -59,15 +63,16 @@ def prepare_series_context(
     for window, chunk in zip(windows, window_tokens, strict=True):
         state = working_states.get(window.series_key)
         if state is None:
-            games, tokens, fragments, active = store.planning_state(window.series_key)
+            games, ended = store.planning_state(window.series_key)
+            game_number, fragments = active.get(window.series_key, (None, ()))
             state = (
                 games,
-                tokens,
+                game_number,
                 tuple(
                     fragment.to(device=target_tokens.device, dtype=target_tokens.dtype)
                     for fragment in fragments
                 ),
-                active,
+                ended,
             )
             working_states[window.series_key] = state
 
@@ -102,18 +107,23 @@ def prepare_series_context(
 
 def commit_history_updates(
     store: SeriesHistoryStore,
+    active: ActiveGames,
     windows: tuple[BCGameWindow, ...],
     window_tokens: tuple[Tensor, ...],
 ) -> None:
-    """Append completed window tokens to the series history store."""
+    """Keep unfinished window tokens in active, and append completed games to the store."""
     for window, chunk in zip(windows, window_tokens, strict=True):
-        store.append(
-            window.series_key,
-            window.game_number,
-            chunk,
-            is_game_end=window.is_game_end,
-            is_series_end=window.is_series_end,
-        )
+        _, fragments = active.pop(window.series_key, (window.game_number, ()))
+        retained = chunk.detach().to(device="cpu", dtype=torch.float32, copy=True)
+        if window.is_game_end:
+            store.append(
+                window.series_key,
+                window.game_number,
+                torch.cat((*fragments, retained)) if fragments else retained,
+                is_series_end=window.is_series_end,
+            )
+        else:
+            active[window.series_key] = window.game_number, (*fragments, retained)
 
 
 def _resample_histories(

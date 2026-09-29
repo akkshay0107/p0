@@ -210,7 +210,7 @@ class TestCheckpoints:
         self,
         tmp_path: Path,
     ) -> None:
-        """Verify detached active history survives the checkpoint metadata envelope."""
+        """Verify detached completed-game history survives the checkpoint metadata envelope."""
         path = tmp_path / "collector-training.pt"
         policy = _small_policy()
         history = SeriesHistoryStore(policy.d_model)
@@ -218,7 +218,6 @@ class TestCheckpoints:
             "series",
             1,
             torch.ones((3, policy.d_model), requires_grad=True),
-            is_game_end=False,
             is_series_end=False,
         )
         collector_state = {
@@ -243,15 +242,10 @@ class TestCheckpoints:
         raw_history = raw_collector_state["series_history1"]
         assert isinstance(raw_history, dict)
         restored.restore_training_state(raw_history)
-        assert restored.has_partial_games
-        restored_state = restored.training_state()["series"]
-        active_fragments = restored_state["active_fragments"]
-        assert isinstance(active_fragments, tuple)
-        assert isinstance(active_fragments[0], torch.Tensor)
-        torch.testing.assert_close(
-            active_fragments[0],
-            torch.ones((3, policy.d_model)),
-        )
+        assert restored.next_game_number("series") == 2
+        (game,) = restored.snapshot("series")
+        assert game.requires_grad is False
+        torch.testing.assert_close(game, torch.ones((3, policy.d_model)))
 
     def test_checkpoint_rejects_global_contract_tampering(self, tmp_path: Path) -> None:
         """Verify checkpoint loading rejects files whose global contract checksum has been altered."""

@@ -197,13 +197,7 @@ class TestCudaTraining:
         policy = build_policy(MODEL_CONFIG, default_runtime_resources()).to(cuda_device)
         key = SeriesPerspectiveKey("cuda-fragment", 0)
         store = SeriesHistoryStore(d_model=policy.d_model)
-        store.append(
-            key,
-            1,
-            torch.full((2, policy.d_model), 0.25),
-            is_game_end=False,
-            is_series_end=False,
-        )
+        active = {key: (1, (torch.full((2, policy.d_model), 0.25),))}
         current = torch.randn((2, policy.d_model), device=cuda_device, dtype=dtype)
         current.requires_grad_()
         windows = (
@@ -217,7 +211,7 @@ class TestCudaTraining:
             dtype=dtype if dtype is not torch.float32 else torch.float16,
         ):
             context, mask = prepare_series_context(
-                store, windows, (current[0:1], current[1:2]), current, policy.series
+                store, active, windows, (current[0:1], current[1:2]), current, policy.series
             )
             loss = context[1].float().square().sum()
         loss.backward()
@@ -230,7 +224,7 @@ class TestCudaTraining:
         assert current.grad[0].isfinite().all()
         assert current.grad[0].abs().sum() > 0
         assert current.grad[1].abs().sum() == 0
-        assert store.planning_state(key)[2][0].device.type == "cpu"
+        assert active[key][1][0].device.type == "cpu"
 
     @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_autocast_update_and_scaler_resume(

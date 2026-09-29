@@ -23,6 +23,7 @@ from p0.training._bc_batch import (
     collate_bc_batches,
 )
 from p0.training._bc_history import (
+    ActiveGames,
     commit_history_updates,
     prepare_series_context,
     window_history_tokens,
@@ -205,9 +206,6 @@ class BCTrainer:
                 if self.cancel_requested():
                     raise BCCancelled("Behavior-cloning training was cancelled")
                 self._train_update(update_batches, totals)
-
-            if self._series_history.has_partial_games:
-                raise ValueError("BC dataset ended with an incomplete perspective-game")
         finally:
             self._series_history.clear()
         return totals
@@ -218,22 +216,20 @@ class BCTrainer:
         totals: dict[str, Any],
     ) -> None:
         """Backpropagate and step once for one complete-game update group."""
-        history_state = self._series_history.snapshot_keys(
-            window.series_key for batch in batches for window in batch.windows
-        )
+        active: ActiveGames = {}
         policy_weight = sum(float(batch.loss_mask.sum()) for batch in batches)
         value_count = sum(int(batch.outcome_valid.sum()) for batch in batches)
         try:
             update_loss = sum(
-                self._backward_chunk(batch, policy_weight, value_count) for batch in batches
+                self._backward_chunk(batch, active, policy_weight, value_count) for batch in batches
             )
 
             grad_norm = 0.0
             if policy_weight or value_count:
                 grad_norm = self._step_optimizer()
         except Exception:
+            # Drop partial gradients; the caller ends the epoch and clears the history.
             self.optimizer.zero_grad(set_to_none=True)
-            self._series_history.restore_keys(history_state)
             raise
 
         totals["loss"] += update_loss
@@ -260,7 +256,7 @@ class BCTrainer:
         }
 
     def _prepare_model_inputs(
-        self, batch: BCDecisionBatch
+        self, batch: BCDecisionBatch, active: ActiveGames
     ) -> tuple[PreparedDecision, Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         observations = batch.observations.to(self.device)
         context_action_mask = batch.context_action_mask.to(self.device)
@@ -283,6 +279,7 @@ class BCTrainer:
         window_tokens = window_history_tokens(batch.windows, target_local_tokens, local_tokens)
         series_tokens, series_mask = prepare_series_context(
             self._series_history,
+            active,
             batch.windows,
             window_tokens,
             target_local_tokens,
@@ -325,6 +322,7 @@ class BCTrainer:
     def _backward_chunk(
         self,
         batch: BCDecisionBatch,
+        active: ActiveGames,
         policy_weight: float,
         effective_value_count: int,
     ) -> Tensor:
@@ -333,6 +331,7 @@ class BCTrainer:
 
         Arguments:
           batch: Collated CPU batch containing one contiguous set of decisions.
+          active: Unfinished games of the current update.
           policy_weight: Total policy label weight for the update.
           effective_value_count: Total valid outcome count for the update.
 
@@ -357,7 +356,7 @@ class BCTrainer:
         loss_mask = batch.loss_mask.to(self.device)
         with self.precision.autocast_context(self.device):
             prepared, action_mask, candidate_values, candidate_offsets, window_tokens = (
-                self._prepare_model_inputs(batch)
+                self._prepare_model_inputs(batch, active)
             )
             log_probs = self.policy.score_candidates(
                 prepared,
@@ -387,7 +386,7 @@ class BCTrainer:
                 raise FloatingPointError("BC update has a non-finite loss and was discarded")
             self.scaler.scale(total_loss).backward()
 
-        commit_history_updates(self._series_history, batch.windows, window_tokens)
+        commit_history_updates(self._series_history, active, batch.windows, window_tokens)
         return policy_sum.detach()
 
     @torch.inference_mode()
@@ -401,6 +400,7 @@ class BCTrainer:
         source = self.dataset if dataset is None else dataset
         accumulator = _BCEvaluationAccumulator.create(self.device)
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
+        active: ActiveGames = {}
 
         try:
             for batch in collate_bc_batches(source, chunk_size):
@@ -416,7 +416,7 @@ class BCTrainer:
                     candidate_values,
                     candidate_offsets,
                     window_tokens,
-                ) = self._prepare_model_inputs(batch)
+                ) = self._prepare_model_inputs(batch, active)
                 candidate_log_probs = self.policy.score_candidates(
                     prepared,
                     action_mask,
@@ -443,7 +443,7 @@ class BCTrainer:
                     team_preview=prepared.encoded.phase,
                 )
                 accumulator.add_value(value_predictions, value_targets, value_mask)
-                commit_history_updates(self._series_history, batch.windows, window_tokens)
+                commit_history_updates(self._series_history, active, batch.windows, window_tokens)
 
             metrics = accumulator.finalize()
         finally:

@@ -136,6 +136,11 @@ class SimEnv(MegaEnv):
         return self._series_games_played
 
     @property
+    def series_complete(self) -> bool:
+        """Whether the series is decided; after a game ends, this holds until the next reset."""
+        return max(self._series_scores) >= 2 or self._series_games_played >= 3
+
+    @property
     def retrying(self) -> tuple[bool, bool]:
         """Whether each seat is about to decide again because its last choice was rejected."""
         return (
@@ -227,8 +232,8 @@ class SimEnv(MegaEnv):
         self._resume_reset_pending = False
         # A replaced game is still active, so its count does not end the series:
         # the game count includes the active game, which can be the third one.
-        is_completed_series = max(self._series_scores) >= 2 or (
-            self._series_games_played >= 3 and not preserve_restored_game
+        is_completed_series = self.series_complete and (
+            not preserve_restored_game or max(self._series_scores) >= 2
         )
 
         if is_completed_series or is_new_series:

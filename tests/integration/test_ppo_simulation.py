@@ -69,27 +69,25 @@ class TestPpoSimulation:
             previous_games: dict[int, tuple[str, tuple[CollectedTrajectory, ...]]] = {}
             final_entry_checks = 0
             for _ in range(1_200):
-                active_series_ids = tuple(
-                    str(info["series_id"]) for info in (vector_env.last_infos or ())
-                )
                 completed_before = len(collector.completed_trajectories)
                 collector.collect()
                 infos = vector_env.last_infos
-                if infos is None:
+                finished_games = vector_env.last_finished
+                if infos is None or finished_games is None:
                     raise AssertionError("ThreadVecEnv did not publish battle metadata")
                 # Games finishing in one step are completed in environment order,
                 # seat 1 then seat 2.
                 new_trajectories = collector.completed_trajectories[completed_before:]
                 finished = [
-                    index for index, info in enumerate(infos) if "terminal_observation1" in info
+                    (index, game) for index, game in enumerate(finished_games) if game is not None
                 ]
-                for index, seats in zip(
+                for (index, game), seats in zip(
                     finished,
                     zip(new_trajectories[::2], new_trajectories[1::2], strict=True),
                     strict=True,
                 ):
                     previous = previous_games.get(index)
-                    if previous is not None and previous[0] == active_series_ids[index]:
+                    if previous is not None and previous[0] == game.series_id:
                         for prior, current in zip(previous[1], seats, strict=True):
                             # A finished game adds its final board after the recorded
                             # decisions; a truncated game adds nothing.
@@ -98,11 +96,12 @@ class TestPpoSimulation:
                                 prior.length + final_entries
                             )
                             final_entry_checks += final_entries
-                    previous_games[index] = (active_series_ids[index], seats)
-                for index, info in enumerate(infos):
-                    if info.get("series_complete"):
+                    previous_games[index] = (game.series_id, seats)
+                    if game.series_complete:
+                        # The reset started a new series, which the info describes.
+                        assert infos[index]["series_id"] != game.series_id
                         completed_series.add(index)
-                        completed_series_ids.add(active_series_ids[index])
+                        completed_series_ids.add(game.series_id)
                 # Each game appends seat 1 then seat 2. Opponent-only replacements give
                 # the seats different decision counts, which game completion must accept;
                 # keep playing until at least one such game has finished.
@@ -224,16 +223,18 @@ class TestThirdGameCheckpointResume:
                 assert isinstance(history, dict)
                 series = history[active["series_id"]]
                 assert [number for number, _ in series["completed_games"]] == [1, 2]
-                assert series["active_game_number"] is None
 
             # The restored third game ends the series.
+            finished_game = None
             for _ in range(3_000):
                 resumed_collector.collect()
-                infos = vector_env.last_infos
-                assert infos is not None
-                if "terminal_observation1" in infos[0]:
+                assert vector_env.last_finished is not None
+                finished_game = vector_env.last_finished[0]
+                if finished_game is not None:
                     break
-            assert infos[0]["series_complete"] is True
+            assert finished_game is not None
+            assert finished_game.series_id == active["series_id"]
+            assert finished_game.series_complete is True
             assert resumed_env.series_id != active["series_id"]
             assert resumed_env.series_games_played == 1
         finally:

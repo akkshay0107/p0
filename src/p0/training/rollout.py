@@ -19,7 +19,7 @@ from p0.training.trajectory import (
     prepare_trajectory_batches,
 )
 from p0.training.utils import OptimizationPrecision, select_optimization_precision
-from p0.training.vector_env import ThreadVecEnv
+from p0.training.vector_env import FinishedGame, ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
 MAX_TRAJECTORY_STEPS = 200
@@ -27,17 +27,13 @@ MAX_TRAJECTORY_STEPS = 200
 __all__ = ["RolloutCollector"]
 
 
-def _terminal_action_mask(
-    info: Mapping[str, object], key: str, device: torch.device
-) -> torch.Tensor:
+def _terminal_action_mask(raw_mask: np.ndarray, device: torch.device) -> torch.Tensor:
     """Return one validated two-slot mask saved before a vector-env reset."""
-    raw_mask = info.get(key)
-    if raw_mask is None:
-        raise RuntimeError(f"Completed rollout info is missing {key}")
-
     mask = torch.as_tensor(raw_mask, device=device, dtype=torch.bool)
     if mask.shape != (2, ACT_SIZE):
-        raise ValueError(f"Expected {key} to have shape (2, {ACT_SIZE}), got {tuple(mask.shape)}")
+        raise ValueError(
+            f"Expected a terminal action mask of shape (2, {ACT_SIZE}), got {tuple(mask.shape)}"
+        )
     return mask
 
 
@@ -161,7 +157,7 @@ class RolloutCollector:
                 for i in range(n_envs)
             ]
 
-            masks1, masks2, rewards1, rewards2, done_status, infos = vec_env.step(env_actions)
+            masks1, masks2, rewards1, rewards2, done_status, _, finished = vec_env.step(env_actions)
 
             # RL non-terminal masking only cares if the episode naturally terminated.
             # Status 1 is Terminated, Status 2 is Truncated.
@@ -177,15 +173,9 @@ class RolloutCollector:
                 seat.trajectories.rewards[idx_all, last_steps] = torch.from_numpy(rewards)
                 seat.trajectories.dones[idx_all, last_steps] = torch.from_numpy(game_done)
 
-            for i in range(n_envs):
-                if done_status[i]:
-                    self._finish_game(
-                        i,
-                        int(done_status[i]),
-                        infos[i],
-                        series_ids[i],
-                        precision,
-                    )
+            for i, game in enumerate(finished):
+                if game is not None:
+                    self._finish_game(i, game, precision)
 
     def _memory_inputs(
         self, env_ids: torch.Tensor, series_ids: list[str], device: torch.device
@@ -205,9 +195,7 @@ class RolloutCollector:
     def _finish_game(
         self,
         env_id: int,
-        done_status: int,
-        info: Mapping[str, object],
-        series_id: str,
+        game: FinishedGame,
         precision: OptimizationPrecision,
     ) -> None:
         """
@@ -215,9 +203,7 @@ class RolloutCollector:
 
         Arguments:
             env_id: Environment index.
-            done_status: 1 if game terminated naturally, 2 if truncated.
-            info: Terminal metadata captured before the automatic reset.
-            series_id: Identifier of the series that produced the game.
+            game: The finished game, captured before the automatic reset.
             precision: Selected inference autocast precision.
 
         Returns:
@@ -225,18 +211,19 @@ class RolloutCollector:
         """
         policy = self.policy
         device = policy.device
+        series_id = game.series_id
+        done_status = game.done_status
         snapshots = tuple(seat.series_history.snapshot(series_id) for seat in self._seats)
-        terminal_observations: list[StructuredObservation] = []
-        for key in ("terminal_observation1", "terminal_observation2"):
-            observation = info.get(key)
-            if not isinstance(observation, StructuredObservation):
-                raise RuntimeError(f"Completed rollout info is missing {key}")
-            terminal_observations.append(observation.unsqueeze(0).to(device))
-        terminal_obs = StructuredObservation.cat(terminal_observations)
+        terminal_obs = StructuredObservation.cat(
+            [
+                observation.unsqueeze(0).to(device)
+                for observation in (game.observation1, game.observation2)
+            ]
+        )
         terminal_mask = torch.stack(
             tuple(
-                _terminal_action_mask(info, f"terminal_action_mask{seat_index}", device)
-                for seat_index in (1, 2)
+                _terminal_action_mask(mask, device)
+                for mask in (game.action_mask1, game.action_mask2)
             )
         )
         with precision.autocast_context(device):
@@ -268,7 +255,7 @@ class RolloutCollector:
                 )
             )
 
-        if info.get("series_complete"):
+        if game.series_complete:
             for seat in self._seats:
                 seat.series_tokens.drop(series_id)
                 seat.series_history.drop(series_id)
@@ -287,7 +274,6 @@ class RolloutCollector:
                     series_id,
                     seat.series_history.next_game_number(series_id),
                     history[0],
-                    is_game_end=True,
                     is_series_end=False,
                 )
                 seat.series_tokens.append(series_id, summary)
@@ -305,7 +291,6 @@ class RolloutCollector:
         self.completed_trajectories.clear()
         for seat in self._seats:
             seat.trajectories.step_counts.zero_()
-            seat.series_history.discard_active_games()
         for env in self.vector_env.envs:
             env.prepare_for_checkpoint()
         self.vector_env.reset()

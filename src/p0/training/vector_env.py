@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -18,6 +19,27 @@ def _publish_seats(info: dict[str, object], env: SimEnv) -> None:
     # its next observation is not a decision and its action will not be sent.
     info["to_move"] = (env.agent1_to_move, env.agent2_to_move)
     info["retry"] = env.retrying
+
+
+@dataclass(frozen=True, slots=True)
+class FinishedGame:
+    """
+    A game that ended on the last step, captured before the automatic reset.
+
+    The step's info describes the game that replaced it, whose series_id differs
+    from this one when the finished game ended its series.
+    """
+
+    series_id: str
+    # 1 terminated, 2 truncated.
+    done_status: int
+    series_complete: bool
+    # Final observations and masks: truncation bootstraps from them, and a
+    # finished game adds their summaries to the series history.
+    observation1: StructuredObservation
+    observation2: StructuredObservation
+    action_mask1: np.ndarray
+    action_mask2: np.ndarray
 
 
 class ThreadVecEnv:
@@ -38,6 +60,7 @@ class ThreadVecEnv:
         self.last_masks1: np.ndarray | None = None
         self.last_masks2: np.ndarray | None = None
         self.last_infos: list[dict[str, object]] | None = None
+        self.last_finished: list[FinishedGame | None] | None = None
 
     def _reset_env(
         self, env_id: int, env: SimEnv
@@ -65,6 +88,7 @@ class ThreadVecEnv:
         self.last_masks1 = masks1
         self.last_masks2 = masks2
         self.last_infos = infos
+        self.last_finished = [None for _ in range(self.n_envs)]
         return masks1, masks2, infos
 
     def _step_env(self, env_id: int, env: SimEnv, action: dict[str, np.ndarray]):
@@ -84,26 +108,24 @@ class ThreadVecEnv:
         reward1 = rewards[agent1]
         reward2 = rewards[agent2] if agent2 in rewards else 0.0
 
-        series_complete = False
-        terminal: dict[str, object] = {}
+        finished = None
         if done_status > 0:
-            series_complete = max(env.series_scores) >= 2 or env.series_games_played >= 3
-            # Preserve the final observations and masks before the automatic reset
-            # replaces them: truncation bootstraps from them, and a finished game
-            # adds their summaries to the series history.
-            terminal = {
-                "terminal_observation1": self.obs1_buffers[env_id].clone(),
-                "terminal_observation2": self.obs2_buffers[env_id].clone(),
-                "terminal_action_mask1": mask1.copy(),
-                "terminal_action_mask2": mask2.copy(),
-            }
+            # The automatic reset overwrites the observation buffers and may start
+            # a new series, so capture the finished game first.
+            finished = FinishedGame(
+                series_id=env.series_id,
+                done_status=done_status,
+                series_complete=env.series_complete,
+                observation1=self.obs1_buffers[env_id].clone(),
+                observation2=self.obs2_buffers[env_id].clone(),
+                action_mask1=mask1.copy(),
+                action_mask2=mask2.copy(),
+            )
             mask1, mask2, _ = self._reset_env(env_id, env)
 
         info["series_id"] = env.series_id
-        info["series_complete"] = series_complete
-        info.update(terminal)
         _publish_seats(info, env)
-        return mask1, mask2, reward1, reward2, done_status, info
+        return mask1, mask2, reward1, reward2, done_status, info, finished
 
     def step(self, actions: list[dict[str, np.ndarray]]):
         if len(actions) != self.n_envs:
@@ -118,11 +140,13 @@ class ThreadVecEnv:
         # truncation into termination and silently disable bootstrapping.
         done_status = np.array([r[4] for r in results], dtype=np.int64)
         infos = [r[5] for r in results]
+        finished = [r[6] for r in results]
 
         self.last_masks1 = masks1
         self.last_masks2 = masks2
         self.last_infos = infos
-        return masks1, masks2, rewards1, rewards2, done_status, infos
+        self.last_finished = finished
+        return masks1, masks2, rewards1, rewards2, done_status, infos, finished
 
     def get_batched_obs1(self, device: torch.device) -> StructuredObservation:
         return self.obs1_buffers.to(device, non_blocking=True)
