@@ -1,24 +1,149 @@
 # p0: Reinforcement Learning for Pokémon VGC
 
-`p0` is a self-play reinforcement learning engine for Pokemon VGC. The current codebase is being refactored toward roster-independent Champions play and public Bo3 replay pretraining. NOTE: everything below is mostly stale (when I was training with a smaller vocab and a fixed set of teams). I will be updating it after I build out more features.
+`p0` trains Pokémon VGC agents through self-play on Pokémon Showdown. It supports
+Champions best-of-three (Bo3) battles with open team sheets (OTS), optional
+behaviour cloning (BC) from public replays, and PPO training from scratch or a BC policy.
+You can evaluate checkpoints against baseline bots or run them as Showdown players.
 
----
+This is a research project. GPU validation is deferred, and the current model's
+playing strength and training throughput have not been measured.
 
-## Table of Contents
+## Getting started
 
-- [About](#about)
-- [Features](#features)
-- [Modules](#modules)
-- [Workflow Guide](#workflow-guide)
-  - [1. Setup & Installation](#1-setup--installation)
-  - [2. PPO Training Loop](#2-ppo-training-loop)
-  - [3. Local Play](#3-local-play)
-- [Utility Scripts](#utility-scripts)
-- [References](#references)
-- [Contributing](#contributing)
-- [License](#license)
+You need Git, [uv](https://docs.astral.sh/uv/getting-started/installation/),
+Python 3.13 or newer, and Node.js with npm. The pinned Showdown version requires
+Node.js 16 or newer. Training uses POSIX file locks; use Linux or macOS.
 
----
+```bash
+git clone https://github.com/akkshay0107/p0.git
+cd p0
+git submodule update --init --recursive
+uv python install 3.13
+uv sync --extra cpu
+npm --prefix pokemon-showdown install
+cp config.example.yaml config.yaml
+```
+
+For a CUDA machine, replace `uv sync --extra cpu` with `uv sync --extra cuda`.
+The two extras are mutually exclusive. Run the commands below from the repository root.
+
+### Train from scratch
+
+Add your own six-Pokémon Showdown team exports (`.txt`) to `teams/all/`.
+Teams must be legal for Champions VGC Regulation M-B. Team files and generated
+corpus manifests are local inputs and are not included in the repository.
+
+Review [config.example.yaml](config.example.yaml) and adjust your `config.yaml`,
+particularly `training.n_envs` and the training budget. Then build the pool and train:
+
+```bash
+uv run p0-corpus build --input teams/all
+uv run p0-train
+```
+
+Training starts from random weights and manages its own Showdown servers. By default,
+it saves to `artifacts/checkpoints/ppo_checkpoint.pt`, with metrics and TensorBoard
+logs under `artifacts/runs/ppo_training/`. Use empty output locations for a new run.
+
+For a smaller agent pool, supply exports in `teams/reduced/`, build it with
+`p0-corpus build --input teams/reduced`, and run `p0-train --agent-team-source reduced`.
+The opponent still samples from `teams/all/`; the reduced pool is optional.
+
+Set `paths.resume_checkpoint` in `config.yaml` to resume a training checkpoint,
+or `paths.initial_policy_checkpoint` to start a new run from policy weights.
+These settings are mutually exclusive. Resume keeps the saved settings and PPO budget;
+use policy initialization for a new schedule. PPO drops unfinished games when saving.
+
+## Other workflows
+
+### Pretrain from replays
+
+BC is optional. Collect complete linked Bo3 OTS series, compile them, and split
+by series so games from one series do not cross train/validation/test boundaries:
+
+```bash
+uv run p0-replays scrape --cache-dir artifacts/replays --limit-games 50
+uv run p0-replays build-shards --cache-dir artifacts/replays --output-dir artifacts/shards
+```
+
+`build-shards` prints a `manifest_path`. Replace the example path below with that
+actual path; there is no fixed default. `create-splits` writes `splits.json` beside it.
+
+```bash
+shard_manifest="/absolute/path/from/build-shards/manifest.json"
+uv run p0-replays create-splits --shard-manifest "$shard_manifest"
+uv run p0-bc train --config config.yaml \
+  --shard-manifest "$shard_manifest" \
+  --split-manifest "${shard_manifest%/*}/splits.json"
+```
+
+The best BC policy is saved to `artifacts/checkpoints/bc/bc_best_policy.pt` by default.
+Set `paths.initial_policy_checkpoint` to that file before starting PPO.
+To use config instead of CLI overrides, replace `bc.shard_manifest` and
+`bc.split_manifest` in `config.yaml`; the example values are placeholders.
+
+After changing replay reconstruction, remove the old dataset build directory before
+rebuilding shards, recreate the splits, and update their paths. Existing builds are
+reused, and the dataset hash does not include reconstruction code changes.
+
+### Evaluate or play a checkpoint
+
+Evaluate against a baseline on a server managed by p0:
+
+```bash
+uv run p0-eval --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --opponent random
+```
+
+The default report is `artifacts/eval/evaluation_report.json`. Use `--help` for other
+baselines, checkpoint opponents, and evaluation settings.
+
+`p0-play` connects to an existing server. For local play, start Showdown in a separate
+terminal from `pokemon-showdown/`:
+
+```bash
+npm run build
+node pokemon-showdown start --no-security 8000
+```
+
+Then, from the p0 repository root:
+
+```bash
+uv run p0-play --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --username MyBot --team-pool all
+```
+
+Challenge `MyBot` in `gen9championsvgc2026regmbbo3`, the supported live-play format.
+The `--no-security` server setup above is for local use. See `p0-play --help` for
+remote server settings, repeatable team files, and challenge limits.
+
+## Code and development
+
+The policy encodes the board and recent battle events, reads a 48-decision history
+and prior-game summaries, and selects the two actions in sequence with legality masks.
+PPO runs the policy on both sides and regularizes it toward a frozen copy that is
+refreshed periodically.
+
+- [Configuration](config.example.yaml): training, paths, team pools, BC, and evaluation.
+- [Model](src/p0/model/): [model dimensions](src/p0/model/config.py) and
+  [tensor layout constants](src/p0/model/architecture_contract.py).
+- [Runtime contract](data/runtime_manifest.json): hashes used to check artifact compatibility.
+- [Command-line entry points](src/p0/cli/): run each command with `--help` for options.
+
+From the repository root:
+
+```bash
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run pyright
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 uv run pytest -q
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 P0_STRESS_GAME_COUNT=50 uv run pytest -q -m heavy
+git diff --check
+uv build
+```
+
+The default and heavy suites must pass before a commit. Integration tests need Node.js,
+the Showdown submodule and dependencies, and loopback sockets. The default run excludes
+heavy, stress, network, and GPU tests. Keep the heavy replay workload at 50 games or
+fewer per run. GPU checks are deferred; CPU passes do not validate CUDA execution.
 
 ## About
 
@@ -30,317 +155,6 @@ With the release of Pokemon Champions, I thought it might be a good idea to revi
 
 I also plan on hopefully releasing a larger article detailing the rationale behind a lot of the choices made in v1 and v2, explaining the failures, and current architecture. In the meanwhile, if you want to know more, feel free to reach out and contact me.
 
----
-
-## Features
-
-- **Custom Tokenizer & Observation Builder**: Converts Pokemon VGC game states (species, items, moves, abilities, status conditions, active/bench volatiles, side conditions) into tokens mapped from a pre-built game vocabulary. The categorical tokens and the remaining numerical features from the battle are packed into a structured observation used downstream.
-- **Token Fusion Encoder**: Uses nonlinear sum-based DeepSets for the unordered type summary and typed-effect records while retaining primary type as an explicit ordered feature, then uses a learned query to pool the heterogeneous components into one token per Pokémon. Up to 32 ordered event records since the player's previous decision, each addressed by the battlefield positions it involves, are read by four position queries through a one-layer pre-RMSNorm Transformer. Events retain reported item and ability identities, action-blocking reasons, and field/side condition transitions. Event addresses and queries share the board position embeddings, with separate source and target projections to preserve direction.
-- **Autoregressive Policy Pointer Head**: Uses a pointer-attention network to select actions. The first head predicts action `a1` for the first active Pokemon. This selection is embedded and passed as context to the second head to predict action `a2` for the second active Pokemon. Sequential masking prevents invalid choices (such as duplicate switch targets or multiple mega evolutions in a single turn).
-- **Inbuilt Team Preview Handling**: The same policy used for battling can also be used for team picking at the team preview stage. The input is differentiated through a team preview flag in the observation.
-- **Magnetic Mirror-Descent Self-Play**: Runs the live policy on both seats of every environment and regularizes PPO toward a slowly refreshed frozen magnet with a reverse-KL penalty. This preserves strategic diversity in one stochastic policy without a checkpoint league or recurrent BPTT loop.
-- **Fixed Memory-Window Training**: Builds immutable per-decision local summaries after one self-attention layer lets the board, legality and event tokens read each other, gathers a causal 48-decision history window, and reduces it with perspective-safe prior-game slots (each finished game also contributes a summary of its final board) and a standard pre-RMSNorm Transformer over one explicit absolute-position layout. PPO uses the conventional symmetric clipped objective; MMD regularization supplies the QRE pressure.
-
-- **Bo3 Replay Pretraining**: Acquires complete linked Champions Bo3 OTS series, audits every raw replay, preserves canonical player identity across games, and creates leakage-safe series-level train/validation/test splits.
-- **Vectorized Environments with Threaded Showdown Instances**: Runs parallel Node.js Pokémon Showdown server instances managed by a vectorized thread pool. It batches battle states for GPU inference.
-- **Automatic Mixed Precision & Compilation**: With optimizations enabled, training prefers BF16, falls back to scaled FP16, and otherwise uses FP32. CUDA execution also enables optional `torch.compile` acceleration.
-
-Model contracts and dimensional hyperparameters are defined in `src/p0/model/architecture_contract.py`.
-
----
-
-## Modules
-
-### 1. `src/p0/` (Source)
-
-- **`battle/`**: Event definitions, action legality, and battle view abstractions.
-- **`cli/`**: Installed entry points for training, evaluation, replay compilation, and live bot execution.
-- **`evaluation/`**: Matchup harness and reporting against checkpoints or baseline heuristics.
-- **`model/`**: Tokenizer, observation builder, encoders, and pointer actor-critic policy.
-- **`replays/`**: OTS parsing, replay reconstruction, decision inference, and shard compilation.
-- **`runtime/`**: Showdown process management, live event capture, and poke-env environment adapters.
-- **`teams/`**: Team validation, stat point imputation from usage priors, and corpus sampling.
-- **`training/`**: Behavioral cloning (BC), PPO self-play with magnetic regularization, and checkpoint file I/O.
-
-### 2. `tests/` (Tests)
-
-- **`unit/`**: Fast, self-contained unit tests across all library submodules.
-- **`integration/`**: End-to-end integration tests using local Showdown server instances.
-- **`stress/`**: Randomized and large-scale workload simulations (opt-in via pytest markers).
-
-## Workflow Guide
-
-Steps 2 and 3 below are optional if you would like to start off self play from a purely random initialized bot. [uv](https://docs.astral.sh/uv/) is needed to setup and run the project.
-
-### 1. Setup & Installation
-
-First, clone the repository and initialize the git submodules (required for Pokémon Showdown):
-
-```bash
-git clone https://github.com/akkshay0107/p0.git
-cd p0
-git submodule update --init --recursive
-```
-
-Install the Python dependencies using uv from the p0 dir. By default, this installs the CUDA-enabled version of PyTorch:
-
-```bash
-uv python install 3.13
-uv sync --extra cuda
-```
-
-_(If you are limited to CPU-only, use `uv sync --extra cpu` instead)._
-
-Next, install the Node.js dependencies required by the local Pokémon Showdown server:
-
-```bash
-cd pokemon-showdown && npm install && cd ..
-```
-
-### 2. PPO Training Loop
-
-The legacy heuristic bootstrap has been removed. Teams are organized into `teams/all/` for broad sampling and `teams/reduced/` for focused practice. Each pool contains its own `corpus_manifest.json`. Copy `config.example.yaml` to the ignored, machine-local `config.yaml`, then set `teams.all` and `teams.reduced` as needed. Relative paths are resolved under `paths.teams_root`.
-
-Build each pool manifest from the team files in that pool. The reduced pool is independent; it is never inferred from `teams/all/`, and building an empty pool fails.
-
-```bash
-uv run p0-corpus build --input teams/all
-uv run p0-corpus build --input teams/reduced
-```
-
-Launch the main reinforcement learning loop. The script automatically manages the background Showdown servers and begins all-self-play with magnetic regularization.
-
-```bash
-uv run p0-train
-```
-
-Use `uv run p0-train --agent-team-source reduced` to train the agent from the focused pool; the default is `all`, and the opponent continues to use the all-team pool.
-
-Set `paths.resume_checkpoint` to restore PPO training state, or set
-`paths.initial_policy_checkpoint` to import policy weights with a fresh optimizer and
-episode zero. The two settings are mutually exclusive. A BC
-`bc_best_policy.pt` is the supported weights-only handoff into PPO.
-
-PPO TensorBoard tracks policy loss, value loss, KL divergence, clipping, normalized
-entropy, explained variance, MAGNET KL, gradient norm, mean game length, and the
-timeout/truncation rate. Rollout trajectory counts are written to
-`artifacts/runs/ppo_training/metrics.json`. View the board with
-`tensorboard --logdir ./artifacts/runs/ppo_training/tensorboard/`.
-
-### Saving and resuming training
-
-BC and PPO share one saving implementation. Each keeps a rolling training checkpoint
-with model and optimizer state, random generators, effective training settings,
-metric history, an installed Python source hash, and the SHA-256 of the input checkpoint. The input's filename is
-informational; recovery never follows it. Source-policy details retain BC dataset
-and split identities when PPO starts from BC. Parents are audit records, not an
-automatically retained checkpoint archive. Copy a checkpoint yourself to retain it.
-
-BC also stores the selected best policy inside its training checkpoint. The separate
-`bc_best_policy.pt`, `metrics.json`, and TensorBoard events are display/inference
-copies: resume rebuilds them from the checkpoint, including in a new output directory.
-BC no longer writes `metrics.jsonl`. PPO metric history now survives each resume.
-The checkpoint commits first; interruption while writing the copies cannot destroy
-recoverable training state. JSON and checkpoint replacement synchronize both the
-file and its parent directory on POSIX. Training output locks require a POSIX host.
-
-Resume rejects missing requested optimizer/scheduler/scaler/magnet state and changed
-training settings. BC can increase its epoch budget. PPO keeps its original schedule
-and budget; use policy initialization for a new schedule. PPO saves every ten outer
-iterations and on cancellation/completion; BC saves completed epochs. Both CLI
-commands handle SIGINT/SIGTERM cooperatively. PPO still discards unfinished games at
-save boundaries and warns/starts fresh series if rollout state cannot be restored.
-This does not promise identical simulator randomness across restarts.
-
-Resuming requires a training checkpoint generated with run metadata and embedded state;
-weights-only or legacy checkpoints without embedded state cannot be resumed. Choose an
-empty output directory for new runs or when resuming into a fresh workspace.
-
-### Replay BC pilot
-
-The replay collector searches only the configured Champions Bo3 OTS format. The
-50-game limit is soft so the last linked series is always completed.
-
-```bash
-uv run p0-replays scrape --cache-dir artifacts/replays --limit-games 50
-uv run p0-replays build-shards \
-  --cache-dir artifacts/replays \
-  --output-dir artifacts/shards
-uv run p0-replays create-splits \
-  --shard-manifest artifacts/shards/<global-contract-hash>/<dataset-hash>/manifest.json
-uv run p0-bc train \
-  --config config.yaml \
-  --shard-manifest artifacts/shards/<global-contract-hash>/<dataset-hash>/manifest.json \
-  --split-manifest artifacts/shards/<global-contract-hash>/<dataset-hash>/splits.json
-```
-
-There is no fixed shard manifest path. `build-shards` writes the build to
-`<output-dir>/<global-contract-hash>/<dataset-hash>/` and prints a JSON summary whose
-`manifest_path` field is the manifest to use. `create-splits` writes `splits.json`
-next to that manifest unless `--output` is given. Pass both paths to `p0-bc` with
-`--shard-manifest` and `--split-manifest`, or copy them into `bc.shard_manifest` and
-`bc.split_manifest` in `config.yaml`. The defaults in `config.example.yaml` are
-placeholders and must be replaced. Relative paths in `config.yaml` are resolved
-against `paths.repository_root`.
-
-Raw response bytes remain immutable even when parsing or OTS checks fail. Derived
-shards are published atomically under the global contract and dataset hashes. The
-shard `manifest.json` records the content hash of every source replay, the series
-membership, and accepted/rejected counts with rejection reasons in `diagnostics`.
-
-For single-format inputs, `build-shards` validates existing output and returns
-before reconstruction. Mixed-format inputs are compiled first, because the build's
-format comes from the first accepted game. The dataset hash covers the source replays, build
-settings and global contract hash, but not the replay reconstruction code. After a
-change to reconstruction, delete the old `<dataset-hash>` directory before running
-`build-shards`, or the old shards are reused.
-
-Default dex lookup tables are built lazily once per process and are read-only.
-Restart the process after changing reference data; tables for any other dex are
-rebuilt on every call.
-
-### 3. Local Play & Bot Runner
-
-Run the trained policy as an active bot on a local or remote Pokémon Showdown server using `p0-play`:
-
-```bash
-uv run p0-play --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --username MyBot --team-pool all
-```
-
-Supported options include:
-- `--checkpoint`: Path to policy checkpoint (or `--allow-random-init` to run with untrained weights).
-- `--server`: Target server specified as `'<websocket_url>,<authentication_url>'` (defaults to localhost:8000).
-- `--team-pool`: Named team pool (`all` or `reduced`) or repeatable `--team-file` paths.
-- `--top-p`: Top-p sampling threshold (default: `0.9`).
-- `--challenge-limit`: Number of challenges to accept before cleanly exiting.
-- `--opponent`: Restrict accepted challenges to a specific opponent username.
-
----
-
-## Utility Scripts
-
-- **`scripts/cleanup.sh`**: Clears the default runs, replays, checkpoints, and selected log files. It does not follow custom output paths or delete compiled datasets.
-- **`scripts/export_training.py`** (installed as `p0-export-training`): Exports one new-format training checkpoint with its recorded inputs and runtime resources. It writes a checked archive atomically and generates a resume configuration from saved settings, without reading the current `config.yaml`.
-
-```bash
-uv run p0-export-training --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --output training_export.tar.gz
-```
-
-Extract into a compatible p0 checkout, then run `p0-train --config run/config.yaml
---agent-team-source reduced` for PPO, or `p0-bc train --config run/config.yaml` for BC.
-BC exports include the referenced shards and split; PPO exports include both team pools. Inputs must still match the
-saved identities. The archive contains checksums, but does not include Python/Node
-installations, the p0 source checkout, or Showdown. Those must be supplied separately.
-New outputs go under `artifacts/resumed`; use a fresh output path for each import.
-
-The former `.ppoconfig` format is no longer accepted; migrate its flat keys into the nested sections shown in `config.example.yaml`.
-
-### Runtime compatibility
-
-`data/runtime_manifest.json` is the sole runtime contract. It has three subsystems:
-
-- `actions`: the flat action layout, joint-action constraints and team preview encoding.
-- `model`: tensor layout constants and `observation_layout_sha256`, the hash of the
-  structured observation layout. Importing the model fails if the code layout does not
-  match this hash.
-- `resources`: the vocabulary hash (major), and the Champions dex and spread usage
-  hashes (minor).
-
-Each subsystem has a major and a minor payload, each with a version number and a SHA-256.
-The major hashes of all subsystems make up `global_sha256`.
-
-Generated replay shards, splits and team corpus manifests store `global_contract_sha256`
-and must match the active `global_sha256` exactly. Checkpoints embed a full copy of the
-contract: a major version or hash difference fails before training setup, and a minor
-difference is logged as a warning. Vocabulary and dex identities are validated when the
-active contract is loaded.
-
-Development versioning rule: while the project is in development, contract version
-numbers stay fixed (all subsystems are at 1.0). When behavior or layout changes, only
-the affected hashes are refreshed. Because the checks compare hashes, a refreshed hash
-still rejects old checkpoints and shards, even though the version numbers match. Matching
-version numbers never mean that an old checkpoint or shard build is compatible. Some
-changes, such as replay reconstruction fixes, change no hash at all; see the migration
-notes below.
-
-### Migration notes
-
-These changes on the current development line are not caught by version numbers:
-
-- **Event layout (T4)**: the event token layout changed and the model layout hash was
-  refreshed. Checkpoints and shard builds from before this change are incompatible.
-  Retrain or re-import policies, and rebuild shards.
-- **Ally-or-self target labels (R1)**: for moves that target an adjacent ally or the
-  user, a replay decision aimed at the user is now labelled with the same own-side
-  target code as live play (-1 or -2) instead of 0. Shards built before this change
-  carry the old labels; rebuild them, and do not compare BC results across the change.
-- **Reconstruction changes in general**: the dataset hash does not cover replay
-  reconstruction code. After any reconstruction change, delete the old dataset directory
-  (`artifacts/shards/<global-contract-hash>/<dataset-hash>/`) before `build-shards`, or
-  the old shards are reused. Then run `create-splits` again and update the paths in
-  `config.yaml`.
-- **Shard manifest path**: `bc.shard_manifest` and `bc.split_manifest` no longer have a
-  working default. Set them to the paths printed by `build-shards` and `create-splits`.
-
-The standalone artifact verification command is intentionally deferred until checkpoint, model,
-replay-shard, dataset, and resource verification can share one interface.
-
-## Development verification
-
-Run the standard checks from the repository root:
-
-```bash
-uv run ruff check src tests
-uv run ruff format --check src tests
-uv run pyright
-uv run pytest -q
-uv run pytest -q -m heavy
-git diff --check
-uv build
-```
-
-The default pytest command discovers only `tests/unit` and `tests/integration` and
-deselects the `heavy`, `stress`, `network` and `gpu` markers. Local integration tests
-need the built Showdown submodule (`pokemon-showdown` with `npm install` done) and
-loopback sockets. The default and heavy suites must both pass before a commit.
-
-Opt-in groups:
-
-| Group | Command | Needs |
-| --- | --- | --- |
-| heavy | `uv run pytest -q -m heavy` | Showdown, several minutes of CPU, more memory |
-| stress | `P0_STRESS_GAME_COUNT=50 uv run pytest tests/stress -q -m stress` | Showdown and Node.js; long run |
-| network | `uv run pytest -q -m network` | Access to the public Showdown replay endpoint |
-| gpu | `uv run pytest tests/gpu -q -m gpu` | A CUDA device |
-
-Notes:
-
-- `pytest -m stress` alone finds no stress tests, because `tests/stress` is not in the
-  default test paths. Pass the directory as shown.
-- Keep `P0_STRESS_GAME_COUNT` at 50 or less per run (50 is the default); 100 games
-  in one process has exhausted host memory. `P0_STRESS_SEED` changes the random
-  replay seed.
-- `P0_INTEGRATION_DEVICES` and `P0_STRESS_DEVICES` (default `cpu,cuda`) choose the
-  devices; CUDA is used only when it is available.
-- Without CUDA every GPU test is skipped. A skipped GPU run is not hardware
-  validation.
-- Setting `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2` keeps the heavy and stress suites from
-  oversubscribing CPU threads.
-
-The BC `batch_decisions` setting is an explicit target-window budget. Each window
-recomputes its local context under current weights before updating, while retaining
-past-only context and the fixed 48-decision cap. BC, PPO, evaluation, and play use
-Bo3 series orchestration and keep each canonical player's prior-game state isolated.
-BC TensorBoard logs the selected NLL, validation, legality, label-quality, value,
-gradient, and learning-rate metrics. Its update, game, and decision counts remain
-in the JSON metrics artifacts rather than the board.
-
-The installed command-line interfaces include `p0-train`, `p0-bc`, `p0-replays`,
-`p0-corpus`, `p0-eval`, `p0-play`, `p0-build-vocab`, `p0-build-spreads`, and
-`p0-export-training`.
-
----
-
 ## References
 
 This project was heavily inspired by the work of the devs behind the following repos, and in several cases, components of their source code were adapted or utilized as foundations for this engine. I am deeply grateful to them.
@@ -351,13 +165,11 @@ This project was heavily inspired by the work of the devs behind the following r
 - [Metamon](https://github.com/UT-Austin-RPL/metamon)
 - [Foul Play](https://github.com/pmariglia/foul-play)
 
----
-
 ## Contributing
 
 Contributions are very welcome! If you are interested in this project, have any feedback or queries, want to help implement new features, or can provide resources to train larger models, please reach out or open an issue on GitHub.
 
----
+For bugs and questions, [open an issue](https://github.com/akkshay0107/p0/issues).
 
 ## License
 
