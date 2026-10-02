@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -600,12 +599,18 @@ class TestReconstructionEvents:
         assert len(result.events) == len(document.protocol_lines) == 186
         assert tuple(event.line_index for event in result.events) == tuple(range(186))
         assert result.diagnostics == ()
-        assert Counter(event.classification for event in result.events) == {
-            EventClassification.NO_STATE_CHANGE: 55,
-            EventClassification.PUBLIC_STATE: 70,
-            EventClassification.ACTION_EXECUTION: 34,
-            EventClassification.BOUNDARY_SIGNAL: 27,
+        expected = {
+            "switch": EventClassification.ACTION_EXECUTION,
+            "move": EventClassification.ACTION_EXECUTION,
+            "turn": EventClassification.BOUNDARY_SIGNAL,
+            "win": EventClassification.BOUNDARY_SIGNAL,
+            "-damage": EventClassification.PUBLIC_STATE,
+            "-supereffective": EventClassification.NO_STATE_CHANGE,
         }
+        for tag, classification in expected.items():
+            assert {event.classification for event in result.events if event.tag == tag} == {
+                classification
+            }
 
         resolved = resolve_replay_events(document).require_accepted()
         first_switch = next(event for event in resolved if event.event.tag == "switch")

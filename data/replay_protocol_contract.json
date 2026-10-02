@@ -13084,13 +13084,13 @@
     "-curestatus": {
       "classifier": "-curestatus",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions"
+        "tests/unit/test_reconstruction_state.py:test_status_is_applied_before_it_is_cured"
       ]
     },
     "-damage": {
       "classifier": "-damage",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions"
+        "tests/unit/test_reconstruction_state.py:test_source_shaped_hp_transitions"
       ]
     },
     "-end": {
@@ -13108,7 +13108,7 @@
     "-enditem": {
       "classifier": "-enditem",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions"
+        "tests/unit/test_reconstruction_state.py:test_item_is_replaced_before_it_is_consumed"
       ]
     },
     "-fieldactivate": {
@@ -13138,7 +13138,7 @@
     "-heal": {
       "classifier": "-heal",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions"
+        "tests/unit/test_reconstruction_state.py:test_source_shaped_hp_transitions"
       ]
     },
     "-hitcount": {
@@ -13162,7 +13162,7 @@
     "-item": {
       "classifier": "-item",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions"
+        "tests/unit/test_reconstruction_state.py:test_item_is_replaced_before_it_is_consumed"
       ]
     },
     "-mega": {
@@ -13186,7 +13186,7 @@
     "-sethp": {
       "classifier": "-sethp",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions"
+        "tests/unit/test_reconstruction_state.py:test_source_shaped_hp_transitions"
       ]
     },
     "-sideend": {
@@ -13210,7 +13210,7 @@
     "-singleturn": {
       "classifier": "-singleturn",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_member_singleturn_effect_expires_at_upkeep"
+        "tests/unit/test_reconstruction_state.py:test_other_singleturn_effects_remain_member_scoped"
       ]
     },
     "-start": {
@@ -13222,7 +13222,7 @@
     "-status": {
       "classifier": "-status",
       "transition_tests": [
-        "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions"
+        "tests/unit/test_reconstruction_state.py:test_status_is_applied_before_it_is_cured"
       ]
     },
     "-swapboost": {
@@ -13344,11 +13344,8 @@
     "tests/unit/test_reconstruction_contract.py:test_inventory_is_total_for_classifiers_and_pinned",
     "tests/unit/test_reconstruction_contract.py:test_state_neutral_source_shapes",
     "tests/unit/test_reconstruction_contract.py:test_malformed_shapes_fail_closed",
-    "tests/unit/test_reconstruction_contract.py:test_stored_stat_predicate_is_unsupported",
-    "tests/unit/test_reconstruction_contract.py:test_raw_inventory_contains_source_shaped_witnesses",
     "tests/unit/test_reconstruction_contract.py:test_missing_source_file_and_unresolved_site_fail_coverage",
     "tests/unit/test_reconstruction_contract.py:test_compiled_volatile_metadata_checks_existence_and_copy_hooks",
-    "tests/unit/test_reconstruction_contract.py:test_stateful_witness_key_mutation_fails_closed",
     "tests/unit/test_reconstruction_state.py:test_requested_snapshots_still_apply_every_event",
     "tests/unit/test_reconstruction_state.py:test_snapshot_lines_must_belong_to_the_event_stream",
     "tests/unit/test_reconstruction_state.py:test_clearallboost_clears_every_active_boost",
@@ -13370,7 +13367,9 @@
     "tests/unit/test_reconstruction_state.py:test_source_shaped_state_neutral_effect_events",
     "tests/unit/test_reconstruction_state.py:test_source_shaped_weather_and_field_transitions",
     "tests/unit/test_reconstruction_state.py:test_new_terrain_replaces_previous_terrain_without_fieldend",
-    "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
+    "tests/unit/test_reconstruction_state.py:test_source_shaped_hp_transitions",
+    "tests/unit/test_reconstruction_state.py:test_status_is_applied_before_it_is_cured",
+    "tests/unit/test_reconstruction_state.py:test_item_is_replaced_before_it_is_consumed",
     "tests/unit/test_reconstruction_state.py:test_roost_restores_flying_type_when_single_turn_effect_expires",
     "tests/unit/test_reconstruction_state.py:test_baton_pass_transfers_boosts_but_shed_tail_only_substitute",
     "tests/unit/test_reconstruction_state.py:test_baton_pass_preserves_copyable_source_and_dynamic_metadata",
@@ -13402,8 +13401,6 @@
     "tests/unit/test_reconstruction_state.py:test_trace_source_reference_does_not_overwrite_the_target_ability",
     "tests/unit/test_reconstruction_state.py:test_endability_preserves_ability_and_records_gastro_acid",
     "tests/unit/test_reconstruction_state.py:test_perish_countdown_updates_one_effect_and_clears_on_switch",
-    "tests/unit/test_reconstruction_state.py:test_invalid_perish_count_is_rejected_without_partial_snapshots",
-    "tests/unit/test_reconstruction_state.py:test_dynamic_effect_normalization_retains_canonical_data",
     "tests/unit/test_reconstruction_state.py:test_invalid_dynamic_effect_variants_reject_without_partial_snapshots",
     "tests/unit/test_reconstruction_state.py:test_dynamic_effect_start_and_end_clear_metadata",
     "tests/unit/test_reconstruction_state.py:test_dynamic_effect_metadata_is_cleared_when_the_member_switches",
@@ -13411,9 +13408,8 @@
     "tests/unit/test_reconstruction_state.py:test_side_guard_is_side_scoped_survives_actions_and_expires_at_upkeep",
     "tests/unit/test_reconstruction_state.py:test_breaking_move_removes_side_guard_and_protection_counter",
     "tests/unit/test_reconstruction_state.py:test_breaking_move_removes_member_protect_effect",
-    "tests/unit/test_reconstruction_state.py:test_side_guard_follows_side_condition_swap_but_not_source_switch_or_faint",
+    "tests/unit/test_reconstruction_state.py:test_side_condition_swap_is_rejected_as_unsupported",
     "tests/unit/test_reconstruction_state.py:test_duplicate_side_guard_and_member_scoped_singleturn_have_distinct_lifecycles",
-    "tests/unit/test_reconstruction_state.py:test_member_singleturn_effect_expires_at_upkeep",
     "tests/unit/test_reconstruction_state.py:test_other_singleturn_effects_remain_member_scoped",
     "tests/unit/test_reconstruction_state.py:test_protection_counter_resets_on_failure_and_switch",
     "tests/unit/test_reconstruction_state.py:test_side_conditions_outside_generated_active_allowlist_reject_structurally",
@@ -13429,7 +13425,7 @@
     "tests/unit/test_reconstruction_state.py:test_illusion_reveal_preserves_actual_state_and_causal_display_history",
     "tests/unit/test_reconstruction_state.py:test_duplicate_illusion_display_does_not_mutate_the_disguise_target",
     "tests/unit/test_reconstruction_state.py:test_faint_before_illusion_reveal_updates_only_the_actual_member",
-    "tests/unit/test_reconstruction_state.py:test_unsupported_reducer_transition_discards_all_snapshots",
+    "tests/unit/test_reconstruction_state.py:test_invalid_reducer_transition_discards_all_snapshots",
     "tests/unit/test_reconstruction_state.py:test_local_golden_replay_reduces_or_reports_known_rejection"
   ],
   "unsupported_predicates": [

@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from p0.format_config import (
-    ACTION_CONTRACT,
     GlobalContract,
     active_global_contract,
     canonical_json_sha256,
@@ -16,8 +15,11 @@ from p0.format_config import (
     compare_global_contracts,
     current_manifest,
     load_active_global_contract,
+    load_global_contract,
+    sha256_file,
     validate_artifact_runtime_contract,
 )
+from p0.paths import DEFAULT_PATHS
 
 
 def _resources(
@@ -34,16 +36,6 @@ def _resources(
 
 
 class TestFormatConfig:
-    def test_runtime_manifest_round_trips_one_readable_contract(self, tmp_path: Path) -> None:
-        """Verify GlobalContract serializes and deserializes losslessly while preserving ABI invariants and contract hashes."""
-        vocab, dex = _resources(tmp_path)
-        manifest = current_manifest(vocab_path=vocab, dex_path=dex)
-        restored = GlobalContract.from_dict(json.loads(json.dumps(manifest.to_dict())))
-
-        assert restored == manifest
-        assert restored.action == ACTION_CONTRACT
-        assert restored.global_sha256 == manifest.global_sha256
-
     def test_canonical_hash_ignores_object_order_but_not_required_semantics(self) -> None:
         """Verify canonical JSON SHA-256 is insensitive to dictionary key ordering but sensitive to value changes."""
         first = {"shape": [31, 10], "dtype": "int64"}
@@ -210,3 +202,27 @@ class TestFormatConfig:
             ValueError, match="The active runtime contract is always the default global manifest"
         ):
             checkpoint_contract_compatibility(checkpoint_artifact, fake_path)
+
+    def test_runtime_manifest_digest_is_semantic_and_round_trips(self, tmp_path: Path) -> None:
+        """Verify runtime manifest digest computation is invariant to key reordering in on-disk JSON."""
+        vocab = tmp_path / "vocab.json"
+        dex = tmp_path / "champions_dex.json"
+        vocab.write_text('{"species":{"pikachu":1},"moves":{"tackle":1}}', encoding="utf-8")
+        dex.write_text('{"pikachu":{"base_stats":{"hp":35}}}', encoding="utf-8")
+        manifest = current_manifest(vocab_path=vocab, dex_path=dex)
+        reordered = json.loads(json.dumps(manifest.to_dict()))
+        reordered["contracts"]["actions"]["major"] = {
+            key: reordered["contracts"]["actions"]["major"][key]
+            for key in reversed(tuple(reordered["contracts"]["actions"]["major"]))
+        }
+        assert GlobalContract.from_dict(reordered) == manifest
+        path = tmp_path / "runtime_manifest.json"
+        path.write_text(json.dumps(reordered), encoding="utf-8")
+        assert load_global_contract(path) == manifest
+
+    def test_active_contract_records_the_current_spread_table(self) -> None:
+        """Verify the recorded spread checksum matches the pinned resource."""
+        contract = active_global_contract()
+        assert contract.spread_usage_sha256 == sha256_file(
+            DEFAULT_PATHS.data_root / "spread_usage.json"
+        )

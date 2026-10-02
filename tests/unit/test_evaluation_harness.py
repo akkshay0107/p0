@@ -128,13 +128,11 @@ class TestEvaluationHarness:
                 start_listening=False,
             )
 
-    def test_evaluation_confidence_intervals_and_matchup_serialization_are_deterministic(
-        self,
-    ) -> None:
-        """Verify Wilson score confidence interval calculation and matchup result serialization."""
+    def test_wilson_interval_and_matchup_tuple_serialization(self) -> None:
+        """Pin the 95% Wilson interval and serialized tuple fields."""
         assert wilson_score_interval(0, 0) == (0.0, 0.0)
-        lower, upper = wilson_score_interval(3, 5)
-        assert 0.0 < lower < 0.6 < upper < 1.0
+        expected_interval = (0.23071993220883702, 0.8823817688407467)
+        assert wilson_score_interval(3, 5) == pytest.approx(expected_interval, abs=1e-12)
         team_hash = hashlib.sha256(b"team-data").hexdigest()[:8]
         result = MatchupResult(
             policy_a="live",
@@ -145,9 +143,12 @@ class TestEvaluationHarness:
             wins_b=2,
             ties=0,
             win_rate_a=0.6,
-            confidence_interval_a=(lower, upper),
+            confidence_interval_a=expected_interval,
             per_team_results={team_hash: {"wins": 3, "games": 5, "win_rate": 0.6}},
         )
         serialized = result.to_dict()
-        assert serialized["confidence_interval_a"] == [lower, upper]
+        assert serialized["confidence_interval_a"] == [
+            0.23071993220883702,
+            0.8823817688407467,
+        ]
         assert serialized["per_team_results"][team_hash]["games"] == 5

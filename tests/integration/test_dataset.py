@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,8 @@ def _identity_rows(loader: DataLoader) -> list[tuple[Any, ...]]:
 
 
 class TestDataset:
-    @pytest.mark.stress
+    @pytest.mark.heavy
+    @pytest.mark.integration
     @pytest.mark.parametrize("num_workers", (0, 1, 2, 4))
     def test_dataset_workers_yield_each_random_perspective_once(
         self, tmp_path: Path, num_workers: int
@@ -81,20 +83,22 @@ class TestDataset:
             collate_fn=_dataset_identity,
             **loader_kwargs,
         )
-        observed = set(loader)
+        observed = list(loader)
 
         # Confirm worker sharding partition is lossless and free of duplicate chunks
-        assert observed == expected
+        assert Counter(observed) == Counter({identity: 1 for identity in expected})
 
-    @pytest.mark.stress
+    @pytest.mark.heavy
+    @pytest.mark.integration
     def test_dataset_prefetch_and_repeated_iteration_are_stable(self, tmp_path) -> None:
         """
         Verify that multi-worker prefetching with persistent workers produces consistent epoch iterations.
 
         Ensures that background prefetch buffers and persistent worker worker-loop state
-        do not cause order corruption, missed elements, or memory leakage across repeated dataset epochs.
+        do not duplicate or omit perspectives across repeated dataset epochs.
         """
-        built = _build_dataset(tmp_path, stress_count("P0_STRESS_DATASET_PREFETCH_REPLAYS", 64))
+        count = stress_count("P0_STRESS_DATASET_PREFETCH_REPLAYS", 64)
+        built = _build_dataset(tmp_path, count)
         loader = DataLoader(
             LazyReplayDataset(built.manifest_path, verify_hashes=True),
             batch_size=None,
@@ -106,7 +110,12 @@ class TestDataset:
         )
 
         expected = _identity_rows(loader)
-        assert expected
+        identities = Counter(
+            (stress_series_id(f"dataset-series-{index}"), 1, player, player)
+            for index in range(count)
+            for player in (0, 1)
+        )
+        assert Counter(expected) == identities
         # Verify every subsequent epoch matches the exact sequence of the initial epoch pass
         for _ in range(stress_count("P0_STRESS_DATASET_ITERATIONS", 8)):
             assert _identity_rows(loader) == expected

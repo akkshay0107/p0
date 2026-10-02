@@ -12,6 +12,7 @@ from p0.replays.shards import (
     ShardIndexEntry,
     ShardManifest,
     final_observation_field_specs,
+    load_shard_manifest,
     observation_field_specs,
     validate_shard_tensors,
 )
@@ -121,12 +122,29 @@ class TestShardManifest:
             data["artifact_schema"] = "unknown.v99"
             ShardManifest.from_dict(data)
 
-    def test_rejects_partition_mismatch(self) -> None:
+    def test_loader_rejects_runtime_contract_and_obsolete_field(self) -> None:
+        manifest = _valid_shard_manifest()
+        value = manifest.to_dict()
+        assert load_shard_manifest(value) == manifest
+
+        with pytest.raises(ValueError, match="incompatible"):
+            load_shard_manifest({**value, "global_contract_sha256": "0" * 64})
+        with pytest.raises(ValueError, match="unknown"):
+            load_shard_manifest({**value, "runtime_manifest_sha256": "0" * 64})
+
+    @pytest.mark.parametrize("omit_source_membership", (False, True))
+    def test_rejects_partition_mismatch(self, omit_source_membership: bool) -> None:
         manifest = _valid_shard_manifest()
         data = manifest.to_dict()
-        data["raw_replays"]["game-extra"] = "e" * 64
-        data["source_games"] = 3
-        with pytest.raises(ValueError, match="partition all raw replays"):
+        assert ShardManifest.from_dict(data) == manifest
+        if omit_source_membership:
+            data["source_series"] = {"series-1": ["game-1"]}
+            error = "source_series"
+        else:
+            data["raw_replays"]["game-extra"] = "e" * 64
+            data["source_games"] = 3
+            error = "partition all raw replays"
+        with pytest.raises(ValueError, match=error):
             ShardManifest.from_dict(data)
 
 

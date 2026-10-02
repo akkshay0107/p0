@@ -1,70 +1,17 @@
-"""Tests for tokenizer and manifest contracts."""
+"""Tests for tokenizer resolution and domain values."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
+from poke_env.battle import Pokemon
+from poke_env.battle.move import Move
+from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.status import Status
+from poke_env.teambuilder.teambuilder import TeambuilderPokemon
 
-from p0.format_config import (
-    GlobalContract,
-    active_global_contract,
-    current_manifest,
-    load_global_contract,
-    sha256_file,
-)
 from p0.model.tokenizer import PokemonTokenizer, Resolution
-from p0.paths import DEFAULT_PATHS
-
-
-def write_config(tmp_path: Path, contents: str) -> Path:
-    path = tmp_path / "config.yaml"
-    path.write_text(contents, encoding="utf-8")
-    return path
-
-
-def _resources(
-    tmp_path: Path, *, extra_species: bool = False, base_power: int = 90
-) -> tuple[Path, Path]:
-    vocab = tmp_path / "vocab.json"
-    species = {"pikachu": 1}
-    if extra_species:
-        species["raichu"] = 2
-    vocab.write_text(json.dumps({"species": species}), encoding="utf-8")
-    dex = tmp_path / "champions_dex.json"
-    dex.write_text(json.dumps({"moves": [{"id": "test", "basePower": base_power}]}))
-    return vocab, dex
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def _runtime_files(tmp_path: Path) -> tuple[Path, Path]:
-    vocab = tmp_path / "vocab.json"
-    dex = tmp_path / "champions_dex.json"
-    vocab.write_text(
-        json.dumps({"species": {"pikachu": 1}, "moves": {"tackle": 1}}), encoding="utf-8"
-    )
-    dex.write_text('{"pikachu":{"base_stats":{"hp":35}}}', encoding="utf-8")
-    return vocab, dex
 
 
 class TestTokenizerContracts:
-    def test_runtime_manifest_digest_is_semantic_and_round_trips(self, tmp_path: Path) -> None:
-        """Verify runtime manifest digest computation is invariant to key reordering in on-disk JSON."""
-        vocab, dex = _runtime_files(tmp_path)
-        manifest = current_manifest(vocab_path=vocab, dex_path=dex)
-        reordered = json.loads(json.dumps(manifest.to_dict()))
-        reordered["contracts"]["actions"]["major"] = {
-            key: reordered["contracts"]["actions"]["major"][key]
-            for key in reversed(tuple(reordered["contracts"]["actions"]["major"]))
-        }
-        assert GlobalContract.from_dict(reordered) == manifest
-        path = tmp_path / "runtime_manifest.json"
-        path.write_text(json.dumps(reordered), encoding="utf-8")
-        assert load_global_contract(path) == manifest
-
     def test_tokenizer_resolution_keeps_unknown_zero_distinct_from_known_none(
         self,
     ) -> None:
@@ -74,6 +21,7 @@ class TestTokenizerContracts:
                 "weathers": {"raindance": 4},
                 "status": {"brn": 5},
                 "moves": {"uturn": 7},
+                "species": {"pikachu": 8},
             }
         )
         assert tokenizer_instance.id_for("moves", "U-turn") == 7
@@ -83,6 +31,9 @@ class TestTokenizerContracts:
         assert tokenizer_instance.resolve("status", "not-a-status") == (0, Resolution.OOV)
         assert tokenizer_instance.resolve("status", None) == (0, Resolution.KNOWN_NONE)
         assert tokenizer_instance.resolve("missing", "rain") == (0, Resolution.UNKNOWN)
+        assert tokenizer_instance.resolve("species", None) == (0, Resolution.KNOWN_NONE)
+        assert tokenizer_instance.resolve("species", "missingno") == (0, Resolution.OOV)
+        assert tokenizer_instance.resolve("species", "pikachu") == (8, Resolution.KNOWN)
 
     def test_enum_like_tables_lazy_cache_and_missing_member_results(self) -> None:
         """Verify lazy dictionary caching on enum-like tables (weathers, status)."""
@@ -95,12 +46,101 @@ class TestTokenizerContracts:
         assert tokenizer_instance.status[Status.BRN] == 5
         assert tokenizer_instance.status["brn"] == 5
         assert tokenizer_instance.status["unknown-status"] == 0
+        assert tokenizer_instance.status["UNKNOWN_STATUS"] == 0
+        assert "unknownstatus" not in tokenizer_instance.status
         assert tokenizer_instance.status == {"brn": 5}
         assert all(isinstance(key, str) for key in tokenizer_instance.status)
 
-    def test_active_contract_rejects_an_unrecorded_spread_table(self) -> None:
-        """Verify active global contract checks spread_usage.json checksum."""
-        contract = active_global_contract()
-        assert contract.spread_usage_sha256 == sha256_file(
-            DEFAULT_PATHS.data_root / "spread_usage.json"
+    def test_tokenizer_normalization_and_table_resolution(self) -> None:
+        """Verify PokemonTokenizer normalization and resolution taxonomy: KNOWN, KNOWN_NONE, OOV, UNKNOWN."""
+        assert tuple(
+            PokemonTokenizer.normalize_id(value)
+            for value in (
+                "Charizard-Mega-Y",
+                "U-turn",
+                "Leech Seed",
+                "  Thunderbolt  ",
+                "CHARIZARD-MEGA-Y",
+                "Species-1",
+            )
+        ) == (
+            "charizardmegay",
+            "uturn",
+            "leechseed",
+            "thunderbolt",
+            "charizardmegay",
+            "species1",
         )
+        assert PokemonTokenizer.normalize_id(None) == ""
+
+    def test_tokenizer_domain_objects_and_missing_values(self) -> None:
+        """Verify tokenizer extracts vocabulary IDs from poke-env domain objects (Pokemon, Move, Status, PokemonType, Nature)."""
+        tokenizer_instance = PokemonTokenizer(
+            {
+                "species": {"archaludon": 2, "charizard": 3, "pikachu": 4},
+                "abilities": {"intimidate": 5},
+                "items": {"choicescarf": 6},
+                "types": {"fire": 7, "water": 8, "fighting": 9},
+                "moves": {"closecombat": 10, "aquajet": 11},
+                "categories": {"special": 14, "status": 15},
+                "status": {"brn": 16, "slp": 17},
+            }
+        )
+        assert tokenizer_instance.status_id(Status.BRN) == 16
+        assert tokenizer_instance.status_id(Status.SLP) == 17
+        assert tokenizer_instance.status_id(None) == 0
+
+        p1 = Pokemon(gen=9, species="archaludon")
+        assert tokenizer_instance.species_id(p1) == 2
+
+        assert tokenizer_instance.species_id(None) == 0
+
+        p3 = Pokemon(
+            gen=9,
+            teambuilder=TeambuilderPokemon(species="charizard", ability="intimidate"),
+        )
+        assert tokenizer_instance.ability_id(p3) == 5
+        assert tokenizer_instance.ability_id(None) == 0
+
+        p4 = Pokemon(
+            gen=9,
+            teambuilder=TeambuilderPokemon(species="charizard", item="choicescarf"),
+        )
+        assert tokenizer_instance.item_id(p4) == 6
+        assert tokenizer_instance.item_id(None) == 0
+
+        assert tokenizer_instance.type_id(PokemonType.FIRE) == 7
+        assert tokenizer_instance.type_id(PokemonType.WATER) == 8
+        assert tokenizer_instance.type_id(None) == 0
+
+        m1 = Move("closecombat", 9)
+        assert tokenizer_instance.move_id(m1) == 10
+        m_aquajet = Move("aquajet", 9)
+        assert tokenizer_instance.move_id(m_aquajet) == 11
+        assert tokenizer_instance.move_id(None) == 0
+
+        assert tokenizer_instance.move_type_id(m1) == 9
+        assert tokenizer_instance.move_type_id(None) == 0
+
+        m2 = Move("thunderbolt", 9)
+        assert tokenizer_instance.move_category_id(m2) == 14
+
+        m3 = Move("protect", 9)
+        assert tokenizer_instance.move_category_id(m3) == 15
+        assert tokenizer_instance.move_category_id(None) == 0
+        assert tokenizer_instance.nature_id(None) == 0
+
+        for nature, expected_id in (
+            ("Serious", 0),
+            ("Bashful", 0),
+            ("Adamant", 1),
+            ("Jolly", 12),
+            ("unknown_nature", 0),
+        ):
+            pokemon = Pokemon(
+                gen=9,
+                teambuilder=TeambuilderPokemon(
+                    species="pikachu", nature=nature, evs=[1, 0, 0, 0, 0, 0]
+                ),
+            )
+            assert tokenizer_instance.nature_id(pokemon) == expected_id

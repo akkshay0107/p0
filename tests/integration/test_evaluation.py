@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -144,15 +145,16 @@ class TestEvaluation:
         )
         try:
             await first.battle_against(second, n_battles=1)
-            winner = await EvaluationHarness._wait_for_series_completion(
-                first, second, 1, timeout=30
+            parent_a, winner = await asyncio.wait_for(
+                poke_env_patches.wait_for_parent_result(first.ps_client, 1), timeout=30
             )
+            parent_b, opponent_winner = await asyncio.wait_for(
+                poke_env_patches.wait_for_parent_result(second.ps_client, 1), timeout=30
+            )
+            assert parent_a == parent_b
+            assert winner == opponent_winner
             expected = (
-                name_a.casefold()
-                if expected_winner == "a"
-                else name_b.casefold()
-                if expected_winner == "b"
-                else None
+                name_a if expected_winner == "a" else name_b if expected_winner == "b" else None
             )
             assert winner == expected
             assert len(first.commanded_games) == len(outcomes)

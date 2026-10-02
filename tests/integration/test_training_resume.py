@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,10 +14,18 @@ import torch
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
+from p0.model.structured_observation import StructuredObservation
 from p0.paths import DEFAULT_PATHS
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import GlobalConfig, TeamsConfig, TrainingConfig
+from p0.training.files import training_run
+from p0.training.magnet import Magnet
+from p0.training.ppo import ppo_update
 from p0.training.ppo_runner import run_training
+from p0.training.trajectory import (
+    CollectedTrajectory,
+    prepare_trajectory_batches,
+)
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
@@ -182,3 +191,75 @@ class TestTrainingResume:
         )
         run_training(resumed, cancel_requested=lambda: True)
         assert store.load_episode(paths.checkpoint_path) == 0
+
+    @pytest.mark.integration
+    def test_invalid_minibatch_does_not_poison_saved_success(self, tmp_path: Path) -> None:
+        torch.manual_seed(23)
+        policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
+        initial_weights = {name: value.clone() for name, value in policy.state_dict().items()}
+        collected = [
+            CollectedTrajectory(
+                observations=StructuredObservation.empty_batch(1),
+                action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
+                actions=torch.tensor([[7, 8]], dtype=torch.long),
+                log_probs=torch.tensor([float("nan") if index == 0 else 0.0]),
+                values=torch.zeros(1),
+                rewards=torch.ones(1),
+                dones=torch.ones(1),
+                length=1,
+                bootstrap_value=0.0,
+                series_history=(),
+            )
+            for index in range(2)
+        ]
+        prepared = prepare_trajectory_batches(
+            collected, torch.device("cpu"), gamma=0.99, gae_lambda=0.95
+        )
+        stats = ppo_update(
+            prepared,
+            policy,
+            Magnet(policy),
+            torch.optim.SGD(policy.parameters(), lr=1e-3),
+            torch.amp.GradScaler("cpu", enabled=False),
+            TrainingConfig(
+                num_episodes=20,
+                n_envs=1,
+                rollout_steps=1,
+                batch_size=1,
+                minibatch_size=1,
+                ppo_epochs=1,
+                target_kl=1.0e9,
+                enable_optim=False,
+            ),
+            episode=0,
+            alpha=0.0,
+            cancel_requested=lambda: False,
+        )
+        assert stats["optimizer_updates"] == 1
+        assert all(math.isfinite(value) for value in stats.values())
+        assert any(
+            not torch.equal(initial_weights[name], value)
+            for name, value in policy.state_dict().items()
+        )
+
+        checkpoint = tmp_path / "checkpoint.pt"
+        store = CheckpointStore()
+        with training_run(
+            store, checkpoint, tmp_path / "metrics", trainer_kind="ppo", settings={}
+        ) as run:
+            run.start(0)
+            run.record(1, {}, {"train": {"policy_loss": stats["policy_loss"]}})
+            run.save(1, policy, metadata={})
+        with training_run(
+            store,
+            checkpoint,
+            tmp_path / "metrics",
+            trainer_kind="ppo",
+            settings={},
+            source_path=checkpoint,
+            resume=True,
+        ) as resumed:
+            resumed.start(1)
+        restored = store.load_policy(checkpoint, torch.device("cpu"))
+        for name, value in policy.state_dict().items():
+            torch.testing.assert_close(restored.state_dict()[name], value)

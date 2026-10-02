@@ -172,7 +172,10 @@ class TestReconstructionProjection:
         displayed_species = observation.categorical[6, 0]
         assert (observation.categorical[6:12, 0] == displayed_species).sum().item() == 1
 
-    def test_production_compiler_projects_both_perspectives_from_one_compilation(self) -> None:
+    def test_compiled_game_projects_opposing_perspectives_with_correct_roster_and_sides(
+        self,
+    ) -> None:
+        """Verify opposing perspectives mirror each other with correct roster states, side roles, and flags."""
         result = compile_payloads((decision_payload(),), chunksize=0)
 
         first, second = result.accepted_series[0].games[0].perspectives
@@ -180,14 +183,36 @@ class TestReconstructionProjection:
         assert second.player == 1
         assert first.snapshots[0].view.teampreview
         assert second.snapshots[0].view.teampreview
-        assert first.snapshots[1].view.team != second.snapshots[1].view.team
-        assert first.snapshots[1].view.opponent_team != second.snapshots[1].view.opponent_team
+
+        # Cross-perspective roster states mirror each other
+        first_team = first.snapshots[1].view.team
+        first_opp = first.snapshots[1].view.opponent_team
+        second_team = second.snapshots[1].view.team
+        second_opp = second.snapshots[1].view.opponent_team
+
+        assert {k: mon.state for k, mon in first_team.items()} == {
+            k: mon.state for k, mon in second_opp.items()
+        }
+        assert {k: mon.state for k, mon in first_opp.items()} == {
+            k: mon.state for k, mon in second_team.items()
+        }
+        assert all(not mon.opponent for mon in first_team.values())
+        assert all(mon.opponent for mon in first_opp.values())
+        assert all(not mon.opponent for mon in second_team.values())
+        assert all(mon.opponent for mon in second_opp.values())
+
         first_active = first.snapshots[1].view.active_pokemon[0]
         second_active = second.snapshots[1].view.active_pokemon[0]
         assert first_active is not None
         assert second_active is not None
         assert first_active.member_id.side.value == "p1"
         assert second_active.member_id.side.value == "p2"
+        first_opp_active = first.snapshots[1].view.opponent_active_pokemon[0]
+        second_opp_active = second.snapshots[1].view.opponent_active_pokemon[0]
+        assert first_opp_active is not None
+        assert second_opp_active is not None
+        assert first_active.state == second_opp_active.state
+        assert second_active.state == first_opp_active.state
 
     def test_preview_observation_excludes_executed_lead_choices(self) -> None:
         first_payload = golden_replay_payload("preview-first")
@@ -285,6 +310,8 @@ class TestReconstructionProjection:
             gen=9,
         )
         skipped = frozenset({"", "t:", "expire", "uhtmlchange", "showteam", "win", "tie"})
+        compared_boundaries = 0
+        compared_members = 0
 
         for line in document.protocol_lines:
             snapshot = boundaries.get(line.index)
@@ -293,6 +320,7 @@ class TestReconstructionProjection:
                 and not snapshot.view.teampreview
                 and oracle.player_role is not None
             ):
+                compared_boundaries += 1
                 live_active = oracle.active_pokemon
                 for slot, live in enumerate(live_active):
                     projected = snapshot.view.active_pokemon[slot]
@@ -305,6 +333,7 @@ class TestReconstructionProjection:
                         abs=0.02,
                     )
                     assert dict(live.boosts) == dict(projected.boosts)
+                    compared_members += 1
 
             if line.parts[1] in skipped:
                 continue
@@ -312,6 +341,9 @@ class TestReconstructionProjection:
                 oracle.parse_message(list(line.parts))
             except (AssertionError, IndexError, KeyError, NotImplementedError, ValueError) as exc:
                 pytest.fail(f"poke-env rejected {line.raw!r}: {exc}")
+
+        assert compared_boundaries == 6
+        assert compared_members == 11
 
 
 class TestSpatialEventIntervals:

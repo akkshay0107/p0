@@ -26,8 +26,6 @@ from p0.replays.dataset import (
 )
 from tests.unit.replay_fixtures import (
     build_dataset,
-    build_dataset_from_payloads,
-    golden_replay_payload,
     sample_replay_payload,
     torch_summaries,
     write_dataset_replay_dataset,
@@ -59,13 +57,42 @@ class TestReplayDatasets:
         write_split_manifest(first, path)
         assert load_split_manifest(path).to_dict() == first.to_dict()
 
+    @pytest.mark.parametrize(
+        ("series_ids", "val_fraction", "test_fraction", "expected_splits"),
+        [
+            (("a", "b", "c", "d", "e"), 0.1, 0.1, {"train", "validation", "test"}),
+            (("a", "b", "c"), 0.1, 0.1, {"train", "validation", "test"}),
+            (("a", "b"), 0.1, 0.1, {"train"}),
+            (("a",), 0.1, 0.1, {"train"}),
+            (("a", "b", "c", "d", "e"), 0.0, 0.0, {"train"}),
+        ],
+    )
+    def test_split_assignment_populates_all_requested_splits_when_possible(
+        self,
+        series_ids: tuple[str, ...],
+        val_fraction: float,
+        test_fraction: float,
+        expected_splits: set[str],
+    ) -> None:
+        """Verify assign_series_splits allocates items to requested partitions under boundary conditions."""
+        manifest = assign_series_splits(
+            series_ids,
+            validation_fraction=val_fraction,
+            test_fraction=test_fraction,
+            global_contract_sha256="a" * 64,
+            dataset_hash="b" * 64,
+        )
+        assert set(manifest.assignments.values()) == expected_splits
+
     def test_split_dataset_keeps_series_together(self, tmp_path: Path) -> None:
-        """Verify series split partitioning assigns all games of a series to the same split, avoiding data leakage."""
+        """Verify series split partitioning assigns all games of a multi-game series to the same split."""
         built = write_dataset_replay_dataset(
             tmp_path,
             (
-                sample_replay_payload("game-1", "series-1"),
-                sample_replay_payload("game-2", "series-2"),
+                sample_replay_payload("game-1", "series-1", game_number=1),
+                sample_replay_payload("game-2", "series-1", game_number=2),
+                sample_replay_payload("game-3", "series-2", game_number=1),
+                sample_replay_payload("game-4", "series-2", game_number=2),
             ),
         )
         series_ids = sorted({str(summary["series_id"]) for summary in torch_summaries(built)})
@@ -82,8 +109,18 @@ class TestReplayDatasets:
             LazyReplayDataset(built.manifest_path, split="train", split_manifest=split_path)
         )
         test = list(LazyReplayDataset(built.manifest_path, split="test", split_manifest=split_path))
-        assert {chunk.series_id for chunk in train} == {series_ids[0]}
-        assert {chunk.series_id for chunk in test} == {series_ids[1]}
+        assert [(chunk.series_id, chunk.game_number, chunk.player) for chunk in train] == [
+            (series_ids[0], 1, 0),
+            (series_ids[0], 1, 1),
+            (series_ids[0], 2, 0),
+            (series_ids[0], 2, 1),
+        ]
+        assert [(chunk.series_id, chunk.game_number, chunk.player) for chunk in test] == [
+            (series_ids[1], 1, 0),
+            (series_ids[1], 1, 1),
+            (series_ids[1], 2, 0),
+            (series_ids[1], 2, 1),
+        ]
 
     def test_lazy_dataset_yields_canonical_bo3_game_perspectives(
         self,
@@ -143,24 +180,31 @@ class TestReplayDatasets:
         with pytest.raises(ValueError, match="Shard file is missing"):
             next(iter(LazyReplayDataset(built.manifest_path)))
 
-    def test_dataset_rejects_missing_and_duplicate_source_records(self, tmp_path: Path) -> None:
-        """Verify ShardManifest validation checks consistency between raw_replays and source_series records."""
-        missing = build_dataset_from_payloads(
-            tmp_path / "missing", (golden_replay_payload("only", series_id="series"),)
+    def test_dataset_rejects_duplicate_persisted_summaries(self, tmp_path: Path) -> None:
+        """Verify LazyReplayDataset detects and rejects duplicate persisted summaries at the reader boundary."""
+        built = write_dataset_replay_dataset(
+            tmp_path,
+            (sample_replay_payload("game-1"), sample_replay_payload("game-2")),
         )
-        missing_manifest = missing.manifest.to_dict()
-        missing_manifest["raw_replays"] = {}
-        altered = missing.manifest_path.parent / "missing.json"
-        altered.write_text(json.dumps(missing_manifest), encoding="utf-8")
-        with pytest.raises(ValueError, match="raw_replays|source_games|partition"):
-            LazyReplayDataset(altered)
+        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
+        payload = torch.load(shard_path, weights_only=True, map_location="cpu")
+        summaries = payload["series_summaries"]
+        payload["series_summaries"] = [*summaries, summaries[0]]
+        torch.save(payload, shard_path)
 
-        duplicate_payloads = (
-            golden_replay_payload("duplicate", series_id="duplicate-series"),
-            golden_replay_payload("duplicate", series_id="duplicate-series"),
-        )
-        with pytest.raises((ValueError, KeyError), match="duplicate|already|unique|invalid"):
-            build_dataset_from_payloads(tmp_path / "duplicate", duplicate_payloads)
+        manifest = built.manifest.to_dict()
+        digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+        manifest["shards"][0]["sha256"] = digest
+        manifest["shards"][0]["byte_size"] = shard_path.stat().st_size
+        manifest["artifact_hashes"][built.manifest.shards[0].filename] = digest
+        altered = built.manifest_path.parent / "altered.json"
+        altered.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match="Shard summary count does not match game offsets|Shard summaries do not cover",
+        ):
+            LazyReplayDataset(altered)
 
     def test_dataset_rejects_nonchronological_game_summaries(self, tmp_path: Path) -> None:
         built = write_dataset_replay_dataset(

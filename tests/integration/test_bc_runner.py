@@ -1,4 +1,4 @@
-"""Tests for behavior-cloning runner and CLI orchestration."""
+"""Integration tests for behavior-cloning runner and CLI orchestration."""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from p0.model.config import ModelConfig
+from p0.model.factory import build_policy
+from p0.model.resources import default_runtime_resources
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from p0.replays.dataset import (
     SeriesSplitManifest,
@@ -18,18 +21,28 @@ from p0.replays.dataset import (
 )
 from p0.replays.schema import LabelKind
 from p0.training.bc_runner import evaluate_bc, train_bc
+from p0.training.checkpoint import CheckpointStore, value_objective_metadata
 from p0.training.config import BCConfig
 from tests.unit.replay_fixtures import sample_replay_payload
 
 
+@pytest.mark.heavy
+@pytest.mark.integration
 class TestBCRunner:
-    def test_training_rejects_empty_validation_before_saving_a_policy(
+    @pytest.mark.parametrize(
+        ("split_assignment", "match_error"),
+        [
+            ("train", "validation split has no accepted series"),
+            ("validation", "train split has no accepted series"),
+        ],
+    )
+    def test_training_rejects_empty_splits_and_tampered_shards(
         self,
         tmp_path: Path,
+        split_assignment: str,
+        match_error: str,
     ) -> None:
-        result = compile_payloads(
-            (sample_replay_payload("empty-validation", parent="only-series"),)
-        )
+        result = compile_payloads((sample_replay_payload("empty-split", parent="only-series"),))
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
@@ -42,7 +55,7 @@ class TestBCRunner:
             SeriesSplitManifest(
                 built.manifest.global_contract_sha256,
                 0,
-                {only_series: "train"},
+                {only_series: split_assignment},
                 dataset_hash=built.manifest.dataset_hash,
             ),
             split_path,
@@ -67,24 +80,11 @@ class TestBCRunner:
             train_bc(config, device="cpu")
         shard_path.write_bytes(original_shard)
 
-        with pytest.raises(ValueError, match="validation split has no accepted series"):
+        with pytest.raises(ValueError, match=match_error):
             train_bc(config, device="cpu")
 
         assert not list((tmp_path / "output").rglob("bc_best_policy.pt"))
 
-        write_split_manifest(
-            SeriesSplitManifest(
-                built.manifest.global_contract_sha256,
-                0,
-                {only_series: "validation"},
-                dataset_hash=built.manifest.dataset_hash,
-            ),
-            split_path,
-        )
-        with pytest.raises(ValueError, match="train split has no accepted series"):
-            train_bc(config, device="cpu")
-
-    @pytest.mark.heavy
     def test_runner_learns_on_toy_dataset(self, tmp_path: Path) -> None:
         compiled = compile_payloads(
             (
@@ -162,7 +162,6 @@ class TestBCRunner:
             result["initial_training"]["overall_nll"] * 0.5
         )
 
-    @pytest.mark.heavy
     def test_resume_restores_selected_policy_and_metrics_without_external_files(
         self,
         tmp_path: Path,
@@ -241,58 +240,6 @@ class TestBCRunner:
         assert json.loads(Path(resumed["metrics_path"]).read_text())["completed_step"] == 1
         assert first_latest.is_file()
         assert first_best.is_file()
-        evaluation = evaluate_bc(first_config, first_best, split="validation", device="cpu")
-        assert evaluation["objective"] == {
-            "gamma": first_config.gamma,
-            "value_target_semantics": "discounted_terminal_outcome.v1",
-        }
-        cli = subprocess.run(
-            (
-                sys.executable,
-                "-m",
-                "p0.cli.bc",
-                "evaluate",
-                "--config",
-                str(Path(__file__).parents[2] / "config.example.yaml"),
-                "--shard-manifest",
-                str(built.manifest_path),
-                "--split-manifest",
-                str(split_path),
-                "--checkpoint",
-                str(first_best),
-                "--split",
-                "validation",
-                "--device",
-                "cpu",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        cli_evaluation = json.loads(cli.stdout)
-        assert cli_evaluation["split"] == "validation"
-        assert cli_evaluation["checkpoint"] == str(first_best)
-        assert cli_evaluation["metrics"] == evaluation["metrics"]
-        with pytest.raises(ValueError, match="provenance field 'gamma' is incompatible"):
-            evaluate_bc(
-                replace(first_config, gamma=0.5),
-                first_best,
-                split="validation",
-                device="cpu",
-            )
-        with pytest.raises(ValueError, match="test split has no accepted series"):
-            evaluate_bc(first_config, first_best, split="test", device="cpu")
-
-        cancelled = train_bc(
-            replace(first_config, output_dir=tmp_path / "cancelled-output"),
-            device="cpu",
-            cancel_requested=lambda: True,
-        )
-        assert cancelled["completed_epoch"] == 0
-        assert cancelled["cancelled"] is True
-        assert cancelled["latest_training_checkpoint"] is None
-        assert cancelled["best_policy_checkpoint"] is None
-        assert cancelled["metrics_path"] is None
 
         overfit_checkpoint_path = tmp_path / "legacy_overfit.pt"
         overfit_artifact = dict(torch.load(first_latest, weights_only=True))
@@ -388,3 +335,147 @@ class TestBCRunner:
         assert Path(restored["best_policy_checkpoint"]).is_file()
         history = json.loads(Path(restored["metrics_path"]).read_text())["metrics"]
         assert [record["step"] for record in history] == [1, 2]
+
+    def test_bc_evaluation_and_cli_parity(self, tmp_path: Path) -> None:
+        result = compile_payloads(
+            (
+                sample_replay_payload("eval-train", parent="train-series"),
+                sample_replay_payload("eval-validation", parent="validation-series"),
+            )
+        )
+        built = write_tensor_shards(
+            result,
+            tmp_path / "shards",
+            max_decisions_per_shard=8,
+            created_at="2026-01-01T00:00:00Z",
+        )
+        split_path = tmp_path / "splits.json"
+        series_by_replay = {
+            replay_ids[0]: series_id
+            for series_id, replay_ids in built.manifest.source_series.items()
+        }
+        write_split_manifest(
+            SeriesSplitManifest(
+                built.manifest.global_contract_sha256,
+                0,
+                {
+                    series_by_replay["eval-train"]: "train",
+                    series_by_replay["eval-validation"]: "validation",
+                },
+                dataset_hash=built.manifest.dataset_hash,
+            ),
+            split_path,
+        )
+        config = BCConfig(
+            batch_decisions=4,
+            max_chunk_size=4,
+            epochs=1,
+            num_workers=0,
+            enable_optim=False,
+            shard_manifest=built.manifest_path,
+            split_manifest=split_path,
+            output_dir=tmp_path / "output",
+        )
+        policy_checkpoint = tmp_path / "best_policy.pt"
+        store = CheckpointStore()
+        policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
+        store.save_policy(
+            policy_checkpoint,
+            policy,
+            metadata={
+                **value_objective_metadata(config.gamma),
+                "trainer_kind": "bc",
+                "selected_epoch": 1,
+            },
+        )
+
+        evaluation = evaluate_bc(config, policy_checkpoint, split="validation", device="cpu")
+        assert evaluation["objective"] == {
+            "gamma": config.gamma,
+            "value_target_semantics": "discounted_terminal_outcome.v1",
+        }
+        cli = subprocess.run(
+            (
+                sys.executable,
+                "-m",
+                "p0.cli.bc",
+                "evaluate",
+                "--config",
+                str(Path(__file__).parents[2] / "config.example.yaml"),
+                "--shard-manifest",
+                str(built.manifest_path),
+                "--split-manifest",
+                str(split_path),
+                "--checkpoint",
+                str(policy_checkpoint),
+                "--split",
+                "validation",
+                "--device",
+                "cpu",
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        cli_evaluation = json.loads(cli.stdout)
+        assert cli_evaluation["split"] == "validation"
+        assert cli_evaluation["checkpoint"] == str(policy_checkpoint)
+        assert cli_evaluation["metrics"] == evaluation["metrics"]
+        with pytest.raises(ValueError, match="provenance field 'gamma' is incompatible"):
+            evaluate_bc(
+                replace(config, gamma=0.5),
+                policy_checkpoint,
+                split="validation",
+                device="cpu",
+            )
+        with pytest.raises(ValueError, match="test split has no accepted series"):
+            evaluate_bc(config, policy_checkpoint, split="test", device="cpu")
+
+    def test_training_cancellation_halts_cleanly(self, tmp_path: Path) -> None:
+        result = compile_payloads(
+            (
+                sample_replay_payload("cancel-train", parent="train-series"),
+                sample_replay_payload("cancel-validation", parent="validation-series"),
+            )
+        )
+        built = write_tensor_shards(
+            result,
+            tmp_path / "shards",
+            max_decisions_per_shard=8,
+            created_at="2026-01-01T00:00:00Z",
+        )
+        split_path = tmp_path / "splits.json"
+        series_by_replay = {
+            replay_ids[0]: series_id
+            for series_id, replay_ids in built.manifest.source_series.items()
+        }
+        write_split_manifest(
+            SeriesSplitManifest(
+                built.manifest.global_contract_sha256,
+                0,
+                {
+                    series_by_replay["cancel-train"]: "train",
+                    series_by_replay["cancel-validation"]: "validation",
+                },
+                dataset_hash=built.manifest.dataset_hash,
+            ),
+            split_path,
+        )
+        config = BCConfig(
+            batch_decisions=4,
+            max_chunk_size=4,
+            epochs=1,
+            num_workers=0,
+            enable_optim=False,
+            shard_manifest=built.manifest_path,
+            split_manifest=split_path,
+            output_dir=tmp_path / "cancelled-output",
+        )
+
+        cancelled = train_bc(config, device="cpu", cancel_requested=lambda: True)
+        assert cancelled["completed_epoch"] == 0
+        assert cancelled["cancelled"] is True
+        assert cancelled["latest_training_checkpoint"] is None
+        assert cancelled["best_policy_checkpoint"] is None
+        assert cancelled["metrics_path"] is None
+        assert not list((tmp_path / "cancelled-output").rglob("*.pt"))

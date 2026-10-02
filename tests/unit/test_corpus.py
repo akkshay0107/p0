@@ -30,10 +30,29 @@ def _sample_entry(
 
 
 class TestCorpusEntry:
-    def test_valid_entry(self) -> None:
-        entry = _sample_entry()
-        assert entry.spread_provenance == "imputed"
-        assert entry.usage_count == 5
+    def test_entry_serialization_preserves_exact_and_default_provenance(self) -> None:
+        packed_hash = "dbd1bf2dccae769e98729649a1a1c4c9f1a29cc5135e12ea364b98e9295ff5ec"
+        entry = CorpusEntry(
+            canonical_hash="a" * 64,
+            packed="packed-pikachu",
+            packed_sha256=packed_hash,
+            usage_count=17,
+            spread_provenance="exact",
+        )
+        expected = {
+            "canonical_hash": "a" * 64,
+            "packed": "packed-pikachu",
+            "packed_sha256": packed_hash,
+            "usage_count": 17,
+            "spread_provenance": "exact",
+        }
+
+        assert entry.to_dict() == expected
+        assert CorpusEntry.from_dict(expected) == entry
+
+        default_entry = _sample_entry()
+        assert default_entry.spread_provenance == "imputed"
+        assert default_entry.to_dict()["spread_provenance"] == "imputed"
 
     def test_packed_hash_mismatch_raises(self) -> None:
         with pytest.raises(ValueError, match="does not match the packed team"):
@@ -74,11 +93,6 @@ class TestCorpusEntry:
                 spread_provenance="unknown",
             )
 
-    def test_to_dict_and_from_dict_roundtrip(self) -> None:
-        entry = _sample_entry()
-        d = entry.to_dict()
-        assert CorpusEntry.from_dict(d) == entry
-
     def test_from_dict_rejects_unknown_fields(self) -> None:
         entry = _sample_entry()
         d = entry.to_dict()
@@ -91,22 +105,52 @@ class TestCorpusManifest:
     def test_content_hash_invariance_to_order(self) -> None:
         e1 = _sample_entry("team-alpha")
         e2 = _sample_entry("team-beta")
+        changed_entry = _sample_entry("team-gamma")
         assert corpus_content_hash((e1, e2)) == corpus_content_hash((e2, e1))
+        assert corpus_content_hash((e1, e2)) != corpus_content_hash((e1, changed_entry))
 
     def test_manifest_roundtrip_and_validation(self) -> None:
-        entries = (_sample_entry("team-1"), _sample_entry("team-2"))
+        entry = CorpusEntry(
+            canonical_hash="a" * 64,
+            packed="packed-pikachu",
+            packed_sha256="dbd1bf2dccae769e98729649a1a1c4c9f1a29cc5135e12ea364b98e9295ff5ec",
+            usage_count=17,
+            spread_provenance="exact",
+        )
+        entries = (entry,)
         active_sha = current_manifest().global_sha256
-        content_hash = corpus_content_hash(entries)
+        serialized = {
+            "artifact_schema": "p0.team_corpus.v1",
+            "global_contract_sha256": active_sha,
+            "format_id": "gen9championsvgc2026regmb",
+            "corpus_hash": "fcab590ee1e21a55318c3b07fccf5722186e293bb6f261db1941d1919b8c6f05",
+            "entries": [
+                {
+                    "canonical_hash": "a" * 64,
+                    "packed": "packed-pikachu",
+                    "packed_sha256": "dbd1bf2dccae769e98729649a1a1c4c9f1a29cc5135e12ea364b98e9295ff5ec",
+                    "usage_count": 17,
+                    "spread_provenance": "exact",
+                }
+            ],
+            "created_at": "2026-08-01T00:00:00Z",
+            "sampling_metadata": {"test": True},
+        }
         manifest = TeamCorpusManifest(
             global_contract_sha256=active_sha,
             format_id="gen9championsvgc2026regmb",
-            corpus_hash=content_hash,
+            corpus_hash="fcab590ee1e21a55318c3b07fccf5722186e293bb6f261db1941d1919b8c6f05",
             entries=entries,
             created_at="2026-08-01T00:00:00Z",
             sampling_metadata={"test": True},
         )
-        assert TeamCorpusManifest.from_dict(manifest.to_dict()) == manifest
-        assert load_corpus_manifest(manifest.to_dict()) == manifest
+        assert manifest.to_dict() == serialized
+        assert TeamCorpusManifest.from_dict(serialized) == manifest
+        assert load_corpus_manifest(serialized) == manifest
+
+        incompatible = {**serialized, "global_contract_sha256": "b" * 64}
+        with pytest.raises(ValueError, match="incompatible with the active runtime"):
+            load_corpus_manifest(incompatible)
 
     def test_duplicate_entry_raises(self) -> None:
         entry = _sample_entry("team-1")

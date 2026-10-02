@@ -20,6 +20,12 @@ def _log_is_open(path: Path) -> bool:
 
 
 class TestShowdown:
+    def test_showdown_server_group_rejects_duplicate_ports(self) -> None:
+        """Reject duplicate ports before building assets or launching a process."""
+        with pytest.raises(ValueError, match="unique"):
+            with showdown.start_showdown_servers(2, ports=(1, 1), build_assets=False):
+                pass
+
     def test_start_closes_log_when_process_creation_fails(self, tmp_path: Path) -> None:
         log_path = tmp_path / "showdown.log"
         server = showdown.ShowdownServer(
@@ -48,7 +54,6 @@ class TestShowdown:
         assert log_path.is_file()
         assert not _log_is_open(log_path)
 
-    @pytest.mark.network
     def test_loopback_port_allocator_returns_distinct_reusable_ports(self) -> None:
         ports = showdown.allocate_loopback_ports(8)
         assert len(ports) == len(set(ports))

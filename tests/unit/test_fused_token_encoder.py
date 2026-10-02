@@ -3,7 +3,25 @@ from __future__ import annotations
 import pytest
 import torch
 
-from p0.model.fused_token_encoder import DeepSetEncoder
+from p0.battle.events import EventDetail, EventKind, EventPosition
+from p0.format_config import (
+    FORMAT,
+)
+from p0.model.architecture_contract import POOLED_EVENT_COUNT
+from p0.model.fused_token_encoder import (
+    DeepSetEncoder,
+    FusedTokenEncoder,
+)
+from p0.model.resources import default_runtime_resources
+from p0.model.structured_observation import (
+    CAT_IDX_NATURE,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    TOKEN_IDX_ALLY_SIDE,
+    StructuredObservation,
+)
+
+ABILITY_CATEGORICAL_INDEX = 1
+ITEM_CATEGORICAL_INDEX = 2
 
 
 class TestDeepSetEncoder:
@@ -132,3 +150,180 @@ class TestEventPositions:
             tokens, _ = encoder(obs, torch.ones((3, 2, FORMAT.action_size), dtype=torch.bool))
         assert not torch.allclose(tokens[0, -4:], tokens[1, -4:])
         assert not torch.allclose(tokens[0, -4:], tokens[2, -4:])
+
+
+class TestResourceFeatures:
+    @pytest.mark.parametrize(
+        ("table", "column", "first_id", "second_id"),
+        (
+            ("abilities", ABILITY_CATEGORICAL_INDEX, "intimidate", "defiant"),
+            ("items", ITEM_CATEGORICAL_INDEX, "sitrusberry", "leftovers"),
+            ("natures", CAT_IDX_NATURE, "adamant", "bold"),
+        ),
+    )
+    def test_each_resource_id_changes_the_encoded_pokemon(
+        self, table: str, column: int, first_id: str, second_id: str
+    ) -> None:
+        """Changing either ability, item, or nature alone must reach the Pokémon token."""
+        resources = default_runtime_resources()
+        encoder = FusedTokenEncoder(
+            d_model=32,
+            nhead=4,
+            dim_feedforward=64,
+            resources=resources,
+        )
+        encoder.eval()
+        first = StructuredObservation.empty_batch(1)
+        second = first.clone()
+        first_token = (
+            resources.tokenizer.natures[first_id]
+            if table == "natures"
+            else resources.tokenizer.id_for(table, first_id)
+        )
+        second_token = (
+            resources.tokenizer.natures[second_id]
+            if table == "natures"
+            else resources.tokenizer.id_for(table, second_id)
+        )
+        first.categorical[0, 0, column] = first_token
+        second.categorical[0, 0, column] = second_token
+        action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+
+        with torch.inference_mode():
+            first_tokens, _ = encoder(first, action_mask)
+            second_tokens, _ = encoder(second, action_mask)
+
+        assert not torch.equal(first_tokens[:, 0], second_tokens[:, 0])
+
+
+class TestEventTokens:
+    def test_event_tokens_depend_on_record_order_and_positions(self) -> None:
+        """Verify event tokens distinguish record order and source/target positions."""
+        resources = default_runtime_resources()
+        encoder = FusedTokenEncoder(32, 4, 64, resources)
+        action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+
+        def encode_record(row: int, target: int) -> torch.Tensor:
+            obs = StructuredObservation.empty_batch(1)
+            obs.spatial_cat[0, row] = torch.tensor(
+                [EventKind.MOVE, EventPosition.OWN_LEFT, target, 10, EventDetail.NONE, 0, 0, 0, 0]
+            )
+            with torch.no_grad():
+                tokens, _ = encoder(obs, action_mask)
+            return tokens[0, -4:]
+
+        first_at_left = encode_record(0, EventPosition.OPPONENT_LEFT)
+        first_at_right = encode_record(0, EventPosition.OPPONENT_RIGHT)
+        second_at_left = encode_record(1, EventPosition.OPPONENT_LEFT)
+
+        assert not torch.allclose(first_at_left, first_at_right, atol=1e-6)
+        assert not torch.allclose(first_at_left, second_at_left, atol=1e-6)
+
+    def test_padding_records_do_not_change_event_tokens(self) -> None:
+        """Verify rows marked EventKind.NONE are ignored whatever their other fields hold, with an active record negative control."""
+        resources = default_runtime_resources()
+        encoder = FusedTokenEncoder(32, 4, 64, resources)
+        action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+
+        obs = StructuredObservation.empty_batch(1)
+        obs.spatial_cat[0, 0] = torch.tensor([EventKind.MOVE, 0, 2, 10, 0, 0, 0, 0, 0])
+        noisy_padding = obs.clone()
+        noisy_padding.spatial_cat[0, 1:, 1:] = 3
+        noisy_padding.spatial_num[0, 1:] = 0.9
+
+        with torch.no_grad():
+            clean_tokens, _ = encoder(obs, action_mask)
+            noisy_tokens, _ = encoder(noisy_padding, action_mask)
+
+        # Padding noise is ignored
+        torch.testing.assert_close(clean_tokens, noisy_tokens)
+
+        # Negative control: mutating the real active record DOES change the tokens
+        active_modified = obs.clone()
+        active_modified.spatial_cat[0, 0, 3] = 99
+        with torch.no_grad():
+            modified_tokens, _ = encoder(active_modified, action_mask)
+        assert not torch.allclose(clean_tokens[:, -4:], modified_tokens[:, -4:], atol=1e-6)
+
+    def test_spatial_event_channels_remain_observable(self) -> None:
+        """Verify FusedTokenEncoder responds to each categorical and numerical event record channel."""
+        resources = default_runtime_resources()
+        encoder = FusedTokenEncoder(32, 4, 64, resources)
+        action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+
+        base = StructuredObservation.empty_batch(1)
+        base.spatial_cat[0, 0] = torch.tensor(
+            [
+                EventKind.BOOST,
+                EventPosition.OWN_LEFT,
+                EventPosition.OPPONENT_LEFT,
+                0,
+                EventDetail.ATK,
+                0,
+                0,
+                4,
+                1,
+            ]
+        )
+        base.spatial_num[0, 0] = torch.tensor([-1 / 6, 1.0])
+
+        with torch.no_grad():
+            base_tokens, _ = encoder(base, action_mask)
+            base_events = base_tokens[:, -4:]
+
+        # Categorical channels 0..8
+        cat_variants = (
+            (0, EventKind.DAMAGE),
+            (1, EventPosition.NONE),
+            (2, EventPosition.OPPONENT_RIGHT),
+            (3, 10),
+            (4, EventDetail.SPE),
+            (5, 1),
+            (6, 1),
+            (7, 3),
+            (8, 2),
+        )
+        for column, value in cat_variants:
+            variant = base.clone()
+            variant.spatial_cat[0, 0, column] = value
+            with torch.no_grad():
+                variant_tokens, _ = encoder(variant, action_mask)
+            assert not torch.allclose(base_events, variant_tokens[:, -4:], atol=1e-6)
+
+        # Numerical channels 0..1
+        num_variants = (
+            (0, -2 / 6),
+            (1, 0.0),
+        )
+        for column, value in num_variants:
+            variant = base.clone()
+            variant.spatial_num[0, 0, column] = value
+            with torch.no_grad():
+                variant_tokens, _ = encoder(variant, action_mask)
+            assert not torch.allclose(base_events, variant_tokens[:, -4:], atol=1e-6)
+
+    def test_unknown_legality_gate_replaces_the_mask_it_cannot_prove(self) -> None:
+        """Verify that when legality is unknown, the encoder substitutes learned unknown-gate embeddings in place of action masks."""
+        encoder = FusedTokenEncoder(32, 4, 64, default_runtime_resources())
+        encoder.eval()
+
+        observations = StructuredObservation.empty_batch(2)
+        gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)
+        observations.numerical[1, TOKEN_IDX_ALLY_SIDE, gates] = 1.0
+
+        mask = torch.zeros((2, 2, FORMAT.action_size), dtype=torch.bool)
+        mask[:, :, :8] = True
+
+        with torch.no_grad():
+            tokens, _ = encoder(observations, mask)
+            other_mask = mask.clone()
+            other_mask[:, :, 8:16] = True
+            other_tokens, _ = encoder(observations, other_mask)
+
+        mask_token = -POOLED_EVENT_COUNT - 1
+        proven, unknown = tokens[0, mask_token], tokens[1, mask_token]
+        assert torch.isfinite(tokens).all()
+        assert not torch.allclose(proven, unknown)
+        assert not torch.allclose(other_tokens[0, mask_token], proven)
+        # When legality gate is active, changing the input mask has no effect on encoded output
+        torch.testing.assert_close(other_tokens[1, mask_token], unknown)

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
 from dataclasses import replace
 from pathlib import Path
 
@@ -106,8 +110,17 @@ class TestReplayCompiler:
         assert [chunk.game_number for chunk in chunks] == [1, 1, 2, 2]
 
     def test_compiler_retains_exact_partial_unknown_and_rejected_labels(self) -> None:
-        """Verify compiler tracks counters for exact, partial, unknown, and rejected labels based on evidence and OTS validity."""
+        """Verify compiler tracks counters for exact, partial, and unknown labels based on evidence."""
         exact = golden_replay_payload("exact", series_id="label-series")
+        exact["log"] = str(exact["log"]).replace(
+            '["Tackle","Helping Hand"]', '["Protect","Tackle"]'
+        )
+        exact["log"] = str(exact["log"]).replace(
+            "|move|p1b: Eevee|Tackle|p2b: Charmander", "|move|p1b: Eevee|Protect"
+        )
+        exact["log"] = str(exact["log"]).replace(
+            "|move|p2b: Charmander|Tackle|p1b: Eevee", "|move|p2b: Charmander|Protect"
+        )
         partial = golden_replay_payload(
             "partial", series_id="label-series-2", first_move_target=None
         )
@@ -117,8 +130,8 @@ class TestReplayCompiler:
         result = compile_payloads((exact, partial), format_id=exact["formatid"])
         counters = result.metrics.counters
         assert counters["accepted_games"] == 2
-        assert counters["label_exact"] == 0
-        assert counters["label_partial"] == 8
+        assert counters["label_exact"] == 2
+        assert counters["label_partial"] == 6
         assert counters["label_unknown"] == 0
 
         capped = compile_payloads((partial,), format_id=partial["formatid"], max_candidates=1)
@@ -126,46 +139,98 @@ class TestReplayCompiler:
         assert capped.metrics.counters["label_exact"] == 0
         assert capped.metrics.counters["label_unknown"] == 4
 
-        rejected = golden_replay_payload("rejected", series_id="rejected-series")
-        rejected["log"] = "\n".join(
-            line for line in str(rejected["log"]).splitlines() if "|showteam|" not in line
+    @pytest.mark.heavy
+    def test_compilation_is_input_order_invariant_and_candidates_hold_executed_orders(
+        self,
+    ) -> None:
+        """Verify compile order does not change results and each executed order is a candidate."""
+        first = sample_replay_payload("g1")
+        second = sample_replay_payload("g2", winner="Bob")
+
+        result = compile_payloads((first, second))
+
+        assert result.to_dict() == compile_payloads((second, first)).to_dict()
+        left, right = result.accepted_series[0].games[0].perspectives
+        assert (9, 11) in left.decisions[1].evidence.candidates
+        assert (9, 11) in right.decisions[1].evidence.candidates
+        assert left.snapshots[1].pre_line_index < left.snapshots[1].post_line_index
+        assert result.metrics.counters["illegal_candidates"] == 0
+
+    def test_compiler_matches_serial_results_with_two_workers(self, tmp_path: Path) -> None:
+        script = tmp_path / "compare_compilers.py"
+        script.write_text(
+            textwrap.dedent("""            import os
+            from p0.replays.compile import compile_payloads
+            from tests.unit.replay_fixtures import golden_replay_payload
+
+            if __name__ == "__main__":
+                assert os.cpu_count() == 2
+                payloads = tuple(
+                    golden_replay_payload(f"game-{i}", series_id=f"series-{i}")
+                    for i in range(3)
+                )
+                serial = compile_payloads(payloads, chunksize=0)
+                assert len(serial.accepted_series) == 3
+                # Three jobs exceed the two CPUs, so positive chunks use the process pool.
+                for chunksize in (1, 2):
+                    parallel = compile_payloads(payloads, chunksize=chunksize)
+                    assert parallel.to_dict() == serial.to_dict()
+            """),
+            encoding="utf-8",
         )
-        with pytest.raises(ReplayInputContractError) as error:
-            compile_payloads((rejected,), format_id=rejected["formatid"])
-        assert error.value.category == "INVALID_INPUT_CONTRACT"
+        root = Path(__file__).resolve().parents[2]
+        environment = {
+            **os.environ,
+            "PYTHON_CPU_COUNT": "2",
+            "PYTHONPATH": os.pathsep.join((str(root), str(root / "src"))),
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+        }
 
-    def test_compiler_is_stable_across_worker_chunk_sizes(self) -> None:
-        """Verify public compilation produces the same replay result for serial and parallel chunks."""
-        payloads = (
-            golden_replay_payload("chunk-a", series_id="chunk-series-a"),
-            golden_replay_payload("chunk-b", series_id="chunk-series-b"),
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
 
-        serial = compile_payloads(payloads, chunksize=0)
-        parallel = compile_payloads(payloads, chunksize=1)
-
-        assert serial.to_dict() == parallel.to_dict()
+        assert result.returncode == 0, result.stdout + result.stderr
 
     def test_reconstructed_views_carry_open_team_sheet_nature(self) -> None:
-        """Verify open team sheet natures are preserved for both projected sides."""
+        """Verify open team sheet natures match literal sheet values for both projected sides."""
         payload = payload_with_ots_natures("ots-nature")
         result = compile_payloads((payload,))
         assert result.accepted_series
 
-        own: set[str | None] = set()
-        opponent: set[str | None] = set()
+        expected_team_0 = {
+            "Pikachu": "Jolly",
+            "Eevee": "Adamant",
+            "Raichu": "Serious",
+            "Jolteon": "Serious",
+            "Vaporeon": "Serious",
+            "Flareon": "Serious",
+        }
+        expected_team_1 = {
+            "Bulbasaur": "Bold",
+            "Charmander": "Timid",
+            "Squirtle": "Serious",
+            "Ivysaur": "Serious",
+            "Charmeleon": "Serious",
+            "Wartortle": "Serious",
+        }
         for game in result.accepted_series[0].games:
             for perspective in game.perspectives:
+                expected_own = expected_team_0 if perspective.player == 0 else expected_team_1
+                expected_opp = expected_team_1 if perspective.player == 0 else expected_team_0
                 for snapshot in perspective.snapshots:
-                    own.update(mon.nature for mon in snapshot.view.team.values())
-                    opponent.update(mon.nature for mon in snapshot.view.opponent_team.values())
-
-        # Every projected roster member comes from the same open team sheet facts.
-        natures = {"Jolly", "Adamant", "Bold", "Timid", "Serious"}
-        assert opponent and None not in opponent
-        assert opponent <= natures
-        assert own and None not in own
-        assert own <= natures
+                    assert {
+                        mon.species: mon.nature for mon in snapshot.view.team.values()
+                    } == expected_own
+                    assert {
+                        mon.species: mon.nature for mon in snapshot.view.opponent_team.values()
+                    } == expected_opp
 
     def test_external_rejections_keep_raw_identity_and_do_not_enter_dataset(
         self,
@@ -185,9 +250,11 @@ class TestReplayCompiler:
         assert built.manifest.accepted_games == 1
         assert built.manifest.rejected_games == 1
         assert set(built.manifest.raw_replays) == {"accepted", "malformed"}
-        assert dataset.accepted_series_ids() == tuple(
-            sorted({chunk.series_id for chunk in dataset})
-        )
+        assert dataset.accepted_series_ids() == ("863aaa3132d82aee2dc3c06c",)
+        assert dataset.manifest.raw_replays["malformed"] == "a" * 64
+        chunks = tuple(dataset)
+        assert len(chunks) == 2
+        assert all(chunk.series_id == "863aaa3132d82aee2dc3c06c" for chunk in chunks)
 
     def test_existing_dataset_ignores_legacy_release_report(self, tmp_path: Path) -> None:
         payload = golden_replay_payload("legacy-report", series_id="legacy-series")

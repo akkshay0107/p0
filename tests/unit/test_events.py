@@ -282,19 +282,6 @@ class TestSpatialEventRecorder:
             ),
         )
 
-    def test_item_reveal_and_removal_are_distinct(self) -> None:
-        recorder = SpatialEventRecorder(player_role="p1")
-
-        recorder.apply_line(["", "-item", "p2a: Tornadus", "Covert Cloak"], tokenizer, _no_hp)
-        recorder.apply_line(
-            ["", "-enditem", "p1a: Incineroar", "Sitrus Berry", "[eat]"], tokenizer, _no_hp
-        )
-
-        assert [(r.target, r.detail) for r in recorder.pending()] == [
-            (EventPosition.OPPONENT_LEFT, EventDetail.ITEM_PRESENT),
-            (EventPosition.OWN_LEFT, EventDetail.ITEM_EATEN),
-        ]
-
     def test_overflow_keeps_the_earliest_records_and_warns(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

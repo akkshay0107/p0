@@ -12,6 +12,7 @@ from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
 
 class TestShowdown:
     @pytest.mark.integration
+    @pytest.mark.heavy
     def test_showdown_server_context_terminates_process_and_releases_port(
         self, showdown_assets
     ) -> None:
@@ -31,10 +32,3 @@ class TestShowdown:
         assert not Path(f"/proc/{process_id}").exists()
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", port))
-
-    @pytest.mark.integration
-    def test_showdown_server_group_rejects_duplicate_ports(self, showdown_assets) -> None:
-        """Verify invalid public group configuration fails before launching a process."""
-        with pytest.raises(ValueError, match="unique"):
-            with start_showdown_servers(2, ports=(1, 1), build_assets=False):
-                pass

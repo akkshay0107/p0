@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import cast
 
 import pytest
 
@@ -84,8 +85,19 @@ class TestTeamMember:
             ability="Static",
             moves=("Protect", "Thunderbolt"),
             nature="Jolly",
+            gender="F",
+            level=73,
         )
         d = member.to_dict()
+        assert d == {
+            "species": "pikachu",
+            "item": "lightball",
+            "ability": "static",
+            "moves": ["protect", "thunderbolt"],
+            "nature": "jolly",
+            "gender": "F",
+            "level": 73,
+        }
         restored = TeamMember.from_dict(d)
         assert restored == member.canonical()
 
@@ -104,9 +116,36 @@ class TestCanonicalTeam:
         second = team_variant(members=reversed_members)
         assert first.team.team_hash == second.team.team_hash
 
+        pikachu = first.team.members[0]
+        display_variant = replace(
+            pikachu,
+            species="PIKACHU",
+            item="Light-Ball",
+            ability="STATIC",
+            moves=tuple(move.upper() for move in reversed(pikachu.moves)),
+            nature="JOLLY",
+        )
+        display_team = CanonicalTeam((display_variant, *first.team.members[1:]))
+        assert display_team.team_hash == first.team.team_hash
+
+        semantic_variant = replace(display_variant, ability="Lightning Rod")
+        semantic_team = CanonicalTeam((semantic_variant, *first.team.members[1:]))
+        assert semantic_team.team_hash != first.team.team_hash
+
     def test_team_dict_roundtrip(self) -> None:
-        team = team_variant().team
+        variant = team_variant()
+        pikachu = replace(variant.team.members[0], gender="M", level=73)
+        team = CanonicalTeam((pikachu, *variant.team.members[1:]))
         d = team.to_dict()
+        assert cast(list[object], d["members"])[4] == {
+            "species": "pikachu",
+            "item": "lightball",
+            "ability": "static",
+            "moves": ["electroweb", "fakeout", "protect", "thunderbolt"],
+            "nature": "jolly",
+            "gender": "M",
+            "level": 73,
+        }
         restored = CanonicalTeam.from_dict(d)
         assert restored == team.canonical()
 
@@ -141,12 +180,43 @@ class TestTeamRecord:
 class TestDeduplicateVariants:
     def test_merges_metadata_and_preserves_spread_variants(self) -> None:
         first = team_variant()
+        first = replace(
+            first,
+            spreads=(
+                StatPoints(hp=1),
+                StatPoints(atk=2),
+                StatPoints(defense=3),
+                StatPoints(spa=4),
+                StatPoints(spd=5),
+                StatPoints(spe=6),
+            ),
+        )
         duplicate = replace(first, metadata=metadata(usage=2))
+        reordered = replace(
+            duplicate,
+            team=CanonicalTeam(tuple(reversed(duplicate.team.members))),
+            spreads=tuple(reversed(duplicate.spreads)),
+        )
         alternate = replace(
             first,
             spreads=tuple(StatPoints(hp=32, defense=17, spd=17) for _ in first.spreads),
         )
-        result = deduplicate_variants((duplicate, alternate, first))
+        result = deduplicate_variants((reordered, alternate, first))
         assert len(result) == 2
-        merged = next(item for item in result if item.spreads == first.spreads)
+        merged = next(item for item in result if len(set(item.spreads)) == 6)
         assert merged.metadata.usage_count == 3
+        associations = tuple(
+            (member.canonical().species, spread.as_tuple())
+            for member, spread in sorted(
+                zip(merged.team.members, merged.spreads, strict=True),
+                key=lambda pair: pair[0].canonical().species,
+            )
+        )
+        assert associations == (
+            ("charizard", (0, 2, 0, 0, 0, 0)),
+            ("garchomp", (0, 0, 0, 4, 0, 0)),
+            ("glimmora", (0, 0, 0, 0, 0, 6)),
+            ("kingambit", (0, 0, 0, 0, 5, 0)),
+            ("pikachu", (1, 0, 0, 0, 0, 0)),
+            ("whimsicott", (0, 0, 3, 0, 0, 0)),
+        )

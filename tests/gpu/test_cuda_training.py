@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from p0.battle.series import SeriesPerspectiveKey
 from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, canonical_policy_state_dict, compile_policy
@@ -19,15 +18,12 @@ from p0.model.structured_observation import StructuredObservation
 from p0.paths import DEFAULT_PATHS
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
-from p0.training._bc_batch import BCGameWindow
-from p0.training._bc_history import prepare_series_context
 from p0.training.bc import BCTrainer
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig, GlobalConfig, TeamsConfig, TrainingConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import ppo_update
 from p0.training.ppo_runner import run_training
-from p0.training.series_history import SeriesHistoryStore
 from p0.training.trajectory import CollectedTrajectory, prepare_trajectory_batches
 from p0.training.utils import select_optimization_precision
 from tests.team_fixtures import DEFAULT_TEST_TEAM
@@ -186,6 +182,32 @@ class TestCudaTraining:
         )
         for name, value in policy.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[name], value)
+        assert optimizer.state_dict()["state"]
+        torch.testing.assert_close(
+            restored_optimizer.state_dict(), optimizer.state_dict(), rtol=0, atol=0
+        )
+        assert restored_scaler.state_dict() == scaler.state_dict()
+
+        resumed_before = {
+            name: value.detach().clone() for name, value in restored.state_dict().items()
+        }
+        resumed_stats = ppo_update(
+            batches[1:],
+            restored,
+            Magnet(restored),
+            restored_optimizer,
+            restored_scaler,
+            config,
+            episode=1,
+            alpha=0.0,
+            cancel_requested=lambda: False,
+        )
+        assert resumed_stats["optimizer_updates"] == 1
+        assert all(math.isfinite(value) for value in resumed_stats.values())
+        assert any(
+            not torch.equal(resumed_before[name], value)
+            for name, value in restored.state_dict().items()
+        )
 
     @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
     def test_bc_fragment_crosses_cpu_cuda_boundary_with_gradients(
@@ -194,37 +216,61 @@ class TestCudaTraining:
         if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
             pytest.skip("CUDA BF16 is unsupported on this device")
 
+        torch.manual_seed(29)
         policy = build_policy(MODEL_CONFIG, default_runtime_resources()).to(cuda_device)
-        key = SeriesPerspectiveKey("cuda-fragment", 0)
-        store = SeriesHistoryStore(d_model=policy.d_model)
-        active = {key: (1, (torch.full((2, policy.d_model), 0.25),))}
-        current = torch.randn((2, policy.d_model), device=cuda_device, dtype=dtype)
-        current.requires_grad_()
-        windows = (
-            BCGameWindow(key, 1, 0, 1, True, False, 1),
-            BCGameWindow(key, 2, 1, 2, False, False, 2),
+        first = _exact_label_game(3, "cuda-fragment")
+        first = replace(
+            first,
+            is_series_end=False,
+            label_kind=torch.full((3,), int(LabelKind.UNKNOWN), dtype=torch.long),
+            loss_mask=torch.zeros(3),
+            candidate_values=torch.empty((0, 2), dtype=torch.long),
+            candidate_offsets=torch.zeros(4, dtype=torch.long),
+            outcome_valid=False,
         )
-
-        with torch.amp.autocast(
-            "cuda",
-            enabled=dtype is not torch.float32,
-            dtype=dtype if dtype is not torch.float32 else torch.float16,
-        ):
-            context, mask = prepare_series_context(
-                store, active, windows, (current[0:1], current[1:2]), current, policy.series
-            )
-            loss = context[1].float().square().sum()
-        loss.backward()
+        second = replace(_exact_label_game(2, "cuda-fragment"), game_number=2)
+        first.observations.numerical.requires_grad_()
+        second.observations.numerical.requires_grad_()
+        before = {
+            name: value.detach().clone() for name, value in policy.series.state_dict().items()
+        }
+        trainer = BCTrainer(
+            policy,
+            (first, second),
+            BCConfig(
+                batch_decisions=2,
+                max_chunk_size=1,
+                learning_rate=1e-3,
+                enable_optim=dtype is not torch.float32,
+            ),
+            device=cuda_device,
+        )
+        trainer.precision = select_optimization_precision(
+            dtype is not torch.float32, cuda_device, bf16_supported=dtype is torch.bfloat16
+        )
+        # Keep this transfer/gradient fixture below FP16 overflow; scaler adaptation has its own owner.
+        trainer.scaler = torch.amp.GradScaler(
+            "cuda", enabled=dtype is torch.float16, init_scale=16.0
+        )
+        metrics = trainer.train()
         torch.cuda.synchronize()
 
-        assert context.device == cuda_device
-        assert mask.device == cuda_device
-        assert context.isfinite().all()
-        assert current.grad is not None
-        assert current.grad[0].isfinite().all()
-        assert current.grad[0].abs().sum() > 0
-        assert current.grad[1].abs().sum() == 0
-        assert active[key][1][0].device.type == "cpu"
+        assert metrics["games"] == 2
+        assert metrics["decisions"] == 5
+        assert metrics["updates"] == 1
+        assert all(math.isfinite(float(value)) for value in metrics.values())
+        # Game one has no own objective and its completed history must be detached.
+        prefix_gradient = first.observations.numerical.grad
+        assert prefix_gradient is None or not prefix_gradient.any()
+        current_gradient = second.observations.numerical.grad
+        assert current_gradient is not None
+        assert current_gradient.isfinite().all()
+        assert current_gradient.abs().sum() > 0
+        assert first.observations.numerical.device.type == "cpu"
+        assert any(
+            not torch.equal(before[name], value)
+            for name, value in policy.series.state_dict().items()
+        )
 
     @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_autocast_update_and_scaler_resume(
@@ -286,6 +332,10 @@ class TestCudaTraining:
         assert episode == 1
         for name, value in policy.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[name], value)
+        assert optimizer.state_dict()["state"]
+        torch.testing.assert_close(
+            restored_optimizer.state_dict(), optimizer.state_dict(), rtol=0, atol=0
+        )
         assert restored_scaler.state_dict() == scaler.state_dict()
 
 
@@ -370,7 +420,7 @@ class TestCudaTrainingLoops:
             runs_dir=tmp_path / "runs",
         )
         training = TrainingConfig(
-            num_episodes=3,
+            num_episodes=4,
             n_envs=2,
             rollout_steps=8,
             batch_size=256,
@@ -384,7 +434,12 @@ class TestCudaTrainingLoops:
             training=training, paths=paths, teams=TeamsConfig(all=team, reduced=team)
         )
 
-        run_training(config)
+        run_training(
+            config,
+            cancel_requested=lambda: (
+                paths.checkpoint_path.is_file() and store.load_episode(paths.checkpoint_path) >= 3
+            ),
+        )
 
         saved = store.read(paths.checkpoint_path)
         assert store.load_episode(saved) == 3
@@ -406,4 +461,13 @@ class TestCudaTrainingLoops:
             ),
         )
         run_training(resumed)
-        assert store.load_episode(paths.checkpoint_path) == 3
+        final = store.read(paths.checkpoint_path)
+        assert store.load_episode(final) == 4
+        resumed_metrics = final.artifact["training_state"]["run"]["metrics"]
+        assert [record["step"] for record in resumed_metrics] == [1, 2, 3, 4]
+        assert resumed_metrics[:3] == metrics
+        assert resumed_metrics[-1]["optimizer_updates"] > 0
+        assert any(
+            not torch.equal(value, final.artifact["model_state_dict"][name])
+            for name, value in saved.artifact["model_state_dict"].items()
+        )

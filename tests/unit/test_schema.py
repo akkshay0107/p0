@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 import torch
 
-from p0.format_config import (
-    current_manifest,
-    load_global_contract,
+from p0.battle.events import SPATIAL_SLOT_COUNT
+from p0.model.architecture_contract import (
+    CURRENT_REDUCER_TOKEN_COUNT,
+    CURRENT_TOKEN_COUNT,
+    HISTORY_WINDOW,
+    POOLED_EVENT_COUNT,
+    REDUCER_MAX_LENGTH,
+    SERIES_SLOTS,
 )
 from p0.model.structured_observation import (
+    CATEGORICAL_WIDTH,
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EFFECTS,
+    MAX_EVENT_RECORDS,
+    NUM_IDX_EFFECT_COUNT,
+    NUM_IDX_EFFECT_OVERFLOW,
+    NUMERICAL_WIDTH,
+    SEQUENCE_LENGTH,
     StructuredObservation,
-)
-from p0.replays.compile import (
-    ShardBuildResult,
-    compile_payloads,
-    write_tensor_shards,
+    TokenType,
 )
 from p0.replays.schema import (
     ActionEvidence,
@@ -30,60 +37,8 @@ from p0.replays.schema import (
 )
 from p0.replays.shards import (
     SHARD_TENSOR_SPECS,
-    ShardIndexEntry,
-    ShardManifest,
-    load_shard_manifest,
     observation_field_specs,
 )
-from tests.unit.replay_fixtures import golden_replay_payload, sample_replay_payload
-
-
-def _write_dataset_replay_dataset(
-    tmp_path: Path, payloads: tuple[dict[str, object], ...]
-) -> ShardBuildResult:
-    result = compile_payloads(payloads)
-    return write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
-
-
-def torch_summaries(built) -> list[dict[str, object]]:
-    payload_path = built.manifest_path.parent / built.manifest.shards[0].filename
-    payload = torch.load(payload_path, weights_only=True, map_location="cpu")
-    return payload["series_summaries"]
-
-
-def _build_dataset_from_payloads(tmp_path, payloads):
-    result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
-    return write_tensor_shards(
-        result,
-        tmp_path / "dataset",
-        max_decisions_per_shard=1,
-        created_at="2026-01-01T00:00:00Z",
-    )
-
-
-def _build_dataset(tmp_path, count: int):
-    payloads = tuple(
-        golden_replay_payload(f"dataset-{index}", series_id=f"dataset-series-{index}")
-        for index in range(count)
-    )
-    return _build_dataset_from_payloads(tmp_path, payloads)
-
-
-def _payload_with_ots_natures(replay_id: str) -> dict[str, object]:
-    """A pipeline payload whose open team sheets declare natures, as real replays do."""
-    natures = {"Pikachu": "Jolly", "Eevee": "Adamant", "Bulbasaur": "Bold", "Charmander": "Timid"}
-    payload = sample_replay_payload(replay_id)
-    lines = []
-    for line in str(payload["log"]).splitlines():
-        if line.startswith("|showteam|"):
-            head, _, body = line.rpartition("|")
-            roster = json.loads(body)
-            for mon in roster:
-                mon["nature"] = natures.get(mon["species"], "Serious")
-            line = f"{head}|{json.dumps(roster, separators=(',', ':'))}"
-        lines.append(line)
-    payload["log"] = "\n".join(lines)
-    return payload
 
 
 def _evidence(kind: LabelKind) -> ActionEvidence:
@@ -113,30 +68,6 @@ def _series_record() -> SeriesRecord:
         score=(2, 0),
         grouping_method=GroupingMethod.PARENT_ROOM,
         grouping_confidence=1.0,
-    )
-
-
-def _shard_manifest_fixture_unit() -> ShardManifest:
-    active_contract = load_global_contract().global_sha256
-    entry = ShardIndexEntry(
-        filename="shard-000.pt", sha256="c" * 64, decisions=10, games=2, series=1, byte_size=1024
-    )
-    return ShardManifest(
-        global_contract_sha256=active_contract,
-        shards=(entry,),
-        diagnostics={"oov_ids": 0},
-        created_at="2026-07-17T00:00:00Z",
-        dataset_hash="d" * 64,
-        source_format_id="gen9championsvgc2026regmbbo3",
-        build_config={"max_candidates": 256},
-        raw_replays={"game-1": "f" * 64},
-        source_series={"series-1": ("game-1",)},
-        source_games=1,
-        accepted_games=1,
-        rejected_games=0,
-        artifact_hashes={
-            "shard-000.pt": "c" * 64,
-        },
     )
 
 
@@ -248,54 +179,47 @@ class TestReplaySchemas:
             "outcome",
         ]
 
-    def test_shard_manifest_contract(self) -> None:
-        """Verify ShardManifest contract checks global SHA-256 validity and roundtrips through dictionary representation."""
-        manifest = _shard_manifest_fixture_unit()
-        assert ShardManifest.from_dict(manifest.to_dict()) == manifest
-        assert manifest.decisions == 10 and manifest.games == 2 and manifest.series == 1
-        assert load_shard_manifest(manifest.to_dict()) == manifest
-        with pytest.raises(ValueError, match="incompatible"):
-            load_shard_manifest({**manifest.to_dict(), "global_contract_sha256": "0" * 64})
-        with pytest.raises(ValueError, match="unknown"):
-            load_shard_manifest({**manifest.to_dict(), "runtime_manifest_sha256": "0" * 64})
-
-    def test_shard_manifest_round_trip_and_tamper_detection(self, tmp_path: Path) -> None:
-        """Verify ShardManifest verifies global runtime contract and detects tampered or mismatched source series."""
-        vocab = tmp_path / "vocab.json"
-        dex = tmp_path / "champions_dex.json"
-        vocab.write_text(
-            json.dumps({"species": {"pikachu": 1}, "moves": {"tackle": 1}}), encoding="utf-8"
+    def test_fixed_memory_and_observation_contract(self) -> None:
+        """Verify the persisted architecture dimensions and the serialized observation layout."""
+        assert SEQUENCE_LENGTH == 15
+        assert (CATEGORICAL_WIDTH, NUMERICAL_WIDTH) == (60, 116)
+        assert (SPATIAL_SLOT_COUNT, MAX_EVENT_RECORDS) == (4, 32)
+        assert set(TokenType) == {TokenType.POKEMON, TokenType.FIELD, TokenType.EVENT}
+        assert (CURRENT_TOKEN_COUNT, CURRENT_REDUCER_TOKEN_COUNT, REDUCER_MAX_LENGTH) == (
+            20,
+            21,
+            77,
         )
-        dex.write_text('{"pikachu":{"base_stats":{"hp":35}}}', encoding="utf-8")
-        runtime = current_manifest(vocab_path=vocab, dex_path=dex)
+        assert (HISTORY_WINDOW, SERIES_SLOTS, POOLED_EVENT_COUNT) == (48, 8, 4)
 
-        entry = ShardIndexEntry("shard-000.pt", "c" * 64, 10, 4, 1, 100)
-        manifest = ShardManifest(
-            global_contract_sha256=runtime.global_sha256,
-            shards=(entry,),
-            diagnostics={"oov_ids": 0},
-            created_at="2026-07-17T00:00:00Z",
-            dataset_hash="d" * 64,
-            source_format_id="gen9championsvgc2026regmbbo3",
-            build_config={"seed": 3},
-            raw_replays={"game-1": "f" * 64, "game-2": "e" * 64},
-            source_series={"series-1": ("game-1", "game-2")},
-            source_games=2,
-            accepted_games=2,
-            rejected_games=0,
-            artifact_hashes={"shard-000.pt": "c" * 64},
+        observation = StructuredObservation.empty_batch(2)
+        assert observation.token_type_ids.shape == (2, SEQUENCE_LENGTH)
+        assert observation.spatial_cat.shape == (2, MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH)
+        assert observation.spatial_num.shape == (2, MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
+        for (_, shape, _), tensor in zip(
+            observation_field_specs(), observation.tensors(), strict=True
+        ):
+            assert tuple(tensor.shape[1:]) == tuple(shape[1:])
+
+    def test_observation_overflow_contract_holds_at_capacity_boundaries(self) -> None:
+        """Verify validate_overflow_contract verifies effect overflow totals and rejects mismatches."""
+        observation = StructuredObservation.empty_batch(1)[0]
+        observation.numerical[:, NUM_IDX_EFFECT_COUNT] = torch.tensor(
+            (0,) * 12 + (MAX_EFFECTS, MAX_EFFECTS + 2, 0),
+            dtype=torch.float32,
         )
-        assert ShardManifest.from_dict(manifest.to_dict()) == manifest
-        manifest_path = tmp_path / "runtime_manifest.json"
-        manifest_path.write_text(json.dumps(runtime.to_dict()), encoding="utf-8")
-        with pytest.raises(ValueError, match="default global manifest"):
-            load_shard_manifest(
-                {**manifest.to_dict(), "global_contract_sha256": "b" * 64}, manifest_path
-            )
-        with pytest.raises(ValueError, match="source_series"):
-            ShardManifest.from_dict(
-                {**manifest.to_dict(), "source_series": {"series-1": ("game-1",)}}
-            )
+        observation.numerical[:, NUM_IDX_EFFECT_OVERFLOW] = torch.tensor(
+            (0.0,) * 12 + (0.0, 2.0, 0.0),
+            dtype=torch.float32,
+        )
+        observation.validate_overflow_contract()
+        assert observation.overflow_totals() == (2, 0)
+
+        observation.numerical[13, NUM_IDX_EFFECT_OVERFLOW] = 1.0
+        with pytest.raises(
+            ValueError, match="Effect overflow does not match the number of dropped effects"
+        ):
+            observation.validate_overflow_contract()
 
     def test_schema_modules_stay_pure(self) -> None:
         """Verify intermediate representation modules stay pure without importing torch or runtime."""

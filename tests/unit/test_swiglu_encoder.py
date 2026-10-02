@@ -40,20 +40,22 @@ class TestAttentionPool:
 
 class TestSwiGLUTransformerEncoder:
     @pytest.mark.parametrize(
-        ("layers", "selected", "unreturned_row"),
+        ("layers", "selected", "unreturned_row", "has_padded_key"),
         (
-            (1, slice(3, None), 1),
-            (3, slice(1, 7, 2), 2),
+            (1, slice(3, None), 1, True),
+            (3, slice(1, 7, 2), 2, True),
+            (2, slice(None), 1, False),
         ),
     )
-    def test_selected_outputs_preserve_full_context_and_gradients(
-        self, layers: int, selected: slice, unreturned_row: int
+    def test_selected_outputs_preserve_full_context_and_gradients_under_concrete_masks(
+        self, layers: int, selected: slice, unreturned_row: int, has_padded_key: bool
     ) -> None:
         torch.manual_seed(29)
         encoder = SwiGLUTransformerEncoder(16, 4, 64, layers).double()
         source = torch.randn(2, 7, 16, dtype=torch.float64, requires_grad=True)
         padding = torch.zeros(2, 7, dtype=torch.bool)
-        padding[:, 0] = True
+        if has_padded_key:
+            padding[:, 0] = True
         full = encoder(source, src_key_padding_mask=padding)[:, selected]
         partial = encoder(source, src_key_padding_mask=padding, output_slice=selected)
         weights = torch.randn_like(full)
@@ -67,20 +69,10 @@ class TestSwiGLUTransformerEncoder:
             torch.testing.assert_close(actual, expected, rtol=1e-7, atol=1e-10)
         # Unreturned rows remain part of the context, while padded keys contribute nothing.
         assert torch.count_nonzero(partial_gradients[0][:, unreturned_row]) > 0
-        assert torch.count_nonzero(partial_gradients[0][:, 0]) == 0
-
-    def test_unmasked_call_uses_concrete_all_false_mask(self) -> None:
-        torch.manual_seed(37)
-        encoder = SwiGLUTransformerEncoder(16, 4, 64, 2).double()
-        source = torch.randn(2, 7, 16, dtype=torch.float64, requires_grad=True)
-        padding = torch.zeros(2, 7, dtype=torch.bool)
-
-        output = encoder(source, padding)
-        output.sum().backward()
-
-        assert output.shape == (2, 7, 16)
-        assert source.grad is not None
-        assert torch.isfinite(source.grad).all()
+        if has_padded_key:
+            assert torch.count_nonzero(partial_gradients[0][:, 0]) == 0
+        else:
+            assert torch.count_nonzero(partial_gradients[0][:, 0]) > 0
 
     def test_all_keys_excluded_returns_finite_output_with_gradients(self) -> None:
         torch.manual_seed(41)
@@ -109,6 +101,7 @@ class TestSwiGLUTransformerEncoder:
         with pytest.raises(ValueError, match="boolean tensor"):
             encoder(source, torch.zeros(2, 7, dtype=torch.uint8))
 
+    @pytest.mark.heavy
     def test_selected_outputs_compile_without_graph_breaks(self) -> None:
         torch.manual_seed(31)
         encoder = SwiGLUTransformerEncoder(16, 4, 64, 2)
@@ -124,3 +117,9 @@ class TestSwiGLUTransformerEncoder:
 
         torch.testing.assert_close(actual, eager)
         torch.testing.assert_close(actual_gradient, eager_gradient)
+
+    def test_each_layer_owns_its_parameters(self) -> None:
+        counts = [len(list(SwiGLUTransformerEncoder(16, 4, 64, n).parameters())) for n in (1, 2, 3)]
+
+        # parameters() counts a module shared between layers only once.
+        assert counts[2] - counts[1] == counts[1] - counts[0] > 0

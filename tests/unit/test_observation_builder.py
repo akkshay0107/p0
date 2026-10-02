@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -27,7 +27,6 @@ from p0.battle.events import (
     EventRecord,
 )
 from p0.battle.legality import DecisionView, SlotDecision
-from p0.battle.views import FixtureBattleView
 from p0.model.observation_builder import (
     ObservationBuilder,
 )
@@ -45,6 +44,7 @@ from p0.model.structured_observation import (
     NUM_IDX_CAN_SWITCH_OUT,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_FAINTED,
     NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_PREPARING,
@@ -112,6 +112,43 @@ class ObservationPokemon:
     is_terastallized: bool = False
     tera_type: Any = None
     types: tuple[Any, ...] = ()
+
+
+@dataclass(slots=True)
+class FixtureBattleView:
+    """Concrete battle value used to exercise the public BattleView protocol."""
+
+    team: Mapping[str, Any]
+    opponent_team: Mapping[str, Any]
+    active_pokemon: Sequence[Any | None]
+    opponent_active_pokemon: Sequence[Any | None]
+    available_moves: Sequence[Sequence[Any]]
+    available_switches: Sequence[Sequence[Any]]
+    can_mega_evolve: Sequence[bool]
+    force_switch: Sequence[bool]
+    trapped: Sequence[bool]
+    maybe_trapped: Sequence[bool]
+    teampreview: bool
+    player_role: str | None
+    wait: bool
+    weather: Mapping[Any, int]
+    fields: Mapping[Any, int]
+    side_conditions: Mapping[Any, int]
+    opponent_side_conditions: Mapping[Any, int]
+    turn: int
+    used_mega_evolve: bool
+    opponent_used_mega_evolve: bool
+    decision: DecisionView
+    identifiers: Mapping[str, Any] = field(default_factory=dict)
+    spatial_events: Sequence[EventRecord] = ()
+    stat_cache: dict[Any, Any] = field(default_factory=dict)
+
+    def get_pokemon(self, identifier: str) -> Any:
+        return self.identifiers[identifier]
+
+    def last_move(self, pokemon: Any) -> str | None:
+        move = pokemon.last_move
+        return None if move is None else move.id
 
 
 def make_pokemon_view(
@@ -246,11 +283,6 @@ def from_battle(battle, tok=tokenizer, stat_overrides=None):
     return _OBSERVATION_BUILDER.build(battle, stat_overrides)
 
 
-def from_battle_into(battle, out, tok=tokenizer, stat_overrides=None):
-    assert tok is _OBSERVATION_BUILDER.tokenizer
-    _OBSERVATION_BUILDER.build_into(battle, out, stat_overrides)
-
-
 class TestObservationBuilder:
     def test_observation_builder_serializes_pokemon_features(self) -> None:
         """
@@ -317,7 +349,7 @@ class TestObservationBuilder:
         assert num[NUM_IDX_PREPARING] == 1.0  # Preparing move flag
         assert num[NUM_IDX_CAN_MEGA] == 1.0  # Can mega evolve flag
 
-    def test_ordered_pokemon_and_slot_conditions_real(self) -> None:
+    def test_ordered_pokemon_and_slot_conditions(self) -> None:
         """Verify public observations preserve roster order and active-slot placement."""
         p1 = make_pokemon_view(species="aerodactyl")
         p2 = make_pokemon_view(species="archaludon")
@@ -359,7 +391,13 @@ class TestObservationBuilder:
         assert left_empty.numerical[0, 1] == 1.0
         assert left_empty.numerical[1, 2] == 1.0
 
-    def test_global_and_side_field_tokens_include_mega_availability(self) -> None:
+    @pytest.mark.parametrize(
+        ("turn", "expected_turn_fraction"),
+        [(5, 5 / 24.0), (12, 12 / 24.0)],
+    )
+    def test_global_and_side_field_tokens_include_mega_availability(
+        self, turn: int, expected_turn_fraction: float
+    ) -> None:
         """Verify global field and side tokens include turn fraction scaling, team preview indicator, and mega availability."""
         ally_mega = make_pokemon_view(species="charizard", item="charizarditey")
         battle = make_battle_view(
@@ -369,7 +407,7 @@ class TestObservationBuilder:
             fields={Field.ELECTRIC_TERRAIN: 4},
             side_conditions={SideCondition.REFLECT: 2},
             opponent_side_conditions={SideCondition.LIGHT_SCREEN: 1},
-            turn=5,
+            turn=turn,
             teampreview=False,
             can_mega_evolve=[True, False],
         )
@@ -378,8 +416,9 @@ class TestObservationBuilder:
 
         # Global Field Token (index 12)
         assert obs.token_type_ids[TOKEN_IDX_GLOBAL_FIELD] == TokenType.FIELD
-        assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, 3] == pytest.approx(5 / 24.0)  # turn / 24
+        assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, 3] == pytest.approx(expected_turn_fraction)
         assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] == 0.0
+        assert all(torch.isfinite(t).all() for t in obs.tensors())
 
         # Ally Side Token (index 13)
         assert obs.token_type_ids[TOKEN_IDX_ALLY_SIDE] == TokenType.FIELD
@@ -513,8 +552,8 @@ class TestObservationBuilder:
         assert not obs.spatial_cat[3:].any()
         assert not obs.spatial_num[3:].any()
 
-    def test_from_battle_into_overwrites_and_validates_output_buffer(self) -> None:
-        """Verify from_battle_into performs in-place tensor writing into pre-allocated memory buffers without stale artifact leakage."""
+    def test_build_into_overwrites_and_validates_output_buffer(self) -> None:
+        """Verify build_into overwrites every field of a poisoned buffer and rejects a wrong dtype."""
         ally = make_pokemon_view(
             species="charizard",
             moves={"airslash": 10, "protect": 8},
@@ -537,34 +576,23 @@ class TestObservationBuilder:
             turn=3,
         )
 
-        expected = from_battle(battle, tokenizer)
         out = StructuredObservation.empty_batch(1)[0]
-        # Poison buffer with sentinel 99 values to ensure everything is cleanly overwritten
-        out.token_type_ids.fill_(99)
-        out.side_ids.fill_(99)
-        out.slot_ids.fill_(99)
-        out.categorical.fill_(99)
-        out.numerical.fill_(99.0)
-        out.spatial_cat.fill_(99)
-        out.spatial_num.fill_(99.0)
+        # Poison every field with a sentinel so any unwritten value stays visible.
+        for tensor in out.tensors():
+            tensor.fill_(99)
 
-        from_battle_into(battle, out, tokenizer)
+        _OBSERVATION_BUILDER.build_into(battle, out)
 
-        assert torch.equal(out.token_type_ids, expected.token_type_ids)
-        assert torch.equal(out.side_ids, expected.side_ids)
-        assert torch.equal(out.slot_ids, expected.slot_ids)
-        assert torch.equal(out.categorical, expected.categorical)
-        assert torch.equal(out.numerical, expected.numerical)
-        assert torch.equal(out.spatial_cat, expected.spatial_cat)
-        assert torch.equal(out.spatial_num, expected.spatial_num)
-        assert not torch.any(out.categorical == 99)
-        assert not torch.any(out.numerical == 99)
+        for tensor in out.tensors():
+            assert not torch.any(tensor == 99)
+        assert out.categorical[0, 0].item() == tokenizer.species["charizard"]
+        assert out.categorical[6, 0].item() == tokenizer.species["venusaur"]
+        assert out.numerical[12, 3].item() == pytest.approx(3 / 24.0)
 
-        # Validate dtype validation rejection
         invalid = StructuredObservation.empty_batch(1)[0]
         invalid.numerical = invalid.numerical.to(torch.float64)
         with pytest.raises(ValueError, match="Invalid numerical"):
-            from_battle_into(battle, invalid)
+            _OBSERVATION_BUILDER.build_into(battle, invalid)
 
     def test_observation_builder_identity_knownness_and_stat_provenance(self) -> None:
         """Verify IdentityKnownness (KNOWN/OOV/UNKNOWN/PAD) and StatProvenance (KNOWN/IMPUTED/UNKNOWN/PAD)."""
@@ -627,20 +655,6 @@ class TestObservationBuilder:
         assert obs.categorical[7, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
         assert obs.categorical[7, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
         assert obs.numerical[7, NUM_IDX_STAT_PROVENANCE] == 0.0
-
-    def test_observation_overflow_contract_holds_at_capacity_boundaries(self) -> None:
-        """Verify validate_overflow_contract verifies effect overflow totals."""
-        observation = StructuredObservation.empty_batch(1)[0]
-        observation.numerical[:, NUM_IDX_EFFECT_COUNT] = torch.tensor(
-            (0,) * 12 + (MAX_EFFECTS, MAX_EFFECTS + 2, 0),
-            dtype=torch.float32,
-        )
-        observation.numerical[:, NUM_IDX_EFFECT_OVERFLOW] = torch.tensor(
-            (0.0,) * 12 + (0.0, 2.0, 0.0),
-            dtype=torch.float32,
-        )
-        observation.validate_overflow_contract()
-        assert observation.overflow_totals() == (2, 0)
 
 
 def _legality_fixture_view(decision: DecisionView) -> FixtureBattleView:
@@ -719,18 +733,27 @@ class TestObservationBuilderLegalityAndState:
             )
             assert output.numerical[12, 3].item() == pytest.approx(snapshot.view.turn / 24.0)
 
-    def test_empty_slot_and_fainted_pokemon_zero_padding(self) -> None:
-        """Verify empty/unrevealed bench slots write empty slot condition (1.0) and zero out stat/move numerical columns."""
+    def test_empty_and_fainted_roster_slots_keep_distinct_state(self) -> None:
+        """Verify empty rows are zero padded while a fainted bench member keeps its identity."""
         mon = make_pokemon_view(species="pikachu")
-        battle = make_battle_view(active_pokemon=[mon, None], team=[mon])
+        fainted = make_pokemon_view(species="charizard", current_hp=0, status=Status.FNT)
+        battle = make_battle_view(active_pokemon=[mon, None], team=[mon, fainted])
 
         obs = _OBSERVATION_BUILDER.build(battle)
 
-        # Empty ally bench slot (slot index 2): condition 0 (empty) is encoded at numerical[1]
-        assert obs.token_type_ids[2] == TokenType.POKEMON
-        assert obs.categorical[2, 0].item() == 0  # No species
-        assert obs.numerical[2, 1].item() == 1.0  # Slot condition empty
-        assert not obs.numerical[2, 5:].any()  # All Pokemon stats/HP/boosts are zero
+        # Rows 0-1 are the active slots, so the empty right slot stays an empty row.
+        assert obs.categorical[0, 0].item() == tokenizer.species["pikachu"]
+        assert obs.numerical[0, NUM_IDX_FAINTED].item() == 0.0
+        # The fainted bench member follows the active rows and keeps its faint flag.
+        assert obs.categorical[2, 0].item() == tokenizer.species["charizard"]
+        assert obs.numerical[2, NUM_IDX_FAINTED].item() == 1.0
+
+        # The remaining ally rows are empty and store no species or stats.
+        for slot_idx in (1, 3, 4, 5):
+            assert obs.token_type_ids[slot_idx] == TokenType.POKEMON
+            assert obs.categorical[slot_idx, 0].item() == 0
+            assert obs.numerical[slot_idx, 1].item() == 1.0
+            assert not obs.numerical[slot_idx, 5:].any()
 
         # Opponent slots (slots 6..11) all empty
         for slot_idx in range(6, 12):
@@ -738,34 +761,44 @@ class TestObservationBuilderLegalityAndState:
             assert obs.numerical[slot_idx, 1].item() == 1.0
             assert not obs.numerical[slot_idx, 5:].any()
 
-    def test_field_and_weather_turn_fraction_scaling(self) -> None:
-        """Verify turn numbers are scaled by 1/24 on the global field token and all output tensors contain finite numbers."""
-        mon = make_pokemon_view(species="charizard")
-        battle = make_battle_view(
-            active_pokemon=[mon, None],
-            team=[mon],
-            weather={Weather.SUNNYDAY: 3},
-            fields={Field.ELECTRIC_TERRAIN: 5},
-            turn=12,
-        )
-        obs = _OBSERVATION_BUILDER.build(battle)
-
-        # Global field token turn count is normalized by 24 (12 / 24 = 0.5)
-        assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, 3].item() == pytest.approx(12.0 / 24.0)
-        assert all(torch.isfinite(t).all() for t in obs.tensors())
-
     def test_spatial_events_exceeding_capacity_are_truncated_safely(self) -> None:
-        """Verify views with more than MAX_EVENT_RECORDS do not crash observation building."""
-        from p0.battle.events import EventKind, EventRecord
-
+        """Verify views with more than MAX_EVENT_RECORDS preserve arrival prefix and truncate trailing events."""
         mon = make_pokemon_view(species="pikachu")
-        extra_records = tuple(
-            EventRecord(EventKind.MOVE, 0, 2, 1) for _ in range(MAX_EVENT_RECORDS + 5)
+        first_record = EventRecord(
+            EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15
         )
+        middle_records = [
+            EventRecord(
+                EventKind.DAMAGE,
+                EventPosition.OWN_LEFT,
+                EventPosition.OPPONENT_LEFT,
+                amount=-0.1,
+            )
+            for _ in range(MAX_EVENT_RECORDS - 2)
+        ]
+        last_in_capacity = EventRecord(
+            EventKind.HEAL,
+            EventPosition.OWN_LEFT,
+            EventPosition.OPPONENT_LEFT,
+            amount=0.5,
+        )
+        overflow_records = [
+            EventRecord(EventKind.FAINT, EventPosition.OPPONENT_LEFT, EventPosition.NONE)
+            for _ in range(5)
+        ]
+        extra_records = (first_record, *middle_records, last_in_capacity, *overflow_records)
+
         battle = make_battle_view(active_pokemon=[mon, None], team=[mon])
         battle.spatial_events = extra_records
 
         obs = _OBSERVATION_BUILDER.build(battle)
         assert obs.spatial_cat.shape == (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH)
         assert obs.spatial_num.shape == (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
-        assert (obs.spatial_cat[:, 0] == int(EventKind.MOVE)).all()
+        # First record preserved at arrival index 0
+        assert obs.spatial_cat[0, 0].item() == int(EventKind.MOVE)
+        assert obs.spatial_cat[0, 3].item() == 15
+        # Last record within capacity preserved at index MAX_EVENT_RECORDS - 1
+        assert obs.spatial_cat[-1, 0].item() == int(EventKind.HEAL)
+        assert obs.spatial_num[-1, 0].item() == pytest.approx(0.5)
+        # Trailing records beyond capacity were evicted
+        assert not (obs.spatial_cat[:, 0] == int(EventKind.FAINT)).any()

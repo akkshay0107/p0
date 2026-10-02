@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 import torch
@@ -21,8 +21,7 @@ from p0.model.structured_observation import (
     TOKEN_IDX_GLOBAL_FIELD,
     StructuredObservation,
 )
-from p0.replays.compile import compile_payloads, write_tensor_shards
-from p0.replays.dataset import LazyReplayDataset, ReplayGameChunk
+from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
 from p0.training.bc import (
     BCGameWindow,
@@ -30,9 +29,7 @@ from p0.training.bc import (
     collate_bc_batches,
     compute_bc_objective,
 )
-from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
-from tests.unit.replay_fixtures import sample_replay_payload
 
 
 class TestBCObjectives:
@@ -58,35 +55,48 @@ class TestBCObjectives:
         assert result.loss.item() == pytest.approx((expected_exact + expected_partial) / 2)
         assert result.marginal_log_probs[2].isneginf()
 
-    def test_fractional_loss_weights_do_not_change_labeled_counts(self) -> None:
-        """Verify fractional sample weights scale total loss without distorting discrete labeled count metrics."""
-        result = compute_bc_objective(
-            torch.log(torch.tensor([0.25, 0.75])),
-            torch.tensor([0, 1, 2], dtype=torch.long),
-            torch.tensor([int(LabelKind.EXACT), int(LabelKind.EXACT)]),
-            torch.tensor([0.25, 0.75]),
-        )
-
-        assert result.labeled_count == 2
-        assert result.loss_weight == 1.0
-        assert result.loss.item() == pytest.approx(-0.25 * math.log(0.25) - 0.75 * math.log(0.75))
-
-    def test_fractional_weights_use_the_true_weighted_mean(self) -> None:
-        """Verify fractional sample weights compute the mathematically exact weighted mean and gradients."""
-        log_probs = torch.log(torch.tensor([0.25, 0.5])).requires_grad_()
+    @pytest.mark.parametrize(
+        ("probabilities", "weights", "expected_loss", "expected_gradient"),
+        [
+            pytest.param(
+                (0.25, 0.75),
+                (0.25, 0.75),
+                0.5623351446188083,
+                (-0.25, -0.75),
+                id="unit-total-weight",
+            ),
+            pytest.param(
+                (0.25, 0.5),
+                (0.1, 0.15),
+                0.9704060527839233,
+                (-0.4, -0.6),
+                id="below-one-total-weight",
+            ),
+        ],
+    )
+    def test_fractional_weights_use_the_true_weighted_mean(
+        self,
+        probabilities: tuple[float, float],
+        weights: tuple[float, float],
+        expected_loss: float,
+        expected_gradient: tuple[float, float],
+    ) -> None:
+        """Pin weighted loss, gradient, and discrete label counts for fractional weights."""
+        log_probs = torch.log(torch.tensor(probabilities)).requires_grad_()
 
         result = compute_bc_objective(
             log_probs,
             torch.tensor([0, 1, 2], dtype=torch.long),
             torch.tensor([int(LabelKind.EXACT), int(LabelKind.EXACT)]),
-            torch.tensor([0.1, 0.15]),
+            torch.tensor(weights),
         )
         result.loss.backward()
 
-        expected = (-0.1 * math.log(0.25) - 0.15 * math.log(0.5)) / 0.25
-        assert result.loss_weight.item() == pytest.approx(0.25)
-        assert result.loss.item() == pytest.approx(expected)
-        torch.testing.assert_close(log_probs.grad, torch.tensor([-0.4, -0.6]))
+        assert result.labeled_count.item() == 2
+        assert result.exact_count.item() == 2
+        assert result.loss_weight.item() == pytest.approx(sum(weights))
+        assert result.loss.item() == pytest.approx(expected_loss)
+        torch.testing.assert_close(log_probs.grad, torch.tensor(expected_gradient))
 
     def test_unknown_steps_have_zero_loss_and_preserve_boundaries(self) -> None:
         """Verify UNKNOWN labels produce zero loss and empty gradients without breaking backprop graph."""
@@ -138,7 +148,8 @@ class TestBCObjectives:
         )
         result.loss.backward()
         assert probabilities.grad is not None
-        assert torch.isfinite(probabilities.grad).all()
+        # -log(p0 + p1 + p2) has derivative -1 / (p0 + p1 + p2) for each input.
+        torch.testing.assert_close(probabilities.grad, torch.tensor([-1.0, -1.0, -1.0]))
 
     @pytest.mark.parametrize(
         ("log_probs", "offsets", "labels", "message"),
@@ -256,6 +267,41 @@ def _trainer(chunk: ReplayGameChunk, *, minibatch_size: int = 2) -> BCTrainer:
     )
 
 
+def _two_game_series(final_board: float) -> tuple[ReplayGameChunk, ReplayGameChunk]:
+    """Helper building a three-decision game and its two-decision successor in one series."""
+    first = _chunk([int(LabelKind.EXACT)] * 3, [(7, 8)] * 3, [0, 1, 2, 3])
+    first.observations.numerical[:, :, 0] = torch.arange(3.0).reshape(3, 1)
+    first.final_observation.numerical[:, :, 0] = final_board
+    second = _chunk(
+        [int(LabelKind.EXACT)] * 2,
+        [(7, 8)] * 2,
+        [0, 1, 2],
+        game_number=2,
+        is_series_end=True,
+    )
+    return first, second
+
+
+def _train_series_parameters(
+    games: tuple[ReplayGameChunk, ...], max_chunk_size: int
+) -> dict[str, torch.Tensor]:
+    """Helper training one epoch from a fixed seed and returning the series-memory weights."""
+    torch.manual_seed(0)
+    policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
+    BCTrainer(
+        policy,
+        games,
+        BCConfig(
+            batch_decisions=8,
+            max_chunk_size=max_chunk_size,
+            learning_rate=1e-3,
+            enable_optim=False,
+        ),
+        device="cpu",
+    ).train_epoch()
+    return {name: value.detach() for name, value in policy.series.named_parameters()}
+
+
 class TestBCTrainer:
     def test_complete_game_reaches_optimizer_before_next_game_is_requested(self) -> None:
         first = _chunk(
@@ -341,111 +387,6 @@ class TestBCTrainer:
         assert metrics.exact_nll == pytest.approx(math.log(90.0), rel=1e-5)
         assert metrics.exact_joint_accuracy == 1.0
 
-    def test_real_shards_close_all_worker_game_boundaries(self, tmp_path: Path) -> None:
-        result = compile_payloads(
-            (
-                sample_replay_payload("worker-a", parent="worker-series-a"),
-                sample_replay_payload("worker-b", parent="worker-series-b"),
-            )
-        )
-        built = write_tensor_shards(
-            result,
-            tmp_path / "shards",
-            max_decisions_per_shard=1,
-            created_at="2026-01-01T00:00:00Z",
-        )
-        dataset = LazyReplayDataset(built.manifest_path)
-        policy = build_policy(
-            ModelConfig(64, 4, 1, 128),
-            default_runtime_resources(),
-        )
-        trainer = BCTrainer(
-            policy,
-            dataset,
-            BCConfig(
-                batch_decisions=3,
-                max_chunk_size=3,
-                num_workers=2,
-                learning_rate=1e-3,
-                enable_optim=False,
-            ),
-            device="cpu",
-        )
-
-        metrics = trainer.train_epoch()
-
-        assert metrics["decisions"] > 0
-        assert metrics["games"] == 4
-
-    def test_replay_to_series_bc_checkpoint_smoke(self, tmp_path: Path) -> None:
-        result = compile_payloads(
-            (sample_replay_payload("game-1"), sample_replay_payload("game-2"))
-        )
-        built = write_tensor_shards(
-            result,
-            tmp_path / "shards",
-            max_decisions_per_shard=8,
-            created_at="2026-01-01T00:00:00Z",
-        )
-        dataset = LazyReplayDataset(built.manifest_path)
-        policy = build_policy(
-            ModelConfig(
-                d_model=64,
-                nhead=4,
-                reducer_layers=1,
-                dim_feedforward=128,
-            ),
-            default_runtime_resources(),
-        )
-        trainer = BCTrainer(
-            policy,
-            dataset,
-            BCConfig(
-                batch_decisions=2,
-                learning_rate=1e-3,
-                epochs=1,
-                enable_optim=False,
-            ),
-            device="cpu",
-        )
-
-        metrics = trainer.train()
-
-        assert metrics["decisions"] == 8
-        assert metrics["games"] == 4
-        assert torch.isfinite(torch.tensor(metrics["overall_nll"]))
-        checkpoint = tmp_path / "bc.pt"
-        store = CheckpointStore()
-        store.save_training(
-            checkpoint,
-            1,
-            trainer.policy,
-            optimizer=trainer.optimizer,
-            scaler=trainer.scaler,
-            trainer_kind="bc",
-        )
-
-        restored = build_policy(trainer.policy.config, default_runtime_resources())
-        restored_trainer = BCTrainer(
-            restored,
-            (),
-            trainer.config,
-            device="cpu",
-        )
-        assert (
-            store.load_training(
-                checkpoint,
-                restored_trainer.policy,
-                optimizer=restored_trainer.optimizer,
-                scaler=restored_trainer.scaler,
-                expected_trainer_kind="bc",
-                require_training_state=True,
-            )
-            == 1
-        )
-        for name, parameter in trainer.policy.state_dict().items():
-            torch.testing.assert_close(parameter, restored_trainer.policy.state_dict()[name])
-
     def test_bc_trainer_updates_policy_in_game_local_chunks(self) -> None:
         chunk = _chunk(
             [int(LabelKind.EXACT), int(LabelKind.EXACT)],
@@ -506,13 +447,38 @@ class TestBCTrainer:
             for name, parameter in policy.series.named_parameters()
         )
 
+    def test_split_game_trains_like_the_unsplit_game(self) -> None:
+        games = _two_game_series(final_board=5.0)
+
+        unsplit = _train_series_parameters(games, max_chunk_size=64)
+        split = _train_series_parameters(games, max_chunk_size=2)
+
+        for name, value in unsplit.items():
+            torch.testing.assert_close(split[name], value, rtol=0.0, atol=1e-6)
+
+    def test_final_board_of_a_prior_game_reaches_the_next_game_context(self) -> None:
+        empty_board = _train_series_parameters(_two_game_series(final_board=0.0), max_chunk_size=64)
+        full_board = _train_series_parameters(_two_game_series(final_board=5.0), max_chunk_size=64)
+
+        assert any(
+            not torch.allclose(empty_board[name], value, rtol=0.0, atol=1e-6)
+            for name, value in full_board.items()
+        )
+
     def test_unknown_decision_is_excluded_without_breaking_game_context(self) -> None:
         chunk = _chunk(
             [int(LabelKind.UNKNOWN), int(LabelKind.EXACT)],
             [(7, 8)],
             [0, 0, 1],
         )
-        metrics = _trainer(chunk).train()
+        trainer = _trainer(chunk)
+
+        evaluation = trainer.evaluate()
+        metrics = trainer.train()
+
+        assert evaluation.labeled_count == 1
+        assert evaluation.exact_count == 1
+        assert evaluation.unknown_label_fraction == 0.5
         assert metrics["decisions"] == 2
         assert metrics["games"] == 1
 
@@ -523,10 +489,21 @@ class TestBCTrainer:
             [0, 0, 0],
         )
 
-        metrics = _trainer(chunk, minibatch_size=1).train()
+        trainer = _trainer(chunk, minibatch_size=1)
+        before_policy = {
+            name: value.detach().clone() for name, value in trainer.policy.state_dict().items()
+        }
+        before_optimizer = copy.deepcopy(trainer.optimizer.state_dict())
+
+        metrics = trainer.train()
 
         assert metrics["updates"] == 0
         assert metrics["games"] == 1
+        assert all(
+            torch.equal(before_policy[name], value)
+            for name, value in trainer.policy.state_dict().items()
+        )
+        assert trainer.optimizer.state_dict() == before_optimizer
 
     def test_unknown_policy_labels_with_known_outcome_train_the_value_head(self) -> None:
         game = replace(
@@ -647,13 +624,16 @@ class TestBCTrainer:
             device="cpu",
         )
         before = {name: value.detach().clone() for name, value in policy.named_parameters()}
-        handle = policy.actor.q_proj1.weight.register_hook(
-            lambda gradient: torch.full_like(gradient, float("inf"))
-        )
+        # No finite input overflows only the gradient, so force it on every parameter.
+        handles = [
+            parameter.register_hook(lambda gradient: torch.full_like(gradient, float("inf")))
+            for parameter in policy.parameters()
+        ]
 
         with pytest.raises(FloatingPointError, match="non-finite gradients"):
             trainer.train_epoch()
-        handle.remove()
+        for handle in handles:
+            handle.remove()
 
         assert not trainer.optimizer.state
         assert all(parameter.grad is None for parameter in policy.parameters())
@@ -758,10 +738,16 @@ class TestBCTrainer:
         game = _chunk([int(LabelKind.EXACT)] * 2, [(7, 8), (7, 8)], [0, 1, 2])
         gates = slice(NUM_IDX_SLOT_LEGALITY_UNKNOWN, NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2)
         game.observations.numerical[1, TOKEN_IDX_ALLY_SIDE, gates] = 1.0
+        # The gated row would give 48/49 if it were counted.
+        game.action_mask[1, 0] = False
+        game.action_mask[1, 0, 7] = True
         policy = build_policy(
             ModelConfig(d_model=64, nhead=4, reducer_layers=1, dim_feedforward=128),
             default_runtime_resources(),
         )
+        with torch.no_grad():
+            for parameter in policy.parameters():
+                parameter.zero_()
         trainer = BCTrainer(
             policy,
             (game,),
@@ -771,7 +757,8 @@ class TestBCTrainer:
 
         metrics = trainer.evaluate()
 
-        assert 0.0 < metrics.illegal_probability_mass < 1.0
+        # Zeroed weights give uniform logits, so 47 of 49 first-slot actions are illegal.
+        assert metrics.illegal_probability_mass == pytest.approx(47 / 49)
         assert metrics.to_dict()["illegal_probability_mass"] == metrics.illegal_probability_mass
 
     def test_validation_is_deterministic_inference_only_and_reports_all_counts(self) -> None:
@@ -801,6 +788,10 @@ class TestBCTrainer:
         second = trainer.evaluate()
 
         assert first.to_dict() == second.to_dict()
+        assert first.decisions == 3
+        assert first.labeled_count == 2
+        assert first.exact_count == 1
+        assert first.partial_count == 1
         assert first.unknown_label_fraction == pytest.approx(1 / 3)
         assert first.non_finite_values == 0
         assert set(first.to_dict()) == {
@@ -821,39 +812,3 @@ class TestBCTrainer:
         assert all(
             torch.equal(before[name], parameter) for name, parameter in policy.named_parameters()
         )
-
-    def test_bc_training_state_cannot_resume_ppo_but_policy_weights_can_transfer(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        policy = build_policy(
-            ModelConfig(d_model=64, nhead=4, reducer_layers=1, dim_feedforward=128),
-            default_runtime_resources(),
-        )
-        store = CheckpointStore()
-        training_path = tmp_path / "bc-training.pt"
-        policy_path = tmp_path / "bc-policy.pt"
-        store.save_training(
-            training_path,
-            1,
-            policy,
-            optimizer=torch.optim.AdamW(policy.parameters()),
-            trainer_kind="bc",
-        )
-        store.save_policy(policy_path, policy, metadata={"dataset_hash": "a" * 64})
-        restored = store.load_policy(policy_path, "cpu")
-
-        with pytest.raises(ValueError, match="trainer"):
-            store.load_training(
-                training_path,
-                restored,
-                expected_trainer_kind="ppo",
-                require_training_state=True,
-            )
-        with pytest.raises(ValueError, match="weights-only"):
-            store.load_training(
-                policy_path,
-                restored,
-                expected_trainer_kind="ppo",
-                require_training_state=True,
-            )

@@ -16,22 +16,23 @@ from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
 class TestLiveBo3:
-    @pytest.mark.stress
+    @pytest.mark.heavy
+    @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_local_rl_player_completes_bo3_against_random(
-        self, showdown_server, stress_policy
+        self, showdown_server, model_policy
     ) -> None:
         """Play one complete local Showdown Bo3 and verify public player state is reclaimed."""
         poke_env_patches.install()
         source = FixedTeamSource(DEFAULT_TEST_TEAM)
         random_source = FixedTeamSource(DEFAULT_TEST_TEAM)
         rl_player = RLPlayer(
-            policy=stress_policy,
+            policy=model_policy,
             battle_format=FORMAT.bo3_format,
             server_configuration=showdown_server,
             team_source=source,
             team_rng=random.Random(17),
-            observation_builder=ObservationBuilder(stress_policy.resources),
+            observation_builder=ObservationBuilder(model_policy.resources),
             account_configuration=AccountConfiguration("StressBo3RL", None),
             max_concurrent_battles=1,
         )

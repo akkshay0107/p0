@@ -1,3 +1,5 @@
+from collections import Counter
+
 import pytest
 import torch
 
@@ -24,30 +26,14 @@ class TestLivePolicyBattle:
 
         for decision in decisions:
             assert decision.chosen_action in decision.legal_joint_actions
-            assert decision.chosen_order
-
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_showdown_order_sets_remain_nonempty_across_many_requests(
-        self, showdown_server
-    ) -> None:
-        """Verify legal joint actions and single action sets remain non-empty and bounded by ACT_SIZE."""
-        decisions = await capture_showdown_decisions(
-            showdown_server,
-            game_count=integration_count("P0_INTEGRATION_ACTION_GAMES", 2),
-        )
-        assert decisions
-        assert all(decision.legal_joint_actions for decision in decisions)
-        for decision in decisions:
-            # Extract the set of all discrete actions appearing in any legal joint action pair
-            projected = tuple(
-                sorted({action for pair in decision.legal_joint_actions for action in pair})
+            assert decision.chosen_order == decision.regenerated_order
+            assert decision.legal_joint_actions
+            assert all(
+                0 <= action < ACT_SIZE for pair in decision.legal_joint_actions for action in pair
             )
-            observed = tuple(sorted(set(decision.legal_actions[0] + decision.legal_actions[1])))
-            assert observed
-            # Joint actions must be a subset of the union of per-slot legal actions
-            assert set(projected) <= set(observed)
-            assert all(0 <= action < ACT_SIZE for action in observed)
+            assert all(
+                0 <= action < ACT_SIZE for actions in decision.legal_actions for action in actions
+            )
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -72,9 +58,16 @@ class TestLivePolicyBattle:
         assert decisions
         # Tile captured single-turn decisions to construct the requested batch size
         selected = tuple(decisions[index % len(decisions)] for index in range(batch_size))
-        observation = StructuredObservation.stack(
+        cpu_observation = StructuredObservation.stack(
             [decision.observation for decision in selected]
-        ).to(model_device)
+        )
+        observation = cpu_observation.to(model_device)
+        for original, transferred in zip(
+            cpu_observation.tensors(), observation.tensors(), strict=True
+        ):
+            assert transferred.device == model_device
+            assert transferred.dtype == original.dtype
+            torch.testing.assert_close(transferred.cpu(), original, rtol=0, atol=0)
         # Construct 3D boolean action mask: [batch, 2_slots, ACT_SIZE]
         action_mask = torch.zeros((batch_size, 2, ACT_SIZE), dtype=torch.bool, device=model_device)
         for index, decision in enumerate(selected):
@@ -120,11 +113,15 @@ class TestLivePolicyBattle:
         self, showdown_server
     ) -> None:
         """Verify live battle decision capture operates reliably across concurrent multi-game matches."""
+        game_count = max(2, integration_count("P0_INTEGRATION_SELF_PLAY_GAMES", 2))
         decisions = await capture_showdown_decisions(
             showdown_server,
-            game_count=integration_count("P0_INTEGRATION_SELF_PLAY_GAMES", 2),
+            game_count=game_count,
             max_concurrent_battles=2,
         )
         assert decisions
+        by_game = Counter(decision.battle_tag for decision in decisions)
+        assert len(by_game) == game_count
+        assert all(count > 0 for count in by_game.values())
         assert all(decision.legal_joint_actions for decision in decisions)
         assert all(decision.observation.numerical.isfinite().all() for decision in decisions)

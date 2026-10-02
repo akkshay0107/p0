@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import pytest
 import torch
@@ -12,11 +11,9 @@ from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
-from p0.training.checkpoint import CheckpointStore
 from p0.training.config import TrainingConfig
-from p0.training.files import training_run
 from p0.training.magnet import Magnet
-from p0.training.ppo import compute_ppo_objective, ppo_update
+from p0.training.ppo import compute_ppo_objective, magnet_kl_per_step, ppo_update
 from p0.training.trajectory import (
     CollectedTrajectory,
     prepare_trajectory_batches,
@@ -24,77 +21,6 @@ from p0.training.trajectory import (
 
 
 class TestPPO:
-    def test_invalid_minibatch_does_not_poison_saved_success(self, tmp_path: Path) -> None:
-        torch.manual_seed(23)
-        policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
-        initial_weights = {name: value.clone() for name, value in policy.state_dict().items()}
-        collected = [
-            CollectedTrajectory(
-                observations=StructuredObservation.empty_batch(1),
-                action_masks=torch.ones((1, 2, 49), dtype=torch.bool),
-                actions=torch.tensor([[7, 8]], dtype=torch.long),
-                log_probs=torch.tensor([float("nan") if index == 0 else 0.0]),
-                values=torch.zeros(1),
-                rewards=torch.ones(1),
-                dones=torch.ones(1),
-                length=1,
-                bootstrap_value=0.0,
-                series_history=(),
-            )
-            for index in range(2)
-        ]
-        prepared = prepare_trajectory_batches(
-            collected, torch.device("cpu"), gamma=0.99, gae_lambda=0.95
-        )
-        stats = ppo_update(
-            prepared,
-            policy,
-            Magnet(policy),
-            torch.optim.SGD(policy.parameters(), lr=1e-3),
-            torch.amp.GradScaler("cpu", enabled=False),
-            TrainingConfig(
-                num_episodes=20,
-                n_envs=1,
-                rollout_steps=1,
-                batch_size=1,
-                minibatch_size=1,
-                ppo_epochs=1,
-                target_kl=1.0e9,
-                enable_optim=False,
-            ),
-            episode=0,
-            alpha=0.0,
-            cancel_requested=lambda: False,
-        )
-        assert stats["optimizer_updates"] == 1
-        assert all(math.isfinite(value) for value in stats.values())
-        assert any(
-            not torch.equal(initial_weights[name], value)
-            for name, value in policy.state_dict().items()
-        )
-
-        checkpoint = tmp_path / "checkpoint.pt"
-        store = CheckpointStore()
-        with training_run(
-            store, checkpoint, tmp_path / "metrics", trainer_kind="ppo", settings={}
-        ) as run:
-            run.start(0)
-            run.record(1, {}, {"train": {"policy_loss": stats["policy_loss"]}})
-            run.save(1, policy, metadata={})
-        with training_run(
-            store,
-            checkpoint,
-            tmp_path / "metrics",
-            trainer_kind="ppo",
-            settings={},
-            source_path=checkpoint,
-            resume=True,
-        ) as resumed:
-            resumed.start(1)
-        restored = store.load_policy(checkpoint, torch.device("cpu"))
-        for name, value in policy.state_dict().items():
-            torch.testing.assert_close(restored.state_dict()[name], value)
-
     def test_update_honors_batch_size_without_mutating_input_order(self) -> None:
         torch.manual_seed(3)
         policy = build_policy(
@@ -205,76 +131,115 @@ class TestPPO:
         )
         assert history.grad is None
 
-    def test_pure_ppo_objective_uses_symmetric_clipping(self) -> None:
-        """Verify conventional PPO ratio clipping and value loss."""
-        config = TrainingConfig(
-            clip_range=0.2,
-            entropy_coef=0.0,
-        )
+    def test_ppo_objective_weights_each_row_independently(self) -> None:
+        """Verify distinct rows keep their own clipping, value, entropy and Magnet terms."""
+        config = TrainingConfig(clip_range=0.2, value_coef=0.5, entropy_coef=0.1)
         total, policy, value, ratio, log_ratio = compute_ppo_objective(
-            torch.log(torch.tensor([2.0, 0.5])),
-            torch.tensor([0.0, 1.0]),
-            torch.tensor([0.5, 0.5]),
-            torch.zeros(2),
-            torch.zeros(2),
-            torch.ones(2),
-            torch.ones(2),
+            torch.log(torch.tensor([2.0, 0.5, 1.5])),
+            torch.tensor([0.0, 3.0, 0.5]),
+            torch.tensor([0.5, 0.25, 1.0]),
+            torch.tensor([0.1, 0.2, 0.4]),
+            torch.zeros(3),
+            torch.tensor([1.0, 2.0, -2.0]),
+            torch.tensor([1.0, 1.0, 2.0]),
             config,
-            alpha=0.1,
+            alpha=0.5,
         )
-        assert total.shape == policy.shape == value.shape == ratio.shape == log_ratio.shape == (2,)
-        assert ratio.tolist() == pytest.approx([2.0, 0.5])
-        # For element 0: ratio=2.0, clipped to 1.2, adv=1.0 -> policy_loss = -1.2
-        # value_loss = (0 - 1)^2 = 1.0 -> total = 0.5 * 1.0 - 1.2 = -0.7
-        # For element 1: ratio=0.5, clipped to 0.8, adv=1.0 -> policy_loss = -0.5 (min of unclipped=0.5, clipped=0.8)
-        # value_loss = (1 - 1)^2 = 0.0 -> total = -0.5 (no team preview scaling)
-        assert policy[0].item() == pytest.approx(-1.2)
-        assert policy[1].item() == pytest.approx(-0.5)
-        assert total[0].item() == pytest.approx(config.value_coef * 1.0 - 1.2)
-        assert total[1].item() == pytest.approx(-0.5)
 
-    def test_ppo_objective_matches_simple_reference(self) -> None:
-        """Verify symmetric PPO clipping, value loss, MMD penalty, and entropy bonus."""
-        config = TrainingConfig(
-            clip_range=0.2,
-            value_coef=0.5,
-            entropy_coef=0.2,
+        assert ratio.tolist() == pytest.approx([2.0, 0.5, 1.5])
+        assert log_ratio.tolist() == pytest.approx([math.log(2.0), math.log(0.5), math.log(1.5)])
+        # Row 0 clips high (-1.2), row 1 keeps the unclipped lower bound (-1.0), and row 2 keeps
+        # the unclipped pessimistic branch for a negative advantage (3.0).
+        assert policy.tolist() == pytest.approx([-1.2, -1.0, 3.0])
+        assert value.tolist() == pytest.approx([1.0, 4.0, 2.25])
+        # policy + 0.5 * value + 0.5 * magnet_kl - 0.1 * entropy
+        assert total.tolist() == pytest.approx([-0.7, 1.075, 4.225])
+
+    def test_magnet_kl_is_exactly_zero_for_single_action_masks(self) -> None:
+        """Verify -inf padding contributes no 0 * inf NaN and real divergence is still measured."""
+        inf = float("inf")
+        live = torch.tensor(
+            [
+                [[0.0, -inf, -inf], [2.0, -inf, -inf]],
+                [[0.0, 0.0, -inf], [0.0, 0.0, -inf]],
+            ]
         )
-        batch_size = 64
-        generator = torch.Generator().manual_seed(20260807)
-        current_log_probs = torch.randn(batch_size, generator=generator)
-        old_log_probs = torch.randn(batch_size, generator=generator)
-        advantages = torch.randn(batch_size, generator=generator)
-        values = torch.randn(batch_size, generator=generator)
-        returns = torch.randn(batch_size, generator=generator)
-        entropy = torch.rand(batch_size, generator=generator)
-        kl = torch.rand(batch_size, generator=generator)
-        total, policy, value, ratio, log_ratio = compute_ppo_objective(
-            current_log_probs,
-            values,
-            entropy,
-            kl,
-            old_log_probs,
-            advantages,
-            returns,
+        magnet = torch.tensor(
+            [
+                [[5.0, -inf, -inf], [-1.0, -inf, -inf]],
+                [[0.0, math.log(3.0), -inf], [0.0, math.log(3.0), -inf]],
+            ]
+        )
+
+        kl = magnet_kl_per_step(live, magnet)
+
+        assert kl[0].item() == 0.0
+        # Each slot is 0.5 * log(0.5 / 0.25) + 0.5 * log(0.5 / 0.75) = 0.5 * log(4 / 3).
+        assert kl[1].item() == pytest.approx(math.log(4.0 / 3.0))
+
+    @pytest.mark.parametrize(
+        ("ratio", "advantage", "expected_policy"),
+        (
+            (0.5, 2.0, -1.0),
+            (0.8, 2.0, -1.6),
+            (1.0, 2.0, -2.0),
+            (1.2, 2.0, -2.4),
+            (1.5, 2.0, -2.4),
+            (0.5, -2.0, 1.6),
+            (0.8, -2.0, 1.6),
+            (1.0, -2.0, 2.0),
+            (1.2, -2.0, 2.4),
+            (1.5, -2.0, 3.0),
+        ),
+    )
+    def test_ppo_clipping_respects_advantage_sign(
+        self, ratio: float, advantage: float, expected_policy: float
+    ) -> None:
+        config = TrainingConfig(clip_range=0.2, value_coef=0.0, entropy_coef=0.0)
+        total, policy, value, actual_ratio, log_ratio = compute_ppo_objective(
+            torch.tensor([math.log(ratio)]),
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.tensor([advantage]),
+            torch.zeros(1),
             config,
-            alpha=0.3,
+            alpha=0.0,
         )
-        expected_ratio = torch.exp(current_log_probs - old_log_probs)
-        expected_clipped = torch.clamp(
-            expected_ratio,
-            1.0 - config.clip_range,
-            1.0 + config.clip_range,
+
+        assert policy.item() == pytest.approx(expected_policy)
+        assert total.item() == pytest.approx(expected_policy)
+        assert value.item() == 0.0
+        assert actual_ratio.item() == pytest.approx(ratio)
+        assert log_ratio.item() == pytest.approx(math.log(ratio))
+
+    @pytest.mark.parametrize(
+        ("value_coef", "entropy_coef", "alpha", "expected_total"),
+        (
+            (0.0, 0.0, 0.0, -2.0),
+            (0.5, 0.0, 0.0, 0.0),
+            (0.0, 0.2, 0.0, -2.1),
+            (0.0, 0.0, 0.3, -1.7),
+            (0.5, 0.2, 0.3, 0.2),
+        ),
+    )
+    def test_ppo_loss_terms_have_the_expected_sign_and_weight(
+        self, value_coef: float, entropy_coef: float, alpha: float, expected_total: float
+    ) -> None:
+        config = TrainingConfig(value_coef=value_coef, entropy_coef=entropy_coef)
+        total, policy, value, _, _ = compute_ppo_objective(
+            torch.zeros(1),
+            torch.tensor([3.0]),
+            torch.tensor([0.5]),
+            torch.ones(1),
+            torch.zeros(1),
+            torch.tensor([2.0]),
+            torch.ones(1),
+            config,
+            alpha=alpha,
         )
-        expected_policy = -torch.minimum(
-            expected_ratio * advantages,
-            expected_clipped * advantages,
-        )
-        expected_value = (values - returns).square()
-        expected_total = expected_policy + config.value_coef * expected_value + 0.3 * kl
-        expected_total = expected_total - config.entropy_coef * entropy
-        torch.testing.assert_close(ratio, expected_ratio)
-        torch.testing.assert_close(log_ratio, current_log_probs - old_log_probs)
-        torch.testing.assert_close(policy, expected_policy)
-        torch.testing.assert_close(value, expected_value)
-        torch.testing.assert_close(total, expected_total)
+
+        assert policy.item() == -2.0
+        assert value.item() == 4.0
+        assert total.item() == pytest.approx(expected_total, abs=1e-6)

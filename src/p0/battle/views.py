@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from p0.battle.events import EventRecord
@@ -387,40 +386,3 @@ class BattleView(FieldView, Protocol):
     def get_pokemon(self, identifier: str) -> Any: ...
 
     def last_move(self, pokemon: Any) -> str | None: ...
-
-
-@dataclass(slots=True)
-class FixtureBattleView:
-    """Concrete battle view used in testing and replay reconstruction."""
-
-    team: Mapping[str, Any]
-    opponent_team: Mapping[str, Any]
-    active_pokemon: Sequence[Any | None]
-    opponent_active_pokemon: Sequence[Any | None]
-    available_moves: Sequence[Sequence[Any]]
-    available_switches: Sequence[Sequence[Any]]
-    can_mega_evolve: Sequence[bool]
-    force_switch: Sequence[bool]
-    trapped: Sequence[bool]
-    maybe_trapped: Sequence[bool]
-    teampreview: bool
-    player_role: str | None
-    wait: bool
-    weather: Mapping[Any, int]
-    fields: Mapping[Any, int]
-    side_conditions: Mapping[Any, int]
-    opponent_side_conditions: Mapping[Any, int]
-    turn: int
-    used_mega_evolve: bool
-    opponent_used_mega_evolve: bool
-    decision: DecisionView
-    identifiers: Mapping[str, Any] = field(default_factory=dict)
-    spatial_events: Sequence[EventRecord] = ()
-    stat_cache: dict[Any, Any] = field(default_factory=dict)
-
-    def get_pokemon(self, identifier: str) -> Any:
-        return self.identifiers[identifier]
-
-    def last_move(self, pokemon: Any) -> str | None:
-        move = pokemon.last_move
-        return None if move is None else move.id

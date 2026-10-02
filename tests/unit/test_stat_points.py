@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from p0.teams.stat_points import (
-    STAT_NAMES,
     STAT_POINT_TOTAL_LIMIT,
     BaseStats,
     StatPoints,
@@ -40,9 +39,9 @@ class TestStatPoints:
             StatPoints(hp=3.5)  # type: ignore[arg-type]
 
     def test_as_dict_and_from_dict_roundtrip(self) -> None:
-        points = StatPoints(hp=2, atk=0, defense=0, spa=32, spd=0, spe=32)
+        points = StatPoints(hp=1, atk=2, defense=3, spa=4, spd=5, spe=6)
         d = points.as_dict()
-        assert tuple(d.keys()) == STAT_NAMES
+        assert d == {"hp": 1, "atk": 2, "def": 3, "spa": 4, "spd": 5, "spe": 6}
         assert StatPoints.from_dict(d) == points
 
     def test_from_dict_missing_field_raises(self) -> None:
@@ -52,9 +51,10 @@ class TestStatPoints:
 
 class TestBaseStats:
     def test_from_mapping_and_tuple(self) -> None:
-        mapping = {"hp": 100, "atk": 100, "def": 100, "spa": 100, "spd": 100, "spe": 100}
+        mapping = {"hp": 101, "atk": 102, "def": 103, "spa": 104, "spd": 105, "spe": 106}
         stats = BaseStats.from_mapping(mapping)
-        assert stats.as_tuple() == (100, 100, 100, 100, 100, 100)
+        assert stats.as_tuple() == (101, 102, 103, 104, 105, 106)
+        assert stats.defense == 103
 
     def test_from_mapping_missing_field_raises(self) -> None:
         with pytest.raises(ValueError, match="Missing base stat"):
@@ -62,6 +62,14 @@ class TestBaseStats:
 
 
 class TestCalculateStats:
+    def test_first_point_and_nature_truncation_match_showdown(self) -> None:
+        """Verify level 50 Adamant stats cross the first Stat Point boundary by one attack point."""
+        base = BaseStats(100, 100, 100, 100, 100, 100)
+        zero = calculate_stats(base, StatPoints(), "adamant")
+        one = calculate_stats(base, StatPoints(atk=1), "adamant")
+        assert zero == (175, 132, 120, 108, 120, 120)
+        assert one == (175, 133, 120, 108, 120, 120)
+
     def test_level_50_neutral_nature(self) -> None:
         base = BaseStats(100, 100, 100, 100, 100, 100)
         points = StatPoints(hp=0, atk=0, defense=0, spa=0, spd=0, spe=0)
@@ -101,22 +109,23 @@ class TestCalculateStats:
 
 
 class TestFallbackSpreads:
-    def test_physical_category_fallback(self) -> None:
-        spread = fallback_points(("physical", "physical", "status", "special"))
-        assert spread == StatPoints(hp=32, atk=32, spe=2)
-
-    def test_special_category_fallback(self) -> None:
-        spread = fallback_points(("special", "special", "status"))
-        assert spread == StatPoints(hp=32, spa=32, spe=2)
-
-    def test_status_category_fallback(self) -> None:
-        spread = fallback_points(("status", "status", "physical"))
-        assert spread == StatPoints(hp=32, defense=17, spd=17)
-
-    def test_insufficient_moves_returns_none(self) -> None:
-        spread = fallback_points(("physical", "special", "status"))
-        assert spread is None
-
-    def test_case_insensitive_categories(self) -> None:
-        spread = fallback_points(("PHYSICAL", "Physical"))
-        assert spread == StatPoints(hp=32, atk=32, spe=2)
+    @pytest.mark.parametrize(
+        "categories, expected",
+        (
+            (("physical", "physical", "status", "special"), StatPoints(hp=32, atk=32, spe=2)),
+            (("special", "special", "status"), StatPoints(hp=32, spa=32, spe=2)),
+            (("status", "status", "physical"), StatPoints(hp=32, defense=17, spd=17)),
+            (("physical", "physical", "special", "special"), StatPoints(hp=32, atk=32, spe=2)),
+            (("PHYSICAL", "Physical"), StatPoints(hp=32, atk=32, spe=2)),
+            (("physical", "special", "status"), None),
+            ((), None),
+            (("physical",), None),
+        ),
+    )
+    def test_fallback_categories_preserve_priority_and_unknown_cases(
+        self, categories: tuple[str, ...], expected: StatPoints | None
+    ) -> None:
+        actual = fallback_points(categories)
+        assert actual == expected
+        if actual is not None:
+            assert sum(actual.as_tuple()) == 66

@@ -12,11 +12,11 @@ from p0.model.resources import default_runtime_resources
 from p0.replays.identity import ReplayMemberId, ReplaySide
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.decisions import build_decision_view
+from p0.replays.reconstruction.diagnostics import ReplayEventParseError
 from p0.replays.reconstruction.events import parse_protocol_events
 from p0.replays.reconstruction.projection import project_battle_view
 from p0.replays.reconstruction.resolution import resolve_protocol_events
 from p0.replays.reconstruction.state import (
-    normalize_dynamic_effect,
     reconstruct_replay_state,
     reduce_replay_state,
 )
@@ -26,6 +26,22 @@ _GOLDEN_REPLAY_DIRECTORY = (
     Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
 )
 _GOLDEN_REPLAYS = tuple(sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")))
+_UNRESOLVED_ILLUSION_REPLAYS = frozenset(
+    f"gen9championsvgc2026regmbbo3-{number}"
+    for number in (
+        "2670609846",
+        "2670610791",
+        "2670613319",
+        "2670623194",
+        "2670633916",
+        "2670639242",
+        "2670857037",
+        "2670858949",
+        "2670968279",
+        "2670969833",
+        "2671057223",
+    )
+)
 _P1_SPECIES = ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")
 _P2_SPECIES = ("Golf", "Hotel", "India", "Juliet", "Kilo", "Lima")
 
@@ -216,25 +232,38 @@ class TestReconstructionState:
     def test_clearallboost_clears_every_active_boost(self) -> None:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p1b: Bravo|Bravo, L50|100/100",
             "|switch|p2a: Golf|Golf, L50|100/100",
             "|-boost|p1a: Alpha|atk|2",
+            "|-unboost|p1b: Bravo|def|1",
+            "|-boost|p2a: Golf|spa|1",
+            "|switch|p1a: Charlie|Charlie, L50|100/100",
             "|-clearallboost",
         )
         final = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 0
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts).get("atk", 0) == 0
+        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 1)).boosts).get("def", 0) == 0
+        assert dict(final.member(ReplayMemberId(ReplaySide.P2, 0)).boosts).get("spa", 0) == 0
 
     def test_clearboost_clears_the_named_member_boosts(self) -> None:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p1b: Bravo|Bravo, L50|100/100",
             "|-boost|p1a: Alpha|atk|2",
+            "|-unboost|p1a: Alpha|def|1",
+            "|-boost|p1b: Bravo|spa|1",
             "|-clearboost|p1a: Alpha",
         )
         final = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 0
+        alpha = dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)
+        bravo = dict(final.member(ReplayMemberId(ReplaySide.P1, 1)).boosts)
+        assert alpha.get("atk", 0) == 0
+        assert alpha.get("def", 0) == 0
+        assert bravo["spa"] == 1
 
     def test_clearnegativeboost_preserves_positive_boosts(self) -> None:
         events = _resolved(
@@ -269,31 +298,50 @@ class TestReconstructionState:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
             "|switch|p1b: Charlie|Charlie, L50|100/100",
+            "|-boost|p1a: Alpha|atk|1",
+            "|-unboost|p1a: Alpha|def|2",
             "|-boost|p1b: Charlie|atk|2",
+            "|-boost|p1b: Charlie|def|1",
             "|-copyboost|p1a: Alpha|p1b: Charlie",
         )
         final = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 2
+        copied = dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)
+        donor = dict(final.member(ReplayMemberId(ReplaySide.P1, 2)).boosts)
+        assert copied["atk"] == 2
+        assert copied["def"] == 1
+        assert donor["atk"] == 2
+        assert donor["def"] == 1
 
     def test_invertboost_inverts_each_member_boost(self) -> None:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
             "|-boost|p1a: Alpha|atk|2",
+            "|-unboost|p1a: Alpha|def|1",
             "|-invertboost|p1a: Alpha",
         )
         final = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == -2
+        boosts = dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)
+        assert boosts["atk"] == -2
+        assert boosts["def"] == 1
+        assert boosts.get("spa", 0) == 0
 
     def test_setboost_sets_the_named_stat_absolute_value(self) -> None:
-        events = _resolved("|switch|p1a: Alpha|Alpha, L50|100/100", "|-setboost|p1a: Alpha|atk|3")
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-boost|p1a: Alpha|atk|2",
+            "|-unboost|p1a: Alpha|def|1",
+            "|-setboost|p1a: Alpha|atk|3",
+        )
         final = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 3
+        boosts = dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)
+        assert boosts["atk"] == 3
+        assert boosts["def"] == -1
 
     def test_unboost_decreases_the_named_stat(self) -> None:
         events = _resolved(
@@ -375,10 +423,12 @@ class TestReconstructionState:
 
     def test_sidestart_and_sideend_update_side_conditions(self) -> None:
         events = _resolved("|-sidestart|p1: Player|move: Reflect", "|-sideend|p1: Player|Reflect")
-        final = reduce_replay_state(
+        snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
-        assert final.sides[0].conditions == ()
+        ).require_accepted()
+
+        assert dict(snapshots[0].sides[0].conditions) == {"reflect": 0}
+        assert snapshots[1].sides[0].conditions == ()
 
     def test_singlemove_records_a_member_scoped_effect(self) -> None:
         events = _resolved(
@@ -394,14 +444,20 @@ class TestReconstructionState:
             "|switch|p1a: Alpha|Alpha, L50|100/100",
             "|switch|p1b: Charlie|Charlie, L50|100/100",
             "|-boost|p1a: Alpha|atk|2",
+            "|-boost|p1a: Alpha|def|1",
             "|-boost|p1b: Charlie|atk|1",
+            "|-boost|p1b: Charlie|def|3",
             "|-swapboost|p1a: Alpha|p1b: Charlie|atk",
         )
         final = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)["atk"] == 1
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 2)).boosts)["atk"] == 2
+        alpha = dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).boosts)
+        charlie = dict(final.member(ReplayMemberId(ReplaySide.P1, 2)).boosts)
+        assert alpha["atk"] == 1
+        assert alpha["def"] == 1
+        assert charlie["atk"] == 2
+        assert charlie["def"] == 3
 
     def test_initialization_events_are_state_neutral(self) -> None:
         events = _resolved(
@@ -414,7 +470,13 @@ class TestReconstructionState:
         snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()
-        assert snapshots[-1].sides[0].active == (None, None)
+        initial = replace(snapshots[0], line_index=0)
+        assert initial.sides[0].active == (None, None)
+        assert initial.turn == 0
+        assert initial.weather == ()
+        assert initial.fields == ()
+        for snapshot in snapshots[1:]:
+            assert replace(snapshot, line_index=0) == initial
 
     def test_source_shaped_state_neutral_effect_events(self) -> None:
         events = _resolved(
@@ -430,8 +492,9 @@ class TestReconstructionState:
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()
 
-        assert snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).hp_fraction == 1.0
-        assert dict(snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).effects) == {}
+        before = snapshots[1]
+        for snapshot in snapshots[2:]:
+            assert replace(snapshot, line_index=before.line_index) == before
 
     def test_source_shaped_weather_and_field_transitions(self) -> None:
         events = _resolved(
@@ -441,13 +504,18 @@ class TestReconstructionState:
             "|-fieldend|move: Electric Terrain",
             "|-weather|none",
         )
-
         snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()
 
-        assert snapshots[-1].weather == ()
-        assert snapshots[-1].fields == ()
+        assert [dict(state.weather) for state in snapshots] == [{"sunnyday": 0}] * 4 + [{}]
+        assert [dict(state.fields) for state in snapshots] == [
+            {},
+            {"electricterrain": 0},
+            {"electricterrain": 0},
+            {},
+            {},
+        ]
 
     def test_new_terrain_replaces_previous_terrain_without_fieldend(self) -> None:
         events = _resolved(
@@ -462,26 +530,57 @@ class TestReconstructionState:
 
         assert {name for name, _ in snapshots[-1].fields} == {"gravity", "psychicterrain"}
 
-    def test_source_shaped_item_status_hp_transitions(self) -> None:
+    def test_source_shaped_hp_transitions(self) -> None:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
-            "|-item|p1a: Alpha|Leftovers",
-            "|-status|p1a: Alpha|brn",
             "|-damage|p1a: Alpha|75/100|[from] item: Life Orb",
             "|-sethp|p1a: Alpha|80/100|[silent]",
             "|-heal|p1a: Alpha|100/100|[from] item: Leftovers",
+        )
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+
+        assert [
+            state.member(ReplayMemberId(ReplaySide.P1, 0)).hp_fraction for state in snapshots
+        ] == [
+            1.0,
+            0.75,
+            0.8,
+            1.0,
+        ]
+
+    def test_status_is_applied_before_it_is_cured(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-status|p1a: Alpha|brn",
             "|-curestatus|p1a: Alpha|brn",
+        )
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+
+        assert [state.member(ReplayMemberId(ReplaySide.P1, 0)).status for state in snapshots] == [
+            None,
+            "brn",
+            None,
+        ]
+
+    def test_item_is_replaced_before_it_is_consumed(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-item|p1a: Alpha|Leftovers",
             "|-enditem|p1a: Alpha|Leftovers",
         )
-
-        final = reduce_replay_state(
+        snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
-        member = final.member(ReplayMemberId(ReplaySide.P1, 0))
+        ).require_accepted()
 
-        assert member.hp_fraction == 1.0
-        assert member.status is None
-        assert member.item is None
+        assert [state.member(ReplayMemberId(ReplaySide.P1, 0)).item for state in snapshots] == [
+            "Item Alpha",
+            "Leftovers",
+            None,
+        ]
 
     def test_roost_restores_flying_type_when_single_turn_effect_expires(self) -> None:
         dex = _dex()
@@ -798,9 +897,9 @@ class TestReconstructionState:
         )
 
         snapshots = reduce_replay_state("state-test", sheets, events, dex=dex).require_accepted()
-        tackle = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).moves[0]
-        assert tackle.max_pp == 32
-        assert tackle.current_pp == 32
+        tackle = [state.member(ReplayMemberId(ReplaySide.P1, 0)).moves[0] for state in snapshots]
+        assert [move.current_pp for move in tackle] == [32, 32, 31, 27, 32]
+        assert all(move.max_pp == 32 for move in tackle)
 
     def test_caused_spread_execution_charges_sleep_talk_owner_under_pressure(self) -> None:
         dex = default_runtime_resources().dex
@@ -886,9 +985,13 @@ class TestReconstructionState:
             "|cant|p1a: Alpha|recharge",
         )
 
-        final = reduce_replay_state("state-test", _complete_ots(), events, dex=_dex())
-        alpha = final.require_accepted()[-1].member(ReplayMemberId(ReplaySide.P1, 0))
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+        before_cant = snapshots[1].member(ReplayMemberId(ReplaySide.P1, 0))
+        alpha = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
 
+        assert dict(before_cant.effects)["mustrecharge"] == 0
         assert "mustrecharge" not in dict(alpha.effects)
 
     def test_toxic_stage_resets_when_a_statused_member_reenters(self) -> None:
@@ -899,9 +1002,13 @@ class TestReconstructionState:
             "|switch|p1a: Alpha|Alpha, L50|100/100 tox",
         )
 
-        final = reduce_replay_state("state-test", _complete_ots(), events, dex=_dex())
-        alpha = final.require_accepted()[-1].member(ReplayMemberId(ReplaySide.P1, 0))
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+        before_reentry = snapshots[0].member(ReplayMemberId(ReplaySide.P1, 0))
+        alpha = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
 
+        assert before_reentry.status == "tox"
         assert alpha.status == "tox"
         assert alpha.status_counter == 0
 
@@ -913,9 +1020,13 @@ class TestReconstructionState:
             "|faint|p1a: Alpha",
         )
 
-        final = reduce_replay_state("state-test", _complete_ots(), events, dex=_dex())
-        alpha = final.require_accepted()[-1].member(ReplayMemberId(ReplaySide.P1, 0))
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=_dex()
+        ).require_accepted()
+        before_faint = snapshots[-2].member(ReplayMemberId(ReplaySide.P1, 0))
+        alpha = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
 
+        assert before_faint.status == "tox"
         assert alpha.status is None
         assert alpha.status_counter == 0
 
@@ -1150,13 +1261,13 @@ class TestReconstructionState:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
             "|switch|p2a: Golf|Golf, L50|100/100",
-            "|-ability|p1a: Alpha|Ability Golf|[from] ability: Trace|[of] p2a: Golf",
+            "|-ability|p1a: Alpha|Intimidate|[from] ability: Trace|[of] p2a: Golf",
         )
 
         final = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
         ).require_accepted()[-1]
-        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).ability.current == "Ability Golf"
+        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).ability.current == "Intimidate"
         assert final.member(ReplayMemberId(ReplaySide.P2, 0)).ability.current == "Ability Golf"
 
     def test_endability_preserves_ability_and_records_gastro_acid(self) -> None:
@@ -1197,50 +1308,6 @@ class TestReconstructionState:
         assert snapshots[5].member(alpha_id).perish_count is None
         assert dict(snapshots[5].member(alpha_id).effects) == {}
 
-    def test_invalid_perish_count_is_rejected_without_partial_snapshots(self) -> None:
-        events = _resolved(
-            "|switch|p1a: Alpha|Alpha, L50|100/100",
-            "|-start|p1a: Alpha|perish4",
-        )
-        dex = _dex()
-        dex["legalProtocolEffects"] = {"effect": ["perishsong"]}
-
-        result = reduce_replay_state("state-test", _complete_ots(), events, dex=dex)
-
-        assert result.snapshots == ()
-        assert result.diagnostics[0].reason == "unsupported effect variant 'perish4'"
-
-    @pytest.mark.parametrize(
-        ("effect", "canonical", "value"),
-        (
-            ("stockpile1", "stockpile", 1),
-            ("stockpile2", "stockpile", 2),
-            ("stockpile3", "stockpile", 3),
-            ("protosynthesisatk", "protosynthesis", "atk"),
-            ("protosynthesisdef", "protosynthesis", "def"),
-            ("protosynthesisspa", "protosynthesis", "spa"),
-            ("protosynthesisspd", "protosynthesis", "spd"),
-            ("protosynthesisspe", "protosynthesis", "spe"),
-            ("quarkdriveatk", "quarkdrive", "atk"),
-            ("quarkdrivedef", "quarkdrive", "def"),
-            ("quarkdrivespa", "quarkdrive", "spa"),
-            ("quarkdrivespd", "quarkdrive", "spd"),
-            ("quarkdrivespe", "quarkdrive", "spe"),
-            ("fallen1", "supremeoverlord", 1),
-            ("fallen2", "supremeoverlord", 2),
-            ("fallen3", "supremeoverlord", 3),
-            ("fallen4", "supremeoverlord", 4),
-            ("fallen5", "supremeoverlord", 5),
-        ),
-    )
-    def test_dynamic_effect_normalization_retains_canonical_data(
-        self, effect: str, canonical: str, value: int | str
-    ) -> None:
-        variant = normalize_dynamic_effect(effect)
-
-        assert variant is not None
-        assert (variant.canonical_id, variant.wire_id, variant.value) == (canonical, effect, value)
-
     @pytest.mark.parametrize(
         "effect",
         (
@@ -1270,9 +1337,23 @@ class TestReconstructionState:
         ("wire_effect", "canonical", "end_effect"),
         (
             ("stockpile1", "stockpile", "Stockpile"),
+            ("stockpile2", "stockpile", "Stockpile"),
+            ("stockpile3", "stockpile", "Stockpile"),
             ("protosynthesisatk", "protosynthesis", "Protosynthesis"),
+            ("protosynthesisdef", "protosynthesis", "Protosynthesis"),
+            ("protosynthesisspa", "protosynthesis", "Protosynthesis"),
+            ("protosynthesisspd", "protosynthesis", "Protosynthesis"),
+            ("protosynthesisspe", "protosynthesis", "Protosynthesis"),
+            ("quarkdriveatk", "quarkdrive", "Quark Drive"),
+            ("quarkdrivedef", "quarkdrive", "Quark Drive"),
+            ("quarkdrivespa", "quarkdrive", "Quark Drive"),
+            ("quarkdrivespd", "quarkdrive", "Quark Drive"),
             ("quarkdrivespe", "quarkdrive", "Quark Drive"),
+            ("fallen1", "supremeoverlord", "fallen1"),
+            ("fallen2", "supremeoverlord", "fallen2"),
             ("fallen3", "supremeoverlord", "fallen3"),
+            ("fallen4", "supremeoverlord", "fallen4"),
+            ("fallen5", "supremeoverlord", "fallen5"),
         ),
     )
     def test_dynamic_effect_start_and_end_clear_metadata(
@@ -1302,11 +1383,14 @@ class TestReconstructionState:
             "|switch|p1a: Bravo|Bravo, L50|100/100",
         )
 
-        final = reduce_replay_state(
+        snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
+        ).require_accepted()
 
-        alpha = final.member(ReplayMemberId(ReplaySide.P1, 0))
+        active = snapshots[1].member(ReplayMemberId(ReplaySide.P1, 0))
+        alpha = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
+        assert dict(active.effects) == {"stockpile": 0}
+        assert dict(active.effect_variants) == {"stockpile": "stockpile2"}
         assert dict(alpha.effects) == {}
         assert dict(alpha.effect_variants) == {}
 
@@ -1368,10 +1452,14 @@ class TestReconstructionState:
             "|-activate|p1a: Alpha|move: Feint|[broken]",
         )
 
-        final = reduce_replay_state(
+        snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
+        ).require_accepted()
 
+        during_guard = snapshots[2]
+        final = snapshots[-1]
+        assert dict(during_guard.sides[0].conditions) == {"wideguard": 1}
+        assert during_guard.member(ReplayMemberId(ReplaySide.P1, 0)).protect_counter == 1
         assert dict(final.sides[0].conditions) == {}
         assert final.member(ReplayMemberId(ReplaySide.P1, 0)).protect_counter == 0
 
@@ -1383,15 +1471,18 @@ class TestReconstructionState:
             "|-activate|p1a: Alpha|move: Feint",
         )
 
-        final = reduce_replay_state(
+        snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
+        ).require_accepted()
 
-        member = final.member(ReplayMemberId(ReplaySide.P1, 0))
+        during_protect = snapshots[2].member(ReplayMemberId(ReplaySide.P1, 0))
+        member = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
+        assert dict(during_protect.effects) == {"protect": 1}
+        assert during_protect.protect_counter == 1
         assert dict(member.effects) == {}
         assert member.protect_counter == 0
 
-    def test_side_guard_follows_side_condition_swap_but_not_source_switch_or_faint(self) -> None:
+    def test_side_condition_swap_is_rejected_as_unsupported(self) -> None:
         lines = tuple(
             ProtocolLine(index, raw, tuple(raw.split("|")), None)
             for index, raw in enumerate(
@@ -1402,8 +1493,6 @@ class TestReconstructionState:
                     "|-singleturn|p1a: Alpha|Quick Guard",
                     "|-singleturn|p2a: Golf|Mat Block",
                     "|-swapsideconditions",
-                    "|switch|p1a: Bravo|Bravo, L50|100/100",
-                    "|faint|p1a: Bravo",
                 )
             )
         )
@@ -1420,32 +1509,11 @@ class TestReconstructionState:
             "|-singleturn|p1a: Alpha|Wide Guard",
             "|-singleturn|p1a: Alpha|Wide Guard",
         )
-        member_events = _resolved(
-            "|switch|p1a: Alpha|Alpha, L50|100/100",
-            "|-singleturn|p1a: Alpha|Protect",
-        )
-
         duplicate = reduce_replay_state("state-test", _complete_ots(), duplicate_events, dex=_dex())
-        member = reduce_replay_state("state-test", _complete_ots(), member_events, dex=_dex())
 
         assert duplicate.snapshots == ()
-        assert "started twice" in duplicate.diagnostics[0].reason
-        assert dict(member.snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).effects) == {
-            "protect": 0
-        }
-
-    def test_member_singleturn_effect_expires_at_upkeep(self) -> None:
-        events = _resolved(
-            "|switch|p1a: Alpha|Alpha, L50|100/100",
-            "|-singleturn|p1a: Alpha|Protect",
-            "|upkeep",
-        )
-
-        final = reduce_replay_state(
-            "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
-
-        assert dict(final.member(ReplayMemberId(ReplaySide.P1, 0)).effects) == {}
+        assert duplicate.diagnostics[0].line_index == 2
+        assert duplicate.diagnostics[0].reason == "side guard 'wideguard' started twice"
 
     @pytest.mark.parametrize(
         "effect",
@@ -1470,15 +1538,19 @@ class TestReconstructionState:
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
             f"|-singleturn|p1a: Alpha|{effect}",
+            "|upkeep",
         )
 
-        final = reduce_replay_state(
+        snapshots = reduce_replay_state(
             "state-test", _complete_ots(), events, dex=_dex()
-        ).require_accepted()[-1]
+        ).require_accepted()
+        during_effect = snapshots[1].member(ReplayMemberId(ReplaySide.P1, 0))
+        final = snapshots[-1]
         member = final.member(ReplayMemberId(ReplaySide.P1, 0))
 
+        assert dict(during_effect.effects) == {effect.lower().replace(" ", ""): 0}
         assert dict(final.sides[0].conditions) == {}
-        assert dict(member.effects) == {effect.lower().replace(" ", ""): 0}
+        assert dict(member.effects) == {}
 
     def test_protection_counter_resets_on_failure_and_switch(self) -> None:
         events = _resolved(
@@ -1500,6 +1572,7 @@ class TestReconstructionState:
         assert snapshots[3].member(alpha_id).protect_counter == 0
         assert snapshots[4].member(alpha_id).protect_counter == 1
         assert snapshots[5].member(bravo_id).protect_counter == 0
+        assert snapshots[5].member(alpha_id).protect_counter == 0
 
     @pytest.mark.parametrize(
         "condition",
@@ -1626,7 +1699,11 @@ class TestReconstructionState:
 
         snapshots = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()
 
-        assert snapshots[5].delayed_moves[0].target_slot == 0
+        post_swap = snapshots[6].delayed_moves[0]
+        assert post_swap.target_side == ReplaySide.P2
+        assert post_swap.target_slot == 0
+        assert post_swap.source_member_id == ReplayMemberId(ReplaySide.P1, 0)
+        assert post_swap.scheduled_turn == 3
         assert snapshots[-1].delayed_moves == ()
 
     def test_failed_delayed_move_without_target_preserves_existing_condition(self) -> None:
@@ -1647,6 +1724,11 @@ class TestReconstructionState:
 
         snapshots = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()
 
+        post_fail = snapshots[7].delayed_moves[0]
+        assert post_fail.source_member_id == ReplayMemberId(ReplaySide.P1, 0)
+        assert post_fail.target_side == ReplaySide.P2
+        assert post_fail.target_slot == 0
+        assert post_fail.scheduled_turn == 3
         assert snapshots[-1].delayed_moves == ()
 
     def test_delayed_move_to_fainted_target_skips_untracked_condition(self) -> None:
@@ -1671,6 +1753,10 @@ class TestReconstructionState:
 
         snapshots = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()
 
+        assert len(snapshots[10].delayed_moves) == 1
+        assert snapshots[10].delayed_moves[0].target_slot == 0
+        assert snapshots[10].delayed_moves[0].source_member_id == ReplayMemberId(ReplaySide.P1, 0)
+        assert snapshots[11].delayed_moves == snapshots[10].delayed_moves
         assert snapshots[-1].delayed_moves == ()
 
     def test_delayed_move_hint_clears_condition_without_end_event(self) -> None:
@@ -1696,6 +1782,11 @@ class TestReconstructionState:
 
         snapshots = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()
 
+        assert len(snapshots[8].delayed_moves) == 1
+        assert snapshots[8].delayed_moves[0].scheduled_turn == 3
+        assert snapshots[9].delayed_moves == ()
+        assert len(snapshots[12].delayed_moves) == 1
+        assert snapshots[12].delayed_moves[0].scheduled_turn == 6
         assert snapshots[-1].delayed_moves == ()
 
     def test_delayed_move_hint_only_clears_the_fainted_target_slot(self) -> None:
@@ -1721,45 +1812,67 @@ class TestReconstructionState:
 
         snapshots = reduce_replay_state("state-test", ots, events, dex=_dex()).require_accepted()
 
+        assert len(snapshots[13].delayed_moves) == 1
+        remaining = snapshots[13].delayed_moves[0]
+        assert remaining.target_slot == 1
+        assert remaining.source_member_id == ReplayMemberId(ReplaySide.P1, 1)
         assert snapshots[-1].delayed_moves == ()
 
     @pytest.mark.parametrize(
-        "lines",
+        ("lines", "line_index", "reason"),
         (
             (
-                "|switch|p1a: Alpha|Alpha, L50|100/100",
-                "|-start|p1a: Alpha|move: Future Sight",
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|-start|p1a: Alpha|move: Future Sight",
+                ),
+                1,
+                "futuresight start has an ambiguous pending move from the referenced caster",
             ),
             (
-                "|switch|p1a: Alpha|Alpha, L50|100/100",
-                "|switch|p2a: Golf|Golf, L50|100/100",
-                "|turn|1",
-                "|move|p1a: Alpha|Future Sight|p2a: Golf",
-                "|-start|p1a: Alpha|move: Future Sight",
-                "|-end|p2a: Golf|move: Future Sight",
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|switch|p2a: Golf|Golf, L50|100/100",
+                    "|turn|1",
+                    "|move|p1a: Alpha|Future Sight|p2a: Golf",
+                    "|-start|p1a: Alpha|move: Future Sight",
+                    "|-end|p2a: Golf|move: Future Sight",
+                ),
+                5,
+                "delayed move ended before its scheduled turn",
             ),
             (
-                "|switch|p1a: Alpha|Alpha, L50|100/100",
-                "|switch|p2a: Golf|Golf, L50|100/100",
-                "|turn|1",
-                "|move|p1a: Alpha|Future Sight|p2a: Golf",
-                "|-start|p1a: Alpha|move: Future Sight",
-                "|move|p1a: Alpha|Future Sight|p2a: Golf",
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|switch|p2a: Golf|Golf, L50|100/100",
+                    "|turn|1",
+                    "|move|p1a: Alpha|Future Sight|p2a: Golf",
+                    "|-start|p1a: Alpha|move: Future Sight",
+                    "|move|p1a: Alpha|Future Sight|p2a: Golf",
+                ),
+                5,
+                "delayed move target slot already has a pending effect",
             ),
             (
-                "|switch|p1a: Alpha|Alpha, L50|100/100",
-                "|switch|p2a: Golf|Golf, L50|100/100",
-                "|turn|1",
-                "|move|p1a: Alpha|Future Sight|p2a: Golf",
-                "|-start|p1a: Alpha|move: Future Sight",
-                "|turn|4",
-                "|-end|p2a: Golf|move: Future Sight",
+                (
+                    "|switch|p1a: Alpha|Alpha, L50|100/100",
+                    "|switch|p2a: Golf|Golf, L50|100/100",
+                    "|turn|1",
+                    "|move|p1a: Alpha|Future Sight|p2a: Golf",
+                    "|-start|p1a: Alpha|move: Future Sight",
+                    "|turn|4",
+                    "|-end|p2a: Golf|move: Future Sight",
+                ),
+                6,
+                "delayed move ended after its scheduled turn",
             ),
         ),
     )
     def test_delayed_move_rejects_missing_pending_duplicate_early_or_late_hit(
         self,
         lines: tuple[str, ...],
+        line_index: int,
+        reason: str,
     ) -> None:
         ots = _complete_delayed_ots()
         events = _resolved(*lines, ots=ots)
@@ -1767,7 +1880,9 @@ class TestReconstructionState:
         result = reduce_replay_state("state-test", ots, events, dex=_dex())
 
         assert result.snapshots == ()
-        assert result.diagnostics
+        assert [(item.line_index, item.reason) for item in result.diagnostics] == [
+            (line_index, reason)
+        ]
 
     def test_delayed_move_source_only_context_is_rejected_during_event_parsing(self) -> None:
         line = ProtocolLine(
@@ -1783,15 +1898,35 @@ class TestReconstructionState:
         assert "delayed move requires an explicit target" in parsed.diagnostics[0].reason
 
     def test_partial_trap_end_uses_the_protocol_effect_variant(self) -> None:
+        dex = _dex()
+        cast(list[dict[str, object]], dex["moves"]).append(
+            {
+                "id": "firespin",
+                "name": "Fire Spin",
+                "type": "Fire",
+                "category": "Special",
+                "target": "normal",
+                "pp": 15,
+                "volatileStatus": "partiallytrapped",
+            }
+        )
         events = _resolved(
             "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|switch|p2a: Golf|Golf, L50|100/100",
+            "|-activate|p1a: Alpha|move: Fire Spin|[of] p2a: Golf",
             "|-end|p1a: Alpha|Fire Spin|[partiallytrapped]|[silent]",
         )
 
-        snapshots = reduce_replay_state("state-test", _complete_ots(), events, dex=_dex())
-        member = snapshots.require_accepted()[-1].member(ReplayMemberId(ReplaySide.P1, 0))
+        snapshots = reduce_replay_state(
+            "state-test", _complete_ots(), events, dex=dex
+        ).require_accepted()
+        trapped = snapshots[2].member(ReplayMemberId(ReplaySide.P1, 0))
+        assert dict(trapped.effects) == {"firespin": 0}
+        assert dict(trapped.effect_sources) == {"firespin": ReplayMemberId(ReplaySide.P2, 0)}
 
-        assert dict(member.effects) == {}
+        ended = snapshots[3].member(ReplayMemberId(ReplaySide.P1, 0))
+        assert dict(ended.effects) == {}
+        assert dict(ended.effect_sources) == {}
 
     def test_illusion_reveal_preserves_actual_state_and_causal_display_history(self) -> None:
         ots = _complete_ots(illusion_member="Bravo")
@@ -1867,20 +2002,19 @@ class TestReconstructionState:
         assert final.member(bravo_id).hp_fraction == 0.0
         assert final.member(bravo_id).fainted
 
-    def test_unsupported_reducer_transition_discards_all_snapshots(self) -> None:
-        lines = tuple(
-            ProtocolLine(index, raw, tuple(raw.split("|")), None)
-            for index, raw in enumerate(
-                (
-                    "|switch|p1a: Alpha|Alpha, L50|100/100",
-                    "|-center",
-                )
-            )
+    def test_invalid_reducer_transition_discards_all_snapshots(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|-sideend|p1: Player|Reflect",
         )
-        parsed = parse_protocol_events("state-test", lines)
-        events = parsed.events
+        result = reduce_replay_state("state-test", _complete_ots(), events, dex=_dex())
 
-        assert events[1].diagnostic is not None
+        assert result.snapshots == ()
+        assert len(result.diagnostics) == 1
+        assert result.diagnostics[0].line_index == 1
+        assert result.diagnostics[0].reason == "side condition 'reflect' ended before it started"
+        with pytest.raises(ReplayEventParseError, match="ended before it started"):
+            result.require_accepted()
 
     @pytest.mark.skipif(not _GOLDEN_REPLAYS, reason="local golden replays are not present")
     @pytest.mark.parametrize("replay_path", _GOLDEN_REPLAYS, ids=lambda path: path.stem)
@@ -1890,7 +2024,7 @@ class TestReconstructionState:
         document = parse_replay_payload(replay_path.read_bytes())
         reconstruction = reconstruct_replay_state(document)
 
-        if reconstruction.diagnostics:
+        if replay_path.stem in _UNRESOLVED_ILLUSION_REPLAYS:
             assert tuple(diagnostic.reason for diagnostic in reconstruction.diagnostics) == (
                 "unresolved_illusion: active history has multiple valid assignments",
             )

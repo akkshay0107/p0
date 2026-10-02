@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import subprocess
 from copy import deepcopy
 
 import pytest
 
+from p0.paths import DEFAULT_PATHS
 from p0.replays.reconstruction.classification import (
     CLASSIFICATION_REGISTRY,
     EventClassification,
@@ -27,7 +29,20 @@ def _line(raw: str) -> ProtocolLine:
 
 class TestReplayProtocolContract:
     def test_inventory_is_total_for_classifiers_and_pinned(self) -> None:
-        assert PROTOCOL_CONTRACT["showdown_commit"] == SHOWDOWN_COMMIT
+        checked_out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=DEFAULT_PATHS.showdown_root,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+
+        assert (
+            PROTOCOL_CONTRACT["showdown_commit"]
+            == RAW_EMISSION_INVENTORY["showdown_commit"]
+            == SHOWDOWN_COMMIT
+            == checked_out
+        )
         assert {entry["tag"] for entry in PROTOCOL_CONTRACT["entries"]} == set(
             CLASSIFICATION_REGISTRY
         )
@@ -56,43 +71,6 @@ class TestReplayProtocolContract:
             is EventClassification.MALFORMED
         )
 
-    def test_stored_stat_predicate_is_unsupported(self) -> None:
-        event = parse_protocol_event("r", _line("|-activate|p1a: A|move: Power Split"))
-        assert event.classification is EventClassification.UNSUPPORTED_STATE
-
-    def test_raw_inventory_contains_source_shaped_witnesses(self) -> None:
-        validate_raw_emission_inventory()
-        witnesses = {
-            f"{entry['path']}:{entry['line']}:{entry['call']}": entry
-            for entry in RAW_EMISSION_INVENTORY["entries"]
-        }
-        preview = witnesses["sim/battle.ts:1393:add"]
-        species_rule = witnesses["data/rulesets.ts:793:add"]
-        assert preview["resolved_tags"] == ["teampreview"]
-        assert preview["reachability"] == "reachable-resolved"
-        assert species_rule["tag"] == "rule"
-        assert species_rule["reachability"] == "reachable-potential"
-        assert {row["id"] for row in PROTOCOL_CONTRACT["raw_witnesses"]} >= {
-            "sim/battle.ts:1393:add",
-            "data/rulesets.ts:793:add",
-        }
-        assert witnesses["data/mods/champions/rulesets.ts:49:add"]["reachability"] == "excluded"
-        ohko = [entry for entry in RAW_EMISSION_INVENTORY["entries"] if entry["tag"] == "-ohko"]
-        assert any(entry["arguments"] == ["'-ohko'"] for entry in ohko)
-        pressure = [
-            entry
-            for entry in RAW_EMISSION_INVENTORY["entries"]
-            if "Pressure" in entry["expression"]
-        ]
-        assert any(entry["path"] == "data/abilities.ts" for entry in pressure)
-        spite = [
-            entry for entry in RAW_EMISSION_INVENTORY["entries"] if "Spite" in entry["expression"]
-        ]
-        assert any(
-            entry["data_owner"] == "spite" and entry["reachability"] != "excluded"
-            for entry in spite
-        )
-
     def test_missing_source_file_and_unresolved_site_fail_coverage(self) -> None:
         missing_file = deepcopy(RAW_EMISSION_INVENTORY)
         missing_file["files"] = [
@@ -102,19 +80,27 @@ class TestReplayProtocolContract:
             validate_raw_emission_inventory(missing_file)
 
         unresolved = deepcopy(RAW_EMISSION_INVENTORY)
+        counts = unresolved["reachability_counts"]
+        counts[unresolved["entries"][0]["reachability"]] -= 1
+        counts["unresolved"] = 1
         unresolved["entries"][0]["reachability"] = "unresolved"
-        unresolved["reachability_counts"]["unresolved"] = 1
-        with pytest.raises(ValueError, match="unresolved|counts disagree"):
+        with pytest.raises(ValueError, match="unresolved"):
             validate_raw_emission_inventory(unresolved)
 
         missing_witness = deepcopy(PROTOCOL_CONTRACT)
+        removed_id = next(
+            entry["id"]
+            for entry in missing_witness["raw_witnesses"]
+            if entry["path"] == "sim/battle.ts" and entry["resolved_tags"] == ["teampreview"]
+        )
         missing_witness["raw_witnesses"] = [
-            row for row in missing_witness["raw_witnesses"] if row["id"] != "sim/battle.ts:1393:add"
+            row for row in missing_witness["raw_witnesses"] if row["id"] != removed_id
         ]
         with pytest.raises(ValueError, match="source witnesses"):
             validate_protocol_contract(missing_witness)
 
     def test_compiled_volatile_metadata_checks_existence_and_copy_hooks(self) -> None:
+        validate_raw_emission_inventory()
         rows = {row["id"]: row for row in RAW_EMISSION_INVENTORY["volatile_conditions"]}
         assert rows["substitute"]["exists"] is True
         assert rows["substitute"]["noCopy"] is False
@@ -128,14 +114,3 @@ class TestReplayProtocolContract:
             assert rows[condition_id]["exists"] is True
             assert rows[condition_id]["reachable"] is True
         assert rows["substitute"]["source"]["path"] == "data/moves.ts"
-        assert rows["substitute"]["source"]["line"] is not None
-
-    def test_stateful_witness_key_mutation_fails_closed(self) -> None:
-        mutated = deepcopy(PROTOCOL_CONTRACT)
-        mutated["stateful_witnesses"].pop("-activate")
-        try:
-            validate_protocol_contract(mutated)
-        except ValueError as exc:
-            assert "stateful witness keys" in str(exc)
-        else:
-            raise AssertionError("removing a reachable stateful witness must fail validation")

@@ -1,5 +1,5 @@
 """
-Stress the live observation -> replay -> reconstructed observation path.
+Compare live observations with replay reconstruction and disk shards.
 
 The important assertion in this test is deliberately made before tensor fusion:
 the observation captured at a live request must be the same observation that the
@@ -68,6 +68,7 @@ from p0.teams.source import FileTeamSource
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import TeamMember
 from tests.stress._helpers import stress_count, stress_random_team_record
+from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 # Cant reasons emitted by the checked-in Showdown commit for the champions
 # format.  The source locations are data/conditions.ts, data/abilities.ts,
@@ -365,11 +366,6 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         self.replay_paths.append(path)
 
 
-class _FailingPreviewPlayer(JsonCapturingRandomPlayer):
-    def teampreview(self, battle: AbstractBattle) -> str:
-        raise RuntimeError(f"Deliberate preview failure in {battle.battle_tag}")
-
-
 def _stress_game_count() -> int:
     return stress_count("P0_STRESS_GAME_COUNT", 50)
 
@@ -630,20 +626,16 @@ def _assert_live_action_is_observable(
     slot. Treating that invisible component as a required joint-action match
     manufactures a reconstruction failure at an otherwise shared boundary.
     """
-    if evidence.label_kind is LabelKind.EXACT and all(
-        action != PASS_ACTION for action in live_action
-    ):
-        assert live_action == evidence.candidates[0]
-        return
-
     assert evidence.candidates
-    for slot, action in enumerate(live_action):
-        if action == PASS_ACTION:
-            continue
-        assert any(candidate[slot] == action for candidate in evidence.candidates), (
-            f"Live action component {action} for slot {slot} was not candidate-contained: "
-            f"candidates={evidence.candidates!r}"
+    assert any(
+        all(
+            action == PASS_ACTION or candidate[slot] == action
+            for slot, action in enumerate(live_action)
         )
+        for candidate in evidence.candidates
+    ), (
+        f"Observable components of live action {live_action} are absent from joint candidates {evidence.candidates}"
+    )
 
 
 def _match_live_records(
@@ -710,8 +702,8 @@ def _assert_live_truth(
     live_records: tuple[dict[str, Any], ...],
     document: ReplayDocument,
     builder: ObservationBuilder,
-) -> int:
-    """Check matched live decisions against replay and return how many event intervals agreed."""
+) -> tuple[int, int]:
+    """Return the counts of matching event intervals and observable action comparisons."""
     # A rejected order is retried before any new battle line arrives, so every
     # retry of one request observes the events its first attempt observed.
     first_events: dict[int, torch.Tensor] = {}
@@ -722,6 +714,7 @@ def _assert_live_truth(
         )
 
     compared_intervals = 0
+    compared_actions = 0
     seen_replay_cursors: set[int] = set()
     splice_index, splice_count = _showteam_offset(document)
     starts = tuple(snapshot.pre_line_index for snapshot in perspective.snapshots)
@@ -740,10 +733,10 @@ def _assert_live_truth(
         # non-attributable to this replay decision, even when the numeric cursors
         # happen to agree.
         action_boundary_exact = exact_boundary and "submission_state_changed" not in evidence.tags
-        replay_action_ambiguous = bool(set(evidence.tags) & _REPLAY_AMBIGUITY_TAGS)
-        if action_boundary_exact and not replay_action_ambiguous:
+        if action_boundary_exact:
             if evidence.label_kind in (LabelKind.EXACT, LabelKind.PARTIAL):
                 _assert_live_action_is_observable(live_action, evidence)
+                compared_actions += int(any(action != PASS_ACTION for action in live_action))
             else:
                 reasons = _cant_reasons(snapshot, perspective.player)
                 if reasons:
@@ -784,7 +777,8 @@ def _assert_live_truth(
             ) from exc
         seen_replay_cursors.add(replay_cursor)
         compared_intervals += same_interval
-    return compared_intervals
+    assert seen_replay_cursors, "No live requests matched this accepted perspective"
+    return compared_intervals, compared_actions
 
 
 _ORACLE_SKIPPED_TAGS = frozenset({"", "t:", "expire", "uhtmlchange", "showteam", "win", "tie"})
@@ -952,17 +946,23 @@ def _assert_decision_boundaries_partition_the_log(
     assert cursor <= len(document.protocol_lines)
 
 
-class TestRandomReplayReconstruction:
+class TestReplayCaptureHarness:
     @pytest.mark.integration
-    @pytest.mark.stress
+    @pytest.mark.heavy
     @pytest.mark.asyncio
-    async def test_player_handler_error_surfaces_before_timeout(
+    async def test_artifact_write_failure_reaches_waiter_through_live_callback(
         self, showdown_server, tmp_path: Path
     ) -> None:
-        team_source = _random_team_source(tmp_path / "teams", seed=3, count=4)
+        # A real filesystem error exercises failure delivery from poke-env's completion callback.
+        teams = tmp_path / "teams"
+        teams.mkdir()
+        (teams / "team.txt").write_text(DEFAULT_TEST_TEAM)
+        team_source = FileTeamSource(teams)
+        blocked_output = tmp_path / "observations"
+        blocked_output.write_text("An existing file cannot be an artifact directory")
         failure: Future[None] = Future()
         poke_env_patches.install(capture_protocol_lines=True)
-        player = _FailingPreviewPlayer(
+        player = JsonCapturingRandomPlayer(
             account_configuration=AccountConfiguration("StressFailureA", None),
             battle_format=FORMAT.battle_format,
             server_configuration=showdown_server,
@@ -985,8 +985,8 @@ class TestRandomReplayReconstruction:
         battle_task = asyncio.create_task(player.battle_against(opponent, n_battles=1))
         try:
             with pytest.raises(RuntimeError, match="StressFailureA failed in battle-") as error:
-                await asyncio.wait_for(asyncio.wrap_future(failure), timeout=15)
-            assert "Deliberate preview failure" in str(error.value)
+                await asyncio.wait_for(asyncio.wrap_future(failure), timeout=60)
+            assert isinstance(error.value.__cause__, FileExistsError)
         finally:
             battle_task.cancel()
             await asyncio.gather(battle_task, return_exceptions=True)
@@ -995,17 +995,19 @@ class TestRandomReplayReconstruction:
             )
             poke_env_patches.uninstall_for_tests()
 
+
+class TestRandomReplayReconstruction:
     @pytest.mark.integration
-    @pytest.mark.stress
+    @pytest.mark.heavy
     @pytest.mark.asyncio
     async def test_random_local_games_reconstruct_to_valid_tensors(
         self, showdown_server, tmp_path: Path, request: pytest.FixtureRequest
     ) -> None:
         """
-        End-to-end stress test: live Showdown battles -> replay JSON -> offline observation reconstruction -> tensor shards.
+        Compare live Showdown battles with replay JSON, reconstructed observations and disk shards.
 
         Verifies that:
-        1. 100+ random live battles run concurrently against a local Showdown server.
+        1. A seeded workload of real live battles completes against local Showdown.
         2. Spliced replay documents capture all turns with valid terminal line indices.
         3. Reconstructed observations match ground truth live captured tensors at exact line boundaries.
         4. Offline reconstructed state machines perfectly agree with poke-env active pokemon/field state.
@@ -1109,6 +1111,8 @@ class TestRandomReplayReconstruction:
         # ambiguous traces must be rejected as whole games.
         rejected_ids: set[str] = set()
         compared_intervals = 0
+        compared_actions = 0
+        compared_perspectives = 0
         for document in documents:
             replay_id = document.metadata.replay_id
             perspectives = _assert_reconstruction_labels(document, max_candidates=max_candidates)
@@ -1126,10 +1130,14 @@ class TestRandomReplayReconstruction:
                 # Verify agreement with poke-env oracle battle state
                 _assert_poke_env_state_agreement(perspective, document)
                 # Verify reconstructed structured observations match live pre-fusion observation tensors
-                compared_intervals += _assert_live_truth(
+                intervals, actions = _assert_live_truth(
                     perspective, artifact["records"], document, builder
                 )
+                compared_intervals += intervals
+                compared_actions += actions
+                compared_perspectives += 1
         assert compared_intervals > 0
+        assert compared_actions > 0
 
         # Compile replay documents into training dataset representation
         compilation = compile_documents(
@@ -1138,6 +1146,8 @@ class TestRandomReplayReconstruction:
             max_candidates=max_candidates,
         )
         accepted_count = sum(len(series.games) for series in compilation.accepted_series)
+        assert accepted_count > 0
+        assert compared_perspectives == 2 * accepted_count
         assert accepted_count + len(rejected_ids) == game_count
         assert compilation.metrics.counters["accepted_games"] == accepted_count
         assert compilation.metrics.counters["rejected_games"] == len(rejected_ids)

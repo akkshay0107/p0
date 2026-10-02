@@ -31,29 +31,65 @@ def _struggle_battle(can_mega: bool) -> DecisionView:
 
 
 class TestLegality:
-    def test_scalar_joint_constraints_match_policy_vectorization(self) -> None:
-        """Verify that scalar joint validation (validate_joint_action) matches vectorized second_action_mask."""
+    def test_joint_actions_reject_duplicate_switches_and_double_mega(self) -> None:
+        """Verify joint validation and second action masks reject duplicate switches and suppress all Mega variants."""
         view = DecisionView(
             slots=(
                 SlotDecision(
-                    switch_slots=(2, 3),
-                    move_targets=((-2, 1, 2), (0,), (), (1,)),
-                    can_mega=True,
+                    switch_slots=(2, 3), move_targets=((-2, 1), (), (), ()), can_mega=True
                 ),
                 SlotDecision(
-                    switch_slots=(2, 4),
-                    move_targets=((-1, 1, 2), (), (0,), ()),
-                    can_mega=False,
+                    switch_slots=(2, 4), move_targets=((-2, 1), (), (), ()), can_mega=True
                 ),
             )
         )
-        mask1 = action_mask(view)[0]
-        for a1 in range(ACT_SIZE):
-            if not mask1[a1]:
-                continue
-            mask2 = second_action_mask(view, a1)
-            for a2 in range(ACT_SIZE):
-                assert mask2[a2] == validate_joint_action(view, a1, a2)
+
+        # Actions 3/4/5 switch to roster slots 2/3/4; 7/10 are self/opp move 0;
+        # 27/30 are self/opp Mega move 0.
+        assert validate_joint_action(view, 3, 5)
+        assert not validate_joint_action(view, 3, 3)
+        assert validate_joint_action(view, 27, 7)
+        assert validate_joint_action(view, 30, 10)
+        assert not validate_joint_action(view, 27, 27)
+        assert not validate_joint_action(view, 27, 30)
+        assert not validate_joint_action(view, 30, 27)
+        assert not validate_joint_action(view, 30, 30)
+        assert not validate_joint_action(view, 1, 5)
+
+        # Switching permits all second slot options: remaining switch (5), normal moves (7, 10), and Mega moves (27, 30)
+        assert set(np.flatnonzero(second_action_mask(view, 3))) == {5, 7, 10, 27, 30}
+        # Both self-target (27) and opponent (30) Mega choices suppress the entire 27:48 Mega slice
+        mask_self_mega = second_action_mask(view, 27)
+        assert set(np.flatnonzero(mask_self_mega)) == {3, 5, 7, 10}
+        assert not mask_self_mega[27:48].any()
+
+        mask_opp_mega = second_action_mask(view, 30)
+        assert set(np.flatnonzero(mask_opp_mega)) == {3, 5, 7, 10}
+        assert not mask_opp_mega[27:48].any()
+
+        # Forced-Mega (47) endpoint is also suppressed when the first slot uses a Mega action
+        forced_view = DecisionView(
+            slots=(
+                SlotDecision(
+                    switch_slots=(2, 3),
+                    move_targets=((-2, 1), (), (), ()),
+                    can_mega=True,
+                    forced_move=True,
+                ),
+                SlotDecision(switch_slots=(2, 4), can_mega=True, forced_move=True),
+            )
+        )
+        assert validate_joint_action(forced_view, 3, 47)
+        assert not validate_joint_action(forced_view, 27, 47)
+        assert not validate_joint_action(forced_view, 47, 47)
+        assert validate_joint_action(forced_view, 47, 48)
+
+        mask_switch = second_action_mask(forced_view, 3)
+        assert set(np.flatnonzero(mask_switch)) == {5, 47, 48}
+
+        mask_forced_mega = second_action_mask(forced_view, 47)
+        assert set(np.flatnonzero(mask_forced_mega)) == {3, 5, 48}
+        assert not mask_forced_mega[27:48].any()
 
     def test_double_force_switch_with_single_available_switch(self) -> None:
         """Verify fallback behavior when both slots are forced to switch but only one replacement is available."""
@@ -117,21 +153,6 @@ class TestLegality:
 
         assert mask_unknown.sum() >= mask_known.sum()
         assert (mask_known & ~mask_unknown).sum() == 0
-
-    def test_mega_evolution_joint_constraint_suppression(self) -> None:
-        """Verify that when slot 0 mega evolves, slot 1 mega actions are suppressed."""
-        view = DecisionView(
-            slots=(
-                SlotDecision(move_targets=((-2,),), can_mega=True),
-                SlotDecision(move_targets=((-2,),), can_mega=True),
-            )
-        )
-        # Slot 0 takes mega move (action 27)
-        mask_slot1 = second_action_mask(view, first=27)
-        # Actions 27..47 (mega moves and mega forced move) must all be False
-        assert not mask_slot1[27:48].any()
-        # Non-mega move (action 7) must remain legal
-        assert mask_slot1[7]
 
     def test_trapped_and_inactive_slot_legality(self) -> None:
         """Verify that trapped slots cannot switch and inactive slots only switch or pass."""

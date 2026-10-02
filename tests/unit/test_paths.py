@@ -46,8 +46,11 @@ class TestProjectPaths:
                 initial_policy_checkpoint=tmp_path / "initial.pt",
             )
 
-    def test_default_paths_anchor_repository(self) -> None:
-        """Verify DEFAULT_PATHS points to an existing project root containing data and manifest."""
-        assert DEFAULT_PATHS.repository_root.is_dir()
-        assert DEFAULT_PATHS.data_root.is_dir()
+    def test_default_paths_anchor_the_source_checkout(self) -> None:
+        """Verify source-mode DEFAULT_PATHS resolves to the checkout containing this test suite."""
+        checkout = Path(__file__).resolve().parents[2]
+
+        assert (checkout / "pyproject.toml").is_file()
+        assert DEFAULT_PATHS.repository_root == checkout
+        assert DEFAULT_PATHS.data_root == checkout / "data"
         assert (DEFAULT_PATHS.data_root / "runtime_manifest.json").is_file()

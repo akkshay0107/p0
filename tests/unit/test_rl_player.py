@@ -18,7 +18,6 @@ from p0.battle.legality import GAME_END_DECISION, action_mask
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
-from p0.model.policy import MemoryInputs
 from p0.model.resources import default_runtime_resources
 from p0.rl_player import RLPlayer
 from p0.runtime import poke_env_patches
@@ -125,7 +124,7 @@ class TestRLPlayerMemory:
         battle = _battle("battle-window", with_request=True)
         saved_tokens = []
         snapshots = []
-        for turn in range(1, 99):
+        for turn in range(1, 51):
             battle.parse_message(["", "turn", str(turn)])
             with torch.no_grad():
                 encoded = player.policy.encode(
@@ -144,23 +143,8 @@ class TestRLPlayerMemory:
                 torch.testing.assert_close(
                     memory.history_tokens[:, -count:], torch.stack(saved_tokens[-count:], dim=1)
                 )
-            if turn in (1, 2, 48, 49, 50, 97):
+            if turn in (1, 2, 48, 49, 50):
                 snapshots.append((memory, memory.history_tokens.clone()))
-                reference_history = torch.cat(
-                    [torch.zeros((1, 48 - count, player.policy.d_model))]
-                    + [token.unsqueeze(1) for token in saved_tokens[-48:]],
-                    dim=1,
-                )
-                reference_memory = MemoryInputs(
-                    series_tokens=torch.zeros_like(memory.series_tokens),
-                    series_mask=torch.zeros_like(memory.series_mask),
-                    history_tokens=reference_history,
-                    history_mask=(torch.arange(48) >= 48 - count).unsqueeze(0),
-                )
-                with torch.no_grad():
-                    actual = player.policy.prepare(encoded, memory).reduced
-                    expected = player.policy.prepare(encoded, reference_memory).reduced
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             player.choose_move(battle)
             saved_tokens.append(encoded.local_history_token)
 

@@ -17,6 +17,7 @@ from p0.model.structured_observation import (
     CAT_IDX_NATURE,
     CAT_IDX_STATUS,
     CAT_IDX_STATUS_COUNTER_KIND,
+    NUM_IDX_HP_FRACTION,
     CounterKind,
     IdentityKnownness,
     StructuredObservation,
@@ -248,6 +249,9 @@ class TestModel:
         batch_size = 64
         observation = StructuredObservation.empty_batch(batch_size).to(stress_device)
         action_mask = torch.ones((batch_size, 2, ACT_SIZE), dtype=torch.bool, device=stress_device)
+        observation.numerical[:, 0, NUM_IDX_HP_FRACTION] = (
+            torch.arange(batch_size, device=stress_device, dtype=torch.float32) / batch_size
+        )
         memory = _empty_memory(stress_policy, batch_size)
         encoded = stress_policy.encode(observation, action_mask)
         generator = torch.Generator().manual_seed(seed)
@@ -261,8 +265,7 @@ class TestModel:
             (candidate_count, 2),
             generator=generator,
             dtype=torch.long,
-            device=stress_device,
-        )
+        ).to(stress_device)
         candidate_offsets = torch.tensor(
             (0, *torch.tensor(counts, dtype=torch.long).cumsum(0).tolist()), dtype=torch.long
         )
@@ -284,3 +287,16 @@ class TestModel:
         # Find starting indices of non-empty candidate segments
         # Guaranteed valid moves at non-empty starts must have finite log-probabilities
         assert torch.isfinite(log_probs[nonempty_starts]).all()
+        # Evaluate each candidate as an ordinary decision, independent of CSR scoring.
+        row_indices = torch.repeat_interleave(torch.arange(batch_size), torch.tensor(counts)).to(
+            stress_device
+        )
+        with torch.inference_mode():
+            rows = stress_policy.encode(observation[row_indices], action_mask[row_indices])
+            prepared_rows = stress_policy.prepare(
+                rows, _empty_memory(stress_policy, candidate_count)
+            )
+            expected = stress_policy.evaluate(
+                prepared_rows, action_mask[row_indices], candidate_values
+            ).log_probs
+        torch.testing.assert_close(log_probs, expected, rtol=1e-5, atol=1e-5)

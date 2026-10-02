@@ -7,6 +7,7 @@ from poke_env import AccountConfiguration
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
 
+from p0.battle.events import NUM_EVENT_DETAILS, NUM_EVENT_KINDS, NUM_EVENT_POSITIONS
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
@@ -17,7 +18,6 @@ from p0.model.structured_observation import (
 )
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_battle_adapter import battle_view
-from tests.integration.helpers import capture_showdown_decisions, integration_count
 
 
 def _build_double_observation(
@@ -66,6 +66,7 @@ class _ObservationCapturePlayer(RandomPlayer):
         return super().choose_move(battle)
 
 
+@pytest.mark.heavy
 class TestObservation:
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -128,41 +129,57 @@ class TestObservation:
             assert obs.categorical.shape == (SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
             assert obs.numerical.shape == (SEQUENCE_LENGTH, NUMERICAL_WIDTH)
 
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_live_showdown_observations_remain_valid(self, showdown_server) -> None:
-        """
-        Verify live Showdown observations satisfy numerical validity and vocabulary bounds.
-
-        Captures turns over multiple live games to verify:
-        1. Categorical token IDs do not violate vocabulary bounds or overflow contracts.
-        2. Numerical features are all finite (no NaN or infinite float values).
-        3. Tensors are initialized cleanly on CPU.
-        """
-        decisions = await capture_showdown_decisions(
-            showdown_server,
-            game_count=integration_count("P0_INTEGRATION_OBSERVATION_GAMES", 2),
-        )
-        assert decisions
-
-        for decision in decisions:
-            observation = decision.observation
-            # Validate that categorical indices fall strictly within tokenizer vocabulary sizes
-            observation.validate_overflow_contract()
-            # Verify no NaN or Inf values in numerical feature tensors
-            assert all(torch.isfinite(tensor).all() for tensor in observation.tensors())
-            assert all(tensor.device.type == "cpu" for tensor in observation.tensors())
-
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_live_observations_transfer_to_each_available_model_device(
-        self,
-        showdown_server,
-        model_device,
-    ) -> None:
-        """Verify batch-stacked live observations transfer correctly to target devices (CPU/CUDA)."""
-        decisions = await capture_showdown_decisions(showdown_server, game_count=1)
-        assert decisions
-        # Stack single-turn observations into a batched representation and transfer to device under test
-        observation = StructuredObservation.stack([decisions[0].observation]).to(model_device)
-        assert all(tensor.device == model_device for tensor in observation.tensors())
+            obs.validate_overflow_contract()
+            assert all(torch.isfinite(tensor).all() for tensor in obs.tensors())
+            assert all(tensor.device.type == "cpu" for tensor in obs.tensors())
+            vocab = builder.tokenizer.vocab
+            sizes = {name: len(table) + 1 for name, table in vocab.items()}
+            identity_limits = torch.tensor(
+                [
+                    sizes["species"],
+                    sizes["abilities"],
+                    sizes["items"],
+                    *([sizes["types"]] * 2),
+                    *([sizes["moves"]] * 4),
+                    *([sizes["types"]] * 4),
+                    *([sizes["categories"]] * 4),
+                    sizes["status"],
+                    25,
+                    5,
+                    4,
+                    4,
+                    5,
+                    3,
+                ]
+            )
+            assert torch.all(obs.categorical[:, :24] >= 0)
+            assert torch.all(obs.categorical[:, :24] < identity_limits)
+            effects = obs.categorical[:, 24:].reshape(SEQUENCE_LENGTH, -1, 3)
+            assert torch.all((effects[..., 1:] >= 0) & (effects[..., 1:] < 5))
+            namespace_limits = torch.tensor(
+                [
+                    1,
+                    sizes["volatiles"],
+                    sizes["side_conditions"],
+                    sizes["fields"],
+                    sizes["weathers"],
+                ]
+            )
+            assert torch.all(effects[..., 0] >= 0)
+            assert torch.all(effects[..., 0] < namespace_limits[effects[..., 2]])
+            events = obs.spatial_cat
+            assert torch.all(events >= 0)
+            event_limits = torch.tensor(
+                [
+                    NUM_EVENT_KINDS,
+                    NUM_EVENT_POSITIONS,
+                    NUM_EVENT_POSITIONS,
+                    sizes["moves"],
+                    NUM_EVENT_DETAILS,
+                    sizes["items"],
+                    sizes["abilities"],
+                    5,
+                ]
+            )
+            assert torch.all(events[:, :8] < event_limits)
+            assert torch.all(events[:, 8] < namespace_limits[events[:, 7]])

@@ -81,9 +81,14 @@ def test_ambiguous_slotless_reference_is_rejected_by_category() -> None:
         _ots(ReplaySide.P1, ("Alpha", "Bravo", "C", "D", "E", "F")),
         _ots(ReplaySide.P2, ("Golf", "Golf", "I", "J", "K", "L")),
     )
-    events = _events("|move|p1a: Alpha|Tackle|p2: Golf")
+    events = _events(
+        "|switch|p1a: Alpha|Alpha, L50|100/100",
+        "|move|p1a: Alpha|Tackle|p2: Golf",
+    )
 
     result = resolve_protocol_events("resolution-test", ots, events)
 
     assert result.events == ()
     assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
+    assert "Golf" in result.diagnostics[0].reason
+    assert "2 roster members" in result.diagnostics[0].reason

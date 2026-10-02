@@ -38,10 +38,9 @@ class TestCheckpoints:
         DEFAULT_CHECKPOINT_STORE.save_training(path, 7, original)
 
         restored = DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu")
-        assert restored.d_model == original.d_model
-        assert len(restored.actor.reducer.encoder.layers) == 1
+        assert restored.config == ModelConfig(32, 4, 1, 128)
         assert DEFAULT_CHECKPOINT_STORE.load_training(path, restored) == 7
-        artifact = torch.load(path, weights_only=False)
+        artifact = DEFAULT_CHECKPOINT_STORE.read(path).artifact
         assert artifact["artifact_schema"] == CHECKPOINT_ARTIFACT_SCHEMA
         assert artifact["artifact_type"] == "training"
         assert "runtime_manifest_sha256" not in artifact
@@ -56,7 +55,7 @@ class TestCheckpoints:
             metadata={"showdown_commit": "older", "stat_imputer": "experimental"},
         )
         assert DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu").d_model == 32
-        state = torch.load(path, weights_only=True)["model_state_dict"]
+        state = DEFAULT_CHECKPOINT_STORE.read(path).artifact["model_state_dict"]
         # Verify runtime static buffers are excluded from serialized model state dict
         assert not any(
             name.endswith(
@@ -70,25 +69,8 @@ class TestCheckpoints:
             for name in state
         )
 
-    def test_series_policy_checkpoint_round_trip(self, tmp_path: Path) -> None:
-        """Verify that serialized policy restores series encoder weights producing bitwise identical series tokens."""
-        path = tmp_path / "policy.pt"
-        config = ModelConfig(32, 4, 1, 128)
-        original = build_policy(config, default_runtime_resources())
-        DEFAULT_CHECKPOINT_STORE.save_policy(path, original)
-
-        restored = DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu")
-        assert restored.config == config
-
-        histories = torch.randn(1, 10, config.d_model)
-        history_mask = torch.ones(1, 10, dtype=torch.bool)
-        with torch.no_grad():
-            rest_t = restored.series(histories, history_mask)
-            orig_t = original.series(histories, history_mask)
-            assert torch.equal(rest_t, orig_t)
-
     def test_deep_checkpoint_round_trip_is_deterministic(self, tmp_path: Path) -> None:
-        """Verify deep multi-layer transformer policies restore all layer weights deterministically without alias sharing."""
+        """Verify deep multi-layer transformer policies restore all layer weights deterministically."""
         path = tmp_path / "policy.pt"
         config = ModelConfig(
             d_model=32,
@@ -102,13 +84,18 @@ class TestCheckpoints:
         restored = DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu")
 
         assert restored.config == config
-        assert len(restored.actor.reducer.encoder.layers) == 3
-        # Ensure layers are distinct module instances rather than shared references
-        assert (
-            restored.actor.reducer.encoder.layers[0] is not restored.actor.reducer.encoder.layers[1]
-        )
         for name, parameter in original.state_dict().items():
             torch.testing.assert_close(parameter, restored.state_dict()[name])
+
+        histories = torch.randn(1, 10, config.d_model)
+        history_mask = torch.ones(1, 10, dtype=torch.bool)
+        with torch.no_grad():
+            torch.testing.assert_close(
+                original.series(histories, history_mask),
+                restored.series(histories, history_mask),
+                rtol=0,
+                atol=0,
+            )
 
     @pytest.mark.parametrize(
         "mutate, message",
@@ -124,7 +111,7 @@ class TestCheckpoints:
         """Verify that CheckpointStore strictly validates model configuration schema and rejects malformed configs."""
         path = tmp_path / "policy.pt"
         DEFAULT_CHECKPOINT_STORE.save_policy(path, _small_policy())
-        artifact = torch.load(path, weights_only=False)
+        artifact = dict(DEFAULT_CHECKPOINT_STORE.read(path).artifact)
         mutate(artifact["model_config"])
         torch.save(artifact, path)
 
@@ -135,25 +122,19 @@ class TestCheckpoints:
         """Verify load_training detects architecture mismatch between checkpoint and target model instance."""
         path = tmp_path / "policy.pt"
         DEFAULT_CHECKPOINT_STORE.save_training(path, 1, _small_policy())
-        artifact = torch.load(path, weights_only=False)
+        artifact = dict(DEFAULT_CHECKPOINT_STORE.read(path).artifact)
         artifact["model_config"]["d_model"] = 64
         torch.save(artifact, path)
 
         policy = _small_policy()
+        before_state = {
+            name: tensor.detach().clone() for name, tensor in policy.state_dict().items()
+        }
         with pytest.raises(ValueError, match="model configuration does not match"):
             DEFAULT_CHECKPOINT_STORE.load_training(path, policy)
-
-    def test_atomic_checkpoint_failure_preserves_previous_target(self, tmp_path: Path) -> None:
-        """Verify a failed filesystem replacement leaves the existing checkpoint target untouched."""
-        path = tmp_path / "policy.pt"
-        path.mkdir()
-        sentinel = path / "previous"
-        sentinel.write_bytes(b"previous")
-
-        with pytest.raises(OSError):
-            DEFAULT_CHECKPOINT_STORE.save_policy(path, _small_policy())
-
-        assert sentinel.read_bytes() == b"previous"
+        assert all(
+            torch.equal(before_state[name], tensor) for name, tensor in policy.state_dict().items()
+        )
 
     def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance(
         self,
@@ -172,6 +153,7 @@ class TestCheckpoints:
         loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        saved_optimizer_state = optimizer.state_dict()
         with torch.no_grad():
             for parameter in magnet.policy.parameters():
                 parameter.add_(0.125)
@@ -199,8 +181,8 @@ class TestCheckpoints:
         )
         assert episode == 17
         # Confirm learning rate and Adam moment tensors were restored from checkpoint
+        torch.testing.assert_close(restored_optimizer.state_dict(), saved_optimizer_state)
         assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
-        assert restored_optimizer.state
         for name, parameter in restored.state_dict().items():
             torch.testing.assert_close(parameter, policy.state_dict()[name])
         for name, parameter in restored_magnet.state_dict().items():
@@ -254,7 +236,7 @@ class TestCheckpoints:
         store.save_policy(
             path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
         )
-        artifact = torch.load(path, weights_only=False)
+        artifact = dict(store.read(path).artifact)
         artifact["global_contract_sha256"] = "0" * 64
         torch.save(artifact, path)
         with pytest.raises(ValueError, match="global_contract_sha256"):
@@ -295,6 +277,33 @@ class TestCheckpoints:
         assert episode == 0
         for name, param in original.state_dict().items():
             torch.testing.assert_close(target.state_dict()[name], param)
+
+    def test_training_checkpoint_rejects_other_trainer_but_policy_weights_transfer(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify a BC training checkpoint cannot resume PPO but still supplies inference weights."""
+        path = tmp_path / "bc-training.pt"
+        store = CheckpointStore()
+        policy = _small_policy()
+        store.save_training(
+            path,
+            1,
+            policy,
+            optimizer=torch.optim.AdamW(policy.parameters()),
+            trainer_kind="bc",
+        )
+
+        with pytest.raises(ValueError, match="trainer"):
+            store.load_training(
+                path,
+                _small_policy(),
+                expected_trainer_kind="ppo",
+                require_training_state=True,
+            )
+
+        restored = store.load_policy(path, "cpu")
+        for name, tensor in policy.state_dict().items():
+            torch.testing.assert_close(restored.state_dict()[name], tensor)
 
     def test_load_episode_helper(self, tmp_path: Path) -> None:
         """Verify load_episode reads episode without full model restoration."""

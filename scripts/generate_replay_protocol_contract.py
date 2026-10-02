@@ -30,30 +30,30 @@ STATEFUL_TRANSITION_TESTS = {
     "-clearnegativeboost": "tests/unit/test_reconstruction_state.py:test_clearnegativeboost_preserves_positive_boosts",
     "-clearpositiveboost": "tests/unit/test_reconstruction_state.py:test_clearpositiveboost_preserves_negative_boosts",
     "-copyboost": "tests/unit/test_reconstruction_state.py:test_copyboost_copies_donor_to_argument_zero",
-    "-curestatus": "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
-    "-damage": "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
+    "-curestatus": "tests/unit/test_reconstruction_state.py:test_status_is_applied_before_it_is_cured",
+    "-damage": "tests/unit/test_reconstruction_state.py:test_source_shaped_hp_transitions",
     "-end": "tests/unit/test_reconstruction_state.py:test_dynamic_effect_start_and_end_clear_metadata",
     "-endability": "tests/unit/test_reconstruction_state.py:test_endability_preserves_ability_and_records_gastro_acid",
-    "-enditem": "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
+    "-enditem": "tests/unit/test_reconstruction_state.py:test_item_is_replaced_before_it_is_consumed",
     "-fieldactivate": "tests/unit/test_reconstruction_state.py:test_source_shaped_weather_and_field_transitions",
     "-fieldend": "tests/unit/test_reconstruction_state.py:test_source_shaped_weather_and_field_transitions",
     "-fieldstart": "tests/unit/test_reconstruction_state.py:test_source_shaped_weather_and_field_transitions",
     "-formechange": "tests/unit/test_reconstruction_state.py:test_formechange_updates_the_transient_form",
-    "-heal": "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
+    "-heal": "tests/unit/test_reconstruction_state.py:test_source_shaped_hp_transitions",
     "-hitcount": "tests/unit/test_reconstruction_state.py:test_source_shaped_state_neutral_effect_events",
     "-immune": "tests/unit/test_reconstruction_state.py:test_source_shaped_state_neutral_effect_events",
     "-invertboost": "tests/unit/test_reconstruction_state.py:test_invertboost_inverts_each_member_boost",
-    "-item": "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
+    "-item": "tests/unit/test_reconstruction_state.py:test_item_is_replaced_before_it_is_consumed",
     "-mega": "tests/unit/test_reconstruction_state.py:test_mega_marks_the_side_as_having_mega_evolved",
     "-mustrecharge": "tests/unit/test_reconstruction_state.py:test_recharge_cant_consumes_mustrecharge_state",
     "-setboost": "tests/unit/test_reconstruction_state.py:test_setboost_sets_the_named_stat_absolute_value",
-    "-sethp": "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
+    "-sethp": "tests/unit/test_reconstruction_state.py:test_source_shaped_hp_transitions",
     "-sideend": "tests/unit/test_reconstruction_state.py:test_sidestart_and_sideend_update_side_conditions",
     "-sidestart": "tests/unit/test_reconstruction_state.py:test_sidestart_and_sideend_update_side_conditions",
     "-singlemove": "tests/unit/test_reconstruction_state.py:test_singlemove_records_a_member_scoped_effect",
-    "-singleturn": "tests/unit/test_reconstruction_state.py:test_member_singleturn_effect_expires_at_upkeep",
+    "-singleturn": "tests/unit/test_reconstruction_state.py:test_other_singleturn_effects_remain_member_scoped",
     "-start": "tests/unit/test_reconstruction_state.py:test_dynamic_effect_start_and_end_clear_metadata",
-    "-status": "tests/unit/test_reconstruction_state.py:test_source_shaped_item_status_hp_transitions",
+    "-status": "tests/unit/test_reconstruction_state.py:test_status_is_applied_before_it_is_cured",
     "-swapboost": "tests/unit/test_reconstruction_state.py:test_swapboost_swaps_only_the_named_stat",
     "-transform": "tests/unit/test_reconstruction_state.py:test_transform_is_an_immutable_overlay_with_its_own_pp",
     "-unboost": "tests/unit/test_reconstruction_state.py:test_unboost_decreases_the_named_stat",
@@ -82,7 +82,7 @@ def main() -> None:
         if tag and raw.get("reachability") != "excluded":
             source_by_tag.setdefault(tag, raw)
         if raw.get("reachability") in {"reachable-potential", "reachable-resolved", "unresolved"}:
-            tags = ([tag] if tag is not None else raw.get("resolved_tags", []))
+            tags = [tag] if tag is not None else raw.get("resolved_tags", [])
             dispositions = {
                 CLASSIFICATION_REGISTRY[item].classification.value
                 for item in tags

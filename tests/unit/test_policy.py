@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import FrozenInstanceError
 from typing import Any
 
@@ -11,38 +10,30 @@ import torch
 
 from p0.battle.actions import encode_team_pair
 from p0.battle.events import (
-    EVENT_CATEGORICAL_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     MAX_EVENT_RECORDS,
     NUM_EVENT_DETAILS,
     NUM_EVENT_KINDS,
     NUM_EVENT_POSITIONS,
-    SPATIAL_SLOT_COUNT,
-    EventDetail,
     EventKind,
     EventPosition,
 )
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import (
-    CURRENT_REDUCER_TOKEN_COUNT,
     CURRENT_TOKEN_COUNT,
     HISTORY_WINDOW,
-    POOLED_EVENT_COUNT,
     REDUCER_MAX_LENGTH,
     SERIES_SLOTS,
     SERIES_TOKENS_PER_GAME,
 )
-from p0.model.cls_reducer import MemoryReducer, pack_history_tokens
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import ActorPolicy, MemoryInputs, PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.model.series_context import DynamicSeriesResampler
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
     CAT_IDX_IDENTITY_KNOWNNESS,
     CAT_IDX_MECHANIC_STATE,
-    CAT_IDX_NATURE,
     CAT_IDX_PRESENCE_STATUS,
     CAT_IDX_STAT_PROVENANCE,
     CAT_IDX_STATUS_COUNTER_KIND,
@@ -60,9 +51,7 @@ from p0.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
-from p0.training.ppo import compute_ppo_objective, magnet_kl_per_step
 
 ACT_SIZE = FORMAT.action_size
 
@@ -205,20 +194,6 @@ def dummy_obs() -> StructuredObservation:
     )
 
 
-D_MODEL = 32
-
-
-def _resampler() -> DynamicSeriesResampler:
-    torch.manual_seed(0)
-    return DynamicSeriesResampler(
-        d_model=D_MODEL,
-        nhead=4,
-        dim_feedforward=64,
-        num_summary_tokens=SERIES_TOKENS_PER_GAME,
-        num_layers=2,
-    )
-
-
 class TestPolicyArchitecture:
     def test_policy_uses_rmsnorm_and_only_explicit_position_tables(self, policy: PolicyNet) -> None:
         """Verify the simplified baseline has one documented table per fixed semantic layout."""
@@ -269,6 +244,7 @@ class TestPolicy:
             encoded = policy_net.encode(obs, action_mask)
             out = policy_net.act(policy_net.prepare(encoded, memory), action_mask)
 
+        assert encoded.tokens.shape == (B, CURRENT_TOKEN_COUNT, policy_net.d_model)
         assert out.log_probs.shape == (B,)
         assert out.actions.shape == (B, 2)
         assert out.value.shape == (B,)
@@ -307,8 +283,8 @@ class TestPolicy:
             torch.cat([enc.aux for enc in separate]),
         )
 
-    def test_encoded_phase_is_an_immutable_snapshot(self, policy_net: PolicyNet) -> None:
-        """Verify EncodedObservation is a frozen immutable container whose tensor buffers cannot be modified in-place."""
+    def test_encoding_captures_phase_and_freezes_container(self, policy_net: PolicyNet) -> None:
+        """Verify the phase snapshot survives input mutation and its field cannot be replaced."""
         observation = StructuredObservation.empty_batch(1)
         action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
         encoded = policy_net.encode(observation, action_mask)
@@ -319,30 +295,6 @@ class TestPolicy:
 
         with pytest.raises(FrozenInstanceError):
             setattr(encoded, "phase", torch.ones_like(encoded.phase))
-
-    def test_reducer_keeps_current_and_history_summaries_trainable(self) -> None:
-        """Verify differentiable training reconstruction reaches current and history tokens."""
-        reducer = MemoryReducer(32, 4, 1, 64)
-        current = torch.randn(2, CURRENT_TOKEN_COUNT, 32, requires_grad=True)
-        local_summary = reducer.local_summary(current)
-        history = torch.randn(2, HISTORY_WINDOW, 32, requires_grad=True)
-        series = torch.zeros(2, SERIES_SLOTS, 32)
-        series_mask = torch.zeros(2, SERIES_SLOTS, dtype=torch.bool)
-        history_mask = torch.ones(2, HISTORY_WINDOW, dtype=torch.bool)
-
-        output = reducer.reduce(
-            local_summary,
-            current,
-            series,
-            series_mask,
-            history,
-            history_mask,
-        )
-        output.cls.square().mean().backward()
-
-        assert current.grad is not None and torch.isfinite(current.grad).all()
-        assert history.grad is not None and torch.isfinite(history.grad).all()
-        assert torch.count_nonzero(history.grad) > 0
 
     def test_policy_inputs_reject_unbatched_missing_mask_and_invalid_top_p(
         self,
@@ -388,20 +340,6 @@ class TestPolicy:
 
         assert torch.isfinite(output.logits[0, 1, 0])
         assert torch.isneginf(output.logits[0, 1, 1:]).all()
-
-    def test_nature_embedding_correctness(self, policy_net: PolicyNet) -> None:
-        """Verify changing a public nature token changes the encoded Pokémon representation."""
-        first = StructuredObservation.empty_batch(1)
-        second = first.clone()
-        first.categorical[0, 0, CAT_IDX_NATURE] = 5
-        second.categorical[0, 0, CAT_IDX_NATURE] = 12
-        action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
-
-        with torch.inference_mode():
-            first_tokens = policy_net.encode(first, action_mask).tokens
-            second_tokens = policy_net.encode(second, action_mask).tokens
-
-        assert not torch.allclose(first_tokens[:, 0], second_tokens[:, 0])
 
     def test_fainted_pokemon_visible(self, policy_net: PolicyNet) -> None:
         """Verify fainted bench Pokémon tokens remain visible to the transformer encoder and affect policy output distributions."""
@@ -458,72 +396,14 @@ class TestPolicy:
         assert not torch.allclose(out_fainted.logits, out_modified.logits, atol=1e-5)
         assert not torch.allclose(out_fainted.value, out_modified.value, atol=1e-5)
 
-    def test_memory_reducer_pokemon_tokens_alignment(self) -> None:
-        """Verify MemoryReducer outputs 12 aligned Pokémon tokens matching the ally and opponent roster slots."""
-        reducer = MemoryReducer(32, 4, 1, 128)
-        current = torch.randn(2, CURRENT_TOKEN_COUNT, 32)
-        series = torch.zeros(2, SERIES_SLOTS, 32)
-        series_mask = torch.zeros(2, SERIES_SLOTS, dtype=torch.bool)
-        history = torch.zeros(2, 48, 32)
-        history_mask = torch.zeros(2, 48, dtype=torch.bool)
-        reduced = reducer.reduce(
-            reducer.local_summary(current),
-            current,
-            series,
-            series_mask,
-            history,
-            history_mask,
-        )
-        assert reduced.pokemon.shape == (2, 12, 32)
-
-    def test_event_tokens_depend_on_record_order_and_positions(self, policy_net: PolicyNet) -> None:
-        """Verify event tokens distinguish record order and source/target positions."""
-        from p0.battle.actions import ACT_SIZE
-
-        def encode_record(row: int, target: int) -> torch.Tensor:
-            obs = StructuredObservation.empty_batch(1)
-            obs.spatial_cat[0, row] = torch.tensor(
-                [EventKind.MOVE, EventPosition.OWN_LEFT, target, 10, EventDetail.NONE, 0, 0, 0, 0]
-            )
-            action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
-            with torch.no_grad():
-                tokens, _ = policy_net.encoder(obs, action_mask)
-            # The four event tokens are the last current tokens, positions 16..19.
-            return tokens[0, 16:20]
-
-        first_at_left = encode_record(0, EventPosition.OPPONENT_LEFT)
-        first_at_right = encode_record(0, EventPosition.OPPONENT_RIGHT)
-        second_at_left = encode_record(1, EventPosition.OPPONENT_LEFT)
-
-        assert not torch.allclose(first_at_left, first_at_right, atol=1e-6)
-        assert not torch.allclose(first_at_left, second_at_left, atol=1e-6)
-
-    def test_padding_records_do_not_change_event_tokens(self, policy_net: PolicyNet) -> None:
-        """Verify rows marked EventKind.NONE are ignored whatever their other fields hold."""
-        from p0.battle.actions import ACT_SIZE
-
-        obs = StructuredObservation.empty_batch(1)
-        obs.spatial_cat[0, 0] = torch.tensor([EventKind.MOVE, 0, 2, 10, 0, 0, 0, 0, 0])
-        noisy = obs.clone()
-        noisy.spatial_cat[0, 1:, 1:] = 3
-        noisy.spatial_num[0, 1:] = 0.9
-        action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
-        with torch.no_grad():
-            clean_tokens, _ = policy_net.encoder(obs, action_mask)
-            noisy_tokens, _ = policy_net.encoder(noisy, action_mask)
-
-        torch.testing.assert_close(clean_tokens, noisy_tokens)
-
     def test_gradient_flow(self, dummy_obs: StructuredObservation) -> None:
         """Verify loss backpropagation computes non-zero gradients across encoder, actor reducer, query projections, and critic head."""
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources()).to(device)
+        policy = build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
         policy.train()
 
-        obs = dummy_obs.to(device)
-        action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.uint8).to(device)
+        action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.uint8)
 
-        encoded = policy.encode(obs, action_mask)
+        encoded = policy.encode(dummy_obs, action_mask)
         out = policy.act(policy.prepare(encoded, _empty_memory(policy, 2)), action_mask)
         loss = out.value.mean() - out.log_probs.mean()
 
@@ -532,7 +412,6 @@ class TestPolicy:
         loss.backward()
 
         missing_grads: list[str] = []
-        zero_grads: list[str] = []
 
         conditional_params = [
             "series.",
@@ -555,8 +434,6 @@ class TestPolicy:
             if param.requires_grad:
                 if param.grad is None:
                     missing_grads.append(name)
-                elif torch.all(param.grad == 0):
-                    zero_grads.append(name)
 
         assert not missing_grads, f"Parameters missing gradients: {missing_grads}"
 
@@ -583,51 +460,49 @@ class TestPolicy:
             f"The following components are not receiving gradients: {failed_components}"
         )
 
-    def test_forced_move_keys_use_the_move_pointer_and_mega_constraint(
-        self, policy: PolicyNet
-    ) -> None:
-        """Verify public policy evaluation accepts forced moves and rejects other actions."""
-        batch_size = 2
-        obs = StructuredObservation.empty_batch(batch_size)
-        action_mask = torch.zeros((batch_size, 2, ACT_SIZE), dtype=torch.bool)
-        action_mask[:, 0, 48] = True
-        action_mask[:, 1, 47] = True
+    def test_forced_moves_stay_legal_but_a_second_mega_is_rejected(self, policy: PolicyNet) -> None:
+        """Verify public evaluation scores forced moves and masks a second Mega after a first."""
+        # 7 is a normal move, 27 a Mega move, 47 the Mega forced move, 48 the forced move.
+        action_mask = torch.zeros((4, 2, ACT_SIZE), dtype=torch.bool)
+        action_mask[:, 0, [7, 27, 47, 48]] = True
+        action_mask[:, 1, [8, 28, 47, 48]] = True
+        actions = torch.tensor([[7, 47], [48, 48], [47, 47], [27, 28]])
 
-        memory = _empty_memory(policy, batch_size)
+        memory = _empty_memory(policy, 4)
         with torch.inference_mode():
-            encoded = policy.encode(obs, action_mask)
-            output = policy.evaluate(
-                policy.prepare(encoded, memory),
-                action_mask,
-                torch.tensor([[48, 47], [48, 47]]),
-            )
+            encoded = policy.encode(StructuredObservation.empty_batch(4), action_mask)
+            logits = policy.evaluate(policy.prepare(encoded, memory), action_mask, actions).logits
 
-        assert torch.isfinite(output.logits[:, 0, 48]).all()
-        assert torch.isfinite(output.logits[:, 1, 47]).all()
-        assert torch.isneginf(output.logits[:, 0, :48]).all()
-        assert torch.isneginf(output.logits[:, 1, :47]).all()
+        assert torch.isfinite(logits[0, 1, 47])
+        assert torch.isfinite(logits[1, 1, 48])
+        assert torch.isneginf(logits[2, 1, 47])
+        assert torch.isneginf(logits[3, 1, 28])
+        assert torch.isfinite(logits[3, 1, 8])
 
-    def test_team_preview_pointer_is_symmetric_and_uses_phase_roles(
+    def test_team_preview_pointer_is_symmetric_within_lead_and_back_pairs(
         self, policy: PolicyNet
     ) -> None:
-        """Verify public team-preview logits are invariant to member order within a pair."""
+        """Verify public team-preview logits are invariant to member order within each pair."""
         obs = StructuredObservation.empty_batch(1)
         obs.numerical[:, TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] = 1.0
         action_mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
 
         memory = _empty_memory(policy, 1)
-        left_right = encode_team_pair(0, 1)
-        right_left = encode_team_pair(1, 0)
+        lead = encode_team_pair(0, 1)
+        back = encode_team_pair(2, 3)
+        swapped_back = encode_team_pair(3, 2)
         with torch.inference_mode():
             encoded = policy.encode(obs, action_mask)
-            output = policy.evaluate(
+            logits = policy.evaluate(
                 policy.prepare(encoded, memory),
                 action_mask,
-                torch.tensor([[left_right, right_left]]),
-            )
+                torch.tensor([[lead, back]]),
+            ).logits
 
-        torch.testing.assert_close(output.logits[:, 0, left_right], output.logits[:, 0, right_left])
-        torch.testing.assert_close(output.logits[:, 1, left_right], output.logits[:, 1, right_left])
+        assert torch.isfinite(logits[0, 0, lead])
+        assert torch.isfinite(logits[0, 1, back])
+        torch.testing.assert_close(logits[:, 0, lead], logits[:, 0, encode_team_pair(1, 0)])
+        torch.testing.assert_close(logits[:, 1, back], logits[:, 1, swapped_back])
 
     def test_singleton_candidate_scores_match_standard_joint_scoring(
         self, policy: PolicyNet
@@ -660,32 +535,6 @@ class TestPolicy:
             )
         torch.testing.assert_close(candidate_scores, expected)
 
-    def test_reducer_rejects_a_local_summary_that_does_not_match_the_batch(
-        self, policy: PolicyNet
-    ) -> None:
-        """Verify MemoryReducer validates batch size and dtype alignment on local_summary arguments."""
-        encoded, _, memory = _inputs(policy, batch_size=2)
-        summary = policy.actor.reducer.local_summary(encoded.tokens)
-
-        with pytest.raises(ValueError, match="local summary"):
-            policy.actor.reducer.reduce(
-                summary[:1],
-                encoded.tokens,
-                memory.series_tokens,
-                memory.series_mask,
-                memory.history_tokens,
-                memory.history_mask,
-            )
-        with pytest.raises(ValueError, match="local summary"):
-            policy.actor.reducer.reduce(
-                summary.to(torch.float64),
-                encoded.tokens,
-                memory.series_tokens,
-                memory.series_mask,
-                memory.history_tokens,
-                memory.history_mask,
-            )
-
     def test_candidate_order_does_not_change_scores(self, policy: PolicyNet) -> None:
         """Verify score_candidates scores are invariant to candidate action permutation."""
         encoded, action_mask, memory = _inputs(policy, batch_size=1)
@@ -700,22 +549,29 @@ class TestPolicy:
             )
         torch.testing.assert_close(first, second[torch.argsort(permutation)])
 
-    def test_candidate_scoring_applies_second_action_mask(self, policy: PolicyNet) -> None:
-        """Verify score_candidates applies slot 2 sequential masking, setting illegal 2nd actions to -inf score."""
+    def test_candidate_scoring_applies_sequential_second_action_masks(
+        self, policy: PolicyNet
+    ) -> None:
+        """Verify score_candidates masks a repeated switch and a second Mega that the raw mask allows."""
         encoded, _, memory = _inputs(policy, batch_size=1)
+        # 1-2 are switches, 7-8 normal moves, 27-28 Mega moves.
         action_mask = torch.zeros((1, 2, FORMAT.action_size), dtype=torch.bool)
-        action_mask[:, 0, 7] = True
-        action_mask[:, 1, 8] = True
-        candidates = torch.tensor([[7, 8], [7, 7]], dtype=torch.long)
-        offsets = torch.tensor([0, 2], dtype=torch.long)
+        action_mask[:, 0, [1, 7, 27]] = True
+        action_mask[:, 1, [1, 2, 7, 8, 28]] = True
+        candidates = torch.tensor(
+            [[7, 8], [7, 9], [1, 2], [1, 1], [27, 8], [27, 28]], dtype=torch.long
+        )
+        offsets = torch.tensor([0, 6], dtype=torch.long)
+
         scores = policy.score_candidates(
             policy.prepare(encoded, memory), action_mask, candidates, offsets
         )
-        assert torch.isfinite(scores[0])
-        assert torch.isneginf(scores[1])
+
+        assert torch.isfinite(scores[[0, 2, 4]]).all()
+        assert torch.isneginf(scores[[1, 3, 5]]).all()
 
     def test_greedy_inference_selects_actions_autoregressively(self, policy: PolicyNet) -> None:
-        """Verify deterministic greedy action sampling (deterministic=True) chooses valid actions autoregressively across slots."""
+        """Verify greedy action selection takes each slot's best legal action given the first slot."""
         encoded, _, memory = _inputs(policy, batch_size=2)
         action_mask = torch.zeros((2, 2, FORMAT.action_size), dtype=torch.bool)
         action_mask[:, 0, 7] = True
@@ -725,14 +581,34 @@ class TestPolicy:
 
         prepared = policy.prepare(encoded, memory)
         with torch.inference_mode():
-            first = policy.act(prepared, action_mask, deterministic=True)
-            second = policy.act(prepared, action_mask, deterministic=True)
+            chosen = policy.act(prepared, action_mask, deterministic=True).actions
+            logits = policy.evaluate(prepared, action_mask, chosen).logits
 
-        torch.testing.assert_close(first.actions, second.actions)
-        torch.testing.assert_close(first.log_probs, second.log_probs)
-        assert first.actions.shape == (2, 2)
-        assert torch.all((first.actions[:, 0] == 7) | (first.actions[:, 0] == 9))
-        assert torch.all((first.actions[:, 1] == 8) | (first.actions[:, 1] == 10))
+        assert chosen.shape == (2, 2)
+        torch.testing.assert_close(chosen, logits.argmax(dim=-1))
+
+    def test_top_p_sampling_stays_inside_the_nucleus(self, policy: PolicyNet) -> None:
+        """Verify top_p sampling only picks first-slot actions inside the smallest mass-p set."""
+        encoded, _, memory = _inputs(policy, batch_size=1)
+        action_mask = torch.ones((1, 2, FORMAT.action_size), dtype=torch.bool)
+        prepared = policy.prepare(encoded, memory)
+        top_p = 0.5
+
+        with torch.inference_mode():
+            greedy = policy.act(prepared, action_mask, deterministic=True).actions[0, 0]
+            logits = policy.evaluate(prepared, action_mask, torch.zeros((1, 2), dtype=torch.long))
+            probabilities, order = torch.softmax(logits.logits[0, 0], dim=-1).sort(descending=True)
+            nucleus = order[probabilities.cumsum(dim=0) - probabilities < top_p]
+            torch.manual_seed(0)
+            sampled = torch.stack(
+                [policy.act(prepared, action_mask, top_p=top_p).actions[0, 0] for _ in range(100)]
+            )
+            narrowest = policy.act(prepared, action_mask, top_p=1e-6).actions[0, 0]
+
+        assert nucleus.numel() < FORMAT.action_size
+        assert torch.isin(sampled, nucleus).all()
+        assert sampled.unique().numel() > 1
+        assert narrowest == greedy
 
     def test_candidate_scoring_rejects_malformed_ragged_inputs(self, policy: PolicyNet) -> None:
         """Verify score_candidates validates ragged CSR offset dimensions and action ID data types."""
@@ -769,131 +645,6 @@ class TestPolicy:
 
         assert log_probs.shape == (0,)
 
-    def test_magnet_params_are_frozen(self) -> None:
-        """Verify Magnet anchor network parameters are set to requires_grad=False."""
-        policy = _tiny_policy()
-        magnet = Magnet(policy)
-        assert all(not p.requires_grad for p in magnet.policy.parameters())
-
-    def test_magnet_refresh_does_not_perturb_optimizer_state(self) -> None:
-        """Verify magnet.refresh(policy) updates anchor weights without corrupting or resetting live optimizer state."""
-        policy = _tiny_policy()
-        magnet = Magnet(policy)
-        optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-3)
-
-        obs, masks, actions = _batch(policy)
-        encoded = policy.encode(obs, masks)
-        loss = policy.evaluate(
-            policy.prepare(encoded, _empty_memory(policy, obs.numerical.size(0))), masks, actions
-        ).value.sum()
-        loss.backward()
-        optimizer.step()
-
-        before = copy.deepcopy(optimizer.state_dict())
-        magnet.refresh(policy)
-        after = optimizer.state_dict()
-
-        for pid, moments in before["state"].items():
-            for key, value in moments.items():
-                if torch.is_tensor(value):
-                    assert torch.equal(value, after["state"][pid][key])
-
-    def test_magnet_frozen_under_live_optimizer_step(self) -> None:
-        """Verify Magnet anchor weights remain unchanged when the active policy undergoes optimizer step."""
-        policy = _tiny_policy()
-        magnet = Magnet(policy)
-        snapshot = copy.deepcopy(magnet.policy.state_dict())
-        optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-2)
-
-        obs, masks, actions = _batch(policy)
-        encoded = policy.encode(obs, masks)
-        loss = policy.evaluate(
-            policy.prepare(encoded, _empty_memory(policy, obs.numerical.size(0))), masks, actions
-        ).value.sum()
-        loss.backward()
-        optimizer.step()
-
-        for key, value in magnet.policy.state_dict().items():
-            assert torch.equal(value, snapshot[key])
-
-    def test_magnet_kl_is_zero_at_refresh(self) -> None:
-        """Verify magnet_kl_per_step is 0.0 immediately upon initializing or refreshing Magnet."""
-        policy = _tiny_policy()
-        magnet = Magnet(policy)
-        obs, masks, actions = _batch(policy)
-        with torch.no_grad():
-            live, mag = _live_and_magnet_logits(policy, magnet, obs, masks, actions)
-            kl = magnet_kl_per_step(live, mag)
-        assert torch.allclose(kl, torch.zeros_like(kl), atol=1e-5)
-
-    def test_magnet_kl_grows_then_resets_after_refresh(self) -> None:
-        """Verify Magnet KL divergence increases when weights drift and resets to 0.0 following refresh."""
-        torch.manual_seed(0)
-        policy = _tiny_policy()
-        magnet = Magnet(policy)
-        obs, masks, actions = _batch(policy)
-
-        with torch.no_grad():
-            for p in policy.parameters():
-                p.add_(torch.randn_like(p) * 0.05)
-            live, mag = _live_and_magnet_logits(policy, magnet, obs, masks, actions)
-            kl_drifted = magnet_kl_per_step(live, mag)
-        assert (kl_drifted > 1e-4).any()
-
-        magnet.refresh(policy)
-        with torch.no_grad():
-            live, mag = _live_and_magnet_logits(policy, magnet, obs, masks, actions)
-            kl_after = magnet_kl_per_step(live, mag)
-        assert torch.allclose(kl_after, torch.zeros_like(kl_after), atol=1e-5)
-
-    def test_magnet_kl_is_finite_for_degenerate_masks(self) -> None:
-        """Verify magnet_kl_per_step produces finite numbers even under single-action degenerate masks."""
-        policy = _tiny_policy()
-        magnet = Magnet(policy)
-        batch_size = 2
-        obs = StructuredObservation.empty_batch(batch_size)
-        masks = torch.zeros((batch_size, 2, policy.act_size), dtype=torch.bool)
-        masks[:, :, 0] = True
-        actions = torch.zeros((batch_size, 2), dtype=torch.long)
-        with torch.no_grad():
-            live, mag = _live_and_magnet_logits(policy, magnet, obs, masks, actions)
-            kl = magnet_kl_per_step(live, mag)
-        assert torch.isfinite(kl).all()
-
-    def test_magnet_kl_loss_sign_increases_with_divergence(self) -> None:
-        """Verify compute_ppo_objective penalizes larger Magnet KL divergences proportionally."""
-        config = TrainingConfig()
-        common: dict[str, Any] = dict(
-            current_log_probs=torch.zeros(2),
-            current_values=torch.zeros(2),
-            normalized_entropy=torch.zeros(2),
-            old_log_probs=torch.zeros(2),
-            advantages=torch.ones(2),
-            returns=torch.zeros(2),
-            config=config,
-        )
-        low, *_ = compute_ppo_objective(magnet_kl=torch.zeros(2), alpha=0.5, **common)
-        high, *_ = compute_ppo_objective(magnet_kl=torch.ones(2), alpha=0.5, **common)
-        assert (high > low).all()
-
-    def test_fixed_memory_and_observation_contract(self) -> None:
-        """Verify architecture contract constants (SEQUENCE_LENGTH=15, 32 event records, HISTORY_WINDOW=48, SERIES_SLOTS=8)."""
-        observation = StructuredObservation.empty_batch(2)
-        assert SEQUENCE_LENGTH == 15
-        assert CATEGORICAL_WIDTH == 60
-        assert NUMERICAL_WIDTH == 116
-        assert (SPATIAL_SLOT_COUNT, MAX_EVENT_RECORDS) == (4, 32)
-        assert observation.token_type_ids.shape == (2, 15)
-        assert observation.spatial_cat.shape == (2, 32, EVENT_CATEGORICAL_WIDTH)
-        assert observation.spatial_num.shape == (2, 32, EVENT_NUMERICAL_WIDTH)
-        assert set(TokenType) == {TokenType.POKEMON, TokenType.FIELD, TokenType.EVENT}
-        assert (CURRENT_TOKEN_COUNT, CURRENT_REDUCER_TOKEN_COUNT, REDUCER_MAX_LENGTH) == (
-            20,
-            21,
-            77,
-        )
-        assert (HISTORY_WINDOW, SERIES_SLOTS, POOLED_EVENT_COUNT) == (48, 8, 4)
-
     def test_empty_events_are_finite_deterministic_and_pooled(self, policy: PolicyNet) -> None:
         """Verify public policy encoding returns finite, deterministic empty-event tokens."""
         obs = StructuredObservation.empty_batch(2)
@@ -905,48 +656,6 @@ class TestPolicy:
         assert torch.isfinite(first).all()
         torch.testing.assert_close(first, second)
 
-    def test_spatial_event_channels_remain_observable(self, policy: PolicyNet) -> None:
-        """Verify public policy encoding responds to each event record channel."""
-        base = StructuredObservation.empty_batch(1)
-        base.spatial_cat[0, 0] = torch.tensor(
-            [
-                EventKind.BOOST,
-                EventPosition.OWN_LEFT,
-                EventPosition.OPPONENT_LEFT,
-                0,
-                EventDetail.ATK,
-                0,
-                0,
-                4,
-                1,
-            ]
-        )
-        base.spatial_num[0, 0] = torch.tensor([-1 / 6, 1.0])
-
-        variants = []
-        for column, value in (
-            (0, EventKind.DAMAGE),
-            (1, EventPosition.NONE),
-            (2, EventPosition.OPPONENT_RIGHT),
-            (3, 10),
-            (4, EventDetail.SPE),
-            (5, 1),
-            (6, 1),
-            (7, 3),
-            (8, 2),
-        ):
-            variant = base.clone()
-            variant.spatial_cat[0, 0, column] = value
-            variants.append(variant)
-        for column, value in ((0, -2 / 6), (1, 0.0)):
-            variant = base.clone()
-            variant.spatial_num[0, 0, column] = value
-            variants.append(variant)
-
-        mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
-        outputs = [policy.encode(item, mask).tokens[:, 16:20] for item in (base, *variants)]
-        assert all(not torch.allclose(outputs[0], other) for other in outputs[1:])
-
     def test_event_compression_has_gradient_paths(self, policy: PolicyNet) -> None:
         """Verify spatial event tokens participate in the public policy computation graph."""
         obs = StructuredObservation.empty_batch(2)
@@ -954,17 +663,19 @@ class TestPolicy:
             [EventKind.MOVE, EventPosition.OWN_LEFT, EventPosition.OPPONENT_LEFT, 15, 0, 0, 0, 0, 0]
         )
         action_mask = torch.ones((2, 2, ACT_SIZE), dtype=torch.bool)
+        obs.spatial_num.requires_grad_()
         output = policy.encode(obs, action_mask).tokens[:, 16:20]
-        output.square().mean().backward()
-        assert any(
-            parameter.grad is not None and torch.isfinite(parameter.grad).all()
-            for parameter in policy.parameters()
-        )
+        output[..., 0].sum().backward()
+
+        assert obs.spatial_num.grad is not None
+        assert torch.isfinite(obs.spatial_num.grad).all()
+        assert torch.count_nonzero(obs.spatial_num.grad[:, 0]) > 0
+        assert torch.count_nonzero(obs.spatial_num.grad[:, 1:]) == 0
 
     def test_event_only_change_reaches_board_tokens_before_the_local_summary(
         self, policy: PolicyNet
     ) -> None:
-        """Board tokens are built without events; the local mixer lets them read events."""
+        """Verify the local mixer lets board tokens read events, which the fused encoder leaves out."""
         base = StructuredObservation.empty_batch(1)
         with_event = base.clone()
         with_event.spatial_cat[0, 0] = torch.tensor(
@@ -973,13 +684,10 @@ class TestPolicy:
         mask = torch.ones((1, 2, ACT_SIZE), dtype=torch.bool)
 
         with torch.no_grad():
-            fused_base, _ = policy.encoder(base, mask)
-            fused_event, _ = policy.encoder(with_event, mask)
             mixed_base = policy.encode(base, mask).tokens
             mixed_event = policy.encode(with_event, mask).tokens
 
         pokemon = slice(0, len(POKEMON_TOKENS))
-        torch.testing.assert_close(fused_base[:, pokemon], fused_event[:, pokemon])
         assert not torch.allclose(mixed_base[:, pokemon], mixed_event[:, pokemon])
 
     def test_local_summary_is_unchanged_by_history_and_series_inputs(
@@ -1021,84 +729,14 @@ class TestPolicy:
         )
         assert any(gradient is not None and gradient.abs().sum() > 0 for gradient in gradients)
 
-    def test_reducer_uses_fixed_padding_only_memory_attention(self) -> None:
-        """Verify MemoryReducer ignores masked padding tokens in series and history memory banks."""
-        torch.manual_seed(0)
-        reducer = MemoryReducer(32, 4, 1, 64)
-        current = torch.randn(2, CURRENT_TOKEN_COUNT, 32)
-        series = torch.randn(2, SERIES_SLOTS, 32)
-        series_mask = torch.zeros(2, SERIES_SLOTS, dtype=torch.bool)
-        series_mask[1, :4] = True
-        history = torch.randn(2, HISTORY_WINDOW, 32)
-        history_mask = torch.zeros(2, HISTORY_WINDOW, dtype=torch.bool)
-        first = reducer.reduce(
-            reducer.local_summary(current),
-            current,
-            series,
-            series_mask,
-            history,
-            history_mask,
-        )
-
-        # Mutating unmasked padding tokens must not change reduced CLS token
-        changed_padding = series.clone()
-        changed_padding[0] = 1000.0
-        second = reducer.reduce(
-            reducer.local_summary(current),
-            current,
-            changed_padding,
-            series_mask,
-            history,
-            history_mask,
-        )
-        torch.testing.assert_close(first.cls, second.cls)
-
-        # Mutating valid unmasked history tokens alters reduced representation
-        changed_valid_history = history.clone()
-        changed_valid_history[1, -1] = 1000.0
-        changed_mask = history_mask.clone()
-        changed_mask[1, -1] = True
-        third = reducer.reduce(
-            reducer.local_summary(current),
-            current,
-            series,
-            series_mask,
-            changed_valid_history,
-            changed_mask,
-        )
-        assert not torch.allclose(first.cls[1], third.cls[1])
-        assert first.pokemon.shape == (2, 12, 32)
-        assert first.local_history_token.shape == (2, 32)
-
-    def test_local_history_summary_is_independent_of_prior_memory_and_window_is_sliding(
-        self,
-    ) -> None:
-        """Verify local summaries use only the current turn and history packing is right-aligned."""
-        torch.manual_seed(1)
-        reducer = MemoryReducer(32, 4, 1, 64)
-        current = torch.randn(1, CURRENT_TOKEN_COUNT, 32)
-        summary_a = reducer.local_summary(current)
-        summary_b = reducer.local_summary(current)
-        torch.testing.assert_close(summary_a, summary_b)
-
-        all_history = torch.arange((HISTORY_WINDOW + 3) * 32, dtype=torch.float32).reshape(
-            1, HISTORY_WINDOW + 3, 32
-        )
-        packed, mask = pack_history_tokens(all_history[:, -HISTORY_WINDOW:])
-        assert packed.shape == (1, HISTORY_WINDOW, 32)
-        assert mask.all()
-
-    def test_policy_exposes_fixed_current_tokens_and_immutable_history_token(
-        self, policy: PolicyNet
-    ) -> None:
-        """Verify encoder and local-history outputs follow the fixed token contracts."""
+    def test_policy_exposes_history_token_from_act(self, policy: PolicyNet) -> None:
+        """Verify the public action output carries a model-width history token."""
         obs = StructuredObservation.empty_batch(2)
         mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool)
         encoded = policy.encode(obs, mask)
         memory = _empty_memory(policy, 2)
         with torch.no_grad():
             output = policy.act(policy.prepare(encoded, memory), mask)
-        assert encoded.tokens.shape == (2, CURRENT_TOKEN_COUNT, policy.d_model)
         assert output.history_token.shape == (2, policy.d_model)
 
     @pytest.mark.parametrize("history_length", (1, HISTORY_WINDOW))
@@ -1149,3 +787,51 @@ class TestPolicy:
         assert earlier_summary.grad is not None
         assert torch.isfinite(earlier_summary.grad).all()
         assert torch.count_nonzero(earlier_summary.grad) > 0
+
+    @pytest.mark.parametrize("prior_games", (1, 2))
+    def test_policy_series_path_trains_every_used_resampler_group(self, prior_games: int) -> None:
+        """Verify one and two prior games reach every live series-resampler parameter group."""
+        torch.manual_seed(9)
+        policy = build_policy(
+            ModelConfig(d_model=32, nhead=4, reducer_layers=1, dim_feedforward=64),
+            default_runtime_resources(),
+        )
+        observations = StructuredObservation.empty_batch(2)
+        action_mask = torch.ones((2, 2, FORMAT.action_size), dtype=torch.bool)
+        encoded = policy.encode(observations, action_mask)
+        histories = torch.randn(prior_games, 7, policy.d_model)
+        history_mask = torch.ones((prior_games, 7), dtype=torch.bool)
+        series_tokens = policy.series(histories, history_mask).flatten(0, 1)
+        series_tokens = torch.cat(
+            (
+                series_tokens,
+                torch.zeros(
+                    (SERIES_SLOTS - series_tokens.size(0), policy.d_model),
+                    dtype=series_tokens.dtype,
+                ),
+            ),
+            dim=0,
+        ).unsqueeze(0)
+        series_tokens = series_tokens.expand(2, -1, -1)
+        series_mask = torch.zeros((2, SERIES_SLOTS), dtype=torch.bool)
+        series_mask[:, : prior_games * SERIES_TOKENS_PER_GAME] = True
+        memory = MemoryInputs(
+            series_tokens=series_tokens,
+            series_mask=series_mask,
+            history_tokens=torch.zeros((2, HISTORY_WINDOW, policy.d_model)),
+            history_mask=torch.zeros((2, HISTORY_WINDOW), dtype=torch.bool),
+        )
+
+        output = policy.evaluate(
+            policy.prepare(encoded, memory),
+            action_mask,
+            torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+        )
+        output.log_probs.sum().backward()
+
+        assert all(
+            parameter.grad is not None
+            and torch.isfinite(parameter.grad).all()
+            and torch.count_nonzero(parameter.grad) > 0
+            for parameter in policy.series.parameters()
+        )

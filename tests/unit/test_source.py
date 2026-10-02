@@ -7,11 +7,9 @@ import json
 import random
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from p0.cli.corpus import main as corpus_main
 from p0.format_config import FORMAT, current_manifest
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
@@ -26,62 +24,7 @@ from p0.teams.source import (
     ValidatedTeam,
     build_team_source,
 )
-from p0.teams.spread_usage import (
-    SPREAD_USAGE_SCHEMA,
-)
 from tests.team_fixtures import DEFAULT_TEST_TEAM
-
-
-def vocabulary() -> dict[str, dict[str, int]]:
-    return {
-        "species": {
-            "pikachu": 1,
-            "charizard": 2,
-            "whimsicott": 3,
-            "garchomp": 4,
-            "kingambit": 5,
-            "glimmora": 6,
-            "raichu": 7,
-        },
-        "items": {
-            "lightball": 1,
-            "charizarditey": 2,
-            "focussash": 3,
-            "sitrusberry": 4,
-            "blackglasses": 5,
-            "shucaberry": 6,
-            "lifeorb": 7,
-        },
-        "abilities": {
-            "static": 1,
-            "blaze": 2,
-            "prankster": 3,
-            "roughskin": 4,
-            "defiant": 5,
-            "toxicdebris": 6,
-        },
-        "moves": {
-            "fakeout": 1,
-            "protect": 2,
-            "thunderbolt": 3,
-            "electroweb": 4,
-            "heatwave": 5,
-            "solarbeam": 6,
-            "weatherball": 7,
-            "moonblast": 8,
-            "tailwind": 9,
-            "encore": 10,
-            "earthquake": 11,
-            "dragonclaw": 12,
-            "rockslide": 13,
-            "kowtowcleave": 14,
-            "suckerpunch": 15,
-            "lowkick": 16,
-            "powergem": 17,
-            "sludgebomb": 18,
-            "earthpower": 19,
-        },
-    }
 
 
 def _make_entry(
@@ -121,53 +64,6 @@ def _write_manifest(
         json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
     return path, manifest
-
-
-def _chaos(species: str, spreads: dict[str, float]) -> dict[str, Any]:
-    """Build a minimal chaos export carrying one species' spread distribution."""
-    return {"data": {species: {"Spreads": spreads}}}
-
-
-def _dex(*species: dict[str, Any]) -> dict[str, Any]:
-    """Build a minimal dex carrying only what forme aliasing reads."""
-    return {"species": list(species), "moves": []}
-
-
-_BASE_STATS = {"hp": 78, "atk": 65, "def": 68, "spa": 112, "spd": 154, "spe": 75}
-
-
-def _payload(spreads: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
-    return {
-        "schema": SPREAD_USAGE_SCHEMA,
-        "format_id": FORMAT.battle_format,
-        "weight_scale": 1_000_000,
-        "aliases": aliases or {},
-        "spreads": spreads,
-    }
-
-
-_ONE_BUCKET = {"real": {"timid": [[2, 0, 0, 32, 0, 32, 1000]]}}
-
-
-def _corpus_entry(packed: str = "packed-team") -> CorpusEntry:
-    return CorpusEntry(
-        canonical_hash=hashlib.sha256(packed.encode()).hexdigest(),
-        packed=packed,
-        packed_sha256=hashlib.sha256(packed.encode()).hexdigest(),
-        usage_count=3,
-    )
-
-
-def _corpus_manifest(entries: tuple[CorpusEntry, ...]) -> TeamCorpusManifest:
-    active_contract = current_manifest().global_sha256
-    return TeamCorpusManifest(
-        global_contract_sha256=active_contract,
-        format_id="gen9championsvgc2026regmb",
-        corpus_hash=corpus_content_hash(entries),
-        entries=entries,
-        created_at="2026-07-17T00:00:00Z",
-        sampling_metadata={"sampling": "uniform_canonical"},
-    )
 
 
 class TestTeamSources:
@@ -220,18 +116,8 @@ class TestTeamSources:
         for count in canonical_counts.values():
             assert 220 <= count <= 380
 
-    def test_uniform_sampling_index(self, tmp_path: Path) -> None:
-        """Verify immutable canonical sampling pools are precomputed during CorpusTeamSource initialization."""
-        e1 = _make_entry(1, canonical_index=1, usage_count=100)
-        e2 = _make_entry(2, canonical_index=2, usage_count=100)
-        path, manifest = _write_manifest(tmp_path, (e1, e2))
-        source = CorpusTeamSource.from_path(path)
-        assert source.describe()["pool_size"] == 2
-        rng = random.Random(700)
-        assert source.sample(rng) is not None
-
-    def test_validated_team_rejects_untrusted_packed_values(self) -> None:
-        """Verify ValidatedTeam verifies SHA-256 hash length and formatting."""
+    def test_validated_team_requires_64_character_sha256(self) -> None:
+        """Verify ValidatedTeam rejects a packed-team hash shorter than 64 characters."""
         with pytest.raises(ValueError, match="SHA-256"):
             ValidatedTeam("packed", "short")
 
@@ -277,6 +163,17 @@ class TestBuildTeamSource:
         (pool_dir / "team.txt").write_text(team_text, encoding="utf-8")
         source = build_team_source(pool_dir)
         assert isinstance(source, FileTeamSource)
+        expected_team = ValidatedTeam.from_showdown(team_text)
+        rng = random.Random(0)
+        sampled = source.sample(rng)
+        assert sampled.packed == expected_team.packed
+        assert sampled.team_hash == expected_team.team_hash
+        assert source.describe() == {
+            "kind": "file_pool",
+            "format": "showdown-export",
+            "pool_id": hashlib.sha256(expected_team.team_hash.encode()).hexdigest(),
+            "team_hashes": (expected_team.team_hash,),
+        }
 
     def test_rejects_invalid_manifest(self, tmp_path: Path) -> None:
         pool_dir = tmp_path / "pool"
@@ -285,41 +182,3 @@ class TestBuildTeamSource:
 
         with pytest.raises(ValueError, match="Invalid corpus manifest"):
             build_team_source(pool_dir)
-
-
-class TestCorpusCLI:
-    def test_cli_build_and_audit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        input_dir = tmp_path / "inputs"
-        input_dir.mkdir()
-        team_text_1 = DEFAULT_TEST_TEAM
-        team_text_2 = DEFAULT_TEST_TEAM.replace("Pikachu @ Light Ball", "Raichu @ Light Ball", 1)
-        (input_dir / "v1.txt").write_text(team_text_1, encoding="utf-8")
-        (input_dir / "v2.txt").write_text(team_text_2, encoding="utf-8")
-
-        all_dir = tmp_path / "pools" / "all"
-
-        corpus_main(
-            [
-                "build",
-                "--input",
-                str(input_dir),
-                "--output-dir",
-                str(all_dir),
-                "--format-id",
-                FORMAT.battle_format,
-            ]
-        )
-
-        assert (all_dir / "corpus_manifest.json").is_file()
-
-        captured = capsys.readouterr()
-        audit_data = json.loads(captured.out.split("\n")[-2]) if captured.out.strip() else {}
-        assert audit_data["admitted_count"] == 2
-        assert audit_data["rejected_count"] == 0
-
-        corpus_main(["audit", "--path", str(all_dir)])
-        audit_captured = capsys.readouterr()
-        re_audit_data = (
-            json.loads(audit_captured.out.split("\n")[-2]) if audit_captured.out.strip() else {}
-        )
-        assert re_audit_data["admitted_count"] == 2

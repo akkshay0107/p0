@@ -8,30 +8,31 @@ from p0.model.config import ModelConfig
 
 
 class TestModelConfig:
-    def test_model_config_is_checkpoint_local_and_validated(self) -> None:
-        """Verify ModelConfig enforces divisibility requirements (d_model % nhead == 0)."""
+    def test_serialization_pins_architecture_and_rejects_invalid_configs(self) -> None:
+        """Pin serialized fields, defaults, and invalid architecture inputs."""
         config = ModelConfig.baseline()
         assert config.d_model == 384
+        assert config.nhead == 8
         assert config.reducer_layers == 8
         assert config.dim_feedforward == 1536
-        with pytest.raises(ValueError, match="divisible"):
-            ModelConfig(63, 8, 1, 256)
+        baseline_fields = {
+            "d_model": 384,
+            "nhead": 8,
+            "reducer_layers": 8,
+            "dim_feedforward": 1536,
+        }
+        assert config.to_dict() == baseline_fields
+        assert ModelConfig.from_dict(baseline_fields) == config
 
-    def test_model_config_has_only_scaling_fields(self) -> None:
-        """Verify ModelConfig accepts valid scaling architectures and rejects deprecated parameters."""
-        config = ModelConfig.baseline()
-        assert config.dim_feedforward == 1536
-        assert ModelConfig.from_dict(config.to_dict()) == config
-        enabled = ModelConfig(
-            d_model=64,
-            nhead=4,
-            reducer_layers=1,
-            dim_feedforward=128,
-        )
-        assert ModelConfig.from_dict(enabled.to_dict()) == enabled
-        stale = config.to_dict()
+        stale = dict(baseline_fields)
         stale["history_tokens"] = 8
         with pytest.raises(ValueError, match=r"unknown=.*history_tokens"):
             ModelConfig.from_dict(stale)
-        with pytest.raises(ValueError, match="low-width event channel"):
-            ModelConfig(d_model=96, nhead=3, reducer_layers=1, dim_feedforward=128)
+
+        invalid_configs = (
+            (63, 8, 1, 256, "divisible"),
+            (96, 3, 1, 128, "low-width event channel"),
+        )
+        for d_model, nhead, reducer_layers, dim_feedforward, error in invalid_configs:
+            with pytest.raises(ValueError, match=error):
+                ModelConfig(d_model, nhead, reducer_layers, dim_feedforward)

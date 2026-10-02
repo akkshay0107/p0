@@ -65,3 +65,16 @@ class TestPersistence:
         atomic_torch_save(target, {"step": 2})
 
         assert torch.load(target, weights_only=True)["step"] == 2
+
+    def test_atomic_torch_save_failure_preserves_existing_file(self, tmp_path: Path) -> None:
+        """Verify serialization failure leaves the previous checkpoint and no temporary file."""
+        target = tmp_path / "checkpoint.pt"
+        atomic_torch_save(target, {"step": 1})
+        original = target.read_bytes()
+
+        with pytest.raises(AttributeError):
+            atomic_torch_save(target, lambda: None)
+
+        assert target.read_bytes() == original
+        assert torch.load(target, weights_only=True) == {"step": 1}
+        assert list(tmp_path.iterdir()) == [target]

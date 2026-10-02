@@ -15,7 +15,11 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.runtime import poke_env_patches
-from p0.runtime.poke_env_action_adapter import order_to_action, single_order_to_action
+from p0.runtime.poke_env_action_adapter import (
+    action_to_order,
+    order_to_action,
+    single_order_to_action,
+)
 from p0.runtime.poke_env_battle_adapter import battle_view
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
@@ -38,6 +42,8 @@ class GroundTruthDecision:
     legal_joint_actions: tuple[tuple[int, int], ...]
     chosen_action: tuple[int, int]
     chosen_order: str
+    regenerated_order: str
+    battle_tag: str
 
 
 class _GroundTruthPlayer(RandomPlayer):
@@ -97,6 +103,8 @@ class _GroundTruthPlayer(RandomPlayer):
                 legal_joint_actions=legal_joint_actions,
                 chosen_action=(int(action[0]), int(action[1])),
                 chosen_order=str(order),
+                regenerated_order=str(action_to_order(action, battle)),
+                battle_tag=battle.battle_tag,
             )
         )
         return order
@@ -132,6 +140,10 @@ async def capture_showdown_decisions(
     poke_env_patches.install()
     try:
         await player_a.battle_against(player_b, n_battles=game_count)
+        assert player_a.n_finished_battles == game_count
+        assert player_b.n_finished_battles == game_count
+        assert len(player_a.battles) == game_count
+        assert all(battle.finished for battle in player_a.battles.values())
     finally:
         await player_a.ps_client.stop_listening()
         await player_b.ps_client.stop_listening()

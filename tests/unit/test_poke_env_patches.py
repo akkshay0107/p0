@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 from poke_env.battle import DoubleBattle, Effect, Pokemon, PokemonType, SideCondition, Status
-from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
 
@@ -145,38 +144,33 @@ class TestPokeEnvPatches:
         )
         assert result.returncode == 0, result.stderr
 
-    def test_patch_installation_is_idempotent_reversible_and_logger_scoped(self) -> None:
-        poke_env_patches.uninstall_for_tests()
-        original = DoubleBattle.parse_message
-        original_stop = PSClient.stop_listening
-        original_start_effect = Pokemon.start_effect
-        original_copy_boosts = Pokemon.copy_boosts
-        original_parse_request = DoubleBattle.parse_request
-        poke_env_patches.install()
-        installed = DoubleBattle.parse_message
-        poke_env_patches.install()
-        assert DoubleBattle.parse_message is installed
-        assert installed is not original
-        assert PSClient.stop_listening is not original_stop
-        assert Pokemon.start_effect is not original_start_effect
-        assert Pokemon.copy_boosts is not original_copy_boosts
-        assert DoubleBattle.parse_request is not original_parse_request
-        poke_env_patches.uninstall_for_tests()
-        assert DoubleBattle.parse_message is original
-        assert PSClient.stop_listening is original_stop
-        assert Pokemon.start_effect is original_start_effect
-        assert Pokemon.copy_boosts is original_copy_boosts
-        assert DoubleBattle.parse_request is original_parse_request
-
+    def test_repeated_install_applies_each_patch_once_and_scopes_the_log_filter(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        message = "is active, but it's not"
         target = logging.getLogger("test.poke-env")
         other = logging.getLogger("test.other")
         poke_env_patches.install(target)
-        record = logging.LogRecord(
-            "test", logging.WARNING, "", 0, "is active, but it's not", (), None
-        )
-        assert not target.filter(record)
-        assert other.filter(record)
-        poke_env_patches.uninstall_for_tests()
+        poke_env_patches.install(target)
+        try:
+            battle = DoubleBattle("install-test", "Alice", logging.getLogger("test"), gen=9)
+            for event in (
+                ["", "player", "p1", "Alice", "", ""],
+                ["", "player", "p2", "Bob", "", ""],
+                ["", "switch", "p1a: Aegislash", "Aegislash, L50", "100/100"],
+                ["", "-formechange", "p1a: Aegislash", "Aegislash-Blade"],
+                ["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"],
+            ):
+                battle.parse_message(event)
+
+            with caplog.at_level(logging.WARNING):
+                target.warning(message)
+                other.warning(message)
+        finally:
+            poke_env_patches.uninstall_for_tests()
+
+        assert [record.name for record in caplog.records] == ["test.other"]
+        assert battle.team["p1: Aegislash"].species == "aegislash"
 
     def test_transform_patch_accepts_species_target(self) -> None:
         poke_env_patches.install()
@@ -260,7 +254,11 @@ class TestPokeEnvPatches:
             assert transformed.species == "roserade"
             assert transformed.base_stats["hp"] == 48
             assert transformed.base_stats["spa"] == 125
-            assert transformed.moves["gigadrain"].current_pp == 5
+            move_view = transformed.moves["gigadrain"]
+            assert move_view.current_pp == 5
+            assert move_view.max_pp == 5
+            assert move_view.type.name == "GRASS"
+            assert move_view.category.name == "SPECIAL"
 
             battle.parse_message(["", "move", "p1a: Ditto", "Giga Drain", "p2a: Roserade"])
             assert battle_view(battle).active_pokemon[0].moves["gigadrain"].current_pp == 4
@@ -427,55 +425,42 @@ class TestPokeEnvPatches:
         finally:
             poke_env_patches.uninstall_for_tests()
 
-    def test_forecast_form_resets_when_castform_switches_out(self) -> None:
+    @pytest.mark.parametrize(
+        ("species", "temporary_form", "expected_active_form", "base_type"),
+        [
+            pytest.param("Morpeko", "Morpeko-Hangry", "morpekohangry", "ELECTRIC", id="morpeko"),
+            pytest.param("Aegislash", "Aegislash-Blade", "aegislashblade", "STEEL", id="aegislash"),
+            pytest.param("Cherrim", "Cherrim-Sunshine", "cherrimsunshine", "GRASS", id="cherrim"),
+        ],
+    )
+    def test_temporary_forms_reset_to_base_species_when_switching_out(
+        self,
+        species: str,
+        temporary_form: str,
+        expected_active_form: str,
+        base_type: str,
+    ) -> None:
+        """Keep each named temporary form and base type through a real switch stream."""
         poke_env_patches.install()
         try:
-            battle = DoubleBattle("forecast-switch", "Alice", logging.getLogger("test"), gen=9)
+            battle = DoubleBattle(
+                f"{species.lower()}-switch", "Alice", logging.getLogger("test"), gen=9
+            )
             for event in (
                 ["", "player", "p1", "Alice", "", ""],
                 ["", "player", "p2", "Bob", "", ""],
-                ["", "switch", "p2a: Castform", "Castform, L50", "100/100"],
-                ["", "-ability", "p2a: Castform", "Forecast"],
-                [
-                    "",
-                    "-formechange",
-                    "p2a: Castform",
-                    "Castform-Rainy",
-                    "[from] ability: Forecast",
-                ],
-            ):
-                battle.parse_message(event)
-            active = battle.opponent_active_pokemon[0]
-            assert active is not None
-            assert active.species == "castformrainy"
-
-            battle.parse_message(["", "switch", "p2a: Pikachu", "Pikachu, L50", "100/100"])
-
-            castform = battle.opponent_team["p2: Castform"]
-            assert castform.species == "castform"
-            assert castform.type_1.name == "NORMAL"
-        finally:
-            poke_env_patches.uninstall_for_tests()
-
-    def test_hunger_switch_form_resets_when_morpeko_switches_out(self) -> None:
-        poke_env_patches.install()
-        try:
-            battle = DoubleBattle("morpeko-switch", "Alice", logging.getLogger("test"), gen=9)
-            for event in (
-                ["", "player", "p1", "Alice", "", ""],
-                ["", "player", "p2", "Bob", "", ""],
-                ["", "switch", "p1a: Morpeko", "Morpeko, L50", "100/100"],
-                ["", "-formechange", "p1a: Morpeko", "Morpeko-Hangry"],
+                ["", "switch", f"p1a: {species}", f"{species}, L50", "100/100"],
+                ["", "-formechange", f"p1a: {species}", temporary_form],
             ):
                 battle.parse_message(event)
             active = battle.active_pokemon[0]
-            assert active is not None and active.species == "morpekohangry"
+            assert active is not None and active.species == expected_active_form
 
             battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
 
-            morpeko = battle.team["p1: Morpeko"]
-            assert morpeko.species == "morpeko"
-            assert morpeko.type_1.name == "ELECTRIC"
+            returned_to_base = battle.team[f"p1: {species}"]
+            assert returned_to_base.species == species.lower()
+            assert returned_to_base.type_1.name == base_type
         finally:
             poke_env_patches.uninstall_for_tests()
 
@@ -629,100 +614,92 @@ class TestPokeEnvPatches:
         finally:
             poke_env_patches.uninstall_for_tests()
 
-    def test_copyboost_replaces_focus_energy(self) -> None:
-        poke_env_patches.install()
-        try:
-            battle = DoubleBattle("copyboost-focus", "Alice", logging.getLogger("test"), gen=9)
-            for event in (
-                ["", "player", "p1", "Alice", "", ""],
-                ["", "player", "p2", "Bob", "", ""],
-                ["", "switch", "p1a: Receiver", "Pikachu, L50", "100/100"],
-                ["", "switch", "p1b: Donor", "Eevee, L50", "100/100"],
-                ["", "-start", "p1a: Receiver", "Dragon Cheer"],
-                ["", "-start", "p1b: Donor", "Focus Energy"],
-                ["", "-copyboost", "p1a: Receiver", "p1b: Donor"],
-            ):
-                battle.parse_message(event)
-
-            receiver = battle.get_pokemon("p1a: Receiver")
-            donor = battle.get_pokemon("p1b: Donor")
-            assert Effect.FOCUS_ENERGY in receiver.effects
-            assert Effect.DRAGON_CHEER not in receiver.effects
-            assert Effect.FOCUS_ENERGY in donor.effects
-        finally:
-            poke_env_patches.uninstall_for_tests()
-
-    def test_copyboost_preserves_dragon_cheer_metadata(self) -> None:
-        poke_env_patches.install()
-        try:
-            battle = DoubleBattle(
-                "copyboost-dragon-cheer", "Alice", logging.getLogger("test"), gen=9
-            )
-            for event in (
-                ["", "player", "p1", "Alice", "", ""],
-                ["", "player", "p2", "Bob", "", ""],
-                ["", "switch", "p1a: Receiver", "Pikachu, L50", "100/100"],
-                ["", "switch", "p1b: Donor", "Garchomp, L50", "100/100"],
-                ["", "-start", "p1a: Receiver", "Focus Energy"],
-                ["", "-start", "p1b: Donor", "Dragon Cheer"],
-                ["", "-copyboost", "p1a: Receiver", "p1b: Donor"],
-            ):
-                battle.parse_message(event)
-
-            receiver = battle.get_pokemon("p1a: Receiver")
-            donor = battle.get_pokemon("p1b: Donor")
-            assert receiver.effects[Effect.DRAGON_CHEER] == 1
-            assert Effect.FOCUS_ENERGY not in receiver.effects
-            assert donor.effects[Effect.DRAGON_CHEER] == 1
-        finally:
-            poke_env_patches.uninstall_for_tests()
-
-    def test_copyboost_preserves_gmax_chi_strike_layers(self) -> None:
-        poke_env_patches.install()
-        try:
-            battle = DoubleBattle("copyboost-gmax", "Alice", logging.getLogger("test"), gen=9)
-            for event in (
-                ["", "player", "p1", "Alice", "", ""],
-                ["", "player", "p2", "Bob", "", ""],
-                ["", "switch", "p1a: Receiver", "Pikachu, L50", "100/100"],
-                ["", "switch", "p1b: Donor", "Eevee, L50", "100/100"],
-                ["", "-start", "p1a: Receiver", "Laser Focus"],
-                ["", "-start", "p1b: Donor", "G-Max Chi Strike"],
-                ["", "-start", "p1b: Donor", "G-Max Chi Strike"],
-                ["", "-copyboost", "p1a: Receiver", "p1b: Donor"],
-            ):
-                battle.parse_message(event)
-
-            receiver = battle.get_pokemon("p1a: Receiver")
-            donor = battle.get_pokemon("p1b: Donor")
-            assert receiver.effects[Effect.G_MAX_CHI_STRIKE] == 2
-            assert Effect.LASER_FOCUS not in receiver.effects
-            assert donor.effects[Effect.G_MAX_CHI_STRIKE] == 2
-        finally:
-            poke_env_patches.uninstall_for_tests()
-
-    def test_copyboost_replaces_laser_focus(self) -> None:
+    @pytest.mark.parametrize(
+        (
+            "receiver_effect",
+            "donor_effect",
+            "donor_species",
+            "donor_layers",
+            "expected_effect",
+            "expected_payload",
+        ),
+        [
+            pytest.param(
+                "Dragon Cheer",
+                "Focus Energy",
+                "Eevee",
+                1,
+                Effect.FOCUS_ENERGY,
+                None,
+                id="focus-energy",
+            ),
+            pytest.param(
+                "Focus Energy",
+                "Dragon Cheer",
+                "Garchomp",
+                1,
+                Effect.DRAGON_CHEER,
+                1,
+                id="dragon-cheer",
+            ),
+            pytest.param(
+                "Laser Focus",
+                "G-Max Chi Strike",
+                "Eevee",
+                2,
+                Effect.G_MAX_CHI_STRIKE,
+                2,
+                id="gmax-chi-strike",
+            ),
+            pytest.param(
+                "Focus Energy",
+                "Laser Focus",
+                "Eevee",
+                1,
+                Effect.LASER_FOCUS,
+                None,
+                id="laser-focus",
+            ),
+        ],
+    )
+    def test_copyboost_replaces_critical_volatile_state_from_donor(
+        self,
+        receiver_effect: str,
+        donor_effect: str,
+        donor_species: str,
+        donor_layers: int,
+        expected_effect: Effect,
+        expected_payload: int | None,
+    ) -> None:
+        """Copy each critical volatile while replacing receiver state and preserving the donor."""
         poke_env_patches.install()
         try:
             battle = DoubleBattle(
-                "copyboost-laser-focus", "Alice", logging.getLogger("test"), gen=9
+                "copyboost-critical-volatile", "Alice", logging.getLogger("test"), gen=9
             )
-            for event in (
+            events = [
                 ["", "player", "p1", "Alice", "", ""],
                 ["", "player", "p2", "Bob", "", ""],
                 ["", "switch", "p1a: Receiver", "Pikachu, L50", "100/100"],
-                ["", "switch", "p1b: Donor", "Eevee, L50", "100/100"],
-                ["", "-start", "p1a: Receiver", "Focus Energy"],
-                ["", "-start", "p1b: Donor", "Laser Focus"],
+                ["", "switch", "p1b: Donor", f"{donor_species}, L50", "100/100"],
+                ["", "-start", "p1a: Receiver", receiver_effect],
+                *[["", "-start", "p1b: Donor", donor_effect] for _ in range(donor_layers)],
                 ["", "-copyboost", "p1a: Receiver", "p1b: Donor"],
-            ):
+            ]
+            for event in events:
                 battle.parse_message(event)
 
             receiver = battle.get_pokemon("p1a: Receiver")
             donor = battle.get_pokemon("p1b: Donor")
-            assert Effect.LASER_FOCUS in receiver.effects
-            assert Effect.FOCUS_ENERGY not in receiver.effects
-            assert Effect.LASER_FOCUS in donor.effects
+            assert receiver_effect.lower().replace(" ", "_") not in {
+                effect.name.lower() for effect in receiver.effects
+            }
+            if expected_payload is None:
+                assert expected_effect in receiver.effects
+                assert expected_effect in donor.effects
+            else:
+                assert receiver.effects[expected_effect] == expected_payload
+                assert donor.effects[expected_effect] == expected_payload
         finally:
             poke_env_patches.uninstall_for_tests()
 
@@ -809,22 +786,24 @@ def _teambuilder_mon(packed: str) -> TeambuilderPokemon:
 
 
 class TestPokeEnvNaturePatch:
-    def test_poke_env_drops_the_open_team_sheet_nature_without_the_patch(self) -> None:
+    def test_nature_patch_restores_the_open_team_sheet_nature(self) -> None:
         assert not poke_env_patches.is_installed()
         assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET)).nature is None
         assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_BEARING_SHEET)).nature == "impish"
 
-    def test_nature_patch_restores_the_open_team_sheet_nature(self) -> None:
         poke_env_patches.install()
         try:
             mon = Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET))
             assert mon.nature == "impish"
+            ev_bearing = Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_BEARING_SHEET))
+            assert ev_bearing.nature == "impish"
             no_nature = _teambuilder_mon("Incineroar||sitrusberry|intimidate|fakeout||||||50|")
             assert Pokemon(gen=9, teambuilder=no_nature).nature is None
         finally:
             poke_env_patches.uninstall_for_tests()
 
         assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_LESS_SHEET)).nature is None
+        assert Pokemon(gen=9, teambuilder=_teambuilder_mon(_EV_BEARING_SHEET)).nature == "impish"
 
 
 def _request_pokemon(ident: str, details: str, condition: str, active: bool) -> dict[str, object]:

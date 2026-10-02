@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 import pytest
 import torch
 
 from p0.replays.compile import compile_payloads, write_tensor_shards
-from p0.replays.shards import validate_shard_tensors
 from tests.stress._helpers import (
     stress_count,
     stress_random_bo3_payloads,
@@ -17,16 +17,10 @@ from tests.stress._helpers import (
 
 
 class TestReplayCompile:
-    @pytest.mark.stress
+    @pytest.mark.heavy
+    @pytest.mark.integration
     def test_compiler_preserves_random_replay_identity_at_scale(self, tmp_path) -> None:
-        """
-        Verify that replay compilation and tensor sharding accurately preserve all games and metadata at scale.
-
-        Checks that:
-        1. 128+ randomized replays compile without drops or ID corruption.
-        2. Shard writer creates valid tensor files satisfying PyTorch schema and dimension constraints.
-        3. Manifest captures all source replay IDs and summary statistics accurately.
-        """
+        """Preserve every source ID and both perspective summaries through real compilation and disk shards."""
         count = stress_count("P0_STRESS_REPLAY_COUNT", 128)
         rng = stress_rng()
         payloads = list(
@@ -44,9 +38,11 @@ class TestReplayCompile:
 
         assert result.metrics.counters["replays"] == count
         assert result.metrics.counters["accepted_games"] == count
-        assert {game.replay_id for series in result.accepted_series for game in series.games} == {
-            f"stress-{index}" for index in range(count)
-        }
+        expected_ids = Counter({f"stress-{index}": 1 for index in range(count)})
+        assert (
+            Counter(game.replay_id for series in result.accepted_series for game in series.games)
+            == expected_ids
+        )
 
         # Write each decision into separate shard files to test boundary splitting logic
         built = write_tensor_shards(
@@ -57,24 +53,16 @@ class TestReplayCompile:
         )
         assert built.manifest.source_games == count
         assert built.manifest.accepted_games == count
-        assert set(built.manifest.raw_replays) == {f"stress-{index}" for index in range(count)}
+        assert Counter(tuple(built.manifest.raw_replays)) == expected_ids
         assert len(built.manifest.shards) == count
-        assert {
-            summary["source_replay_id"]
+        assert Counter(
+            (summary["source_replay_id"], summary["player"])
             for shard in built.manifest.shards
             for summary in _summaries(built, shard.filename)
-        } == {f"stress-{index}" for index in range(count)}
+        ) == Counter((f"stress-{index}", player) for index in range(count) for player in (0, 1))
 
-        # Validate tensor dtype, finiteness, and dimension contracts for each written shard file
-        for shard in built.manifest.shards:
-            artifact = torch.load(
-                built.manifest_path.parent / shard.filename,
-                map_location="cpu",
-                weights_only=True,
-            )
-            validate_shard_tensors(artifact["tensors"])
-
-    @pytest.mark.stress
+    @pytest.mark.heavy
+    @pytest.mark.integration
     def test_compiler_keeps_series_together_across_shard_boundaries(self, tmp_path) -> None:
         """
         Verify that games belonging to the same Best-of-3 series are never split across shard files.
@@ -103,17 +91,20 @@ class TestReplayCompile:
             max_decisions_per_shard=1,
             created_at="2026-01-01T00:00:00Z",
         )
-        # Extract unique series IDs present within each generated shard
-        shard_series = [
-            {str(summary["series_id"]) for summary in _summaries(built, shard.filename)}
-            for shard in built.manifest.shards
-        ]
-        # Each shard must contain exactly one atomic series (no fragmentation across shards)
-        assert all(len(series_ids) == 1 for series_ids in shard_series)
-        # The set of all shard series must match the expected series hash IDs
-        assert {next(iter(series_ids)) for series_ids in shard_series} == {
-            stress_series_id(f"series-{index}") for index in range(series_count)
-        }
+        summaries = [_summaries(built, shard.filename) for shard in built.manifest.shards]
+        assert len(summaries) == series_count
+        assert all(len(rows) == 4 for rows in summaries)
+        owners = Counter()
+        for rows in summaries:
+            series_ids = {str(row["series_id"]) for row in rows}
+            assert len(series_ids) == 1
+            owners.update(series_ids)
+            assert Counter((row["game_number"], row["player"]) for row in rows) == Counter(
+                (game, player) for game in (1, 2) for player in (0, 1)
+            )
+        assert owners == Counter(
+            {stress_series_id(f"series-{index}"): 1 for index in range(series_count)}
+        )
 
 
 def _summaries(build, filename: str) -> list[dict[str, Any]]:

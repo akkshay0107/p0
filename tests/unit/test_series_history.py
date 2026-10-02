@@ -4,15 +4,20 @@ import pytest
 import torch
 
 from p0.battle.series import SeriesPerspectiveKey
-from p0.training.series_history import SeriesHistoryStore
+from p0.training.series_history import SeriesHistoryStore, advance_series_state
 
 
 class TestSeriesHistoryStore:
-    def test_snapshots_are_detached_cpu_float32_copies_that_survive_drop(self) -> None:
+    @pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+    def test_snapshots_are_detached_cpu_float32_copies_that_survive_drop(
+        self, dtype: torch.dtype
+    ) -> None:
         store = SeriesHistoryStore(d_model=2)
-        values = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float64, requires_grad=True)
+        values = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=dtype, requires_grad=True)
 
         store.append("series", 1, values, is_series_end=False)
+        with torch.no_grad():
+            values[0, 0] = 99.0
         (game,) = store.snapshot("series")
         store.drop("series")
 
@@ -93,3 +98,22 @@ class TestSeriesHistoryStore:
         assert len(snapshot) == 1
         torch.testing.assert_close(snapshot[0], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
         assert restored.next_game_number(key) == 2
+
+
+class TestAdvanceSeriesState:
+    def test_rejects_a_game_change_before_the_active_game_ends(self) -> None:
+        fragment = torch.ones(1, 2)
+        active_game_one = ((), 1, (fragment,), False)
+
+        with pytest.raises(ValueError, match="changed"):
+            advance_series_state(
+                active_game_one, 2, fragment, is_game_end=True, is_series_end=False
+            )
+
+        completed, active_game, fragments, ended = advance_series_state(
+            active_game_one, 1, fragment, is_game_end=True, is_series_end=False
+        )
+        assert [number for number, _ in completed] == [1]
+        assert active_game is None
+        assert fragments == ()
+        assert ended is False

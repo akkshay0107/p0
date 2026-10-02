@@ -87,7 +87,10 @@ class TestTrainingFiles:
         ) as run:
             run.start(0)
             run.state["best_policy"] = store.snapshot_policy(policy, {"selected_epoch": 1})
-            before = next(iter(run.state["best_policy"]["model_state_dict"].values())).clone()
+            before = {
+                name: tensor.clone()
+                for name, tensor in run.state["best_policy"]["model_state_dict"].items()
+            }
             with torch.no_grad():
                 for parameter in policy.parameters():
                     parameter.add_(1)
@@ -108,7 +111,10 @@ class TestTrainingFiles:
         ) as run:
             run.start(1)
         best = store.read(destination.parent / "bc_best_policy.pt")
-        torch.testing.assert_close(next(iter(best.artifact["model_state_dict"].values())), before)
+        best_state = best.artifact["model_state_dict"]
+        assert best_state.keys() == before.keys()
+        for name, expected in before.items():
+            torch.testing.assert_close(best_state[name], expected)
         assert (
             json.loads((destination.parent / "metrics.json").read_text())["metrics"][0]["loss"]
             == 1.0

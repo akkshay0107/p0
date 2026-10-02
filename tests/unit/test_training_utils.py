@@ -103,17 +103,17 @@ class TestPPOScheduler:
 class TestAdamWParamGroups:
     def test_param_groups_weight_decay_filtering(self) -> None:
         """Verify weight decay applies only to Linear weights and skips frozen parameters."""
-
-        class DummyModel(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.linear = nn.Linear(8, 8, bias=True)
-                self.frozen_linear = nn.Linear(8, 8, bias=False)
-                self.frozen_linear.weight.requires_grad = False
-                self.norm = nn.LayerNorm(8)
-                self.embed = nn.Embedding(10, 8)
-
-        model = DummyModel()
+        linear = nn.Linear(8, 8, bias=True)
+        norm = nn.LayerNorm(8)
+        embedding = nn.Embedding(10, 8)
+        frozen_linear = nn.Linear(8, 4, bias=False)
+        frozen_linear.weight.requires_grad = False
+        model = nn.Sequential(
+            linear,
+            norm,
+            embedding,
+            frozen_linear,
+        )
         groups = adamw_param_groups(model, weight_decay=1e-2)
 
         assert len(groups) == 2
@@ -122,20 +122,18 @@ class TestAdamWParamGroups:
         assert decay_group["weight_decay"] == 1e-2
         assert no_decay_group["weight_decay"] == 0.0
 
-        # Only active Linear weight is in decay group
-        assert len(decay_group["params"]) == 1
-        assert decay_group["params"][0] is model.linear.weight
+        decay_ids = {id(parameter) for parameter in decay_group["params"]}
+        assert decay_ids == {id(linear.weight)}
 
-        # Linear bias, norm weight/bias, embed weight in no-decay group
         no_decay_ids = {id(p) for p in no_decay_group["params"]}
-        assert id(model.linear.bias) in no_decay_ids
-        assert id(model.norm.weight) in no_decay_ids
-        assert id(model.norm.bias) in no_decay_ids
-        assert id(model.embed.weight) in no_decay_ids
+        assert no_decay_ids == {
+            id(linear.bias),
+            id(norm.weight),
+            id(norm.bias),
+            id(embedding.weight),
+        }
 
-        # Frozen weight is not in either group
-        assert id(model.frozen_linear.weight) not in no_decay_ids
-        assert id(model.frozen_linear.weight) not in {id(p) for p in decay_group["params"]}
+        assert id(frozen_linear.weight) not in no_decay_ids | decay_ids
 
     def test_negative_weight_decay_rejected(self) -> None:
         """Verify negative weight decay is rejected."""

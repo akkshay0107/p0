@@ -5,7 +5,7 @@ import pytest
 from poke_env import AccountConfiguration, ServerConfiguration
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import RandomPlayer
-from poke_env.player.battle_order import DoubleBattleOrder
+from poke_env.player.battle_order import DoubleBattleOrder, ForfeitBattleOrder
 
 from p0.battle.views import TransformedPokemonView
 from p0.format_config import FORMAT
@@ -128,6 +128,7 @@ class DittoTrackerPlayer(RandomPlayer):
         self.saw_transform = False
         self.transform_observations: list[tuple[str | None, str, str | None, bool]] = []
         self.transform_move_sets: list[frozenset[str]] = []
+        self.post_mega_observations: list[tuple[str | None, str, str | None, bool]] = []
         self.error: Exception | None = None
 
     def teampreview(self, battle: AbstractBattle) -> str:
@@ -151,6 +152,11 @@ class DittoTrackerPlayer(RandomPlayer):
                         )
                     )
                     self.transform_move_sets.append(frozenset(active.moves))
+                    if any(
+                        opponent is not None and opponent.species == "charizardmegay"
+                        for opponent in view.opponent_active_pokemon
+                    ):
+                        self.post_mega_observations.append(self.transform_observations[-1])
                     assert active.moves
                     self.saw_transform = True
                     break
@@ -159,6 +165,18 @@ class DittoTrackerPlayer(RandomPlayer):
             if self.error is None:
                 self.error = exc
 
+        if battle.turn >= 2:
+            return ForfeitBattleOrder()
+        if isinstance(battle, DoubleBattle):
+            orders = [
+                next(
+                    candidate
+                    for candidate in slot
+                    if getattr(candidate.order, "id", "") == "protect"
+                )
+                for slot in battle.valid_orders
+            ]
+            return DoubleBattleOrder(orders[0], orders[1])
         return super().choose_move(battle)
 
 
@@ -167,9 +185,16 @@ class MegaCharizardPlayer(RandomPlayer):
         return "/team 1234"
 
     def choose_move(self, battle: AbstractBattle) -> Any:
-        order = super().choose_move(battle)
-        if not isinstance(battle, DoubleBattle) or not isinstance(order, DoubleBattleOrder):
-            return order
+        if not isinstance(battle, DoubleBattle):
+            return super().choose_move(battle)
+        orders = [
+            next(
+                candidate
+                for candidate in slot
+                if getattr(candidate.order, "id", "") == "protect" and not candidate.mega
+            )
+            for slot in battle.valid_orders
+        ]
 
         for position, active in enumerate(battle.active_pokemon):
             if (
@@ -180,21 +205,25 @@ class MegaCharizardPlayer(RandomPlayer):
                 continue
 
             mega_order = next(
-                (candidate for candidate in battle.valid_orders[position] if candidate.mega),
+                (
+                    candidate
+                    for candidate in battle.valid_orders[position]
+                    if candidate.mega and getattr(candidate.order, "id", "") == "protect"
+                ),
                 None,
             )
             if mega_order is None:
                 continue
 
-            orders = [order.first_order, order.second_order]
             orders[position] = mega_order
             return DoubleBattleOrder(orders[0], orders[1])
 
-        return order
+        return DoubleBattleOrder(orders[0], orders[1])
 
 
 class TestDitto:
     @pytest.mark.integration
+    @pytest.mark.heavy
     @pytest.mark.asyncio
     async def test_live_ditto_transform_proxy_integration(
         self,
@@ -230,6 +259,7 @@ class TestDitto:
 
         assert first.saw_transform, "Did not observe a transform proxy during the battle"
         assert ("charizard", "charizard", "choicescarf", False) in first.transform_observations
+        assert ("charizard", "charizard", "choicescarf", False) in first.post_mega_observations
         assert frozenset({"heatwave", "solarbeam", "protect", "weatherball"}) in (
             first.transform_move_sets
         )
