@@ -1,36 +1,29 @@
-"""Compiled tensor-shard artifact contract for streaming behaviour cloning.
-
-This module owns the derived-tensor layer: bounded shard files holding
-stacked schema-v4 observations and label tensors for whole chronological
-games, plus the manifest and index that tie a compiled corpus to one runtime
-contract. It may import torch and the observation schema; p0.replays.schema
-must stay torch-free, and nothing here may import p0.runtime.
-
-Compilation and dataset behavior live elsewhere; this module only defines
-the layout and validates manifests before any tensor payload is consumed.
-"""
+"""Tensor shard format, schema definitions, and manifest validation for replay datasets."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import torch
 
-from p0.battle.actions import ACT_SIZE
-from p0.battle.series import SERIES_SUMMARY_SCHEMA_VERSION
-from p0.format_config import DEFAULT_RUNTIME_MANIFEST, validate_artifact_runtime_contract
-from p0.model.structured_observation import OBSERVATION_SCHEMA_VERSION, StructuredObservation
+from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
+from p0.format_config import (
+    DEFAULT_RUNTIME_MANIFEST,
+    is_sha256,
+    require_dataclass_fields,
+    validate_artifact_runtime_contract,
+)
+from p0.model.structured_observation import StructuredObservation
 from p0.replays.schema import (
-    REPLAY_IR_SCHEMA_VERSION,
-    _is_sha256,
-    _require_fields,
+    DecisionType,
+    LabelKind,
+    MaskProvenance,
     _require_iso_timestamp,
 )
 
-SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v4"
-BO3_COMPILATION_SEMANTICS = "canonical_player_bo3_history.v1"
+SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v1"
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
 # T is the shard's decision count and C its total candidate count. Candidates
@@ -56,19 +49,35 @@ SHARD_TENSOR_SPECS: tuple[tuple[str, tuple[int, ...], torch.dtype], ...] = (
     ("outcome", (-1,), torch.float32),
 )
 
-# Per-game GameSummary payloads ride along as JSON strings, not tensors, so
-# the series-context encoder owns their tensorization inside each game graph.
+# Per-game identity records ride along as JSON, not tensors: the series and
+# canonical-player each game belongs to, plus its outcome provenance. Series
+# context itself is continuous and rebuilt in process, never stored here.
 SHARD_SUMMARY_KEY = "series_summaries"
 
 
 def observation_field_specs() -> tuple[tuple[str, tuple[int, ...], torch.dtype], ...]:
-    """Observation tensors stacked along a leading decision axis.
+    """
+    Observation tensors stacked along a leading decision axis.
 
     Derived from StructuredObservation._FIELD_SPECS so an observation-schema
     change cannot silently diverge from the shard layout.
     """
     return tuple(
         (name, (-1, *shape), dtype) for name, shape, dtype in StructuredObservation._FIELD_SPECS
+    )
+
+
+# Each game perspective's board after its last line, stacked along a leading
+# game axis under these prefixed names. It feeds series memory only and has no
+# label, mask or outcome.
+FINAL_OBSERVATION_PREFIX = "final_"
+
+
+def final_observation_field_specs() -> tuple[tuple[str, tuple[int, ...], torch.dtype], ...]:
+    """Final-observation tensors stacked along a leading game axis."""
+    return tuple(
+        (f"{FINAL_OBSERVATION_PREFIX}{name}", shape, dtype)
+        for name, shape, dtype in observation_field_specs()
     )
 
 
@@ -81,13 +90,11 @@ class ShardIndexEntry:
     series: int
     byte_size: int
 
-    _FIELDS = frozenset({"filename", "sha256", "decisions", "games", "series", "byte_size"})
-
     def __post_init__(self) -> None:
         if not self.filename:
             raise ValueError("ShardIndexEntry.filename must be non-empty")
 
-        if not _is_sha256(self.sha256):
+        if not is_sha256(self.sha256):
             raise ValueError("ShardIndexEntry.sha256 must be a lowercase SHA-256 digest")
 
         for name, count in (
@@ -101,19 +108,12 @@ class ShardIndexEntry:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the index entry to a JSON-serializable dictionary."""
-        return {
-            "filename": self.filename,
-            "sha256": self.sha256,
-            "decisions": self.decisions,
-            "games": self.games,
-            "series": self.series,
-            "byte_size": self.byte_size,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShardIndexEntry:
         """Parse a JSON dictionary into a ShardIndexEntry after validation."""
-        _require_fields(value, cls._FIELDS, "ShardIndexEntry")
+        require_dataclass_fields(value, cls)
 
         return cls(
             filename=str(value["filename"]),
@@ -129,7 +129,7 @@ class ShardIndexEntry:
 class ShardManifest:
     """Index and immutable identity for one compiled shard family."""
 
-    runtime_contract_sha256: str
+    global_contract_sha256: str
     shards: tuple[ShardIndexEntry, ...]
     diagnostics: Mapping[str, int]
     created_at: str
@@ -142,34 +142,7 @@ class ShardManifest:
     accepted_games: int
     rejected_games: int
     artifact_hashes: Mapping[str, str]
-    compilation_semantics: str = BO3_COMPILATION_SEMANTICS
     artifact_schema: str = SHARD_ARTIFACT_SCHEMA
-    observation_schema_version: int = OBSERVATION_SCHEMA_VERSION
-    replay_ir_schema_version: int = REPLAY_IR_SCHEMA_VERSION
-    series_summary_schema_version: int = SERIES_SUMMARY_SCHEMA_VERSION
-
-    _FIELDS = frozenset(
-        {
-            "runtime_contract_sha256",
-            "dataset_hash",
-            "source_format_id",
-            "compilation_semantics",
-            "build_config",
-            "raw_replays",
-            "source_series",
-            "source_games",
-            "accepted_games",
-            "rejected_games",
-            "artifact_hashes",
-            "shards",
-            "diagnostics",
-            "created_at",
-            "artifact_schema",
-            "observation_schema_version",
-            "replay_ir_schema_version",
-            "series_summary_schema_version",
-        }
-    )
 
     def __post_init__(self) -> None:
         if self.artifact_schema != SHARD_ARTIFACT_SCHEMA:
@@ -178,43 +151,22 @@ class ShardManifest:
                 f"expected {SHARD_ARTIFACT_SCHEMA}"
             )
 
-        for name, declared, expected in (
-            (
-                "observation_schema_version",
-                self.observation_schema_version,
-                OBSERVATION_SCHEMA_VERSION,
-            ),
-            ("replay_ir_schema_version", self.replay_ir_schema_version, REPLAY_IR_SCHEMA_VERSION),
-            (
-                "series_summary_schema_version",
-                self.series_summary_schema_version,
-                SERIES_SUMMARY_SCHEMA_VERSION,
-            ),
-        ):
-            if declared != expected:
-                raise ValueError(
-                    f"ShardManifest.{name} {declared!r} does not match the active {expected}"
-                )
-
-        if not _is_sha256(self.runtime_contract_sha256):
+        if not is_sha256(self.global_contract_sha256):
             raise ValueError(
-                "ShardManifest.runtime_contract_sha256 must be a lowercase SHA-256 digest"
+                "ShardManifest.global_contract_sha256 must be a lowercase SHA-256 digest"
             )
 
-        if not _is_sha256(self.dataset_hash):
+        if not is_sha256(self.dataset_hash):
             raise ValueError("ShardManifest.dataset_hash must be a lowercase SHA-256 digest")
 
         if not self.source_format_id:
             raise ValueError("ShardManifest.source_format_id must be non-empty")
 
-        if self.compilation_semantics != BO3_COMPILATION_SEMANTICS:
-            raise ValueError(f"Unsupported compilation semantics {self.compilation_semantics!r}")
-
         if not isinstance(self.build_config, Mapping):
             raise ValueError("ShardManifest.build_config must be a mapping")
 
         for replay_id, digest in self.raw_replays.items():
-            if not replay_id or not _is_sha256(digest):
+            if not replay_id or not is_sha256(digest):
                 raise ValueError("ShardManifest.raw_replays contains an invalid identity")
 
         for series_id, replay_ids in self.source_series.items():
@@ -243,15 +195,22 @@ class ShardManifest:
         if len(self.raw_replays) != self.source_games:
             raise ValueError("ShardManifest.raw_replays must account for every source game")
 
+        if self.games != self.accepted_games * 2:
+            raise ValueError("Shard game counts must contain two perspectives per accepted game")
+
         for filename, digest in self.artifact_hashes.items():
-            if not filename or not _is_sha256(digest):
+            if not filename or not is_sha256(digest):
                 raise ValueError("ShardManifest.artifact_hashes contains an invalid entry")
 
         seen: set[str] = set()
+        digests: set[str] = set()
         for entry in self.shards:
             if entry.filename in seen:
                 raise ValueError(f"Duplicate shard filename {entry.filename!r}")
+            if entry.sha256 in digests:
+                raise ValueError(f"Duplicate shard content {entry.sha256!r}")
             seen.add(entry.filename)
+            digests.add(entry.sha256)
 
         for key, count in self.diagnostics.items():
             if not isinstance(key, str) or type(count) is not int or count < 0:
@@ -275,10 +234,9 @@ class ShardManifest:
         """Convert the manifest identity to a JSON-serializable dictionary."""
         return {
             "artifact_schema": self.artifact_schema,
-            "runtime_contract_sha256": self.runtime_contract_sha256,
+            "global_contract_sha256": self.global_contract_sha256,
             "dataset_hash": self.dataset_hash,
             "source_format_id": self.source_format_id,
-            "compilation_semantics": self.compilation_semantics,
             "build_config": dict(self.build_config),
             "raw_replays": {
                 replay_id: self.raw_replays[replay_id] for replay_id in sorted(self.raw_replays)
@@ -294,9 +252,6 @@ class ShardManifest:
                 filename: self.artifact_hashes[filename]
                 for filename in sorted(self.artifact_hashes)
             },
-            "observation_schema_version": self.observation_schema_version,
-            "replay_ir_schema_version": self.replay_ir_schema_version,
-            "series_summary_schema_version": self.series_summary_schema_version,
             "shards": [entry.to_dict() for entry in self.shards],
             "diagnostics": {key: self.diagnostics[key] for key in sorted(self.diagnostics)},
             "created_at": self.created_at,
@@ -305,7 +260,7 @@ class ShardManifest:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShardManifest:
         """Parse a JSON dictionary into a ShardManifest after validation."""
-        _require_fields(value, cls._FIELDS, "ShardManifest")
+        require_dataclass_fields(value, cls)
 
         diagnostics = value["diagnostics"]
         if not isinstance(diagnostics, Mapping):
@@ -326,10 +281,9 @@ class ShardManifest:
 
         return cls(
             artifact_schema=str(value["artifact_schema"]),
-            runtime_contract_sha256=str(value["runtime_contract_sha256"]),
+            global_contract_sha256=str(value["global_contract_sha256"]),
             dataset_hash=str(value["dataset_hash"]),
             source_format_id=str(value["source_format_id"]),
-            compilation_semantics=str(value["compilation_semantics"]),
             build_config=dict(build_config),
             raw_replays={str(replay_id): str(digest) for replay_id, digest in raw_replays.items()},
             source_series={
@@ -342,9 +296,6 @@ class ShardManifest:
             artifact_hashes={
                 str(filename): str(digest) for filename, digest in artifact_hashes.items()
             },
-            observation_schema_version=int(value["observation_schema_version"]),
-            replay_ir_schema_version=int(value["replay_ir_schema_version"]),
-            series_summary_schema_version=int(value["series_summary_schema_version"]),
             shards=tuple(ShardIndexEntry.from_dict(entry) for entry in value["shards"]),
             diagnostics={str(key): int(count) for key, count in diagnostics.items()},
             created_at=str(value["created_at"]),
@@ -360,14 +311,19 @@ def load_shard_manifest(
 
 
 def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
-    """Check a shard tensor payload against the frozen layout above.
+    """
+    Check a shard tensor payload against the frozen layout above.
 
     Shared by compilation and loading so a writer cannot emit a payload the
     reader would reject.
     """
     expected = {
         name: (shape, dtype)
-        for name, shape, dtype in (*observation_field_specs(), *SHARD_TENSOR_SPECS)
+        for name, shape, dtype in (
+            *observation_field_specs(),
+            *final_observation_field_specs(),
+            *SHARD_TENSOR_SPECS,
+        )
     }
 
     if set(tensors) != set(expected):
@@ -391,6 +347,22 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
     decisions = tensors["loss_mask"].shape[0]
     candidate_offsets = tensors["candidate_offsets"]
 
+    if decisions == 0:
+        raise ValueError("Published replay shards must contain at least one decision")
+
+    decision_fields = {name for name, _, _ in observation_field_specs()} | {
+        "action_mask",
+        "mask_provenance",
+        "label_kind",
+        "label_confidence",
+        "loss_mask",
+        "decision_type",
+        "exact_action",
+        "outcome",
+    }
+    if any(tensors[name].shape[0] != decisions for name in decision_fields):
+        raise ValueError("Shard decision tensors must have the same leading dimension")
+
     if (
         candidate_offsets.shape != (decisions + 1,)
         or candidate_offsets[0].item() != 0
@@ -402,17 +374,26 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
     for name in ("game_offsets", "series_offsets"):
         offsets = tensors[name]
         if (
-            offsets[0].item() != 0
+            offsets.numel() < 2
+            or offsets.shape[0] > decisions + 1
+            or offsets[0].item() != 0
             or offsets[-1].item() != decisions
-            or torch.any(offsets[1:] < offsets[:-1])
+            or torch.any(offsets[1:] <= offsets[:-1])
         ):
-            raise ValueError(f"Shard {name} must be nondecreasing and end at decisions")
+            raise ValueError(f"Shard {name} must increase from zero to the decision count")
 
-    if decisions == 0:
-        raise ValueError("Published replay shards must contain at least one decision")
+    games = tensors["game_offsets"].numel() - 1
+    if any(tensors[name].shape[0] != games for name, _, _ in final_observation_field_specs()):
+        raise ValueError("Shard final observations must hold exactly one row per game")
+
+    game_boundaries = set(tensors["game_offsets"].tolist())
+    if any(offset not in game_boundaries for offset in tensors["series_offsets"].tolist()):
+        raise ValueError("Shard series_offsets must fall on game boundaries")
 
     if not torch.isfinite(tensors["label_confidence"]).all():
         raise ValueError("Shard label_confidence contains non-finite values")
+    if torch.any((tensors["label_confidence"] < 0) | (tensors["label_confidence"] > 1)):
+        raise ValueError("Shard label_confidence must be in [0, 1]")
 
     if (
         not torch.isfinite(tensors["loss_mask"]).all()
@@ -429,11 +410,14 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
     if torch.any(~action_mask.any(dim=-1)):
         raise ValueError("Every action slot must contain at least one legal action")
 
+    if torch.any(tensors["mask_provenance"] != int(MaskProvenance.CONSERVATIVE_RECONSTRUCTED)):
+        raise ValueError("Shard mask_provenance contains an unsupported value")
+
     label_kind = tensors["label_kind"]
     counts = candidate_offsets[1:] - candidate_offsets[:-1]
-    exact = label_kind == 1
-    partial = label_kind == 2
-    unknown = label_kind == 3
+    exact = label_kind == int(LabelKind.EXACT)
+    partial = label_kind == int(LabelKind.PARTIAL)
+    unknown = label_kind == int(LabelKind.UNKNOWN)
 
     if torch.any(~(exact | partial | unknown)):
         raise ValueError("Shard label_kind contains an unsupported value")
@@ -453,6 +437,8 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
         raise ValueError("Shard candidate action ids are outside the action contract")
 
     if candidates.numel():
+        if torch.any(tensors["exact_action"][exact] != candidates[candidate_offsets[:-1][exact]]):
+            raise ValueError("Shard exact actions must match their only candidate")
         owners = torch.repeat_interleave(torch.arange(decisions), counts)
         legal = action_mask[owners, 0, candidates[:, 0]] & action_mask[owners, 1, candidates[:, 1]]
 
@@ -461,8 +447,32 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
             & (candidates[:, 0] <= 6)
             & (candidates[:, 0] == candidates[:, 1])
         )
-        mega_first = (candidates[:, 0] >= 27) & (candidates[:, 0] <= 47)
-        mega_second = (candidates[:, 1] >= 27) & (candidates[:, 1] <= 47)
+        # Only one mega per turn, but the same id range encodes team-preview pairs,
+        # where both actions legitimately fall inside it.
+        is_turn = tensors["decision_type"][owners] != int(DecisionType.TEAM_PREVIEW)
+        mega_first = (
+            is_turn
+            & (candidates[:, 0] >= MEGA_MOVE_START)
+            & (candidates[:, 0] <= MEGA_FORCED_ACTION)
+        )
+        mega_second = (
+            is_turn
+            & (candidates[:, 1] >= MEGA_MOVE_START)
+            & (candidates[:, 1] <= MEGA_FORCED_ACTION)
+        )
 
         if torch.any(~legal | same_switch | (mega_first & mega_second)):
             raise ValueError("Shard contains an illegal labeled candidate")
+
+    decision_type = tensors["decision_type"]
+    if torch.any(
+        ~torch.isin(
+            decision_type,
+            torch.tensor(
+                tuple(int(value) for value in DecisionType if value), device=decision_type.device
+            ),
+        )
+    ):
+        raise ValueError("Shard decision_type contains an unsupported value")
+    if torch.any((tensors["outcome"] < -1) | (tensors["outcome"] > 1)):
+        raise ValueError("Shard outcomes must be in [-1, 1]")

@@ -5,16 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from p0.battle.actions import (
-    ACT_SIZE,
-    FORCED_ACTION,
-    MEGA_FORCED_ACTION,
-    PASS_ACTION,
-    SWITCH_START,
-    ActionKind,
-    SlotAction,
-    encode_action,
-)
+from p0.battle.actions import ACT_SIZE, PASS_ACTION
 from p0.battle.legality import (
     DecisionView,
     apply_joint_constraints,
@@ -22,6 +13,12 @@ from p0.battle.legality import (
     slot1_base_mask,
 )
 from p0.replays.schema import ActionEvidence, LabelKind, MaskProvenance
+
+# Label confidence: a fully observed single action, several observed candidates, and
+# any label that needed an unobserved slot filled from its legal actions.
+EXACT_CONFIDENCE = 1.0
+PARTIAL_CONFIDENCE = 0.75
+UNCERTAIN_CONFIDENCE = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +77,7 @@ def enumerate_joint_candidates(
     if not first_actions or not second_actions:
         return ()
 
-    legal0 = legal_actions(view, 0)
+    legal0 = frozenset(legal_actions(view, 0))
     base_slot1 = slot1_base_mask(view)
 
     for first_action in first_actions:
@@ -99,12 +96,12 @@ def enumerate_joint_candidates(
     return tuple(candidates)
 
 
-def _unknown(tags: Iterable[str], provenance: MaskProvenance) -> ActionEvidence:
+def _unknown(tags: Iterable[str]) -> ActionEvidence:
     return ActionEvidence(
         label_kind=LabelKind.UNKNOWN,
         candidates=(),
         confidence=0.0,
-        mask_provenance=provenance,
+        mask_provenance=MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
         tags=tuple(dict.fromkeys(tags)),
     )
 
@@ -117,20 +114,18 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
     tags = list(request.tags)
     if request.unknown:
         tags.append("unsupported")
-        return _unknown(tags, MaskProvenance.CONSERVATIVE_RECONSTRUCTED)
+        return _unknown(tags)
 
     scalar: list[tuple[int, ...]] = []
     uncertain = False
     for slot in request.slots:
         if slot is None or not slot.candidates:
             legal = legal_actions(request.view, len(scalar))
-            if slot is None and legal == (PASS_ACTION,):
-                scalar.append(legal)
-                tags.append("implicit_pass")
-                continue
-
             scalar.append(legal)
-            uncertain = True
+            if slot is None and legal == (PASS_ACTION,):
+                tags.append("implicit_pass")
+            else:
+                uncertain = True
             continue
 
         scalar.append(slot.candidates)
@@ -142,22 +137,17 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
         request.view, scalar[0], scalar[1], max_candidates=request.max_candidates
     )
     if not candidates:
-        if any(len(values) > 0 for values in scalar):
+        if any(scalar):
             tags.append("candidate_cap_or_illegal")
-        return _unknown(tags, MaskProvenance.CONSERVATIVE_RECONSTRUCTED)
+        return _unknown(tags)
 
-    if len(candidates) == 1:
-        return ActionEvidence(
-            LabelKind.EXACT,
-            candidates,
-            1.0 if not uncertain else 0.5,
-            MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
-            tuple(dict.fromkeys(tags)),
-        )
-
-    confidence = 0.75 if not uncertain else 0.5
+    exact = len(candidates) == 1
+    if uncertain:
+        confidence = UNCERTAIN_CONFIDENCE
+    else:
+        confidence = EXACT_CONFIDENCE if exact else PARTIAL_CONFIDENCE
     return ActionEvidence(
-        LabelKind.PARTIAL,
+        LabelKind.EXACT if exact else LabelKind.PARTIAL,
         candidates,
         confidence,
         MaskProvenance.CONSERVATIVE_RECONSTRUCTED,
@@ -165,38 +155,9 @@ def extract_action_evidence(request: EvidenceRequest) -> ActionEvidence:
     )
 
 
-def observed_move_action(
-    *,
-    move_slot: int | None,
-    target: int | None,
-    mega: bool = False,
-    forced: bool = False,
-    tag: str = "",
-) -> ObservedAction:
-    """Encode a protocol move, retaining target ambiguity as alternatives."""
-    if forced:
-        return ObservedAction(MEGA_FORCED_ACTION if mega else FORCED_ACTION, exact=True, tag=tag)
-    if move_slot is None or target is None:
-        return ObservedAction(None, exact=False, tag=tag or "move_slot_or_target_unknown")
-
-    return ObservedAction(
-        encode_action(SlotAction(ActionKind.MOVE, move_slot=move_slot, target=target, mega=mega)),
-        exact=True,
-        tag=tag,
-    )
-
-
-def observed_switch_action(slot: int | None, *, tag: str = "") -> ObservedAction:
-    if slot is None:
-        return ObservedAction(None, exact=False, tag=tag or "switch_slot_unknown")
-    return ObservedAction(SWITCH_START + slot, exact=True, tag=tag)
-
-
 __all__ = [
     "EvidenceRequest",
     "ObservedAction",
     "enumerate_joint_candidates",
     "extract_action_evidence",
-    "observed_move_action",
-    "observed_switch_action",
 ]

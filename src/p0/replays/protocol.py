@@ -1,4 +1,5 @@
-"""Parsing of public Showdown replay payloads into ordered pure records.
+"""
+Parsing of public Showdown replay payloads into ordered pure records.
 
 This module understands transport JSON and the line-oriented Showdown protocol,
 but does not simulate a battle. Keeping parsing here makes reconstruction
@@ -10,24 +11,59 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
 import orjson
 
-from p0.replays.identity import canonical_format_id, normalize_showdown_id
+from p0.replays.identity import (
+    ReplayMemberId,
+    ReplaySide,
+    canonical_format_id,
+    normalize_showdown_id,
+)
 from p0.replays.schema import (
     GameEndReason,
     OTSData,
+    OTSMember,
     ProtocolLine,
     ReplayMetadata,
     ReplayOutcome,
 )
 
+_TRAILING_RESULT_TAGS = frozenset(
+    {
+        "",
+        "t:",
+        "message",
+        "-message",
+        "raw",
+        "html",
+        "uhtml",
+        "uhtmlchange",
+        "allowleave",
+        "inactive",
+        "inactiveoff",
+        "j",
+        "l",
+        "player",
+        "c",
+        "chat",
+        "c:",
+        "chatmsg",
+    }
+)
+
 
 class ReplayParseError(ValueError):
     """Raised when a response is not a supported public replay payload."""
+
+    category = "INVALID_INPUT_CONTRACT"
+
+
+class ReplayInputContractError(ReplayParseError):
+    """Raised when transport, metadata, OTS, or terminal input is unusable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +80,7 @@ class ReplayDocument:
         for expected, line in enumerate(self.protocol_lines):
             if line.index != expected:
                 raise ValueError("ReplayDocument protocol lines must be contiguous and ordered")
-        if tuple(ots.player for ots in self.ots) != ("p1", "p2"):
+        if tuple(ots.side for ots in self.ots) != (ReplaySide.P1, ReplaySide.P2):
             raise ValueError("ReplayDocument.ots must be ordered as p1 and p2")
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,7 +110,10 @@ class ReplayDocument:
 
 def _as_object(payload: bytes | str | Mapping[str, Any]) -> tuple[Mapping[str, Any], bytes]:
     if isinstance(payload, Mapping):
-        encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+        try:
+            encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+        except (TypeError, ValueError) as exc:
+            raise ReplayInputContractError("Replay payload contains non-JSON metadata") from exc
         return payload, encoded
 
     raw = payload.encode("utf-8") if isinstance(payload, str) else payload
@@ -88,7 +127,7 @@ def _as_object(payload: bytes | str | Mapping[str, Any]) -> tuple[Mapping[str, A
 
 
 def _timestamp(value: Any) -> str:
-    if isinstance(value, (int, float)) and value >= 0:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
         return datetime.fromtimestamp(value, UTC).isoformat().replace("+00:00", "Z")
 
     if isinstance(value, str) and value:
@@ -153,10 +192,22 @@ def _metadata(
         upload_time=_timestamp(value.get("uploadtime", value.get("upload_time"))),
         room_id=room_id,
         parent_room=parent_room,
-        game_number=int(v) if (v := value.get("game_number")) else None,
-        rating=int(v) if (v := value.get("rating")) else None,
-        views=int(v) if (v := value.get("views")) else None,
+        game_number=_optional_int(value, "game_number"),
+        rating=_optional_int(value, "rating"),
+        views=_optional_int(value, "views"),
     )
+
+
+def _optional_int(value: Mapping[str, Any], field: str) -> int | None:
+    candidate = value.get(field)
+    if candidate in (None, ""):
+        return None
+    if isinstance(candidate, bool):
+        raise ReplayInputContractError(f"Replay metadata {field} must be an integer")
+    try:
+        return int(candidate)
+    except (TypeError, ValueError) as exc:
+        raise ReplayInputContractError(f"Replay metadata {field} must be an integer") from exc
 
 
 def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
@@ -177,12 +228,16 @@ def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
             continue
 
         if not line.startswith("|"):
+            # The replay endpoint occasionally emits the room's plain MESSAGE
+            # text as an unframed line after a chat record.  It carries no
+            # battle state and must not make an otherwise valid replay fail.
             if skipping_chat_response:
+                skipping_chat_response = False
                 continue
             raise ReplayParseError(f"Malformed protocol line {index}: {line!r}")
 
         parts_list = line.split("|")
-        if len(parts_list) >= 2 and parts_list[1] in {"c", "chatmsg"}:
+        if len(parts_list) >= 2 and parts_list[1] in {"c", "chat", "c:", "chatmsg"}:
             skipping_chat_response = True
             continue
 
@@ -199,82 +254,173 @@ def _protocol_lines(log: Any) -> tuple[ProtocolLine, ...]:
     return tuple(result)
 
 
-def _details_from_payload(payload: str) -> dict[str, dict[str, Any]]:
-    if not payload:
-        return {}
+def _moves(value: Any) -> tuple[str, ...]:
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        return tuple(move for move in value.split(",") if move)
+    if isinstance(value, (list, tuple)) and all(isinstance(move, str) and move for move in value):
+        return tuple(value)
+    raise ReplayParseError("OTS moves must be a comma-separated string or string array")
 
+
+def _level(value: Any) -> int:
+    if value is None or value == "":
+        return 50
+    normalized = value.lstrip("L") if isinstance(value, str) else value
+    try:
+        level = int(normalized)
+    except (TypeError, ValueError) as exc:
+        raise ReplayParseError(f"Invalid OTS level {value!r}") from exc
+    if not 1 <= level <= 100:
+        raise ReplayParseError(f"OTS level must be in [1, 100], received {level}")
+    return level
+
+
+def _serialized_evs(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (Mapping, list, tuple)):
+        return orjson.dumps(value, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+    raise ReplayParseError("OTS EVs must be a string, object, or array")
+
+
+def _optional_ots_string(entry: Mapping[str, Any], field: str) -> str:
+    value = entry.get(field)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ReplayParseError(f"OTS {field} must be a string when present")
+    return value
+
+
+def _parse_mapping_ots_member(
+    side: ReplaySide,
+    roster_index: int,
+    entry: Mapping[str, Any],
+) -> OTSMember:
+    species_value = entry.get("species", entry.get("name"))
+    if not isinstance(species_value, str) or not species_value.strip():
+        raise ReplayParseError(f"OTS member {side.value}[{roster_index}] has no species")
+    species = species_value.split(",", 1)[0].strip()
+    nickname_value = entry.get("name")
+    if nickname_value is not None and not isinstance(nickname_value, str):
+        raise ReplayParseError("OTS name must be a string when present")
+    nickname = nickname_value or species
+    raw = orjson.dumps(entry, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+    return OTSMember(
+        member_id=ReplayMemberId(side, roster_index),
+        nickname=nickname,
+        species=species,
+        item=_optional_ots_string(entry, "item"),
+        ability=_optional_ots_string(entry, "ability"),
+        moves=_moves(entry.get("moves")),
+        nature=_optional_ots_string(entry, "nature"),
+        gender=_optional_ots_string(entry, "gender"),
+        level=_level(entry.get("level")),
+        evs=_serialized_evs(entry.get("evs")),
+        raw_packed_set=raw,
+    )
+
+
+def _parse_packed_ots_member(
+    side: ReplaySide,
+    roster_index: int,
+    packed_set: str,
+) -> OTSMember:
+    fields = packed_set.split("|")
+    if len(fields) < 5 or not fields[0]:
+        raise ReplayParseError(f"Malformed packed OTS member {side.value}[{roster_index}]")
+    nickname = fields[0]
+    species = fields[1] or nickname
+    return OTSMember(
+        member_id=ReplayMemberId(side, roster_index),
+        nickname=nickname,
+        species=species,
+        item=fields[2],
+        ability=fields[3],
+        moves=_moves(fields[4]),
+        nature=fields[5] if len(fields) > 5 else "",
+        gender=fields[7] if len(fields) > 7 else "",
+        level=_level(fields[10] if len(fields) > 10 else None),
+        evs=fields[6] if len(fields) > 6 else "",
+        raw_packed_set=packed_set,
+    )
+
+
+def _parse_showteam_payload(side: ReplaySide, payload: str) -> tuple[OTSMember, ...]:
+    if not payload:
+        raise ReplayParseError(f"Empty showteam payload for {side.value}")
     try:
         value = orjson.loads(payload)
     except orjson.JSONDecodeError:
         value = None
 
-    details: dict[str, dict[str, Any]] = {}
-    if isinstance(value, list):
-        entries = value
-    elif isinstance(value, Mapping):
-        entries = value.get("team", value.get("pokemon", ()))
+    if isinstance(value, Mapping):
+        entries = value.get("team", value.get("pokemon"))
     else:
-        entries = ()
-        for packed_set in payload.split("]"):
-            fields = packed_set.split("|")
-            if len(fields) < 5 or not fields[0]:
-                continue
-            species = fields[1] or fields[0]
-            details[species] = {
-                "name": fields[0],
-                "species": species,
-                "item": fields[2],
-                "ability": fields[3],
-                "moves": tuple(move for move in fields[4].split(",") if move),
-                "nature": fields[5] if len(fields) > 5 else "",
-                "evs": fields[6] if len(fields) > 6 else "",
-                "level": fields[10] if len(fields) > 10 and fields[10] else 100,
-            }
+        entries = value
 
     if isinstance(entries, list):
-        for entry in entries:
+        members = []
+        for roster_index, entry in enumerate(entries):
             if isinstance(entry, Mapping):
-                name = entry.get("species", entry.get("name"))
-                if isinstance(name, str) and name:
-                    species = name.split(",", 1)[0].strip()
-                    entry_details = dict(entry)
-                    details[species] = entry_details
+                members.append(_parse_mapping_ots_member(side, roster_index, entry))
             elif isinstance(entry, str) and entry:
                 species = entry.split(",", 1)[0].strip()
-                details[species] = {"raw": entry}
+                members.append(
+                    _parse_mapping_ots_member(
+                        side,
+                        roster_index,
+                        {"name": species, "species": species, "raw": entry},
+                    )
+                )
+            else:
+                raise ReplayParseError(
+                    f"OTS member {side.value}[{roster_index}] must be an object or string"
+                )
+    elif value is None:
+        packed_sets = payload.split("]")
+        members = [
+            _parse_packed_ots_member(side, roster_index, packed_set)
+            for roster_index, packed_set in enumerate(packed_sets)
+            if packed_set
+        ]
+    else:
+        raise ReplayParseError(f"Unsupported showteam payload for {side.value}")
 
-    return details
+    if not members:
+        raise ReplayParseError(f"Showteam payload for {side.value} contains no members")
+    if len(members) > 6:
+        raise ReplayParseError(f"Showteam payload for {side.value} contains more than six members")
+    return tuple(members)
 
 
 def _ots(lines: tuple[ProtocolLine, ...]) -> tuple[OTSData, OTSData]:
-    payloads = {"p1": [], "p2": []}
-    species: dict[str, list[str]] = {"p1": [], "p2": []}
-    details: dict[str, dict[str, Mapping[str, Any]]] = {"p1": {}, "p2": {}}
+    payloads: dict[ReplaySide, list[str]] = {ReplaySide.P1: [], ReplaySide.P2: []}
     for line in lines:
-        if len(line.parts) < 3:
+        if len(line.parts) < 4 or line.parts[1] != "showteam":
             continue
+        try:
+            side = ReplaySide(line.parts[2])
+        except ValueError as exc:
+            raise ReplayParseError(f"Invalid showteam side at line {line.index}") from exc
+        payloads[side].append("|".join(line.parts[3:]))
 
-        tag = line.parts[1]
-        if tag == "showteam" and len(line.parts) >= 4 and line.parts[2] in payloads:
-            payload = "|".join(line.parts[3:])
-            payloads[line.parts[2]].append(payload)
-            payload_details = _details_from_payload(payload)
-            species[line.parts[2]].extend(payload_details)
-            details[line.parts[2]].update(payload_details)
-        elif tag == "poke" and line.parts[2] in species and len(line.parts) >= 4:
-            species[line.parts[2]].append(line.parts[3].split(",", 1)[0].strip())
-
-    result = []
-    for player in ("p1", "p2"):
-        raw = "\n".join(payloads[player])
-        result.append(
-            OTSData(
-                player=player,
-                raw_payload=raw,
-                revealed_species=tuple(dict.fromkeys(item for item in species[player] if item)),
-                revealed_details=details[player],
+    result: list[OTSData] = []
+    for side in (ReplaySide.P1, ReplaySide.P2):
+        if len(payloads[side]) > 1:
+            raise ReplayParseError(
+                f"Replay cannot contain repeated showteam payloads for {side.value}; "
+                f"received {len(payloads[side])}"
             )
-        )
+        if not payloads[side]:
+            result.append(OTSData(side, "", ()))
+            continue
+        raw_payload = payloads[side][0]
+        result.append(OTSData(side, raw_payload, _parse_showteam_payload(side, raw_payload)))
 
     return result[0], result[1]
 
@@ -284,24 +430,60 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
     end_reason = GameEndReason.NORMAL
     terminal: int | None = None
     players = tuple(normalize_showdown_id(name) for name in metadata.player_names)
+    pending_message_reason: GameEndReason | None = None
+    result_seen = False
     for line in lines:
-        if len(line.parts) < 3:
+        if len(line.parts) < 2:
             continue
         tag = line.parts[1]
+        if result_seen and tag not in _TRAILING_RESULT_TAGS:
+            raise ReplayInputContractError(
+                f"Battle event after terminal result at index {line.index}"
+            )
+        if tag in {"message", "-message"}:
+            text = "|".join(line.parts[2:]).casefold()
+            if any(word in text for word in ("timed out", "timeout", "inactive", "inactivity")):
+                pending_message_reason = GameEndReason.TIMEOUT
+            elif "forfeit" in text or "changing their name" in text or "inappropriate name" in text:
+                pending_message_reason = GameEndReason.FORFEIT
+            continue
         if tag == "win":
+            if len(line.parts) != 3 or not line.parts[2]:
+                raise ReplayInputContractError(f"Malformed win line at index {line.index}")
             terminal = line.index
             winner_name = normalize_showdown_id(line.parts[2])
             if winner_name in players:
                 winner = players.index(winner_name)
+            else:
+                raise ReplayInputContractError(
+                    f"Win line names an unknown player at index {line.index}"
+                )
+            result_seen = True
         elif tag == "tie":
+            if len(line.parts) != 2:
+                raise ReplayInputContractError(f"Malformed tie line at index {line.index}")
             terminal = line.index
+            winner = -1
+            result_seen = True
         elif tag == "forfeit":
+            if len(line.parts) != 3 or not line.parts[2]:
+                raise ReplayInputContractError(f"Malformed forfeit line at index {line.index}")
             terminal = line.index
             end_reason = GameEndReason.FORFEIT
-        elif tag == "message" and "timeout" in line.parts[-1].casefold():
-            end_reason = GameEndReason.TIMEOUT
-            terminal = line.index
+        if tag in {"win", "tie"} and pending_message_reason is not None:
+            end_reason = pending_message_reason
     turns = max((line.turn or 0 for line in lines), default=0)
+    if terminal is None:
+        # Incomplete captures are retained for grouping/quarantine.  A
+        # terminal marker is required before reconstruction, but its absence
+        # is not malformed transport input.
+        return ReplayOutcome(-1, GameEndReason.NORMAL, turns, None)
+    if (
+        winner < 0
+        and end_reason is GameEndReason.NORMAL
+        and any(line.parts[1] == "win" for line in lines if len(line.parts) > 1)
+    ):
+        raise ReplayInputContractError("Replay win outcome has no recognized winner")
     return ReplayOutcome(winner, end_reason, turns, terminal)
 
 
@@ -326,18 +508,7 @@ def _bestof_metadata(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) 
     if parent == metadata.parent_room and game_number == metadata.game_number:
         return metadata
 
-    return ReplayMetadata(
-        replay_id=metadata.replay_id,
-        format_id=metadata.format_id,
-        player_names=metadata.player_names,
-        winner=metadata.winner,
-        upload_time=metadata.upload_time,
-        room_id=metadata.room_id,
-        parent_room=parent,
-        game_number=game_number,
-        rating=metadata.rating,
-        views=metadata.views,
-    )
+    return replace(metadata, parent_room=parent, game_number=game_number)
 
 
 def parse_replay_payload(
@@ -349,19 +520,19 @@ def parse_replay_payload(
     """Parse one public replay response without applying future protocol lines."""
     value, raw = _as_object(payload)
     metadata = _metadata(value, replay_id, format_id)
+    players = tuple(normalize_showdown_id(name) for name in metadata.player_names)
+    if not all(players) or players[0] == players[1]:
+        raise ReplayInputContractError(
+            f"Replay {metadata.replay_id!r} must name two distinct players"
+        )
     lines = _protocol_lines(value.get("log"))
     metadata = _bestof_metadata(metadata, lines)
     return ReplayDocument(metadata, lines, _ots(lines), _outcome(metadata, lines), raw)
 
 
-parse_replay = parse_replay_payload
-parse_protocol = _protocol_lines
-
-
 __all__ = [
     "ReplayDocument",
     "ReplayParseError",
-    "parse_protocol",
-    "parse_replay",
+    "ReplayInputContractError",
     "parse_replay_payload",
 ]

@@ -1,43 +1,51 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
+from hypothesis.internal.conjecture import engine as conjecture_engine
+from poke_env import LocalhostServerConfiguration, ServerConfiguration
 
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
+from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
+from tests.stress._helpers import stress_devices
+
+# Stress strategies intentionally generate large tensor batches. Hypothesis' default
+# choice buffer rejects the configured 128-by-64 case before the test body runs.
+HYPOTHESIS_STRESS_BUFFER_SIZE = 256 * 1024
+conjecture_engine.BUFFER_SIZE = HYPOTHESIS_STRESS_BUFFER_SIZE
 
 
-def _stress_devices() -> tuple[torch.device, ...]:
-    requested = tuple(
-        value.strip().lower()
-        for value in os.getenv("P0_STRESS_DEVICES", "cpu,cuda").split(",")
-        if value.strip()
+@pytest.fixture(scope="function")
+def showdown_server(showdown_assets):
+    """
+    Start live stress tests only when the checked-out server is runnable.
+
+    Dynamically binds an unused loopback port to prevent port collisions between
+    concurrent test workers, launching an isolated Showdown server instance for the test lifecycle.
+    """
+    del showdown_assets
+
+    # Allocate a fresh ephemeral port per-test so parallel stress jobs cannot cross-connect
+    port = allocate_loopback_ports(1)[0]
+    server_configuration = ServerConfiguration(
+        websocket_url=f"ws://localhost:{port}/showdown/websocket",
+        authentication_url=LocalhostServerConfiguration.authentication_url,
     )
-    devices: list[torch.device] = []
-    for name in requested:
-        if name == "cpu":
-            devices.append(torch.device("cpu"))
-        elif name == "cuda" and torch.cuda.is_available():
-            devices.append(torch.device("cuda"))
-        elif name != "cuda":
-            raise ValueError(f"Unsupported stress-test device {name!r}")
-    if not devices:
-        return (torch.device("cpu"),)
-    return tuple(dict.fromkeys(devices))
+    with start_showdown_servers(1, ports=(port,), build_assets=False):
+        yield server_configuration
 
 
-@pytest.fixture(params=_stress_devices(), ids=lambda device: device.type)
+@pytest.fixture(params=stress_devices(), ids=lambda device: device.type)
 def stress_device(request: pytest.FixtureRequest) -> torch.device:
-    """Run device-sensitive tests on CPU and on CUDA when it is available."""
+    """Parametrize device-sensitive stress tests across CPU and available CUDA accelerators."""
     return request.param
 
 
 @pytest.fixture
 def stress_policy(stress_device: torch.device):
-    """Build a small policy so scaling tests remain practical on CPU-only hosts."""
+    """Build a lightweight Transformer policy for fast multi-step stress workloads on CPU or GPU."""
     policy = build_policy(
         ModelConfig(d_model=32, nhead=2, reducer_layers=1, dim_feedforward=128),
         default_runtime_resources(),

@@ -69,25 +69,38 @@ def _time(document: ReplayDocument) -> datetime:
 
 
 def _team_hash(document: ReplayDocument, side: int) -> str:
-    ots = document.ots[side]
-    members = []
-    for species in sorted(ots.revealed_species, key=str.casefold):
-        details = ots.revealed_details.get(species, {})
-        members.append(
-            {
-                "species": species.casefold(),
-                "item": str(details.get("item", "")).casefold(),
-                "ability": str(details.get("ability", "")).casefold(),
-                "nature": str(details.get("nature", "")).casefold(),
-                "moves": sorted(
-                    str(move).casefold()
-                    for move in details.get("moves", ())
-                    if isinstance(move, str)
-                ),
-            }
+    members = sorted(
+        (
+            member.species.casefold(),
+            member.item.casefold(),
+            member.ability.casefold(),
+            member.nature.casefold(),
+            tuple(sorted(move.casefold() for move in member.moves)),
         )
-    payload = orjson.dumps(members, option=orjson.OPT_SORT_KEYS)
+        for member in document.ots[side].members
+    )
+    payload = orjson.dumps(
+        [
+            {"species": species, "item": item, "ability": ability, "nature": nature, "moves": moves}
+            for species, item, ability, nature, moves in members
+        ],
+        option=orjson.OPT_SORT_KEYS,
+    )
     return hashlib.sha256(payload).hexdigest()
+
+
+def _team_hashes(document: ReplayDocument, players: tuple[str, str]) -> tuple[str, str]:
+    """Return both canonical players' team hashes in canonical player order."""
+    roles = _roles(document, players)
+    return _team_hash(document, roles[0]), _team_hash(document, roles[1])
+
+
+def _incomplete_series(group: GroupedSeries) -> GroupingDiagnostic:
+    return GroupingDiagnostic(
+        "incomplete_series",
+        group.record.game_replay_ids,
+        "series does not contain a validated two-win result",
+    )
 
 
 def _series_id(format_id: str, key: str, players: tuple[str, str]) -> str:
@@ -157,17 +170,17 @@ def _series_score(
     players: tuple[str, str],
 ) -> tuple[tuple[int, int], tuple[GroupingDiagnostic, ...]]:
     score = [0, 0]
-    games_after_clinch: list[str] = []
+    games_after_win: list[str] = []
     games_without_winner: list[str] = []
-    clinched = False
+    series_won = False
     for game in games:
-        if clinched:
-            games_after_clinch.append(game.metadata.replay_id)
+        if series_won:
+            games_after_win.append(game.metadata.replay_id)
             continue
         winner = game.outcome.winner
         if winner in (0, 1):
             score[_roles(game, players)[winner]] += 1
-            clinched = max(score) == 2
+            series_won = max(score) == 2
         else:
             games_without_winner.append(game.metadata.replay_id)
     diagnostics: list[GroupingDiagnostic] = []
@@ -179,12 +192,12 @@ def _series_score(
                 f"games have no public winner: {tuple(games_without_winner)}",
             )
         )
-    if games_after_clinch:
+    if games_after_win:
         diagnostics.append(
             GroupingDiagnostic(
-                "game_after_series_clinch",
+                "game_after_series_won",
                 tuple(game.metadata.replay_id for game in games),
-                f"games occur after the series was won: {tuple(games_after_clinch)}",
+                f"games occur after the series was won: {tuple(games_after_win)}",
             )
         )
     return (score[0], score[1]), tuple(diagnostics)
@@ -197,17 +210,7 @@ def _make_group(
     method: GroupingMethod,
     diagnostics: tuple[GroupingDiagnostic, ...] = (),
 ) -> GroupedSeries:
-    """Forms a strict deterministic Series out of a collection of grouped games.
-
-    Arguments:
-        documents: A tuple of replay documents belonging to the same grouping bucket.
-        key: The grouping identifier key (e.g. parent room).
-        method: The method by which these games were grouped.
-        diagnostics: Any existing diagnostics to carry over.
-
-    Returns:
-        A strictly verified and deterministic GroupedSeries.
-    """
+    """Build one checked series from a grouping bucket."""
     if not documents:
         raise ValueError("Cannot group an empty replay collection")
 
@@ -221,17 +224,11 @@ def _make_group(
     numbering_diagnostics = _numbering_diagnostics(ordered, numbers)
     score, outcome_diagnostics = _series_score(ordered, players)
 
-    first_roles = _roles(ordered[0], players)
-    team_hashes = (_team_hash(ordered[0], first_roles[0]), _team_hash(ordered[0], first_roles[1]))
+    team_hashes = _team_hashes(ordered[0], players)
     conflicts = []
 
     for game in ordered[1:]:
-        roles = _roles(game, players)
-        game_hashes = (
-            _team_hash(game, roles[0]),
-            _team_hash(game, roles[1]),
-        )
-        if game_hashes != team_hashes:
+        if _team_hashes(game, players) != team_hashes:
             conflicts.append(
                 GroupingDiagnostic(
                     "team_identity_conflict",
@@ -248,15 +245,8 @@ def _make_group(
         and not any(diagnostic.code == "too_many_games" for diagnostic in diagnostics)
     )
     series_id = _series_id(format_id, key, players)
-    membership_diagnostics = tuple(
-        diagnostic.code
-        for diagnostic in (
-            *diagnostics,
-            *numbering_diagnostics,
-            *outcome_diagnostics,
-            *conflicts,
-        )
-    )
+    group_diagnostics = (*diagnostics, *numbering_diagnostics, *outcome_diagnostics, *conflicts)
+    membership_diagnostics = tuple(diagnostic.code for diagnostic in group_diagnostics)
 
     memberships = tuple(
         SeriesMembership(
@@ -283,14 +273,6 @@ def _make_group(
         grouping_method=method,
         grouping_confidence=1.0 if method is GroupingMethod.PARENT_ROOM else 0.5,
     )
-
-    group_diagnostics = (
-        *diagnostics,
-        *numbering_diagnostics,
-        *outcome_diagnostics,
-        *conflicts,
-    )
-
     return GroupedSeries(record, ordered, memberships, group_diagnostics)
 
 
@@ -300,7 +282,8 @@ def group_replays(
     format_id: str | None = None,
     max_games: int = 3,
 ) -> GroupingResult:
-    """Group compatible documents without merging conflicting player pairs.
+    """
+    Group compatible documents without merging conflicting player pairs.
 
     Arguments:
         documents: Parsed, model-agnostic replay documents.
@@ -357,8 +340,7 @@ def group_replays(
             chunks: list[list[ReplayDocument]] = [[]]
             previous_hashes: tuple[str, str] | None = None
             for game in games:
-                roles = _roles(game, bucket[2])
-                hashes = (_team_hash(game, roles[0]), _team_hash(game, roles[1]))
+                hashes = _team_hashes(game, bucket[2])
                 if previous_hashes is not None and hashes != previous_hashes:
                     diagnostics.append(
                         GroupingDiagnostic(
@@ -380,42 +362,35 @@ def group_replays(
                     result.append(group)
                     diagnostics.extend(group.diagnostics)
                     if not group.record.is_complete:
-                        diagnostics.append(
-                            GroupingDiagnostic(
-                                "incomplete_series",
-                                group.record.game_replay_ids,
-                                "series does not contain a validated two-win result",
-                            )
-                        )
+                        diagnostics.append(_incomplete_series(group))
                 continue
         group_diagnostics: list[GroupingDiagnostic] = []
         if len(games) > max_games:
             diagnostic = GroupingDiagnostic(
                 "too_many_games",
                 tuple(game.metadata.replay_id for game in games),
-                f"group contains {len(games)} games; retained first {max_games}",
+                f"group contains {len(games)} games; exceeds {max_games}",
             )
             diagnostics.append(diagnostic)
             group_diagnostics.append(diagnostic)
-            games = games[:max_games]
-        group = _make_group(
-            games,
-            key=bucket[1],
-            method=method,
-            diagnostics=tuple(group_diagnostics),
-        )
-        result.append(group)
-        diagnostics.extend(
-            diagnostic for diagnostic in group.diagnostics if diagnostic not in group_diagnostics
-        )
-        if not group.record.is_complete:
-            diagnostics.append(
-                GroupingDiagnostic(
-                    "incomplete_series",
-                    group.record.game_replay_ids,
-                    "series does not contain a validated two-win result",
-                )
+        batches = tuple(games[i : i + max_games] for i in range(0, len(games), max_games))
+        for batch_index, batch in enumerate(batches):
+            key_suffix = "" if batch_index == 0 else f":extra:{batch_index}"
+            group = _make_group(
+                batch,
+                key=f"{bucket[1]}{key_suffix}",
+                method=method,
+                diagnostics=tuple(group_diagnostics),
             )
+            result.append(group)
+            if batch_index == 0:
+                diagnostics.extend(
+                    diagnostic
+                    for diagnostic in group.diagnostics
+                    if diagnostic not in group_diagnostics
+                )
+                if not group.record.is_complete:
+                    diagnostics.append(_incomplete_series(group))
     return GroupingResult(tuple(result), tuple(diagnostics))
 
 
@@ -453,7 +428,7 @@ def validated_bo3_series(
     blocking = {
         "duplicate_game_number",
         "fallback_team_conflict",
-        "game_after_series_clinch",
+        "game_after_series_won",
         "missing_game_number",
         "missing_outcome",
         "non_contiguous_game_numbers",

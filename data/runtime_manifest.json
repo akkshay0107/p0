@@ -1,62 +1,119 @@
 {
-  "manifest_schema": 2,
-  "mechanics_provenance": {
-    "battle_format": "gen9championsvgc2026regmb",
-    "bo3_format": "gen9championsvgc2026regmbbo3",
-    "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
-    "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac"
-  },
-  "runtime_contract": {
-    "action": {
-      "action_count": 49,
-      "joint_constraints": ["no_duplicate_switch", "at_most_one_mega"],
-      "joint_width": 2,
-      "ranges": [
-        {
-          "end": 1,
-          "meaning": "pass",
-          "start": 0
-        },
-        {
-          "end": 7,
-          "meaning": "switch",
-          "roster_slots": 6,
-          "start": 1
-        },
-        {
-          "end": 27,
-          "meaning": "move",
-          "move_slots": 4,
-          "start": 7,
-          "targets": [-2, -1, 0, 1, 2]
-        },
-        {
-          "end": 47,
-          "meaning": "mega_move",
-          "move_slots": 4,
-          "start": 27,
-          "targets": [-2, -1, 0, 1, 2]
-        },
-        {
-          "end": 48,
-          "meaning": "mega_forced_move",
-          "start": 47
-        },
-        {
-          "end": 49,
-          "meaning": "forced_move",
-          "start": 48
-        }
-      ],
-      "team_preview": {
-        "encoding": "ordered_roster_pair",
-        "joint_unique": true,
-        "roster_size": 6
-      }
+  "manifest_schema": 1,
+  "subsystems": {
+    "actions": {
+      "major_sha256": "cea4d0ef89979d9824b0341b801f3f4d04770dca51b38aa1bb0ae0c08fb610f9",
+      "minor_sha256": "96df4e1af3ad8450887d32ca312d5b4a7dd3860e5f4283fef5e622229ffcac47",
+      "major_version": 1,
+      "minor_version": 0
     },
-    "resource_feature_abi": "champions-dex-features-v1",
-    "tensor_abi": "champions-memory-channel-v1",
-    "vocabulary_sha256": "b8380f7f6324664087d88c9ab62a27d5185602d46ad001de05627a3a18f3e752"
+    "model": {
+      "major_sha256": "fd534c7610d847cb44aa32bf0b0f661632d2a05b794623effd1e233312ec8e4a",
+      "minor_sha256": "85c1e35b7e7a53145ef7c77fd4415f122bdffa7dddfd52df5bef22f98c5326bd",
+      "major_version": 1,
+      "minor_version": 0
+    },
+    "resources": {
+      "major_sha256": "44b742aab01b1856bf0ab36e8b4cf42c74782dff9c021efa6c086ba6916aaeb6",
+      "minor_sha256": "7e7dabe3c280099d2597c82f2ee07f5cd0e3259f386145df450d5d1580d8aacb",
+      "major_version": 1,
+      "minor_version": 0
+    }
   },
-  "runtime_contract_sha256": "34596dfb8cd1670493ebee5db62ba6976748dba701eba3a2d288391ad18876dc"
+  "contracts": {
+    "actions": {
+      "major": {
+        "action_count": 49,
+        "joint_constraints": [
+          "no_duplicate_switch",
+          "at_most_one_mega"
+        ],
+        "joint_width": 2,
+        "ranges": [
+          {
+            "end": 1,
+            "meaning": "pass",
+            "start": 0
+          },
+          {
+            "end": 7,
+            "meaning": "switch",
+            "roster_slots": 6,
+            "start": 1
+          },
+          {
+            "end": 27,
+            "meaning": "move",
+            "move_slots": 4,
+            "start": 7,
+            "targets": [
+              -2,
+              -1,
+              0,
+              1,
+              2
+            ]
+          },
+          {
+            "end": 47,
+            "meaning": "mega_move",
+            "move_slots": 4,
+            "start": 27,
+            "targets": [
+              -2,
+              -1,
+              0,
+              1,
+              2
+            ]
+          },
+          {
+            "end": 48,
+            "meaning": "mega_forced_move",
+            "start": 47
+          },
+          {
+            "end": 49,
+            "meaning": "forced_move",
+            "start": 48
+          }
+        ],
+        "team_preview": {
+          "encoding": "ordered_roster_pair",
+          "joint_unique": true,
+          "roster_size": 6
+        }
+      },
+      "minor": {}
+    },
+    "model": {
+      "major": {
+        "event_raw_width": 128,
+        "history_window": 48,
+        "max_prior_games": 2,
+        "observation_entity_count": 15,
+        "observation_layout_sha256": "7dca9c231a7dfc3ee26646e5ccbbd6885b90b29293b8257683275d6c4f05c51a",
+        "owner_count": 3,
+        "pokemon_count": 12,
+        "pooled_event_count": 4,
+        "raw_event_count": 32,
+        "self_target_sentinel": -1,
+        "series_tokens_per_game": 4
+      },
+      "minor": {}
+    },
+    "resources": {
+      "major": {
+        "vocabulary_sha256": "b8380f7f6324664087d88c9ab62a27d5185602d46ad001de05627a3a18f3e752"
+      },
+      "minor": {
+        "battle_format": "gen9championsvgc2026regmb",
+        "bo3_format": "gen9championsvgc2026regmbbo3",
+        "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
+        "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac",
+        "spread_usage_sha256": "dd7336d665a33febee43bc6250c812400541b52eefc8a4ffbcaabd034b757ad3"
+      }
+    }
+  },
+  "global_sha256": "042c8da2c24089610824da03aae059179bd481fcfb8c5525a1b69688a20a26ef"
 }

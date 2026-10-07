@@ -1,0 +1,67 @@
+# Copy this file to config.yaml for a machine-local configuration.
+training:
+  num_episodes: 2000
+  n_envs: 8
+  rollout_steps: 320
+  batch_size: 128
+  minibatch_size: 32
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  lr: 0.0003
+  value_coef: 0.5
+  magnet_alpha: 0.03
+  magnet_refresh_interval: 20
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  target_kl: 0.01
+  ppo_epochs: 10
+  enable_optim: true
+  seed: 0
+  ramp_up_phase: 0.1
+
+paths:
+  repository_root: .
+  data_root: data
+  teams_root: teams
+  artifacts_root: artifacts
+  showdown_root: pokemon-showdown
+  checkpoint_path: artifacts/checkpoints/ppo_checkpoint.pt
+  resume_checkpoint: null
+  initial_policy_checkpoint: null
+  runs_dir: artifacts/runs
+  replays_dir: artifacts/replays
+  log_path: artifacts/training.log
+
+teams:
+  all: all
+  reduced: reduced
+
+bot:
+  username: Bot
+  battle_format: gen9championsvgc2026regmbbo3
+  top_p: 0.9
+  max_concurrent_battles: 1
+  challenge_limit: 1000000
+  allow_random_init: false
+  log_level: INFO
+
+bc:
+  batch_decisions: 256
+  learning_rate: 0.0003
+  epochs: 1
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  seed: 0
+  enable_optim: true
+  # Placeholders: replace with the manifest_path printed by `p0-replays build-shards`
+  # and the splits.json that `p0-replays create-splits` writes next to it.
+  shard_manifest: artifacts/shards/<global-contract-hash>/<dataset-hash>/manifest.json
+  split_manifest: artifacts/shards/<global-contract-hash>/<dataset-hash>/splits.json
+  output_dir: artifacts/checkpoints/bc
+  resume_checkpoint: null
+
+evaluation:
+  episodes_per_matchup: 20
+  seed: 0
+  report_dir: artifacts/eval

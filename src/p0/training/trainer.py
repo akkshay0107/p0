@@ -1,21 +1,50 @@
-"""Episode-level PPO training lifecycle."""
+"""PPO training loop and checkpoint management."""
 
 from __future__ import annotations
 
 import logging
-import time
-from collections.abc import Callable, Mapping
-from pathlib import Path
+from collections.abc import Callable
+
+from torch.amp import GradScaler
+from torch.optim import Optimizer
 
 from p0.model.policy import PolicyNet
-from p0.training.checkpoint import PolicyStore
+from p0.training.checkpoint import value_objective_metadata
 from p0.training.config import TrainingConfig
+from p0.training.files import TrainingRun
 from p0.training.magnet import Magnet
-from p0.training.ppo import PPOUpdater
+from p0.training.ppo import ppo_update
 from p0.training.rollout import RolloutCollector
+from p0.training.trajectory import PreparedTrajectory
 from p0.training.utils import PPOScheduler
 
-MetricSink = Callable[[Mapping[str, float], int, str], None]
+LOGGER = logging.getLogger(__name__)
+
+PPO_BOARD_METRICS = (
+    "policy_loss",
+    "value_loss",
+    "kl_divergence",
+    "clip_fraction",
+    "normalized_entropy",
+    "explained_variance",
+    "magnet_kl",
+    "grad_norm",
+    "mean_game_length",
+    "timeout_or_truncation_rate",
+)
+
+
+def _rollout_metrics(trajectories: list[PreparedTrajectory]) -> dict[str, float]:
+    """Summarize completed self-play games for the PPO board."""
+    if not trajectories:
+        raise ValueError("Cannot summarize an empty PPO rollout")
+
+    lengths = [int(trajectory.length) for trajectory in trajectories]
+    truncated = sum(trajectory.truncated for trajectory in trajectories)
+    return {
+        "mean_game_length": sum(lengths) / len(lengths),
+        "timeout_or_truncation_rate": truncated / len(lengths),
+    }
 
 
 class PPOTrainer:
@@ -23,25 +52,23 @@ class PPOTrainer:
         self,
         *,
         policy: PolicyNet,
-        policy_store: PolicyStore,
-        checkpoint_path: Path,
+        files: TrainingRun,
         collector: RolloutCollector,
-        updater: PPOUpdater,
+        optimizer: Optimizer,
+        scaler: GradScaler,
         magnet: Magnet,
         scheduler: PPOScheduler,
         training_config: TrainingConfig,
-        metric_sink: MetricSink = lambda metrics, step, phase: None,
         cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self.policy = policy
-        self.policy_store = policy_store
-        self.checkpoint_path = checkpoint_path
+        self.files = files
         self.collector = collector
-        self.updater = updater
+        self.optimizer = optimizer
+        self.scaler = scaler
         self.magnet = magnet
         self.scheduler = scheduler
         self.training_config = training_config
-        self.metric_sink = metric_sink
         self.cancel_requested = cancel_requested
 
     def run(self, start_episode: int = 0) -> None:
@@ -52,63 +79,71 @@ class PPOTrainer:
             if self.cancel_requested():
                 self._save(episode)
                 return
-            for group in self.updater.optimizer.param_groups:
+            for group in self.optimizer.param_groups:
                 group["lr"] = self.scheduler.lr(episode)
             alpha = self.scheduler.alpha(episode)
             self.collector.reset_completed()
             self.policy.eval()
-            started = time.monotonic()
-            self.collector.collect()
-            rollout_seconds = time.monotonic() - started
-            trajectories = self.collector.get_batches(self.policy.device)
-            if not trajectories:
-                logging.warning("No trajectories collected, skipping update")
-                completed_episode = episode + 1
-                continue
-            stats = self.updater.update(trajectories, episode, alpha)
+            while True:
+                self.collector.collect(self.cancel_requested)
+                if self.cancel_requested():
+                    self._save(episode)
+                    return
+                trajectories = self.collector.get_batches(self.policy.device)
+                if trajectories:
+                    break
+            trajectory_count = len(trajectories)
+            rollout_metrics = _rollout_metrics(trajectories)
+            try:
+                stats = ppo_update(
+                    trajectories,
+                    self.policy,
+                    self.magnet,
+                    self.optimizer,
+                    self.scaler,
+                    self.training_config,
+                    episode,
+                    alpha,
+                    cancel_requested=self.cancel_requested,
+                )
+            finally:
+                # The next rollout does not need the previous update's GPU copies.
+                del trajectories
+            if self.cancel_requested() and int(stats["optimizer_updates"]) == 0:
+                self._save(episode)
+                return
+            if int(stats["optimizer_updates"]) == 0:
+                raise RuntimeError("PPO completed an episode without an optimizer update")
             if (episode + 1) % refresh_interval == 0:
                 self.magnet.refresh(self.policy)
-                logging.info(f"Refreshed magnet at episode {episode + 1}")
-            metrics = {
-                key: float(value) for key, value in stats.items() if isinstance(value, (int, float))
-            }
-            metrics.update(
-                {
-                    "rollout_seconds": rollout_seconds,
-                    "learning_rate": float(self.updater.optimizer.param_groups[0]["lr"]),
-                    "trajectory_count": float(len(trajectories)),
-                }
+                LOGGER.info("Refreshed magnet at episode %s", episode + 1)
+            metrics = {name: float(stats[name]) for name in PPO_BOARD_METRICS if name in stats}
+            metrics.update(rollout_metrics)
+            self.files.record(
+                episode + 1, {"trajectory_count": trajectory_count, **metrics}, {"train": metrics}
             )
-            self.metric_sink(metrics, episode + 1, "train")
             completed_episode = episode + 1
+            if self.cancel_requested():
+                self._save(completed_episode)
+                return
             if (episode + 1) % 10 == 0:
                 self._save(episode + 1)
-        if completed_episode % 10 != 0:
+        if completed_episode > start_episode and completed_episode % 10 != 0:
             self._save(completed_episode)
 
     def _save(self, episode: int) -> None:
-        prepare_checkpoint = getattr(self.collector, "prepare_for_checkpoint", None)
-        if callable(prepare_checkpoint):
-            prepare_checkpoint()
+        self.collector.prepare_for_checkpoint()
         metadata: dict[str, object] = {
-            "gamma": self.training_config.gamma,
-            "value_target_semantics": "discounted_terminal_outcome.v1",
+            **value_objective_metadata(self.training_config.gamma),
+            "environment_state": self.collector.vector_env.training_state(),
+            "collector_state": self.collector.training_state(),
         }
-        vector_env = self.collector.vector_env
-        capture_state = getattr(vector_env, "training_state", None)
-        if callable(capture_state):
-            metadata["environment_state"] = capture_state()
-        capture_collector_state = getattr(self.collector, "training_state", None)
-        if callable(capture_collector_state):
-            metadata["collector_state"] = capture_collector_state()
-        self.policy_store.save_training_state(
-            self.checkpoint_path,
+        self.files.save(
             episode,
             self.policy,
-            optimizer=self.updater.optimizer,
+            optimizer=self.optimizer,
             scheduler=self.scheduler,
-            scaler=self.updater.scaler,
+            scaler=self.scaler,
             magnet=self.magnet,
             metadata=metadata,
-            trainer_kind="ppo",
         )

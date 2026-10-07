@@ -1,13 +1,8 @@
 #!/usr/bin/env node
 
-/**
- * Emit the authoritative Champions content used by the pinned Showdown checkout.
- *
- * The output deliberately contains normalized, JSON-safe fields rather than the
- * simulator's runtime objects.  Run from the repository root:
- *
- *   node scripts/dump_champions_dex.js
- */
+// Emit the authoritative Champions content used by the pinned Showdown checkout.
+// The output contains normalized JSON-safe fields rather than simulator runtime
+// objects. Run this command from the repository root: node scripts/dump_champions_dex.js
 
 const fs = require("node:fs");
 const path = require("node:path");

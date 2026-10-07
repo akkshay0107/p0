@@ -1,8 +1,14 @@
-"""Pure scalar legality and joint-action constraints."""
+"""Action legality and joint-action constraints.
+
+Computes legal moves and switches for both active battlefield slots. In replay
+reconstruction where choices cannot be fully observed, unconfirmed slots allow
+all possible actions so training never rules out the demonstrator's action.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import numpy.typing as npt
@@ -18,6 +24,7 @@ from p0.battle.actions import (
     PASS_ACTION,
     SWITCH_END,
     SWITCH_START,
+    TARGET_COUNT,
     decode_team_pair,
 )
 
@@ -31,6 +38,7 @@ class SlotDecision:
     force_switch: bool = False
     can_mega: bool = False
     forced_move: bool = False
+    legality_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,20 +49,32 @@ class DecisionView:
     team_size: int = 6
 
 
-_TEAM_PREVIEW_CACHE: dict[int, tuple[int, ...]] = {}
+# A finished game has no pending request, so its final observation proves no legality.
+_NO_CHOICE_SLOT = SlotDecision(active=False, legality_known=False)
+GAME_END_DECISION = DecisionView(slots=(_NO_CHOICE_SLOT, _NO_CHOICE_SLOT))
 
 
+@lru_cache(maxsize=None)
 def _get_team_preview(team_size: int) -> tuple[int, ...]:
     """Ordered distinct team-preview pair action IDs, in ascending roster order."""
-    if team_size not in _TEAM_PREVIEW_CACHE:
-        _TEAM_PREVIEW_CACHE[team_size] = tuple(
-            first * team_size + second
-            for first in range(team_size)
-            for second in range(team_size)
-            if first != second
-        )
+    return tuple(
+        first * team_size + second
+        for first in range(team_size)
+        for second in range(team_size)
+        if first != second
+    )
 
-    return _TEAM_PREVIEW_CACHE[team_size]
+
+@lru_cache(maxsize=None)
+def _get_team_preview_joint_mask(
+    team_size: int, first_pair: tuple[int, int]
+) -> npt.NDArray[np.bool_]:
+    """Return precomputed boolean mask of valid second team-preview actions."""
+    mask = np.zeros(team_size * team_size, dtype=np.bool_)
+    for second in range(team_size * team_size):
+        sf, ss = divmod(second, team_size)
+        mask[second] = sf != ss and sf not in first_pair and ss not in first_pair
+    return mask
 
 
 def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:
@@ -81,7 +101,7 @@ def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:
         mega_moves = (MEGA_FORCED_ACTION,) if slot.can_mega else ()
     else:
         moves = tuple(
-            MOVE_START + move_slot * 5 + target + 2
+            MOVE_START + move_slot * TARGET_COUNT + target + 2
             for move_slot, targets in enumerate(slot.move_targets)
             for target in targets
         )
@@ -89,7 +109,20 @@ def legal_actions(view: DecisionView, position: int) -> tuple[int, ...]:
             tuple(action + (MOVE_END - MOVE_START) for action in moves) if slot.can_mega else ()
         )
 
-    return (*switches, *moves, *mega_moves) or (PASS_ACTION,)
+        # When legality is not fully known, allow forced moves (e.g. Outrage,
+        # recharge turns) which map to the forced action slot.
+        if not slot.legality_known:
+            moves = (*moves, FORCED_ACTION)
+            if slot.can_mega:
+                mega_moves = (*mega_moves, MEGA_FORCED_ACTION)
+
+    actions = (*switches, *moves, *mega_moves)
+    if slot.legality_known:
+        return actions or (PASS_ACTION,)
+
+    # When legality is not fully known, allow passing to account for partial
+    # mid-turn replacement requests.
+    return (*actions, PASS_ACTION)
 
 
 def action_mask(view: DecisionView) -> npt.NDArray[np.bool_]:
@@ -108,7 +141,7 @@ def slot1_base_mask(view: DecisionView) -> npt.NDArray[np.bool_]:
 
 
 def apply_joint_constraints(mask: npt.NDArray[np.bool_], view: DecisionView, first: int) -> None:
-    """Apply the sequential slot-1 joint-action constraints in place to ``mask``."""
+    """Apply the sequential slot-1 joint-action constraints in place to mask."""
     if view.team_preview:
         try:
             first_pair = decode_team_pair(first, view.team_size)
@@ -116,29 +149,14 @@ def apply_joint_constraints(mask: npt.NDArray[np.bool_], view: DecisionView, fir
             mask.fill(False)
             return
 
-        actions = np.arange(view.team_size**2)
-        second_first, second_second = np.divmod(actions, view.team_size)
-
-        valid = (
-            (second_first < view.team_size)
-            & (second_second < view.team_size)
-            & (second_first != second_second)
-        )
-
-        conflict = (
-            (second_first == first_pair[0])
-            | (second_first == first_pair[1])
-            | (second_second == first_pair[0])
-            | (second_second == first_pair[1])
-        )
-
-        mask[: view.team_size**2] &= valid & ~conflict
+        total_pairs = view.team_size**2
+        mask[:total_pairs] &= _get_team_preview_joint_mask(view.team_size, first_pair)
     else:
         if SWITCH_START <= first < SWITCH_END:
             mask[first] = False
 
         if MEGA_MOVE_START <= first < MEGA_MOVE_END or first == MEGA_FORCED_ACTION:
-            mask[27:48] = False
+            mask[MEGA_MOVE_START : MEGA_FORCED_ACTION + 1] = False
 
         if first == PASS_ACTION:
             mask[PASS_ACTION] = False

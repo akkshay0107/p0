@@ -9,6 +9,7 @@ dist/
 # Testing & Linting
 .pytest_cache/
 .ruff_cache/
+.hypothesis/
 
 # System & Local Configs
 .DS_Store
@@ -18,6 +19,7 @@ config.yaml
 # Project Runtime Artifacts & Scratch
 artifacts/
 scratch/
+scratch_docs/
 assets/
 *.tar.gz
 *.whl
@@ -30,3 +32,13 @@ data/*.tmp
 data/champions_coverage.json
 teams/**/*.txt
 teams/*.txt
+
+# temporary golden replay to use as reference while building the reconstruction pipeline
+src/p0/replays/reconstruction/golden_replays/*.json
+
+# Generated corpus manifests
+teams/**/corpus_manifest.json
+
+# Codex
+.codex
+.agents/skills/

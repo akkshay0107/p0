@@ -14,15 +14,7 @@ from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
-from p0.format_config import (
-    ACTION_CONTRACT,
-    FORMAT,
-    RESOURCE_FEATURE_ABI,
-    TENSOR_ABI,
-    RuntimeManifest,
-    canonical_json_sha256,
-    sha256_file,
-)
+from p0.format_config import active_global_contract, load_global_contract, update_resource_contract
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_json_save
 
@@ -30,6 +22,7 @@ ROOT = DEFAULT_PATHS.repository_root
 DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
 DEFAULT_VOCAB = ROOT / "data" / "vocab.json"
 DEFAULT_MANIFEST = ROOT / "data" / "runtime_manifest.json"
+DEFAULT_SPREAD_USAGE = ROOT / "data" / "spread_usage.json"
 
 TABLES = (
     "species",
@@ -46,6 +39,18 @@ TABLES = (
     "types",
 )
 RESERVED_SEMANTICS = ("PAD", "UNKNOWN", "KNOWN_NONE", "OOV")
+POKEMON_TYPES = (
+    "Normal Fire Water Electric Grass Ice Fighting Poison Ground "
+    "Flying Psychic Bug Rock Ghost Dragon Dark Steel Fairy"
+).split()
+# Protocol-effect family, its vocabulary table, and the poke-env enum that names it.
+EFFECT_FAMILIES = {
+    "effect": ("volatiles", Effect),
+    "field": ("fields", Field),
+    "side_condition": ("side_conditions", SideCondition),
+    "weather": ("weathers", Weather),
+    "status": ("status", Status),
+}
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -73,14 +78,17 @@ def build(
     vocab_path: Path,
     manifest_path: Path,
     coverage_path: Path | None = None,
+    spread_usage_path: Path = DEFAULT_SPREAD_USAGE,
 ) -> dict[str, Any]:
-    """Build the vocab mapping, checking for schema and dataset coverage.
+    """
+    Build the vocab mapping, checking for schema and dataset coverage.
 
     Arguments:
         dex_path: Champions data file containing legal content and protocol IDs.
         vocab_path: Destination for the atomically written vocabulary.
         manifest_path: Destination for the atomically written runtime manifest.
         coverage_path: Optional destination for the coverage audit JSON.
+        spread_usage_path: Spread priors pinned as a minor resource identity.
 
     Returns:
         The generated coverage audit.
@@ -91,47 +99,13 @@ def build(
     legal = dex.get("legality", {})
     for table in ("species", "items", "abilities", "moves"):
         append_keys(vocab[table], {normalize(identifier) for identifier in legal.get(table, [])})
-    append_keys(vocab["volatiles"], enum_keys(Effect))
-    append_keys(vocab["fields"], enum_keys(Field))
-    append_keys(vocab["status"], enum_keys(Status))
-    append_keys(vocab["side_conditions"], enum_keys(SideCondition))
-    append_keys(vocab["weathers"], enum_keys(Weather))
+    for table, enum in EFFECT_FAMILIES.values():
+        append_keys(vocab[table], enum_keys(enum))
     append_keys(vocab["trickroom"], {"trickroom"})
     append_keys(vocab["categories"], {"physical", "special", "status"})
-    append_keys(
-        vocab["types"],
-        {
-            normalize(entry)
-            for entry in (
-                "Normal",
-                "Fire",
-                "Water",
-                "Electric",
-                "Grass",
-                "Ice",
-                "Fighting",
-                "Poison",
-                "Ground",
-                "Flying",
-                "Psychic",
-                "Bug",
-                "Rock",
-                "Ghost",
-                "Dragon",
-                "Dark",
-                "Steel",
-                "Fairy",
-            )
-        },
-    )
+    append_keys(vocab["types"], {normalize(entry) for entry in POKEMON_TYPES})
 
-    effect_tables = {
-        "effect": "volatiles",
-        "field": "fields",
-        "side_condition": "side_conditions",
-        "weather": "weathers",
-        "status": "status",
-    }
+    effect_tables = {family: table for family, (table, _) in EFFECT_FAMILIES.items()}
     legal_effects = dex.get("legalProtocolEffects", {})
     for family, identifiers in legal_effects.items():
         table = effect_tables.get(family)
@@ -157,14 +131,7 @@ def build(
         if missing:
             missing_content[table] = missing
 
-    enum_families = {
-        "effect": enum_keys(Effect),
-        "field": enum_keys(Field),
-        "side_condition": enum_keys(SideCondition),
-        "weather": enum_keys(Weather),
-        "status": enum_keys(Status),
-    }
-    known_protocol_ids = set().union(*enum_families.values())
+    known_protocol_ids = set().union(*(enum_keys(enum) for _, enum in EFFECT_FAMILIES.values()))
     known_protocol_ids.update(
         normalize(identifier) for table in effect_tables.values() for identifier in vocab[table]
     )
@@ -183,27 +150,21 @@ def build(
     if missing_content:
         raise ValueError(f"Champions coverage audit failed: missing={missing_content}")
 
-    contract = {
-        "tensor_abi": TENSOR_ABI,
-        "vocabulary_sha256": canonical_json_sha256(vocab),
-        "action": ACTION_CONTRACT,
-        "resource_feature_abi": RESOURCE_FEATURE_ABI,
-    }
-    manifest = RuntimeManifest(
-        tensor_abi=TENSOR_ABI,
-        vocabulary_sha256=contract["vocabulary_sha256"],
-        action=ACTION_CONTRACT,
-        resource_feature_abi=RESOURCE_FEATURE_ABI,
-        runtime_contract_sha256=canonical_json_sha256(contract),
-        champions_dex_sha256=sha256_file(dex_path),
-        showdown_commit=FORMAT.showdown_commit,
-        battle_format=FORMAT.battle_format,
-        bo3_format=FORMAT.bo3_format,
-    )
     atomic_json_save(vocab_path, vocab)
     if coverage_path is not None:
         atomic_json_save(coverage_path, coverage)
-    atomic_json_save(manifest_path, manifest.to_dict())
+    base = (
+        load_global_contract(manifest_path) if manifest_path.exists() else active_global_contract()
+    )
+    atomic_json_save(
+        manifest_path,
+        update_resource_contract(
+            base,
+            vocab_path=vocab_path,
+            dex_path=dex_path,
+            spread_usage_path=spread_usage_path,
+        ).to_dict(),
+    )
     return coverage
 
 

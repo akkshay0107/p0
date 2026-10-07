@@ -1,68 +1,85 @@
-"""Fused token encoder that turns categorical/numerical battle features into mixed context tokens.
+"""
+Fused token encoder that turns categorical/numerical battle features into mixed context tokens.
 
-Produces the casual observation sequence consumed by the memory reducer, including side-owned
+Produces the current observation sequence consumed by the memory reducer, including side-owned
 scalars (turn, team-preview flag, fainted counts), entity rows, and pooled battle events.
 """
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import torch
 import torch.nn as nn
-import torch.nn.init as init
+import torch.nn.functional as F
 
-from p0.battle.events import EVENT_TYPE_COUNT, EventTypeId
+from p0.battle.events import (
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EVENT_RECORDS,
+    NUM_EVENT_DETAILS,
+    NUM_EVENT_KINDS,
+    SPATIAL_SLOT_COUNT,
+    EventKind,
+)
 from p0.format_config import FORMAT
-from p0.model.architecture_contract import EVENT_RAW_WIDTH, POOLED_EVENT_COUNT
+from p0.model.architecture_contract import EVENT_RAW_WIDTH
 from p0.model.resources import RuntimeResources
 from p0.model.structured_observation import (
     CAT_EFFECT_START,
+    CAT_IDX_IDENTITY_KNOWNNESS,
+    CAT_IDX_MECHANIC_STATE,
+    CAT_IDX_NATURE,
+    CAT_IDX_PRESENCE_STATUS,
+    CAT_IDX_STAT_PROVENANCE,
     CAT_IDX_STATUS,
     CAT_IDX_STATUS_COUNTER_KIND,
-    CAT_KNOWNNESS_START,
-    CAT_KNOWNNESS_WIDTH,
     CATEGORICAL_WIDTH,
     EFFECT_CATEGORICAL_WIDTH,
     EFFECT_NUMERICAL_WIDTH,
-    EVENT_METADATA_WIDTH,
-    EVENT_NUMERICAL_WIDTH,
-    EVENT_ORDER_VOCAB_SIZE,
     MAX_EFFECTS,
     MOVE_SLOTS,
+    NUM_BASE_WIDTH,
     NUM_EFFECT_START,
+    NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_MOVE_LAST,
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_MOVE_PP,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STATUS_COUNTER,
-    NUM_PROVENANCE_START,
     NUMERICAL_WIDTH,
     OWNER_TOKENS,
     POKEMON_TOKENS,
     SEQUENCE_LENGTH,
-    EffectNamespace,
+    TOKEN_IDX_ALLY_SIDE,
+    TOKEN_IDX_GLOBAL_FIELD,
+    TOKEN_IDX_OPPONENT_SIDE,
+    IdentityKnownness,
+    MechanicState,
+    PresenceStatus,
+    StatProvenance,
     StructuredObservation,
-    TokenType,
 )
-from p0.model.swiglu_encoder import SwiGLUTransformerEncoder
+from p0.model.swiglu_encoder import (
+    MODEL_INIT_STD,
+    AttentionPool,
+    SwiGLUTransformerEncoder,
+    initialize_module,
+)
 
 ACT_SIZE = FORMAT.action_size
 NUM_COMPONENTS = 14
-NUM_TOKEN_TYPES = 3
-NUM_SIDES = 3
-NUM_SLOTS = 7
+POKEMON_TYPE_START = 3
+POKEMON_TYPE_SLOTS = 2
 
 # 0-11 pokemon tokens (one fused token per Pokemon)
 # 12 Global-field, 13 Ally-side, 14 Opponent-side (one fused token per owner)
-_POKE_POS = POKEMON_TOKENS
-_OWNER_POS = OWNER_TOKENS
 
-MOVE_DYNAMIC_WIDTH = 3  # pp fraction, last-move flag, legal-this-step
+# pp fraction, last-move flag, legal-this-step, legality-proven gate
+MOVE_DYNAMIC_WIDTH = 4
 STATUS_DYNAMIC_WIDTH = 1  # status counter (turns asleep / toxic stage)
 SPECIES_STATIC_WIDTH = 9  # six base stats, weight, mega flag, forme relationship
 
-# Pokemon-owned scalars: everything in the base+provenance numeric row except the
-# fields owned by a narrower record (move dynamics -> MoveRecord, status counter
-# -> StatusRecord). Effects live past NUM_EFFECT_START and are owned by the
-# typed-effect deepset, so they are excluded structurally.
+# Pokemon-owned scalars: base stats and status flags, excluding move dynamics and effects.
 _MOVE_DYN_IDX = frozenset(
     index
     for start in (NUM_IDX_MOVE_PP, NUM_IDX_MOVE_LAST, NUM_IDX_MOVE_LEGAL)
@@ -95,29 +112,11 @@ _TARGET_CLASS_INDEX = {name: index for index, name in enumerate(_TARGET_CLASSES)
 _TARGET_CLASS_ALIASES = {
     # Distance is irrelevant with two active slots per side, so these have the
     # same selectable Pokemon in doubles. Other Showdown target types remain
-    # distinct, including `all` (includes the user) and `allAdjacent` (does not).
+    # distinct, including all (includes the user) and allAdjacent (does not).
     "normal": "selectedpokemon",
     "any": "selectedpokemon",
 }
 MOVE_STATIC_WIDTH = 7 + len(_TARGET_CLASSES)
-
-# Event effect ids index four independently-numbered vocab tables; the event
-# type determines which one, so the namespace tag is derived from it. This
-# mirrors the state path, which always pairs effect_emb with a namespace term.
-_EVENT_EFFECT_NAMESPACE: dict[EventTypeId, EffectNamespace] = {
-    EventTypeId.WEATHER_START: EffectNamespace.WEATHER,
-    EventTypeId.WEATHER_END: EffectNamespace.WEATHER,
-    EventTypeId.FIELD_START: EffectNamespace.FIELD,
-    EventTypeId.FIELD_END: EffectNamespace.FIELD,
-    EventTypeId.FIELD_ACTIVATE: EffectNamespace.FIELD,
-    EventTypeId.SIDE_START: EffectNamespace.SIDE,
-    EventTypeId.SIDE_END: EffectNamespace.SIDE,
-    EventTypeId.EFFECT_START: EffectNamespace.POKEMON,
-    EventTypeId.EFFECT_END: EffectNamespace.POKEMON,
-    EventTypeId.CANT: EffectNamespace.POKEMON,
-    EventTypeId.SINGLEMOVE: EffectNamespace.POKEMON,
-    EventTypeId.ACTIVATE: EffectNamespace.POKEMON,
-}
 
 
 def _load_vocab_sizes(resources: RuntimeResources) -> dict[str, int]:
@@ -161,8 +160,12 @@ def _load_move_statics(resources: RuntimeResources) -> torch.Tensor:
         table[idx, 0] = float(move.get("basePower", 0)) / 150.0
         table[idx, 1] = float(move.get("pp", 0)) / 64.0
         table[idx, 2] = float(move.get("priority", 0)) / 5.0
+        # Showdown marks moves that cannot miss with accuracy true.
         accuracy = move.get("accuracy", 100)
-        table[idx, 3] = float(accuracy) / 100.0 if isinstance(accuracy, (int, float)) else 0.0
+        if accuracy is True:
+            table[idx, 3] = 1.0
+        elif isinstance(accuracy, (int, float)):
+            table[idx, 3] = float(accuracy) / 100.0
         target = str(move.get("target", "")).lower()
         target_class = _TARGET_CLASS_ALIASES.get(target, target)
         target_index = _TARGET_CLASS_INDEX.get(target_class)
@@ -209,33 +212,48 @@ def _load_mechanic_tag_tables(
     return tables
 
 
-class MultiAggDeepSet(nn.Module):
-    def __init__(self, in_features: int, d_model: int):
+class DeepSetEncoder(nn.Module):
+    """Encode a fixed-capacity unordered set with nonlinear sum pooling."""
+
+    def __init__(self, in_features: int, d_model: int, max_members: int) -> None:
         super().__init__()
-        self.g = nn.Sequential(nn.Linear(in_features, d_model), nn.GELU())
-        self.f = nn.Sequential(nn.Linear(d_model * 2, d_model), nn.GELU())
+        if max_members <= 0:
+            raise ValueError("max_members must be positive")
+        self.d_model = d_model
+        self.max_members = max_members
+        self.member_network = nn.Sequential(
+            nn.Linear(in_features, d_model),
+            nn.SiLU(),
+        )
+        self.set_network = nn.Sequential(
+            nn.Linear(d_model + 1, d_model),
+            nn.SiLU(),
+            nn.RMSNorm(d_model),
+        )
+        initialize_module(self)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        gx = self.g(x)
-        if mask is not None:
-            mask_expanded = mask.unsqueeze(-1)
-            sum_gx = torch.where(mask_expanded, gx, 0.0).sum(dim=-2)
-            max_gx = gx.masked_fill(~mask_expanded, float("-inf")).amax(dim=-2)
-            max_gx = torch.where(max_gx == float("-inf"), 0.0, max_gx)
-        else:
-            sum_gx = gx.sum(dim=-2)
-            max_gx = gx.max(dim=-2)[0]
+    def forward(self, members: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if members.dim() < 2 or members.size(-2) != self.max_members:
+            raise ValueError(
+                f"members must contain exactly {self.max_members} set slots; got {members.shape}"
+            )
+        if (
+            mask.shape != members.shape[:-1]
+            or mask.dtype != torch.bool
+            or mask.device != members.device
+        ):
+            raise ValueError("mask must be a boolean tensor matching the set-member dimensions")
 
-        return self.f(torch.cat([sum_gx, max_gx], dim=-1))
+        encoded_members = self.member_network(members)
+        pooled = torch.where(mask.unsqueeze(-1), encoded_members, 0.0).sum(dim=-2)
+        normalized_count = mask.sum(dim=-1, keepdim=True).to(pooled.dtype) / self.max_members
+        return self.set_network(torch.cat((pooled, normalized_count), dim=-1))
 
 
 class FusedTokenEncoder(nn.Module):
     # Buffers registered dynamically by torch need explicit declarations for Pyright.
-    _poke_pos: torch.Tensor
-    _owner_pos: torch.Tensor
+    _event_address_rows: Annotated[torch.Tensor, "event_positions"]
     _pokemon_scalar_idx: torch.Tensor
-    _event_effect_namespace: torch.Tensor
-    _component_ids: torch.Tensor
     _species_statics: torch.Tensor
     _move_statics: torch.Tensor
     _item_mechanic_tags: torch.Tensor
@@ -268,7 +286,11 @@ class FusedTokenEncoder(nn.Module):
         self.effect_emb = nn.Embedding(effect_vocab_size, d_raw)
         self.counter_kind_emb = nn.Embedding(5, 16)
         self.effect_namespace_emb = nn.Embedding(5, 16)
-        self.knownness_emb = nn.Embedding(5, 16)
+        self.identity_knownness_emb = nn.Embedding(len(IdentityKnownness), 16)
+        self.stat_provenance_emb = nn.Embedding(len(StatProvenance), 16)
+        self.presence_status_emb = nn.Embedding(len(PresenceStatus), 16)
+        self.mechanic_state_emb = nn.Embedding(len(MechanicState), 16)
+        self.provenance_proj = nn.Linear(16 * 4, d_model)
 
         self.species_proj = nn.Linear(d_raw, d_model)
         self.species_static_proj = nn.Linear(SPECIES_STATIC_WIDTH, d_model)
@@ -288,7 +310,7 @@ class FusedTokenEncoder(nn.Module):
 
         # pooled type summary plus a non-pooled primary-type signal, so
         # order-sensitive mechanics (Revelation Dance) have a slot-aware channel
-        self.type_set = MultiAggDeepSet(d_raw, d_model)
+        self.type_set = DeepSetEncoder(d_raw, d_model, POKEMON_TYPE_SLOTS)
         self.primary_type_proj = nn.Linear(d_raw, d_model)
 
         # each move fuses its identity (move/type/category embeddings), static dex scalars,
@@ -304,103 +326,85 @@ class FusedTokenEncoder(nn.Module):
 
         self.nature_proj = nn.Linear(d_raw, d_model)
 
-        self.typed_effect_set = MultiAggDeepSet(d_raw + 16 + 16 + EFFECT_NUMERICAL_WIDTH, d_model)
+        self.typed_effect_set = DeepSetEncoder(
+            d_raw + 16 + 16 + EFFECT_NUMERICAL_WIDTH,
+            d_model,
+            MAX_EFFECTS,
+        )
 
         # Pokemon-owned dynamics (boosts, hp, protect counter, ...) are one more
         # component of the Pokemon fusion kernel, not a second sequence token.
-        self.pokemon_scalar_proj = nn.Sequential(
-            nn.Linear(POKEMON_SCALAR_WIDTH, d_model),
-            nn.GELU(),
-        )
+        self.pokemon_scalar_proj = nn.Linear(POKEMON_SCALAR_WIDTH, d_model)
         self.register_buffer(
             "_pokemon_scalar_idx", torch.tensor(_POKEMON_SCALAR_IDX, dtype=torch.long)
         )
 
-        self.knownness_proj = nn.Linear(CAT_KNOWNNESS_WIDTH * 16, d_model)
+        self.pokemon_pool = AttentionPool(d_model, nhead)
 
-        # one internal fusion pass over all of the components above
-        self.component_emb = nn.Embedding(NUM_COMPONENTS, d_model)
-        # cache component ids instead of creating them every forward pass
-        self.register_buffer("_component_ids", torch.arange(NUM_COMPONENTS))
-        self.mon_fusion = SwiGLUTransformerEncoder(
+        # field/side-owned scalars (turn, team-preview flag, fainted count,
+        # mega availability) fused into the single owner token
+        self.owner_scalar_proj = nn.Linear(NUM_BASE_WIDTH, d_model)
+
+        # The observation ABI has a fixed 15-row semantic layout. One absolute
+        # table is sufficient; separate type/side/slot tables were redundant.
+        self.entity_position_emb = nn.Embedding(SEQUENCE_LENGTH, d_model)
+        self.action_mask_proj = nn.Linear(2 * ACT_SIZE, d_model)
+        self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
+        # One learned marker per active slot, added in place of a mask the data source
+        # could not prove. Keeps unknown as a distinct state instead of a mask value.
+        self.unknown_legality_emb = nn.Parameter(torch.empty(2, d_model))
+
+        # Ordered event records since this player's previous decision. One learned
+        # query per active position (own left/right, opponent left/right) reads them.
+        self.event_kind_emb = nn.Embedding(NUM_EVENT_KINDS, d_model)
+        self.event_source_proj = nn.Linear(d_model, d_model, bias=False)
+        self.event_target_proj = nn.Linear(d_model, d_model, bias=False)
+        self.event_special_position_emb = nn.Embedding(2, d_model)
+        # Event positions map to board rows; NONE and BOTH_SIDES follow the board.
+        self.register_buffer(
+            "_event_address_rows",
+            torch.tensor(
+                (
+                    0,
+                    1,
+                    6,
+                    7,
+                    SEQUENCE_LENGTH,
+                    TOKEN_IDX_ALLY_SIDE,
+                    TOKEN_IDX_OPPONENT_SIDE,
+                    TOKEN_IDX_GLOBAL_FIELD,
+                    SEQUENCE_LENGTH + 1,
+                )
+            ),
+            persistent=False,
+        )
+        self.event_detail_emb = nn.Embedding(NUM_EVENT_DETAILS, d_model)
+        self.event_order_emb = nn.Embedding(MAX_EVENT_RECORDS, d_model)
+        self.spatial_move_proj = nn.Linear(d_raw, d_model)
+        self.spatial_num_proj = nn.Linear(EVENT_NUMERICAL_WIDTH, d_model)
+        self.spatial_item_proj = nn.Linear(d_raw, d_model, bias=False)
+        self.spatial_ability_proj = nn.Linear(d_raw, d_model, bias=False)
+        self.spatial_condition_proj = nn.Linear(
+            d_raw + self.effect_namespace_emb.embedding_dim, d_model, bias=False
+        )
+        self.event_type_token = nn.Parameter(torch.empty(d_model))
+        self.event_encoder = SwiGLUTransformerEncoder(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             num_layers=1,
         )
-        self.mon_fusion_token = nn.Parameter(torch.empty(1, 1, d_model))
-
-        # field/side-owned scalars (turn, team-preview flag, fainted count,
-        # mega availability) fused into the single owner token
-        self.owner_scalar_proj = nn.Sequential(
-            nn.Linear(NUM_PROVENANCE_START, d_model),
-            nn.GELU(),
-        )
-
-        self.token_type_emb = nn.Embedding(NUM_TOKEN_TYPES, d_model)
-        self.side_emb = nn.Embedding(NUM_SIDES, d_model)
-        self.slot_emb = nn.Embedding(NUM_SLOTS, d_model)
-        self.action_mask_proj = nn.Sequential(
-            nn.Linear(2 * ACT_SIZE, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-        self.action_mask_token = nn.Parameter(torch.empty(1, 1, d_model))
-
-        # Event records stay in d_raw until the eight learned pooling queries
-        # emit full-width reducer tokens.
-        self.event_type_emb = nn.Embedding(EVENT_TYPE_COUNT, d_raw)
-        self.order_pos_emb = nn.Embedding(EVENT_ORDER_VOCAB_SIZE, d_raw)
-        self.event_flag_emb = nn.Embedding(8, d_raw)
-        self.event_side_emb = nn.Embedding(NUM_SIDES, d_raw)
-        self.event_slot_emb = nn.Embedding(NUM_SLOTS, d_raw)
-        self.event_proj = nn.Linear(5 * d_raw + EVENT_NUMERICAL_WIDTH, d_raw)
-        self.event_namespace_proj = nn.Linear(16, d_raw, bias=False)
-        # a learned role transform on the target endpoint keeps the shared
-        # side/slot tables (attention join to the owner token) while breaking
-        # the actor/target swap symmetry of a purely additive tag sum
-        self.target_role_proj = nn.Linear(d_raw, d_raw, bias=False)
-        namespace_by_type = torch.zeros(EVENT_TYPE_COUNT, dtype=torch.long)
-        for event_type, namespace in _EVENT_EFFECT_NAMESPACE.items():
-            namespace_by_type[event_type] = namespace
-        self.register_buffer("_event_effect_namespace", namespace_by_type, persistent=False)
-
-        if d_raw % nhead:
-            raise ValueError(f"Event width {d_raw} must be divisible by nhead {nhead}")
-        self.event_encoder = SwiGLUTransformerEncoder(
-            d_model=d_raw,
-            nhead=nhead,
-            dim_feedforward=max(64, dim_feedforward // 8),
-            num_layers=1,
-        )
-        self.event_pool_queries = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
-        self.event_key_proj = nn.Linear(d_raw, d_model)
-        self.event_value_proj = nn.Linear(d_raw, d_model)
-        self.event_pool_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.event_metadata_proj = nn.Linear(EVENT_METADATA_WIDTH, d_model)
-        self.empty_event_tokens = nn.Parameter(torch.empty(1, POOLED_EVENT_COUNT, d_model))
-
-        # cache fixed sequence-position indices so advanced indexing uses pre-allocated
-        # device tensors rather than constructing a new index tensor on every forward pass.
-        self.register_buffer("_poke_pos", torch.tensor(_POKE_POS, dtype=torch.long))
-        self.register_buffer("_owner_pos", torch.tensor(_OWNER_POS, dtype=torch.long))
 
         self._init_weights()
 
     @torch.no_grad()
     def _init_weights(self) -> None:
-        emb_gain = self.d_model**-0.5
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                init.orthogonal_(module.weight, gain=1.0)
-                if module.bias is not None:
-                    init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                init.normal_(module.weight, std=emb_gain)
-        init.normal_(self.mon_fusion_token, std=emb_gain)
-        init.normal_(self.action_mask_token, std=emb_gain)
-        init.normal_(self.event_pool_queries, std=emb_gain)
-        init.normal_(self.empty_event_tokens, std=emb_gain)
+        initialize_module(self)
+        nn.init.normal_(self.action_mask_token, std=MODEL_INIT_STD)
+        nn.init.normal_(self.unknown_legality_emb, std=MODEL_INIT_STD)
+        nn.init.normal_(self.event_type_token, std=MODEL_INIT_STD)
+        self.pokemon_pool.reset_parameters()
+        self.event_encoder.reset_parameters()
 
     def _embed_pokemon_components(
         self, categorical: torch.Tensor, numerical: torch.Tensor
@@ -420,16 +424,24 @@ class FusedTokenEncoder(nn.Module):
 
         # non-pooled primary-type channel
         # some moves like revelation dance rely on the primary type
-        type_summary = self.type_set(self.type_emb(categorical[..., 3:5]))
-        primary_type = self.primary_type_proj(self.type_emb(categorical[..., 3]))
+        type_ids = categorical[..., POKEMON_TYPE_START : POKEMON_TYPE_START + POKEMON_TYPE_SLOTS]
+        type_embeddings = self.type_emb(type_ids)
+        type_summary = self.type_set(type_embeddings, type_ids != 0)
+        primary_type = self.primary_type_proj(type_embeddings[..., 0, :])
 
         # MoveRecord: identity + static dex scalars + move-owned dynamics fused once
         move_ids = categorical[..., 5:9]
+        # A row whose legality is unproven carries zeros in the legal-this-step channel;
+        # the proven gate keeps that from reading as a proven illegal action this step.
+        legality_proven = (
+            1.0 - numerical[..., NUM_IDX_LEGALITY_UNKNOWN : NUM_IDX_LEGALITY_UNKNOWN + 1]
+        )
         move_dynamics = torch.stack(
             [
                 numerical[..., NUM_IDX_MOVE_PP : NUM_IDX_MOVE_PP + MOVE_SLOTS],
                 numerical[..., NUM_IDX_MOVE_LAST : NUM_IDX_MOVE_LAST + MOVE_SLOTS],
                 numerical[..., NUM_IDX_MOVE_LEGAL : NUM_IDX_MOVE_LEGAL + MOVE_SLOTS],
+                legality_proven.expand(*legality_proven.shape[:-1], MOVE_SLOTS),
             ],
             dim=-1,
         )
@@ -443,9 +455,7 @@ class FusedTokenEncoder(nn.Module):
             ],
             dim=-1,
         )
-        # pos emb added here to break permutation invariance
-        # the model downstream needs to know which slot is which
-        # for a1 to choose the indices
+        # Add position embedding so move slot order is distinguishable.
         move_embs = self.move_proj(move_parts) + self.move_pos_emb.weight
 
         # StatusRecord: identity + counter semantics + counter value fused once
@@ -460,14 +470,20 @@ class FusedTokenEncoder(nn.Module):
             )
         )
 
-        nature = self.nature_proj(self.nature_emb(categorical[..., 24]))
+        nature = self.nature_proj(self.nature_emb(categorical[..., CAT_IDX_NATURE]))
 
         effects = self._embed_typed_effects(categorical, numerical)
         scalars = self.pokemon_scalar_proj(numerical[..., self._pokemon_scalar_idx])
-        knownness = self.knownness_proj(
-            self.knownness_emb(
-                categorical[..., CAT_KNOWNNESS_START : CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH]
-            ).flatten(-2)
+        provenance = self.provenance_proj(
+            torch.cat(
+                [
+                    self.identity_knownness_emb(categorical[..., CAT_IDX_IDENTITY_KNOWNNESS]),
+                    self.stat_provenance_emb(categorical[..., CAT_IDX_STAT_PROVENANCE]),
+                    self.presence_status_emb(categorical[..., CAT_IDX_PRESENCE_STATUS]),
+                    self.mechanic_state_emb(categorical[..., CAT_IDX_MECHANIC_STATE]),
+                ],
+                dim=-1,
+            )
         )
 
         # combine all components into (N, NUM_COMPONENTS, d_model)
@@ -484,26 +500,11 @@ class FusedTokenEncoder(nn.Module):
                 nature.unsqueeze(-2),
                 effects.unsqueeze(-2),
                 scalars.unsqueeze(-2),
-                knownness.unsqueeze(-2),
+                provenance.unsqueeze(-2),
             ],
             dim=-2,
         )
-        components = components + self.component_emb(self._component_ids)
-
-        # The internal fusion query remains the Pokemon super-token. It is not
-        # an observation-level row and is therefore unaffected by CLS removal.
-        N = components.shape[0]
-        fusion_token = self.mon_fusion_token.expand(N, 1, -1)
-        fused = self.mon_fusion(torch.cat([fusion_token, components], dim=1))
-
-        return fused[:, 0], move_embs
-
-    def _embed_pokemon_super(
-        self, categorical: torch.Tensor, numerical: torch.Tensor
-    ) -> torch.Tensor:
-        """Embed Pokemon rows without exposing pointer-head auxiliary features."""
-        fused_token, _ = self._embed_pokemon_components(categorical, numerical)
-        return fused_token
+        return self.pokemon_pool(components), move_embs
 
     def _embed_typed_effects(
         self, categorical: torch.Tensor, numerical: torch.Tensor
@@ -526,77 +527,78 @@ class FusedTokenEncoder(nn.Module):
         return self.typed_effect_set(features, mask=effect_num[..., 0] > 0.5)
 
     def _encode_events(self, obs: StructuredObservation, device: torch.device) -> torch.Tensor:
-        events_cat = obs.events_cat.long().to(device)
-        events_num = obs.events_num.float().to(device)
-        events_side_ids = obs.events_side_ids.long().to(device)
-        events_slot_ids = obs.events_slot_ids.long().to(device)
-        event_metadata = obs.events_metadata.float().to(device)
-
-        event_types = events_cat[..., 0]
-        event_feats = torch.cat(
-            [
-                self.move_emb(events_cat[..., 1]),
-                self.item_emb(events_cat[..., 2]),
-                self.status_emb(events_cat[..., 3]),
-                self.effect_emb(events_cat[..., 5]),
-                self.ability_emb(events_cat[..., 6]),
-                events_num,
-            ],
+        spatial_cat = obs.spatial_cat.long().to(device)
+        spatial_num = obs.spatial_num.float().to(device)
+        addresses = torch.cat(
+            (self.entity_position_emb.weight, self.event_special_position_emb.weight)
+        )[self._event_address_rows]
+        # Project the nine addresses once, not every endpoint in every batch row.
+        sources = self.event_source_proj(addresses)
+        targets = self.event_target_proj(addresses)
+        conditions = torch.cat(
+            (
+                self.effect_emb(spatial_cat[..., 8]),
+                self.effect_namespace_emb(spatial_cat[..., 7]),
+            ),
             dim=-1,
         )
-        what = (
-            self.event_type_emb(event_types)
-            + self.event_namespace_proj(
-                self.effect_namespace_emb(self._event_effect_namespace[event_types])
-            )
-            + self.event_flag_emb(events_cat[..., 7])
+        records = (
+            self.event_kind_emb(spatial_cat[..., 0])
+            + F.embedding(spatial_cat[..., 1], sources)
+            + F.embedding(spatial_cat[..., 2], targets)
+            + self.spatial_move_proj(self.move_emb(spatial_cat[..., 3]))
+            + self.event_detail_emb(spatial_cat[..., 4])
+            + self.spatial_item_proj(self.item_emb(spatial_cat[..., 5]))
+            * (spatial_cat[..., 5] != 0).unsqueeze(-1)
+            + self.spatial_ability_proj(self.ability_emb(spatial_cat[..., 6]))
+            * (spatial_cat[..., 6] != 0).unsqueeze(-1)
+            + self.spatial_condition_proj(conditions) * (spatial_cat[..., 7] != 0).unsqueeze(-1)
+            + self.spatial_num_proj(spatial_num)
+            + self.event_order_emb.weight
         )
-        actor = self.event_side_emb(events_side_ids) + self.event_slot_emb(events_slot_ids)
-        target = self.target_role_proj(
-            self.event_side_emb(events_cat[..., 8]) + self.event_slot_emb(events_cat[..., 9])
-        )
-        when = self.order_pos_emb(events_cat[..., 4])
-        raw = self.event_proj(event_feats) + what + actor + target + when
-        event_mask = events_cat[..., 0] != 0
-        raw = raw.masked_fill(~event_mask.unsqueeze(-1), 0.0)
+        batch = records.size(0)
+        queries = (addresses[:SPATIAL_SLOT_COUNT] + self.event_type_token).expand(batch, -1, -1)
 
-        # Fully masked key sets are undefined for attention. An empty window
-        # gets one deterministic computational anchor and is replaced by the
-        # learned empty output after pooling.
-        has_events = event_mask.any(dim=-1)
-        padding = (~event_mask).clone()
-        padding[~has_events, 0] = False
-        contextual = self.event_encoder(raw, src_key_padding_mask=padding)
-
-        queries = self.event_pool_queries.expand(raw.size(0), -1, -1)
-        pooled, _ = self.event_pool_attn(
-            queries,
-            self.event_key_proj(contextual),
-            self.event_value_proj(contextual),
-            key_padding_mask=padding,
-            need_weights=False,
+        # The query rows are never padded, so an empty interval still has valid keys.
+        padding = torch.cat(
+            (
+                torch.zeros(batch, SPATIAL_SLOT_COUNT, dtype=torch.bool, device=device),
+                spatial_cat[..., 0] == EventKind.NONE,
+            ),
+            dim=1,
         )
-        pooled = pooled + self.event_metadata_proj(event_metadata).unsqueeze(1)
-        return torch.where(
-            has_events[:, None, None],
-            pooled,
-            self.empty_event_tokens.expand(raw.size(0), -1, -1).to(pooled.dtype),
+        return self.event_encoder(
+            torch.cat((queries, records), dim=1),
+            padding,
+            output_slice=slice(0, SPATIAL_SLOT_COUNT),
         )
 
     def _append_action_mask_token(
         self,
         tokens: torch.Tensor,
         action_mask: torch.Tensor,
+        numerical: torch.Tensor,
     ) -> torch.Tensor:
+        """Append the joint action-mask token, gated by per-slot unknown-legality flags."""
         B = tokens.size(0)
         if action_mask.shape != (B, 2, ACT_SIZE):
             raise ValueError(
                 f"Expected action mask ({B}, 2, {ACT_SIZE}); got {tuple(action_mask.shape)}."
             )
-        flat_mask = action_mask.reshape(B, -1).to(tokens.dtype)
-
-        mask_token = self.action_mask_token.expand(B, -1, -1)
-        mask_token = mask_token + self.action_mask_proj(flat_mask).unsqueeze(1)
+        dtype = tokens.dtype
+        slot_unknown = numerical[
+            :,
+            TOKEN_IDX_ALLY_SIDE,
+            NUM_IDX_SLOT_LEGALITY_UNKNOWN : NUM_IDX_SLOT_LEGALITY_UNKNOWN + 2,
+        ].to(dtype)
+        # An unknown slot contributes its learned marker instead of mask values.
+        gated_mask = action_mask.to(dtype) * (1.0 - slot_unknown).unsqueeze(-1)
+        unknown_marker = slot_unknown @ self.unknown_legality_emb.to(dtype)
+        mask_token = (
+            self.action_mask_token.expand(B, -1, -1)
+            + self.action_mask_proj(gated_mask.reshape(B, -1)).unsqueeze(1)
+            + unknown_marker.unsqueeze(1)
+        )
         return torch.cat([tokens, mask_token], dim=1)
 
     def forward(
@@ -604,7 +606,8 @@ class FusedTokenEncoder(nn.Module):
         obs: StructuredObservation,
         action_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode a batched observation into token and auxiliary-context tensors.
+        """
+        Encode a batched observation into token and auxiliary-context tensors.
 
         Arguments:
           obs: the batched structured observation to encode
@@ -615,10 +618,6 @@ class FusedTokenEncoder(nn.Module):
         """
         categorical = obs.categorical.long()
         numerical = obs.numerical.float()
-        token_type_ids = obs.token_type_ids.long()
-        side_ids = obs.side_ids.long()
-        slot_ids = obs.slot_ids.long()
-
         if categorical.dim() != 3:
             raise ValueError(
                 f"Expected a batched categorical tensor with 3 dimensions; "
@@ -638,12 +637,9 @@ class FusedTokenEncoder(nn.Module):
                 f"and {tuple(numerical.shape)}."
             )
 
-        device = self.mon_fusion_token.device
+        device = self.action_mask_token.device
         categorical = categorical.to(device)
         numerical = numerical.to(device)
-        token_type_ids = token_type_ids.to(device)
-        side_ids = side_ids.to(device)
-        slot_ids = slot_ids.to(device)
         action_mask = action_mask.to(device)
 
         x = torch.zeros(
@@ -651,39 +647,34 @@ class FusedTokenEncoder(nn.Module):
             sequence_length,
             self.d_model,
             device=device,
-            dtype=self.mon_fusion_token.dtype,
+            dtype=self.action_mask_token.dtype,
         )
 
-        n_poke = len(_POKE_POS)
-        poke_cats = categorical[:, self._poke_pos, :].flatten(0, 1)
-        poke_nums = numerical[:, self._poke_pos, :].flatten(0, 1)
+        n_poke = len(POKEMON_TOKENS)
+        poke_cats = categorical[:, :n_poke, :].flatten(0, 1)
+        poke_nums = numerical[:, :n_poke, :].flatten(0, 1)
         poke_out, all_move_embs = self._embed_pokemon_components(poke_cats, poke_nums)
 
-        x[:, self._poke_pos, :] = poke_out.unflatten(0, (batch_size, n_poke)).to(x.dtype)
+        x[:, :n_poke, :] = poke_out.unflatten(0, (batch_size, n_poke)).to(x.dtype)
         # the two active allies' MoveRecords double as the pointer-head move
         # keys; the records already carry pp/legality state, so no extra patch
         aux_moves = all_move_embs.unflatten(0, (batch_size, n_poke))[:, :2]
 
+        n_owner = len(OWNER_TOKENS)
+        owner_end = n_poke + n_owner
         # field / ally-side / opponent-side owners: one fused token each, from
         # the owner's typed effects plus its own scalars
-        x[:, self._owner_pos, :] = (
+        x[:, n_poke:owner_end, :] = (
             self._embed_typed_effects(
-                categorical[:, self._owner_pos, :],
-                numerical[:, self._owner_pos, :],
+                categorical[:, n_poke:owner_end, :],
+                numerical[:, n_poke:owner_end, :],
             )
-            + self.owner_scalar_proj(numerical[:, self._owner_pos, :NUM_PROVENANCE_START])
+            + self.owner_scalar_proj(numerical[:, n_poke:owner_end, :NUM_BASE_WIDTH])
         ).to(x.dtype)
 
-        out_tokens = (
-            x
-            + self.token_type_emb(token_type_ids)
-            + self.side_emb(side_ids)
-            + self.slot_emb(slot_ids)
-        )
-        out_tokens = self._append_action_mask_token(out_tokens, action_mask)
+        out_tokens = x + self.entity_position_emb.weight
+        out_tokens = self._append_action_mask_token(out_tokens, action_mask, numerical)
 
         event_tokens = self._encode_events(obs, device)
-        event_tokens = event_tokens + self.token_type_emb.weight[int(TokenType.EVENT)]
-
         out_tokens = torch.cat([out_tokens, event_tokens.to(out_tokens.dtype)], dim=1)
         return out_tokens, aux_moves

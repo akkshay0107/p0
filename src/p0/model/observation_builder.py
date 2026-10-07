@@ -1,8 +1,8 @@
-"""Builds structured battle observations and per-slot action masks from poke-env battles.
+"""
+Build structured observations from live or reconstructed battle views.
 
-Implements the observation builder that serializes a ``DoubleBattle`` into the
-``StructuredObservation`` contract (entities, categoricals, numericals, action mask and
-team-preview state) consumed by the policy and the runtime.
+Write Pokemon, field, side, and event features into the shared tensor layout.
+Keep unknown information distinct from observed values and estimated stats.
 """
 
 from __future__ import annotations
@@ -12,42 +12,61 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from p0.battle.events import EVENT_DIAGNOSTICS, BattleEvent, truncate_events
-from p0.battle.views import BattleView, MoveView, PokemonView
+from p0.battle.events import EVENT_CATEGORICAL_WIDTH, MAX_EVENT_RECORDS
+from p0.battle.views import BattleView, MoveView, PokemonView, TransformedPokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
+    CAT_IDX_IDENTITY_KNOWNNESS,
+    CAT_IDX_MECHANIC_STATE,
+    CAT_IDX_NATURE,
+    CAT_IDX_PRESENCE_STATUS,
+    CAT_IDX_STAT_PROVENANCE,
     CAT_IDX_STATUS_COUNTER_KIND,
-    CAT_KNOWNNESS_START,
-    CATEGORICAL_WIDTH,
-    EVENT_CATEGORICAL_WIDTH,
-    EVENT_COUNT,
-    EVENT_METADATA_WIDTH,
-    EVENT_NUMERICAL_WIDTH,
     MAX_EFFECTS,
     MOVE_SLOTS,
+    NUM_IDX_CAN_MEGA,
+    NUM_IDX_CAN_SWITCH_OUT,
     NUM_IDX_EFFECT_COUNT,
     NUM_IDX_EFFECT_OVERFLOW,
+    NUM_IDX_HP_FRACTION,
+    NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_LEVEL_STATS,
+    NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_PREPARING,
+    NUM_IDX_REVEALED,
+    NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+    NUM_IDX_STAT_PROVENANCE,
     NUM_IDX_STATUS_COUNTER,
-    NUM_PROVENANCE_START,
-    NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     TEAM_SIZE,
     CounterKind,
     EffectNamespace,
-    Knownness,
-    Provenance,
+    IdentityKnownness,
+    MechanicState,
+    PresenceStatus,
     SideId,
+    StatProvenance,
     StructuredObservation,
     TokenType,
     effect_cat_slice,
     effect_num_slice,
 )
 from p0.model.tokenizer import PokemonTokenizer
-from p0.teams.stat_points import BaseStats, imputed_stats
+from p0.teams.spread_usage import load_spread_table_file
+from p0.teams.stat_points import BaseStats, calculate_stats
+
+# The format's level clause pins every Pokemon to level 50.
+FORMAT_LEVEL = 50
 
 _DEFAULT_RESOURCES = default_runtime_resources()
-_MEGA_ITEMS = _DEFAULT_RESOURCES.mega_items
 _MEGA_FORMS = _DEFAULT_RESOURCES.mega_forms
+_MEGA_SPECIES_BY_ITEM = {
+    PokemonTokenizer.normalize_id(item["id"]): frozenset(
+        PokemonTokenizer.normalize_id(species) for species in item["megaStone"]
+    )
+    for item in _DEFAULT_RESOURCES.dex["items"]
+    if item.get("megaStone")
+}
 
 # Named after the poke-env protocol enums the adapters hand over; matching on
 # member names keeps this module free of the poke-env dependency itself.
@@ -85,14 +104,9 @@ _SLOT_LAYOUT = np.asarray(
 )
 
 
-def _knownness(value: object | None, resolved_id: int) -> Knownness:
-    if value is None or value == "":
-        return Knownness.KNOWN_NONE
-    return Knownness.KNOWN if resolved_id else Knownness.OOV
-
-
 def _status_counter_kind(status: object | None) -> CounterKind:
-    """StatusRecord counter semantics (schema v3, plan §3.1).
+    """
+    StatusRecord counter semantics.
 
     SLP counts public turns already slept (never the hidden RNG total duration);
     TOX is the badly-poisoned stage that scales the damage tick, the same role
@@ -125,16 +139,20 @@ def _pad_team(
     overflow = len(res) - TEAM_SIZE
     if overflow > 0:
         # only happens when an active slot placeholder pushes a 6-mon team list
-        # (opponent with open team sheet) over the row budget.prefer dropping
-        # mons that are confirmed to have not been brought
+        # (opponent with open team sheet) over the row budget. Eviction must stay
+        # decidable from public state, so it never consults team selection.
         actives, rest = res[:2], res[2:]
-        for i in range(len(rest) - 1, -1, -1):
-            if overflow == 0:
-                break
-            mon = rest[i][0]
-            if mon is not None and not mon.revealed and not mon.fainted:
-                rest.pop(i)
-                overflow -= 1
+        for predicate in (
+            lambda mon: mon.fainted,
+            lambda mon: not mon.revealed,
+        ):
+            for i in range(len(rest) - 1, -1, -1):
+                if overflow == 0:
+                    break
+                mon = rest[i][0]
+                if mon is not None and predicate(mon):
+                    rest.pop(i)
+                    overflow -= 1
         del rest[len(rest) - overflow :]
         res = actives + rest
 
@@ -149,7 +167,7 @@ def _selected_ally_pokemon(battle: Any) -> set[Any]:
     if battle.teampreview:
         return set(battle.team.values())
 
-    selected = {mon for mon in battle.team.values() if mon.selected_in_teampreview}
+    selected = {mon for mon in battle.team.values() if mon.selected_in_teampreview is True}
 
     # battle state authoritative, previous is fallback for trapped situations
     selected.update(mon for mon in battle.active_pokemon if mon is not None)
@@ -161,7 +179,6 @@ def _selected_ally_pokemon(battle: Any) -> set[Any]:
 def _get_ordered_pokemon(
     battle: Any,
     is_opponent: bool,
-    selected_allies: set[Any] | None = None,
     orig_idx_map: Mapping[Any, int] | None = None,
 ) -> list[tuple[Any | None, int, int | None]]:
     # returns list of (pokemon, orig_id, active_id)
@@ -173,31 +190,11 @@ def _get_ordered_pokemon(
     if orig_idx_map is None:
         orig_idx_map = {mon: i for i, mon in enumerate(team.values())}
 
-    if is_opponent:
-        if battle.teampreview:
-            res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
-            return _pad_team(res)
-
-        # active slots are positional: left always at index 0, right at index 1
-        res: list[tuple[PokemonView | None, int, int | None]] = []
-        assigned: set[Any] = set()
-        for mon in active:
-            if mon is None:
-                res.append((None, -1, None))
-            else:
-                res.append((mon, orig_idx_map.get(mon, -1), None))
-                assigned.add(mon)
-        res += [
-            (mon, orig_idx_map.get(mon, -1), None) for mon in team.values() if mon not in assigned
+    if battle.teampreview:
+        res: list[tuple[PokemonView | None, int, int | None]] = [
+            (mon, orig_idx_map.get(mon, -1), None) for mon in team.values()
         ]
         return _pad_team(res)
-
-    if battle.teampreview:
-        res = [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values()]
-        return _pad_team(res)
-
-    if selected_allies is None:
-        selected_allies = _selected_ally_pokemon(battle)
 
     res = []
     assigned = set()
@@ -205,19 +202,27 @@ def _get_ordered_pokemon(
         if mon is None:
             res.append((None, -1, None))
         else:
-            res.append((mon, orig_idx_map.get(mon, -1), active_idx))
+            res.append((mon, orig_idx_map.get(mon, -1), None if is_opponent else active_idx))
             assigned.add(mon)
 
-    bench, dropped = [], []
-    for mon in team.values():
-        if mon in assigned:
-            continue
-        idx = orig_idx_map.get(mon, -1)
-        if mon in selected_allies:
-            bench.append((mon, idx, None))
-        else:
-            dropped.append((mon, idx, None))
-    res += bench + dropped
+            # A replay keeps a previously seen disguise target in the team map
+            # with its own public state. While Illusion is active, that target
+            # occupies the active row, so it must not take a second bench row.
+            if is_opponent and getattr(mon, "identity_uncertain", False):
+                target = next(
+                    (
+                        member
+                        for member in team.values()
+                        if member not in assigned and member.species == mon.species
+                    ),
+                    None,
+                )
+                if target is not None:
+                    assigned.add(target)
+
+    # Row order must not depend on team selection: a public replay cannot know it
+    # until a reserve appears, and an order that drifts would break replay parity.
+    res += [(mon, orig_idx_map.get(mon, -1), None) for mon in team.values() if mon not in assigned]
 
     return _pad_team(res)
 
@@ -239,95 +244,102 @@ def _slot_condition(
         return 1
     if is_opponent:
         return 2
+    if mon.selected_in_teampreview is None:
+        return 0
     if selected_allies is None:
         selected_allies = _selected_ally_pokemon(battle)
     return 2 if mon in selected_allies else -1
 
 
-def _imputation_input(pokemon: PokemonView) -> dict | None:
-    if not pokemon.species or not pokemon.nature or len(pokemon.moves) != MOVE_SLOTS:
+def _imputed_stats(pokemon: PokemonView) -> tuple[int, int, int, int, int, int] | None:
+    """
+    Estimate level-50 stats from the usage priors, or None when unrecoverable.
+
+    Only the species and nature are required: the usage prior is keyed on those, and
+    move categories matter solely for the fallback used on uncovered species. A
+    partially revealed opponent therefore still gets a usage-backed estimate.
+    """
+    species = pokemon.species
+    nature = pokemon.nature
+    if not species or not nature:
         return None
-    moves = tuple(pokemon.moves.values())
-    return dict(
-        nature=str(pokemon.nature).lower(),
-        item=PokemonTokenizer.normalize_id(pokemon.item or ""),
-        ability=PokemonTokenizer.normalize_id(pokemon.ability or ""),
-        moves=tuple(move.id for move in moves),
-        move_categories=tuple(move.category.name.lower() for move in moves),
-        base_stats=BaseStats.from_mapping(pokemon.base_stats),
+
+    categories = tuple(move.category.name.lower() for move in pokemon.moves.values())
+    estimate = load_spread_table_file().resolve(species, str(nature), categories)
+    if estimate is None:
+        return None
+
+    return calculate_stats(
+        BaseStats.from_mapping(pokemon.base_stats), estimate.points, str(nature), FORMAT_LEVEL
     )
 
 
 def _cached_imputed_stats(
     pokemon: PokemonView, cache: dict[Any, tuple[int, int, int, int, int, int]]
 ) -> tuple[int, int, int, int, int, int] | None:
-    result = cache.get(pokemon)
+    cache_key = (id(pokemon), pokemon.species)
+    result = cache.get(cache_key)
     if result is not None:
         return result
-    value = _imputation_input(pokemon)
-    if value is None:
+    result = _imputed_stats(pokemon)
+    if result is None:
         return None
-    result = imputed_stats(**value)
-    cache[pokemon] = result
+    cache[cache_key] = result
     return result
+
+
+_STAT_KEYS = ("hp", "atk", "def", "spa", "spd", "spe")
 
 
 def _has_exact_stats(pokemon: PokemonView) -> bool:
     stats = pokemon.stats
-    return stats is not None and all(
-        stats.get(key) is not None for key in ("hp", "atk", "def", "spa", "spd", "spe")
-    )
+    return stats is not None and all(stats.get(key) is not None for key in _STAT_KEYS)
 
 
 def _get_pokemon_level_stats(
     pokemon: PokemonView,
     is_opponent: bool,
     precomputed: tuple[int, int, int, int, int, int] | None,
-) -> tuple[tuple[float, ...], Provenance]:
-    stats = pokemon.stats
-    if not is_opponent and stats is not None:
-        values = [stats.get(key) for key in ("hp", "atk", "def", "spa", "spd", "spe")]
-        if all(value is not None for value in values):
-            return tuple(float(value) for value in values), Provenance.SELF_KNOWN  # type: ignore
+) -> tuple[tuple[float, ...], StatProvenance]:
+    if not is_opponent and _has_exact_stats(pokemon):
+        stats = pokemon.stats
+        return tuple(float(stats[key]) for key in _STAT_KEYS), StatProvenance.KNOWN  # type: ignore
 
     if precomputed is not None:
-        return tuple(float(value) for value in precomputed), Provenance.IMPUTED
-    return (0.0,) * 6, Provenance.UNKNOWN
+        return tuple(float(value) for value in precomputed), StatProvenance.IMPUTED
+    return (0.0,) * 6, StatProvenance.UNKNOWN
 
 
 def _resolve_stats(
     pokemon: PokemonView | None,
     is_opponent: bool,
     cache: dict[Any, tuple[int, int, int, int, int, int]],
-    overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None,
+    overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None,
 ) -> tuple[int, int, int, int, int, int] | None:
     if pokemon is None:
         return None
-    supplied = overrides.get(pokemon) if overrides is not None else None
-    if supplied is not None or (not is_opponent and _has_exact_stats(pokemon)):
-        return supplied
+    if overrides is not None and pokemon in overrides:
+        return overrides[pokemon]
+    if not is_opponent and _has_exact_stats(pokemon):
+        return None
     return _cached_imputed_stats(pokemon, cache)
 
 
 def _is_mega_form(pokemon: PokemonView | None) -> bool:
-    if pokemon is None:
-        return False
-    species = pokemon.species
-    if not species:
-        return False
-    return PokemonTokenizer.normalize_id(species) in _MEGA_FORMS
+    return (
+        pokemon is not None
+        and bool(pokemon.species)
+        and PokemonTokenizer.normalize_id(pokemon.species) in _MEGA_FORMS
+    )
 
 
-def _can_mega(pokemon: PokemonView | None, battle: Any, active_idx: int | None = None) -> bool:
-    if pokemon is None:
+def _holds_mega_stone(pokemon: PokemonView | None) -> bool:
+    """Whether the held stone can Mega Evolve this Pokémon's original species."""
+    if pokemon is None or not pokemon.item or _is_mega_form(pokemon):
         return False
-    if active_idx is not None:
-        return battle.can_mega_evolve[active_idx]
-    # Fallback if the attribute above is unavailable.
-    item = pokemon.item
-    if not item:
-        return False
-    return PokemonTokenizer.normalize_id(item) in _MEGA_ITEMS and not _is_mega_form(pokemon)
+    item = PokemonTokenizer.normalize_id(pokemon.item)
+    species = PokemonTokenizer.normalize_id(pokemon.base_species)
+    return species in _MEGA_SPECIES_BY_ITEM.get(item, ())
 
 
 def _side_mega_available(
@@ -335,20 +347,31 @@ def _side_mega_available(
     *,
     is_opponent: bool,
     selected_allies: set[Any] | None = None,
-) -> bool:
+) -> tuple[bool, bool]:
+    """
+    Whether the side still has a compatible Mega Stone, and whether that is knowable.
+
+    A replay cannot see an unbrought reserve's item, so a side whose only mega-stone
+    holder has not been revealed reports unknown instead of a false negative.
+    """
     if is_opponent:
         if battle.opponent_used_mega_evolve:
-            return False
+            return False, True
         candidates = battle.opponent_team.values()
     else:
         if battle.used_mega_evolve:
-            return False
+            return False, True
         candidates = _selected_ally_pokemon(battle) if selected_allies is None else selected_allies
 
-    return any(
-        PokemonTokenizer.normalize_id(mon.item) in _MEGA_ITEMS and not _is_mega_form(mon)
-        for mon in candidates
+    available = any(_holds_mega_stone(mon) for mon in candidates)
+    if available or is_opponent:
+        return available, True
+
+    unresolved = any(
+        mon.selected_in_teampreview is None and _holds_mega_stone(mon)
+        for mon in battle.team.values()
     )
+    return False, not unresolved
 
 
 def _write_effects(
@@ -414,8 +437,14 @@ def _pokemon_categorical_into(
     tok: PokemonTokenizer,
     move_slots: tuple[MoveView | None, ...],
     row: np.ndarray,
+    cond: int = 0,
+    stat_provenance: StatProvenance = StatProvenance.PAD,
 ) -> None:
     if pokemon is None:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.PAD
+        row[CAT_IDX_STAT_PROVENANCE] = StatProvenance.PAD
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.PAD
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.NORMAL
         return
 
     row[0] = tok.species_id(pokemon)
@@ -429,37 +458,75 @@ def _pokemon_categorical_into(
             row[9 + i] = tok.move_type_id(move)
             row[13 + i] = tok.move_category_id(move)
     row[17] = tok.status_id(pokemon.status)
-    row[24] = tok.nature_id(pokemon)
+    row[CAT_IDX_NATURE] = tok.nature_id(pokemon)
     row[CAT_IDX_STATUS_COUNTER_KIND] = _status_counter_kind(pokemon.status)
-    values = (
-        pokemon.species or pokemon.base_species,
-        pokemon.ability,
-        pokemon.item,
-        pokemon.type_1,
-        pokemon.type_2,
-        *move_slots,
-        *(move.type if move is not None else None for move in move_slots),
-        *(move.category if move is not None else None for move in move_slots),
-        pokemon.status,
-    )
-    for index, value in enumerate(values):
-        row[CAT_KNOWNNESS_START + index] = _knownness(value, int(row[index]))
-    row[CAT_KNOWNNESS_START + 24] = _knownness(pokemon.nature, int(row[24]))
+
+    # Distinguish missing species from names the current vocabulary cannot encode.
+    species_name = pokemon.species
+    if not species_name:
+        try:
+            species_name = pokemon.base_species
+        except (KeyError, AttributeError):
+            species_name = None
+
+    if not species_name:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.UNKNOWN
+    elif row[0] > 0:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.KNOWN
+    else:
+        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.OOV
+
+    # Record whether level stats are exact, estimated, or unavailable.
+    row[CAT_IDX_STAT_PROVENANCE] = stat_provenance
+
+    # Summarize what the observer knows about this Pokemon's battle presence.
+    if cond == 1:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.ACTIVE
+    elif cond == -1:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.UNBROUGHT_CONFIRMED
+    elif pokemon.revealed:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.BENCH_REVEALED
+    else:
+        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.RESERVE_UNCONFIRMED
+
+    # Transform is explicit in the view. Illusion is present only while an
+    # Illusion user is still presenting another Pokemon as its base species.
+    try:
+        base_species_id = PokemonTokenizer.normalize_id(pokemon.base_species)
+    except (KeyError, AttributeError):
+        base_species_id = ""
+
+    if isinstance(pokemon, TransformedPokemonView) or getattr(pokemon, "is_transformed", False):
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.TRANSFORMED
+    elif (
+        cond == 1
+        and PokemonTokenizer.normalize_id(pokemon.ability or "") == "illusion"
+        and PokemonTokenizer.normalize_id(pokemon.species or "") != base_species_id
+    ):
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.ILLUSION_DISGUISED
+    else:
+        row[CAT_IDX_MECHANIC_STATE] = MechanicState.NORMAL
 
 
-def _ally_legality(
-    battle: BattleView, active_idx: int, move_slots: tuple[MoveView | None, ...]
-) -> tuple[list[float], float]:
+def _ally_legality(battle: BattleView, active_idx: int) -> tuple[list[float], float, bool]:
+    """Per-move legality, can-switch-out, and whether the source could prove them."""
     decision = battle.decision
     slot = decision.slots[active_idx]
+
+    # A source without the authoritative request emits zeros and lets the gate say so;
+    # a concrete illegal value here would be indistinguishable from a proven restriction.
+    if not slot.legality_known:
+        return [0.0] * MOVE_SLOTS, 0.0, False
+
     any_force = decision.slots[0].force_switch or decision.slots[1].force_switch
     if decision.wait or (any_force and not slot.force_switch):
-        return [0.0] * MOVE_SLOTS, 0.0
+        return [0.0] * MOVE_SLOTS, 0.0, True
+
     move_legal = [
         float(index < len(slot.move_targets) and bool(slot.move_targets[index]))
         for index in range(MOVE_SLOTS)
     ]
-    return move_legal, float(bool(slot.switch_slots) and not slot.trapped)
+    return move_legal, float(bool(slot.switch_slots) and not slot.trapped), True
 
 
 def _pokemon_numeric_into(
@@ -469,33 +536,22 @@ def _pokemon_numeric_into(
     orig_idx: int,
     move_slots: tuple[MoveView | None, ...],
     row: np.ndarray,
+    level_stats: tuple[float, ...],
+    stat_provenance: StatProvenance,
     active_idx: int | None = None,
     is_opponent: bool = False,
-    precomputed_stats: tuple[int, int, int, int, int, int] | None = None,
 ) -> None:
     row[cond + 1] = 1.0
 
     if pokemon is None:
         return
 
-    row[5] = float(pokemon.current_hp_fraction)
+    row[NUM_IDX_HP_FRACTION] = float(pokemon.current_hp_fraction)
 
-    base_stats = pokemon.base_stats
-    row[6] = base_stats["hp"] / 160.0
-    row[7] = base_stats["atk"] / 160.0
-    row[8] = base_stats["def"] / 160.0
-    row[9] = base_stats["spa"] / 160.0
-    row[10] = base_stats["spd"] / 160.0
-    row[11] = base_stats["spe"] / 160.0
-
-    boosts = pokemon.boosts
-    row[12] = boosts["atk"] / 6.0
-    row[13] = boosts["def"] / 6.0
-    row[14] = boosts["spa"] / 6.0
-    row[15] = boosts["spd"] / 6.0
-    row[16] = boosts["spe"] / 6.0
-    row[17] = boosts["accuracy"] / 6.0
-    row[18] = boosts["evasion"] / 6.0
+    row[6:12] = [pokemon.base_stats[s] / 160.0 for s in ("hp", "atk", "def", "spa", "spd", "spe")]
+    row[12:19] = [
+        pokemon.boosts[s] / 6.0 for s in ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
+    ]
 
     for i, move in enumerate(move_slots):
         if move is not None:
@@ -503,28 +559,23 @@ def _pokemon_numeric_into(
 
     row[23] = min(pokemon.protect_counter, 4) / 4.0
     row[24] = pokemon.first_turn
-
-    # embedding based on low kick tables (since that is what matters)
-    weight = pokemon.weight
-    if weight < 10.0:
-        row[25] = 0.0
-    elif weight < 25.0:
-        row[25] = 0.2
-    elif weight < 50.0:
-        row[25] = 0.4
-    elif weight < 100.0:
-        row[25] = 0.6
-    elif weight < 200.0:
-        row[25] = 0.8
-    else:
-        row[25] = 1.0
+    row[25] = sum(pokemon.weight >= t for t in (10.0, 25.0, 50.0, 100.0, 200.0)) * 0.2
 
     row[26] = 0.0 if orig_idx < 0 else (orig_idx + 1) / float(TEAM_SIZE)
     row[27] = pokemon.fainted
     row[28] = cond == 1
     row[29] = cond == 2
-    row[30] = _can_mega(pokemon, battle, active_idx)
+    identity_uncertain = bool(getattr(pokemon, "identity_uncertain", False))
+    row[NUM_IDX_CAN_MEGA] = (
+        float(battle.can_mega_evolve[active_idx])
+        if active_idx is not None
+        and not identity_uncertain
+        and battle.decision.slots[active_idx].legality_known
+        else 0.0
+    )
     row[31] = _is_mega_form(pokemon)
+    if identity_uncertain:
+        row[NUM_IDX_LEGALITY_UNKNOWN] = 1.0
 
     last_move_id = None
     custom_last_move = battle.last_move(pokemon)
@@ -541,29 +592,20 @@ def _pokemon_numeric_into(
 
     row[NUM_IDX_STATUS_COUNTER] = min(pokemon.status_counter, 5) / 5.0
 
-    row[42] = pokemon.preparing
+    row[NUM_IDX_PREPARING] = pokemon.preparing
 
-    level_stats, stat_provenance = _get_pokemon_level_stats(pokemon, is_opponent, precomputed_stats)
-    row[43] = level_stats[0] / 300.0
-    row[44] = level_stats[1] / 300.0
-    row[45] = level_stats[2] / 300.0
-    row[46] = level_stats[3] / 300.0
-    row[47] = level_stats[4] / 300.0
-    row[48] = level_stats[5] / 300.0
-    row[49] = float(stat_provenance == Provenance.SELF_KNOWN)
-    row[NUM_PROVENANCE_START : NUM_PROVENANCE_START + 6] = stat_provenance
+    row[NUM_IDX_LEVEL_STATS : NUM_IDX_LEVEL_STATS + 6] = [stat / 300.0 for stat in level_stats]
+    row[NUM_IDX_STAT_PROVENANCE] = float(stat_provenance == StatProvenance.KNOWN)
 
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
     if active_idx is not None and not is_opponent and not battle.teampreview:
-        move_legal, can_switch_out = _ally_legality(battle, active_idx, move_slots)
-        row[50] = move_legal[0]
-        row[51] = move_legal[1]
-        row[52] = move_legal[2]
-        row[53] = move_legal[3]
-        row[54] = can_switch_out
+        move_legal, can_switch_out, legality_known = _ally_legality(battle, active_idx)
+        row[NUM_IDX_MOVE_LEGAL : NUM_IDX_MOVE_LEGAL + MOVE_SLOTS] = move_legal
+        row[NUM_IDX_CAN_SWITCH_OUT] = can_switch_out
+        row[NUM_IDX_LEGALITY_UNKNOWN] = float(not legality_known)
 
-    row[55] = pokemon.revealed
+    row[NUM_IDX_REVEALED] = pokemon.revealed
 
 
 def _global_field_token_into(
@@ -572,10 +614,6 @@ def _global_field_token_into(
     categorical: np.ndarray,
     numerical: np.ndarray,
 ) -> None:
-    if not battle.weather and not battle.fields:
-        numerical[2] = float(battle.teampreview)
-        numerical[3] = battle.turn / 24.0
-        return
     effects = []
     for weather, start_turn in battle.weather.items():
         effects.append(
@@ -617,10 +655,6 @@ def _side_token_into(
     cat: np.ndarray,
     num: np.ndarray,
 ) -> None:
-    if not conditions:
-        num[3] = float(fainted_count) / float(TEAM_SIZE)
-        num[4] = float(mega_available)
-        return
     effects = []
     for condition, stored_value in conditions.items():
         stackable = condition.name in _STACKABLE_SIDE_CONDITION_NAMES
@@ -643,112 +677,39 @@ def _side_token_into(
     num[4] = float(mega_available)
 
 
-def _ground_identifier(
-    battle: BattleView,
-    entity_id: str,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
-) -> tuple[SideId, int]:
-    # Side identifiers arrive as bare "p1"/"p2" or "p1: Username"; Pokemon
-    # identifiers carry a position letter ("p1a: Name"), so the third
-    # character distinguishes the two without a lookup.
-    if len(entity_id) >= 2 and (len(entity_id) == 2 or entity_id[2] == ":"):
-        prefix = entity_id[:2]
-        if prefix in ("p1", "p2"):
-            side = SideId.ALLY if prefix == battle.player_role else SideId.OPPONENT
-            return side, 0
-
-    try:
-        pokemon = battle.get_pokemon(entity_id)
-    except (AssertionError, IndexError, KeyError, ValueError):
-        EVENT_DIAGNOSTICS["grounding_misses"] += 1
-        return SideId.NONE, 0
-    location = pokemon_to_slot.get(pokemon)
-    if location is None:
-        EVENT_DIAGNOSTICS["grounding_misses"] += 1
-        return SideId.NONE, 0
-    return location
-
-
-def _event_location(
-    battle: BattleView,
-    event: BattleEvent,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
-) -> tuple[SideId, int]:
-    if event.entity_id is None:
-        return SideId.NONE, 0
-    return _ground_identifier(battle, event.entity_id, pokemon_to_slot)
-
-
-def _event_target_location(
-    battle: BattleView,
-    event: BattleEvent,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
-) -> tuple[SideId, int]:
-    if event.target_id is None:
-        return SideId.NONE, 0
-    return _ground_identifier(battle, event.target_id, pokemon_to_slot)
-
-
-def _write_events(
+def _write_spatial_events(
     battle: BattleView,
     out: StructuredObservation,
-    pokemon_to_slot: dict[Any, tuple[SideId, int]],
 ) -> None:
-    untruncated_events = battle.consume_events()
-    event_overflow = max(0, len(untruncated_events) - EVENT_COUNT)
-    events = truncate_events(untruncated_events, limit=EVENT_COUNT)
-    events_cat = out.events_cat.numpy()
-    events_num = out.events_num.numpy()
-    events_side_ids = out.events_side_ids.numpy()
-    events_slot_ids = out.events_slot_ids.numpy()
-    events_metadata = out.events_metadata.numpy()
-    events_cat.fill(0)
-    events_num.fill(0)
-    events_side_ids.fill(0)
-    events_slot_ids.fill(0)
-    events_metadata.fill(0)
-    events_metadata[:] = (len(untruncated_events), event_overflow)
-    for event_idx, event in enumerate(events):
-        side_id, slot_id = _event_location(battle, event, pokemon_to_slot)
-        target_side_id, target_slot_id = _event_target_location(battle, event, pokemon_to_slot)
-        # Order is re-compacted to the post-truncation index so the positional
-        # vocabulary never saturates and the order scalar stays inside [0, 1).
-        events_cat[event_idx] = (
-            event.event_type,
-            event.move_id,
-            event.item_id,
-            event.status_id,
-            event_idx + 1,
-            event.effect_id,
-            event.ability_id,
-            event.flags,
-            target_side_id,
-            target_slot_id,
-        )
-        events_num[event_idx] = (
-            event.value,
-            event_idx / float(EVENT_COUNT),
-        )
-        events_side_ids[event_idx] = side_id
-        events_slot_ids[event_idx] = slot_id
+    spatial_cat = out.spatial_cat.numpy()
+    spatial_num = out.spatial_num.numpy()
+    spatial_cat.fill(0)
+    spatial_num.fill(0)
+
+    # Records are left-aligned in arrival order; zero rows are EventKind.NONE padding.
+    records = battle.spatial_events[:MAX_EVENT_RECORDS]
+    if records:
+        spatial_cat[: len(records)] = [record[:EVENT_CATEGORICAL_WIDTH] for record in records]
+        spatial_num[: len(records)] = [record[EVENT_CATEGORICAL_WIDTH:] for record in records]
 
 
 def _write_observation(
     battle: BattleView,
     out: StructuredObservation,
     tok: PokemonTokenizer,
-    stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+    stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
 ) -> None:
-    """Serialize a battle view into a pre-allocated StructuredObservation in place.
+    """
+    Serialize a battle view into a pre-allocated StructuredObservation in place.
 
     Arguments:
       battle: battle view providing the entity, categorical, and numerical features
       out: pre-allocated observation buffer to populate in place
       tok: tokenizer mapping string identifiers to categorical vocabulary indices
-      stat_overrides: optional per-species base stat overrides keyed by species identifier
+      stat_overrides: optional estimated level stats keyed by Pokemon view
 
     Returns:
-      None; writes directly into the ``out`` buffers
+      None; writes directly into the out buffers
     """
     token_types = out.token_type_ids.numpy()
     sides = out.side_ids.numpy()
@@ -762,35 +723,35 @@ def _write_observation(
     categorical.fill(0)
     numerical.fill(0)
 
-    selected_allies = set(_selected_ally_pokemon(battle))
+    selected_allies = _selected_ally_pokemon(battle)
     ally_orig_idx = {mon: i for i, mon in enumerate(battle.team.values())}
     opponent_orig_idx = {mon: i for i, mon in enumerate(battle.opponent_team.values())}
     stat_cache = battle.stat_cache
 
-    pokemon_to_slot = {}
-
     idx = 0
-    for side, is_opponent, orig_idx_map in (
-        (SideId.ALLY, False, ally_orig_idx),
-        (SideId.OPPONENT, True, opponent_orig_idx),
+    for is_opponent, orig_idx_map in (
+        (False, ally_orig_idx),
+        (True, opponent_orig_idx),
     ):
         ordered = _get_ordered_pokemon(
             battle,
             is_opponent,
-            selected_allies if not is_opponent else None,
             orig_idx_map,
         )
         for slot_idx, (mon, orig_idx, active_idx) in enumerate(ordered):
             cond = _slot_condition(
                 battle, mon, slot_idx, is_opponent, selected_allies if not is_opponent else None
             )
-            slot_id = slot_idx + 1
             if mon is not None:
-                pokemon_to_slot[mon] = (side, slot_id)
-            move_slots = _iter_move_slots(mon)
+                precomputed = _resolve_stats(mon, is_opponent, stat_cache, stat_overrides)
+                level_stats, stat_prov = _get_pokemon_level_stats(mon, is_opponent, precomputed)
+            else:
+                level_stats, stat_prov = (0.0,) * 6, StatProvenance.PAD
 
-            _pokemon_categorical_into(mon, tok, move_slots, categorical[idx])
-            precomputed = _resolve_stats(mon, is_opponent, stat_cache, stat_overrides)
+            move_slots = _iter_move_slots(mon)
+            _pokemon_categorical_into(
+                mon, tok, move_slots, categorical[idx], cond=cond, stat_provenance=stat_prov
+            )
             _pokemon_numeric_into(
                 mon,
                 battle,
@@ -798,9 +759,10 @@ def _write_observation(
                 orig_idx,
                 move_slots,
                 numerical[idx],
-                active_idx,
+                level_stats=level_stats,
+                stat_provenance=stat_prov,
+                active_idx=active_idx,
                 is_opponent=is_opponent,
-                precomputed_stats=precomputed,
             )
             _pokemon_effects_into(mon, tok, categorical[idx], numerical[idx])
             idx += 1
@@ -809,7 +771,7 @@ def _write_observation(
     idx += 1
 
     ally_fainted = sum(mon.fainted for mon in battle.team.values())
-    ally_mega_available = _side_mega_available(
+    ally_mega_available, ally_mega_known = _side_mega_available(
         battle,
         is_opponent=False,
         selected_allies=selected_allies,
@@ -823,10 +785,18 @@ def _write_observation(
         categorical[idx],
         numerical[idx],
     )
+    # Mark mega availability unknown if not proven.
+    numerical[idx][NUM_IDX_LEGALITY_UNKNOWN] = float(not ally_mega_known)
+    # Per-slot unknown legality flags are stored on the ally side row.
+    if not battle.teampreview:
+        for position, slot in enumerate(battle.decision.slots):
+            numerical[idx][NUM_IDX_SLOT_LEGALITY_UNKNOWN + position] = float(
+                not slot.legality_known
+            )
     idx += 1
 
     opp_fainted = sum(mon.fainted for mon in battle.opponent_team.values())
-    opp_mega_available = _side_mega_available(battle, is_opponent=True)
+    opp_mega_available, _ = _side_mega_available(battle, is_opponent=True)
     _side_token_into(
         battle,
         battle.opponent_side_conditions,
@@ -841,53 +811,7 @@ def _write_observation(
     if idx != SEQUENCE_LENGTH:
         raise RuntimeError(f"Structured observation length drifted to {idx}")
 
-    _write_events(battle, out, pokemon_to_slot)
-
-
-def _validate_output(out: StructuredObservation) -> None:
-    expected = (
-        ("token_type_ids", out.token_type_ids, (SEQUENCE_LENGTH,), torch.long),
-        ("side_ids", out.side_ids, (SEQUENCE_LENGTH,), torch.long),
-        ("slot_ids", out.slot_ids, (SEQUENCE_LENGTH,), torch.long),
-        (
-            "categorical",
-            out.categorical,
-            (SEQUENCE_LENGTH, CATEGORICAL_WIDTH),
-            torch.long,
-        ),
-        (
-            "numerical",
-            out.numerical,
-            (SEQUENCE_LENGTH, NUMERICAL_WIDTH),
-            torch.float32,
-        ),
-        (
-            "events_cat",
-            out.events_cat,
-            (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH),
-            torch.long,
-        ),
-        (
-            "events_num",
-            out.events_num,
-            (EVENT_COUNT, EVENT_NUMERICAL_WIDTH),
-            torch.float32,
-        ),
-        ("events_side_ids", out.events_side_ids, (EVENT_COUNT,), torch.long),
-        ("events_slot_ids", out.events_slot_ids, (EVENT_COUNT,), torch.long),
-        ("events_metadata", out.events_metadata, (EVENT_METADATA_WIDTH,), torch.float32),
-    )
-    for name, tensor, shape, dtype in expected:
-        if tensor.device.type != "cpu":
-            raise ValueError(
-                f"ObservationBuilder.build_into requires CPU output tensors; "
-                f"{name} is on {tensor.device}."
-            )
-        if tensor.shape != shape or tensor.dtype != dtype:
-            raise ValueError(
-                f"Invalid {name}: expected shape {shape} and dtype {dtype}, "
-                f"got shape {tuple(tensor.shape)} and dtype {tensor.dtype}."
-            )
+    _write_spatial_events(battle, out)
 
 
 class ObservationBuilder:
@@ -904,7 +828,7 @@ class ObservationBuilder:
         self,
         battle: BattleView,
         out: StructuredObservation,
-        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
     ) -> None:
         self.validate_output(out)
         self.build_into_prevalidated(battle, out, stat_overrides)
@@ -913,19 +837,28 @@ class ObservationBuilder:
         self,
         battle: BattleView,
         out: StructuredObservation,
-        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
     ) -> None:
         _write_observation(battle, out, self.tokenizer, stat_overrides)
 
     @staticmethod
     def validate_output(out: StructuredObservation) -> None:
-        _validate_output(out)
+        out.validate(batch_rank=0)
+        for tensor in out.tensors():
+            if tensor.device.type != "cpu":
+                raise ValueError("ObservationBuilder.build_into requires CPU output tensors")
 
     def build(
         self,
         battle: BattleView,
-        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int]] | None = None,
+        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
     ) -> StructuredObservation:
-        obs = StructuredObservation.empty_batch(1)[0]
+        # The writer initializes every field, including layout and empty event slots.
+        obs = StructuredObservation(
+            *(
+                torch.empty(shape, dtype=dtype)
+                for _, shape, dtype in StructuredObservation._FIELD_SPECS
+            )
+        )
         self.build_into_prevalidated(battle, obs, stat_overrides)
         return obs

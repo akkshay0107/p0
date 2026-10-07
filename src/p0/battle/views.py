@@ -1,19 +1,16 @@
-"""Player-relative structural views consumed by pure battle services."""
+"""Battle, team, and Pokémon views used by the battle engine and observation builder."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
+from p0.battle.events import EventRecord
 from p0.battle.legality import DecisionView
-
-if TYPE_CHECKING:
-    from p0.battle.events import BattleEvent
 
 
 class NamedEffectView(Protocol):
-    """Enum-like protocol value (status, weather, field, volatile, type, ...)."""
+    """Protocol for named effects like weather, status, and field conditions."""
 
     @property
     def name(self) -> str: ...
@@ -34,6 +31,12 @@ class MoveView(Protocol):
 
     @property
     def max_pp(self) -> int | None: ...
+
+    @property
+    def non_ghost_target(self) -> bool: ...
+
+    @property
+    def deduced_target(self) -> Any: ...
 
 
 class PokemonView(Protocol):
@@ -92,7 +95,7 @@ class PokemonView(Protocol):
     def revealed(self) -> bool: ...
 
     @property
-    def selected_in_teampreview(self) -> bool: ...
+    def selected_in_teampreview(self) -> bool | None: ...
 
     @property
     def effects(self) -> Mapping[Any, int]: ...
@@ -108,6 +111,204 @@ class PokemonView(Protocol):
 
     @property
     def level(self) -> int | None: ...
+
+    @property
+    def is_dynamaxed(self) -> bool: ...
+
+    @property
+    def is_terastallized(self) -> bool: ...
+
+    @property
+    def tera_type(self) -> Any: ...
+
+    @property
+    def types(self) -> Sequence[Any]: ...
+
+
+class TransformedMoveView:
+    """Move view for a transformed Pokemon with its own five-PP move pool."""
+
+    __slots__ = ("_base",)
+
+    def __init__(self, base_move: MoveView) -> None:
+        self._base = base_move
+
+    @property
+    def id(self) -> str:
+        return self._base.id
+
+    @property
+    def type(self) -> Any:
+        return self._base.type
+
+    @property
+    def category(self) -> Any:
+        return self._base.category
+
+    @property
+    def current_pp(self) -> int | None:
+        pp = self._base.current_pp
+        return None if pp is None else min(pp, 5)
+
+    @property
+    def max_pp(self) -> int | None:
+        return 5
+
+    @property
+    def non_ghost_target(self) -> bool:
+        return self._base.non_ghost_target
+
+    @property
+    def deduced_target(self) -> Any:
+        return self._base.deduced_target
+
+
+class TransformedPokemonView:
+    """Pokemon view overlay representing the target species while retaining user identity."""
+
+    __slots__ = ("_base", "_target", "_transformed_moves", "_original_base_hp")
+
+    def __init__(
+        self,
+        base: PokemonView,
+        target: PokemonView,
+        original_base_hp: int | None = None,
+    ) -> None:
+        self._base = base
+        self._target = target
+        self._transformed_moves = {k: TransformedMoveView(v) for k, v in base.moves.items()}
+        self._original_base_hp = (
+            base.base_stats["hp"] if original_base_hp is None else original_base_hp
+        )
+
+    def __hash__(self) -> int:
+        return hash(self._base)
+
+    def __eq__(self, other: Any) -> bool:
+        if self is other:
+            return True
+        if isinstance(other, TransformedPokemonView):
+            return self._base == other._base
+        return self._base == other
+
+    @property
+    def species(self) -> str | None:
+        return self._target.species
+
+    @property
+    def base_species(self) -> str:
+        return self._target.base_species
+
+    @property
+    def ability(self) -> str | None:
+        return self._target.ability
+
+    @property
+    def item(self) -> str | None:
+        return self._base.item
+
+    @property
+    def nature(self) -> str | None:
+        return self._base.nature
+
+    @property
+    def moves(self) -> Mapping[str, Any]:
+        return self._transformed_moves
+
+    @property
+    def type_1(self) -> Any:
+        return self._base.type_1
+
+    @property
+    def type_2(self) -> Any:
+        return self._base.type_2
+
+    @property
+    def status(self) -> Any:
+        return self._base.status
+
+    @property
+    def base_stats(self) -> Mapping[str, int]:
+        return {**self._target.base_stats, "hp": self._original_base_hp}
+
+    @property
+    def stats(self) -> Mapping[str, int | None] | None:
+        target_stats = self._target.stats
+        own_stats = self._base.stats
+        if target_stats is None:
+            return own_stats
+        return {**target_stats, "hp": None if own_stats is None else own_stats.get("hp")}
+
+    @property
+    def boosts(self) -> Mapping[str, int]:
+        return self._base.boosts
+
+    @property
+    def current_hp_fraction(self) -> float:
+        return self._base.current_hp_fraction
+
+    @property
+    def protect_counter(self) -> int:
+        return self._base.protect_counter
+
+    @property
+    def first_turn(self) -> bool:
+        return self._base.first_turn
+
+    @property
+    def weight(self) -> float:
+        return self._target.weight
+
+    @property
+    def fainted(self) -> bool:
+        return self._base.fainted
+
+    @property
+    def revealed(self) -> bool:
+        return self._base.revealed
+
+    @property
+    def selected_in_teampreview(self) -> bool | None:
+        return self._base.selected_in_teampreview
+
+    @property
+    def effects(self) -> Mapping[Any, int]:
+        return self._base.effects
+
+    @property
+    def status_counter(self) -> int:
+        return self._base.status_counter
+
+    @property
+    def preparing(self) -> Any:
+        return self._base.preparing
+
+    @property
+    def last_move(self) -> MoveView | None:
+        return self._base.last_move
+
+    @property
+    def level(self) -> int | None:
+        return self._base.level
+
+    @property
+    def is_dynamaxed(self) -> bool:
+        """Dynamax belongs to the actual active Pokémon, not its copied target."""
+        return self._base.is_dynamaxed
+
+    @property
+    def is_terastallized(self) -> bool:
+        """Terastallization belongs to the actual active Pokémon."""
+        return self._base.is_terastallized
+
+    @property
+    def tera_type(self) -> Any:
+        return self._base.tera_type
+
+    @property
+    def types(self) -> Sequence[Any]:
+        """Expose type changes applied after Transform to move-target logic."""
+        return self._base.types
 
 
 class FieldView(Protocol):
@@ -179,50 +380,9 @@ class BattleView(FieldView, Protocol):
     @property
     def stat_cache(self) -> dict[Any, Any]: ...
 
+    @property
+    def spatial_events(self) -> Sequence[EventRecord]: ...
+
     def get_pokemon(self, identifier: str) -> Any: ...
 
-    def consume_events(self) -> list[BattleEvent]: ...
-
     def last_move(self, pokemon: Any) -> str | None: ...
-
-
-@dataclass(slots=True)
-class FixtureBattleView:
-    """Small concrete view for replay reconstruction and pure tests."""
-
-    team: Mapping[str, Any]
-    opponent_team: Mapping[str, Any]
-    active_pokemon: Sequence[Any | None]
-    opponent_active_pokemon: Sequence[Any | None]
-    available_moves: Sequence[Sequence[Any]]
-    available_switches: Sequence[Sequence[Any]]
-    can_mega_evolve: Sequence[bool]
-    force_switch: Sequence[bool]
-    trapped: Sequence[bool]
-    maybe_trapped: Sequence[bool]
-    teampreview: bool
-    player_role: str | None
-    wait: bool
-    weather: Mapping[Any, int]
-    fields: Mapping[Any, int]
-    side_conditions: Mapping[Any, int]
-    opponent_side_conditions: Mapping[Any, int]
-    turn: int
-    used_mega_evolve: bool
-    opponent_used_mega_evolve: bool
-    decision: DecisionView
-    identifiers: Mapping[str, Any] = field(default_factory=dict)
-    events: list[BattleEvent] = field(default_factory=list)
-    stat_cache: dict[Any, Any] = field(default_factory=dict)
-
-    def get_pokemon(self, identifier: str) -> Any:
-        return self.identifiers[identifier]
-
-    def consume_events(self) -> list[BattleEvent]:
-        # Fixture views are per-decision; repeated builds of the same decision
-        # must observe the identical event window (idempotent consume).
-        return self.events
-
-    def last_move(self, pokemon: Any) -> str | None:
-        move = pokemon.last_move
-        return None if move is None else move.id

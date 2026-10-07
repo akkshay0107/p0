@@ -1,282 +1,401 @@
-import importlib.util
+from __future__ import annotations
+
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
 
+from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
-from p0.runtime import showdown
-from p0.training.checkpoint import CHECKPOINT_SCHEMA, DEFAULT_POLICY_STORE
-from p0.training.config import TrainingConfig
-from p0.training.ppo import compute_ppo_objective
-from p0.training.trainer import PPOTrainer
-from p0.training.utils import amp_enabled
-
-_EXPORT_SPEC = importlib.util.spec_from_file_location(
-    "export_training", Path(__file__).parents[2] / "scripts" / "export_training.py"
-)
-assert _EXPORT_SPEC is not None and _EXPORT_SPEC.loader is not None
-_EXPORT_MODULE = importlib.util.module_from_spec(_EXPORT_SPEC)
-_EXPORT_SPEC.loader.exec_module(_EXPORT_MODULE)
-collect_export_files = _EXPORT_MODULE.collect_export_files
+from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
+from p0.training.magnet import Magnet
+from p0.training.series_history import SeriesHistoryStore
 
 
 def _small_policy() -> PolicyNet:
     return build_policy(ModelConfig(32, 4, 1, 128), default_runtime_resources())
 
 
-def test_checkpoint_round_trip_envelope_provenance_and_state_layout(tmp_path):
-    path = tmp_path / "policy.pt"
-    original = _small_policy()
-    DEFAULT_POLICY_STORE.save_training_state(path, 7, original)
+class TestCheckpoints:
+    def test_checkpoint_round_trip_envelope_provenance_and_state_layout(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Verify that checkpoint saving captures required schema metadata and strips immutable runtime statics.
 
-    restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
-    assert restored.d_model == original.d_model
-    assert len(restored.actor.reducer.encoder.layers) == 1
-    assert DEFAULT_POLICY_STORE.load_training_state(path, restored) == 7
-    artifact = torch.load(path, weights_only=False)
-    assert artifact["artifact_schema"] == CHECKPOINT_SCHEMA
-    assert artifact["artifact_type"] == "training"
-    assert "runtime_manifest_sha256" not in artifact
-    assert len(artifact["runtime_contract_sha256"]) == 64
-    assert artifact["model_config"]["d_model"] == 32
-    assert artifact["provenance"] == {}
+        Verifies that:
+        1. Saved artifact contains global contract SHA-256 and configuration envelopes.
+        2. Static lookup tables (species stats, move stats, mechanic tags) are omitted from state_dict
+           to avoid checkpoint bloat and decouple model weights from static dex data.
+        3. Loading restores matching policy architecture and training step count.
+        """
+        path = tmp_path / "policy.pt"
+        original = _small_policy()
+        DEFAULT_CHECKPOINT_STORE.save_training(path, 7, original)
 
-    DEFAULT_POLICY_STORE.save_policy(
-        path,
-        _small_policy(),
-        metadata={"showdown_commit": "older", "stat_imputer": "experimental"},
-    )
-    assert DEFAULT_POLICY_STORE.load_policy(path, "cpu").d_model == 32
-    state = torch.load(path, weights_only=True)["model_state_dict"]
-    assert not any(
-        name.endswith(
-            (
-                "_species_statics",
-                "_move_statics",
-                "_item_mechanic_tags",
-                "_ability_mechanic_tags",
-            )
+        restored = DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu")
+        assert restored.config == ModelConfig(32, 4, 1, 128)
+        assert DEFAULT_CHECKPOINT_STORE.load_training(path, restored) == 7
+        artifact = DEFAULT_CHECKPOINT_STORE.read(path).artifact
+        assert artifact["artifact_schema"] == CHECKPOINT_ARTIFACT_SCHEMA
+        assert artifact["artifact_type"] == "training"
+        assert "runtime_manifest_sha256" not in artifact
+        assert len(artifact["global_contract_sha256"]) == 64
+        assert artifact["global_contract"]["global_sha256"] == artifact["global_contract_sha256"]
+        assert artifact["model_config"]["d_model"] == 32
+        assert artifact["provenance"] == {}
+
+        DEFAULT_CHECKPOINT_STORE.save_policy(
+            path,
+            _small_policy(),
+            metadata={"showdown_commit": "older", "stat_imputer": "experimental"},
         )
-        for name in state
-    )
+        assert DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu").d_model == 32
+        state = DEFAULT_CHECKPOINT_STORE.read(path).artifact["model_state_dict"]
+        # Verify runtime static buffers are excluded from serialized model state dict
+        assert not any(
+            name.endswith(
+                (
+                    "_species_statics",
+                    "_move_statics",
+                    "_item_mechanic_tags",
+                    "_ability_mechanic_tags",
+                )
+            )
+            for name in state
+        )
 
+    def test_deep_checkpoint_round_trip_is_deterministic(self, tmp_path: Path) -> None:
+        """Verify deep multi-layer transformer policies restore all layer weights deterministically."""
+        path = tmp_path / "policy.pt"
+        config = ModelConfig(
+            d_model=32,
+            nhead=4,
+            reducer_layers=3,
+            dim_feedforward=128,
+        )
+        original = build_policy(config, default_runtime_resources())
+        DEFAULT_CHECKPOINT_STORE.save_policy(path, original)
 
-def test_series_policy_checkpoint_round_trip(tmp_path):
-    path = tmp_path / "policy.pt"
-    config = ModelConfig(32, 4, 1, 128)
-    original = build_policy(config, default_runtime_resources())
-    DEFAULT_POLICY_STORE.save_policy(path, original)
+        restored = DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu")
 
-    restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
-    assert restored.config == config
+        assert restored.config == config
+        for name, parameter in original.state_dict().items():
+            torch.testing.assert_close(parameter, restored.state_dict()[name])
 
-    histories = [torch.randn(1, 10, config.d_model)]
-    with torch.no_grad():
-        rest_t, rest_m = restored.encode_series(histories)
-        orig_t, orig_m = original.encode_series(histories)
-        assert torch.equal(rest_t, orig_t)
-        assert torch.equal(rest_m, orig_m)
+        histories = torch.randn(1, 10, config.d_model)
+        history_mask = torch.ones(1, 10, dtype=torch.bool)
+        with torch.no_grad():
+            torch.testing.assert_close(
+                original.series(histories, history_mask),
+                restored.series(histories, history_mask),
+                rtol=0,
+                atol=0,
+            )
 
-
-def test_deep_checkpoint_round_trip_is_deterministic(tmp_path):
-    path = tmp_path / "policy.pt"
-    config = ModelConfig(
-        d_model=32,
-        nhead=4,
-        reducer_layers=3,
-        dim_feedforward=128,
-    )
-    original = build_policy(config, default_runtime_resources())
-    DEFAULT_POLICY_STORE.save_policy(path, original)
-
-    restored = DEFAULT_POLICY_STORE.load_policy(path, "cpu")
-
-    assert restored.config == config
-    assert len(restored.actor.reducer.encoder.layers) == 3
-    assert restored.actor.reducer.encoder.layers[0] is not restored.actor.reducer.encoder.layers[1]
-    for name, parameter in original.state_dict().items():
-        torch.testing.assert_close(parameter, restored.state_dict()[name])
-
-
-@pytest.mark.parametrize(
-    "mutate, message",
-    (
-        (lambda config: config.pop("reducer_layers"), "Invalid model configuration"),
-        (lambda config: config.update({"unknown": 1}), "Invalid model configuration"),
-        (lambda config: config.update({"d_model": True}), "Invalid model configuration"),
-    ),
-)
-def test_checkpoint_rejects_malformed_model_configuration(tmp_path, mutate, message):
-    path = tmp_path / "policy.pt"
-    DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
-    artifact = torch.load(path, weights_only=False)
-    mutate(artifact["model_config"])
-    torch.save(artifact, path)
-
-    with pytest.raises(ValueError, match=message):
-        DEFAULT_POLICY_STORE.load_policy(path, "cpu")
-
-
-def test_training_checkpoint_rejects_state_config_mismatch(tmp_path):
-    path = tmp_path / "policy.pt"
-    DEFAULT_POLICY_STORE.save_training_state(path, 1, _small_policy())
-    artifact = torch.load(path, weights_only=False)
-    artifact["model_config"]["d_model"] = 64
-    torch.save(artifact, path)
-
-    policy = _small_policy()
-    with pytest.raises(ValueError, match="model configuration does not match"):
-        DEFAULT_POLICY_STORE.load_training_state(path, policy)
-
-
-def test_atomic_checkpoint_failure_preserves_previous_file(tmp_path, monkeypatch):
-    path = tmp_path / "policy.pt"
-    path.write_bytes(b"previous")
-
-    def fail_replace(source, destination):
-        raise OSError("injected replace failure")
-
-    monkeypatch.setattr("p0.persistence.os.replace", fail_replace)
-    with pytest.raises(OSError, match="injected"):
-        DEFAULT_POLICY_STORE.save_policy(path, _small_policy())
-    assert path.read_bytes() == b"previous"
-
-
-def test_export_includes_interpretation_contracts(tmp_path):
-    artifacts = tmp_path / "artifacts"
-    artifacts.mkdir()
-    (artifacts / "checkpoint.pt").write_bytes(b"checkpoint")
-    (tmp_path / "data").mkdir()
-    (tmp_path / "data/runtime_manifest.json").write_text("{}", encoding="utf-8")
-    (tmp_path / "data/vocab.json").write_text("{}", encoding="utf-8")
-
-    exported = {arcname for _, arcname, _ in collect_export_files(tmp_path, artifacts)}
-    assert "artifacts/checkpoint.pt" in exported
-    assert "data/runtime_manifest.json" in exported
-    assert "data/vocab.json" in exported
-
-
-def test_pure_ppo_objective_clips_and_weights_team_preview():
-    config = TrainingConfig(teampreview_loss_mult=2.0, teampreview_alpha_mult=3.0)
-    total, policy, value, ratio, log_ratio = compute_ppo_objective(
-        torch.log(torch.tensor([2.0, 0.5])),
-        torch.tensor([0.0, 1.0]),
-        torch.tensor([0.5, 0.5]),
-        torch.zeros(2),
-        torch.zeros(2),
-        torch.zeros(2),
-        torch.ones(2),
-        torch.tensor([True, False]),
-        config,
-        alpha=0.1,
-    )
-    assert total.shape == policy.shape == value.shape == ratio.shape == log_ratio.shape == (2,)
-    assert ratio.tolist() == pytest.approx([2.0, 0.5])
-    assert total[0] != total[1]
-
-
-def test_ppo_amp_is_cuda_only():
-    config = TrainingConfig(enable_optim=True)
-
-    assert not amp_enabled(config, torch.device("cpu"))
-    assert amp_enabled(config, torch.device("cuda"))
-    assert not amp_enabled(TrainingConfig(enable_optim=False), torch.device("cuda"))
-
-
-def test_showdown_group_rolls_back_servers_when_later_start_fails(monkeypatch):
-    events = []
-
-    class FakeServer:
-        def __init__(self, port, **kwargs):
-            self.port = port
-
-        def __enter__(self):
-            events.append(("start", self.port))
-            if self.port == 2:
-                raise RuntimeError("failed")
-            return self
-
-        def __exit__(self, *args):
-            events.append(("stop", self.port))
-
-    monkeypatch.setattr(showdown, "ShowdownServer", FakeServer)
-    monkeypatch.setattr(showdown, "build_showdown", lambda root: None)
-    with pytest.raises(RuntimeError, match="failed"):
-        with showdown.start_showdown_servers(2, ports=(1, 2)):
-            pass
-    assert events == [("start", 1), ("start", 2), ("stop", 1)]
-
-
-def test_showdown_build_failure_has_bounded_diagnostics(monkeypatch, tmp_path):
-    def fail(*args, **kwargs):
-        raise __import__("subprocess").CalledProcessError(1, args[0], stderr="x" * 5000)
-
-    monkeypatch.setattr(showdown.subprocess, "run", fail)
-    with pytest.raises(RuntimeError) as error:
-        showdown.build_showdown(tmp_path)
-    assert len(str(error.value)) < 4200
-
-
-def test_trainer_cancellation_saves_once_before_collecting(tmp_path):
-    saved = []
-
-    class Store:
-        def save_training_state(self, path, episode, policy, **kwargs):
-            saved.append((path, episode, policy, kwargs))
-
-    collector = SimpleNamespace(vector_env=SimpleNamespace(reset=lambda: None))
-    updater = SimpleNamespace(
-        optimizer=SimpleNamespace(param_groups=[{"lr": 0.0}]),
-        scaler=object(),
-    )
-    trainer = PPOTrainer(
-        policy=cast(Any, object()),
-        policy_store=cast(Any, Store()),
-        checkpoint_path=tmp_path / "checkpoint.pt",
-        collector=cast(Any, collector),
-        updater=cast(Any, updater),
-        magnet=cast(Any, object()),
-        scheduler=cast(Any, object()),
-        training_config=TrainingConfig(
-            num_episodes=9, magnet_refresh_interval=1, ramp_up_phase=0.5
-        ),
-        cancel_requested=lambda: True,
-    )
-    trainer.run()
-    assert [(path, episode) for path, episode, _, _ in saved] == [(tmp_path / "checkpoint.pt", 0)]
-
-
-def test_trainer_saves_final_completed_episode(tmp_path):
-    saved = []
-
-    class Store:
-        def save_training_state(self, path, episode, policy, **kwargs):
-            saved.append((path, episode))
-
-    collector = SimpleNamespace(vector_env=SimpleNamespace(reset=lambda: None))
-    updater = SimpleNamespace(
-        optimizer=SimpleNamespace(param_groups=[{"lr": 0.0}]),
-        scaler=object(),
-    )
-    trainer = PPOTrainer(
-        policy=cast(Any, object()),
-        policy_store=cast(Any, Store()),
-        checkpoint_path=tmp_path / "checkpoint.pt",
-        collector=cast(Any, collector),
-        updater=cast(Any, updater),
-        magnet=cast(Any, object()),
-        scheduler=cast(Any, object()),
-        training_config=TrainingConfig(
-            num_episodes=9, magnet_refresh_interval=1, ramp_up_phase=0.5
+    @pytest.mark.parametrize(
+        "mutate, message",
+        (
+            (lambda config: config.pop("reducer_layers"), "Invalid model configuration"),
+            (lambda config: config.update({"unknown": 1}), "Invalid model configuration"),
+            (lambda config: config.update({"d_model": True}), "Invalid model configuration"),
         ),
     )
+    def test_checkpoint_rejects_malformed_model_configuration(
+        self, tmp_path: Path, mutate: Any, message: str
+    ) -> None:
+        """Verify that CheckpointStore strictly validates model configuration schema and rejects malformed configs."""
+        path = tmp_path / "policy.pt"
+        DEFAULT_CHECKPOINT_STORE.save_policy(path, _small_policy())
+        artifact = dict(DEFAULT_CHECKPOINT_STORE.read(path).artifact)
+        mutate(artifact["model_config"])
+        torch.save(artifact, path)
 
-    trainer.run(start_episode=9)
+        with pytest.raises(ValueError, match=message):
+            DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu")
 
-    assert saved == [(tmp_path / "checkpoint.pt", 9)]
+    def test_training_checkpoint_rejects_state_config_mismatch(self, tmp_path: Path) -> None:
+        """Verify load_training detects architecture mismatch between checkpoint and target model instance."""
+        path = tmp_path / "policy.pt"
+        DEFAULT_CHECKPOINT_STORE.save_training(path, 1, _small_policy())
+        artifact = dict(DEFAULT_CHECKPOINT_STORE.read(path).artifact)
+        artifact["model_config"]["d_model"] = 64
+        torch.save(artifact, path)
+
+        policy = _small_policy()
+        before_state = {
+            name: tensor.detach().clone() for name, tensor in policy.state_dict().items()
+        }
+        with pytest.raises(ValueError, match="model configuration does not match"):
+            DEFAULT_CHECKPOINT_STORE.load_training(path, policy)
+        assert all(
+            torch.equal(before_state[name], tensor) for name, tensor in policy.state_dict().items()
+        )
+
+    def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Verify that full training checkpoints restore optimizer states, EMA Magnet weights, and step counts."""
+        path = tmp_path / "training.pt"
+        store = CheckpointStore()
+        policy = build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
+        optimizer = torch.optim.Adam(policy.parameters(), lr=0.001)
+        magnet = Magnet(policy)
+        # Perform a dummy training step to populate Adam momentum and variance state buffers
+        loss = torch.stack(
+            tuple(parameter.square().mean() for parameter in policy.parameters())
+        ).sum()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        saved_optimizer_state = optimizer.state_dict()
+        with torch.no_grad():
+            for parameter in magnet.policy.parameters():
+                parameter.add_(0.125)
+        store.save_training(
+            path,
+            17,
+            policy,
+            optimizer=optimizer,
+            magnet=magnet,
+            metadata={"dataset_hash": "d" * 64},
+            trainer_kind="ppo",
+        )
+
+        restored = build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
+        restored_optimizer = torch.optim.Adam(restored.parameters(), lr=0.5)
+        restored_magnet = Magnet(restored)
+        episode = store.load_training(
+            path,
+            restored,
+            optimizer=restored_optimizer,
+            magnet=restored_magnet,
+            expected_trainer_kind="ppo",
+            expected_metadata={"dataset_hash": "d" * 64},
+            require_training_state=True,
+        )
+        assert episode == 17
+        # Confirm learning rate and Adam moment tensors were restored from checkpoint
+        torch.testing.assert_close(restored_optimizer.state_dict(), saved_optimizer_state)
+        assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
+        for name, parameter in restored.state_dict().items():
+            torch.testing.assert_close(parameter, policy.state_dict()[name])
+        for name, parameter in restored_magnet.state_dict().items():
+            torch.testing.assert_close(parameter, magnet.state_dict()[name])
+
+    def test_training_checkpoint_round_trip_restores_collector_history_metadata(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Verify detached completed-game history survives the checkpoint metadata envelope."""
+        path = tmp_path / "collector-training.pt"
+        policy = _small_policy()
+        history = SeriesHistoryStore(policy.d_model)
+        history.append(
+            "series",
+            1,
+            torch.ones((3, policy.d_model), requires_grad=True),
+            is_series_end=False,
+        )
+        collector_state = {
+            "series_store1": {},
+            "series_store2": {},
+            "series_history1": history.training_state(),
+            "series_history2": {},
+        }
+        store = CheckpointStore()
+        store.save_training(
+            path,
+            4,
+            policy,
+            metadata={"collector_state": collector_state},
+            trainer_kind="ppo",
+        )
+
+        metadata = store.load_metadata(path)
+        raw_collector_state = metadata["collector_state"]
+        assert isinstance(raw_collector_state, dict)
+        restored = SeriesHistoryStore(policy.d_model)
+        raw_history = raw_collector_state["series_history1"]
+        assert isinstance(raw_history, dict)
+        restored.restore_training_state(raw_history)
+        assert restored.next_game_number("series") == 2
+        (game,) = restored.snapshot("series")
+        assert game.requires_grad is False
+        torch.testing.assert_close(game, torch.ones((3, policy.d_model)))
+
+    def test_checkpoint_rejects_global_contract_tampering(self, tmp_path: Path) -> None:
+        """Verify checkpoint loading rejects files whose global contract checksum has been altered."""
+        path = tmp_path / "policy.pt"
+        store = CheckpointStore()
+        store.save_policy(
+            path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
+        )
+        artifact = dict(store.read(path).artifact)
+        artifact["global_contract_sha256"] = "0" * 64
+        torch.save(artifact, path)
+        with pytest.raises(ValueError, match="global_contract_sha256"):
+            store.load_policy(path, "cpu")
+
+    def test_checkpoint_rejects_weights_only_resume_when_training_is_required(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify that requiring training state rejects weights-only inference checkpoints."""
+        path = tmp_path / "policy.pt"
+        store = CheckpointStore()
+        store.save_policy(
+            path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
+        )
+        with pytest.raises(ValueError, match="weights-only"):
+            store.load_training(
+                path,
+                build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources()),
+                require_training_state=True,
+            )
+
+    def test_policy_checkpoint_loads_weights_when_training_state_not_required(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify load_training loads policy weights even when require_training_state is False."""
+        path = tmp_path / "weights.pt"
+        store = CheckpointStore()
+        config = ModelConfig(16, 2, 1, 64)
+        original = build_policy(config, default_runtime_resources())
+        with torch.no_grad():
+            for param in original.parameters():
+                param.add_(1.5)
+        store.save_policy(path, original)
+
+        target = build_policy(config, default_runtime_resources())
+        # Target starts with fresh randomly initialized weights
+        episode = store.load_training(path, target, require_training_state=False)
+        assert episode == 0
+        for name, param in original.state_dict().items():
+            torch.testing.assert_close(target.state_dict()[name], param)
+
+    def test_training_checkpoint_rejects_other_trainer_but_policy_weights_transfer(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify a BC training checkpoint cannot resume PPO but still supplies inference weights."""
+        path = tmp_path / "bc-training.pt"
+        store = CheckpointStore()
+        policy = _small_policy()
+        store.save_training(
+            path,
+            1,
+            policy,
+            optimizer=torch.optim.AdamW(policy.parameters()),
+            trainer_kind="bc",
+        )
+
+        with pytest.raises(ValueError, match="trainer"):
+            store.load_training(
+                path,
+                _small_policy(),
+                expected_trainer_kind="ppo",
+                require_training_state=True,
+            )
+
+        restored = store.load_policy(path, "cpu")
+        for name, tensor in policy.state_dict().items():
+            torch.testing.assert_close(restored.state_dict()[name], tensor)
+
+    def test_load_episode_helper(self, tmp_path: Path) -> None:
+        """Verify load_episode reads episode without full model restoration."""
+        store = CheckpointStore()
+        policy = _small_policy()
+
+        missing = tmp_path / "missing.pt"
+        assert store.load_episode(missing) == 0
+
+        policy_path = tmp_path / "policy.pt"
+        store.save_policy(policy_path, policy)
+        assert store.load_episode(policy_path) == 0
+
+        training_path = tmp_path / "training.pt"
+        store.save_training(training_path, 42, policy)
+        assert store.load_episode(training_path) == 42
+
+    def test_lineage_metadata_preservation(self, tmp_path: Path) -> None:
+        """Verify upstream lineage metadata persists and can be validated."""
+        path = tmp_path / "lineage.pt"
+        store = CheckpointStore()
+        policy = _small_policy()
+        metadata = {
+            "parent_checkpoint_sha256": "f" * 64,
+            "dataset_hash": "e" * 64,
+            "gamma": 0.99,
+        }
+        store.save_training(path, 5, policy, metadata=metadata, trainer_kind="ppo")
+
+        loaded_metadata = store.load_metadata(path)
+        assert loaded_metadata["parent_checkpoint_sha256"] == "f" * 64
+        assert loaded_metadata["dataset_hash"] == "e" * 64
+        assert loaded_metadata["trainer_kind"] == "ppo"
+
+        # Matching expected metadata succeeds
+        restored = _small_policy()
+        assert (
+            store.load_training(
+                path,
+                restored,
+                expected_trainer_kind="ppo",
+                expected_metadata={"dataset_hash": "e" * 64},
+            )
+            == 5
+        )
+
+        # Mismatched expected metadata is rejected
+        with pytest.raises(ValueError, match="is incompatible"):
+            store.load_training(
+                path,
+                restored,
+                expected_metadata={"dataset_hash": "wrong"},
+            )
+
+
+class TestStrictTrainingResume:
+    def test_missing_optimizer_state_fails_before_weights_change(self, tmp_path: Path) -> None:
+        store = CheckpointStore()
+        path = tmp_path / "missing-optimizer.pt"
+        store.save_training(path, 1, _small_policy())
+        target = _small_policy()
+        before = next(target.parameters()).detach().clone()
+        optimizer = torch.optim.AdamW(target.parameters())
+        with pytest.raises(ValueError, match="missing required training state"):
+            store.load_training(path, target, optimizer=optimizer, require_training_state=True)
+        torch.testing.assert_close(next(target.parameters()), before)
+
+    def test_resume_restores_all_cpu_random_generators(self, tmp_path: Path) -> None:
+        import random
+
+        import numpy as np
+
+        store = CheckpointStore()
+        path = tmp_path / "rng.pt"
+        policy = _small_policy()
+        store.save_training(path, 1, policy)
+        expected = (random.random(), np.random.random(), torch.rand(4))
+        store.load_training(path, policy, require_training_state=True)
+        assert random.random() == expected[0]
+        assert np.random.random() == expected[1]
+        torch.testing.assert_close(torch.rand(4), expected[2], rtol=0, atol=0)
+
+    def test_loaded_input_survives_atomic_replacement(self, tmp_path: Path) -> None:
+        import hashlib
+
+        store = CheckpointStore()
+        path = tmp_path / "input.pt"
+        policy = _small_policy()
+        store.save_training(path, 1, policy)
+        expected_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        loaded = store.read(path)
+        store.save_training(path, 2, policy)
+        assert loaded.sha256 == expected_hash
+        assert store.load_episode(loaded) == 1
+        assert store.load_episode(path) == 2

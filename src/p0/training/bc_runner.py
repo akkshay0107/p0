@@ -1,204 +1,212 @@
-"""Composition root for streaming replay behaviour cloning and evaluation."""
+"""Behavior cloning training and evaluation runner."""
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
 
+from p0.format_config import sha256_file
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
 from p0.model.resources import default_runtime_resources
 from p0.persistence import atomic_json_save
-from p0.replays.dataset import LazyReplayDataset, load_split_manifest
-from p0.replays.shards import load_shard_manifest
+from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest
 from p0.training.bc import BCCancelled, BCEvaluationMetrics, BCTrainer
-from p0.training.checkpoint import CheckpointStore
+from p0.training.checkpoint import CheckpointStore, LoadedCheckpoint, value_objective_metadata
 from p0.training.config import BCConfig
+from p0.training.files import TrainingRun, training_run
 from p0.training.utils import default_device, seed_everything
 
 
-def _trainer_config(config: BCConfig, *, overfit: bool) -> dict[str, Any]:
-    return {
-        "batch_decisions": config.batch_decisions,
-        "max_chunk_size": config.max_chunk_size,
-        "learning_rate": config.learning_rate,
-        "gamma": config.gamma,
-        "value_coef": config.value_coef,
-        "epochs": 200 if overfit else config.epochs,
-        "weight_decay": config.weight_decay,
-        "max_grad_norm": config.max_grad_norm,
-        "seed": config.seed,
-        "amp": config.amp,
-        "overfit": overfit,
-    }
-
-
-def _provenance(
+def _training_metadata(
     config: BCConfig,
     *,
     dataset_hash: str,
     split_manifest: Path,
-    overfit: bool,
 ) -> dict[str, Any]:
+    trainer_config = asdict(config)
+    for name in ("epochs", "shard_manifest", "split_manifest", "output_dir", "resume_checkpoint"):
+        del trainer_config[name]
     return {
         "dataset_hash": dataset_hash,
-        "split_manifest_sha256": hashlib.sha256(split_manifest.read_bytes()).hexdigest(),
-        "trainer_config": _trainer_config(config, overfit=overfit),
-        "gamma": config.gamma,
-        "value_target_semantics": "discounted_terminal_outcome.v1",
+        "split_manifest_sha256": sha256_file(split_manifest),
+        "trainer_config": trainer_config,
+        "epoch_budget": config.epochs,
+        **value_objective_metadata(config.gamma),
     }
 
 
 def _validation_is_failed(metrics: BCEvaluationMetrics) -> bool:
     return (
         metrics.non_finite_values > 0
-        or metrics.illegal_predictions > 0
-        or not all(
-            math.isfinite(value)
-            for value in (
-                metrics.overall_nll,
-                metrics.exact_nll,
-                metrics.partial_nll,
-                metrics.exact_joint_accuracy,
-                metrics.value_loss,
-            )
-        )
+        or metrics.labeled_count == 0
+        or not all(math.isfinite(value) for value in metrics.to_dict().values())
     )
 
 
-def _flatten_metrics(
-    prefix: str,
-    values: Mapping[str, object],
-) -> dict[str, float]:
-    flattened: dict[str, float] = {}
-    for name, value in values.items():
-        key = f"{prefix}/{name}" if prefix else name
-        if isinstance(value, Mapping):
-            flattened.update(_flatten_metrics(key, value))
-        elif isinstance(value, (int, float)):
-            flattened[key] = float(value)
-    return flattened
+_BC_TRAIN_BOARD_METRICS = ("overall_nll", "grad_norm", "learning_rate")
 
 
-def _append_metrics(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
-        stream.flush()
+def _has_accepted_series(
+    split_manifest: SeriesSplitManifest,
+    accepted_series: frozenset[str],
+    split: str,
+) -> bool:
+    return any(
+        assigned_split == split and series_id in accepted_series
+        for series_id, assigned_split in split_manifest.assignments.items()
+    )
 
 
-def _load_identities(
-    shard_manifest_path: Path,
-    split_manifest_path: Path,
-) -> tuple[Any, Any]:
-    shard_value = json.loads(shard_manifest_path.read_text(encoding="utf-8"))
-    shard_manifest = load_shard_manifest(shard_value)
-    split_manifest = load_split_manifest(split_manifest_path)
-    if split_manifest.runtime_contract_sha256 != shard_manifest.runtime_contract_sha256:
-        raise ValueError("BC shard and split manifests reference different runtime contracts")
-    if split_manifest.dataset_hash != shard_manifest.dataset_hash:
-        raise ValueError("BC shard and split manifests reference different datasets")
-    return shard_manifest, split_manifest
+def _restore_best_policy(
+    files: TrainingRun,
+    selection: Mapping[str, Any],
+    step: int,
+    expected_metadata: Mapping[str, Any],
+) -> None:
+    """Restore the embedded best policy from the resume checkpoint."""
+    score, epoch = selection.get("best_validation_nll"), selection.get("selected_epoch")
+    if (
+        not isinstance(score, (float, int))
+        or not math.isfinite(score)
+        or type(epoch) is not int
+        or epoch <= 0
+    ):
+        raise ValueError("BC resume checkpoint has incomplete selected-policy state")
+    if epoch > step:
+        raise ValueError("BC resume checkpoint has stale selected-policy state")
+    best = files.state.get("best_policy")
+    if best is None:
+        raise ValueError("BC resume checkpoint has no embedded selected policy")
+    source = files.source
+    assert source is not None
+    files.store.validate_artifact(best, source.path)
+    files.store.load_policy(
+        LoadedCheckpoint(source.path, best, ""),
+        "cpu",
+        expected_metadata={**expected_metadata, "selected_epoch": epoch},
+    )
+
+
+def _reported_path(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    return str(path.resolve())
 
 
 def train_bc(
     config: BCConfig,
     *,
-    overfit: bool = False,
     device: torch.device | str | None = None,
     cancel_requested: Callable[[], bool] = lambda: False,
 ) -> dict[str, Any]:
-    """Train one epoch at a time, validate, and checkpoint completed epochs.
+    """
+    Train one epoch at a time, validate, and checkpoint completed epochs.
 
     Arguments:
-        config: Behaviour-cloning dataset, optimizer, and output configuration.
-        overfit: Use the bounded overfit mode intended for data-pipeline checks.
+        config: Behavior-cloning dataset, optimizer, and output configuration.
         device: Device override; the runtime default is used when omitted.
         cancel_requested: Callback polled between training units.
 
     Returns:
         The final training and validation metrics plus selected checkpoint state.
     """
-    shard_manifest, _ = _load_identities(config.shard_manifest, config.split_manifest)
-    train_dataset = LazyReplayDataset(
-        config.shard_manifest,
-        split="train",
-        split_manifest=config.split_manifest,
-    )
-    validation_dataset = LazyReplayDataset(
-        config.shard_manifest,
-        split="validation",
-        split_manifest=config.split_manifest,
-    )
-    selected_device = default_device() if device is None else torch.device(device)
-    seed_everything(config.seed)
     store = CheckpointStore()
-    if config.resume_checkpoint is None:
-        policy = build_policy(ModelConfig.baseline(), default_runtime_resources())
-    else:
-        policy = store.load_policy(
-            config.resume_checkpoint,
-            selected_device,
-            expected_metadata={
-                "gamma": config.gamma,
-                "value_target_semantics": "discounted_terminal_outcome.v1",
-            },
-        )
-
+    dataset = LazyReplayDataset(
+        config.shard_manifest, split_manifest=config.split_manifest, verify_hashes=True
+    )
+    shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
+    assert split_manifest is not None
+    accepted_series = frozenset(dataset.accepted_series_ids())
+    for split in ("train", "validation"):
+        if not _has_accepted_series(split_manifest, accepted_series, split):
+            raise ValueError(f"BC {split} split has no accepted series")
+    train_dataset = dataset.for_split("train")
+    validation_dataset = dataset.for_split("validation")
     dataset_output = config.output_dir / shard_manifest.dataset_hash
-    dataset_output.mkdir(parents=True, exist_ok=True)
     latest_path = dataset_output / "bc_latest_training.pt"
     best_path = dataset_output / "bc_best_policy.pt"
-    metrics_path = dataset_output / "metrics.jsonl"
-    provenance = _provenance(
+    metrics_path = dataset_output / "metrics.json"
+    metadata = _training_metadata(
         config,
         dataset_hash=shard_manifest.dataset_hash,
         split_manifest=config.split_manifest,
-        overfit=overfit,
     )
-    trainer = BCTrainer(
-        policy,
-        train_dataset,
-        config,
-        device=selected_device,
-        checkpoint_store=store,
-        provenance=provenance,
-        cancel_requested=cancel_requested,
-    )
-    if config.resume_checkpoint is not None:
-        completed_epoch = trainer.load_checkpoint(config.resume_checkpoint)
-        selection_state = trainer.load_selection_state(config.resume_checkpoint)
-        raw_best = selection_state.get("best_validation_nll")
-        raw_epoch = selection_state.get("selected_epoch")
-        best_validation_nll = (
-            float(raw_best) if isinstance(raw_best, (int, float)) else float("inf")
+    with training_run(
+        store,
+        latest_path,
+        dataset_output,
+        trainer_kind="bc",
+        settings=metadata["trainer_config"],
+        source_path=config.resume_checkpoint,
+        resume=config.resume_checkpoint is not None,
+    ) as files:
+        files.metadata["inputs"] = {
+            "shard_manifest": str(config.shard_manifest.resolve()),
+            "split_manifest": str(config.split_manifest.resolve()),
+        }
+        selected_device = default_device() if device is None else torch.device(device)
+        seed_everything(config.seed)
+        policy = (
+            store.load_policy(
+                files.source,
+                selected_device,
+                expected_metadata=value_objective_metadata(config.gamma),
+            )
+            if files.source is not None
+            else build_policy(ModelConfig.baseline(), default_runtime_resources())
         )
-        best_selected_epoch = int(raw_epoch) if isinstance(raw_epoch, int) else 0
-    else:
-        completed_epoch = 0
-        selection_state = {}
-        best_validation_nll = float("inf")
-        best_selected_epoch = 0
-    policy = compile_policy(policy, enable=selected_device.type == "cuda")
-    initial_training = trainer.evaluate(train_dataset)
-    if _validation_is_failed(initial_training):
-        raise RuntimeError("Initial BC training evaluation contains invalid predictions or values")
-    initial_nll = initial_training.overall_nll
-    final_training = initial_training
-    final_validation: BCEvaluationMetrics | None = None
-    max_epochs = 200 if overfit else config.epochs
-    writer = SummaryWriter(log_dir=str(dataset_output / "tensorboard"))
-    cancelled = False
-    try:
-        for epoch in range(completed_epoch + 1, max_epochs + 1):
+        trainer = BCTrainer(
+            policy,
+            train_dataset,
+            config,
+            device=selected_device,
+            cancel_requested=cancel_requested,
+        )
+        if files.source is not None:
+            source_metadata = store.load_metadata(files.source)
+            if source_metadata.get("trainer_config", {}).get("overfit") is True:
+                raise ValueError("Cannot resume an overfit training run")
+            resume_metadata = {
+                key: value for key, value in metadata.items() if key != "epoch_budget"
+            }
+            selection_state = dict(source_metadata.get("selection_state", {}))
+            completed_epoch = store.load_episode(files.source)
+            _restore_best_policy(files, selection_state, completed_epoch, resume_metadata)
+            # Restore randomness after constructing the selected-policy validation model.
+            store.load_training(
+                files.source,
+                trainer.policy,
+                optimizer=trainer.optimizer,
+                scaler=trainer.scaler,
+                expected_trainer_kind="bc",
+                expected_metadata=resume_metadata,
+                require_training_state=True,
+            )
+            latest_artifact: Path | None = files.source.path
+        else:
+            completed_epoch = 0
+            selection_state = {}
+            latest_artifact = None
+        policy = compile_policy(
+            policy,
+            enable=config.enable_optim and selected_device.type == "cuda",
+        )
+        initial_training = trainer.evaluate(train_dataset)
+        if _validation_is_failed(initial_training):
+            raise RuntimeError(
+                "Initial BC training evaluation contains invalid predictions or values"
+            )
+        last_training_update: dict[str, float | int] | None = None
+        final_validation: BCEvaluationMetrics | None = None
+        files.start(completed_epoch)
+        cancelled = False
+        for epoch in range(completed_epoch + 1, config.epochs + 1):
             if cancel_requested():
                 cancelled = True
                 break
@@ -207,98 +215,66 @@ def train_bc(
             except BCCancelled:
                 cancelled = True
                 break
+            if training["updates"] == 0:
+                raise RuntimeError(f"BC training made no successful updates at epoch {epoch}")
             validation = trainer.evaluate(validation_dataset)
             if _validation_is_failed(validation):
                 raise RuntimeError(f"BC validation failed at epoch {epoch}")
-            if overfit:
-                final_training = trainer.evaluate(train_dataset)
-                if _validation_is_failed(final_training):
-                    raise RuntimeError(f"BC training evaluation failed at epoch {epoch}")
-            else:
-                final_training = BCEvaluationMetrics(
-                    overall_nll=float(training["loss"]),
-                    exact_nll=float(training["exact_nll"]),
-                    partial_nll=float(training["partial_nll"]),
-                    exact_joint_accuracy=0.0,
-                    decisions=int(training["decisions"]),
-                    labeled_decisions=int(training["labeled_decisions"]),
-                    unknown_decisions=int(training["decisions"])
-                    - int(training["labeled_decisions"]),
-                    exact_decisions=int(training["exact_decisions"]),
-                    partial_decisions=int(training["partial_decisions"]),
-                    illegal_predictions=0,
-                    non_finite_values=0,
-                    by_decision_type={},
-                    confidence_buckets={},
-                    candidate_set_sizes={},
-                    value_loss=float(training["value_loss"]),
-                    value_decisions=int(training["value_decisions"]),
-                )
+            last_training_update = training
             final_validation = validation
-            if validation.overall_nll < best_validation_nll:
-                best_validation_nll = validation.overall_nll
-                best_selected_epoch = epoch
-                store.save_policy(
-                    best_path,
+            if validation.overall_nll < selection_state.get("best_validation_nll", float("inf")):
+                files.state["best_policy"] = store.snapshot_policy(
                     trainer.policy,
-                    metadata={**provenance, "selected_epoch": epoch},
+                    {
+                        **metadata,
+                        "trainer_kind": "bc",
+                        "selected_epoch": epoch,
+                        "run": files.metadata,
+                    },
                 )
-            trainer.save_checkpoint(
-                latest_path,
-                epoch=epoch,
-                selection_state={
-                    "best_validation_nll": best_validation_nll,
-                    "selected_epoch": best_selected_epoch,
-                    "best_artifact": str(best_path),
-                },
-            )
+                selection_state = {
+                    "best_validation_nll": validation.overall_nll,
+                    "selected_epoch": epoch,
+                }
+            validation_values = validation.to_dict()
             record = {
-                "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "epoch": epoch,
                 "dataset_hash": shard_manifest.dataset_hash,
                 "train_update": training,
-                "training": final_training.to_dict(),
-                "validation": validation.to_dict(),
+                "training": training,
+                "validation": validation_values,
             }
-            _append_metrics(metrics_path, record)
-            for name, value in _flatten_metrics("train", training).items():
-                writer.add_scalar(name, value, epoch)
-            for name, value in _flatten_metrics("validation", validation.to_dict()).items():
-                writer.add_scalar(name, value, epoch)
-            writer.flush()
+            files.record(
+                epoch,
+                record,
+                {
+                    "train": {name: training[name] for name in _BC_TRAIN_BOARD_METRICS},
+                    "validation": validation_values,
+                },
+            )
+            files.save(
+                epoch,
+                trainer.policy,
+                optimizer=trainer.optimizer,
+                scaler=trainer.scaler,
+                metadata={**metadata, "selection_state": selection_state},
+            )
+            latest_artifact = latest_path.resolve()
             completed_epoch = epoch
-            if (
-                overfit
-                and final_training.overall_nll <= initial_nll * 0.2
-                and final_training.exact_joint_accuracy >= 0.9
-            ):
-                break
-    finally:
-        writer.close()
-    overfit_passed = not overfit or (
-        final_training.overall_nll <= initial_nll * 0.2
-        and final_training.exact_joint_accuracy >= 0.9
-    )
-    result = {
-        "dataset_hash": shard_manifest.dataset_hash,
-        "runtime_hash": shard_manifest.runtime_contract_sha256,
-        "completed_epoch": completed_epoch,
-        "cancelled": cancelled,
-        "overfit_passed": overfit_passed,
-        "initial_training": initial_training.to_dict(),
-        "final_training": final_training.to_dict(),
-        "final_validation": (None if final_validation is None else final_validation.to_dict()),
-        "latest_training_checkpoint": str(latest_path.resolve()),
-        "best_policy_checkpoint": str(best_path.resolve()),
-        "metrics_path": str(metrics_path.resolve()),
-    }
-    atomic_json_save(dataset_output / "bc-result.json", result)
-    if overfit and not overfit_passed and not cancelled:
-        raise RuntimeError(
-            "BC overfit acceptance failed: training NLL did not fall by 80% "
-            "with at least 90% exact accuracy"
-        )
-    return result
+        result = {
+            "dataset_hash": shard_manifest.dataset_hash,
+            "global_hash": shard_manifest.global_contract_sha256,
+            "completed_epoch": completed_epoch,
+            "cancelled": cancelled,
+            "initial_training": initial_training.to_dict(),
+            "final_training": ({} if last_training_update is None else last_training_update),
+            "final_validation": (None if final_validation is None else final_validation.to_dict()),
+            "latest_training_checkpoint": _reported_path(latest_artifact),
+            "best_policy_checkpoint": _reported_path(best_path),
+            "metrics_path": _reported_path(metrics_path),
+        }
+        atomic_json_save(dataset_output / "bc-result.json", result)
+        return result
 
 
 @torch.inference_mode()
@@ -310,23 +286,28 @@ def evaluate_bc(
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     """Evaluate a weights-only or BC training checkpoint on one bound split."""
-    shard_manifest, _ = _load_identities(config.shard_manifest, config.split_manifest)
     selected_device = default_device() if device is None else torch.device(device)
     store = CheckpointStore()
-    policy = store.load_policy(checkpoint, selected_device)
+    objective = value_objective_metadata(config.gamma)
+    policy = store.load_policy(checkpoint, selected_device, expected_metadata=objective)
     dataset = LazyReplayDataset(
-        config.shard_manifest,
-        split=split,
-        split_manifest=config.split_manifest,
+        config.shard_manifest, split_manifest=config.split_manifest, verify_hashes=True
     )
-    trainer = BCTrainer(policy, dataset, config, device=selected_device, checkpoint_store=store)
+    shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
+    assert split_manifest is not None
+    accepted_series = frozenset(dataset.accepted_series_ids())
+    dataset = dataset.for_split(split)
+    if not _has_accepted_series(split_manifest, accepted_series, split):
+        raise ValueError(f"BC {split} split has no accepted series")
+    trainer = BCTrainer(policy, dataset, config, device=selected_device)
     metrics = trainer.evaluate()
     if _validation_is_failed(metrics):
         raise RuntimeError("BC evaluation contains invalid predictions or non-finite values")
     return {
         "dataset_hash": shard_manifest.dataset_hash,
-        "runtime_hash": shard_manifest.runtime_contract_sha256,
+        "global_hash": shard_manifest.global_contract_sha256,
         "split": split,
         "checkpoint": str(checkpoint.resolve()),
+        "objective": objective,
         "metrics": metrics.to_dict(),
     }

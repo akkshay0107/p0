@@ -1,4 +1,4 @@
-"""Deterministic lifecycle management for pinned local Showdown processes."""
+"""Start and stop pinned local Showdown processes."""
 
 from __future__ import annotations
 
@@ -10,7 +10,21 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TextIO
 
+from poke_env.ps_client import ServerConfiguration
+
 from p0.paths import DEFAULT_PATHS
+
+LOOPBACK_HOST = "127.0.0.1"
+# Local servers run with --no-security, so this public endpoint is only a placeholder
+# for poke-env's required login URL.
+AUTHENTICATION_URL = "https://play.pokemonshowdown.com/action.php?"
+
+
+def local_server_configuration(port: int) -> ServerConfiguration:
+    """Return the poke-env connection settings for a local Showdown server on port."""
+    return ServerConfiguration(
+        f"ws://{LOOPBACK_HOST}:{port}/showdown/websocket", AUTHENTICATION_URL
+    )
 
 
 def build_showdown(showdown_root: Path = DEFAULT_PATHS.showdown_root) -> None:
@@ -29,25 +43,19 @@ def build_showdown(showdown_root: Path = DEFAULT_PATHS.showdown_root) -> None:
 
 
 def allocate_loopback_ports(count: int) -> tuple[int, ...]:
-    """Allocate loopback socket ports dynamically."""
+    """Find distinct free ports on the loopback interface."""
     if count < 1:
         raise ValueError("At least one Showdown port is required")
 
-    listeners: list[socket.socket] = []
-    try:
-        for _ in range(count):
-            listener = socket.socket()
-            listener.bind(("127.0.0.1", 0))
-            listeners.append(listener)
-
-        return tuple(int(listener.getsockname()[1]) for listener in listeners)
-    finally:
+    with contextlib.ExitStack() as stack:
+        listeners = [stack.enter_context(socket.socket()) for _ in range(count)]
         for listener in listeners:
-            listener.close()
+            listener.bind((LOOPBACK_HOST, 0))
+        return tuple(int(listener.getsockname()[1]) for listener in listeners)
 
 
 class ShowdownServer:
-    """Own exactly one local Showdown subprocess with non-blocking file log output."""
+    """Manage one local Showdown process and its error log."""
 
     def __init__(
         self,
@@ -68,7 +76,7 @@ class ShowdownServer:
 
     @property
     def websocket_url(self) -> str:
-        return f"ws://127.0.0.1:{self.port}/showdown/websocket"
+        return local_server_configuration(self.port).websocket_url
 
     def start(self) -> None:
         if self.process is not None:
@@ -87,13 +95,18 @@ class ShowdownServer:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_file = self.log_path.open("a", encoding="utf-8")
 
-        self.process = subprocess.Popen(
-            command,
-            cwd=self.showdown_root,
-            stdout=subprocess.DEVNULL,
-            stderr=self._log_file,
-            text=True,
-        )
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=self.showdown_root,
+                stdout=subprocess.DEVNULL,
+                stderr=self._log_file,
+                text=True,
+            )
+        except Exception:
+            # Release the owned log before propagating any process-start failure.
+            self._close_log()
+            raise
         deadline = time.monotonic() + self.startup_timeout
 
         while time.monotonic() < deadline:
@@ -101,7 +114,7 @@ class ShowdownServer:
                 self._raise_startup_failure(command)
 
             try:
-                with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
+                with socket.create_connection((LOOPBACK_HOST, self.port), timeout=0.2):
                     return
             except OSError:
                 time.sleep(0.05)
@@ -117,9 +130,7 @@ class ShowdownServer:
         code = self.process.returncode
         self.process = None
 
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
+        self._close_log()
 
         stderr = (
             self.log_path.read_text(encoding="utf-8")[-4000:] if self.log_path.is_file() else ""
@@ -138,9 +149,12 @@ class ShowdownServer:
                 process.kill()
                 process.wait(timeout=self.stop_timeout)
 
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
+        self._close_log()
+
+    def _close_log(self) -> None:
+        log_file, self._log_file = self._log_file, None
+        if log_file is not None:
+            log_file.close()
 
     def __enter__(self) -> ShowdownServer:
         self.start()
@@ -156,15 +170,24 @@ def start_showdown_servers(
     *,
     showdown_root: Path = DEFAULT_PATHS.showdown_root,
     ports: Sequence[int] | None = None,
+    build_assets: bool = True,
+    log_dir: Path | None = None,
 ) -> Iterator[tuple[ShowdownServer, ...]]:
     selected_ports = allocate_loopback_ports(count) if ports is None else tuple(ports)
     if len(selected_ports) != count or len(set(selected_ports)) != count:
         raise ValueError("Showdown ports must be unique and match the requested server count")
 
-    build_showdown(showdown_root)
+    if build_assets:
+        build_showdown(showdown_root)
     with contextlib.ExitStack() as stack:
         servers = tuple(
-            stack.enter_context(ShowdownServer(port, showdown_root=showdown_root))
+            stack.enter_context(
+                ShowdownServer(
+                    port,
+                    showdown_root=showdown_root,
+                    log_path=log_dir / f"showdown_{port}.log" if log_dir is not None else None,
+                )
+            )
             for port in selected_ports
         )
         yield servers

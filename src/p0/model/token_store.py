@@ -14,12 +14,7 @@ SeriesStoreKey = str | SeriesPerspectiveKey
 
 
 class SeriesTokenStore:
-    """Manages the lifecycle of continuous series tokens for Bo3 matches.
-
-    Acts as a pure state manager without neural network dependencies. Tokens
-    should be computed by the caller (e.g. via PolicyNet.encode_series) and
-    committed here.
-    """
+    """Stores completed-game summary tokens for Best-of-3 series."""
 
     def __init__(self, d_model: int, max_games: int = 2) -> None:
         self.d_model = d_model
@@ -37,14 +32,12 @@ class SeriesTokenStore:
         mask = torch.zeros((batch_size, SERIES_SLOTS), dtype=torch.bool, device=device)
 
         for i, key in enumerate(keys):
-            if key in self._store:
-                game_tokens = self._store[key]
-                for j, t in enumerate(game_tokens):
-                    start = j * SERIES_TOKENS_PER_GAME
-                    end = start + SERIES_TOKENS_PER_GAME
-                    if end <= SERIES_SLOTS:
-                        tokens[i, start:end] = t.to(device)
-                        mask[i, start:end] = True
+            for j, game_tokens in enumerate(self._store.get(key, ())):
+                start = j * SERIES_TOKENS_PER_GAME
+                end = start + SERIES_TOKENS_PER_GAME
+                if end <= SERIES_SLOTS:
+                    tokens[i, start:end] = game_tokens.to(device)
+                    mask[i, start:end] = True
 
         return tokens, mask
 
@@ -56,15 +49,11 @@ class SeriesTokenStore:
                 f"Expected new_game_tokens to have shape {expected_shape}, got {tuple(new_game_tokens.shape)}"
             )
 
-        new_game_tokens = new_game_tokens.detach().to(device="cpu", dtype=torch.float32)
-
-        history = self._store.pop(key, [])
+        new_game_tokens = new_game_tokens.detach().to(device="cpu", dtype=torch.float32, copy=True)
+        history = self._store.setdefault(key, [])
         history.append(new_game_tokens)
-
         if len(history) > self.max_games:
-            history = history[-self.max_games :]
-
-        self._store[key] = history
+            history.pop(0)
 
     def drop(self, key: SeriesStoreKey) -> None:
         """Explicitly clear the tokens for a series state."""
@@ -75,16 +64,16 @@ class SeriesTokenStore:
         self._store.clear()
 
     def training_state(self) -> dict[str, tuple[Tensor, ...]]:
-        """Capture string-keyed series state for an episode-boundary checkpoint."""
+        """Capture string-keyed series state for checkpointing."""
         state: dict[str, tuple[Tensor, ...]] = {}
         for key, values in self._store.items():
             if not isinstance(key, str):
                 raise ValueError("Only string-keyed series state can be checkpointed")
-            state[key] = tuple(value.clone() for value in values)
+            state[key] = tuple(v.clone() for v in values)
         return state
 
     def restore_training_state(self, state: Mapping[str, Sequence[Tensor]]) -> None:
-        """Restore series state captured by :meth:`training_state`."""
+        """Restore series state captured by the training_state method."""
         restored: dict[SeriesStoreKey, list[Tensor]] = {}
         for key, values in state.items():
             if not isinstance(key, str) or not key:

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache, wraps
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import load_active_runtime_manifest
+import orjson
+
+from p0.format_config import load_active_global_contract
 from p0.model.tokenizer import PokemonTokenizer, tokenizer
 from p0.paths import DEFAULT_PATHS
 
@@ -23,10 +25,8 @@ class RuntimeResources:
 
     @classmethod
     def from_files(cls, vocab_path: str | Path, dex_path: str | Path) -> RuntimeResources:
-        with Path(vocab_path).open("r", encoding="utf-8") as stream:
-            vocab = json.load(stream)
-        with Path(dex_path).open("r", encoding="utf-8") as stream:
-            dex = json.load(stream)
+        vocab = orjson.loads(Path(vocab_path).read_bytes())
+        dex = orjson.loads(Path(dex_path).read_bytes())
         if not isinstance(vocab, dict) or not isinstance(dex, dict):
             raise ValueError("Runtime vocabulary and dex roots must be objects")
         return cls.from_data(vocab, dex)
@@ -34,7 +34,7 @@ class RuntimeResources:
     @classmethod
     def from_manifest(cls, manifest_path: str | Path) -> RuntimeResources:
         path = Path(manifest_path)
-        load_active_runtime_manifest(path)
+        load_active_global_contract(path)
         vocab_path = path.with_name("vocab.json")
         dex_path = path.with_name("champions_dex.json")
         # Dex and Showdown identities are provenance. Updated mechanics remain loadable
@@ -81,8 +81,26 @@ class RuntimeResources:
 @lru_cache(maxsize=1)
 def default_runtime_resources() -> RuntimeResources:
     manifest_path = DEFAULT_PATHS.data_root / "runtime_manifest.json"
-    load_active_runtime_manifest(manifest_path)
+    load_active_global_contract(manifest_path)
     dex_path = manifest_path.with_name("champions_dex.json")
-    with dex_path.open("r", encoding="utf-8") as stream:
-        dex = json.load(stream)
+    dex = orjson.loads(dex_path.read_bytes())
     return RuntimeResources.from_data(tokenizer.vocab, dex, shared_tokenizer=tokenizer)
+
+
+def cache_default_dex[T](
+    build: Callable[[Mapping[str, Any]], T],
+) -> Callable[[Mapping[str, Any]], T]:
+    """Reuse default-dex tables per process; build them read-only, since callers share them."""
+    default = cache(lambda: build(default_runtime_resources().dex))
+
+    @wraps(build)
+    def lookup(dex: Mapping[str, Any]) -> T:
+        # Custom data must not load default resources or reuse their tables.
+        if (
+            default_runtime_resources.cache_info().currsize
+            and dex is default_runtime_resources().dex
+        ):
+            return default()
+        return build(dex)
+
+    return lookup

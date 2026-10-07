@@ -1,24 +1,41 @@
-"""Pure PPO objective and stateless memory-window optimizer lifecycle."""
+"""PPO loss computation and update loop."""
 
 from __future__ import annotations
 
 import logging
 import random
-import time
 from collections.abc import Callable, Sequence
-from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
+from torch import Tensor
+from torch.amp import GradScaler
 
-from p0.model.architecture_contract import HISTORY_WINDOW, SERIES_SLOTS
-from p0.model.policy import EncodedObs, PolicyNet
-from p0.model.structured_observation import StructuredObservation, is_teampreview
+from p0.model.architecture_contract import (
+    HISTORY_WINDOW,
+    MAX_PRIOR_GAMES,
+    SERIES_SLOTS,
+    SERIES_TOKENS_PER_GAME,
+)
+from p0.model.policy import EncodedObs, MemoryInputs, PolicyNet
+from p0.model.structured_observation import StructuredObservation
 from p0.training.config import TrainingConfig
 from p0.training.magnet import Magnet
-from p0.training.trajectory import TrajectoryBatch
-from p0.training.utils import amp_enabled
+from p0.training.series_history import SeriesHistorySnapshot
+from p0.training.trajectory import PreparedTrajectory
+from p0.training.utils import OptimizationPrecision, select_optimization_precision
+
+LOGGER = logging.getLogger(__name__)
+KL_METRIC_INDEX = 4
+_SUMMARY_METRICS = (
+    "policy_loss",
+    "value_loss",
+    "normalized_entropy",
+    "magnet_kl",
+    "kl_divergence",
+    "grad_norm",
+    "clip_fraction",
+)
 
 
 def magnet_kl_per_step(live_logits: torch.Tensor, magnet_logits: torch.Tensor) -> torch.Tensor:
@@ -42,7 +59,6 @@ def compute_ppo_objective(
     old_log_probs: torch.Tensor,
     advantages: torch.Tensor,
     returns: torch.Tensor,
-    team_preview: torch.Tensor,
     config: TrainingConfig,
     *,
     alpha: float,
@@ -52,81 +68,33 @@ def compute_ppo_objective(
     ratio = torch.exp(log_ratio)
 
     unclipped = ratio * advantages
-    clipped = torch.clamp(ratio, 1.0 - config.clip_low, 1.0 + config.clip_high) * advantages
+    clipped = torch.clamp(ratio, 1.0 - config.clip_range, 1.0 + config.clip_range) * advantages
     policy_loss = -torch.min(unclipped, clipped)
 
     value_loss = F.mse_loss(current_values, returns, reduction="none")
-    total = config.value_coef * value_loss
-
-    alpha_scale = alpha * torch.where(team_preview.reshape(-1), config.teampreview_alpha_mult, 1.0)
-    total = total + policy_loss + alpha_scale * magnet_kl
-
-    if config.residual_entropy_coef > 0.0:
-        total = total - config.residual_entropy_coef * normalized_entropy
-
-    total = torch.where(
-        team_preview.reshape(-1),
-        total * config.teampreview_loss_mult,
-        total,
-    )
+    total = policy_loss + config.value_coef * value_loss + alpha * magnet_kl
+    total = total - config.entropy_coef * normalized_entropy
 
     return total, policy_loss, value_loss, ratio, log_ratio
 
 
-class PPOUpdater:
-    """Own optimizer/scaler state while delegating memory-window evaluation."""
-
-    def __init__(
-        self,
-        policy: PolicyNet,
-        optimizer: torch.optim.Optimizer,
-        scaler: GradScaler,
-        config: TrainingConfig,
-        magnet: Magnet,
-        *,
-        cancel_requested: Callable[[], bool],
-    ) -> None:
-        self.policy = policy
-        self.optimizer = optimizer
-        self.scaler = scaler
-        self.config = config
-        self.magnet = magnet
-        self.cancel_requested = cancel_requested
-
-    def update(
-        self,
-        trajectories: Sequence[TrajectoryBatch],
-        episode: int,
-        alpha: float,
-    ) -> dict[str, Any]:
-        return ppo_update(
-            list(trajectories),
-            self.policy,
-            self.magnet,
-            self.optimizer,
-            self.scaler,
-            self.config,
-            episode,
-            alpha,
-            cancel_requested=self.cancel_requested,
-        )
-
-
-def _kl_exceeds_target(kl_sum: float, steps: int, target_kl: float) -> tuple[bool, float]:
+def _kl_exceeds_target(kl_sum: Tensor, steps: int, target_kl: float) -> tuple[bool, float]:
     """Check if the mean KL divergence exceeds the target early-stopping threshold."""
-    mean_kl = kl_sum / steps if steps > 0 else 0.0
-    return mean_kl > target_kl, mean_kl
+    mean_kl_value = float((kl_sum / steps).detach().item())
+    return mean_kl_value > target_kl, mean_kl_value
 
 
 def _build_memory_inputs(
     policy: PolicyNet,
     encoded: EncodedObs,
-    episodes: list[TrajectoryBatch],
+    episodes: Sequence[PreparedTrajectory],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build Bo1 memory inputs from one encoded trajectory batch."""
+) -> MemoryInputs:
+    """Build current-game and prior-game history memory inputs."""
     dtype = encoded.tokens.dtype
-    local_tokens = policy.local_history_tokens(encoded)
+    # Use local summaries as history inputs for subsequent decisions.
+    # Do not reuse the memory-aware readout to avoid leaking prior context into itself.
+    local_tokens = encoded.local_history_token
     lengths = torch.tensor([item.length for item in episodes], device=device, dtype=torch.long)
     starts = torch.cat((torch.zeros(1, device=device, dtype=torch.long), lengths.cumsum(0)[:-1]))
     targets = torch.arange(encoded.tokens.size(0), device=device)
@@ -136,120 +104,142 @@ def _build_memory_inputs(
     history_mask = history_indices >= episode_starts[:, None]
     history_indices = history_indices.clamp_min(0)
     history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
-    history_age_ids = torch.where(
-        history_mask,
-        torch.arange(HISTORY_WINDOW - 1, -1, -1, device=device)[None, :],
-        torch.zeros_like(history_indices),
-    )
     decision_count = encoded.tokens.size(0)
-    if episodes and all(ep.series_tokens is not None for ep in episodes):
-        series_tokens = torch.cat(
-            [ep.series_tokens for ep in episodes if ep.series_tokens is not None], dim=0
-        ).to(device)
-        series_mask = torch.cat(
-            [ep.series_mask for ep in episodes if ep.series_mask is not None], dim=0
-        ).to(device)
+    histories: list[Tensor] = []
+    history_rows: dict[int, int] = {}
+    episode_history_rows_data = [[-1] * MAX_PRIOR_GAMES for _ in episodes]
+    for episode_index, episode in enumerate(episodes):
+        snapshot: SeriesHistorySnapshot = episode.series_history
+        if len(snapshot) > MAX_PRIOR_GAMES:
+            raise ValueError(f"A trajectory cannot expose more than {MAX_PRIOR_GAMES} prior games")
+        for game_index, history in enumerate(snapshot):
+            identity = id(history)
+            row = history_rows.get(identity)
+            if row is None:
+                row = len(histories)
+                history_rows[identity] = row
+                histories.append(history.detach().to(device="cpu", dtype=torch.float32))
+            episode_history_rows_data[episode_index][game_index] = row
+
+    if histories:
+        history_lengths = torch.tensor([history.size(0) for history in histories], dtype=torch.long)
+        padded_cpu = torch.nn.utils.rnn.pad_sequence(histories, batch_first=True)
+        mask_cpu = torch.arange(padded_cpu.size(1)).unsqueeze(0) < history_lengths.unsqueeze(1)
+        padded = padded_cpu.to(device=device, dtype=dtype)
+        mask = mask_cpu.to(device=device)
+        summaries = policy.series(padded, mask)
+
+        episode_history_rows = torch.tensor(
+            episode_history_rows_data, dtype=torch.long, device=device
+        )
+        valid = episode_history_rows >= 0
+        selected = summaries[episode_history_rows.clamp_min(0)]
+        selected = selected.masked_fill(~valid[:, :, None, None], 0.0)
+        per_episode_tokens = selected.flatten(1, 2)
+        per_episode_mask = torch.arange(SERIES_SLOTS, device=device).unsqueeze(0) < (
+            valid.sum(dim=1, keepdim=True) * SERIES_TOKENS_PER_GAME
+        )
+        series_tokens = torch.repeat_interleave(per_episode_tokens, lengths, dim=0)
+        series_mask = torch.repeat_interleave(per_episode_mask, lengths, dim=0)
     else:
         series_tokens = torch.zeros(
-            (decision_count, SERIES_SLOTS, policy.d_model),
-            device=device,
-            dtype=dtype,
+            (decision_count, SERIES_SLOTS, policy.d_model), device=device, dtype=dtype
         )
-        series_mask = torch.zeros(
-            (decision_count, SERIES_SLOTS),
-            device=device,
-            dtype=torch.bool,
-        )
-    return (
-        series_tokens,
-        series_mask,
-        history_tokens,
-        history_mask,
-        history_age_ids,
+        series_mask = torch.zeros((decision_count, SERIES_SLOTS), device=device, dtype=torch.bool)
+    return MemoryInputs(
+        series_tokens=series_tokens,
+        series_mask=series_mask,
+        history_tokens=history_tokens,
+        history_mask=history_mask,
     )
+
+
+def _compute_magnet_logits(
+    episodes: Sequence[PreparedTrajectory],
+    magnet: Magnet,
+    device: torch.device,
+    precision: OptimizationPrecision,
+) -> torch.Tensor:
+    """Compute frozen-policy logits without retaining intermediate tensors."""
+    observations = StructuredObservation.cat([episode.observations for episode in episodes], dim=0)
+    action_masks = torch.cat([episode.action_masks for episode in episodes], dim=0)
+    actions = torch.cat([episode.actions for episode in episodes], dim=0)
+
+    with torch.inference_mode(), precision.autocast_context(device):
+        encoded = magnet.policy.encode(observations, action_masks)
+        memory = _build_memory_inputs(magnet.policy, encoded, episodes, device)
+        logits = magnet.policy.action_logits(
+            magnet.policy.prepare(encoded, memory), action_masks, actions
+        )
+    return logits.detach()
+
+
+def _cached_magnet_logits(
+    episodes: Sequence[PreparedTrajectory],
+    magnet: Magnet,
+    device: torch.device,
+    precision: OptimizationPrecision,
+    cache: dict[int, torch.Tensor],
+) -> torch.Tensor:
+    """Return GPU-resident magnet logits, computing each trajectory once per update."""
+    missing = [episode for episode in episodes if id(episode) not in cache]
+    if missing:
+        logits = _compute_magnet_logits(missing, magnet, device, precision)
+        offset = 0
+        for episode in missing:
+            end = offset + episode.length
+            cache[id(episode)] = logits[offset:end]
+            offset = end
+
+    return torch.cat([cache[id(episode)] for episode in episodes], dim=0)
 
 
 def _run_batched_ppo(
-    episodes: list[TrajectoryBatch],
+    episodes: list[PreparedTrajectory],
     policy: PolicyNet,
     magnet: Magnet,
     config: TrainingConfig,
     device: torch.device,
-    episode: int,
+    precision: OptimizationPrecision,
     alpha: float,
-) -> tuple[torch.Tensor, dict[str, float], int]:
-    """Evaluate one PPO minibatch with one reducer pass per decision.
+    magnet_cache: dict[int, torch.Tensor],
+) -> tuple[torch.Tensor, Tensor, int]:
+    """
+    Compute PPO losses and metrics for one minibatch.
 
     Arguments:
-        episodes: Trajectories included in the minibatch.
-        policy: Live policy receiving gradients.
-        magnet: Frozen reference policy used for reverse-KL regularization.
-        config: PPO optimization settings.
-        device: Device hosting the minibatch computation.
-        episode: Current training episode index.
-        alpha: Active magnet regularization coefficient.
+        episodes: Trajectories in the minibatch.
+        policy: Policy network being trained.
+        magnet: Frozen reference policy for KL regularization.
+        config: Training configuration.
+        device: Target compute device.
+        precision: Mixed precision settings.
+        alpha: Weight for magnet KL loss.
+        magnet_cache: Cache of precomputed magnet logits.
 
     Returns:
-        Summed loss tensor, summed scalar metrics, and decision count.
+        Total loss, metric tensor, and number of steps.
     """
     if not episodes:
-        return (
-            torch.tensor(0.0, device=device),
-            {
-                "policy_loss": 0.0,
-                "value_loss": 0.0,
-                "kl_div": 0.0,
-                "clip_frac": 0.0,
-            },
-            0,
-        )
+        raise ValueError("A PPO minibatch cannot be empty")
 
     all_obs = StructuredObservation.cat([ep.observations for ep in episodes], dim=0)
     all_action_masks = torch.cat([ep.action_masks for ep in episodes], dim=0)
-    use_amp = amp_enabled(config, device)
-
-    with autocast(device_type=device.type, enabled=use_amp):
-        all_enc = policy.encode(all_obs, all_action_masks)
-
     actions = torch.cat([ep.actions for ep in episodes])
     old_log_probs = torch.cat([ep.log_probs for ep in episodes])
-    advantages = torch.cat([ep.advantages for ep in episodes if ep.advantages is not None])
-    returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None])
+    advantages = torch.cat([ep.advantages for ep in episodes])
+    returns = torch.cat([ep.returns for ep in episodes])
 
-    live_memory = _build_memory_inputs(policy, all_enc, episodes, device)
-    magnet_enc: EncodedObs | None = None
-    magnet_memory: tuple[torch.Tensor, ...] | None = None
+    magnet_logits = _cached_magnet_logits(episodes, magnet, device, precision, magnet_cache)
 
-    with torch.inference_mode(), autocast(device_type=device.type, enabled=use_amp):
-        magnet_enc = magnet.policy.encode(all_obs, all_action_masks)
-        magnet_memory = _build_memory_inputs(magnet.policy, magnet_enc, episodes, device)
-
-    total_loss = torch.tensor(0.0, device=device)
-    # Keep reductions on-device until the update-level aggregation below.
-    metrics: dict[str, Any] = {
-        "policy_loss": torch.tensor(0.0, device=device),
-        "value_loss": torch.tensor(0.0, device=device),
-        "normalized_entropy": torch.tensor(0.0, device=device),
-        "magnet_kl": torch.tensor(0.0, device=device),
-        "kl_div": torch.tensor(0.0, device=device),
-        "clip_frac": torch.tensor(0.0, device=device),
-    }
-    with autocast(device_type=device.type, enabled=use_amp):
+    with precision.autocast_context(device):
+        all_enc = policy.encode(all_obs, all_action_masks)
+        live_memory = _build_memory_inputs(policy, all_enc, episodes, device)
         out = policy.evaluate(
-            all_enc,
+            policy.prepare(all_enc, live_memory),
             all_action_masks,
             actions,
-            *live_memory,
         )
-        if magnet_enc is None or magnet_memory is None:
-            raise RuntimeError("magnet evaluation inputs were not prepared")
-        with torch.inference_mode():
-            magnet_logits, _, _, _ = magnet.policy.actor.score(
-                magnet_enc,
-                all_action_masks,
-                actions,
-                *magnet_memory,
-            )
         magnet_kl = magnet_kl_per_step(out.logits, magnet_logits)
         step_loss, step_policy_loss, step_value_loss, ratio, log_ratio = compute_ppo_objective(
             out.log_probs,
@@ -259,7 +249,6 @@ def _run_batched_ppo(
             old_log_probs,
             advantages,
             returns,
-            is_teampreview(all_enc.numerical),
             config,
             alpha=alpha,
         )
@@ -268,30 +257,22 @@ def _run_batched_ppo(
     total_steps = int(step_loss.numel())
 
     with torch.no_grad():
-        metrics["policy_loss"] = step_policy_loss.sum()
-        metrics["value_loss"] = step_value_loss.sum()
-        metrics["normalized_entropy"] = out.norm_entropy.sum()
-        metrics["magnet_kl"] = magnet_kl.sum()
-        metrics["kl_div"] = ((ratio - 1) - log_ratio).sum()
-        metrics["clip_frac"] = (
-            ((ratio < 1 - config.clip_low) | (ratio > 1 + config.clip_high)).float().sum()
+        metrics = torch.stack(
+            (
+                step_policy_loss.sum(),
+                step_value_loss.sum(),
+                out.norm_entropy.sum(),
+                magnet_kl.sum(),
+                ((ratio - 1) - log_ratio).sum(),
+                ((ratio < 1 - config.clip_range) | (ratio > 1 + config.clip_range)).float().sum(),
+            )
         )
-
-    for k in [
-        "policy_loss",
-        "value_loss",
-        "normalized_entropy",
-        "magnet_kl",
-        "kl_div",
-        "clip_frac",
-    ]:
-        metrics[k] = metrics[k].item()
 
     return total_loss, metrics, total_steps
 
 
 def ppo_update(
-    episodes: list[TrajectoryBatch],
+    episodes: list[PreparedTrajectory],
     policy: PolicyNet,
     magnet: Magnet,
     optimizer: torch.optim.Optimizer,
@@ -301,7 +282,8 @@ def ppo_update(
     alpha: float,
     cancel_requested: Callable[[], bool],
 ) -> dict[str, float | int]:
-    """Apply PPO epochs to a collection of completed trajectories.
+    """
+    Apply PPO epochs to a collection of completed trajectories.
 
     Arguments:
         episodes: Prepared trajectories with returns and advantages.
@@ -315,57 +297,43 @@ def ppo_update(
         cancel_requested: Callback polled for cooperative cancellation.
 
     Returns:
-        Scalar optimization, stability, and timing metrics.
+        Scalar optimization and stability metrics.
     """
+    if not episodes:
+        raise ValueError("PPO update requires at least one prepared trajectory")
     policy.train()
-    t0 = time.time()
 
-    with torch.no_grad():
-        all_returns = torch.cat([ep.returns for ep in episodes if ep.returns is not None])
-        all_values = torch.cat([ep.values for ep in episodes])
-        var_y = torch.var(all_returns)
-        if var_y > 1e-8:
-            explained_var = 1.0 - torch.var(all_returns - all_values) / var_y
-        else:
-            explained_var = torch.tensor(0.0)
-        explained_var = explained_var.item()
+    explained_var = episodes[0].explained_variance
+    if any(trajectory.explained_variance != explained_var for trajectory in episodes[1:]):
+        raise ValueError("Prepared trajectories must share one explained-variance metric")
 
-    tot_policy_loss = 0.0
-    tot_value_loss = 0.0
-    tot_normalized_entropy = 0.0
-    tot_magnet_kl = 0.0
-    tot_kl_div = 0.0
-    tot_grad_norm = 0.0
-    tot_clip_frac = 0.0
+    metric_zero = torch.zeros((), device=policy.device)
+    metric_totals = torch.zeros(6, device=policy.device)
+    tot_grad_norm = metric_zero.clone()
     tot_steps = 0
     num_updates = 0
-    num_skipped = 0
-    epochs_done = 0
-
-    effective_batch_size = config.minibatch_size * (
-        (config.batch_size + config.minibatch_size - 1) // config.minibatch_size
-    )
+    magnet_cache: dict[int, torch.Tensor] = {}
+    precision = select_optimization_precision(config.enable_optim, policy.device)
+    ordered_episodes = episodes.copy()
 
     for epoch_idx in range(config.ppo_epochs):
         if cancel_requested():
             break
-        random.Random(config.seed + episode * config.ppo_epochs + epoch_idx).shuffle(episodes)
+        random.Random(config.seed + episode * config.ppo_epochs + epoch_idx).shuffle(
+            ordered_episodes
+        )
 
-        epoch_steps = 0
-        epoch_kl = 0.0
-
-        for batch_start in range(0, len(episodes), effective_batch_size):
+        for batch_start in range(0, len(ordered_episodes), config.batch_size):
             if cancel_requested():
                 break
 
-            minibatch = episodes[batch_start : batch_start + effective_batch_size]
-            if not minibatch:
-                continue
+            minibatch = ordered_episodes[batch_start : batch_start + config.batch_size]
 
             optimizer.zero_grad(set_to_none=True)
 
             minibatch_steps = 0
-            minibatch_kl = 0.0
+            minibatch_kl = metric_zero.clone()
+            minibatch_metrics = torch.zeros_like(metric_totals)
             expected_minibatch_steps = sum(ep.length for ep in minibatch)
             should_skip = False
             cancelled = False
@@ -380,31 +348,35 @@ def ppo_update(
                 chunk.sort(key=lambda ep: ep.length, reverse=True)
 
                 batch_loss, batch_metrics, batch_steps = _run_batched_ppo(
-                    chunk, policy, magnet, config, policy.device, episode, alpha
+                    chunk,
+                    policy,
+                    magnet,
+                    config,
+                    policy.device,
+                    precision,
+                    alpha,
+                    magnet_cache,
                 )
 
-                tot_policy_loss += batch_metrics["policy_loss"]
-                tot_value_loss += batch_metrics["value_loss"]
-                tot_normalized_entropy += batch_metrics["normalized_entropy"]
-                tot_magnet_kl += batch_metrics["magnet_kl"]
-                epoch_kl += batch_metrics["kl_div"]
-                minibatch_kl += batch_metrics["kl_div"]
-                tot_clip_frac += batch_metrics["clip_frac"]
+                minibatch_metrics += batch_metrics
+                minibatch_kl += batch_metrics[KL_METRIC_INDEX]
                 minibatch_steps += batch_steps
 
-                if batch_steps > 0:
-                    scaled_loss = batch_loss / expected_minibatch_steps
-                    if torch.isfinite(scaled_loss):
-                        scaler.scale(scaled_loss).backward()
-                    else:
-                        logging.warning(
-                            f"Non-finite chunk loss at episode {episode}; "
-                            "discarding the entire minibatch"
-                        )
-                        non_finite_loss = True
-                        break
+                scaled_loss = batch_loss / expected_minibatch_steps
+                chunk_is_finite = torch.isfinite(scaled_loss) & torch.isfinite(batch_metrics).all()
+                if bool(chunk_is_finite.item()):
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    LOGGER.warning(
+                        f"Non-finite chunk loss at episode {episode}; "
+                        "discarding the entire minibatch"
+                    )
+                    non_finite_loss = True
+                    break
 
-                # Check KL early at the chunk level to save processing remaining chunks
+                # Preserve the original early-stop behavior: once the running
+                # mean KL for this effective minibatch exceeds the target, do
+                # not process any remaining chunks.
                 should_skip, minibatch_mean_kl = _kl_exceeds_target(
                     minibatch_kl, minibatch_steps, config.target_kl
                 )
@@ -414,69 +386,62 @@ def ppo_update(
             if cancelled:
                 optimizer.zero_grad(set_to_none=True)
                 break
-            if minibatch_steps > 0:
-                if should_skip or non_finite_loss:
-                    reason = (
-                        "non-finite loss"
-                        if non_finite_loss
-                        else f"KL={minibatch_mean_kl:.4f} > {config.target_kl:.4f}"
-                    )
-                    logging.info(
-                        f"Skipping minibatch at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
-                        f"batch {batch_start // effective_batch_size + 1} "
-                        f"({reason})"
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    num_skipped += 1
-                else:
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        policy.parameters(), config.max_grad_norm
-                    )
-                    scale_before_update = scaler.get_scale()
-                    if not torch.isfinite(grad_norm):
-                        logging.warning(
-                            "Non-finite grad norm detected; scaler will skip this step "
-                            f"(loss scale={scale_before_update:.0f})"
-                        )
-                    else:
-                        tot_grad_norm += grad_norm.item()
+            if should_skip or non_finite_loss:
+                reason = (
+                    "non-finite loss"
+                    if non_finite_loss
+                    else f"KL={minibatch_mean_kl:.4f} > {config.target_kl:.4f}"
+                )
+                LOGGER.info(
+                    f"Skipping minibatch at epoch {epoch_idx + 1}/{config.ppo_epochs}, "
+                    f"batch {batch_start // config.batch_size + 1} "
+                    f"({reason})"
+                )
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), config.max_grad_norm
+                )
+                scale_before_update = scaler.get_scale()
+                grad_norm_finite = bool(torch.isfinite(grad_norm).item())
+                if grad_norm_finite:
+                    tot_grad_norm += grad_norm.detach()
                     scaler.step(optimizer)
-                    scaler.update()
-                    if torch.isfinite(grad_norm):
-                        num_updates += 1
+                else:
+                    LOGGER.warning(
+                        "Non-finite grad norm detected; discarding this step "
+                        f"(loss scale={scale_before_update:.0f})"
+                    )
+                # GradScaler.update consumes the finite check recorded by
+                # unscale_, including the rejected norm-overflow case.
+                scaler.update()
+                if grad_norm_finite:
+                    num_updates += 1
+                    metric_totals += minibatch_metrics
+                    tot_steps += minibatch_steps
 
-            epoch_steps += minibatch_steps
+    # No subsequent work consumes these gradients. Clear the final minibatch
+    # gradient storage before the next rollout begins.
+    optimizer.zero_grad(set_to_none=True)
 
-        tot_steps += epoch_steps
-        tot_kl_div += epoch_kl
-        epochs_done += 1
-
-    if epochs_done == 0 or tot_steps == 0:
+    if tot_steps == 0:
         return {
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "normalized_entropy": 0.0,
-            "magnet_kl": 0.0,
-            "kl_divergence": 0.0,
-            "grad_norm": 0.0,
-            "clip_fraction": 0.0,
-            "magnet_alpha": alpha,
+            **dict.fromkeys(_SUMMARY_METRICS, 0.0),
             "explained_variance": 0.0,
-            "skipped_minibatches": num_skipped,
-            "time": time.time() - t0,
+            "optimizer_updates": 0,
         }
 
+    grad_norm = tot_grad_norm / num_updates if num_updates > 0 else metric_zero
+    metric_means = metric_totals / tot_steps
+    summary = (
+        torch.cat((metric_means[:5], grad_norm.unsqueeze(0), metric_means[5:]))
+        .detach()
+        .cpu()
+        .tolist()
+    )
     return {
-        "policy_loss": tot_policy_loss / tot_steps,
-        "value_loss": tot_value_loss / tot_steps,
-        "normalized_entropy": tot_normalized_entropy / tot_steps,
-        "magnet_kl": tot_magnet_kl / tot_steps,
-        "kl_divergence": tot_kl_div / tot_steps,
-        "grad_norm": tot_grad_norm / num_updates if num_updates > 0 else 0.0,
-        "clip_fraction": tot_clip_frac / tot_steps,
-        "magnet_alpha": alpha,
+        **dict(zip(_SUMMARY_METRICS, summary, strict=True)),
         "explained_variance": explained_var,
-        "skipped_minibatches": num_skipped,
-        "time": time.time() - t0,
+        "optimizer_updates": num_updates,
     }

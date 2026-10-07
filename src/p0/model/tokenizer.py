@@ -11,30 +11,33 @@ from p0.paths import DEFAULT_PATHS
 CLEAN_ID_RE = re.compile(r"[^a-z0-9]")
 
 
-class _EnumIdTable(dict["NamedEffectView | str", int]):
-    """Vocabulary IDs cached per enum-like member, resolved from member names.
+class _EnumIdTable(dict[NamedEffectView | str, int]):
+    """
+    Vocabulary IDs resolved from enum-like members and normalized names.
 
-    Members are resolved lazily so this module never has to import the runtime
-    enum classes; after the first resolution a lookup is a plain dict hit,
-    identical in cost to a precomputed table.
+    Successful resolutions are cached under normalized strings. Unknown inputs
+    and caller-owned enum-like objects are not retained by the table.
     """
 
-    def __init__(self, table: dict[str, int], aliases: dict[str, str] | None = None):
+    def __init__(self, table: dict[str, int]):
         super().__init__()
         self._table = table
-        self._aliases = aliases or {}
 
     def __missing__(self, member: NamedEffectView | str) -> int:
         name = member if isinstance(member, str) else member.name
         normalized = PokemonTokenizer.normalize_id(name)
-        alias = self._aliases.get(normalized)
-        value = self._table.get(alias) if alias else None
+        if not normalized:
+            return 0
 
-        if value is None:
-            value = self._table.get(normalized, 0)
+        cached = self.get(normalized)
+        if cached is not None:
+            return cached
 
-        self[member] = value
+        if normalized not in self._table:
+            return 0
 
+        value = self._table[normalized]
+        self[normalized] = value
         return value
 
 
@@ -91,35 +94,14 @@ class PokemonTokenizer:
         for nature in ("serious", "bashful", "docile", "hardy", "quirky"):
             self.natures[nature] = 0
 
-        self.aliases = {
-            "weathers": {
-                "rain": "raindance",
-                "sun": "sunnyday",
-                "sand": "sandstorm",
-                "snow": "snowscape",
-            },
-            "status": {
-                "burn": "brn",
-                "freeze": "frz",
-                "paralysis": "par",
-                "poison": "psn",
-                "sleep": "slp",
-                "toxic": "tox",
-            },
-        }
-
         # Enum members resolve lazily from their normalized names.
         self.volatiles = _EnumIdTable(vocab.get("volatiles", {}))
         self.side_conditions = _EnumIdTable(vocab.get("side_conditions", {}))
-        self.weathers = _EnumIdTable(vocab.get("weathers", {}), self.aliases["weathers"])
+        self.weathers = _EnumIdTable(vocab.get("weathers", {}))
         self.fields = _EnumIdTable(vocab.get("fields", {}))
-        self.status = _EnumIdTable(vocab.get("status", {}), self.aliases["status"])
+        self.status = _EnumIdTable(vocab.get("status", {}))
         self.types = _EnumIdTable(vocab.get("types", {}))
         self.categories = _EnumIdTable(vocab.get("categories", {}))
-
-        # pre-bake the trickroom token ID so _global_field_token never does a runtime vocab lookup
-        _trickroom_vocab = vocab.get("trickroom", {})
-        self.trickroom_id: int = _trickroom_vocab.get("trickroom", 0)
 
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> PokemonTokenizer:
@@ -129,7 +111,7 @@ class PokemonTokenizer:
             return cls(json.load(f))
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=4096)
     def _cached_normalize(s: str) -> str:
         return CLEAN_ID_RE.sub("", s.lower())
 
@@ -157,7 +139,8 @@ class PokemonTokenizer:
         return self.id_for(table, remainder if separator else name)
 
     def resolve(self, table: str, name: str | None) -> tuple[int, str]:
-        """Resolve a value while exposing why ID zero was returned.
+        """
+        Resolve a value while exposing why ID zero was returned.
 
         Args:
             table: The vocabulary table name to query (e.g. 'weathers', 'status').
@@ -176,9 +159,6 @@ class PokemonTokenizer:
             return 0, Resolution.UNKNOWN
 
         key = self.normalize_id(name)
-        table_aliases = self.aliases.get(table, {})
-        key = table_aliases.get(key, key)
-
         if key not in vocab_table:
             return 0, Resolution.OOV
 
@@ -193,6 +173,8 @@ class PokemonTokenizer:
         if pokemon is None:
             return 0
         species = pokemon.species or pokemon.base_species
+        if not species:
+            return 0
         return self.species.get(self.normalize_id(species), 0)
 
     def ability_id(self, pokemon: PokemonView | None) -> int:

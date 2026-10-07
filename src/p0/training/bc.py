@@ -1,66 +1,99 @@
-"""Behavior-cloning trainer and compatibility façade."""
+"""Behavior-cloning trainer."""
 
 from __future__ import annotations
 
+import logging
 import random
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 
-from p0.model.policy import EncodedObs, PolicyNet
-from p0.replays.dataset import ReplayGameChunk
+from p0.model.policy import MemoryInputs, PolicyNet, PreparedDecision
+from p0.replays.dataset import LazyReplayDataset, ReplayGameChunk
+from p0.runtime.process_context import PROCESS_CONTEXT
 from p0.training._bc_batch import (
-    BCBatchDataset,
     BCDecisionBatch,
     BCGameWindow,
+    _BCUpdateDataset,
     collate_bc_batches,
 )
-from p0.training._bc_history import _BCHistoryUpdate, _BCSeriesHistory
+from p0.training._bc_history import (
+    ActiveGames,
+    commit_history_updates,
+    prepare_series_context,
+    window_history_tokens,
+)
 from p0.training._bc_metrics import (
     BCEvaluationMetrics,
     BCObjective,
     _BCEvaluationAccumulator,
+    _policy_loss_sum,
     _ragged_logsumexp,
+    _swap_preview_pair,
     _validate_objective_inputs,
     compute_bc_objective,
 )
-from p0.training.checkpoint import DEFAULT_POLICY_STORE, CheckpointStore
 from p0.training.config import BCConfig
+from p0.training.series_history import SeriesHistoryStore
+from p0.training.utils import select_optimization_precision
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _expand_team_preview_orbits(
+    candidate_values: Tensor,
+    candidate_offsets: Tensor,
+    team_preview: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Return each row's distinct candidates, adding preview pair orientations."""
+    if candidate_values.numel() == 0:
+        return candidate_values, candidate_offsets
+
+    if candidate_values.device.type != "cpu" or candidate_offsets.device.type != "cpu":
+        raise ValueError("BC candidate expansion expects CPU tensors")
+
+    values = candidate_values.tolist()
+    offsets = candidate_offsets.tolist()
+    preview_rows = team_preview.to(device="cpu", dtype=torch.bool).tolist()
+    expanded: list[tuple[int, int]] = []
+    expanded_offsets = [0]
+
+    for row, (start, stop) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
+        unique: dict[tuple[int, int], None] = {}
+        for first, second in values[start:stop]:
+            unique[(first, second)] = None
+            if preview_rows[row]:
+                first_swap = _swap_preview_pair(first)
+                second_swap = _swap_preview_pair(second)
+                unique[(first_swap, second)] = None
+                unique[(first, second_swap)] = None
+                unique[(first_swap, second_swap)] = None
+        expanded.extend(unique)
+        expanded_offsets.append(len(expanded))
+
+    return (
+        candidate_values.new_tensor(expanded).reshape(-1, 2),
+        candidate_offsets.new_tensor(expanded_offsets),
+    )
 
 
 class BCCancelled(RuntimeError):
     """Raised between batches so callers keep the last completed epoch checkpoint."""
 
 
-BCModelInputs = tuple[EncodedObs, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedBCBatch:
-    model_inputs: BCModelInputs
-    history_updates: tuple[_BCHistoryUpdate, ...]
-
-
-def _empty_training_totals() -> dict[str, float | int]:
+def _empty_training_totals() -> dict[str, Any]:
     return {
         "loss": 0.0,
         "loss_weight": 0.0,
-        "exact_nll": 0.0,
-        "partial_nll": 0.0,
         "decisions": 0,
-        "labeled_decisions": 0,
-        "exact_decisions": 0,
-        "partial_decisions": 0,
         "updates": 0,
         "games": 0,
-        "value_loss": 0.0,
-        "value_decisions": 0,
+        "grad_norm_sum": 0.0,
     }
 
 
@@ -70,6 +103,32 @@ def _seed_bc_worker(worker_id: int) -> None:
     seed = torch.initial_seed() % (2**32)
     np.random.seed(seed)
     random.seed(seed)
+
+
+def _discounted_outcome_targets(
+    outcome: Tensor,
+    decision_index: Tensor,
+    game_length: Tensor,
+    gamma: Tensor,
+) -> Tensor:
+    """Discount terminal outcomes by the number of following recorded decisions."""
+    exponent = (game_length - 1 - decision_index).to(outcome.dtype)
+    return torch.pow(gamma, exponent) * outcome
+
+
+def _prepare_value_targets(
+    batch: BCDecisionBatch,
+    device: torch.device,
+    gamma: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Prepare discounted outcome targets and value validity mask on device."""
+    value_targets = _discounted_outcome_targets(
+        batch.outcome.to(device=device, dtype=torch.float32),
+        batch.decision_index.to(device),
+        batch.game_length.to(device),
+        gamma,
+    )
+    return value_targets, batch.outcome_valid.to(device)
 
 
 class BCTrainer:
@@ -83,25 +142,22 @@ class BCTrainer:
         *,
         device: torch.device | str = "cpu",
         optimizer: torch.optim.Optimizer | None = None,
-        checkpoint_store: CheckpointStore = DEFAULT_POLICY_STORE,
-        provenance: Mapping[str, object] | None = None,
         cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self.policy = policy.to(device)
         self.dataset = dataset
         self.config = config
         self.device = torch.device(device)
+        self._gamma = torch.tensor(config.gamma, device=self.device, dtype=torch.float32)
         self.optimizer = optimizer or torch.optim.AdamW(
             self.policy.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
-        self.amp_enabled = config.amp and self.device.type == "cuda"
-        self.scaler = GradScaler(device=self.device.type, enabled=self.amp_enabled)
-        self.checkpoint_store = checkpoint_store
-        self.provenance = dict(provenance or {})
+        self.precision = select_optimization_precision(config.enable_optim, self.device)
+        self.scaler = GradScaler(device=self.device.type, enabled=self.precision.grad_scaler)
         self.batch_decisions = config.batch_decisions
-        self._series_history = _BCSeriesHistory(policy.d_model)
+        self._series_history = SeriesHistoryStore(policy.d_model)
         self.cancel_requested = cancel_requested
 
     def train(self) -> dict[str, float | int]:
@@ -120,252 +176,218 @@ class BCTrainer:
         """Train exactly one epoch and return its decision-weighted metrics."""
         return self._metrics(self._train_epoch_totals())
 
-    def _train_epoch_totals(self) -> dict[str, float | int]:
+    def _train_epoch_totals(self) -> dict[str, Any]:
         self.policy.train()
         self._series_history.clear()
-        if self.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self.device)
 
         totals = _empty_training_totals()
-        accumulated_decisions = 0
-        accumulated_loss_weight = 0.0
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
         self.optimizer.zero_grad(set_to_none=True)
         num_workers = self.config.num_workers
-        prefetch_factor = self.config.prefetch_factor if num_workers > 0 else None
-        dataloader = DataLoader(
-            BCBatchDataset(self.dataset, chunk_size),
-            num_workers=num_workers,
-            batch_size=None,
-            prefetch_factor=prefetch_factor,
-            multiprocessing_context="spawn" if num_workers > 0 else None,
-            worker_init_fn=_seed_bc_worker if num_workers > 0 else None,
-            generator=torch.Generator().manual_seed(self.config.seed),
-        )
+        if num_workers > 0 and not isinstance(self.dataset, LazyReplayDataset):
+            raise ValueError(
+                "BC num_workers greater than zero requires a worker-sharded LazyReplayDataset"
+            )
+        update_groups = _BCUpdateDataset(self.dataset, self.batch_decisions, chunk_size)
+        source: Iterable[tuple[BCDecisionBatch, ...]] = update_groups
+        if num_workers > 0:
+            source = DataLoader(
+                update_groups,
+                num_workers=num_workers,
+                batch_size=None,
+                prefetch_factor=self.config.prefetch_factor,
+                multiprocessing_context=PROCESS_CONTEXT,
+                worker_init_fn=_seed_bc_worker,
+                generator=torch.Generator().manual_seed(self.config.seed),
+            )
 
-        for batch in dataloader:
-            if self.cancel_requested():
-                raise BCCancelled("Behaviour-cloning training was cancelled")
-            accumulated_loss_weight += self._backward_chunk(batch, totals)
-            accumulated_decisions += batch.decisions
-            if (
-                accumulated_decisions >= self.batch_decisions
-                and not self._series_history.has_partial_games
-            ):
-                if accumulated_loss_weight > 0:
-                    totals["updates"] += int(self._step_optimizer(accumulated_loss_weight))
-                accumulated_decisions = 0
-                accumulated_loss_weight = 0.0
-
-        if self._series_history.has_partial_games:
-            raise ValueError("BC dataset ended with an incomplete perspective-game")
-        if accumulated_loss_weight > 0:
-            totals["updates"] += int(self._step_optimizer(accumulated_loss_weight))
-        self._series_history.clear()
+        try:
+            for update_batches in source:
+                if self.cancel_requested():
+                    raise BCCancelled("Behavior-cloning training was cancelled")
+                self._train_update(update_batches, totals)
+        finally:
+            self._series_history.clear()
         return totals
 
-    def _metrics(self, totals: dict[str, float | int]) -> dict[str, float | int]:
-        peak_memory = (
-            torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
-        )
+    def _train_update(
+        self,
+        batches: tuple[BCDecisionBatch, ...],
+        totals: dict[str, Any],
+    ) -> None:
+        """Backpropagate and step once for one complete-game update group."""
+        active: ActiveGames = {}
+        policy_weight = sum(float(batch.loss_mask.sum()) for batch in batches)
+        value_count = sum(int(batch.outcome_valid.sum()) for batch in batches)
+        try:
+            update_loss = sum(
+                self._backward_chunk(batch, active, policy_weight, value_count) for batch in batches
+            )
+
+            grad_norm = 0.0
+            if policy_weight or value_count:
+                grad_norm = self._step_optimizer()
+        except Exception:
+            # Drop partial gradients; the caller ends the epoch and clears the history.
+            self.optimizer.zero_grad(set_to_none=True)
+            raise
+
+        totals["loss"] += update_loss
+        totals["loss_weight"] += policy_weight
+        totals["decisions"] += sum(batch.decisions for batch in batches)
+        totals["games"] += sum(batch.completed_game_count for batch in batches)
+        if policy_weight or value_count:
+            totals["updates"] += 1
+            totals["grad_norm_sum"] += grad_norm
+
+    def _metrics(self, totals: dict[str, Any]) -> dict[str, float | int]:
         updates = int(totals["updates"])
-        games = int(totals["games"])
-        decisions = int(totals["decisions"])
         return {
-            "loss": float(totals["loss"]) / max(float(totals["loss_weight"]), 1.0),
-            "exact_nll": float(totals["exact_nll"]) / max(int(totals["exact_decisions"]), 1),
-            "partial_nll": float(totals["partial_nll"]) / max(int(totals["partial_decisions"]), 1),
-            "decisions": decisions,
-            "labeled_decisions": int(totals["labeled_decisions"]),
-            "exact_decisions": int(totals["exact_decisions"]),
-            "partial_decisions": int(totals["partial_decisions"]),
+            "overall_nll": (
+                float(totals["loss"]) / float(totals["loss_weight"])
+                if totals["loss_weight"]
+                else 0.0
+            ),
+            "grad_norm": (float(totals["grad_norm_sum"]) / updates if updates else 0.0),
+            "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
             "updates": updates,
-            "games": games,
-            "decisions_per_update": decisions / updates if updates else 0.0,
-            "games_per_update": games / updates if updates else 0.0,
-            "peak_memory_bytes": peak_memory,
-            # This is mean squared error against the discounted terminal-
-            # outcome target, over decisions with verified outcomes.
-            "value_loss": float(totals["value_loss"]) / max(int(totals["value_decisions"]), 1),
-            "value_decisions": int(totals["value_decisions"]),
+            "games": int(totals["games"]),
+            "decisions": int(totals["decisions"]),
         }
 
-    def save_checkpoint(
-        self,
-        path: str | Path,
-        *,
-        epoch: int,
-        selection_state: Mapping[str, object] | None = None,
-    ) -> None:
-        """Persist the policy and optimizer state through the checkpoint seam."""
-        metadata = dict(self.provenance)
-        if selection_state is not None:
-            metadata["selection_state"] = dict(selection_state)
-        self.checkpoint_store.save_training_state(
-            Path(path),
-            epoch,
-            self.policy,
-            optimizer=self.optimizer,
-            scaler=self.scaler,
-            metadata=metadata,
-            trainer_kind="bc",
-        )
-
-    def load_checkpoint(self, path: str | Path) -> int:
-        """Restore a BC training state and return its completed epoch."""
-        return self.checkpoint_store.load_training_state(
-            Path(path),
-            self.policy,
-            optimizer=self.optimizer,
-            scaler=self.scaler,
-            expected_trainer_kind="bc",
-            expected_metadata=self.provenance,
-            require_training_state=True,
-        )
-
-    def load_selection_state(self, path: str | Path) -> Mapping[str, object]:
-        """Load persisted best-policy selection state for resume-safe validation."""
-        metadata = self.checkpoint_store.load_metadata(Path(path))
-        state = metadata.get("selection_state", {})
-        if not isinstance(state, Mapping):
-            raise ValueError("BC checkpoint selection_state must be a mapping")
-        return state
-
-    def _prepare_model_inputs(self, batch: BCDecisionBatch) -> _PreparedBCBatch:
+    def _prepare_model_inputs(
+        self, batch: BCDecisionBatch, active: ActiveGames
+    ) -> tuple[PreparedDecision, Tensor, Tensor, Tensor, tuple[Tensor, ...]]:
         observations = batch.observations.to(self.device)
         context_action_mask = batch.context_action_mask.to(self.device)
         encoded = self.policy.encode(observations, context_action_mask)
-        local_tokens = self.policy.local_history_tokens(encoded)
+        # Build a local summary for every decision from its current tokens only.
+        # The target row is later reduced with its history; the local summary remains
+        # the snapshot used to populate history windows for other rows.
+        local_tokens = encoded.local_history_token
         target_indices = batch.target_indices.to(self.device)
         target_local_tokens = local_tokens[target_indices]
-        target_encoded = EncodedObs(
-            encoded.tokens[target_indices],
-            encoded.aux[target_indices],
-            encoded.numerical[target_indices],
-        )
+        target_encoded = encoded[target_indices]
         history_indices = batch.history_indices.to(self.device)
         history_mask = batch.history_mask.to(self.device)
         history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
-        history_age_ids = batch.history_age_ids.to(self.device)
-        series_context = self._series_history.prepare(
+        candidate_values, candidate_offsets = _expand_team_preview_orbits(
+            batch.candidate_values,
+            batch.candidate_offsets,
+            batch.observations.is_teampreview()[batch.target_indices],
+        )
+        window_tokens = window_history_tokens(batch.windows, target_local_tokens, local_tokens)
+        series_tokens, series_mask = prepare_series_context(
+            self._series_history,
+            active,
             batch.windows,
+            window_tokens,
             target_local_tokens,
-            self.policy.series.resample_single_game,
+            self.policy.series,
         )
-        return _PreparedBCBatch(
-            model_inputs=(
-                target_encoded,
-                batch.action_mask.to(self.device),
-                series_context.tokens,
-                series_context.mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
-            ),
-            history_updates=series_context.updates,
-        )
-
-    def _forward_batch(
-        self,
-        batch: BCDecisionBatch,
-    ) -> tuple[Tensor, Tensor, tuple[_BCHistoryUpdate, ...]]:
-        prepared = self._prepare_model_inputs(batch)
-        encoded, _, series_tokens, series_mask, history_tokens, history_mask, history_age_ids = (
-            prepared.model_inputs
-        )
-        reduced = self.policy.actor.reducer(
-            encoded.tokens,
-            series_tokens,
-            series_mask,
-            history_tokens,
-            history_mask,
-            history_age_ids,
+        memory = MemoryInputs(
+            series_tokens=series_tokens,
+            series_mask=series_mask,
+            history_tokens=history_tokens,
+            history_mask=history_mask,
         )
         return (
-            self.policy.actor.score_joint_candidates(
-                *prepared.model_inputs,
-                batch.candidate_values.to(self.device),
-                batch.candidate_offsets.to(self.device),
-            ),
-            self.policy.critic(reduced.cls),
-            prepared.history_updates,
+            self.policy.prepare(target_encoded, memory),
+            batch.action_mask.to(self.device),
+            candidate_values.to(self.device),
+            candidate_offsets.to(self.device),
+            window_tokens,
         )
 
-    def _greedy_actions(self, model_inputs: BCModelInputs) -> tuple[Tensor, Tensor]:
-        actions, log_probs, _, _ = self.policy.actor.greedy(*model_inputs)
-        return actions, log_probs
-
-    def _step_optimizer(self, loss_weight: float) -> bool:
-        if loss_weight <= 0:
-            raise ValueError("loss_weight must be positive before an optimizer step")
+    def _step_optimizer(self) -> float:
         self.scaler.unscale_(self.optimizer)
-        inverse_weight = 1.0 / loss_weight
-        for parameter in self.policy.parameters():
-            if parameter.grad is not None:
-                parameter.grad.mul_(inverse_weight)
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.policy.parameters(), self.config.max_grad_norm
+        )
         previous_scale = self.scaler.get_scale()
+        if not bool(torch.isfinite(grad_norm).item()):
+            LOGGER.warning(
+                "Non-finite BC gradient norm detected; discarding the accumulated update "
+                f"(loss scale={previous_scale:.0f})"
+            )
+            self.scaler.update()
+            raise FloatingPointError("BC update has non-finite gradients and was discarded")
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        if self.scaler.get_scale() < previous_scale:
+            raise FloatingPointError("BC update has non-finite gradients and was discarded")
         self.optimizer.zero_grad(set_to_none=True)
-        return self.scaler.get_scale() >= previous_scale
+        return float(grad_norm.item())
 
     def _backward_chunk(
         self,
         batch: BCDecisionBatch,
-        totals: dict[str, float | int],
-    ) -> float:
-        labels = batch.label_kind.to(self.device)
+        active: ActiveGames,
+        policy_weight: float,
+        effective_value_count: int,
+    ) -> Tensor:
+        """
+        Backpropagate one validated decision chunk and update running totals.
+
+        Arguments:
+          batch: Collated CPU batch containing one contiguous set of decisions.
+          active: Unfinished games of the current update.
+          policy_weight: Total policy label weight for the update.
+          effective_value_count: Total valid outcome count for the update.
+
+        Returns:
+          Detached policy-loss numerator. Gradients are accumulated for the update.
+        """
+        _validate_objective_inputs(
+            batch.candidate_values.size(0),
+            batch.candidate_offsets,
+            batch.label_kind,
+            batch.loss_mask,
+        )
+        candidate_values = batch.candidate_values
+        if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
+            raise ValueError("candidate_values must have shape (candidates, 2)")
+        if candidate_values.dtype != torch.long:
+            raise ValueError("candidate_values must use torch.long action ids")
+        if candidate_values.numel() and torch.any(
+            (candidate_values < 0) | (candidate_values >= self.policy.actor.act_size)
+        ):
+            raise ValueError("candidate action ids are outside the action contract")
         loss_mask = batch.loss_mask.to(self.device)
-        with autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            log_probs, value_predictions, history_updates = self._forward_batch(batch)
-        objective = compute_bc_objective(
-            log_probs,
-            batch.candidate_offsets.to(self.device),
-            labels,
-            loss_mask,
-        )
-        outcome = batch.outcome.to(self.device)
-        decision_index = batch.decision_index.to(self.device)
-        game_length = batch.game_length.to(self.device)
-        value_mask = batch.outcome_valid.to(self.device)
-        gamma = torch.as_tensor(self.config.gamma, device=self.device, dtype=outcome.dtype)
-        value_targets = (
-            torch.pow(gamma, (game_length - 1 - decision_index).to(outcome.dtype)) * outcome
-        )
+        with self.precision.autocast_context(self.device):
+            prepared, action_mask, candidate_values, candidate_offsets, window_tokens = (
+                self._prepare_model_inputs(batch, active)
+            )
+            log_probs = self.policy.score_candidates(
+                prepared,
+                action_mask,
+                candidate_values,
+                candidate_offsets,
+                validated=True,
+            )
+            value_predictions = self.policy.critic(prepared.reduced.cls)
+        log_probs = log_probs.float()
+        value_predictions = value_predictions.float()
+        marginal_log_probs = _ragged_logsumexp(log_probs, candidate_offsets)
+        policy_sum, batch_policy_weight = _policy_loss_sum(marginal_log_probs, loss_mask)
+        value_targets, value_mask = _prepare_value_targets(batch, self.device, self._gamma)
         value_error = value_predictions - value_targets
-        value_count = int(value_mask.sum().item())
-        value_loss = (
-            value_error.square()[value_mask].mean()
-            if value_count
+        batch_value_count = int(batch.outcome_valid.sum())
+        value_sum = (
+            value_error.square()[value_mask].sum()
+            if batch_value_count
             else value_predictions.sum() * 0.0
         )
-        policy_sum = objective.loss * objective.loss_weight
-        policy_loss = policy_sum / max(objective.loss_weight, 1.0)
-        loss_weight = max(objective.loss_weight, float(value_count))
-        total_loss = (policy_loss + self.config.value_coef * value_loss) * loss_weight
-        if not torch.isfinite(total_loss):
-            raise ValueError("Non-finite BC loss in a collated decision batch")
-        if objective.labeled_count or value_count:
+        policy_term = policy_sum / policy_weight if policy_weight else policy_sum * 0.0
+        value_term = value_sum / effective_value_count if effective_value_count else value_sum * 0.0
+        total_loss = policy_term + self.config.value_coef * value_term
+        if batch_policy_weight or batch_value_count:
+            if not bool(torch.isfinite(total_loss).item()):
+                raise FloatingPointError("BC update has a non-finite loss and was discarded")
             self.scaler.scale(total_loss).backward()
 
-        self._series_history.apply(history_updates)
-        # Keep the reported policy NLL independent from the auxiliary value loss;
-        # the optimizer still receives their weighted sum above.
-        totals["loss"] += policy_sum.detach().item()
-        totals["loss_weight"] += objective.loss_weight
-        totals["exact_nll"] += objective.exact_nll.detach().item() * objective.exact_count
-        totals["partial_nll"] += objective.partial_nll.detach().item() * objective.partial_count
-        totals["decisions"] += batch.decisions
-        totals["labeled_decisions"] += objective.labeled_count
-        totals["exact_decisions"] += objective.exact_count
-        totals["partial_decisions"] += objective.partial_count
-        totals["games"] += batch.completed_game_count
-        totals.setdefault("value_loss", 0.0)
-        totals.setdefault("value_decisions", 0)
-        totals["value_loss"] += value_loss.detach().item() * value_count
-        totals["value_decisions"] += value_count
-        return loss_weight
+        commit_history_updates(self._series_history, active, batch.windows, window_tokens)
+        return policy_sum.detach()
 
     @torch.inference_mode()
     def evaluate(
@@ -378,75 +400,62 @@ class BCTrainer:
         source = self.dataset if dataset is None else dataset
         accumulator = _BCEvaluationAccumulator.create(self.device)
         chunk_size = min(self.batch_decisions, self.config.max_chunk_size)
+        active: ActiveGames = {}
 
-        for batch in collate_bc_batches(source, chunk_size):
-            prepared = self._prepare_model_inputs(batch)
-            model_inputs = prepared.model_inputs
-            candidate_offsets = batch.candidate_offsets.to(self.device)
-            candidate_log_probs = self.policy.actor.score_joint_candidates(
-                *model_inputs,
-                batch.candidate_values.to(self.device),
-                candidate_offsets,
-            )
-            (
-                encoded,
-                _,
-                series_tokens,
-                series_mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
-            ) = model_inputs
-            reduced = self.policy.actor.reducer(
-                encoded.tokens,
-                series_tokens,
-                series_mask,
-                history_tokens,
-                history_mask,
-                history_age_ids,
-            )
-            value_predictions = self.policy.critic(reduced.cls)
-            outcome = batch.outcome.to(self.device)
-            decision_index = batch.decision_index.to(self.device)
-            game_length = batch.game_length.to(self.device)
-            value_mask = batch.outcome_valid.to(self.device)
-            gamma = torch.as_tensor(self.config.gamma, device=self.device, dtype=outcome.dtype)
-            value_targets = (
-                torch.pow(gamma, (game_length - 1 - decision_index).to(outcome.dtype)) * outcome
-            )
-            validated_masks = _validate_objective_inputs(
-                candidate_log_probs.numel(),
-                batch.candidate_offsets,
-                batch.label_kind,
-                batch.loss_mask,
-            )
-            masks = tuple(mask.to(self.device) for mask in validated_masks)
-            marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
-            safe_nll = torch.where(
-                torch.isfinite(marginal_nll),
-                marginal_nll,
-                torch.zeros_like(marginal_nll),
-            )
-            predicted, best_scores = self._greedy_actions(model_inputs)
-            accumulator.add(
-                batch,
-                candidate_offsets=candidate_offsets,
-                masks=masks,  # pyright: ignore[reportArgumentType]
-                marginal_nll=marginal_nll,
-                safe_nll=safe_nll,
-                predicted=predicted,
-                best_scores=best_scores,
-            )
-            accumulator.add_value(value_predictions, value_targets, value_mask)
-            self._series_history.apply(prepared.history_updates)
+        try:
+            for batch in collate_bc_batches(source, chunk_size):
+                validated_masks = _validate_objective_inputs(
+                    batch.candidate_values.size(0),
+                    batch.candidate_offsets,
+                    batch.label_kind,
+                    batch.loss_mask,
+                )
+                (
+                    prepared,
+                    action_mask,
+                    candidate_values,
+                    candidate_offsets,
+                    window_tokens,
+                ) = self._prepare_model_inputs(batch, active)
+                candidate_log_probs = self.policy.score_candidates(
+                    prepared,
+                    action_mask,
+                    candidate_values,
+                    candidate_offsets,
+                    validated=True,
+                ).float()
+                value_predictions = self.policy.critic(prepared.reduced.cls).float()
+                accumulator.add_legality(
+                    self.policy.unmasked_first_slot_logits(prepared),
+                    action_mask,
+                    prepared.encoded.numerical,
+                )
+                value_targets, value_mask = _prepare_value_targets(batch, self.device, self._gamma)
+                masks = tuple(mask.to(self.device) for mask in validated_masks)
+                marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
+                greedy = self.policy.act(prepared, action_mask, deterministic=True)
+                accumulator.add(
+                    exact_actions=batch.exact_action.to(self.device),
+                    masks=masks,  # pyright: ignore[reportArgumentType]
+                    marginal_nll=marginal_nll,
+                    predicted=greedy.actions,
+                    best_scores=greedy.log_probs,
+                    team_preview=prepared.encoded.phase,
+                )
+                accumulator.add_value(value_predictions, value_targets, value_mask)
+                commit_history_updates(self._series_history, active, batch.windows, window_tokens)
 
-        self._series_history.clear()
-        return accumulator.finalize()
+            metrics = accumulator.finalize()
+        finally:
+            self._series_history.clear()
+
+        if metrics.non_finite_values:
+            raise FloatingPointError("BC evaluation contains non-finite predictions or values")
+        return metrics
 
 
 __all__ = [
     "BCCancelled",
-    "BCBatchDataset",
     "BCDecisionBatch",
     "BCEvaluationMetrics",
     "BCGameWindow",

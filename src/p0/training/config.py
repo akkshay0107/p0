@@ -1,5 +1,8 @@
 """Typed, immutable application configuration loaded from YAML."""
 
+from __future__ import annotations
+
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
@@ -12,28 +15,36 @@ from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS, ProjectPaths
 
 
-def _positive_ints(owner: str, *values: tuple[str, object]) -> None:
-    for name, value in values:
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError(f"{owner}.{name} must be a positive integer")
+def _positive_ints(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            raise ValueError(f"{type(obj).__name__}.{name} must be a positive integer")
 
 
-def _positive(owner: str, *values: tuple[str, float]) -> None:
-    for name, value in values:
-        if value <= 0:
-            raise ValueError(f"{owner}.{name} must be greater than zero")
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _non_negative(owner: str, *values: tuple[str, float]) -> None:
-    for name, value in values:
-        if value < 0:
-            raise ValueError(f"{owner}.{name} must not be negative")
+def _positive(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not _is_finite_number(val) or val <= 0:
+            raise ValueError(f"{type(obj).__name__}.{name} must be greater than zero")
 
 
-def _unit_interval(owner: str, *values: tuple[str, float]) -> None:
-    for name, value in values:
-        if not 0 <= value <= 1:
-            raise ValueError(f"{owner}.{name} must be between 0 and 1")
+def _non_negative(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not _is_finite_number(val) or val < 0:
+            raise ValueError(f"{type(obj).__name__}.{name} must not be negative")
+
+
+def _unit_interval(obj: object, *names: str) -> None:
+    for name in names:
+        val = getattr(obj, name)
+        if not _is_finite_number(val) or not 0 <= val <= 1:
+            raise ValueError(f"{type(obj).__name__}.{name} must be between 0 and 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,65 +55,47 @@ class TrainingConfig:
     batch_size: int = 128
     minibatch_size: int = 32
     gamma: float = 0.99
-    gae_lambda: float = 0.97
-    clip_low: float = 0.2
-    clip_high: float = 0.28
-    lr: float = 6e-5
-    value_coef: float = 0.05
+    gae_lambda: float = 0.95
+    clip_range: float = 0.2
+    lr: float = 3e-4
+    value_coef: float = 0.5
     magnet_alpha: float = 0.03
     magnet_refresh_interval: int = 20
-    residual_entropy_coef: float = 0.0
-    max_grad_norm: float = 1.0
-    target_kl: float = 0.015
-    ppo_epochs: int = 6
-    teampreview_loss_mult: float = 1.5
-    teampreview_alpha_mult: float = 2.0
+    entropy_coef: float = 0.01
+    max_grad_norm: float = 0.5
+    target_kl: float = 0.01
+    ppo_epochs: int = 10
     enable_optim: bool = True
     seed: int = 0
     ramp_up_phase: float = 0.1
 
     def __post_init__(self) -> None:
         _positive_ints(
-            type(self).__name__,
-            ("num_episodes", self.num_episodes),
-            ("n_envs", self.n_envs),
-            ("rollout_steps", self.rollout_steps),
-            ("batch_size", self.batch_size),
-            ("minibatch_size", self.minibatch_size),
-            ("ppo_epochs", self.ppo_epochs),
-            ("magnet_refresh_interval", self.magnet_refresh_interval),
+            self,
+            "num_episodes",
+            "n_envs",
+            "rollout_steps",
+            "batch_size",
+            "minibatch_size",
+            "ppo_epochs",
+            "magnet_refresh_interval",
         )
-
-        _unit_interval(
-            type(self).__name__,
-            ("gamma", self.gamma),
-            ("gae_lambda", self.gae_lambda),
-            ("ramp_up_phase", self.ramp_up_phase),
-        )
+        _unit_interval(self, "gamma", "gae_lambda", "ramp_up_phase")
         if self.gamma >= 1.0:
             raise ValueError("TrainingConfig.gamma must be less than 1")
 
         _non_negative(
-            type(self).__name__,
-            ("clip_low", self.clip_low),
-            ("clip_high", self.clip_high),
-            ("value_coef", self.value_coef),
-            ("magnet_alpha", self.magnet_alpha),
-            ("residual_entropy_coef", self.residual_entropy_coef),
-            ("target_kl", self.target_kl),
+            self,
+            "clip_range",
+            "value_coef",
+            "magnet_alpha",
+            "entropy_coef",
+            "target_kl",
         )
-
-        _positive(
-            type(self).__name__,
-            ("lr", self.lr),
-            ("max_grad_norm", self.max_grad_norm),
-            ("teampreview_loss_mult", self.teampreview_loss_mult),
-            ("teampreview_alpha_mult", self.teampreview_alpha_mult),
-        )
+        _positive(self, "lr", "max_grad_norm")
 
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("training.seed must be a nonnegative integer")
-
         if not 0.0 < self.ramp_up_phase < 1.0:
             raise ValueError("training.ramp_up_phase must be strictly between 0 and 1")
 
@@ -111,7 +104,6 @@ class TrainingConfig:
             raise ValueError(
                 "training.ramp_up_phase must produce an endpoint before the final episode"
             )
-
         if self.magnet_refresh_interval > self.num_episodes:
             raise ValueError(
                 "training.magnet_refresh_interval must not exceed training.num_episodes"
@@ -119,97 +111,77 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class TeamSourceConfig:
-    path: Path = Path("all")
+class TeamsConfig:
+    all: Path = Path("all")
+    reduced: Path = Path("reduced")
 
     def __post_init__(self) -> None:
-        if not str(self.path).strip():
-            raise ValueError("TeamSourceConfig.path must not be empty")
-
-
-@dataclass(frozen=True, slots=True)
-class EnvironmentConfig:
-    agent_team_source: TeamSourceConfig = TeamSourceConfig()
-    opponent_team_source: TeamSourceConfig = TeamSourceConfig()
+        for name, path in (("all", self.all), ("reduced", self.reduced)):
+            if not str(path).strip():
+                raise ValueError(f"teams.{name} must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
 class BotConfig:
     username: str = "Bot"
     password: str | None = None
-    battle_format: str = FORMAT.battle_format
+    battle_format: str = FORMAT.bo3_format
     websocket_url: str | None = None
     authentication_url: str | None = None
     checkpoint_path: Path | None = None
     team_files: tuple[Path, ...] = ()
     top_p: float = 0.9
-    max_concurrent_battles: int = 10
+    max_concurrent_battles: int = 1
     challenge_limit: int = 1_000_000
     opponent: str | None = None
-    accept_open_team_sheet: bool = True
     allow_random_init: bool = False
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
-        if self.battle_format != FORMAT.battle_format:
-            raise ValueError(
-                f"bot.battle_format must match configured format {FORMAT.battle_format!r}"
-            )
+        if not isinstance(self.team_files, tuple):
+            object.__setattr__(self, "team_files", tuple(self.team_files))
+
+        if self.battle_format != FORMAT.bo3_format:
+            raise ValueError(f"bot.battle_format must be the Bo3 format {FORMAT.bo3_format!r}")
 
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError("bot.top_p must be in (0, 1]")
 
+        if type(self.max_concurrent_battles) is not int or self.max_concurrent_battles != 1:
+            raise ValueError("bot.max_concurrent_battles is fixed at 1 for live Bo3 play")
 
-# The bc, corpus, and evaluation sections are reserved here so their
-# workstreams only ever touch their own dataclass's field list; adding a new
-# root section requires editing GlobalConfig and load_config in one place.
+
 @dataclass(frozen=True, slots=True)
 class BCConfig:
     batch_decisions: int = 256
     max_chunk_size: int = 1024
     learning_rate: float = 3e-4
-    # These objective settings are copied from TrainingConfig when the full
-    # application configuration is built; BC and PPO must share them.
     gamma: float = 0.99
-    value_coef: float = 0.05
+    value_coef: float = 0.5
     epochs: int = 1
-    # BC history state is chronological across shards; multiprocessing remains
-    # opt-in until an order-preserving prefetcher is available.
     num_workers: int = 0
     prefetch_factor: int = 2
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     seed: int = 0
-    amp: bool = True
+    enable_optim: bool = True
     shard_manifest: Path = Path("artifacts/shards/manifest.json")
     split_manifest: Path = Path("artifacts/shards/splits.json")
     output_dir: Path = Path("artifacts/checkpoints/bc")
     resume_checkpoint: Path | None = None
 
     def __post_init__(self) -> None:
-        _positive_ints(
-            type(self).__name__,
-            ("batch_decisions", self.batch_decisions),
-            ("max_chunk_size", self.max_chunk_size),
-            ("epochs", self.epochs),
-        )
-
+        _positive_ints(self, "batch_decisions", "max_chunk_size", "epochs")
         if self.num_workers < 0:
             raise ValueError("bc.num_workers must be non-negative")
-
         if self.prefetch_factor <= 0:
             raise ValueError("bc.prefetch_factor must be positive")
 
-        _positive(type(self).__name__, ("learning_rate", self.learning_rate))
-        _unit_interval(type(self).__name__, ("gamma", self.gamma))
+        _positive(self, "learning_rate", "max_grad_norm")
+        _unit_interval(self, "gamma")
         if self.gamma >= 1.0:
             raise ValueError("BCConfig.gamma must be less than 1")
-        _non_negative(
-            type(self).__name__,
-            ("value_coef", self.value_coef),
-            ("weight_decay", self.weight_decay),
-        )
-        _positive(type(self).__name__, ("max_grad_norm", self.max_grad_norm))
+        _non_negative(self, "value_coef", "weight_decay")
 
         if type(self.seed) is not int:
             raise ValueError("bc.seed must be an integer")
@@ -224,41 +196,14 @@ class BCConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class CorpusConfig:
-    manifest_path: Path = Path("teams/corpus_manifest.json")
-    agent_split: str = "train"
-    sampling_policy: str = "usage_weighted"
-
-    def __post_init__(self) -> None:
-        for name, value in (
-            ("manifest_path", str(self.manifest_path)),
-            ("agent_split", self.agent_split),
-            ("sampling_policy", self.sampling_policy),
-        ):
-            if not value.strip():
-                raise ValueError(f"corpus.{name} must not be empty")
-
-        if self.agent_split.upper() not in {"TRAIN", "VALIDATION", "TEST"}:
-            raise ValueError("corpus.agent_split must be train, validation, or test")
-
-        if self.sampling_policy.upper() not in {
-            "USAGE_WEIGHTED",
-            "UNIFORM_CANONICAL",
-            "UNIFORM_ARCHETYPE",
-            "RARE_COVERAGE",
-        }:
-            raise ValueError("corpus.sampling_policy is not supported")
-
-
-@dataclass(frozen=True, slots=True)
 class EvalConfig:
     episodes_per_matchup: int = 20
     seed: int = 0
     report_dir: Path = Path("artifacts/eval")
 
     def __post_init__(self) -> None:
-        _positive_ints(type(self).__name__, ("episodes_per_matchup", self.episodes_per_matchup))
-        _non_negative(type(self).__name__, ("seed", self.seed))
+        _positive_ints(self, "episodes_per_matchup")
+        _non_negative(self, "seed")
 
         if not str(self.report_dir).strip():
             raise ValueError("evaluation.report_dir must not be empty")
@@ -268,10 +213,9 @@ class EvalConfig:
 class GlobalConfig:
     training: TrainingConfig = TrainingConfig()
     paths: ProjectPaths = DEFAULT_PATHS
-    environment: EnvironmentConfig = EnvironmentConfig()
+    teams: TeamsConfig = TeamsConfig()
     bot: BotConfig = BotConfig()
     bc: BCConfig = BCConfig()
-    corpus: CorpusConfig = CorpusConfig()
     evaluation: EvalConfig = EvalConfig()
 
     def __post_init__(self) -> None:
@@ -286,117 +230,55 @@ def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root)
     return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
+def _resolve_fields(section: Any, base: Path, path_field_names: set[str]) -> Any:
+    """Return the config section with its set path fields resolved against base."""
+    updates = {
+        name: _resolve_path(value, base)
+        for name in path_field_names
+        if (value := getattr(section, name)) is not None
+    }
+    return replace(section, **updates)
+
+
 def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
-    repository_root = _resolve_path(config.paths.repository_root)
-    paths = replace(
-        config.paths,
-        repository_root=repository_root,
-        data_root=_resolve_path(config.paths.data_root, repository_root),
-        teams_root=_resolve_path(config.paths.teams_root, repository_root),
-        artifacts_root=_resolve_path(config.paths.artifacts_root, repository_root),
-        showdown_root=_resolve_path(config.paths.showdown_root, repository_root),
-        gauntlet_dir=_resolve_path(config.paths.gauntlet_dir, repository_root),
-        checkpoint_path=_resolve_path(config.paths.checkpoint_path, repository_root),
-        runs_dir=_resolve_path(config.paths.runs_dir, repository_root),
-        replays_dir=_resolve_path(config.paths.replays_dir, repository_root),
-        backups_dir=_resolve_path(config.paths.backups_dir, repository_root),
-        log_path=_resolve_path(config.paths.log_path, repository_root),
-        resume_checkpoint=(
-            None
-            if config.paths.resume_checkpoint is None
-            else _resolve_path(config.paths.resume_checkpoint, repository_root)
-        ),
-        initial_policy_checkpoint=(
-            None
-            if config.paths.initial_policy_checkpoint is None
-            else _resolve_path(config.paths.initial_policy_checkpoint, repository_root)
-        ),
-    )
+    root = _resolve_path(config.paths.repository_root)
+    path_fields = {f.name for f in fields(ProjectPaths)}
+    paths = _resolve_fields(config.paths, root, path_fields)
     bot = replace(
         config.bot,
         checkpoint_path=(
-            None
-            if config.bot.checkpoint_path is None
-            else _resolve_path(config.bot.checkpoint_path, repository_root)
+            _resolve_path(config.bot.checkpoint_path, root)
+            if config.bot.checkpoint_path is not None
+            else None
         ),
-        team_files=tuple(_resolve_path(path, repository_root) for path in config.bot.team_files),
+        team_files=tuple(_resolve_path(p, root) for p in config.bot.team_files),
     )
-    environment = replace(
-        config.environment,
-        agent_team_source=replace(
-            config.environment.agent_team_source,
-            path=_resolve_path(config.environment.agent_team_source.path, paths.teams_root),
-        ),
-        opponent_team_source=replace(
-            config.environment.opponent_team_source,
-            path=_resolve_path(config.environment.opponent_team_source.path, paths.teams_root),
-        ),
-    )
-    bc = replace(
+    teams = _resolve_fields(config.teams, paths.teams_root, {"all", "reduced"})
+    bc = _resolve_fields(
         config.bc,
-        shard_manifest=_resolve_path(config.bc.shard_manifest, repository_root),
-        split_manifest=_resolve_path(config.bc.split_manifest, repository_root),
-        output_dir=_resolve_path(config.bc.output_dir, repository_root),
-        resume_checkpoint=(
-            None
-            if config.bc.resume_checkpoint is None
-            else _resolve_path(config.bc.resume_checkpoint, repository_root)
-        ),
+        root,
+        {"shard_manifest", "split_manifest", "output_dir", "resume_checkpoint"},
     )
-    corpus = replace(
-        config.corpus,
-        manifest_path=_resolve_path(config.corpus.manifest_path, repository_root),
-    )
-    evaluation = replace(
-        config.evaluation,
-        report_dir=_resolve_path(config.evaluation.report_dir, repository_root),
-    )
+    evaluation = _resolve_fields(config.evaluation, root, {"report_dir"})
 
-    return replace(
-        config,
-        paths=paths,
-        bot=bot,
-        environment=environment,
-        bc=bc,
-        corpus=corpus,
-        evaluation=evaluation,
-    )
+    return replace(config, paths=paths, bot=bot, teams=teams, bc=bc, evaluation=evaluation)
 
 
-def _build_section(cls: type, values: Any, *, bot: bool = False) -> Any:
+def _build_section(cls: type, values: Any) -> Any:
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} must be a mapping")
 
     names = {field.name for field in fields(cls)}
     unknown = set(values) - names
     if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unknown {cls.__name__} field(s): {names}")
-
-    values = dict(values)
-    if bot:
-        values["team_files"] = tuple(values["team_files"])
+        names_str = ", ".join(sorted(unknown))
+        raise ValueError(f"unknown {cls.__name__} field(s): {names_str}")
 
     return cls(**values)
 
 
-def _build_environment(values: Any) -> EnvironmentConfig:
-    if not isinstance(values, Mapping):
-        raise ValueError("EnvironmentConfig must be a mapping")
-
-    names = {field.name for field in fields(EnvironmentConfig)}
-    unknown = set(values) - names
-    if unknown:
-        raise ValueError(f"unknown EnvironmentConfig field(s): {', '.join(sorted(unknown))}")
-
-    return EnvironmentConfig(
-        agent_team_source=_build_section(TeamSourceConfig, values["agent_team_source"]),
-        opponent_team_source=_build_section(TeamSourceConfig, values["opponent_team_source"]),
-    )
-
-
 def load_config(config_path: str | Path | None = None) -> GlobalConfig:
-    """Load required ``config.yaml`` and apply its values to source defaults."""
+    """Load configuration from config.yaml and merge with source defaults."""
     path = (
         DEFAULT_PATHS.repository_root / "config.yaml" if config_path is None else Path(config_path)
     )
@@ -439,10 +321,9 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
         config = GlobalConfig(
             training=training,
             paths=_build_section(ProjectPaths, values["paths"]),
-            environment=_build_environment(values["environment"]),
-            bot=_build_section(BotConfig, values["bot"], bot=True),
+            teams=_build_section(TeamsConfig, values["teams"]),
+            bot=_build_section(BotConfig, values["bot"]),
             bc=_build_section(BCConfig, bc_values),
-            corpus=_build_section(CorpusConfig, values["corpus"]),
             evaluation=_build_section(EvalConfig, values["evaluation"]),
         )
         return _resolve_paths(config)

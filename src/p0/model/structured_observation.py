@@ -1,25 +1,33 @@
-"""Structured tensor observation schema shared by encode, rollouts, and evaluation.
+"""
+Structured tensor observation schema shared by encode, rollouts, and evaluation.
 
-Defines the fixed categorical/numerical/sequence layout of ``StructuredObservation``, the
-``ActionMasker`` helpers, and the observer-facing indices used across the model and runtime.
+Defines the categorical, numerical, and event tensor layout, validation helpers,
+and shared feature indices used by the model and runtime.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 
+from p0.battle.events import (
+    EVENT_CATEGORICAL_WIDTH,
+    EVENT_NUMERICAL_WIDTH,
+    MAX_EVENT_RECORDS,
+    EffectNamespace,
+    EventDetail,
+    EventKind,
+    EventPosition,
+    EventRecord,
+)
+from p0.format_config import active_global_contract, canonical_json_sha256
 from p0.model.architecture_contract import (
     OBSERVATION_ENTITY_COUNT,
-    OBSERVATION_SCHEMA_VERSION,
-    RAW_EVENT_COUNT,
     SELF_TARGET_SENTINEL,
 )
-
-__all__ = ["OBSERVATION_SCHEMA_VERSION"]
 
 # every entity (Pokemon, global field, ally side, opponent side) is one
 # fused token; its categorical and numerical features live on the same row index.
@@ -27,43 +35,52 @@ TEAM_SIZE = 6
 MOVE_SLOTS = 4
 MAX_EFFECTS = 12
 SEQUENCE_LENGTH = OBSERVATION_ENTITY_COUNT
-POKEMON_IDENTITY_WIDTH = 25
+POKEMON_IDENTITY_WIDTH = 19
 CAT_IDX_STATUS = 17
-CAT_KNOWNNESS_START = 25
-CAT_KNOWNNESS_WIDTH = POKEMON_IDENTITY_WIDTH
-CAT_IDX_STATUS_COUNTER_KIND = CAT_KNOWNNESS_START + CAT_KNOWNNESS_WIDTH
-CAT_EFFECT_START = CAT_IDX_STATUS_COUNTER_KIND + 1
+CAT_IDX_NATURE = 18
+CAT_IDX_STATUS_COUNTER_KIND = 19
+CAT_IDX_IDENTITY_KNOWNNESS = 20
+CAT_IDX_STAT_PROVENANCE = 21
+CAT_IDX_PRESENCE_STATUS = 22
+CAT_IDX_MECHANIC_STATE = 23
+CAT_EFFECT_START = 24
 EFFECT_CATEGORICAL_WIDTH = 3
 CATEGORICAL_WIDTH = CAT_EFFECT_START + MAX_EFFECTS * EFFECT_CATEGORICAL_WIDTH
 
-NUM_BASE_WIDTH = 56
-NUM_PROVENANCE_START = NUM_BASE_WIDTH
-NUM_PROVENANCE_WIDTH = 8
-NUM_EFFECT_START = NUM_PROVENANCE_START + NUM_PROVENANCE_WIDTH
+NUM_BASE_WIDTH = 54
+NUM_EFFECT_START = NUM_BASE_WIDTH
 EFFECT_NUMERICAL_WIDTH = 5
 NUM_IDX_EFFECT_COUNT = NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
 NUM_IDX_EFFECT_OVERFLOW = NUM_IDX_EFFECT_COUNT + 1
 NUMERICAL_WIDTH = NUM_IDX_EFFECT_OVERFLOW + 1
 
-EVENT_COUNT = RAW_EVENT_COUNT
-EVENT_CATEGORICAL_WIDTH = 10
-EVENT_NUMERICAL_WIDTH = 2
-EVENT_METADATA_WIDTH = 2
-EVENT_ORDER_VOCAB_SIZE = EVENT_COUNT + 1
-
 TOKEN_IDX_GLOBAL_FIELD = 12
 TOKEN_IDX_ALLY_SIDE = 13
 TOKEN_IDX_OPPONENT_SIDE = 14
 
+# 0-4: one-hot slot condition, offset by one so -1 (a reserve the player did not
+# bring) fits. Index 1 doubles as unknown: an empty row, or a replay row whose
+# team selection is not public yet.
+NUM_IDX_SLOT_CONDITION = 0
+NUM_IDX_SLOT_CONDITION_UNKNOWN = 1
 NUM_IDX_TEAM_PREVIEW = 2
+NUM_IDX_HP_FRACTION = 5
 NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction (MoveRecord dynamic)
 NUM_IDX_ORIG_IDX_RATIO = 26
 NUM_IDX_FAINTED = 27
-NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot "was the last move used" (MoveRecord dynamic)
+NUM_IDX_CAN_MEGA = 30  # active allies only, request-derived like the legality columns
+NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot was the last move used (MoveRecord dynamic)
 NUM_IDX_STATUS_COUNTER = 36  # StatusRecord dynamic (turns asleep / toxic stage)
-NUM_IDX_MOVE_LEGAL = 50  # 50-53: per-move-slot "legal this step" (MoveRecord dynamic)
-NUM_IDX_CAN_SWITCH_OUT = 54  # active allies only
-NUM_IDX_REVEALED = 55  # has appeared on the field this battle
+NUM_IDX_PREPARING = 37
+NUM_IDX_LEVEL_STATS = 38  # 38-43: level-50 derived stats
+NUM_IDX_STAT_PROVENANCE = 44
+NUM_IDX_MOVE_LEGAL = 45  # 45-48: per-move-slot legal this step (MoveRecord dynamic)
+NUM_IDX_CAN_SWITCH_OUT = 49  # active allies only
+NUM_IDX_REVEALED = 50  # has appeared on the field this battle
+# Legality flags. When a data source cannot determine legality (such as a public
+# replay without requests), it sets these flags to distinguish unknown actions from illegal actions.
+NUM_IDX_LEGALITY_UNKNOWN = 51  # this row's move-legal / can-switch-out / can-mega are unproven
+NUM_IDX_SLOT_LEGALITY_UNKNOWN = 52  # 52-53: per-active-slot gate, ally side token only
 
 
 ALLY_POKE_TOKENS = (0, 1, 2, 3, 4, 5)
@@ -85,29 +102,32 @@ class SideId(IntEnum):
     OPPONENT = 2
 
 
-class Knownness(IntEnum):
+class IdentityKnownness(IntEnum):
     PAD = 0
     UNKNOWN = 1
-    KNOWN_NONE = 2
+    KNOWN = 2
+    OOV = 3
+
+
+class StatProvenance(IntEnum):
+    PAD = 0
+    UNKNOWN = 1
+    IMPUTED = 2
     KNOWN = 3
-    OOV = 4
 
 
-class Provenance(IntEnum):
+class PresenceStatus(IntEnum):
     PAD = 0
-    UNKNOWN = 1
-    OBSERVED = 2
-    OPEN_TEAM_SHEET = 3
-    SELF_KNOWN = 4
-    IMPUTED = 5
+    ACTIVE = 1
+    BENCH_REVEALED = 2
+    RESERVE_UNCONFIRMED = 3
+    UNBROUGHT_CONFIRMED = 4
 
 
-class EffectNamespace(IntEnum):
-    NONE = 0
-    POKEMON = 1
-    SIDE = 2
-    FIELD = 3
-    WEATHER = 4
+class MechanicState(IntEnum):
+    NORMAL = 0
+    ILLUSION_DISGUISED = 1
+    TRANSFORMED = 2
 
 
 class CounterKind(IntEnum):
@@ -116,6 +136,95 @@ class CounterKind(IntEnum):
     ACTION_COUNT = 2
     STACK_COUNT = 3
     KNOWN_REMAINING = 4
+
+
+def _observation_layout_descriptor() -> dict[str, object]:
+    """Return observation layout metadata to verify manifest compatibility."""
+    return {
+        "team_size": TEAM_SIZE,
+        "move_slots": MOVE_SLOTS,
+        "max_effects": MAX_EFFECTS,
+        "sequence_length": SEQUENCE_LENGTH,
+        "pokemon_identity_width": POKEMON_IDENTITY_WIDTH,
+        "categorical": {
+            "status": CAT_IDX_STATUS,
+            "nature": CAT_IDX_NATURE,
+            "status_counter_kind": CAT_IDX_STATUS_COUNTER_KIND,
+            "identity_knownness": CAT_IDX_IDENTITY_KNOWNNESS,
+            "stat_provenance": CAT_IDX_STAT_PROVENANCE,
+            "presence_status": CAT_IDX_PRESENCE_STATUS,
+            "mechanic_state": CAT_IDX_MECHANIC_STATE,
+            "effect_start": CAT_EFFECT_START,
+            "effect_width": EFFECT_CATEGORICAL_WIDTH,
+            "width": CATEGORICAL_WIDTH,
+        },
+        "numerical": {
+            "base_width": NUM_BASE_WIDTH,
+            "effect_start": NUM_EFFECT_START,
+            "effect_width": EFFECT_NUMERICAL_WIDTH,
+            "effect_count": NUM_IDX_EFFECT_COUNT,
+            "effect_overflow": NUM_IDX_EFFECT_OVERFLOW,
+            "width": NUMERICAL_WIDTH,
+        },
+        "spatial_events": {
+            "count": MAX_EVENT_RECORDS,
+            "categorical_width": EVENT_CATEGORICAL_WIDTH,
+            "categorical_fields": EventRecord._fields[:EVENT_CATEGORICAL_WIDTH],
+            "numerical_width": EVENT_NUMERICAL_WIDTH,
+        },
+        "tokens": {
+            "global_field": TOKEN_IDX_GLOBAL_FIELD,
+            "ally_side": TOKEN_IDX_ALLY_SIDE,
+            "opponent_side": TOKEN_IDX_OPPONENT_SIDE,
+            "ally_pokemon": ALLY_POKE_TOKENS,
+            "opponent_pokemon": OPPONENT_POKE_TOKENS,
+            "target_sequence": TARGET_SEQ_INDICES,
+        },
+        "numerical_indices": {
+            "slot_condition": NUM_IDX_SLOT_CONDITION,
+            "slot_condition_unknown": NUM_IDX_SLOT_CONDITION_UNKNOWN,
+            "team_preview": NUM_IDX_TEAM_PREVIEW,
+            "hp_fraction": NUM_IDX_HP_FRACTION,
+            "move_pp": NUM_IDX_MOVE_PP,
+            "orig_idx_ratio": NUM_IDX_ORIG_IDX_RATIO,
+            "fainted": NUM_IDX_FAINTED,
+            "can_mega": NUM_IDX_CAN_MEGA,
+            "move_last": NUM_IDX_MOVE_LAST,
+            "status_counter": NUM_IDX_STATUS_COUNTER,
+            "preparing": NUM_IDX_PREPARING,
+            "level_stats": NUM_IDX_LEVEL_STATS,
+            "stat_provenance": NUM_IDX_STAT_PROVENANCE,
+            "move_legal": NUM_IDX_MOVE_LEGAL,
+            "can_switch_out": NUM_IDX_CAN_SWITCH_OUT,
+            "revealed": NUM_IDX_REVEALED,
+            "legality_unknown": NUM_IDX_LEGALITY_UNKNOWN,
+            "slot_legality_unknown": NUM_IDX_SLOT_LEGALITY_UNKNOWN,
+        },
+        "enum_encodings": {
+            key: {member.name.lower(): member.value for member in encoding}
+            for key, encoding in (
+                ("token_type", TokenType),
+                ("side_id", SideId),
+                ("identity_knownness", IdentityKnownness),
+                ("stat_provenance", StatProvenance),
+                ("presence_status", PresenceStatus),
+                ("mechanic_state", MechanicState),
+                ("effect_namespace", EffectNamespace),
+                ("counter_kind", CounterKind),
+                ("event_kind", EventKind),
+                ("event_position", EventPosition),
+                ("event_detail", EventDetail),
+            )
+        },
+    }
+
+
+_MODEL_CONTRACT = active_global_contract().payload("model", "major")
+if (
+    canonical_json_sha256(_observation_layout_descriptor())
+    != _MODEL_CONTRACT["observation_layout_sha256"]
+):
+    raise RuntimeError("Structured observation layout does not match the global model contract")
 
 
 def effect_cat_slice(index: int) -> slice:
@@ -141,36 +250,20 @@ class StructuredObservation:
     slot_ids: torch.Tensor
     categorical: torch.Tensor
     numerical: torch.Tensor
-    events_cat: torch.Tensor
-    events_num: torch.Tensor
-    events_side_ids: torch.Tensor
-    events_slot_ids: torch.Tensor
-    events_metadata: torch.Tensor
+    spatial_cat: torch.Tensor
+    spatial_num: torch.Tensor
 
-    _FIELD_NAMES: ClassVar[tuple[str, ...]] = (
-        "token_type_ids",
-        "side_ids",
-        "slot_ids",
-        "categorical",
-        "numerical",
-        "events_cat",
-        "events_num",
-        "events_side_ids",
-        "events_slot_ids",
-        "events_metadata",
-    )
     _FIELD_SPECS: ClassVar[tuple[tuple[str, tuple[int, ...], torch.dtype], ...]] = (
         ("token_type_ids", (SEQUENCE_LENGTH,), torch.long),
         ("side_ids", (SEQUENCE_LENGTH,), torch.long),
         ("slot_ids", (SEQUENCE_LENGTH,), torch.long),
         ("categorical", (SEQUENCE_LENGTH, CATEGORICAL_WIDTH), torch.long),
         ("numerical", (SEQUENCE_LENGTH, NUMERICAL_WIDTH), torch.float32),
-        ("events_cat", (EVENT_COUNT, EVENT_CATEGORICAL_WIDTH), torch.long),
-        ("events_num", (EVENT_COUNT, EVENT_NUMERICAL_WIDTH), torch.float32),
-        ("events_side_ids", (EVENT_COUNT,), torch.long),
-        ("events_slot_ids", (EVENT_COUNT,), torch.long),
-        ("events_metadata", (EVENT_METADATA_WIDTH,), torch.float32),
+        ("spatial_cat", (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH), torch.long),
+        ("spatial_num", (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH), torch.float32),
     )
+
+    _FIELD_NAMES: ClassVar[tuple[str, ...]] = tuple(name for name, _, _ in _FIELD_SPECS)
 
     @classmethod
     def _from_values(cls, values: list[torch.Tensor]) -> StructuredObservation:
@@ -185,37 +278,25 @@ class StructuredObservation:
             self.slot_ids,
             self.categorical,
             self.numerical,
-            self.events_cat,
-            self.events_num,
-            self.events_side_ids,
-            self.events_slot_ids,
-            self.events_metadata,
+            self.spatial_cat,
+            self.spatial_num,
         )
 
     def is_teampreview(self) -> torch.Tensor:
         return is_teampreview(self.numerical)
 
     def overflow_totals(self) -> tuple[int, int]:
-        """Return effect and event overflow counts for telemetry and corpus audits."""
+        """Return effect overflow counts for telemetry and corpus audits."""
         effect_overflow = int(self.numerical[..., NUM_IDX_EFFECT_OVERFLOW].sum().item())
-        event_overflow = int(self.events_metadata[..., 1].amax().item())
-        return effect_overflow, event_overflow
+        return effect_overflow, 0
 
     def validate_overflow_contract(self) -> None:
-        """Reject counts that imply silent effect or event truncation."""
+        """Reject counts that imply silent effect truncation."""
         counts = self.numerical[..., NUM_IDX_EFFECT_COUNT]
         overflow = self.numerical[..., NUM_IDX_EFFECT_OVERFLOW]
         expected = torch.clamp(counts - MAX_EFFECTS, min=0)
         if not torch.equal(overflow, expected):
             raise ValueError("Effect overflow does not match the number of dropped effects")
-        event_total = (self.events_cat[..., 0] != 0).sum(dim=-1)
-        declared_total = self.events_metadata[..., 0].to(event_total.dtype)
-        declared_overflow = self.events_metadata[..., 1].to(event_total.dtype)
-        expected_overflow = torch.clamp(declared_total - EVENT_COUNT, min=0)
-        if torch.any(declared_total < event_total) or not torch.equal(
-            declared_overflow, expected_overflow
-        ):
-            raise ValueError("Event metadata does not match the retained event records")
 
     def clone(self) -> StructuredObservation:
         return self._from_values([tensor.clone() for tensor in self.tensors()])
@@ -232,22 +313,33 @@ class StructuredObservation:
     def __getitem__(self, index) -> StructuredObservation:
         return self._from_values([tensor[index] for tensor in self.tensors()])
 
+    @classmethod
+    def _combine(
+        cls,
+        observations: list[StructuredObservation],
+        fn: Any,
+        dim: int,
+        empty_msg: str,
+    ) -> StructuredObservation:
+        if not observations:
+            raise ValueError(empty_msg)
+        return cls._from_values(
+            [
+                fn(list(col), dim=dim)
+                for col in zip(*(o.tensors() for o in observations), strict=True)
+            ]
+        )
+
     @staticmethod
     def cat(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
-        if not observations:
-            raise ValueError("Cannot concatenate an empty observation list")
-        columns = zip(*(observation.tensors() for observation in observations), strict=True)
-        return StructuredObservation._from_values(
-            [torch.cat(list(tensors), dim=dim) for tensors in columns]
+        return StructuredObservation._combine(
+            observations, torch.cat, dim, "Cannot concatenate an empty observation list"
         )
 
     @staticmethod
     def stack(observations: list[StructuredObservation], dim: int = 0) -> StructuredObservation:
-        if not observations:
-            raise ValueError("Cannot stack an empty observation list")
-        columns = zip(*(observation.tensors() for observation in observations), strict=True)
-        return StructuredObservation._from_values(
-            [torch.stack(list(tensors), dim=dim) for tensors in columns]
+        return StructuredObservation._combine(
+            observations, torch.stack, dim, "Cannot stack an empty observation list"
         )
 
     @staticmethod

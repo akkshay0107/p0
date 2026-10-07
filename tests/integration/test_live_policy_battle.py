@@ -1,152 +1,127 @@
-import asyncio
-import random
-from typing import cast
+from collections import Counter
 
-import numpy as np
 import pytest
 import torch
-from poke_env.battle import DoubleBattle
-from poke_env.player import RandomPlayer
 
+from p0.battle.actions import ACT_SIZE
 from p0.format_config import FORMAT
-from p0.model.config import ModelConfig
-from p0.model.factory import build_policy
-from p0.model.observation_builder import ObservationBuilder
-from p0.model.resources import default_runtime_resources
-from p0.rl_player import RLPlayer
-from p0.runtime import poke_env_patches
-from p0.teams.source import FixedTeamSource
-
-TEAM = """
-Pikachu @ Light Ball
-Ability: Static
-Level: 50
-Jolly Nature
-- Fake Out
-- Protect
-- Thunderbolt
-- Electroweb
-
-Charizard @ Charizardite Y
-Ability: Blaze
-Level: 50
-Modest Nature
-- Heat Wave
-- Solar Beam
-- Protect
-- Weather Ball
-
-Whimsicott @ Focus Sash
-Ability: Prankster
-Level: 50
-Timid Nature
-- Moonblast
-- Tailwind
-- Encore
-- Protect
-
-Garchomp @ Sitrus Berry
-Ability: Rough Skin
-Level: 50
-Jolly Nature
-- Earthquake
-- Dragon Claw
-- Rock Slide
-- Protect
-
-Kingambit @ Black Glasses
-Ability: Defiant
-Level: 50
-Adamant Nature
-- Kowtow Cleave
-- Sucker Punch
-- Protect
-- Low Kick
-
-Glimmora @ Shuca Berry
-Ability: Corrosion
-Level: 50
-Modest Nature
-- Power Gem
-- Sludge Bomb
-- Earth Power
-- Protect
-"""
+from p0.model.policy import MemoryInputs
+from p0.model.structured_observation import StructuredObservation
+from tests.integration.helpers import capture_showdown_decisions, integration_count
 
 
-class TrackedPolicyPlayer(RLPlayer):
-    def __init__(self, *args, **kwargs):
-        self.preview_decisions = 0
-        self.normal_decisions = 0
-        self.history_tokens = []
-        super().__init__(*args, **kwargs)
-
-    def _get_action(self, battle):
-        action = super()._get_action(battle)
-        assert np.isfinite(action).all()
-        self.history_tokens.append(
-            self._battle_history[self._battle_key(cast(DoubleBattle, battle))][-1]
+@pytest.mark.heavy
+class TestLivePolicyBattle:
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_observed_showdown_orders_round_trip_to_recorded_actions(
+        self, showdown_server
+    ) -> None:
+        """Verify that decisions captured from Showdown always fall within legal joint actions."""
+        decisions = await capture_showdown_decisions(
+            showdown_server,
+            game_count=integration_count("P0_INTEGRATION_ACTION_GAMES", 2),
         )
-        if battle.teampreview:
-            self.preview_decisions += 1
-        else:
-            self.normal_decisions += 1
-        return action
+        assert decisions
 
+        for decision in decisions:
+            assert decision.chosen_action in decision.legal_joint_actions
+            assert decision.chosen_order == decision.regenerated_order
+            assert decision.legal_joint_actions
+            assert all(
+                0 <= action < ACT_SIZE for pair in decision.legal_joint_actions for action in pair
+            )
+            assert all(
+                0 <= action < ACT_SIZE for actions in decision.legal_actions for action in actions
+            )
 
-@pytest.mark.integration
-@pytest.mark.asyncio
-@pytest.mark.parametrize("opponent_mode", ["self_policy", "random"])
-async def test_checkpoint_free_policy_completes_live_battle(
-    showdown_server,
-    opponent_mode,
-):
-    torch.manual_seed(7)
-    poke_env_patches.install()
-    resources = default_runtime_resources()
-    policy = build_policy(ModelConfig.baseline(), resources).eval()
-    first_source = FixedTeamSource(TEAM)
-    second_source = FixedTeamSource(TEAM)
-    first = TrackedPolicyPlayer(
-        policy=policy,
-        battle_format=FORMAT.battle_format,
-        server_configuration=showdown_server,
-        team_source=first_source,
-        team_rng=random.Random(11),
-        observation_builder=ObservationBuilder(resources),
-        max_concurrent_battles=1,
-    )
-    if opponent_mode == "self_policy":
-        second = TrackedPolicyPlayer(
-            policy=policy,
-            battle_format=FORMAT.battle_format,
-            server_configuration=showdown_server,
-            team_source=second_source,
-            team_rng=random.Random(13),
-            observation_builder=ObservationBuilder(resources),
-            max_concurrent_battles=1,
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("batch_size", (1, 8))
+    async def test_policy_handles_showdown_captured_batches(
+        self,
+        showdown_server,
+        model_policy,
+        model_device: torch.device,
+        batch_size: int,
+    ) -> None:
+        """
+        Verify the full forward pipeline (encode -> prepare -> act -> evaluate) on live battle batches.
+
+        Tests that:
+        1. Sampled actions strictly respect the action mask (invalid actions have probability 0).
+        2. Sampled action pairs are valid double battle combinations in legal_joint_actions.
+        3. Log-probabilities, state values, and entropies are finite.
+        4. Evaluated logits are finite for legal actions and -inf for masked actions.
+        """
+        decisions = await capture_showdown_decisions(showdown_server, game_count=1)
+        assert decisions
+        # Tile captured single-turn decisions to construct the requested batch size
+        selected = tuple(decisions[index % len(decisions)] for index in range(batch_size))
+        cpu_observation = StructuredObservation.stack(
+            [decision.observation for decision in selected]
         )
-    else:
-        second = RandomPlayer(
-            battle_format=FORMAT.battle_format,
-            server_configuration=showdown_server,
-            team=second_source.sample(random.Random(13)).packed,
-            max_concurrent_battles=1,
+        observation = cpu_observation.to(model_device)
+        for original, transferred in zip(
+            cpu_observation.tensors(), observation.tensors(), strict=True
+        ):
+            assert transferred.device == model_device
+            assert transferred.dtype == original.dtype
+            torch.testing.assert_close(transferred.cpu(), original, rtol=0, atol=0)
+        # Construct 3D boolean action mask: [batch, 2_slots, ACT_SIZE]
+        action_mask = torch.zeros((batch_size, 2, ACT_SIZE), dtype=torch.bool, device=model_device)
+        for index, decision in enumerate(selected):
+            for position, actions in enumerate(decision.legal_actions):
+                action_mask[index, position, list(actions)] = True
+        memory = MemoryInputs.empty(
+            batch_size,
+            model_policy.d_model,
+            model_policy.device,
+            next(model_policy.parameters()).dtype,
         )
-    try:
-        await asyncio.wait_for(first.battle_against(second, n_battles=1), timeout=60.0)
-    finally:
-        await first.ps_client.stop_listening()
-        await second.ps_client.stop_listening()
-        poke_env_patches.uninstall_for_tests()
 
-    assert first.preview_decisions >= 1
-    assert first.normal_decisions >= 1
-    assert first.history_tokens
-    assert not first._battle_history
-    if isinstance(second, TrackedPolicyPlayer):
-        assert second.preview_decisions >= 1
-        assert second.normal_decisions >= 1
-        assert second.history_tokens
-        assert not second._battle_history
-        assert first.history_tokens[0] is not second.history_tokens[0]
+        with torch.inference_mode():
+            encoded = model_policy.encode(observation, action_mask)
+            prepared = model_policy.prepare(encoded, memory)
+            acted = model_policy.act(prepared, action_mask)
+            evaluated = model_policy.evaluate(prepared, action_mask, acted.actions)
+
+        assert acted.actions.shape == (batch_size, 2)
+        assert torch.all((acted.actions >= 0) & (acted.actions < FORMAT.action_size))
+        # Gather boolean mask values at the chosen action indices to ensure every chosen action is legal
+        assert torch.all(action_mask.gather(2, acted.actions.unsqueeze(-1)).squeeze(-1))
+        assert torch.isfinite(acted.log_probs).all()
+        assert torch.isfinite(acted.value).all()
+        assert torch.isfinite(evaluated.log_probs).all()
+        assert torch.isfinite(evaluated.entropy).all()
+        assert torch.isfinite(evaluated.value).all()
+        # Confirm sampled joint action tuples are valid double battle combinations
+        for index, decision in enumerate(selected):
+            actions = tuple(int(value) for value in acted.actions[index].tolist())
+            assert actions in decision.legal_joint_actions
+
+        # Check that chosen action logits are finite and masked logits are either finite or -inf
+        selected_logits = evaluated.logits.gather(2, acted.actions.unsqueeze(-1)).squeeze(-1)
+        assert torch.isfinite(selected_logits).all()
+        assert torch.logical_or(
+            torch.isfinite(evaluated.logits), torch.isneginf(evaluated.logits)
+        ).all()
+
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_live_capture_captures_decisions_across_repeated_games(
+        self, showdown_server
+    ) -> None:
+        """Verify live battle decision capture operates reliably across concurrent multi-game matches."""
+        game_count = max(2, integration_count("P0_INTEGRATION_SELF_PLAY_GAMES", 2))
+        decisions = await capture_showdown_decisions(
+            showdown_server,
+            game_count=game_count,
+            max_concurrent_battles=2,
+        )
+        assert decisions
+        by_game = Counter(decision.battle_tag for decision in decisions)
+        assert len(by_game) == game_count
+        assert all(count > 0 for count in by_game.values())
+        assert all(decision.legal_joint_actions for decision in decisions)
+        assert all(decision.observation.numerical.isfinite().all() for decision in decisions)

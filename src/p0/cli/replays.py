@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 from collections.abc import Iterator
@@ -11,11 +12,10 @@ from typing import Any
 
 from p0.format_config import DEFAULT_RUNTIME_MANIFEST, FORMAT
 from p0.replays.compile import compile_to_shards
-from p0.replays.dataset import assign_series_splits, write_split_manifest
+from p0.replays.dataset import LazyReplayDataset, assign_series_splits, write_split_manifest
 from p0.replays.group import group_replays
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.scrape import ReplayFetcher, ScrapeConfig, load_raw_replay
-from p0.replays.shards import load_shard_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,6 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--cache-dir", type=Path, default=Path("artifacts/replays"))
     build.add_argument("--output-dir", type=Path, default=Path("artifacts/shards"))
     build.add_argument("--max-candidates", type=int, default=256)
-    build.add_argument("--imputation-seed", type=int, default=0)
     build.add_argument("--max-decisions-per-shard", type=int, default=4096)
     build.add_argument("--runtime-manifest", type=Path, default=DEFAULT_RUNTIME_MANIFEST)
     build.add_argument(
@@ -67,7 +66,8 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
         concurrency=args.concurrency,
     )
 
-    entries = ReplayFetcher(config).acquire(args.replay_id)
+    fetcher = ReplayFetcher(config)
+    entries = fetcher.acquire(args.replay_id)
     documents = []
     unparsed = 0
 
@@ -89,7 +89,7 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "format_id": FORMAT.bo3_format,
-        "index_path": str(ReplayFetcher(config).index_path.resolve()),
+        "index_path": str(fetcher.index_path.resolve()),
         "source_games": len(entries),
         "source_series": source_series,
         "accepted_games": None,
@@ -101,19 +101,23 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
 
 def _yield_documents(
     cache_dir: Path,
-    parse_errors: list[str],
+    parse_errors: dict[str, str],
 ) -> Iterator[ReplayDocument]:
     """Yield cached documents while retaining identities of malformed inputs."""
     for path in sorted((cache_dir / FORMAT.bo3_format / "raw").glob("*.json.gz")):
+        identity = path.name.removesuffix(".json.gz")
         try:
+            payload = load_raw_replay(path)
             yield parse_replay_payload(
-                load_raw_replay(path),
-                replay_id=path.name.removesuffix(".json.gz"),
+                payload,
+                replay_id=identity,
                 format_id=FORMAT.bo3_format,
             )
         except (OSError, TypeError, ValueError) as exc:
-            identity = path.name.removesuffix(".json.gz")
-            parse_errors.append(identity)
+            try:
+                parse_errors[identity] = hashlib.sha256(load_raw_replay(path)).hexdigest()
+            except ValueError:
+                parse_errors[identity] = hashlib.sha256(path.read_bytes()).hexdigest()
             logger.warning("Rejected malformed cached replay %s: %s", identity, exc)
 
 
@@ -121,7 +125,7 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
     """Compile a folder of scraped raw replays into PyTorch tensor shards."""
     if args.max_parse_errors < 0:
         raise ValueError("--max-parse-errors must be non-negative")
-    parse_errors: list[str] = []
+    parse_errors: dict[str, str] = {}
     documents = tuple(_yield_documents(args.cache_dir, parse_errors))
     if len(parse_errors) > args.max_parse_errors:
         raise ValueError(
@@ -134,10 +138,9 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
         output_dir=args.output_dir,
         format_id=FORMAT.bo3_format,
         max_candidates=args.max_candidates,
-        imputation_seed=args.imputation_seed,
         max_decisions_per_shard=args.max_decisions_per_shard,
         manifest_path=args.runtime_manifest,
-        external_rejections=tuple(parse_errors),
+        external_rejections=parse_errors,
     )
 
     manifest = built.manifest
@@ -145,27 +148,29 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "manifest_path": str(built.manifest_path.resolve()),
         "dataset_hash": manifest.dataset_hash,
-        "runtime_hash": manifest.runtime_contract_sha256,
+        "global_hash": manifest.global_contract_sha256,
         "source_games": manifest.source_games,
         "accepted_games": manifest.accepted_games,
         "rejected_games": manifest.rejected_games,
         "source_series": len(manifest.source_series),
-        "parse_errors": parse_errors,
+        "parse_errors": list(parse_errors),
     }
 
 
 def _create_splits(args: argparse.Namespace) -> dict[str, Any]:
     """Assign validation and test splits uniformly across all compiled series."""
-    value = json.loads(args.shard_manifest.read_text(encoding="utf-8"))
-    manifest = load_shard_manifest(value, args.runtime_manifest)
-
-    series_ids = tuple(manifest.source_series.keys())
+    dataset = LazyReplayDataset(
+        args.shard_manifest,
+        runtime_manifest_path=args.runtime_manifest,
+    )
+    manifest = dataset.manifest
+    series_ids = dataset.accepted_series_ids()
     split = assign_series_splits(
         series_ids,
         seed=args.seed,
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,
-        runtime_contract_sha256=manifest.runtime_contract_sha256,
+        global_contract_sha256=manifest.global_contract_sha256,
         dataset_hash=manifest.dataset_hash,
     )
 
@@ -181,7 +186,7 @@ def _create_splits(args: argparse.Namespace) -> dict[str, Any]:
         "split_manifest_path": str(output.resolve()),
         "shard_manifest_path": str(args.shard_manifest.resolve()),
         "dataset_hash": manifest.dataset_hash,
-        "runtime_hash": manifest.runtime_contract_sha256,
+        "global_hash": manifest.global_contract_sha256,
         "source_series": len(series_ids),
         "source_games": manifest.source_games,
         "accepted_games": manifest.accepted_games,

@@ -1,28 +1,37 @@
-"""Fast player-relative facade over poke-env battle state."""
+"""Fast player-relative view of poke-env battle state."""
 
 from __future__ import annotations
 
-from weakref import WeakKeyDictionary
+from typing import Any, cast
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from poke_env.battle import DoubleBattle
 
-from p0.battle.events import BattleEvent, parse_events
-from p0.battle.legality import DecisionView, SlotDecision
-from p0.model.tokenizer import tokenizer
-from p0.runtime.live_event_capture import consume_raw_events, last_move
+from p0.battle.legality import GAME_END_DECISION, DecisionView, SlotDecision
+from p0.battle.views import TransformedPokemonView
+from p0.runtime.live_event_capture import (
+    captured_protocol_lines,
+    last_move,
+    pending_events,
+)
 
 
 class PokeEnvBattleView:
-    """Cached facade with explicit properties and no copied per-decision graph."""
+    """Cached view of a live battle without copying its object graph."""
 
-    __slots__ = ("_battle", "_decision", "_events", "_events_key", "stat_cache")
+    __slots__ = ("_battle_ref", "_decision", "stat_cache")
 
     def __init__(self, battle: DoubleBattle):
-        self._battle = battle
+        self._battle_ref: ReferenceType[DoubleBattle] = ref(battle)
         self._decision: DecisionView | None = None
-        self._events: list[BattleEvent] = []
-        self._events_key: tuple[int, int] = (-1, -1)
         self.stat_cache: dict[object, tuple[int, int, int, int, int, int]] = {}
+
+    @property
+    def _battle(self) -> DoubleBattle:
+        battle = self._battle_ref()
+        if battle is None:
+            raise ReferenceError("The underlying battle has been garbage-collected")
+        return battle
 
     def refresh(self) -> PokeEnvBattleView:
         self._decision = None
@@ -38,11 +47,11 @@ class PokeEnvBattleView:
 
     @property
     def active_pokemon(self):
-        return self._battle.active_pokemon
+        return _transformed_active_pokemon(self._battle)
 
     @property
     def opponent_active_pokemon(self):
-        return self._battle.opponent_active_pokemon
+        return _transformed_active_pokemon(self._battle, opponent=True)
 
     @property
     def available_moves(self):
@@ -78,9 +87,17 @@ class PokeEnvBattleView:
 
     @property
     def wait(self):
-        # poke-env exposes wait as ``_wait`` (asserted integer reason code). This is a
-        # version-pinned access point: poke-env is locked to 0.15.0 in pyproject.toml.
+        # poke-env 0.15.0 exposes this request flag only as _wait.
         return self._battle._wait
+
+    @property
+    def protocol_lines(self) -> tuple[str, ...]:
+        """Return raw battle protocol lines when runtime capture is enabled."""
+        return captured_protocol_lines(self._battle)
+
+    def replay_events(self) -> tuple[str, ...]:
+        """Return poke-env's public replay serialization for this battle."""
+        return tuple(self._battle._build_replay_events())
 
     @property
     def weather(self):
@@ -113,20 +130,17 @@ class PokeEnvBattleView:
     @property
     def decision(self) -> DecisionView:
         if self._decision is None:
-            self._decision = decision_view(self._battle)
+            battle = self._battle
+            # The last request of a finished battle no longer describes a choice.
+            self._decision = GAME_END_DECISION if battle.finished else decision_view(battle)
         return self._decision
+
+    @property
+    def spatial_events(self):
+        return pending_events(self._battle)
 
     def get_pokemon(self, identifier: str):
         return self._battle.get_pokemon(identifier)
-
-    def consume_events(self):
-        # ``last_request`` is a poke-env private attribute; poke-env is pinned to 0.15.0.
-        # It is used as part of a monotonic key to detect when a new request has arrived.
-        key = (self._battle.turn, id(self._battle.last_request))
-        if key != self._events_key:
-            self._events = parse_events(consume_raw_events(self._battle), tokenizer)
-            self._events_key = key
-        return self._events
 
     def last_move(self, pokemon):
         return last_move(pokemon)
@@ -135,10 +149,40 @@ class PokeEnvBattleView:
 _VIEWS: WeakKeyDictionary[DoubleBattle, PokeEnvBattleView] = WeakKeyDictionary()
 
 
+class _CalledMoveView:
+    """Show a sole called continuation in the action move slot for this request."""
+
+    __slots__ = ("_pokemon", "moves", "is_transformed")
+
+    def __init__(self, pokemon: Any, move: Any) -> None:
+        self._pokemon = pokemon
+        self.moves = {move.id: move}
+        self.is_transformed = isinstance(pokemon, TransformedPokemonView)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pokemon, name)
+
+    def __hash__(self) -> int:
+        return hash(self._pokemon)
+
+    def __eq__(self, other: Any) -> bool:
+        return self._pokemon == getattr(other, "_pokemon", other)
+
+
+def action_move_slots(battle: DoubleBattle, position: int) -> tuple[Any, ...]:
+    """Return move slots used by the current action request."""
+    active = battle.active_pokemon[position]
+    if active is None:
+        return ()
+    available = battle.available_moves[position]
+    if len(available) == 1 and available[0].id not in active.moves:
+        return (available[0],)
+    return tuple(active.moves.values())
+
+
 def battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
     """Return refreshed PokeEnvBattleView for the specified battle instance."""
-    view = current_battle_view(battle)
-    return view.refresh()
+    return current_battle_view(battle).refresh()
 
 
 def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
@@ -150,10 +194,37 @@ def current_battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
     return view
 
 
+def _transformed_active_pokemon(
+    battle: DoubleBattle,
+    *,
+    opponent: bool = False,
+) -> list[Any]:
+    active = battle.opponent_active_pokemon if opponent else battle.active_pokemon
+    active_list = cast(list[Any], list(active))
+    targets = getattr(battle, "_p0_transform_targets", {})
+    for index, pokemon in enumerate(active_list):
+        if pokemon is None:
+            continue
+        captured = targets.get(id(pokemon))
+        if captured is not None:
+            pokemon = TransformedPokemonView(
+                pokemon,
+                captured.target,
+                original_base_hp=captured.original_base_hp,
+            )
+        if not opponent:
+            available = battle.available_moves[index]
+            if len(available) == 1 and available[0].id not in pokemon.moves:
+                pokemon = _CalledMoveView(pokemon, available[0])
+        active_list[index] = pokemon
+    return active_list
+
+
 def decision_view(battle: DoubleBattle) -> DecisionView:
     """Extract a lightweight DecisionView from live battle state."""
-    active_pokemon = battle.active_pokemon
     available_moves = battle.available_moves
+    active_pokemon = _transformed_active_pokemon(battle)
+
     available_switches = battle.available_switches
     team = tuple(battle.team.values())
     trapped = battle.trapped
@@ -178,10 +249,9 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
             )
         )
 
-        switches = {pokemon.base_species for pokemon in available_switches[position]}
-        switch_slots = tuple(
-            index for index, pokemon in enumerate(team) if pokemon.base_species in switches
-        )
+        # Match by id: species names can identify the wrong form or duplicate.
+        switches = {id(pokemon) for pokemon in available_switches[position]}
+        switch_slots = tuple(index for index, pokemon in enumerate(team) if id(pokemon) in switches)
 
         forced_move = (
             not any(move_targets)
@@ -194,6 +264,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
                 switch_slots=switch_slots,
                 move_targets=move_targets,
                 active=active is not None and not active.fainted,
+                # With open sheets, maybe-trapped still means switching will fail.
                 trapped=trapped[position] or maybe_trapped[position],
                 force_switch=force_switch[position],
                 can_mega=can_mega_evolve[position],
