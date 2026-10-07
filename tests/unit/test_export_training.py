@@ -83,7 +83,7 @@ class TestExportTraining:
             max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
-        split_path = tmp_path / "splits.json"
+        split_path = built.manifest_path.parent / "splits.json"
         write_split_manifest(
             SeriesSplitManifest(
                 built.manifest.global_contract_sha256,
@@ -129,7 +129,7 @@ class TestExportTraining:
         config_path.write_text(json.dumps(value))
         config = load_config(config_path).bc
         restored = LazyReplayDataset(
-            config.shard_manifest, split_manifest=config.split_manifest, verify_hashes=True
+            config.shard_manifest, split_manifest=config.split_manifest_path, verify_hashes=True
         )
         assert restored.manifest.dataset_hash == built.manifest.dataset_hash
         assert len(list(restored.for_split("train"))) == 2

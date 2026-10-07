@@ -10,6 +10,7 @@ import torch.optim as optim
 from poke_env import AccountConfiguration
 from torch.amp import GradScaler
 
+from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
 from p0.model.observation_builder import ObservationBuilder
@@ -78,10 +79,8 @@ def run_training(
     else:
         raise ValueError("agent_team_source must be 'all' or 'reduced'")
 
-    agent_source = build_team_source(agent_team_path, expected_format_id=config.bot.battle_format)
-    opponent_source = build_team_source(
-        config.teams.all, expected_format_id=config.bot.battle_format
-    )
+    agent_source = build_team_source(agent_team_path, expected_format_id=FORMAT.bo3_format)
+    opponent_source = build_team_source(config.teams.all, expected_format_id=FORMAT.bo3_format)
     settings = {
         "training": asdict(training),
         "teams": [

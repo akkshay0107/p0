@@ -49,7 +49,7 @@ class TestBCRunner:
             max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
-        split_path = tmp_path / "splits.json"
+        split_path = built.manifest_path.parent / "splits.json"
         only_series = next(iter(built.manifest.source_series))
         write_split_manifest(
             SeriesSplitManifest(
@@ -67,7 +67,6 @@ class TestBCRunner:
             num_workers=0,
             enable_optim=False,
             shard_manifest=built.manifest_path,
-            split_manifest=split_path,
             output_dir=tmp_path / "output",
         )
 
@@ -127,7 +126,7 @@ class TestBCRunner:
             replay_ids[0]: series_id
             for series_id, replay_ids in built.manifest.source_series.items()
         }
-        split_path = tmp_path / "splits.json"
+        split_path = built.manifest_path.parent / "splits.json"
         write_split_manifest(
             SeriesSplitManifest(
                 built.manifest.global_contract_sha256,
@@ -148,7 +147,6 @@ class TestBCRunner:
             num_workers=0,
             enable_optim=False,
             shard_manifest=built.manifest_path,
-            split_manifest=split_path,
             output_dir=tmp_path / "output",
         )
 
@@ -178,7 +176,7 @@ class TestBCRunner:
             max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
-        split_path = tmp_path / "splits.json"
+        split_path = built.manifest_path.parent / "splits.json"
         series_by_replay = {
             replay_ids[0]: series_id
             for series_id, replay_ids in built.manifest.source_series.items()
@@ -202,7 +200,6 @@ class TestBCRunner:
             num_workers=0,
             enable_optim=False,
             shard_manifest=built.manifest_path,
-            split_manifest=split_path,
             output_dir=tmp_path / "first-output",
         )
         first = train_bc(first_config, device="cpu")
@@ -349,7 +346,7 @@ class TestBCRunner:
             max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
-        split_path = tmp_path / "splits.json"
+        split_path = built.manifest_path.parent / "splits.json"
         series_by_replay = {
             replay_ids[0]: series_id
             for series_id, replay_ids in built.manifest.source_series.items()
@@ -373,7 +370,6 @@ class TestBCRunner:
             num_workers=0,
             enable_optim=False,
             shard_manifest=built.manifest_path,
-            split_manifest=split_path,
             output_dir=tmp_path / "output",
         )
         policy_checkpoint = tmp_path / "best_policy.pt"
@@ -394,6 +390,17 @@ class TestBCRunner:
             "gamma": config.gamma,
             "value_target_semantics": "discounted_terminal_outcome.v1",
         }
+        cli_config = tmp_path / "bc-config.yaml"
+        cli_config.write_text(
+            json.dumps(
+                {
+                    "bc": {
+                        "shard_manifest": str(built.manifest_path),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         cli = subprocess.run(
             (
                 sys.executable,
@@ -401,11 +408,7 @@ class TestBCRunner:
                 "p0.cli.bc",
                 "evaluate",
                 "--config",
-                str(Path(__file__).parents[2] / "config.example.yaml"),
-                "--shard-manifest",
-                str(built.manifest_path),
-                "--split-manifest",
-                str(split_path),
+                str(cli_config),
                 "--checkpoint",
                 str(policy_checkpoint),
                 "--split",
@@ -444,7 +447,7 @@ class TestBCRunner:
             max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
-        split_path = tmp_path / "splits.json"
+        split_path = built.manifest_path.parent / "splits.json"
         series_by_replay = {
             replay_ids[0]: series_id
             for series_id, replay_ids in built.manifest.source_series.items()
@@ -468,7 +471,6 @@ class TestBCRunner:
             num_workers=0,
             enable_optim=False,
             shard_manifest=built.manifest_path,
-            split_manifest=split_path,
             output_dir=tmp_path / "cancelled-output",
         )
 

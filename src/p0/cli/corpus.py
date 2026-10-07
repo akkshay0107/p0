@@ -8,6 +8,7 @@ import logging
 import random
 from collections import Counter
 from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -167,12 +168,6 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Pool directory for the manifest; defaults to the input directory",
     )
-    build_parser.add_argument(
-        "--format-id",
-        default=FORMAT.battle_format,
-        help="Battle format ID",
-    )
-
     audit_parser = subparsers.add_parser("audit")
     audit_parser.add_argument(
         "--path",
@@ -192,13 +187,14 @@ def main(argv: list[str] | None = None) -> None:
         dex = json.loads(dex_path.read_text(encoding="utf-8")) if dex_path.is_file() else None
         variants = _load_variants(args.input, dex=dex)
         tokenizer = PokemonTokenizer.from_file()
+        format_id = FORMAT.battle_format
 
         manifest, audit = build_corpus(
             variants,
             tokenizer=tokenizer,
-            validator=validate_many,
+            validator=partial(validate_many, format_id=format_id),
             global_contract_sha256=active_global_contract().global_sha256,
-            format_id=args.format_id,
+            format_id=format_id,
         )
         if not manifest.entries:
             raise ValueError(f"No admitted teams found in input path: {args.input}")

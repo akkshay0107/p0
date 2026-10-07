@@ -8,10 +8,8 @@ from typing import Any
 
 import pytest
 
-from p0.format_config import FORMAT
 from p0.training.config import (
     BCConfig,
-    BotConfig,
     GlobalConfig,
     TrainingConfig,
     load_config,
@@ -80,9 +78,9 @@ class TestConfig:
                 "magnet_refresh_interval",
             ),
             (
-                "mismatched bot format",
+                "removed bot format setting",
                 "bot:\n  battle_format: gen9anythinggoes\n",
-                "battle_format",
+                "unknown BotConfig field",
             ),
             (
                 "removed bo3 switch",
@@ -97,21 +95,6 @@ class TestConfig:
         """Verify load_config detects and rejects schema violations with informative errors."""
         with pytest.raises(ValueError, match=message):
             load_config(write_config(tmp_path, contents))
-
-    def test_bot_config_accepts_configured_bo3_format(self) -> None:
-        """Verify live bot configuration exposes the checked-in Bo3 format."""
-        config = BotConfig()
-        assert config.battle_format == FORMAT.bo3_format
-
-    def test_bot_config_rejects_bo1_format(self) -> None:
-        """Verify bot configuration rejects non-Bo3 battle formats."""
-        with pytest.raises(ValueError, match="must be the Bo3 format"):
-            BotConfig(battle_format=FORMAT.battle_format)
-
-    def test_bot_config_rejects_live_concurrency_above_one(self) -> None:
-        """Live Bo3 series tracking is intentionally single-battle."""
-        with pytest.raises(ValueError, match="fixed at 1"):
-            BotConfig(max_concurrent_battles=2)
 
     def test_config_is_immutable(self, tmp_path: Path) -> None:
         """Verify GlobalConfig dataclasses are frozen against accidental mutation."""

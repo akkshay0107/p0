@@ -25,7 +25,7 @@ node scripts/dump_champions_dex.js "$FORMAT" "$REVISION" --check
 mkdir -p data
 rm -f data/runtime_manifest.json
 node scripts/dump_champions_dex.js "$FORMAT" "$REVISION"
-uv run p0-build-vocab --coverage data/champions_coverage.json
+uv run p0-build-vocab
 uv run p0-build-spreads --month "$USAGE_MONTH" --fetch
 node scripts/generate_showdown_raw_inventory.js
 uv run python scripts/generate_replay_protocol_contract.py

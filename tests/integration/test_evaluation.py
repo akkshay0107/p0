@@ -8,7 +8,6 @@ import signal
 import socket
 import subprocess
 import time
-import urllib.parse
 
 import pytest
 from poke_env import AccountConfiguration, ServerConfiguration
@@ -173,14 +172,11 @@ class TestEvaluation:
         aggregates results per team archetype, and produces a complete dictionary serialization
         containing confidence intervals and metadata suitable for logging.
         """
-        parsed = urllib.parse.urlparse(showdown_server.websocket_url)
-        assert parsed.port is not None
         poke_env_patches.install()
 
         harness = EvaluationHarness(
             episodes_per_matchup=1,
             seed=42,
-            port=parsed.port,
         )
         fallback = FixedTeamSource(DEFAULT_TEST_TEAM)
 
@@ -241,8 +237,6 @@ class TestEvaluation:
         policy_side: str,
     ) -> None:
         """Verify live evaluation works symmetrically when the neural policy is player A or player B."""
-        parsed = urllib.parse.urlparse(showdown_server.websocket_url)
-        assert parsed.port is not None
         # Assign the model policy to the parametrized player side and leave the other as None (RandomPlayer)
         policy_a = model_policy if policy_side == "a" else None
         policy_b = model_policy if policy_side == "b" else None
@@ -254,7 +248,6 @@ class TestEvaluation:
             result = await EvaluationHarness(
                 episodes_per_matchup=1,
                 seed=23,
-                port=parsed.port,
             ).run_matchup(
                 name_a=name_a,
                 policy_a=policy_a,
@@ -281,11 +274,9 @@ class TestEvaluation:
     async def test_live_evaluation_matchup_serializes_per_team_outcomes(
         self, showdown_server
     ) -> None:
-        parsed = urllib.parse.urlparse(showdown_server.websocket_url)
-        assert parsed.port is not None
         poke_env_patches.install()
         try:
-            harness = EvaluationHarness(episodes_per_matchup=2, seed=17, port=parsed.port)
+            harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
             result = await harness.run_matchup(
                 name_a="random-a",
                 policy_a=None,
@@ -332,12 +323,9 @@ class TestEvaluation:
         opponent_type: str,
     ) -> None:
         """Verify live evaluation completes matchups against MaxBasePowerPlayer and SimpleHeuristicsPlayer."""
-        parsed = urllib.parse.urlparse(showdown_server.websocket_url)
-        assert parsed.port is not None
-
         poke_env_patches.install()
         try:
-            harness = EvaluationHarness(episodes_per_matchup=1, seed=42, port=parsed.port)
+            harness = EvaluationHarness(episodes_per_matchup=1, seed=42)
             result = await harness.run_matchup(
                 name_a="ModelPlayer",
                 policy_a=model_policy,

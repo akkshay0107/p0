@@ -30,37 +30,34 @@ logger = logging.getLogger("p0.cli.eval")
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="p0-eval", description="Evaluate a trained policy.")
     parser.add_argument("--checkpoint", type=Path, help="Path to policy checkpoint to evaluate.")
-    parser.add_argument(
+    opponent_choice = parser.add_mutually_exclusive_group()
+    opponent_choice.add_argument(
         "--opponent",
         choices=("random", "max_power", "simple_heuristics"),
-        default="random",
         help="Named baseline opponent (default: random).",
     )
-    parser.add_argument(
+    opponent_choice.add_argument(
         "--opponent-checkpoint",
         type=Path,
-        help="Opponent policy checkpoint (overrides --opponent).",
+        help="Opponent policy checkpoint.",
     )
     parser.add_argument("--teams-path", type=Path, default=None, help="Team pool directory.")
     parser.add_argument("--episodes", type=int, help="Number of episodes per matchup.")
     parser.add_argument("--seed", type=int, help="Random seed for evaluations.")
     parser.add_argument("--report-dir", type=Path, help="Directory to save evaluation reports.")
-    parser.add_argument("--port", type=int, default=8120, help="Showdown port to use.")
     parser.add_argument("--config", type=Path, help="Path to global YAML configuration file.")
     return parser
 
 
 async def _run_matchup(
     harness: EvaluationHarness,
-    port: int,
     source: TeamSource,
     policy_a: PolicyNet | None,
     opponent_name: str,
     opponent: PolicyNet | str,
 ) -> MatchupResult:
     """Start one local Showdown server and play the configured matchup on it."""
-    logger.info("Starting local Showdown server on port %d...", port)
-    with start_showdown_servers(1, ports=(port,)) as servers:
+    with start_showdown_servers(1) as servers:
         server_configuration = local_server_configuration(servers[0].port)
         return await harness.run_matchup(
             name_a="PlayerCheckpoint" if policy_a else "RandomA",
@@ -87,9 +84,15 @@ def main(argv: list[str] | None = None) -> int:
         format=LOG_FORMAT,
     )
 
-    episodes = args.episodes or config.evaluation.episodes_per_matchup
+    episodes = config.evaluation.episodes_per_matchup if args.episodes is None else args.episodes
     seed = args.seed if args.seed is not None else config.evaluation.seed
-    report_dir = args.report_dir or Path(config.evaluation.report_dir)
+    report_dir = config.evaluation.report_dir if args.report_dir is None else args.report_dir
+    if episodes <= 0:
+        print("Error: --episodes must be a positive integer.", file=sys.stderr)
+        return 1
+    if seed < 0:
+        print("Error: --seed must be a non-negative integer.", file=sys.stderr)
+        return 1
 
     random.seed(seed)
     torch.manual_seed(seed)
@@ -114,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     policy_b = None
-    opponent_name = args.opponent
+    opponent_name = args.opponent or "random"
     if args.opponent_checkpoint is not None:
         try:
             policy_b = DEFAULT_CHECKPOINT_STORE.load_policy(args.opponent_checkpoint, device)
@@ -124,14 +127,12 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("Failed to load opponent checkpoint: %s", exc)
             return 1
 
-    teams_path = args.teams_path or config.teams.all
+    teams_path = config.teams.all if args.teams_path is None else args.teams_path
 
     harness = EvaluationHarness(
         teams_path=teams_path,
-        format_id=config.bot.battle_format,
         episodes_per_matchup=episodes,
         seed=seed,
-        port=args.port,
     )
 
     try:
@@ -144,11 +145,10 @@ def main(argv: list[str] | None = None) -> int:
         matchup_result = asyncio.run(
             _run_matchup(
                 harness,
-                args.port,
                 source,
                 policy_a,
                 opponent_name,
-                policy_b if policy_b is not None else args.opponent,
+                policy_b if policy_b is not None else opponent_name,
             )
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         "policy_b": (
             str(args.opponent_checkpoint)
             if args.opponent_checkpoint
-            else f"Baseline:{args.opponent}"
+            else f"Baseline:{opponent_name}"
         ),
         "teams_path": str(teams_path.resolve()) if teams_path else None,
         "checkpoints": {

@@ -20,6 +20,7 @@ from p0.persistence import atomic_json_save
 ROOT = DEFAULT_PATHS.repository_root
 DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
 DEFAULT_VOCAB = ROOT / "data" / "vocab.json"
+DEFAULT_COVERAGE = ROOT / "data" / "champions_coverage.json"
 
 TABLES = (
     "species",
@@ -151,19 +152,16 @@ def build(
 
 def main(argv: list[str] | None = None) -> int:
     """Build vocab CLI entrypoint."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dex", type=Path, default=DEFAULT_DEX)
-    parser.add_argument("--vocab", type=Path, default=DEFAULT_VOCAB)
-    parser.add_argument(
-        "--coverage",
-        type=Path,
-        help="Optional path for the reproducible coverage audit report",
+    argparse.ArgumentParser().parse_args(argv)
+
+    build(DEFAULT_DEX, DEFAULT_VOCAB, DEFAULT_COVERAGE)
+
+    print(
+        json.dumps(
+            {"vocab": str(DEFAULT_VOCAB), "coverage": str(DEFAULT_COVERAGE)},
+            indent=2,
+        )
     )
-    args = parser.parse_args(argv)
-
-    build(args.dex, args.vocab, args.coverage)
-
-    print(json.dumps({"vocab": str(args.vocab)}, indent=2))
     return 0
 
 

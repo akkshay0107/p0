@@ -77,7 +77,6 @@ def export_checkpoint(checkpoint: Path, output: Path) -> None:
                 "epochs": metadata["epoch_budget"],
                 "resume_checkpoint": "run/checkpoint.pt",
                 "shard_manifest": "run/inputs/manifest.json",
-                "split_manifest": "run/inputs/splits.json",
                 "output_dir": "artifacts/resumed/bc",
             },
         }

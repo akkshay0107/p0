@@ -30,7 +30,7 @@ def _training_metadata(
     split_manifest: Path,
 ) -> dict[str, Any]:
     trainer_config = asdict(config)
-    for name in ("epochs", "shard_manifest", "split_manifest", "output_dir", "resume_checkpoint"):
+    for name in ("epochs", "shard_manifest", "output_dir", "resume_checkpoint"):
         del trainer_config[name]
     return {
         "dataset_hash": dataset_hash,
@@ -118,7 +118,7 @@ def train_bc(
     """
     store = CheckpointStore()
     dataset = LazyReplayDataset(
-        config.shard_manifest, split_manifest=config.split_manifest, verify_hashes=True
+        config.shard_manifest, split_manifest=config.split_manifest_path, verify_hashes=True
     )
     shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
     assert split_manifest is not None
@@ -135,7 +135,7 @@ def train_bc(
     metadata = _training_metadata(
         config,
         dataset_hash=shard_manifest.dataset_hash,
-        split_manifest=config.split_manifest,
+        split_manifest=config.split_manifest_path,
     )
     with training_run(
         store,
@@ -148,7 +148,7 @@ def train_bc(
     ) as files:
         files.metadata["inputs"] = {
             "shard_manifest": str(config.shard_manifest.resolve()),
-            "split_manifest": str(config.split_manifest.resolve()),
+            "split_manifest": str(config.split_manifest_path.resolve()),
         }
         selected_device = default_device() if device is None else torch.device(device)
         seed_everything(config.seed)
@@ -291,7 +291,7 @@ def evaluate_bc(
     objective = value_objective_metadata(config.gamma)
     policy = store.load_policy(checkpoint, selected_device, expected_metadata=objective)
     dataset = LazyReplayDataset(
-        config.shard_manifest, split_manifest=config.split_manifest, verify_hashes=True
+        config.shard_manifest, split_manifest=config.split_manifest_path, verify_hashes=True
     )
     shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
     assert split_manifest is not None

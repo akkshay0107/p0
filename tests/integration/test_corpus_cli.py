@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from p0.cli.corpus import main as corpus_main
-from p0.format_config import FORMAT
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
@@ -35,8 +34,6 @@ class TestCorpusCLI:
                 str(input_dir),
                 "--output-dir",
                 str(all_dir),
-                "--format-id",
-                FORMAT.battle_format,
             ]
         )
 

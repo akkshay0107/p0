@@ -71,29 +71,29 @@ BC is optional. Collect complete linked Bo3 OTS series, compile them, and split
 by series so games from one series do not cross train/validation/test boundaries:
 
 ```bash
-uv run p0-replays scrape --cache-dir artifacts/replays --limit-games 50
-uv run p0-replays build-shards --cache-dir artifacts/replays --output-dir artifacts/shards
+uv run p0-replays scrape --limit-games 50
+uv run p0-replays build-shards
 ```
 
 `build-shards` prints a `manifest_path`. Replace the example path below with that
 actual path; there is no fixed default. `create-splits` writes `splits.json` beside it.
+Set `bc.shard_manifest` in `config.yaml` to that manifest path before training. BC reads
+`splits.json` beside it, so the split file has no separate path setting.
 
 ```bash
 shard_manifest="/absolute/path/from/build-shards/manifest.json"
 uv run p0-replays create-splits --shard-manifest "$shard_manifest"
-uv run p0-bc train --config config.yaml \
-  --shard-manifest "$shard_manifest" \
-  --split-manifest "${shard_manifest%/*}/splits.json"
+uv run p0-bc train
 ```
 
 The best BC policy is saved to `artifacts/checkpoints/bc/bc_best_policy.pt` by default.
-Set `paths.initial_policy_checkpoint` to that file before starting PPO.
-To use config instead of CLI overrides, replace `bc.shard_manifest` and
-`bc.split_manifest` in `config.yaml`; the example values are placeholders.
+Set `paths.initial_policy_checkpoint` to that file before starting PPO. The shard path
+in `config.example.yaml` is a placeholder; replace it in `config.yaml`.
 
 After changing replay reconstruction, remove the old dataset build directory before
-rebuilding shards, recreate the splits, and update their paths. Existing builds are
-reused, and the dataset hash does not include reconstruction code changes.
+rebuilding shards and recreating the splits. Update `bc.shard_manifest` if the new
+manifest path differs. Existing builds are reused, and the dataset hash does not include
+reconstruction code changes.
 
 ### Evaluate or play a checkpoint
 
@@ -116,12 +116,23 @@ node pokemon-showdown start --skip-build --no-security 8000
 Then, from the p0 repository root:
 
 ```bash
-uv run p0-play --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --username MyBot --team-pool all
+SHOWDOWN_USERNAME=MyBot uv run p0-play \
+  --checkpoint artifacts/checkpoints/ppo_checkpoint.pt \
+  --team-pool all
 ```
 
 Challenge `MyBot` in the Champions Bo3 format selected by `scripts/init-data.sh`.
-The `--no-security` server setup above is for local use. See `p0-play --help` for
-remote server settings, repeatable team files, and challenge limits.
+Set `SHOWDOWN_PASSWORD` in the environment when the account needs a password. The
+`--no-security` server setup above is for local use. For a remote server, configure
+both `bot.websocket_url` and `bot.authentication_url` in `config.yaml`. The YAML config
+also owns sampling, random initialization, and logging settings; `p0-play --help` shows
+the remaining per-run choices.
+
+When updating an older local config, remove `bot.battle_format`,
+`bot.max_concurrent_battles`, `bot.team_files`, and `bot.password`; the format and live
+concurrency are fixed, per-run team files use `--team-file`, and passwords come from
+`SHOWDOWN_PASSWORD`. Also remove `bc.split_manifest`; its path is derived from
+`bc.shard_manifest`.
 
 ## Code and development
 

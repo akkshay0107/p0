@@ -113,45 +113,37 @@ def build(
 def main(argv: list[str] | None = None) -> int:
     """Build spread priors CLI entrypoint."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--usage-dir", type=Path, default=DEFAULT_USAGE_DIR)
-    parser.add_argument("--cutoff", type=int, default=DEFAULT_CUTOFF)
     parser.add_argument("--month", required=True, help="Usage month, as YYYY-MM.")
     parser.add_argument(
         "--fetch",
         action="store_true",
         help="Download missing month-specific usage exports before building.",
     )
-    parser.add_argument("--dex", type=Path, default=DEFAULT_DEX)
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--max-spreads", type=int, default=MAX_SPREADS_PER_BUCKET)
-    parser.add_argument("--min-nature-share", type=float, default=MIN_NATURE_SHARE)
     args = parser.parse_args(argv)
 
     date.fromisoformat(f"{args.month}-01")
-    if args.cutoff < 0:
-        raise ValueError("Usage cutoff must be non-negative")
 
-    source = _read_chaos(args.dex)["source"]
-    usage_dir = args.usage_dir / args.month
+    source = _read_chaos(DEFAULT_DEX)["source"]
+    usage_dir = DEFAULT_USAGE_DIR / args.month
     for format_id in (source["battleFormat"], source["bo3Format"]):
-        if args.fetch and not (usage_dir / f"{format_id}-{args.cutoff}.json").is_file():
-            written = fetch_usage_export(args.month, format_id, args.cutoff, usage_dir)
+        if args.fetch and not (usage_dir / f"{format_id}-{DEFAULT_CUTOFF}.json").is_file():
+            written = fetch_usage_export(args.month, format_id, DEFAULT_CUTOFF, usage_dir)
             print(f"Fetched {written.name} ({written.stat().st_size / 1024:.0f} KiB)")
 
     payload = build(
-        usage_dir / f"{source['battleFormat']}-{args.cutoff}.json",
-        usage_dir / f"{source['bo3Format']}-{args.cutoff}.json",
-        args.dex,
-        args.out,
-        args.max_spreads,
-        args.min_nature_share,
+        usage_dir / f"{source['battleFormat']}-{DEFAULT_CUTOFF}.json",
+        usage_dir / f"{source['bo3Format']}-{DEFAULT_CUTOFF}.json",
+        DEFAULT_DEX,
+        DEFAULT_OUTPUT,
+        MAX_SPREADS_PER_BUCKET,
+        MIN_NATURE_SHARE,
         args.month,
     )
 
     buckets = sum(len(by_nature) for by_nature in payload["spreads"].values())
     print(
-        f"Wrote {args.out}: {len(payload['spreads'])} species, {buckets} buckets, "
-        f"{args.out.stat().st_size / 1024:.0f} KiB"
+        f"Wrote {DEFAULT_OUTPUT}: {len(payload['spreads'])} species, {buckets} buckets, "
+        f"{DEFAULT_OUTPUT.stat().st_size / 1024:.0f} KiB"
     )
     return 0
 

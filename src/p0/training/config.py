@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields, replace
@@ -11,7 +12,6 @@ from typing import Any
 from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS, ProjectPaths
 
 
@@ -124,31 +124,32 @@ class TeamsConfig:
 @dataclass(frozen=True, slots=True)
 class BotConfig:
     username: str = "Bot"
-    password: str | None = None
-    battle_format: str = FORMAT.bo3_format
     websocket_url: str | None = None
     authentication_url: str | None = None
     checkpoint_path: Path | None = None
-    team_files: tuple[Path, ...] = ()
     top_p: float = 0.9
-    max_concurrent_battles: int = 1
     challenge_limit: int = 1_000_000
     opponent: str | None = None
     allow_random_init: bool = False
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.team_files, tuple):
-            object.__setattr__(self, "team_files", tuple(self.team_files))
-
-        if self.battle_format != FORMAT.bo3_format:
-            raise ValueError(f"bot.battle_format must be the Bo3 format {FORMAT.bo3_format!r}")
-
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError("bot.top_p must be in (0, 1]")
-
-        if type(self.max_concurrent_battles) is not int or self.max_concurrent_battles != 1:
-            raise ValueError("bot.max_concurrent_battles is fixed at 1 for live Bo3 play")
+        if type(self.challenge_limit) is not int or self.challenge_limit < 1:
+            raise ValueError("bot.challenge_limit must be a positive integer")
+        if (self.websocket_url is None) != (self.authentication_url is None):
+            raise ValueError(
+                "bot.websocket_url and bot.authentication_url must be configured together"
+            )
+        for name, url in (
+            ("websocket_url", self.websocket_url),
+            ("authentication_url", self.authentication_url),
+        ):
+            if url is not None and not url.strip():
+                raise ValueError(f"bot.{name} must not be empty")
+        if self.log_level.upper() not in logging.getLevelNamesMapping():
+            raise ValueError(f"bot.log_level is not a known logging level: {self.log_level!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,9 +167,13 @@ class BCConfig:
     seed: int = 0
     enable_optim: bool = True
     shard_manifest: Path = Path("artifacts/shards/manifest.json")
-    split_manifest: Path = Path("artifacts/shards/splits.json")
     output_dir: Path = Path("artifacts/checkpoints/bc")
     resume_checkpoint: Path | None = None
+
+    @property
+    def split_manifest_path(self) -> Path:
+        """Return the split manifest stored beside the shard manifest."""
+        return self.shard_manifest.parent / "splits.json"
 
     def __post_init__(self) -> None:
         _positive_ints(self, "batch_decisions", "max_chunk_size", "epochs")
@@ -188,7 +193,6 @@ class BCConfig:
 
         for name, value in (
             ("shard_manifest", self.shard_manifest),
-            ("split_manifest", self.split_manifest),
             ("output_dir", self.output_dir),
         ):
             if not str(value).strip():
@@ -251,13 +255,12 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
             if config.bot.checkpoint_path is not None
             else None
         ),
-        team_files=tuple(_resolve_path(p, root) for p in config.bot.team_files),
     )
     teams = _resolve_fields(config.teams, paths.teams_root, {"all", "reduced"})
     bc = _resolve_fields(
         config.bc,
         root,
-        {"shard_manifest", "split_manifest", "output_dir", "resume_checkpoint"},
+        {"shard_manifest", "output_dir", "resume_checkpoint"},
     )
     evaluation = _resolve_fields(config.evaluation, root, {"report_dir"})
 
@@ -284,9 +287,6 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
     )
     if not path.is_absolute():
         path = DEFAULT_PATHS.repository_root / path
-
-    if path.name in {".ppoconfig", ".ppoconfig.example"}:
-        raise ValueError(".ppoconfig is no longer supported; migrate settings to config.yaml")
 
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {path}")

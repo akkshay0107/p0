@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import logging
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -17,8 +15,6 @@ from p0.replays.group import group_replays
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.scrape import ReplayFetcher, ScrapeConfig, load_raw_replay
 
-logger = logging.getLogger(__name__)
-
 
 def _parser() -> argparse.ArgumentParser:
     """Build the argument parser for replay operations."""
@@ -28,44 +24,32 @@ def _parser() -> argparse.ArgumentParser:
     scrape = subparsers.add_parser("scrape")
     scrape.add_argument("--cache-dir", type=Path, default=Path("artifacts/replays"))
     scrape.add_argument("--limit-games", type=int, default=50)
-    scrape.add_argument("--max-pages", type=int, default=100)
-    scrape.add_argument("--concurrency", type=int, default=4)
     scrape.add_argument("--replay-id", action="append", default=None)
 
     build = subparsers.add_parser("build-shards")
     build.add_argument("--cache-dir", type=Path, default=Path("artifacts/replays"))
     build.add_argument("--output-dir", type=Path, default=Path("artifacts/shards"))
-    build.add_argument("--max-candidates", type=int, default=256)
-    build.add_argument("--max-decisions-per-shard", type=int, default=4096)
-    build.add_argument(
-        "--max-parse-errors",
-        type=int,
-        default=0,
-        help="Maximum malformed cached replay files allowed before failing.",
-    )
 
     splits = subparsers.add_parser("create-splits")
     splits.add_argument("--shard-manifest", type=Path, required=True)
-    splits.add_argument("--output", type=Path, default=None)
-    splits.add_argument("--seed", type=int, default=0)
-    splits.add_argument("--validation-fraction", type=float, default=0.1)
-    splits.add_argument("--test-fraction", type=float, default=0.1)
 
     return parser
 
 
-def _scrape(args: argparse.Namespace) -> dict[str, Any]:
-    """Scrape replays from Pokemon Showdown based on the config parameters."""
+def _scrape(
+    cache_dir: Path,
+    limit_games: int,
+    replay_ids: list[str] | None,
+) -> dict[str, Any]:
+    """Scrape Pokemon Showdown replays up to the selected game limit."""
     config = ScrapeConfig(
         format_id=FORMAT.bo3_format,
-        cache_dir=args.cache_dir,
-        max_pages=args.max_pages,
-        limit_games=args.limit_games,
-        concurrency=args.concurrency,
+        cache_dir=cache_dir,
+        limit_games=limit_games,
     )
 
     fetcher = ReplayFetcher(config)
-    entries = fetcher.acquire(args.replay_id)
+    entries = fetcher.acquire(replay_ids)
     documents = []
     unparsed = 0
 
@@ -74,7 +58,7 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
             documents.append(
                 parse_replay_payload(
                     load_raw_replay(
-                        args.cache_dir / FORMAT.bo3_format / "raw" / f"{entry.replay_id}.json.gz"
+                        cache_dir / FORMAT.bo3_format / "raw" / f"{entry.replay_id}.json.gz"
                     ),
                     replay_id=entry.replay_id,
                     format_id=FORMAT.bo3_format,
@@ -93,15 +77,12 @@ def _scrape(args: argparse.Namespace) -> dict[str, Any]:
         "accepted_games": None,
         "rejected_games": None,
         "dataset_hash": None,
-        "limit_games": args.limit_games,
+        "limit_games": limit_games,
     }
 
 
-def _yield_documents(
-    cache_dir: Path,
-    parse_errors: dict[str, str],
-) -> Iterator[ReplayDocument]:
-    """Yield cached documents while retaining identities of malformed inputs."""
+def _yield_documents(cache_dir: Path) -> Iterator[ReplayDocument]:
+    """Yield parsed replay documents from the cache."""
     for path in sorted((cache_dir / FORMAT.bo3_format / "raw").glob("*.json.gz")):
         identity = path.name.removesuffix(".json.gz")
         try:
@@ -112,32 +93,15 @@ def _yield_documents(
                 format_id=FORMAT.bo3_format,
             )
         except (OSError, TypeError, ValueError) as exc:
-            try:
-                parse_errors[identity] = hashlib.sha256(load_raw_replay(path)).hexdigest()
-            except ValueError:
-                parse_errors[identity] = hashlib.sha256(path.read_bytes()).hexdigest()
-            logger.warning("Rejected malformed cached replay %s: %s", identity, exc)
+            raise ValueError(f"Malformed cached replay: {path}") from exc
 
 
-def _build(args: argparse.Namespace) -> dict[str, Any]:
+def _build(cache_dir: Path, output_dir: Path) -> dict[str, Any]:
     """Compile a folder of scraped raw replays into PyTorch tensor shards."""
-    if args.max_parse_errors < 0:
-        raise ValueError("--max-parse-errors must be non-negative")
-    parse_errors: dict[str, str] = {}
-    documents = tuple(_yield_documents(args.cache_dir, parse_errors))
-    if len(parse_errors) > args.max_parse_errors:
-        raise ValueError(
-            f"Cached replay parse errors ({len(parse_errors)}) exceed the allowed threshold "
-            f"({args.max_parse_errors}): {tuple(parse_errors)}"
-        )
-
     built = compile_to_shards(
-        documents=documents,
-        output_dir=args.output_dir,
+        documents=_yield_documents(cache_dir),
+        output_dir=output_dir,
         format_id=FORMAT.bo3_format,
-        max_candidates=args.max_candidates,
-        max_decisions_per_shard=args.max_decisions_per_shard,
-        external_rejections=parse_errors,
     )
 
     manifest = built.manifest
@@ -150,25 +114,21 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
         "accepted_games": manifest.accepted_games,
         "rejected_games": manifest.rejected_games,
         "source_series": len(manifest.source_series),
-        "parse_errors": list(parse_errors),
     }
 
 
-def _create_splits(args: argparse.Namespace) -> dict[str, Any]:
+def _create_splits(shard_manifest: Path) -> dict[str, Any]:
     """Assign validation and test splits uniformly across all compiled series."""
-    dataset = LazyReplayDataset(args.shard_manifest)
+    dataset = LazyReplayDataset(shard_manifest)
     manifest = dataset.manifest
     series_ids = dataset.accepted_series_ids()
     split = assign_series_splits(
         series_ids,
-        seed=args.seed,
-        validation_fraction=args.validation_fraction,
-        test_fraction=args.test_fraction,
         global_contract_sha256=manifest.global_contract_sha256,
         dataset_hash=manifest.dataset_hash,
     )
 
-    output = args.output or args.shard_manifest.parent / "splits.json"
+    output = shard_manifest.parent / "splits.json"
     write_split_manifest(split, output)
 
     counts = {
@@ -178,7 +138,7 @@ def _create_splits(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "split_manifest_path": str(output.resolve()),
-        "shard_manifest_path": str(args.shard_manifest.resolve()),
+        "shard_manifest_path": str(shard_manifest.resolve()),
         "dataset_hash": manifest.dataset_hash,
         "global_hash": manifest.global_contract_sha256,
         "source_series": len(series_ids),
@@ -194,11 +154,11 @@ def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
 
     if args.command == "scrape":
-        result = _scrape(args)
+        result = _scrape(args.cache_dir, args.limit_games, args.replay_id)
     elif args.command == "build-shards":
-        result = _build(args)
+        result = _build(args.cache_dir, args.output_dir)
     else:
-        result = _create_splits(args)
+        result = _create_splits(args.shard_manifest)
 
     print(json.dumps(result, sort_keys=True))
 

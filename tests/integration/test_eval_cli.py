@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from p0.cli.eval import main
-from p0.runtime.showdown import allocate_loopback_ports
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
@@ -18,11 +17,14 @@ class TestEvaluationCLI:
     def test_completed_matchup_writes_report(self, tmp_path: Path) -> None:
         team_path = tmp_path / "team.txt"
         team_path.write_text(DEFAULT_TEST_TEAM)
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("{}\n", encoding="utf-8")
         report_dir = tmp_path / "reports"
-        port = allocate_loopback_ports(1)[0]
 
         code = main(
             [
+                "--config",
+                str(config_path),
                 "--teams-path",
                 str(team_path),
                 "--episodes",
@@ -31,8 +33,6 @@ class TestEvaluationCLI:
                 "17",
                 "--report-dir",
                 str(report_dir),
-                "--port",
-                str(port),
             ]
         )
 

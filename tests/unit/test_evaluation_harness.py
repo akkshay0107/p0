@@ -61,7 +61,7 @@ class TestEvaluationHarness:
             json.dumps(manifest.to_dict()), encoding="utf-8"
         )
 
-        harness = EvaluationHarness(teams_path=pool_dir, format_id=FORMAT.bo3_format)
+        harness = EvaluationHarness(teams_path=pool_dir)
         source = harness.build_team_source()
         assert isinstance(source, CorpusTeamSource)
 

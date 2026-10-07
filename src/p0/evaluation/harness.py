@@ -233,20 +233,12 @@ class EvaluationHarness:
         self,
         *,
         teams_path: Path | None = None,
-        format_id: str = FORMAT.bo3_format,
         episodes_per_matchup: int = 20,
         seed: int = 0,
-        port: int = 8120,
     ) -> None:
-        if format_id != FORMAT.bo3_format:
-            raise ValueError(
-                f"EvaluationHarness only supports {FORMAT.bo3_format!r}; got {format_id!r}"
-            )
         self.teams_path = teams_path
-        self.format_id = format_id
+        self.format_id = FORMAT.bo3_format
         self.episodes_per_matchup = episodes_per_matchup
-        self.seed = seed
-        self.port = port
         self.rng = random.Random(seed)
 
     def build_team_source(self) -> TeamSource:

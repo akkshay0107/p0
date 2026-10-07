@@ -39,8 +39,10 @@ teams:
 
 bot:
   username: Bot
+  # Set both URLs to use a remote Showdown server; omit both for localhost.
+  websocket_url: null
+  authentication_url: null
   top_p: 0.9
-  max_concurrent_battles: 1
   challenge_limit: 1000000
   allow_random_init: false
   log_level: INFO
@@ -54,9 +56,8 @@ bc:
   seed: 0
   enable_optim: true
   # Placeholders: replace with the manifest_path printed by `p0-replays build-shards`
-  # and the splits.json that `p0-replays create-splits` writes next to it.
+  # `p0-replays create-splits` writes splits.json beside this manifest.
   shard_manifest: artifacts/shards/<global-contract-hash>/<dataset-hash>/manifest.json
-  split_manifest: artifacts/shards/<global-contract-hash>/<dataset-hash>/splits.json
   output_dir: artifacts/checkpoints/bc
   resume_checkpoint: null
 

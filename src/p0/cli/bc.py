@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import replace
 from pathlib import Path
 
 from p0.training.bc_runner import evaluate_bc, train_bc
-from p0.training.config import BCConfig, load_config
+from p0.training.config import load_config
 from p0.training.files import cancellation_signals
 
 
@@ -18,14 +17,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name in ("train", "evaluate"):
         command = subparsers.add_parser(name)
-        command.add_argument("--config", type=Path, default=Path("config.yaml"))
-        command.add_argument("--shard-manifest", type=Path, default=None)
-        command.add_argument("--split-manifest", type=Path, default=None)
-        command.add_argument("--output-dir", type=Path, default=None)
+        command.add_argument(
+            "--config", type=Path, help="Path to the YAML application configuration."
+        )
         command.add_argument("--device", default=None)
-
-    train = subparsers.choices["train"]
-    train.add_argument("--resume-checkpoint", type=Path, default=None)
 
     evaluate = subparsers.choices["evaluate"]
     evaluate.add_argument("--checkpoint", type=Path, required=True)
@@ -37,29 +32,10 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolved_config(args: argparse.Namespace) -> BCConfig:
-    """Resolve the BC configuration with CLI overrides."""
-    config = load_config(args.config).bc
-    output_dir = config.output_dir if args.output_dir is None else args.output_dir.resolve()
-    resume = getattr(args, "resume_checkpoint", None)
-
-    return replace(
-        config,
-        shard_manifest=(
-            config.shard_manifest if args.shard_manifest is None else args.shard_manifest.resolve()
-        ),
-        split_manifest=(
-            config.split_manifest if args.split_manifest is None else args.split_manifest.resolve()
-        ),
-        output_dir=output_dir,
-        resume_checkpoint=(config.resume_checkpoint if resume is None else resume.resolve()),
-    )
-
-
 def main(argv: list[str] | None = None) -> None:
     """BC CLI entrypoint."""
     args = _parser().parse_args(argv)
-    config = _resolved_config(args)
+    config = load_config(args.config).bc
 
     if args.command == "train":
         with cancellation_signals() as cancel_requested:
