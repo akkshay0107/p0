@@ -236,34 +236,34 @@ class TestReplayInputContract:
 
     def test_public_bo3_metadata_and_empty_protocol_commands_are_preserved(self) -> None:
         """Verify public Showdown best-of-3 HTML headers parse parent room IDs and game numbers correctly."""
-        payload = sample_replay_payload("gen9championsvgc2026regmbbo3-100")
+        payload = sample_replay_payload("gen9championsvgc2026regmcbo3-100")
         payload.pop("p1")
         payload.pop("p2")
         payload.pop("parent")
         payload.pop("game_number")
         payload["players"] = ["Alice", "Bob"]
-        payload["format"] = "[Gen 9 Champions] VGC 2026 Reg M-B (Bo3)"
-        payload["formatid"] = "gen9championsvgc2026regmbbo3"
+        payload["format"] = "[Gen 9 Champions] VGC 2026 Reg M-C (Bo3)"
+        payload["formatid"] = "gen9championsvgc2026regmcbo3"
         payload["log"] = "\n".join(
             [
                 "|uhtml|bestof|<h2><strong>Game 1</strong> of "
-                '<a href="/game-bestof3-gen9championsvgc2026regmbbo3-99">a best-of-3</a></h2>',
+                '<a href="/game-bestof3-gen9championsvgc2026regmcbo3-99">a best-of-3</a></h2>',
                 "|",
                 "||Alice is ready for game 2.",
                 str(payload["log"]),
                 "|uhtml|next|Next: "
-                '<a href="/battle-gen9championsvgc2026regmbbo3-101">'
+                '<a href="/battle-gen9championsvgc2026regmcbo3-101">'
                 "<strong>Game 2 of 3</strong></a>",
             ]
         )
 
         document = parse_replay_payload(
             payload,
-            format_id="gen9championsvgc2026regmbbo3",
+            format_id="gen9championsvgc2026regmcbo3",
         )
 
-        assert document.metadata.format_id == "gen9championsvgc2026regmbbo3"
-        assert document.metadata.parent_room == ("game-bestof3-gen9championsvgc2026regmbbo3-99")
+        assert document.metadata.format_id == "gen9championsvgc2026regmcbo3"
+        assert document.metadata.parent_room == ("game-bestof3-gen9championsvgc2026regmcbo3-99")
         assert document.metadata.game_number == 1
         assert [line.raw for line in document.protocol_lines[:3]] == [
             str(payload["log"]).splitlines()[0],
@@ -285,11 +285,11 @@ class TestReplayInputContract:
 
     def test_link_extraction_is_same_format_and_model_agnostic(self) -> None:
         """Verify linked_replay_ids only extracts next-game hyperlinks matching the active battle format."""
-        payload = sample_replay_payload("gen9championsvgc2026regmbbo3-100")
+        payload = sample_replay_payload("gen9championsvgc2026regmcbo3-100")
         payload["log"] = "\n".join(
             [
-                '|uhtml|bestof|<a href="/game-bestof3-gen9championsvgc2026regmbbo3-99">series</a>',
-                '|uhtml|next|<a href="/battle-gen9championsvgc2026regmbbo3-101">Game 2</a>',
+                '|uhtml|bestof|<a href="/game-bestof3-gen9championsvgc2026regmcbo3-99">series</a>',
+                '|uhtml|next|<a href="/battle-gen9championsvgc2026regmcbo3-101">Game 2</a>',
                 '|uhtml|other|<a href="/battle-gen9otherformat-5">other</a>',
             ]
         )
@@ -297,8 +297,8 @@ class TestReplayInputContract:
 
         assert linked_replay_ids(
             body,
-            format_id="gen9championsvgc2026regmbbo3",
-        ) == ("gen9championsvgc2026regmbbo3-101",)
+            format_id="gen9championsvgc2026regmcbo3",
+        ) == ("gen9championsvgc2026regmcbo3-101",)
 
     def test_packed_open_team_sheet_imputation_is_deterministic(self) -> None:
         """Verify open team sheet EV/stat imputation is deterministic across repeated runs."""
@@ -343,9 +343,9 @@ class TestReplayInputContract:
         # only one physical and one status move, so no fallback category reaches two.
         by_member = {item.member_id: item for item in first}
         pikachu_stat = by_member[document.ots[0].members[0].member_id]
-        assert pikachu_stat.values == (112, 107, 60, 63, 70, 156)
+        assert pikachu_stat.values == (111, 107, 61, 63, 71, 155)
         assert pikachu_stat.provenance == "IMPUTED"
-        assert pikachu_stat.confidence == pytest.approx(0.625929, rel=1e-4)
+        assert pikachu_stat.confidence == pytest.approx(0.470793, rel=1e-4)
 
         bulbasaur_stat = by_member[document.ots[1].members[0].member_id]
         assert bulbasaur_stat.values is None

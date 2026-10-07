@@ -46,12 +46,12 @@ class TestReplayScraping:
             for est in game.stat_estimates
             if est.member_id.side.value == "p1" and est.member_id.roster_index == 0
         )
-        assert pikachu_estimate.values == (112, 107, 60, 63, 70, 156)
+        assert pikachu_estimate.values == (111, 107, 61, 63, 71, 155)
         assert pikachu_estimate.provenance == "IMPUTED"
 
         stat_overrides = {estimate.member_id: estimate.values for estimate in game.stat_estimates}
         builder = ObservationBuilder(default_runtime_resources())
-        expected_pikachu = [112 / 300, 107 / 300, 60 / 300, 63 / 300, 70 / 300, 156 / 300]
+        expected_pikachu = [111 / 300, 107 / 300, 61 / 300, 63 / 300, 71 / 300, 155 / 300]
 
         # Perspective 0: Pikachu is on player team (slot 0)
         p0_obs = _replay_observation(

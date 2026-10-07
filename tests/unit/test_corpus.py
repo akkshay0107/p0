@@ -122,7 +122,7 @@ class TestCorpusManifest:
         serialized = {
             "artifact_schema": "p0.team_corpus.v1",
             "global_contract_sha256": active_sha,
-            "format_id": "gen9championsvgc2026regmb",
+            "format_id": "gen9championsvgc2026regmc",
             "corpus_hash": "fcab590ee1e21a55318c3b07fccf5722186e293bb6f261db1941d1919b8c6f05",
             "entries": [
                 {
@@ -138,7 +138,7 @@ class TestCorpusManifest:
         }
         manifest = TeamCorpusManifest(
             global_contract_sha256=active_sha,
-            format_id="gen9championsvgc2026regmb",
+            format_id="gen9championsvgc2026regmc",
             corpus_hash="fcab590ee1e21a55318c3b07fccf5722186e293bb6f261db1941d1919b8c6f05",
             entries=entries,
             created_at="2026-08-01T00:00:00Z",
@@ -158,7 +158,7 @@ class TestCorpusManifest:
         with pytest.raises(ValueError, match="Duplicate corpus entry"):
             TeamCorpusManifest(
                 global_contract_sha256=active_sha,
-                format_id="gen9championsvgc2026regmb",
+                format_id="gen9championsvgc2026regmc",
                 corpus_hash=corpus_content_hash((entry, entry)),
                 entries=(entry, entry),
                 created_at="2026-08-01T00:00:00Z",
@@ -171,7 +171,7 @@ class TestCorpusManifest:
         with pytest.raises(ValueError, match="does not match the entries"):
             TeamCorpusManifest(
                 global_contract_sha256=active_sha,
-                format_id="gen9championsvgc2026regmb",
+                format_id="gen9championsvgc2026regmc",
                 corpus_hash="0" * 64,
                 entries=entries,
                 created_at="2026-08-01T00:00:00Z",
@@ -184,7 +184,7 @@ class TestCorpusManifest:
         with pytest.raises(ValueError, match="Unsupported corpus manifest schema"):
             TeamCorpusManifest(
                 global_contract_sha256=active_sha,
-                format_id="gen9championsvgc2026regmb",
+                format_id="gen9championsvgc2026regmc",
                 corpus_hash=corpus_content_hash(entries),
                 entries=entries,
                 created_at="2026-08-01T00:00:00Z",

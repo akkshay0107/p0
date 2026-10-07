@@ -20,9 +20,15 @@ from p0.model.structured_observation import (
     NUM_IDX_LEGALITY_UNKNOWN,
     StatProvenance,
 )
-from p0.replays.compile import compile_documents, compile_payloads, write_tensor_shards
+from p0.replays.compile import compile_payloads, write_tensor_shards
+from p0.replays.group import group_replays
 from p0.replays.protocol import parse_replay_payload
-from p0.replays.reconstruction.projection import impute_replay_stats, project_battle_view
+from p0.replays.reconstruction.decisions import reconstruct_decisions_from_trace
+from p0.replays.reconstruction.projection import (
+    impute_replay_stats,
+    project_battle_view,
+    project_replay_perspectives,
+)
 from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import AbilityState, reduce_replay_state
 from tests.unit.replay_fixtures import decision_payload, golden_replay_payload
@@ -70,12 +76,24 @@ class TestReconstructionProjection:
                 altered if member.member_id == hidden_id else member for member in original.members
             ),
         )
-        first_game = replace(document, metadata=replace(document.metadata, game_number=1))
-        compiled = compile_documents((first_game,), chunksize=0)
+        dex = default_runtime_resources().dex
+        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
+        replay_state = reduce_replay_state(
+            document.metadata.replay_id, document.ots, replay_events, dex=dex
+        )
+        decisions = (
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=0, dex=dex
+            ),
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=1, dex=dex
+            ),
+        )
+        perspectives = project_replay_perspectives(
+            document, replay_events, replay_state, decisions, dex=dex
+        )
         decision = next(
-            item.view.decision
-            for item in compiled.accepted_series[0].games[0].perspectives[0].snapshots
-            if item.pre_line_index == 112
+            item.view.decision for item in perspectives[0].snapshots if item.pre_line_index == 112
         )
         first_view = project_battle_view(
             original, document.ots, perspective=0, decision=decision, dex=resources.dex
@@ -92,9 +110,23 @@ class TestReconstructionProjection:
     def test_unrevealed_illusion_uses_displayed_public_fields(self) -> None:
         path = _ILLUSION_REPLAY
         document = parse_replay_payload(path.read_bytes())
-        first_game = replace(document, metadata=replace(document.metadata, game_number=1))
-        result = compile_documents((first_game,), chunksize=0)
-        perspective = result.accepted_series[0].games[0].perspectives[0]
+        dex = default_runtime_resources().dex
+        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
+        replay_state = reduce_replay_state(
+            document.metadata.replay_id, document.ots, replay_events, dex=dex
+        )
+        decisions = (
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=0, dex=dex
+            ),
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=1, dex=dex
+            ),
+        )
+        perspectives = project_replay_perspectives(
+            document, replay_events, replay_state, decisions, dex=dex
+        )
+        perspective = perspectives[0]
         snapshot = next(
             snapshot
             for snapshot in perspective.snapshots
@@ -112,7 +144,7 @@ class TestReconstructionProjection:
         assert tuple(value.name for value in disguised.types) == ("Grass", "Poison")
         own_snapshot = next(
             item
-            for item in result.accepted_series[0].games[0].perspectives[1].snapshots
+            for item in perspectives[1].snapshots
             if item.pre_line_index == snapshot.pre_line_index
         )
         own_active = own_snapshot.view.active_pokemon[0]
@@ -142,12 +174,24 @@ class TestReconstructionProjection:
         assert known_venusaur is not None
         bench_side = replace(state.sides[1], active=(state.sides[1].active[0], None))
         bench_state = replace(state, sides=(state.sides[0], bench_side))
-        first_game = replace(document, metadata=replace(document.metadata, game_number=1))
-        compiled = compile_documents((first_game,), chunksize=0)
+        dex = default_runtime_resources().dex
+        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
+        replay_state = reduce_replay_state(
+            document.metadata.replay_id, document.ots, replay_events, dex=dex
+        )
+        decisions = (
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=0, dex=dex
+            ),
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=1, dex=dex
+            ),
+        )
+        perspectives = project_replay_perspectives(
+            document, replay_events, replay_state, decisions, dex=dex
+        )
         decision = next(
-            item.view.decision
-            for item in compiled.accepted_series[0].games[0].perspectives[0].snapshots
-            if item.pre_line_index == 112
+            item.view.decision for item in perspectives[0].snapshots if item.pre_line_index == 112
         )
 
         view = project_battle_view(
@@ -282,26 +326,66 @@ class TestReconstructionProjection:
     def test_golden_corpus_retains_only_resolved_illusion_histories(self) -> None:
         paths = tuple(sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")))
         documents = tuple(parse_replay_payload(path.read_bytes()) for path in paths)
-        result = compile_documents(documents, chunksize=0)
+        grouping = group_replays(documents)
+        dex = default_runtime_resources().dex
+        accepted_ids: set[str] = set()
+        rejections: list[str] = []
+        for document in documents:
+            resolved = resolve_replay_events(document, dex=dex)
+            if resolved.diagnostics:
+                rejections.append(resolved.diagnostics[0].category.value)
+                continue
+            events = resolved.require_accepted()
+            state = reduce_replay_state(document.metadata.replay_id, document.ots, events, dex=dex)
+            if state.diagnostics:
+                rejections.append(state.diagnostics[0].category.value)
+                continue
+            decisions = (
+                reconstruct_decisions_from_trace(document, events, state, perspective=0, dex=dex),
+                reconstruct_decisions_from_trace(document, events, state, perspective=1, dex=dex),
+            )
+            diagnostics = tuple(item for result in decisions for item in result.diagnostics)
+            if diagnostics:
+                rejections.append(diagnostics[0].category.value)
+                continue
+            perspectives = project_replay_perspectives(document, events, state, decisions, dex=dex)
+            assert all(len(item.snapshots) == len(item.decisions) for item in perspectives)
+            accepted_ids.add(document.metadata.replay_id)
 
         assert len(paths) == 51
-        assert result.metrics.counters["accepted_games"] == 33
-        assert result.metrics.counters["rejected_games"] == 18
-        assert result.metrics.counters["rejected_reconstruction_AMBIGUOUS_IDENTITY"] == 11
-        assert result.metrics.counters["complete_series"] == 11
-        assert result.metrics.counters["rejected_non_contiguous_game_numbers"] == 1
-        assert all(
-            len(perspective.snapshots) == len(perspective.decisions)
-            for series in result.accepted_series
-            for game in series.games
-            for perspective in game.perspectives
+        assert len(accepted_ids) == 40
+        assert len(rejections) == 11
+        accepted_groups = tuple(
+            group
+            for group in grouping.series
+            if not any(item.code == "non_contiguous_game_numbers" for item in group.diagnostics)
+            and all(game.metadata.replay_id in accepted_ids for game in group.games)
         )
+        assert sum(len(group.games) for group in accepted_groups) == 33
+        assert sum(group.record.is_complete for group in accepted_groups) == 11
+        assert rejections.count("AMBIGUOUS_IDENTITY") == 11
+        assert sum(item.code == "non_contiguous_game_numbers" for item in grouping.diagnostics) == 1
 
     def test_state_matches_independent_poke_env_cursors(self) -> None:
         path = _STATE_REPLAY
         document = parse_replay_payload(path.read_bytes())
-        result = compile_payloads((document.raw_payload,), chunksize=0)
-        perspective = result.accepted_series[0].games[0].perspectives[0]
+        dex = default_runtime_resources().dex
+        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
+        replay_state = reduce_replay_state(
+            document.metadata.replay_id, document.ots, replay_events, dex=dex
+        )
+        decisions = (
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=0, dex=dex
+            ),
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=1, dex=dex
+            ),
+        )
+        perspectives = project_replay_perspectives(
+            document, replay_events, replay_state, decisions, dex=dex
+        )
+        perspective = perspectives[0]
         boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
         oracle = DoubleBattle(
             document.metadata.replay_id,
@@ -351,8 +435,23 @@ class TestSpatialEventIntervals:
         """A waiting player's interval spans the opponent's decision instead of resetting."""
         payload = _STATE_REPLAY.read_bytes()
         raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
-        result = compile_payloads((payload,), chunksize=0)
-        perspectives = result.accepted_series[0].games[0].perspectives
+        document = parse_replay_payload(payload)
+        dex = default_runtime_resources().dex
+        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
+        replay_state = reduce_replay_state(
+            document.metadata.replay_id, document.ots, replay_events, dex=dex
+        )
+        decisions = (
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=0, dex=dex
+            ),
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=1, dex=dex
+            ),
+        )
+        perspectives = project_replay_perspectives(
+            document, replay_events, replay_state, decisions, dex=dex
+        )
         starts = [[snapshot.pre_line_index for snapshot in item.snapshots] for item in perspectives]
 
         spans_opponent_decision = 0
@@ -377,8 +476,23 @@ class TestSpatialEventIntervals:
         """The last exchange has no request; the final view keeps it with no choice."""
         payload = _STATE_REPLAY.read_bytes()
         raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
-        result = compile_payloads((payload,), chunksize=0)
-        perspectives = result.accepted_series[0].games[0].perspectives
+        document = parse_replay_payload(payload)
+        dex = default_runtime_resources().dex
+        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
+        replay_state = reduce_replay_state(
+            document.metadata.replay_id, document.ots, replay_events, dex=dex
+        )
+        decisions = (
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=0, dex=dex
+            ),
+            reconstruct_decisions_from_trace(
+                document, replay_events, replay_state, perspective=1, dex=dex
+            ),
+        )
+        perspectives = project_replay_perspectives(
+            document, replay_events, replay_state, decisions, dex=dex
+        )
 
         for perspective in perspectives:
             final_interval = raw_lines[perspective.snapshots[-1].pre_line_index :]

@@ -8,10 +8,10 @@ const ts = require('../pokemon-showdown/node_modules/typescript');
 
 const ROOT = path.resolve(__dirname, '..', 'pokemon-showdown');
 const DATA_ROOT = path.resolve(ROOT, '..', 'data');
-const EXPECTED = '8282e63102fa824fd2f7472778ec09793ceb7cac';
+const EXPECTED = 'c046106cbe075931b1ff8d8b800ff5be47a85f96';
 const DIRECTORIES = ['config/formats.ts', 'data/mods/champions', 'sim', 'data'];
 const DATA_FILES = new Set(['moves.ts', 'abilities.ts', 'items.ts', 'conditions.ts', 'rulesets.ts']);
-const FORMATS = ['gen9championsvgc2026regmb', 'gen9championsvgc2026regmbbo3'];
+const FORMATS = ['gen9championsvgc2026regmc', 'gen9championsvgc2026regmcbo3'];
 const CALLS = new Set(['add', 'addMove', 'addSplit', 'attrLastMove', 'retargetLastMove']);
 const {Dex} = require('../pokemon-showdown/dist/sim/dex');
 const ACTIVE_RULES = new Set(FORMATS.flatMap(id => {

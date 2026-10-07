@@ -286,23 +286,23 @@ class TestSpreadValidation:
 
     def test_usage_export_url_matches_the_published_layout(self) -> None:
         """Verify Smogon stats URL formatter generates valid external chaos data paths."""
-        url = USAGE_URL.format(month="2026-07", format_id="gen9championsvgc2026regmb", cutoff=1760)
+        url = USAGE_URL.format(month="2026-09", format_id="gen9championsvgc2026regmc", cutoff=1760)
         assert url == (
-            "https://www.smogon.com/stats/2026-07/chaos/gen9championsvgc2026regmb-1760.json.gz"
+            "https://www.smogon.com/stats/2026-09/chaos/gen9championsvgc2026regmc-1760.json.gz"
         )
 
     def test_shipped_spread_table_pins_its_source_exports(self) -> None:
-        """Verify the committed spread table names the 2026-07 exports and their SHA-256 digests."""
+        """Verify the committed spread table names the 2026-09 exports and their SHA-256 digests."""
         source = orjson.loads(DEFAULT_SPREAD_TABLE_PATH.read_bytes())["source"]
 
         assert source == {
-            "month": "2026-07",
+            "month": "2026-09",
             "exports": {
-                "gen9championsvgc2026regmb-1760.json": (
-                    "02aeefcada5928a6f2b21583c1ae30aa61fb638ba952eed9f1a011f781eccdf7"
+                "gen9championsvgc2026regmc-1760.json": (
+                    "923a9744a1210a9957313ee505e0735e5f0437746bd4e6e030f8b6f9113ed000"
                 ),
-                "gen9championsvgc2026regmbbo3-1760.json": (
-                    "56ffb15d16477a72f8f38935a5dfc4db274aa06c09520b717fdc22e59dde780e"
+                "gen9championsvgc2026regmcbo3-1760.json": (
+                    "f944e2de85ee262f20caa75b6a7b500dc8cfe6347264c142c16c1b0829813ee7"
                 ),
             },
         }
@@ -337,5 +337,5 @@ class TestSpreadValidation:
         assert first is not None
         assert first == second
         assert first.origin == IMPUTED_FROM_USAGE
-        assert first.points == StatPoints(hp=2, atk=0, defense=0, spa=32, spd=0, spe=32)
-        assert first.confidence == pytest.approx(0.24277, rel=1e-4)
+        assert first.points == StatPoints(hp=12, atk=0, defense=14, spa=8, spd=0, spe=32)
+        assert first.confidence == pytest.approx(0.2157505685, rel=1e-4)

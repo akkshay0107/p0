@@ -96,7 +96,7 @@ class TestReplayCompiler:
         )
 
         assert built.manifest.accepted_games == 3
-        assert [shard.decisions for shard in built.manifest.shards] == [4, 8]
+        assert sorted(shard.decisions for shard in built.manifest.shards) == [4, 8]
 
     def test_source_series_preserves_game_number_order(self, tmp_path: Path) -> None:
         first = sample_replay_payload("z-game", game_number=1)
@@ -250,11 +250,11 @@ class TestReplayCompiler:
         assert built.manifest.accepted_games == 1
         assert built.manifest.rejected_games == 1
         assert set(built.manifest.raw_replays) == {"accepted", "malformed"}
-        assert dataset.accepted_series_ids() == ("863aaa3132d82aee2dc3c06c",)
+        assert dataset.accepted_series_ids() == ("72673574c974979d25baec4b",)
         assert dataset.manifest.raw_replays["malformed"] == "a" * 64
         chunks = tuple(dataset)
         assert len(chunks) == 2
-        assert all(chunk.series_id == "863aaa3132d82aee2dc3c06c" for chunk in chunks)
+        assert all(chunk.series_id == "72673574c974979d25baec4b" for chunk in chunks)
 
     def test_existing_dataset_ignores_legacy_release_report(self, tmp_path: Path) -> None:
         payload = golden_replay_payload("legacy-report", series_id="legacy-series")

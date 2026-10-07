@@ -15,10 +15,10 @@ const { TeamValidator } = require(
 );
 const { toID } = Dex;
 
-const SHOWDOWN_COMMIT = "8282e63102fa824fd2f7472778ec09793ceb7cac";
+const SHOWDOWN_COMMIT = "c046106cbe075931b1ff8d8b800ff5be47a85f96";
 const FORMAT_IDS = [
-  "gen9championsvgc2026regmb",
-  "gen9championsvgc2026regmbbo3",
+  "gen9championsvgc2026regmc",
+  "gen9championsvgc2026regmcbo3",
 ];
 
 function sortedObject(value) {
@@ -71,29 +71,68 @@ function normalizedSpecies(species) {
   ]);
 }
 
+const MOVE_DATA_FIELDS = [
+  "id",
+  "name",
+  "num",
+  "gen",
+  "isNonstandard",
+  "type",
+  "target",
+  "basePower",
+  "accuracy",
+  "priority",
+  "category",
+  "pp",
+  "noPPBoosts",
+  "flags",
+  "spreadHit",
+  "selfSwitch",
+  "volatileStatus",
+  "status",
+  "secondary",
+  "secondaries",
+  "boosts",
+  "self",
+  "heal",
+  "drain",
+  "recoil",
+  "damage",
+  "multihit",
+  "critRatio",
+  "defensiveCategory",
+  "forceSwitch",
+  "ignoreAbility",
+  "ignoreDefensive",
+  "ignoreEvasion",
+  "ignoreImmunity",
+  "isFutureMove",
+  "isMax",
+  "isZ",
+  "maxMove",
+  "zMove",
+  "breaksProtect",
+  "overrideOffensivePokemon",
+  "overrideDefensiveStat",
+  "pseudoWeather",
+  "selfBoost",
+  "selfdestruct",
+  "sideCondition",
+  "slotCondition",
+  "sleepUsable",
+  "stallingMove",
+  "stealsBoosts",
+  "terrain",
+  "thawsTarget",
+  "weather",
+];
 function normalizedMove(move) {
-  return pick(move, [
-    "id",
-    "name",
-    "num",
-    "gen",
-    "isNonstandard",
-    "type",
-    "target",
-    "basePower",
-    "accuracy",
-    "priority",
-    "category",
-    "pp",
-    "noPPBoosts",
-    "flags",
-    "spreadHit",
-    "selfSwitch",
-    "volatileStatus",
-    "status",
-    "secondary",
-    "secondaries",
-  ]);
+  const result = pick(move, MOVE_DATA_FIELDS);
+  // poke-env treats these keys' presence as a mechanics marker.
+  if (!move.isZ) delete result.isZ;
+  if (!move.isMax) delete result.isMax;
+  if (!move.noPPBoosts) delete result.noPPBoosts;
+  return result;
 }
 
 function normalizedItem(item) {
@@ -344,6 +383,7 @@ const output = {
     repository: "https://github.com/smogon/pokemon-showdown",
     commit: SHOWDOWN_COMMIT,
     mod: "champions",
+    moveFields: MOVE_DATA_FIELDS,
     formats,
   },
   species: useful(dex.species.all(), normalizedSpecies),

@@ -119,7 +119,7 @@ def sample_replay_payload(
     ]
     return {
         "id": replay_id,
-        "format": "gen9championsvgc2026regmbbo3",
+        "format": "gen9championsvgc2026regmcbo3",
         "p1": players[0],
         "p2": players[1],
         "uploadtime": 1_750_000_000,

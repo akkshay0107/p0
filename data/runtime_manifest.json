@@ -1,25 +1,4 @@
 {
-  "manifest_schema": 1,
-  "subsystems": {
-    "actions": {
-      "major_sha256": "cea4d0ef89979d9824b0341b801f3f4d04770dca51b38aa1bb0ae0c08fb610f9",
-      "minor_sha256": "96df4e1af3ad8450887d32ca312d5b4a7dd3860e5f4283fef5e622229ffcac47",
-      "major_version": 1,
-      "minor_version": 0
-    },
-    "model": {
-      "major_sha256": "fd534c7610d847cb44aa32bf0b0f661632d2a05b794623effd1e233312ec8e4a",
-      "minor_sha256": "85c1e35b7e7a53145ef7c77fd4415f122bdffa7dddfd52df5bef22f98c5326bd",
-      "major_version": 1,
-      "minor_version": 0
-    },
-    "resources": {
-      "major_sha256": "44b742aab01b1856bf0ab36e8b4cf42c74782dff9c021efa6c086ba6916aaeb6",
-      "minor_sha256": "7e7dabe3c280099d2597c82f2ee07f5cd0e3259f386145df450d5d1580d8aacb",
-      "major_version": 1,
-      "minor_version": 0
-    }
-  },
   "contracts": {
     "actions": {
       "major": {
@@ -104,16 +83,37 @@
     },
     "resources": {
       "major": {
-        "vocabulary_sha256": "b8380f7f6324664087d88c9ab62a27d5185602d46ad001de05627a3a18f3e752"
+        "vocabulary_sha256": "4e70582d7925ee1b9322fcfc14d6cdf8ef25bfdae287952159b2e04500d6c7e5"
       },
       "minor": {
-        "battle_format": "gen9championsvgc2026regmb",
-        "bo3_format": "gen9championsvgc2026regmbbo3",
-        "champions_dex_sha256": "ff537943b58172ab5a47503e9219edfe5da53296f60b5a2400eceb5a5682ecbc",
-        "showdown_commit": "8282e63102fa824fd2f7472778ec09793ceb7cac",
-        "spread_usage_sha256": "dd7336d665a33febee43bc6250c812400541b52eefc8a4ffbcaabd034b757ad3"
+        "battle_format": "gen9championsvgc2026regmc",
+        "bo3_format": "gen9championsvgc2026regmcbo3",
+        "champions_dex_sha256": "aa44f3cfe797dc4f65d59160911777a9d1794f3be9038d97f2ff9dfb6f728e69",
+        "showdown_commit": "c046106cbe075931b1ff8d8b800ff5be47a85f96",
+        "spread_usage_sha256": "88e6e8f881541de1df643f534f78b8aad70a702c4e9a7b3e0c8b4f453109971d"
       }
     }
   },
-  "global_sha256": "042c8da2c24089610824da03aae059179bd481fcfb8c5525a1b69688a20a26ef"
+  "global_sha256": "dd02c25d6cec9f0b865312a9cf305b5f2f34cb5fc6fe80ae0815091b49104848",
+  "manifest_schema": 1,
+  "subsystems": {
+    "actions": {
+      "major_sha256": "cea4d0ef89979d9824b0341b801f3f4d04770dca51b38aa1bb0ae0c08fb610f9",
+      "major_version": 1,
+      "minor_sha256": "96df4e1af3ad8450887d32ca312d5b4a7dd3860e5f4283fef5e622229ffcac47",
+      "minor_version": 0
+    },
+    "model": {
+      "major_sha256": "fd534c7610d847cb44aa32bf0b0f661632d2a05b794623effd1e233312ec8e4a",
+      "major_version": 1,
+      "minor_sha256": "85c1e35b7e7a53145ef7c77fd4415f122bdffa7dddfd52df5bef22f98c5326bd",
+      "minor_version": 0
+    },
+    "resources": {
+      "major_sha256": "02d95d718dda24c1d8abddee04716120f6626de37ab85d1560b8024408757deb",
+      "major_version": 1,
+      "minor_sha256": "8c19d942c4dfeb264d99bc73ecf5ca7714fca126965036abb82f82ed22ea136c",
+      "minor_version": 0
+    }
+  }
 }

@@ -12,7 +12,7 @@ from p0.replays.reconstruction.classification import (
     UNSUPPORTED_TAGS,
 )
 
-SHOWDOWN_COMMIT = "8282e63102fa824fd2f7472778ec09793ceb7cac"
+SHOWDOWN_COMMIT = "c046106cbe075931b1ff8d8b800ff5be47a85f96"
 PROJECT_ROOT = Path(__file__).parents[1]
 DATA_ROOT = PROJECT_ROOT / "data"
 
@@ -163,7 +163,7 @@ def main() -> None:
     value = {
         "schema": 1,
         "showdown_commit": SHOWDOWN_COMMIT,
-        "formats": ["gen9championsvgc2026regmb", "gen9championsvgc2026regmbbo3"],
+        "formats": ["gen9championsvgc2026regmc", "gen9championsvgc2026regmcbo3"],
         "unsupported_tags": sorted(UNSUPPORTED_TAGS),
         "unsupported_predicates": [list(item) for item in sorted(UNSUPPORTED_PREDICATES)],
         "review_status": (

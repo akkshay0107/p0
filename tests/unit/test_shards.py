@@ -37,7 +37,7 @@ def _valid_shard_manifest() -> ShardManifest:
         diagnostics={"replays": 2, "accepted_games": 2, "rejected_games": 0},
         created_at="2026-01-01T00:00:00Z",
         dataset_hash="b" * 64,
-        source_format_id="gen9championsvgc2026regmbbo3",
+        source_format_id="gen9championsvgc2026regmcbo3",
         build_config={"max_candidates": 256},
         raw_replays={"game-1": "c" * 64, "game-2": "d" * 64},
         source_series={"series-1": ("game-1", "game-2")},

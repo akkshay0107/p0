@@ -12,7 +12,7 @@ playing strength and training throughput have not been measured.
 
 You need Git, [uv](https://docs.astral.sh/uv/getting-started/installation/),
 Python 3.13 or newer, and Node.js with npm. The pinned Showdown version requires
-Node.js 16 or newer. Training uses POSIX file locks; use Linux or macOS.
+Node.js 22.18 or newer. Training uses POSIX file locks; use Linux or macOS.
 
 ```bash
 git clone https://github.com/akkshay0107/p0.git
@@ -30,7 +30,7 @@ The two extras are mutually exclusive. Run the commands below from the repositor
 ### Train from scratch
 
 Add your own six-Pokémon Showdown team exports (`.txt`) to `teams/all/`.
-Teams must be legal for Champions VGC Regulation M-B. Team files and generated
+Teams must be legal for Champions VGC Regulation M-C. Team files and generated
 corpus manifests are local inputs and are not included in the repository.
 
 Review [config.example.yaml](config.example.yaml) and adjust your `config.yaml`,
@@ -111,7 +111,7 @@ Then, from the p0 repository root:
 uv run p0-play --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --username MyBot --team-pool all
 ```
 
-Challenge `MyBot` in `gen9championsvgc2026regmbbo3`, the supported live-play format.
+Challenge `MyBot` in `gen9championsvgc2026regmcbo3`, the supported live-play format.
 The `--no-security` server setup above is for local use. See `p0-play --help` for
 remote server settings, repeatable team files, and challenge limits.
 

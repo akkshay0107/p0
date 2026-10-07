@@ -719,7 +719,7 @@ class TestPokeEnvPatches:
                 battle.parse_message(["", "move", "p1a: Receiver", "Tackle", "p2a: Donor"])
 
             move = battle.get_pokemon("p1a: Receiver").moves["tackle"]
-            assert move.current_pp == 36
+            assert move.current_pp == 12
             battle.parse_message(
                 ["", "-activate", "p1a: Receiver", "item: Leppa Berry", "Tackle", "[consumed]"]
             )
@@ -745,7 +745,7 @@ class TestPokeEnvPatches:
             battle.parse_message(
                 ["", "-activate", "p1a: Receiver", "item: Leppa Berry", "Tackle", "[consumed]"]
             )
-            assert move.current_pp == 46
+            assert move.current_pp == 22
         finally:
             poke_env_patches.uninstall_for_tests()
 

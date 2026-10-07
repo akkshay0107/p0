@@ -9,7 +9,7 @@ from p0.replays.group import validated_bo3_series
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.scrape import ReplayFetcher, ScrapeConfig, load_raw_replay
 
-PINNED_PUBLIC_CHAMPIONS_BO3_REPLAY = "gen9championsvgc2026regmbbo3-2653729595"
+PINNED_PUBLIC_CHAMPIONS_BO3_REPLAY = "gen9championsvgc2026regmcbo3-2688810773"
 
 
 class TestReplayNetwork:
@@ -23,7 +23,7 @@ class TestReplayNetwork:
         1. ReplayFetcher downloads the target replay and any sibling games in the series over HTTPS.
         2. Gzipped raw JSON payload is persisted to cache and parsed correctly into ReplayDocuments.
         3. ReplayDocument dictionary serialization/deserialization is completely lossless.
-        4. Series grouping correctly associates the games into a completed BO3 series with games 1 and 2.
+        4. Series grouping correctly associates the games into a completed BO3 series with games 1, 2, and 3.
         """
         config = ScrapeConfig(
             format_id=FORMAT.bo3_format,
@@ -44,8 +44,8 @@ class TestReplayNetwork:
         )
         series = validated_bo3_series(documents)
 
-        # A 2-0 sweep in BO3 yields exactly 2 replay documents grouped into 1 series
-        assert len(entries) == 2
+        # A 2-1 result yields three replay documents grouped into one series
+        assert len(entries) == 3
         assert len(series) == 1
         assert all(document.metadata.format_id == config.format_id for document in documents)
         assert all(document.raw_payload for document in documents)
@@ -54,5 +54,5 @@ class TestReplayNetwork:
             ReplayDocument.from_dict(document.to_dict()).to_dict() for document in documents
         ) == tuple(document.to_dict() for document in documents)
         # Validate sequential match ordering and completion status of the series
-        assert [membership.game_number for membership in series[0].memberships] == [1, 2]
+        assert [membership.game_number for membership in series[0].memberships] == [1, 2, 3]
         assert series[0].record.is_complete

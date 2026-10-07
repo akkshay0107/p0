@@ -59,7 +59,7 @@ def _evidence(kind: LabelKind) -> ActionEvidence:
 def _series_record() -> SeriesRecord:
     return SeriesRecord(
         series_id="s1",
-        format_id="gen9championsvgc2026regmbbo3",
+        format_id="gen9championsvgc2026regmcbo3",
         players=("alice", "bob"),
         game_replay_ids=("r1", "r2"),
         game_player_roles=((0, 1), (1, 0)),
@@ -114,7 +114,7 @@ class TestReplaySchemas:
         assert SeriesRecord.from_dict(series.to_dict()) == series
         fetch = FetchIndexEntry(
             replay_id="r1",
-            format_id="gen9championsvgc2026regmbbo3",
+            format_id="gen9championsvgc2026regmcbo3",
             source_url="https://replay.pokemonshowdown.com/r1",
             fetched_at="2026-07-17T00:00:00Z",
             http_status=200,

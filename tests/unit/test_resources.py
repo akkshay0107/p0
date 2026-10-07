@@ -35,13 +35,13 @@ class TestRuntimeResources:
         assert original["species"] == "original"
         assert lookup(dex) is lookup(dex)
 
-    def test_active_contract_is_reg_m_b_and_manifest_matches_sources(self) -> None:
-        """Verify default runtime_manifest matches Champions Regulation M-B battle formats and action contract."""
+    def test_active_contract_matches_sources(self) -> None:
+        """Verify the runtime manifest matches the active dex formats and action contract."""
         manifest = GlobalContract.from_dict(
             json.loads((ROOT / "data/runtime_manifest.json").read_text())
         )
-        assert FORMAT.battle_format == "gen9championsvgc2026regmb"
-        assert FORMAT.bo3_format == "gen9championsvgc2026regmbbo3"
+        dex = json.loads((ROOT / "data/champions_dex.json").read_text())
+        assert set(dex["source"]["formats"]) == {FORMAT.battle_format, FORMAT.bo3_format}
         assert manifest.battle_format == FORMAT.battle_format
         assert manifest.bo3_format == FORMAT.bo3_format
         assert manifest.action == ACTION_CONTRACT
@@ -108,8 +108,8 @@ class TestRuntimeResources:
             for key in dex["legality"][table]:
                 assert tokenizer_instance.resolve(table, key)[1] == "known", (table, key)
 
-    def test_reg_mb_legality_inventory_uses_resolved_showdown_rules(self) -> None:
-        """Verify Regulation M-B format legality whitelist includes legal items/moves and excludes banned content."""
+    def test_legality_inventory_uses_resolved_showdown_rules(self) -> None:
+        """Verify the active legality whitelist includes legal items/moves and excludes banned content."""
         dex = json.loads((ROOT / "data/champions_dex.json").read_text())
         assert "pikachu" in dex["legality"]["species"]
         assert "protect" in dex["legality"]["moves"]

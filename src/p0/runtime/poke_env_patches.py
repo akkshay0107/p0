@@ -15,15 +15,17 @@ from poke_env.battle import (
     AbstractBattle,
     DoubleBattle,
     Effect,
+    Move,
     Pokemon,
     PokemonType,
     SideCondition,
 )
-from poke_env.data import to_id_str
+from poke_env.data import GenData, to_id_str
 from poke_env.environment.env import _EnvPlayer
 from poke_env.ps_client.ps_client import PSClient
 from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
 
+from p0.model.resources import default_runtime_resources
 from p0.replays.reconstruction.contract import COPYABLE_VOLATILES
 from p0.runtime.live_event_capture import capture_message, transform_target_reference
 
@@ -41,6 +43,42 @@ _ORIGINAL_COPY_BOOSTS = Pokemon.copy_boosts
 _installed = False
 _capture_protocol_lines = False
 _filtered_loggers: set[logging.Logger] = set()
+_original_gen_data: dict[str, dict[str, Any]] = {}
+
+
+def _install_champions_data() -> None:
+    """Synchronize poke-env's read-only mechanics with the active Champions dex."""
+    dex = default_runtime_resources().dex
+    gen_data = GenData.from_gen(9)
+    _original_gen_data.update(pokedex=gen_data.pokedex, moves=gen_data.moves)
+    gen_data.pokedex = {
+        **gen_data.pokedex,
+        **{
+            entry["id"]: {
+                **gen_data.pokedex.get(entry["id"], {}),
+                **deepcopy(entry),
+                "species": entry["baseSpecies"],
+            }
+            for entry in dex["species"]
+        },
+    }
+    move_fields = frozenset(dex["source"]["moveFields"])
+    gen_data.moves = {
+        **gen_data.moves,
+        **{
+            entry["id"]: {
+                **{
+                    key: value
+                    for key, value in gen_data.moves.get(entry["id"], {}).items()
+                    if key not in move_fields
+                },
+                **deepcopy(entry),
+            }
+            for entry in dex["moves"]
+        },
+    }
+    Move.should_be_stored.cache_clear()
+
 
 _CRITICAL_COPY_EFFECTS = (
     Effect.DRAGON_CHEER,
@@ -581,6 +619,7 @@ def install(
         return
 
     _capture_protocol_lines = capture_protocol_lines
+    _install_champions_data()
     for owner, name, _, patched in _PATCHES:
         setattr(owner, name, patched)
     _installed = True
@@ -598,6 +637,11 @@ def uninstall_for_tests() -> None:
         for owner, name, original, _ in _PATCHES:
             setattr(owner, name, original)
         _installed = False
+        gen_data = GenData.from_gen(9)
+        gen_data.pokedex = _original_gen_data["pokedex"]
+        gen_data.moves = _original_gen_data["moves"]
+        _original_gen_data.clear()
+        Move.should_be_stored.cache_clear()
 
 
 def is_installed() -> bool:

@@ -134,7 +134,7 @@ class TestReplayHTTP:
     def test_display_formats_and_sibling_links(self, tmp_path: Path) -> None:
         format_id = FORMAT.bo3_format
         first_id, second_id = f"{format_id}-100", f"{format_id}-101"
-        display_format = "[Gen 9 Champions] VGC 2026 Reg M-B (Bo3)"
+        display_format = "[Gen 9 Champions] VGC 2026 Reg M-C (Bo3)"
         first = sample_replay_payload(first_id, game_number=1)
         first["format"] = display_format
         first["log"] = (

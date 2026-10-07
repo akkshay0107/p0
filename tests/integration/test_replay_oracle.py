@@ -56,7 +56,7 @@ class TestReplayOracleIntegration:
 
         payload = {
             "id": "phase5-oracle",
-            "formatid": "gen9championsvgc2026regmb",
+            "formatid": "gen9championsvgc2026regmc",
             "p1": "Alice",
             "p2": "Bob",
             "uploadtime": 1_750_000_000,

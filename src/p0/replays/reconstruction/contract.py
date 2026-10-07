@@ -17,7 +17,7 @@ from p0.replays.reconstruction.classification import (
     UNSUPPORTED_TAGS,
 )
 
-SHOWDOWN_COMMIT = "8282e63102fa824fd2f7472778ec09793ceb7cac"
+SHOWDOWN_COMMIT = "c046106cbe075931b1ff8d8b800ff5be47a85f96"
 CONTRACT_PATH = DEFAULT_PATHS.data_root / "replay_protocol_contract.json"
 RAW_INVENTORY_PATH = DEFAULT_PATHS.data_root / "showdown_raw_emission_inventory.json"
 DEX_PATH = DEFAULT_PATHS.data_root / "champions_dex.json"
@@ -134,7 +134,7 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
         or value.get("review_status") != "raw_inventory_reachable_sites_classified"
     ):
         raise ValueError("raw emission inventory has unresolved source sites")
-    required = {"sim/battle.ts:1393:add", "data/rulesets.ts:793:add"}
+    required = {"sim/battle.ts:1400:add", "data/rulesets.ts:793:add"}
     covered = {
         f"{entry['path']}:{entry['line']}:{entry['call']}"
         for entry in entries

@@ -36,7 +36,7 @@ DEFAULT_CUTOFF = 1760
 
 # The usage month the shipped artifact is built from. Bumping this is the intended
 # way to refresh the priors; rebuild and re-verify accuracy before committing.
-DEFAULT_MONTH = "2026-07"
+DEFAULT_MONTH = "2026-09"
 USAGE_URL = "https://www.smogon.com/stats/{month}/chaos/{format_id}-{cutoff}.json.gz"
 
 
