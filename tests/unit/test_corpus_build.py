@@ -7,7 +7,7 @@ from pathlib import Path
 
 import orjson
 
-from p0.format_config import FORMAT, current_manifest
+from p0.format_config import FORMAT, active_global_contract
 from p0.teams.corpus import (
     CorpusEntry,
     TeamCorpusManifest,
@@ -30,7 +30,7 @@ class TestWriteCorpusManifest:
             spread_provenance="exact",
         )
         manifest = TeamCorpusManifest(
-            global_contract_sha256=current_manifest().global_sha256,
+            global_contract_sha256=active_global_contract().global_sha256,
             format_id=FORMAT.battle_format,
             corpus_hash=corpus_content_hash((entry,)),
             entries=(entry,),

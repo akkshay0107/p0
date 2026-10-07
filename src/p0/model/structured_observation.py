@@ -23,7 +23,8 @@ from p0.battle.events import (
     EventPosition,
     EventRecord,
 )
-from p0.format_config import active_global_contract, canonical_json_sha256
+from p0.contracts import MODEL_CONTRACT as _MODEL_CONTRACT
+from p0.contracts import canonical_json_sha256
 from p0.model.architecture_contract import (
     OBSERVATION_ENTITY_COUNT,
     SELF_TARGET_SENTINEL,
@@ -219,7 +220,6 @@ def _observation_layout_descriptor() -> dict[str, object]:
     }
 
 
-_MODEL_CONTRACT = active_global_contract().payload("model", "major")
 if (
     canonical_json_sha256(_observation_layout_descriptor())
     != _MODEL_CONTRACT["observation_layout_sha256"]

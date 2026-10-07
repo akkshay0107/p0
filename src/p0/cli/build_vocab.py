@@ -14,15 +14,12 @@ from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
 
-from p0.format_config import active_global_contract, load_global_contract, update_resource_contract
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_json_save
 
 ROOT = DEFAULT_PATHS.repository_root
 DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
 DEFAULT_VOCAB = ROOT / "data" / "vocab.json"
-DEFAULT_MANIFEST = ROOT / "data" / "runtime_manifest.json"
-DEFAULT_SPREAD_USAGE = ROOT / "data" / "spread_usage.json"
 
 TABLES = (
     "species",
@@ -76,9 +73,7 @@ def enum_keys(enum: Any) -> set[str]:
 def build(
     dex_path: Path,
     vocab_path: Path,
-    manifest_path: Path,
     coverage_path: Path | None = None,
-    spread_usage_path: Path = DEFAULT_SPREAD_USAGE,
 ) -> dict[str, Any]:
     """
     Build the vocab mapping, checking for schema and dataset coverage.
@@ -86,9 +81,7 @@ def build(
     Arguments:
         dex_path: Champions data file containing legal content and protocol IDs.
         vocab_path: Destination for the atomically written vocabulary.
-        manifest_path: Destination for the atomically written runtime manifest.
         coverage_path: Optional destination for the coverage audit JSON.
-        spread_usage_path: Spread priors pinned as a minor resource identity.
 
     Returns:
         The generated coverage audit.
@@ -153,18 +146,6 @@ def build(
     atomic_json_save(vocab_path, vocab)
     if coverage_path is not None:
         atomic_json_save(coverage_path, coverage)
-    base = (
-        load_global_contract(manifest_path) if manifest_path.exists() else active_global_contract()
-    )
-    atomic_json_save(
-        manifest_path,
-        update_resource_contract(
-            base,
-            vocab_path=vocab_path,
-            dex_path=dex_path,
-            spread_usage_path=spread_usage_path,
-        ).to_dict(),
-    )
     return coverage
 
 
@@ -173,7 +154,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dex", type=Path, default=DEFAULT_DEX)
     parser.add_argument("--vocab", type=Path, default=DEFAULT_VOCAB)
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument(
         "--coverage",
         type=Path,
@@ -181,9 +161,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    build(args.dex, args.vocab, args.manifest, args.coverage)
+    build(args.dex, args.vocab, args.coverage)
 
-    print(json.dumps({"vocab": str(args.vocab), "manifest": str(args.manifest)}, indent=2))
+    print(json.dumps({"vocab": str(args.vocab)}, indent=2))
     return 0
 
 

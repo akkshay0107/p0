@@ -15,11 +15,20 @@ const { TeamValidator } = require(
 );
 const { toID } = Dex;
 
-const SHOWDOWN_COMMIT = "c046106cbe075931b1ff8d8b800ff5be47a85f96";
-const FORMAT_IDS = [
-  "gen9championsvgc2026regmc",
-  "gen9championsvgc2026regmcbo3",
-];
+const [selectedId, showdownCommit, checkOnly] = process.argv.slice(2);
+if (!selectedId || !showdownCommit) throw new Error("Pass a format ID and checkout revision");
+const battleFormat = selectedId.replace(/bo3$/, "");
+const bo3Format = `${battleFormat}bo3`;
+const FORMAT_IDS = [battleFormat, bo3Format];
+const selected = Dex.formats.get(battleFormat);
+if (selected.exists !== true || selected.mod !== "champions") {
+  throw new Error(`Unsupported Champions format: ${selectedId}`);
+}
+const companion = Dex.formats.get(bo3Format);
+if (companion.exists !== true || companion.mod !== selected.mod) {
+  throw new Error(`Missing companion format: ${bo3Format}`);
+}
+if (checkOnly === "--check") process.exit(0);
 
 function sortedObject(value) {
   if (Array.isArray(value)) return value.map(sortedObject);
@@ -186,7 +195,7 @@ function useful(entries, normalizer) {
     );
 }
 
-const dex = Dex.mod("champions");
+const dex = Dex.mod(selected.mod);
 const validator = new TeamValidator(FORMAT_IDS[0]);
 const formats = Object.fromEntries(
   FORMAT_IDS.map((id) => {
@@ -257,6 +266,7 @@ const legalNatures = dex.natures
       nature.exists !== false &&
       passes(validator.checkNature(dummySet, nature, {})),
   );
+const learnsets = {};
 const reachableMoveIds = new Set(["struggle", "recharge"]);
 const reachableAbilityIds = new Set();
 for (const species of legalSpecies) {
@@ -266,6 +276,7 @@ for (const species of legalSpecies) {
   } catch {
     movePool = dex.species.getMovePool(toID(species.baseSpecies));
   }
+  learnsets[species.id] = [...movePool].sort();
   for (const move of movePool) reachableMoveIds.add(move);
   for (const ability of Object.values(species.abilities || {}))
     reachableAbilityIds.add(toID(ability));
@@ -381,8 +392,11 @@ const output = {
   schemaVersion: 2,
   source: {
     repository: "https://github.com/smogon/pokemon-showdown",
-    commit: SHOWDOWN_COMMIT,
-    mod: "champions",
+    commit: showdownCommit,
+    mod: dex.currentMod,
+    generation: dex.gen,
+    battleFormat,
+    bo3Format,
     moveFields: MOVE_DATA_FIELDS,
     formats,
   },
@@ -392,6 +406,7 @@ const output = {
   abilities: useful(dex.abilities.all(), normalizedAbility),
   natures: useful(dex.natures.all(), normalizedNature),
   legality,
+  learnsets,
   transformations,
   protocolEffects: protocolEffectIds,
   legalProtocolEffects: serializedLegalEffects,
@@ -415,4 +430,75 @@ console.log(
     null,
     2,
   ),
+);
+
+// Stress inputs use each sendable form's learnset and validator-approved choices.
+const stressSpecies = [];
+const legalMoveIds = new Set(legality.moves);
+const legalAbilityIds = new Set(legality.abilities);
+for (const species of legalSpecies) {
+  if (species.battleOnly) continue;
+  const moves = learnsets[species.id].filter((id) => legalMoveIds.has(id));
+  const abilities = [...new Set(Object.values(species.abilities))]
+    .filter((name) => legalAbilityIds.has(toID(name)))
+    .sort();
+  const items = legalItems.filter(
+    (item) =>
+      (!species.requiredItem || species.requiredItem === item.name) &&
+      (!species.requiredItems || species.requiredItems.includes(item.name)),
+  );
+  if (!moves.length || !abilities.length || !items.length) continue;
+  const set = {
+    species: species.name,
+    nature: "Serious",
+    level: 50,
+    evs: { hp: 1 },
+    moves: [moves[0]],
+    ability: abilities[0],
+    item: items[0].name,
+  };
+  const valid = (changes) =>
+    !validator.validateSet(
+      {
+        ...set,
+        ...changes,
+        evs: { ...set.evs },
+        moves: [...(changes.moves || set.moves)],
+      },
+      {},
+    );
+  const validAbilities = abilities.filter((ability) => valid({ ability }));
+  if (!validAbilities.length) continue;
+  set.ability = validAbilities[0];
+  const validMoves = moves.filter((id) => valid({ moves: [id] }));
+  if (!validMoves.length) continue;
+  set.moves = [validMoves[0]];
+  const validItems = items
+    .filter((item) => valid({ item: item.name }))
+    .map((item) => item.name)
+    .sort();
+  if (!validItems.length) continue;
+  stressSpecies.push({
+    id: species.id,
+    name: species.name,
+    baseSpecies: species.baseSpecies,
+    abilities: validAbilities,
+    items: validItems,
+    moves: validMoves.map((id) => dex.moves.get(id).name).sort(),
+  });
+}
+if (new Set(stressSpecies.map((species) => species.baseSpecies)).size < 6) {
+  throw new Error("Stress catalog has fewer than six sendable base species");
+}
+fs.writeFileSync(
+  path.join(path.dirname(outputPath), "stress_team_catalog.json"),
+  JSON.stringify(
+    sortedObject({
+      schemaVersion: 1,
+      format: bo3Format,
+      species: stressSpecies.sort((a, b) => a.id.localeCompare(b.id)),
+    }),
+    null,
+    2,
+  ) + "\n",
 );

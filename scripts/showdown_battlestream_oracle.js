@@ -2,8 +2,8 @@
 const path = require("node:path");
 const {BattleStream, Teams} = require(path.join(__dirname, "..", "pokemon-showdown", "dist", "sim"));
 
-// Python verifies this revision before running the check.
-const commit = "c046106cbe075931b1ff8d8b800ff5be47a85f96";
+const source = require("../data/champions_dex.json").source;
+const commit = source.commit;
 
 const species = ["Pikachu", "Eevee", "Raichu", "Jolteon", "Vaporeon", "Flareon"];
 const team = Teams.pack(species.map((name) => ({name, species: name, moves: ["protect", "tackle"]})));
@@ -45,7 +45,7 @@ function handleChunk(chunk) {
   process.stdout.write(JSON.stringify({commit, protocol, teamMembers: species}) + "\n");
 })().catch((error) => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
 
-write(`>start ${JSON.stringify({formatid: "gen9championsvgc2026regmc"})}
+write(`>start ${JSON.stringify({formatid: source.battleFormat})}
 >player p1 ${JSON.stringify({name: "Alice", team})}
 >player p2 ${JSON.stringify({name: "Bob", team})}`);
 

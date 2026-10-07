@@ -23,12 +23,11 @@ class TestBuildVocab:
         outputs = []
         for suffix in ("a", "b"):
             vocab = tmp_path / f"vocab-{suffix}.json"
-            manifest = tmp_path / f"manifest-{suffix}.json"
             coverage = tmp_path / f"coverage-{suffix}.json"
-            build(dex_path, vocab, manifest, coverage)
-            outputs.append((vocab.read_bytes(), manifest.read_bytes(), coverage.read_bytes()))
+            build(dex_path, vocab, coverage)
+            outputs.append((vocab.read_bytes(), coverage.read_bytes()))
         assert outputs[0] == outputs[1]
-        report = json.loads(outputs[0][2])
+        report = json.loads(outputs[0][1])
         assert "condition:nonlegaltesteffect" in report["unsupportedNonlegalEffects"]
 
     def test_unknown_legal_effect_namespace_fails_generation(self, tmp_path: Path) -> None:
@@ -41,6 +40,5 @@ class TestBuildVocab:
             build(
                 dex_path,
                 tmp_path / "vocab.json",
-                tmp_path / "manifest.json",
                 tmp_path / "coverage.json",
             )

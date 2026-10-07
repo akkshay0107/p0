@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 
-from p0.format_config import ACTION_CONTRACT
+from p0.contracts import ACTION_CONTRACT
 
 _RANGES = {entry["meaning"]: entry for entry in ACTION_CONTRACT["ranges"]}
 

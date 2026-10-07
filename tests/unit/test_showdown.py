@@ -21,12 +21,12 @@ def _log_is_open(path: Path) -> bool:
 
 class TestShowdown:
     def test_showdown_server_group_rejects_duplicate_ports(self) -> None:
-        """Reject duplicate ports before building assets or launching a process."""
+        """Reject duplicate ports before launching a process."""
         with pytest.raises(ValueError, match="unique"):
-            with showdown.start_showdown_servers(2, ports=(1, 1), build_assets=False):
+            with showdown.start_showdown_servers(2, ports=(1, 1)):
                 pass
 
-    def test_start_closes_log_when_process_creation_fails(self, tmp_path: Path) -> None:
+    def test_missing_assets_name_initialization_before_opening_log(self, tmp_path: Path) -> None:
         log_path = tmp_path / "showdown.log"
         server = showdown.ShowdownServer(
             8000,
@@ -34,21 +34,17 @@ class TestShowdown:
             log_path=log_path,
         )
 
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(FileNotFoundError, match="scripts/init-data.sh"):
             server.start()
 
-        assert log_path.is_file()
-        assert not _log_is_open(log_path)
+        assert not log_path.exists()
 
-    def test_start_closes_log_when_process_arguments_are_invalid(self, tmp_path: Path) -> None:
-        log_path = tmp_path / "invalid.log"
-        server = showdown.ShowdownServer(
-            8000,
-            showdown_root=Path(f"{tmp_path}\0"),
-            log_path=log_path,
-        )
+    def test_start_timeout_closes_log(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "timeout.log"
+        port = showdown.allocate_loopback_ports(1)[0]
+        server = showdown.ShowdownServer(port, log_path=log_path, startup_timeout=0.0)
 
-        with pytest.raises(ValueError):
+        with pytest.raises(RuntimeError, match="did not listen"):
             server.start()
 
         assert log_path.is_file()

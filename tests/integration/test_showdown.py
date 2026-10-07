@@ -19,7 +19,7 @@ class TestShowdown:
         """Verify the public server context starts, stops, and releases its port."""
         port = allocate_loopback_ports(1)[0]
 
-        with start_showdown_servers(1, ports=(port,), build_assets=False) as servers:
+        with start_showdown_servers(1, ports=(port,)) as servers:
             server = servers[0]
             assert server.process is not None
             process_id = server.process.pid

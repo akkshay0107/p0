@@ -1,9 +1,8 @@
 """
 Build the empirical Stat Point spread priors from Showdown usage exports.
 
-The raw exports live under a gitignored cache, so a clean checkout cannot rebuild
-the artifact without re-downloading them. --fetch performs that download so a
-rebuild is reproducible from the repository alone.
+Raw exports are cached by month. --fetch downloads missing exports and reuses
+existing bytes so regeneration preserves the recorded source hashes.
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -18,7 +18,6 @@ from urllib.request import Request, urlopen
 
 import orjson
 
-from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_json_save
 from p0.teams.spread_usage import (
@@ -34,9 +33,6 @@ DEFAULT_DEX = ROOT / "data" / "champions_dex.json"
 DEFAULT_OUTPUT = ROOT / "data" / "spread_usage.json"
 DEFAULT_CUTOFF = 1760
 
-# The usage month the shipped artifact is built from. Bumping this is the intended
-# way to refresh the priors; rebuild and re-verify accuracy before committing.
-DEFAULT_MONTH = "2026-09"
 USAGE_URL = "https://www.smogon.com/stats/{month}/chaos/{format_id}-{cutoff}.json.gz"
 
 
@@ -85,20 +81,20 @@ def build(
     output_path: Path,
     max_spreads: int,
     min_nature_share: float,
-    month: str = DEFAULT_MONTH,
+    month: str,
 ) -> dict[str, Any]:
     """Blend both usage exports into the spread-prior artifact and write it."""
+    dex = _read_chaos(dex_path)
     payload = build_spread_table(
         _read_chaos(bo1_path),
         _read_chaos(bo3_path),
-        format_id=FORMAT.battle_format,
-        dex=_read_chaos(dex_path),
+        format_id=dex["source"]["battleFormat"],
+        dex=dex,
         max_spreads=max_spreads,
         min_nature_share=min_nature_share,
     )
 
-    # Name the exports the artifact came from, so a stale month is visible in the
-    # committed file rather than only in whoever ran the build.
+    # Record the usage month and exact downloaded bytes.
     payload["source"] = {
         "month": month,
         "exports": {
@@ -119,11 +115,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--usage-dir", type=Path, default=DEFAULT_USAGE_DIR)
     parser.add_argument("--cutoff", type=int, default=DEFAULT_CUTOFF)
-    parser.add_argument("--month", default=DEFAULT_MONTH, help="Usage month, as YYYY-MM.")
+    parser.add_argument("--month", required=True, help="Usage month, as YYYY-MM.")
     parser.add_argument(
         "--fetch",
         action="store_true",
-        help="Download the usage exports before building instead of reusing the cache.",
+        help="Download missing month-specific usage exports before building.",
     )
     parser.add_argument("--dex", type=Path, default=DEFAULT_DEX)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT)
@@ -131,14 +127,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-nature-share", type=float, default=MIN_NATURE_SHARE)
     args = parser.parse_args(argv)
 
-    if args.fetch:
-        for format_id in (FORMAT.battle_format, FORMAT.bo3_format):
-            written = fetch_usage_export(args.month, format_id, args.cutoff, args.usage_dir)
+    date.fromisoformat(f"{args.month}-01")
+    if args.cutoff < 0:
+        raise ValueError("Usage cutoff must be non-negative")
+
+    source = _read_chaos(args.dex)["source"]
+    usage_dir = args.usage_dir / args.month
+    for format_id in (source["battleFormat"], source["bo3Format"]):
+        if args.fetch and not (usage_dir / f"{format_id}-{args.cutoff}.json").is_file():
+            written = fetch_usage_export(args.month, format_id, args.cutoff, usage_dir)
             print(f"Fetched {written.name} ({written.stat().st_size / 1024:.0f} KiB)")
 
     payload = build(
-        args.usage_dir / f"{FORMAT.battle_format}-{args.cutoff}.json",
-        args.usage_dir / f"{FORMAT.bo3_format}-{args.cutoff}.json",
+        usage_dir / f"{source['battleFormat']}-{args.cutoff}.json",
+        usage_dir / f"{source['bo3Format']}-{args.cutoff}.json",
         args.dex,
         args.out,
         args.max_spreads,

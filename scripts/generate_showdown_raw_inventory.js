@@ -8,10 +8,10 @@ const ts = require('../pokemon-showdown/node_modules/typescript');
 
 const ROOT = path.resolve(__dirname, '..', 'pokemon-showdown');
 const DATA_ROOT = path.resolve(ROOT, '..', 'data');
-const EXPECTED = 'c046106cbe075931b1ff8d8b800ff5be47a85f96';
-const DIRECTORIES = ['config/formats.ts', 'data/mods/champions', 'sim', 'data'];
 const DATA_FILES = new Set(['moves.ts', 'abilities.ts', 'items.ts', 'conditions.ts', 'rulesets.ts']);
-const FORMATS = ['gen9championsvgc2026regmc', 'gen9championsvgc2026regmcbo3'];
+const catalog = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, 'champions_dex.json'), 'utf8'));
+const FORMATS = [catalog.source.battleFormat, catalog.source.bo3Format];
+const DIRECTORIES = ['config/formats.ts', `data/mods/${catalog.source.mod}`, 'sim', 'data'];
 const CALLS = new Set(['add', 'addMove', 'addSplit', 'attrLastMove', 'retargetLastMove']);
 const {Dex} = require('../pokemon-showdown/dist/sim/dex');
 const ACTIVE_RULES = new Set(FORMATS.flatMap(id => {
@@ -157,23 +157,8 @@ function scan(file) {
 }
 
 function volatileTable() {
-  const file = path.join(ROOT, 'data/conditions.ts');
-  const text = fs.readFileSync(file, 'utf8');
-  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
-  const {Dex} = require('../pokemon-showdown/dist/sim/dex');
-  const dex = Dex.mod('champions');
+  const dex = Dex.mod(catalog.source.mod);
   const rows = [];
-  const sourceLines = new Map();
-  function visit(node) {
-    if (ts.isPropertyAssignment(node) && node.name && node.initializer &&
-        (ts.isObjectLiteralExpression(node.initializer) || ts.isObjectLiteralExpression(node.initializer))) {
-      const id = node.name.getText(source).replace(/^['"]|['"]$/g, '');
-      const initializer = node.initializer.getText(source);
-      sourceLines.set(id, source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1);
-    }
-    ts.forEachChild(node, visit);
-  }
-  visit(source);
   const keyLocation = id => {
     for (const filename of ['moves.ts', 'items.ts', 'abilities.ts', 'conditions.ts']) {
       const candidate = path.join(ROOT, 'data', filename);
@@ -183,10 +168,9 @@ function volatileTable() {
     }
     return {path: 'data/conditions.ts', line: null};
   };
-  const dexCatalog = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, 'champions_dex.json'), 'utf8'));
-  const legalEffects = new Set(dexCatalog.legalProtocolEffects.effect || []);
+  const legalEffects = new Set(catalog.legalProtocolEffects.effect || []);
   const legalOwners = new Map(['moves', 'items', 'abilities'].map(kind => [kind,
-    new Set((dexCatalog.legality?.[kind] || []).map(entry => typeof entry === 'string' ? entry : entry.id))]));
+    new Set((catalog.legality?.[kind] || []).map(entry => typeof entry === 'string' ? entry : entry.id))]));
   const effectIds = new Set([...Object.keys(dex.data.Conditions), ...legalEffects]);
   const owners = [];
   for (const [kind, api] of [['moves', dex.moves], ['items', dex.items], ['abilities', dex.abilities]]) {
@@ -217,18 +201,11 @@ function volatileTable() {
 }
 
 function main() {
-  const gitdir = path.resolve(ROOT, fs.readFileSync(path.join(ROOT, '.git'), 'utf8').trim().replace('gitdir: ', ''));
-  const head = fs.readFileSync(path.join(gitdir, 'HEAD'), 'utf8').trim();
-  const revision = head.startsWith('ref: ')
-    ? fs.readFileSync(path.join(gitdir, head.slice(5)), 'utf8').trim()
-    : head;
-  if (revision !== EXPECTED) throw new Error(`Showdown revision drift: ${revision}`);
   const files = sourceFiles().map(scan);
   const entries = files.flatMap(file => file.entries);
   const impossible = new Set(['debug', '-candynamax', '-center', '-terastallize', '-zpower', '-primal', '-burst', '-swapsideconditions', '-combine', '-waiting', '-notarget', '-nothing', '-eat']);
-  const catalog = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, 'champions_dex.json'), 'utf8'));
   const legal = new Map(['moves', 'items', 'abilities'].map(kind => [kind, new Set(catalog.legality?.[kind] || [])]));
-  const dex = require('../pokemon-showdown/dist/sim/dex').Dex.mod('champions');
+  const dex = Dex.mod(catalog.source.mod);
   const dynamicActivationEffects = [];
   // Battle#checkMoveMakesContact emits the active move's fullname when the
   // source asks for the announcement. Expand that dynamic site from the
@@ -282,7 +259,7 @@ function main() {
       : dynamicTags.length ? 'source expression expanded from structural call-site values'
       : 'source emission retained for exact format and effect review';
   }
-  const output = {schema: 1, showdown_commit: revision, generated_by: 'TypeScript compiler AST', files, entries,
+  const output = {schema: 1, showdown_commit: catalog.source.commit, formats: FORMATS, generated_by: 'TypeScript compiler AST', files, entries,
     reachability_counts: entries.reduce((counts, entry) => { counts[entry.reachability] = (counts[entry.reachability] || 0) + 1; return counts; }, {}),
     review_status: entries.some(entry => entry.reachability === 'unresolved')
       ? 'raw_inventory_unresolved_sites' : 'raw_inventory_reachable_sites_classified',

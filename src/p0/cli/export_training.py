@@ -12,7 +12,8 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import load_active_global_contract, sha256_file
+from p0.contracts import sha256_file
+from p0.format_config import load_active_global_contract
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_output
 from p0.replays.dataset import LazyReplayDataset

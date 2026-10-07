@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     device = default_device()
 
     try:
-        manifest = load_active_global_contract(config.paths.data_root / "runtime_manifest.json")
+        manifest = load_active_global_contract()
     except (OSError, KeyError, TypeError, ValueError) as exc:
         logger.error("Could not validate runtime contract: %s", exc)
         return 1

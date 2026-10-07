@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from p0.format_config import sha256_file
+from p0.contracts import sha256_file
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
 from p0.model.resources import default_runtime_resources

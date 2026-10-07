@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import FORMAT, current_manifest
+from p0.format_config import FORMAT, active_global_contract
 from p0.model.tokenizer import PokemonTokenizer, Resolution
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_json_save
@@ -122,7 +122,7 @@ def build_corpus(
     if tokenizer is None:
         tokenizer = PokemonTokenizer.from_file(DEFAULT_PATHS.data_root / "vocab.json")
     if not global_contract_sha256:
-        global_contract_sha256 = current_manifest().global_sha256
+        global_contract_sha256 = active_global_contract().global_sha256
 
     deduped = deduplicate_variants(variants)
     validation_results = validator(deduped)

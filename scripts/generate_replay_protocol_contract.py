@@ -1,10 +1,11 @@
-"""Generate the checked-in replay protocol contract from classifiers."""
+"""Generate the replay protocol contract from the selected source inventory."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
+from p0.persistence import atomic_json_save
 from p0.replays.identity import normalize_showdown_id
 from p0.replays.reconstruction.classification import (
     CLASSIFICATION_REGISTRY,
@@ -12,7 +13,6 @@ from p0.replays.reconstruction.classification import (
     UNSUPPORTED_TAGS,
 )
 
-SHOWDOWN_COMMIT = "c046106cbe075931b1ff8d8b800ff5be47a85f96"
 PROJECT_ROOT = Path(__file__).parents[1]
 DATA_ROOT = PROJECT_ROOT / "data"
 
@@ -162,8 +162,8 @@ def main() -> None:
         )
     value = {
         "schema": 1,
-        "showdown_commit": SHOWDOWN_COMMIT,
-        "formats": ["gen9championsvgc2026regmc", "gen9championsvgc2026regmcbo3"],
+        "showdown_commit": raw_inventory["showdown_commit"],
+        "formats": raw_inventory["formats"],
         "unsupported_tags": sorted(UNSUPPORTED_TAGS),
         "unsupported_predicates": [list(item) for item in sorted(UNSUPPORTED_PREDICATES)],
         "review_status": (
@@ -185,7 +185,7 @@ def main() -> None:
         "entries": entries,
     }
     path = DATA_ROOT / "replay_protocol_contract.json"
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_json_save(path, value)
 
 
 if __name__ == "__main__":

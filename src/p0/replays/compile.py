@@ -23,14 +23,8 @@ from p0.battle.legality import (
     legal_actions,
     slot1_base_mask,
 )
-from p0.format_config import (
-    DEFAULT_RUNTIME_MANIFEST,
-    FORMAT,
-    canonical_json_sha256,
-    load_active_global_contract,
-    sha256_file,
-    validate_artifact_runtime_contract,
-)
+from p0.contracts import canonical_json_sha256, sha256_file
+from p0.format_config import FORMAT, load_active_global_contract, validate_artifact_runtime_contract
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
@@ -181,7 +175,6 @@ def _build_identity(
     source_format_id: str,
     max_candidates: int,
     max_decisions_per_shard: int,
-    manifest_path: str | Path,
     external_rejections: Mapping[str, str] | None,
 ) -> dict[str, Any]:
     if max_candidates < 1:
@@ -216,7 +209,7 @@ def _build_identity(
             "spread_table_sha256": sha256_file(DEFAULT_SPREAD_TABLE_PATH),
             "external_rejections": sorted(rejected),
         },
-        "global_contract_sha256": load_active_global_contract(manifest_path).global_sha256,
+        "global_contract_sha256": load_active_global_contract().global_sha256,
     }
 
 
@@ -224,12 +217,11 @@ def _validate_existing_build(
     root: Path,
     *,
     dataset_hash: str,
-    manifest_path: str | Path,
 ) -> ShardBuildResult:
     try:
         manifest_value = orjson.loads((root / "manifest.json").read_bytes())
         manifest = ShardManifest.from_dict(manifest_value)
-        validate_artifact_runtime_contract(manifest_value, manifest_path)
+        validate_artifact_runtime_contract(manifest_value)
     except (OSError, UnicodeDecodeError, orjson.JSONDecodeError, TypeError, ValueError) as exc:
         raise ValueError(f"Existing dataset build is invalid: {root}") from exc
 
@@ -384,7 +376,6 @@ def write_tensor_shards(
     output_dir: str | Path,
     *,
     max_decisions_per_shard: int = 4096,
-    manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     max_candidates: int = 256,
@@ -407,7 +398,6 @@ def write_tensor_shards(
         result: Output of compile_documents.
         output_dir: Root directory for shard builds.
         max_decisions_per_shard: Target decision count per shard; must be positive.
-        manifest_path: Global runtime contract manifest the shards are bound to.
         resources: Runtime resources for the observation builder; None uses the defaults.
         created_at: ISO timestamp for the manifest; None uses the current UTC time.
         max_candidates: Candidate cap recorded in the build configuration; must
@@ -428,7 +418,6 @@ def write_tensor_shards(
         source_format_id,
         max_candidates,
         max_decisions_per_shard,
-        manifest_path,
         external_rejections,
     )
     runtime_hash = identity["global_contract_sha256"]
@@ -441,7 +430,6 @@ def write_tensor_shards(
         return _validate_existing_build(
             destination,
             dataset_hash=dataset_hash,
-            manifest_path=manifest_path,
         )
     root = Path(tempfile.mkdtemp(prefix=f".{dataset_hash}.", dir=runtime_root))
     builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
@@ -492,7 +480,7 @@ def write_tensor_shards(
             diagnostics={key: int(value) for key, value in diagnostics.items() if value >= 0},
             created_at=timestamp,
         )
-        validate_artifact_runtime_contract(manifest.to_dict(), manifest_path)
+        validate_artifact_runtime_contract(manifest.to_dict())
         atomic_json_save(root / "manifest.json", manifest.to_dict())
 
         os.replace(root, destination)
@@ -991,7 +979,6 @@ def compile_to_shards(
     format_id: str | None = None,
     max_candidates: int = 256,
     max_decisions_per_shard: int = 4096,
-    manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     chunksize: int | None = None,
@@ -1014,7 +1001,6 @@ def compile_to_shards(
             next(iter(formats)),
             max_candidates,
             max_decisions_per_shard,
-            manifest_path,
             external_rejections,
         )
         dataset_hash = canonical_json_sha256(identity)
@@ -1023,14 +1009,12 @@ def compile_to_shards(
             return _validate_existing_build(
                 destination,
                 dataset_hash=dataset_hash,
-                manifest_path=manifest_path,
             )
     result = _compile_groups(grouping, max_candidates, chunksize)
     return write_tensor_shards(
         result,
         output_dir,
         max_decisions_per_shard=max_decisions_per_shard,
-        manifest_path=manifest_path,
         resources=resources,
         created_at=created_at,
         max_candidates=max_candidates,

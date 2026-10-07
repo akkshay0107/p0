@@ -9,9 +9,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from p0.format_config import (
-    DEFAULT_RUNTIME_MANIFEST,
-)
 from p0.replays.compile import (
     compile_documents,
     compile_payloads,
@@ -526,9 +523,7 @@ class TestReplayInputContract:
         result = compile_payloads((sample_replay_payload("shard-fixture"),))
         built = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
 
-        manifest = load_shard_manifest(
-            json.loads(built.manifest_path.read_text(encoding="utf-8")), DEFAULT_RUNTIME_MANIFEST
-        )
+        manifest = load_shard_manifest(json.loads(built.manifest_path.read_text(encoding="utf-8")))
         assert manifest.decisions == 4
         assert manifest.games == 2
         assert manifest.series == 1

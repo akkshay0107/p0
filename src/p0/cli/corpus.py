@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import FORMAT, current_manifest
+from p0.format_config import FORMAT, active_global_contract
 from p0.model.tokenizer import PokemonTokenizer
 from p0.paths import DEFAULT_PATHS
 from p0.teams.corpus import TeamCorpusManifest
@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> None:
             variants,
             tokenizer=tokenizer,
             validator=validate_many,
-            global_contract_sha256=current_manifest().global_sha256,
+            global_contract_sha256=active_global_contract().global_sha256,
             format_id=args.format_id,
         )
         if not manifest.entries:

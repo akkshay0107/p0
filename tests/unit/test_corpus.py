@@ -6,7 +6,7 @@ import hashlib
 
 import pytest
 
-from p0.format_config import current_manifest
+from p0.format_config import active_global_contract
 from p0.teams.corpus import (
     CorpusEntry,
     TeamCorpusManifest,
@@ -118,7 +118,7 @@ class TestCorpusManifest:
             spread_provenance="exact",
         )
         entries = (entry,)
-        active_sha = current_manifest().global_sha256
+        active_sha = active_global_contract().global_sha256
         serialized = {
             "artifact_schema": "p0.team_corpus.v1",
             "global_contract_sha256": active_sha,
@@ -154,7 +154,7 @@ class TestCorpusManifest:
 
     def test_duplicate_entry_raises(self) -> None:
         entry = _sample_entry("team-1")
-        active_sha = current_manifest().global_sha256
+        active_sha = active_global_contract().global_sha256
         with pytest.raises(ValueError, match="Duplicate corpus entry"):
             TeamCorpusManifest(
                 global_contract_sha256=active_sha,
@@ -167,7 +167,7 @@ class TestCorpusManifest:
 
     def test_corpus_hash_mismatch_raises(self) -> None:
         entries = (_sample_entry("team-1"),)
-        active_sha = current_manifest().global_sha256
+        active_sha = active_global_contract().global_sha256
         with pytest.raises(ValueError, match="does not match the entries"):
             TeamCorpusManifest(
                 global_contract_sha256=active_sha,
@@ -180,7 +180,7 @@ class TestCorpusManifest:
 
     def test_unsupported_schema_raises(self) -> None:
         entries = (_sample_entry("team-1"),)
-        active_sha = current_manifest().global_sha256
+        active_sha = active_global_contract().global_sha256
         with pytest.raises(ValueError, match="Unsupported corpus manifest schema"):
             TeamCorpusManifest(
                 global_contract_sha256=active_sha,

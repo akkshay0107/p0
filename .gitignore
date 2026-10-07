@@ -29,7 +29,7 @@ assets/
 data/raw/
 data/cache/
 data/*.tmp
-data/champions_coverage.json
+data/*.json
 teams/**/*.txt
 teams/*.txt
 

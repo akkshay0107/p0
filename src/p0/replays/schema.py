@@ -8,7 +8,7 @@ from enum import IntEnum
 from typing import Any, Mapping
 
 from p0.battle.actions import ACT_SIZE
-from p0.format_config import is_sha256, require_dataclass_fields
+from p0.contracts import is_sha256, require_dataclass_fields
 from p0.replays.identity import ReplayMemberId, ReplaySide
 
 

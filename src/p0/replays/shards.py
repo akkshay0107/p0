@@ -3,18 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any, Mapping
 
 import torch
 
 from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
-from p0.format_config import (
-    DEFAULT_RUNTIME_MANIFEST,
-    is_sha256,
-    require_dataclass_fields,
-    validate_artifact_runtime_contract,
-)
+from p0.contracts import is_sha256, require_dataclass_fields
+from p0.format_config import validate_artifact_runtime_contract
 from p0.model.structured_observation import StructuredObservation
 from p0.replays.schema import (
     DecisionType,
@@ -303,10 +298,10 @@ class ShardManifest:
 
 
 def load_shard_manifest(
-    value: Mapping[str, Any], manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST
+    value: Mapping[str, Any],
 ) -> ShardManifest:
     """Validate a shard manifest against the active runtime before any tensor load."""
-    validate_artifact_runtime_contract(value, manifest_path)
+    validate_artifact_runtime_contract(value)
     return ShardManifest.from_dict(value)
 
 

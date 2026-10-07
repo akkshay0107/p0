@@ -20,7 +20,7 @@ from p0.evaluation.harness import (
     create_eval_player,
     wilson_score_interval,
 )
-from p0.format_config import FORMAT, current_manifest
+from p0.format_config import FORMAT, active_global_contract
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
@@ -48,7 +48,7 @@ class TestEvaluationHarness:
             ),
         )
         manifest = TeamCorpusManifest(
-            global_contract_sha256=current_manifest().global_sha256,
+            global_contract_sha256=active_global_contract().global_sha256,
             format_id=FORMAT.battle_format,
             corpus_hash=corpus_content_hash(entries),
             entries=entries,

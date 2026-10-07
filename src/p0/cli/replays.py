@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import DEFAULT_RUNTIME_MANIFEST, FORMAT
+from p0.format_config import FORMAT
 from p0.replays.compile import compile_to_shards
 from p0.replays.dataset import LazyReplayDataset, assign_series_splits, write_split_manifest
 from p0.replays.group import group_replays
@@ -37,7 +37,6 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--output-dir", type=Path, default=Path("artifacts/shards"))
     build.add_argument("--max-candidates", type=int, default=256)
     build.add_argument("--max-decisions-per-shard", type=int, default=4096)
-    build.add_argument("--runtime-manifest", type=Path, default=DEFAULT_RUNTIME_MANIFEST)
     build.add_argument(
         "--max-parse-errors",
         type=int,
@@ -51,7 +50,6 @@ def _parser() -> argparse.ArgumentParser:
     splits.add_argument("--seed", type=int, default=0)
     splits.add_argument("--validation-fraction", type=float, default=0.1)
     splits.add_argument("--test-fraction", type=float, default=0.1)
-    splits.add_argument("--runtime-manifest", type=Path, default=DEFAULT_RUNTIME_MANIFEST)
 
     return parser
 
@@ -139,7 +137,6 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
         format_id=FORMAT.bo3_format,
         max_candidates=args.max_candidates,
         max_decisions_per_shard=args.max_decisions_per_shard,
-        manifest_path=args.runtime_manifest,
         external_rejections=parse_errors,
     )
 
@@ -159,10 +156,7 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
 
 def _create_splits(args: argparse.Namespace) -> dict[str, Any]:
     """Assign validation and test splits uniformly across all compiled series."""
-    dataset = LazyReplayDataset(
-        args.shard_manifest,
-        runtime_manifest_path=args.runtime_manifest,
-    )
+    dataset = LazyReplayDataset(args.shard_manifest)
     manifest = dataset.manifest
     series_ids = dataset.accepted_series_ids()
     split = assign_series_splits(

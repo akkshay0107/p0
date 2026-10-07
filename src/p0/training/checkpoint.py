@@ -12,11 +12,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
-from p0.format_config import (
-    DEFAULT_RUNTIME_MANIFEST,
-    checkpoint_contract_compatibility,
-    load_active_global_contract,
-)
+from p0.format_config import checkpoint_contract_compatibility, load_active_global_contract
 from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
 from p0.model.factory import (
@@ -53,14 +49,10 @@ class CheckpointStore:
 
     def __init__(
         self,
-        manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
         *,
         resources: RuntimeResources | None = None,
     ) -> None:
-        self.manifest_path = Path(manifest_path)
-        if self.manifest_path.resolve() != DEFAULT_RUNTIME_MANIFEST.resolve():
-            raise ValueError("CheckpointStore always uses the default global runtime manifest")
-        self._manifest = load_active_global_contract(self.manifest_path)
+        self._manifest = load_active_global_contract()
         self._resources = resources
 
     def read(self, path: Path) -> LoadedCheckpoint:
@@ -281,7 +273,7 @@ class CheckpointStore:
             raise ValueError(f"Invalid model configuration in checkpoint {path}") from exc
 
     def _validate_contract(self, artifact: Mapping[str, Any], path: Path) -> None:
-        comp = checkpoint_contract_compatibility(artifact, self.manifest_path)
+        comp = checkpoint_contract_compatibility(artifact)
         if not comp.is_compatible:
             diffs = "; ".join(comp.major_differences)
             raise ValueError(

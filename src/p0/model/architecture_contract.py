@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from p0.format_config import active_global_contract
-
-_MODEL_CONTRACT = active_global_contract().payload("model", "major")
+from p0.contracts import MODEL_CONTRACT as _MODEL_CONTRACT
 
 OBSERVATION_ENTITY_COUNT = _MODEL_CONTRACT["observation_entity_count"]
 POKEMON_COUNT = _MODEL_CONTRACT["pokemon_count"]

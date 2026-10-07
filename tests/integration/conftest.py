@@ -47,7 +47,7 @@ def showdown_server(showdown_assets):
         websocket_url=f"ws://localhost:{port}/showdown/websocket",
         authentication_url=LocalhostServerConfiguration.authentication_url,
     )
-    with start_showdown_servers(1, ports=(port,), build_assets=False):
+    with start_showdown_servers(1, ports=(port,)):
         yield server_configuration
 
 

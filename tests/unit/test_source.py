@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from p0.format_config import FORMAT, current_manifest
+from p0.format_config import FORMAT, active_global_contract
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
@@ -52,7 +52,7 @@ def _write_manifest(
 ) -> tuple[Path, TeamCorpusManifest]:
     manifest = TeamCorpusManifest(
         artifact_schema=CORPUS_MANIFEST_SCHEMA,
-        global_contract_sha256=current_manifest().global_sha256,
+        global_contract_sha256=active_global_contract().global_sha256,
         format_id=FORMAT.battle_format,
         corpus_hash=corpus_content_hash(entries),
         entries=entries,

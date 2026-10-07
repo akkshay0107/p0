@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cache, lru_cache, wraps
-from pathlib import Path
 from typing import Any
 
 import orjson
@@ -22,24 +21,6 @@ class RuntimeResources:
     tokenizer: PokemonTokenizer
     mega_items: frozenset[str]
     mega_forms: frozenset[str]
-
-    @classmethod
-    def from_files(cls, vocab_path: str | Path, dex_path: str | Path) -> RuntimeResources:
-        vocab = orjson.loads(Path(vocab_path).read_bytes())
-        dex = orjson.loads(Path(dex_path).read_bytes())
-        if not isinstance(vocab, dict) or not isinstance(dex, dict):
-            raise ValueError("Runtime vocabulary and dex roots must be objects")
-        return cls.from_data(vocab, dex)
-
-    @classmethod
-    def from_manifest(cls, manifest_path: str | Path) -> RuntimeResources:
-        path = Path(manifest_path)
-        load_active_global_contract(path)
-        vocab_path = path.with_name("vocab.json")
-        dex_path = path.with_name("champions_dex.json")
-        # Dex and Showdown identities are provenance. Updated mechanics remain loadable
-        # as long as the resource feature ABI and vocabulary are unchanged.
-        return cls.from_files(vocab_path, dex_path)
 
     @classmethod
     def from_data(
@@ -80,9 +61,8 @@ class RuntimeResources:
 
 @lru_cache(maxsize=1)
 def default_runtime_resources() -> RuntimeResources:
-    manifest_path = DEFAULT_PATHS.data_root / "runtime_manifest.json"
-    load_active_global_contract(manifest_path)
-    dex_path = manifest_path.with_name("champions_dex.json")
+    load_active_global_contract()
+    dex_path = DEFAULT_PATHS.data_root / "champions_dex.json"
     dex = orjson.loads(dex_path.read_bytes())
     return RuntimeResources.from_data(tokenizer.vocab, dex, shared_tokenizer=tokenizer)
 

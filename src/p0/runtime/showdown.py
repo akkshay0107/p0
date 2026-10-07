@@ -27,21 +27,6 @@ def local_server_configuration(port: int) -> ServerConfiguration:
     )
 
 
-def build_showdown(showdown_root: Path = DEFAULT_PATHS.showdown_root) -> None:
-    """Build the local Showdown Node server assets in the target directory."""
-    try:
-        subprocess.run(
-            ["node", "build"],
-            cwd=showdown_root,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "")[-4000:]
-        raise RuntimeError(f"Showdown build failed in {showdown_root}: {stderr}") from exc
-
-
 def allocate_loopback_ports(count: int) -> tuple[int, ...]:
     """Find distinct free ports on the loopback interface."""
     if count < 1:
@@ -81,6 +66,9 @@ class ShowdownServer:
     def start(self) -> None:
         if self.process is not None:
             raise RuntimeError(f"Showdown server on port {self.port} is already started")
+
+        if not (self.showdown_root / "dist" / "sim" / "index.js").is_file():
+            raise FileNotFoundError("Showdown assets are missing. Run bash scripts/init-data.sh.")
 
         command = [
             "node",
@@ -170,15 +158,12 @@ def start_showdown_servers(
     *,
     showdown_root: Path = DEFAULT_PATHS.showdown_root,
     ports: Sequence[int] | None = None,
-    build_assets: bool = True,
     log_dir: Path | None = None,
 ) -> Iterator[tuple[ShowdownServer, ...]]:
     selected_ports = allocate_loopback_ports(count) if ports is None else tuple(ports)
     if len(selected_ports) != count or len(set(selected_ports)) != count:
         raise ValueError("Showdown ports must be unique and match the requested server count")
 
-    if build_assets:
-        build_showdown(showdown_root)
     with contextlib.ExitStack() as stack:
         servers = tuple(
             stack.enter_context(

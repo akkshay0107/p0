@@ -15,7 +15,8 @@ from p0.battle.actions import (
     encode_team_pair,
     team_selection,
 )
-from p0.format_config import ACTION_CONTRACT, FORMAT
+from p0.contracts import ACTION_CONTRACT
+from p0.format_config import FORMAT
 
 
 class TestActions:

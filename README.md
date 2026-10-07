@@ -20,12 +20,21 @@ cd p0
 git submodule update --init --recursive
 uv python install 3.13
 uv sync --extra cpu
-npm --prefix pokemon-showdown install
+bash scripts/init-data.sh
 cp config.example.yaml config.yaml
 ```
 
 For a CUDA machine, replace `uv sync --extra cpu` with `uv sync --extra cuda`.
 The two extras are mutually exclusive. Run the commands below from the repository root.
+
+After pulling changes, run `git submodule update --init --recursive`, `uv sync --extra cpu`
+and `bash scripts/init-data.sh` with training stopped. The script installs and builds
+Showdown, then generates all seven local JSON resources. Its `FORMAT` and
+`USAGE_MONTH` settings select the game data and usage priors; cached usage exports
+live under `data/raw/usage/<month>/`. It writes the runtime manifest last, after
+coverage and protocol validation. If generation fails, rerun the script before
+training. Generated JSON is ignored by Git. Team exports and corpus builds remain
+separate inputs.
 
 ### Train from scratch
 
@@ -101,8 +110,7 @@ baselines, checkpoint opponents, and evaluation settings.
 terminal from `pokemon-showdown/`:
 
 ```bash
-npm run build
-node pokemon-showdown start --no-security 8000
+node pokemon-showdown start --skip-build --no-security 8000
 ```
 
 Then, from the p0 repository root:
@@ -111,7 +119,7 @@ Then, from the p0 repository root:
 uv run p0-play --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --username MyBot --team-pool all
 ```
 
-Challenge `MyBot` in `gen9championsvgc2026regmcbo3`, the supported live-play format.
+Challenge `MyBot` in the Champions Bo3 format selected by `scripts/init-data.sh`.
 The `--no-security` server setup above is for local use. See `p0-play --help` for
 remote server settings, repeatable team files, and challenge limits.
 
@@ -125,17 +133,18 @@ refreshed periodically.
 - [Configuration](config.example.yaml): training, paths, team pools, BC, and evaluation.
 - [Model](src/p0/model/): [model dimensions](src/p0/model/config.py) and
   [tensor layout constants](src/p0/model/architecture_contract.py).
-- [Runtime contract](data/runtime_manifest.json): hashes used to check artifact compatibility.
+- [Compatibility schemas](src/p0/contracts.py): source definitions used to generate the runtime
+  manifest and check artifact compatibility.
 - [Command-line entry points](src/p0/cli/): run each command with `--help` for options.
 
 From the repository root:
 
 ```bash
-uv run ruff check src tests
-uv run ruff format --check src tests
+uv run ruff check src scripts tests
+uv run ruff format --check src scripts tests
 uv run pyright
-OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 uv run pytest -q
-OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 P0_STRESS_GAME_COUNT=50 uv run pytest -q -m heavy
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run pytest -q --basetemp scratch/pytest
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 P0_STRESS_GAME_COUNT=50 P0_STRESS_CONCURRENCY=1 uv run pytest -q -m heavy --basetemp scratch/pytest
 git diff --check
 uv build
 ```

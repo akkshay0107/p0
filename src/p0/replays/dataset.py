@@ -15,12 +15,8 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from p0.battle.series import SeriesPerspectiveKey
-from p0.format_config import (
-    DEFAULT_RUNTIME_MANIFEST,
-    is_sha256,
-    require_dataclass_fields,
-    validate_artifact_runtime_contract,
-)
+from p0.contracts import is_sha256, require_dataclass_fields
+from p0.format_config import validate_artifact_runtime_contract
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save
 from p0.replays.shards import (
@@ -177,7 +173,6 @@ def write_split_manifest(manifest: SeriesSplitManifest, path: str | Path) -> Non
 
 def load_split_manifest(
     value: Mapping[str, Any] | str | Path,
-    manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
 ) -> SeriesSplitManifest:
     """Load and validate a split manifest before selecting any shard rows."""
     if isinstance(value, (str, Path)):
@@ -189,7 +184,7 @@ def load_split_manifest(
     if not isinstance(value, Mapping):
         raise ValueError("Split manifest must be a JSON object")
 
-    validate_artifact_runtime_contract(value, manifest_path)
+    validate_artifact_runtime_contract(value)
     return SeriesSplitManifest.from_dict(value)
 
 
@@ -250,12 +245,11 @@ class LazyReplayDataset(IterableDataset):
         *,
         split: str | None = None,
         split_manifest: SeriesSplitManifest | Mapping[str, Any] | str | Path | None = None,
-        runtime_manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST,
         verify_hashes: bool = False,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         value = orjson.loads(self.manifest_path.read_bytes())
-        self.manifest = load_shard_manifest(value, runtime_manifest_path)
+        self.manifest = load_shard_manifest(value)
         if split is not None and split not in SPLITS:
             raise ValueError(f"Unsupported dataset split {split!r}")
 
@@ -267,7 +261,7 @@ class LazyReplayDataset(IterableDataset):
         elif isinstance(split_manifest, SeriesSplitManifest):
             loaded_split = split_manifest
         else:
-            loaded_split = load_split_manifest(split_manifest, runtime_manifest_path)
+            loaded_split = load_split_manifest(split_manifest)
 
         if loaded_split is not None and (
             loaded_split.global_contract_sha256 != self.manifest.global_contract_sha256
@@ -279,7 +273,6 @@ class LazyReplayDataset(IterableDataset):
 
         self.split = split
         self.split_manifest = loaded_split
-        self.runtime_manifest_path = Path(runtime_manifest_path)
         self.verify_hashes = verify_hashes
         self._root = self.manifest_path.parent
 

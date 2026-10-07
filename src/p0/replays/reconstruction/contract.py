@@ -1,4 +1,4 @@
-"""Checked-in protocol contract for the pinned Showdown replay surface."""
+"""Validate the generated protocol coverage against selected dex metadata."""
 
 from __future__ import annotations
 
@@ -17,10 +17,13 @@ from p0.replays.reconstruction.classification import (
     UNSUPPORTED_TAGS,
 )
 
-SHOWDOWN_COMMIT = "c046106cbe075931b1ff8d8b800ff5be47a85f96"
 CONTRACT_PATH = DEFAULT_PATHS.data_root / "replay_protocol_contract.json"
 RAW_INVENTORY_PATH = DEFAULT_PATHS.data_root / "showdown_raw_emission_inventory.json"
 DEX_PATH = DEFAULT_PATHS.data_root / "champions_dex.json"
+with DEX_PATH.open(encoding="utf-8") as _dex_handle:
+    _DEX_CATALOG = json.load(_dex_handle)
+SHOWDOWN_COMMIT = _DEX_CATALOG["source"]["commit"]
+_FORMATS = [_DEX_CATALOG["source"]["battleFormat"], _DEX_CATALOG["source"]["bo3Format"]]
 
 
 def run_pinned_showdown_oracle(
@@ -30,18 +33,7 @@ def run_pinned_showdown_oracle(
 ) -> tuple[str, ...]:
     """Run the local Showdown BattleStream reference check."""
     root = Path(repository_root).resolve()
-    showdown_root = root / "pokemon-showdown"
     try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=showdown_root,
-            capture_output=True,
-            check=True,
-            text=True,
-            timeout=timeout_seconds,
-        ).stdout.strip()
-        if revision != SHOWDOWN_COMMIT:
-            raise ValueError(f"Pinned Showdown commit mismatch: {revision!r}")
         result = subprocess.run(
             ["node", str(root / "scripts" / "showdown_battlestream_oracle.js")],
             cwd=root,
@@ -64,6 +56,8 @@ def load_protocol_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
         value = json.load(handle)
     if not isinstance(value, dict) or value.get("showdown_commit") != SHOWDOWN_COMMIT:
         raise ValueError("protocol contract has an unexpected Showdown source revision")
+    if value.get("formats") != _FORMATS:
+        raise ValueError("protocol contract formats disagree with dex metadata")
     if not isinstance(value.get("entries"), list):
         raise ValueError("protocol contract entries must be a list")
     return value
@@ -75,6 +69,8 @@ def load_raw_emission_inventory(path: Path = RAW_INVENTORY_PATH) -> dict[str, An
         value = json.load(handle)
     if value.get("showdown_commit") != SHOWDOWN_COMMIT:
         raise ValueError("raw emission inventory has an unexpected Showdown revision")
+    if value.get("formats") != _FORMATS:
+        raise ValueError("raw emission inventory formats disagree with dex metadata")
     return value
 
 
@@ -83,17 +79,6 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
     if value is None:
         value = RAW_EMISSION_INVENTORY
     showdown_root = DEFAULT_PATHS.showdown_root
-    gitdir_line = (showdown_root / ".git").read_text(encoding="utf-8").strip()
-    gitdir = (showdown_root / gitdir_line.removeprefix("gitdir: ")).resolve()
-    head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
-    revision = (
-        (gitdir / head.removeprefix("ref: ")).read_text(encoding="utf-8").strip()
-        if head.startswith("ref: ")
-        else head
-    )
-    if revision != SHOWDOWN_COMMIT:
-        raise ValueError("checked-out Showdown revision does not match protocol inventory")
-
     expected_files = {
         "config/formats.ts",
         "server/room-battle.ts",
@@ -104,7 +89,9 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
         ),
         *(
             source.relative_to(showdown_root).as_posix()
-            for source in (showdown_root / "data/mods/champions").rglob("*.ts")
+            for source in (showdown_root / "data/mods" / _DEX_CATALOG["source"]["mod"]).rglob(
+                "*.ts"
+            )
         ),
     }
     files = value.get("files")
@@ -134,11 +121,15 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
         or value.get("review_status") != "raw_inventory_reachable_sites_classified"
     ):
         raise ValueError("raw emission inventory has unresolved source sites")
-    required = {"sim/battle.ts:1400:add", "data/rulesets.ts:793:add"}
     covered = {
-        f"{entry['path']}:{entry['line']}:{entry['call']}"
+        (entry["path"], entry["call"], tag, entry["enclosing"], entry["data_owner"])
         for entry in entries
         if entry.get("reachability") in {"reachable-potential", "reachable-resolved"}
+        for tag in ([entry["tag"]] if entry.get("tag") is not None else entry["resolved_tags"])
+    }
+    required = {
+        ("sim/battle.ts", "add", "teampreview", "makeRequest", None),
+        ("data/rulesets.ts", "add", "rule", "onBegin", "speciesclause"),
     }
     if not required <= covered:
         raise ValueError(
@@ -148,8 +139,6 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
 
 PROTOCOL_CONTRACT = load_protocol_contract()
 RAW_EMISSION_INVENTORY = load_raw_emission_inventory()
-with DEX_PATH.open(encoding="utf-8") as _dex_handle:
-    _DEX_CATALOG = json.load(_dex_handle)
 LEGAL_EFFECT_IDS = {
     kind: frozenset(_DEX_CATALOG.get("legality", {}).get(kind, ()))
     for kind in ("moves", "items", "abilities")

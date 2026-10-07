@@ -10,16 +10,14 @@ from __future__ import annotations
 import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Mapping
 
-from p0.format_config import (
-    DEFAULT_RUNTIME_MANIFEST,
+from p0.contracts import (
     canonical_json_sha256,
     is_sha256,
     require_dataclass_fields,
-    validate_artifact_runtime_contract,
 )
+from p0.format_config import validate_artifact_runtime_contract
 
 CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v1"
 
@@ -154,8 +152,8 @@ class TeamCorpusManifest:
 
 
 def load_corpus_manifest(
-    value: Mapping[str, Any], manifest_path: str | Path = DEFAULT_RUNTIME_MANIFEST
+    value: Mapping[str, Any],
 ) -> TeamCorpusManifest:
     """Validate a corpus manifest against the active runtime before use."""
-    validate_artifact_runtime_contract(value, manifest_path)
+    validate_artifact_runtime_contract(value)
     return TeamCorpusManifest.from_dict(value)
