@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import random
@@ -248,14 +247,8 @@ def stress_random_replay_teams(
 
 
 def stress_series_id(parent: str, players: tuple[str, str] = ("Alice", "Bob")) -> str:
-    """
-    Calculate the deterministic grouping identity used by the replay compiler.
-
-    Hashes the format ID, parent series ID, and casefolded player names to produce
-    a 24-character hexadecimal series identifier.
-    """
-    value = "\n".join((FORMAT.bo3_format, parent, *(player.casefold() for player in players)))
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+    """Expected source reference for the generated parent and two named players."""
+    return json.dumps([FORMAT.bo3_format, parent, ["alice", "bob"]], separators=(",", ":"))
 
 
 def _showteam_json(team: tuple[TeamMember, ...]) -> str:

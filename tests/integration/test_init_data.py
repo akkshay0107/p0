@@ -63,8 +63,8 @@ class TestInitData:
         )
         data = tmp_path / "data"
         data.mkdir()
-        manifest = data / "runtime_manifest.json"
-        shutil.copyfile(DEFAULT_PATHS.data_root / "runtime_manifest.json", manifest)
+        manifest = data / "champions_dex.json"
+        shutil.copyfile(DEFAULT_PATHS.data_root / "champions_dex.json", manifest)
         before = manifest.read_bytes()
 
         result = subprocess.run(

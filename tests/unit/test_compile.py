@@ -82,7 +82,7 @@ class TestReplayCompiler:
         with pytest.raises(ValueError, match="source membership in order"):
             replace(accepted, games=tuple(reversed(accepted.games)))
 
-    def test_shard_limit_uses_whole_incoming_series(self, tmp_path: Path) -> None:
+    def test_each_shard_contains_one_whole_series(self, tmp_path: Path) -> None:
         single = sample_replay_payload("single-1", parent="single", game_number=1)
         first = sample_replay_payload("valid-1", parent="valid", game_number=1)
         second = sample_replay_payload("valid-2", parent="valid", game_number=2)
@@ -91,7 +91,6 @@ class TestReplayCompiler:
         built = write_tensor_shards(
             result,
             tmp_path,
-            max_decisions_per_shard=9,
             created_at="2026-01-01T00:00:00Z",
         )
 
@@ -242,21 +241,21 @@ class TestReplayCompiler:
             result,
             tmp_path,
             created_at="2026-01-01T00:00:00Z",
-            external_rejections={"malformed": "a" * 64},
+            external_rejections=("malformed",),
         )
         dataset = LazyReplayDataset(built.manifest_path)
 
         assert built.manifest.source_games == 2
         assert built.manifest.accepted_games == 1
         assert built.manifest.rejected_games == 1
-        assert set(built.manifest.raw_replays) == {"accepted", "malformed"}
-        assert dataset.accepted_series_ids() == ("72673574c974979d25baec4b",)
-        assert dataset.manifest.raw_replays["malformed"] == "a" * 64
+        assert set(
+            replay for members in built.manifest.source_series.values() for replay in members
+        ) == {"accepted", "malformed"}
         chunks = tuple(dataset)
         assert len(chunks) == 2
-        assert all(chunk.series_id == "72673574c974979d25baec4b" for chunk in chunks)
+        assert all(chunk.series_id in dataset.accepted_series_ids() for chunk in chunks)
 
-    def test_existing_dataset_ignores_legacy_release_report(self, tmp_path: Path) -> None:
+    def test_cached_dataset_reuses_tensors_and_force_reconstructs(self, tmp_path: Path) -> None:
         payload = golden_replay_payload("legacy-report", series_id="legacy-series")
         result = compile_payloads((payload,), chunksize=0)
         first = write_tensor_shards(
@@ -264,7 +263,6 @@ class TestReplayCompiler:
             tmp_path,
             created_at="2026-01-01T00:00:00Z",
         )
-        (first.manifest_path.parent / "release_gate.json").write_text("not-json", encoding="utf-8")
 
         document = result.series[0].games[0]
         second = compile_to_shards(iter((document,)), tmp_path)
@@ -279,9 +277,11 @@ class TestReplayCompiler:
         invalid = replace(document, outcome=replace(document.outcome, terminal_line_index=None))
         with pytest.raises(ReplayInputContractError, match="terminal"):
             compile_to_shards((invalid,), tmp_path)
-        (first.manifest_path.parent / first.manifest.shards[0].filename).write_bytes(b"corrupt")
-        with pytest.raises(ValueError, match="artifact failed validation"):
-            compile_to_shards((document,), tmp_path)
+        forced = compile_to_shards((document,), tmp_path, force_reconstruct=True, chunksize=0)
+        assert forced.manifest.dataset_id != first.manifest.dataset_id
+        assert forced.manifest.shards[0].shard_id != first.manifest.shards[0].shard_id
+        assert len(list(LazyReplayDataset(first.manifest_path))) == 2
+        assert len(list(LazyReplayDataset(forced.manifest_path))) == 2
 
     def test_extra_game_after_series_won_rejected(self) -> None:
         """Verify that a 2-0 series followed by a 3rd game is rejected under precision-first policy."""
@@ -316,4 +316,31 @@ class TestReplayCompiler:
         assert built.manifest.source_games == 6
         assert built.manifest.accepted_games == 2
         assert built.manifest.rejected_games == 4
-        assert {"f1", "f2", "f3", "f4"} <= set(built.manifest.raw_replays)
+        assert {"f1", "f2", "f3", "f4"} <= {
+            replay for members in built.manifest.source_series.values() for replay in members
+        }
+
+
+class TestCompilationCache:
+    def test_new_series_reuses_existing_tensor_and_membership_change_rebuilds_only_that_series(
+        self, tmp_path: Path
+    ) -> None:
+        from p0.replays.protocol import parse_replay_payload
+
+        first_game = parse_replay_payload(sample_replay_payload("a1", parent="a", game_number=1))
+        unrelated_game = parse_replay_payload(
+            sample_replay_payload("b1", parent="b", game_number=1)
+        )
+        second_game = parse_replay_payload(sample_replay_payload("a2", parent="a", game_number=2))
+        first = compile_to_shards((first_game,), tmp_path, chunksize=0)
+        expanded = compile_to_shards((first_game, unrelated_game), tmp_path, chunksize=0)
+        assert first.manifest.shards[0] in expanded.manifest.shards
+        changed = compile_to_shards(
+            (first_game, second_game, unrelated_game), tmp_path, chunksize=0
+        )
+        existing = {entry.replay_ids: entry.shard_id for entry in expanded.manifest.shards}
+        updated = {entry.replay_ids: entry.shard_id for entry in changed.manifest.shards}
+        assert updated[("b1",)] == existing[("b1",)]
+        assert updated[("a1", "a2")] != existing[("a1",)]
+        assert changed.manifest.accepted_games == 3
+        assert len(list(LazyReplayDataset(first.manifest_path))) == 2

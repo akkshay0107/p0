@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 import pytest
 import torch
 
-from p0.format_config import load_active_global_contract
 from p0.model.structured_observation import (
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     TOKEN_IDX_ALLY_SIDE,
@@ -31,25 +29,23 @@ from tests.unit.replay_fixtures import (
 
 class TestReplayDatasets:
     def test_split_assignment_is_order_independent_and_round_trips(self, tmp_path: Path) -> None:
-        """Verify series split hashing produces deterministic train/val/test splits regardless of input series ID ordering."""
-        global_hash = load_active_global_contract().global_sha256
+        """Verify seeded series assignment produces deterministic train/val/test splits regardless of input series ID ordering."""
+
         first = assign_series_splits(
             ("series-b", "series-a"),
             seed=17,
             validation_fraction=0.2,
             test_fraction=0.2,
-            global_contract_sha256=global_hash,
-            dataset_hash="a" * 64,
+            dataset_id="a" * 64,
         )
         second = assign_series_splits(
             ("series-a", "series-b"),
             seed=17,
             validation_fraction=0.2,
             test_fraction=0.2,
-            global_contract_sha256=global_hash,
-            dataset_hash="a" * 64,
+            dataset_id="a" * 64,
         )
-        assert first.to_dict() == second.to_dict()
+        assert first.assignments == second.assignments
         path = tmp_path / "splits.json"
         write_split_manifest(first, path)
         assert load_split_manifest(path).to_dict() == first.to_dict()
@@ -76,8 +72,7 @@ class TestReplayDatasets:
             series_ids,
             validation_fraction=val_fraction,
             test_fraction=test_fraction,
-            global_contract_sha256="a" * 64,
-            dataset_hash="b" * 64,
+            dataset_id="b" * 64,
         )
         assert set(manifest.assignments.values()) == expected_splits
 
@@ -93,12 +88,12 @@ class TestReplayDatasets:
             ),
         )
         series_ids = sorted({str(summary["series_id"]) for summary in torch_summaries(built)})
-        global_hash = built.manifest.global_contract_sha256
+
         split = SeriesSplitManifest(
-            global_hash,
             0,
             {series_ids[0]: "train", series_ids[1]: "test"},
-            dataset_hash=built.manifest.dataset_hash,
+            dataset_id=built.manifest.dataset_id,
+            split_id="split-test",
         )
         split_path = tmp_path / "splits.json"
         write_split_manifest(split, split_path)
@@ -161,14 +156,6 @@ class TestReplayDatasets:
             assert slot_unknown.tolist() == [1.0, 1.0]
             assert not torch.equal(final.numerical[0], chunk.observations.numerical[-1])
 
-    def test_dataset_rejects_tampered_golden_shard(self, tmp_path: Path) -> None:
-        """Verify LazyReplayDataset raises ValueError on tampered golden replay shards when verify_hashes=True."""
-        built = build_dataset(tmp_path, 1)
-        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
-        shard_path.write_bytes(shard_path.read_bytes() + b"tampered")
-        with pytest.raises(ValueError, match="hash mismatch"):
-            next(iter(LazyReplayDataset(built.manifest_path, verify_hashes=True)))
-
     def test_dataset_rejects_missing_golden_shard(self, tmp_path: Path) -> None:
         """Verify LazyReplayDataset detects missing physical shard files on disk and raises ValueError."""
         built = build_dataset(tmp_path, 1)
@@ -190,10 +177,7 @@ class TestReplayDatasets:
         torch.save(payload, shard_path)
 
         manifest = built.manifest.to_dict()
-        digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
-        manifest["shards"][0]["sha256"] = digest
-        manifest["shards"][0]["byte_size"] = shard_path.stat().st_size
-        manifest["artifact_hashes"][built.manifest.shards[0].filename] = digest
+
         altered = built.manifest_path.parent / "altered.json"
         altered.write_text(json.dumps(manifest), encoding="utf-8")
 
@@ -201,7 +185,7 @@ class TestReplayDatasets:
             ValueError,
             match="Shard summary count does not match game offsets|Shard summaries do not cover",
         ):
-            LazyReplayDataset(altered)
+            list(LazyReplayDataset(altered))
 
     def test_dataset_rejects_nonchronological_game_summaries(self, tmp_path: Path) -> None:
         built = write_dataset_replay_dataset(
@@ -215,39 +199,9 @@ class TestReplayDatasets:
         torch.save(payload, shard_path)
 
         manifest = built.manifest.to_dict()
-        digest = hashlib.sha256(shard_path.read_bytes()).hexdigest()
-        manifest["shards"][0]["sha256"] = digest
-        manifest["shards"][0]["byte_size"] = shard_path.stat().st_size
-        manifest["artifact_hashes"][built.manifest.shards[0].filename] = digest
+
         altered = built.manifest_path.parent / "altered.json"
         altered.write_text(json.dumps(manifest), encoding="utf-8")
 
         with pytest.raises(ValueError, match="not chronological"):
             list(LazyReplayDataset(altered))
-
-    def test_dataset_rejects_semantically_duplicate_shards(self, tmp_path: Path) -> None:
-        built = build_dataset(tmp_path, 1)
-        entry = built.manifest.shards[0]
-        original = built.manifest_path.parent / entry.filename
-        duplicate = built.manifest_path.parent / "duplicate.pt"
-        payload = torch.load(original, weights_only=True, map_location="cpu")
-        payload["tensors"]["outcome"] = -payload["tensors"]["outcome"]
-        torch.save(payload, duplicate)
-        digest = hashlib.sha256(duplicate.read_bytes()).hexdigest()
-
-        manifest = built.manifest.to_dict()
-        duplicate_entry = dict(manifest["shards"][0])
-        duplicate_entry["filename"] = duplicate.name
-        duplicate_entry["sha256"] = digest
-        duplicate_entry["byte_size"] = duplicate.stat().st_size
-        manifest["shards"].append(duplicate_entry)
-        manifest["artifact_hashes"][duplicate.name] = digest
-        manifest["raw_replays"]["phantom"] = "a" * 64
-        manifest["source_series"]["phantom-series"] = ["phantom"]
-        manifest["source_games"] = 2
-        manifest["accepted_games"] = 2
-        altered = built.manifest_path.parent / "duplicate.json"
-        altered.write_text(json.dumps(manifest), encoding="utf-8")
-
-        with pytest.raises(ValueError, match="spans multiple shards|cover every accepted replay"):
-            LazyReplayDataset(altered, verify_hashes=True)

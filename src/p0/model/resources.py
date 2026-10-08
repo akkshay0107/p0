@@ -9,7 +9,6 @@ from typing import Any
 
 import orjson
 
-from p0.format_config import load_active_global_contract
 from p0.model.tokenizer import PokemonTokenizer, tokenizer
 from p0.paths import DEFAULT_PATHS
 
@@ -61,7 +60,6 @@ class RuntimeResources:
 
 @lru_cache(maxsize=1)
 def default_runtime_resources() -> RuntimeResources:
-    load_active_global_contract()
     dex_path = DEFAULT_PATHS.data_root / "champions_dex.json"
     dex = orjson.loads(dex_path.read_bytes())
     return RuntimeResources.from_data(tokenizer.vocab, dex, shared_tokenizer=tokenizer)

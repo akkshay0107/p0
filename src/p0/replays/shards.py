@@ -8,7 +8,7 @@ from typing import Any, Mapping
 import torch
 
 from p0.battle.actions import ACT_SIZE, MEGA_FORCED_ACTION, MEGA_MOVE_START
-from p0.contracts import is_sha256, require_dataclass_fields
+from p0.contracts import require_dataclass_fields
 from p0.format_config import validate_artifact_runtime_contract
 from p0.model.structured_observation import StructuredObservation
 from p0.replays.schema import (
@@ -18,7 +18,7 @@ from p0.replays.schema import (
     _require_iso_timestamp,
 )
 
-SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v1"
+SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v2"
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
 # T is the shard's decision count and C its total candidate count. Candidates
@@ -78,139 +78,66 @@ def final_observation_field_specs() -> tuple[tuple[str, tuple[int, ...], torch.d
 
 @dataclass(frozen=True, slots=True)
 class ShardIndexEntry:
+    """One compiled series, identified by its compilation UUID."""
+
+    shard_id: str
     filename: str
-    sha256: str
+    series_id: str
+    replay_ids: tuple[str, ...]
     decisions: int
     games: int
-    series: int
-    byte_size: int
 
     def __post_init__(self) -> None:
-        if not self.filename:
-            raise ValueError("ShardIndexEntry.filename must be non-empty")
-
-        if not is_sha256(self.sha256):
-            raise ValueError("ShardIndexEntry.sha256 must be a lowercase SHA-256 digest")
-
-        for name, count in (
-            ("decisions", self.decisions),
-            ("games", self.games),
-            ("series", self.series),
-            ("byte_size", self.byte_size),
-        ):
-            if type(count) is not int or count < 0:
-                raise ValueError(f"ShardIndexEntry.{name} must be a nonnegative integer")
+        if not self.shard_id or not self.filename or not self.series_id:
+            raise ValueError("Shard entries require an ID, filename, and series ID")
+        if self.decisions <= 0 or self.games != 2 * len(self.replay_ids):
+            raise ValueError("Shard counts must contain two perspectives per replay")
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the index entry to a JSON-serializable dictionary."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShardIndexEntry:
-        """Parse a JSON dictionary into a ShardIndexEntry after validation."""
         require_dataclass_fields(value, cls)
-
-        return cls(
-            filename=str(value["filename"]),
-            sha256=str(value["sha256"]),
-            decisions=int(value["decisions"]),
-            games=int(value["games"]),
-            series=int(value["series"]),
-            byte_size=int(value["byte_size"]),
-        )
+        return cls(**{**value, "replay_ids": tuple(value["replay_ids"])})
 
 
 @dataclass(frozen=True, slots=True)
 class ShardManifest:
-    """Index and immutable identity for one compiled shard family."""
+    """Small dataset index referencing complete compiled series."""
 
-    global_contract_sha256: str
+    runtime_major: str
     shards: tuple[ShardIndexEntry, ...]
     diagnostics: Mapping[str, int]
     created_at: str
-    dataset_hash: str
+    dataset_id: str
     source_format_id: str
     build_config: Mapping[str, Any]
-    raw_replays: Mapping[str, str]
     source_series: Mapping[str, tuple[str, ...]]
     source_games: int
     accepted_games: int
     rejected_games: int
-    artifact_hashes: Mapping[str, str]
     artifact_schema: str = SHARD_ARTIFACT_SCHEMA
 
     def __post_init__(self) -> None:
         if self.artifact_schema != SHARD_ARTIFACT_SCHEMA:
-            raise ValueError(
-                f"Unsupported shard artifact schema {self.artifact_schema!r}; "
-                f"expected {SHARD_ARTIFACT_SCHEMA}"
-            )
-
-        if not is_sha256(self.global_contract_sha256):
-            raise ValueError(
-                "ShardManifest.global_contract_sha256 must be a lowercase SHA-256 digest"
-            )
-
-        if not is_sha256(self.dataset_hash):
-            raise ValueError("ShardManifest.dataset_hash must be a lowercase SHA-256 digest")
-
-        if not self.source_format_id:
-            raise ValueError("ShardManifest.source_format_id must be non-empty")
-
-        if not isinstance(self.build_config, Mapping):
-            raise ValueError("ShardManifest.build_config must be a mapping")
-
-        for replay_id, digest in self.raw_replays.items():
-            if not replay_id or not is_sha256(digest):
-                raise ValueError("ShardManifest.raw_replays contains an invalid identity")
-
-        for series_id, replay_ids in self.source_series.items():
-            if not series_id or not replay_ids or len(set(replay_ids)) != len(replay_ids):
-                raise ValueError("ShardManifest.source_series contains an invalid membership")
-
-        membership_ids = [
-            replay_id for replay_ids in self.source_series.values() for replay_id in replay_ids
-        ]
-        if len(set(membership_ids)) != len(membership_ids) or set(membership_ids) != set(
-            self.raw_replays
-        ):
-            raise ValueError("ShardManifest.source_series must partition all raw replays")
-
-        for name, count in (
-            ("source_games", self.source_games),
-            ("accepted_games", self.accepted_games),
-            ("rejected_games", self.rejected_games),
-        ):
-            if type(count) is not int or count < 0:
-                raise ValueError(f"ShardManifest.{name} must be a nonnegative integer")
-
+            raise ValueError(f"Unsupported shard artifact schema {self.artifact_schema!r}")
+        if not self.dataset_id or not self.runtime_major or not self.source_format_id:
+            raise ValueError("Dataset requires an ID, runtime reference, and source format")
+        replay_ids = [replay for members in self.source_series.values() for replay in members]
+        if len(set(replay_ids)) != len(replay_ids) or len(replay_ids) != self.source_games:
+            raise ValueError("source_series must contain every source replay exactly once")
         if self.accepted_games + self.rejected_games != self.source_games:
             raise ValueError("Accepted and rejected games must account for every source game")
-
-        if len(self.raw_replays) != self.source_games:
-            raise ValueError("ShardManifest.raw_replays must account for every source game")
-
         if self.games != self.accepted_games * 2:
             raise ValueError("Shard game counts must contain two perspectives per accepted game")
-
-        for filename, digest in self.artifact_hashes.items():
-            if not filename or not is_sha256(digest):
-                raise ValueError("ShardManifest.artifact_hashes contains an invalid entry")
-
-        seen: set[str] = set()
-        digests: set[str] = set()
+        seen = set()
         for entry in self.shards:
-            if entry.filename in seen:
-                raise ValueError(f"Duplicate shard filename {entry.filename!r}")
-            if entry.sha256 in digests:
-                raise ValueError(f"Duplicate shard content {entry.sha256!r}")
-            seen.add(entry.filename)
-            digests.add(entry.sha256)
-
-        for key, count in self.diagnostics.items():
-            if not isinstance(key, str) or type(count) is not int or count < 0:
-                raise ValueError("Shard diagnostics must map strings to nonnegative integers")
-
+            if entry.series_id in seen:
+                raise ValueError(f"Series {entry.series_id!r} spans multiple shards")
+            seen.add(entry.series_id)
+            if self.source_series.get(entry.series_id) != entry.replay_ids:
+                raise ValueError("Shard entry does not match source series")
         _require_iso_timestamp(self.created_at, "ShardManifest.created_at")
 
     @property
@@ -223,84 +150,27 @@ class ShardManifest:
 
     @property
     def series(self) -> int:
-        return sum(entry.series for entry in self.shards)
+        return len(self.shards)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert the manifest identity to a JSON-serializable dictionary."""
         return {
-            "artifact_schema": self.artifact_schema,
-            "global_contract_sha256": self.global_contract_sha256,
-            "dataset_hash": self.dataset_hash,
-            "source_format_id": self.source_format_id,
-            "build_config": dict(self.build_config),
-            "raw_replays": {
-                replay_id: self.raw_replays[replay_id] for replay_id in sorted(self.raw_replays)
-            },
-            "source_series": {
-                series_id: list(self.source_series[series_id])
-                for series_id in sorted(self.source_series)
-            },
-            "source_games": self.source_games,
-            "accepted_games": self.accepted_games,
-            "rejected_games": self.rejected_games,
-            "artifact_hashes": {
-                filename: self.artifact_hashes[filename]
-                for filename in sorted(self.artifact_hashes)
-            },
+            **asdict(self),
             "shards": [entry.to_dict() for entry in self.shards],
-            "diagnostics": {key: self.diagnostics[key] for key in sorted(self.diagnostics)},
-            "created_at": self.created_at,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShardManifest:
-        """Parse a JSON dictionary into a ShardManifest after validation."""
         require_dataclass_fields(value, cls)
-
-        diagnostics = value["diagnostics"]
-        if not isinstance(diagnostics, Mapping):
-            raise ValueError("ShardManifest.diagnostics must be a JSON object")
-
-        source_series = value["source_series"]
-        build_config = value["build_config"]
-        raw_replays = value["raw_replays"]
-        artifact_hashes = value["artifact_hashes"]
-
-        if (
-            not isinstance(source_series, Mapping)
-            or not isinstance(build_config, Mapping)
-            or not isinstance(raw_replays, Mapping)
-            or not isinstance(artifact_hashes, Mapping)
-        ):
-            raise ValueError("ShardManifest identity fields must be JSON objects")
-
         return cls(
-            artifact_schema=str(value["artifact_schema"]),
-            global_contract_sha256=str(value["global_contract_sha256"]),
-            dataset_hash=str(value["dataset_hash"]),
-            source_format_id=str(value["source_format_id"]),
-            build_config=dict(build_config),
-            raw_replays={str(replay_id): str(digest) for replay_id, digest in raw_replays.items()},
-            source_series={
-                str(series_id): tuple(str(replay_id) for replay_id in replay_ids)
-                for series_id, replay_ids in source_series.items()
-            },
-            source_games=int(value["source_games"]),
-            accepted_games=int(value["accepted_games"]),
-            rejected_games=int(value["rejected_games"]),
-            artifact_hashes={
-                str(filename): str(digest) for filename, digest in artifact_hashes.items()
-            },
-            shards=tuple(ShardIndexEntry.from_dict(entry) for entry in value["shards"]),
-            diagnostics={str(key): int(count) for key, count in diagnostics.items()},
-            created_at=str(value["created_at"]),
+            **{
+                **value,
+                "shards": tuple(ShardIndexEntry.from_dict(entry) for entry in value["shards"]),
+                "source_series": {key: tuple(ids) for key, ids in value["source_series"].items()},
+            }
         )
 
 
-def load_shard_manifest(
-    value: Mapping[str, Any],
-) -> ShardManifest:
-    """Validate a shard manifest against the active runtime before any tensor load."""
+def load_shard_manifest(value: Mapping[str, Any]) -> ShardManifest:
     validate_artifact_runtime_contract(value)
     return ShardManifest.from_dict(value)
 

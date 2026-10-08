@@ -171,8 +171,8 @@ class TrainingRun:
                 "metadata": {
                     key: old_metadata[key]
                     for key in (
-                        "dataset_hash",
-                        "split_manifest_sha256",
+                        "dataset_id",
+                        "split_id",
                         "trainer_config",
                         "selected_epoch",
                         "gamma",

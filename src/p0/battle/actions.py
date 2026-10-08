@@ -5,24 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 
-from p0.contracts import ACTION_CONTRACT
-
-_RANGES = {entry["meaning"]: entry for entry in ACTION_CONTRACT["ranges"]}
-
-ACT_SIZE = ACTION_CONTRACT["action_count"]
-PASS_ACTION = _RANGES["pass"]["start"]
-SWITCH_START = _RANGES["switch"]["start"]
-SWITCH_END = _RANGES["switch"]["end"]
-MOVE_START = _RANGES["move"]["start"]
-MOVE_END = _RANGES["move"]["end"]
-MEGA_MOVE_START = _RANGES["mega_move"]["start"]
-MEGA_MOVE_END = _RANGES["mega_move"]["end"]
-MEGA_FORCED_ACTION = _RANGES["mega_forced_move"]["start"]
-FORCED_ACTION = _RANGES["forced_move"]["start"]
-MOVE_SLOT_COUNT = _RANGES["move"]["move_slots"]
-TARGET_COUNT = len(_RANGES["move"]["targets"])
+ACT_SIZE = 49
+PASS_ACTION = 0
+SWITCH_START = 1
+SWITCH_END = 7
+MOVE_START = 7
+MOVE_END = 27
+MEGA_MOVE_START = 27
+MEGA_MOVE_END = 47
+MEGA_FORCED_ACTION = 47
+FORCED_ACTION = 48
+MOVE_SLOT_COUNT = 4
+TARGET_COUNT = 5
 TARGET_OFFSET = 2
-TEAM_SIZE = ACTION_CONTRACT["team_preview"]["roster_size"]
+TEAM_SIZE = 6
 
 
 class ActionKind(IntEnum):

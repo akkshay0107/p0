@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import os
 import shutil
 import tempfile
+import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,12 +23,12 @@ from p0.battle.legality import (
     legal_actions,
     slot1_base_mask,
 )
-from p0.contracts import canonical_json_sha256, sha256_file
-from p0.format_config import FORMAT, load_active_global_contract, validate_artifact_runtime_contract
+from p0.contracts import RuntimeContract
+from p0.format_config import FORMAT, active_runtime_contract
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
-from p0.persistence import atomic_json_save, atomic_torch_save
+from p0.persistence import atomic_json_save, atomic_output, atomic_torch_save
 from p0.replays.group import GroupedSeries, GroupingResult, group_replays
 from p0.replays.identity import ReplayMemberId, normalize_showdown_id
 from p0.replays.protocol import (
@@ -52,7 +52,7 @@ from p0.replays.reconstruction.projection import (
 )
 from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import reduce_replay_state
-from p0.replays.schema import DecisionType, LabelKind
+from p0.replays.schema import DecisionType, LabelKind, _require_iso_timestamp
 from p0.replays.shards import (
     FINAL_OBSERVATION_PREFIX,
     SHARD_ARTIFACT_SCHEMA,
@@ -63,7 +63,6 @@ from p0.replays.shards import (
     validate_shard_tensors,
 )
 from p0.runtime.process_context import PROCESS_CONTEXT
-from p0.teams.spread_usage import DEFAULT_SPREAD_TABLE_PATH
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 
@@ -142,6 +141,7 @@ class CompilationResult:
     series: tuple[GroupedSeries, ...]
     accepted_series: tuple[CompiledSeries, ...]
     metrics: CompilationMetrics
+    rejection_counters: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -168,80 +168,6 @@ class CompilationResult:
             ],
             "metrics": self.metrics.to_dict(),
         }
-
-
-def _build_identity(
-    series: tuple[GroupedSeries, ...],
-    source_format_id: str,
-    max_candidates: int,
-    max_decisions_per_shard: int,
-    external_rejections: Mapping[str, str] | None,
-) -> dict[str, Any]:
-    if max_candidates < 1:
-        raise ValueError("max_candidates must be positive")
-    if max_decisions_per_shard <= 0:
-        raise ValueError("max_decisions_per_shard must be positive")
-    rejected = external_rejections or {}
-    raw_replays = {
-        document.metadata.replay_id: hashlib.sha256(document.raw_payload).hexdigest()
-        for group in series
-        for document in group.games
-    }
-    if raw_replays.keys() & rejected.keys():
-        raise ValueError("Rejected replay ids overlap parsed source replay ids")
-    raw_replays.update(rejected)
-    memberships = {group.record.series_id: group.record.game_replay_ids for group in series}
-    memberships.update(
-        (f"rejected-{hashlib.sha256(replay_id.encode()).hexdigest()[:24]}", (replay_id,))
-        for replay_id in rejected
-    )
-    return {
-        "raw_replays": [
-            {"replay_id": replay_id, "content_sha256": digest}
-            for replay_id, digest in sorted(raw_replays.items())
-        ],
-        "source_series": memberships,
-        "source_format_id": source_format_id,
-        "build_config": {
-            "artifact_schema": SHARD_ARTIFACT_SCHEMA,
-            "max_candidates": max_candidates,
-            "max_decisions_per_shard": max_decisions_per_shard,
-            "spread_table_sha256": sha256_file(DEFAULT_SPREAD_TABLE_PATH),
-            "external_rejections": sorted(rejected),
-        },
-        "global_contract_sha256": load_active_global_contract().global_sha256,
-    }
-
-
-def _validate_existing_build(
-    root: Path,
-    *,
-    dataset_hash: str,
-) -> ShardBuildResult:
-    try:
-        manifest_value = orjson.loads((root / "manifest.json").read_bytes())
-        manifest = ShardManifest.from_dict(manifest_value)
-        validate_artifact_runtime_contract(manifest_value)
-    except (OSError, UnicodeDecodeError, orjson.JSONDecodeError, TypeError, ValueError) as exc:
-        raise ValueError(f"Existing dataset build is invalid: {root}") from exc
-
-    if manifest.dataset_hash != dataset_hash:
-        raise ValueError(f"Dataset directory identity mismatch: {root}")
-
-    expected_artifacts = {entry.filename for entry in manifest.shards}
-
-    if set(manifest.artifact_hashes) != expected_artifacts:
-        raise ValueError(f"Existing dataset artifact index is incomplete: {root}")
-
-    if any(manifest.artifact_hashes[entry.filename] != entry.sha256 for entry in manifest.shards):
-        raise ValueError(f"Existing dataset shard identities are inconsistent: {root}")
-
-    for filename, expected in manifest.artifact_hashes.items():
-        path = root / filename
-        if not path.is_file() or sha256_file(path) != expected:
-            raise ValueError(f"Existing dataset artifact failed validation: {path}")
-
-    return ShardBuildResult(root / "manifest.json", manifest)
 
 
 # Per-decision scalar columns in shard order; action masks are stacked separately.
@@ -340,179 +266,221 @@ def _tensorize_values(
 
 def _save_shard(
     root: Path,
-    index: int,
+    shard_id: str,
     tensors: dict[str, torch.Tensor],
     summaries: list[dict[str, Any]],
-    runtime_hash: str,
-    dataset_hash: str,
+    runtime_major: str,
 ) -> ShardIndexEntry:
     validate_shard_tensors(tensors)
-    if len(summaries) != tensors["game_offsets"].numel() - 1:
-        raise ValueError("Shard summary count must match game count")
-    filename = f"shard-{index:05d}.pt"
-    path = root / filename
+    filename = f"{shard_id}.pt"
     atomic_torch_save(
-        path,
+        root / filename,
         {
             "artifact_schema": SHARD_ARTIFACT_SCHEMA,
-            "global_contract_sha256": runtime_hash,
-            "dataset_hash": dataset_hash,
+            "runtime_major": runtime_major,
+            "shard_id": shard_id,
             "tensors": tensors,
             SHARD_SUMMARY_KEY: summaries,
         },
     )
     return ShardIndexEntry(
+        shard_id=shard_id,
         filename=filename,
-        sha256=sha256_file(path),
-        decisions=int(tensors["loss_mask"].shape[0]),
-        games=int(tensors["game_offsets"].numel() - 1),
-        series=int(tensors["series_offsets"].numel() - 1),
-        byte_size=path.stat().st_size,
+        series_id=summaries[0]["series_id"],
+        replay_ids=tuple(item["source_replay_id"] for item in summaries if item["player"] == 0),
+        decisions=tensors["loss_mask"].shape[0],
+        games=len(summaries),
     )
+
+
+def _read_compilation_index(root: Path) -> dict[str, dict[str, Any]]:
+    path = root / "compiled.jsonl"
+    if not path.exists():
+        return {}
+    with path.open("rb") as stream:
+        rows = [orjson.loads(line) for line in stream if line.strip()]
+    return {row["series_id"]: row for row in rows}
+
+
+def _save_compilation_index(root: Path, rows: Mapping[str, dict[str, Any]]) -> None:
+    with atomic_output(root / "compiled.jsonl") as temporary:
+        with temporary.open("wb") as stream:
+            for series_id in sorted(rows):
+                stream.write(orjson.dumps(rows[series_id]) + b"\n")
+
+
+def _validate_build_inputs(
+    groups: tuple[GroupedSeries, ...],
+    created_at: str | None,
+    external_rejections: Iterable[str],
+) -> tuple[str, ...]:
+    if created_at is not None:
+        _require_iso_timestamp(created_at, "ShardManifest.created_at")
+    rejected = tuple(external_rejections)
+    if any(not isinstance(replay_id, str) or not replay_id for replay_id in rejected):
+        raise ValueError("Rejected replay ids must be non-empty strings")
+    if len(set(rejected)) != len(rejected):
+        raise ValueError("Rejected replay ids must be unique")
+    source_ids = {replay for group in groups for replay in group.record.game_replay_ids}
+    if source_ids.intersection(rejected):
+        raise ValueError("Rejected replay ids overlap parsed source replay ids")
+    return rejected
+
+
+def _cache_compilation(
+    result: CompilationResult,
+    root: Path,
+    rows: dict[str, dict[str, Any]],
+    builder: ObservationBuilder,
+    runtime_major: str,
+    max_candidates: int,
+) -> None:
+    accepted = {series.group.record.series_id: series for series in result.accepted_series}
+    for group in result.series:
+        series_id = group.record.series_id
+        series = accepted.get(series_id)
+        entry = None
+        counters: Counter[str] = Counter(
+            replays=len(group.games), accepted_games=0, rejected_games=len(group.games)
+        )
+        counters.update(result.rejection_counters.get(series_id, {}))
+        if series is not None:
+            games = [
+                (game, perspective) for game in series.games for perspective in game.perspectives
+            ]
+            entry = _write_shard(root / "tensors", str(uuid.uuid4()), games, builder, runtime_major)
+            counters["accepted_games"] = len(series.games)
+            counters["rejected_games"] = 0
+            for game in series.games:
+                _measure_game(counters, game)
+        rows[series_id] = {
+            "series_id": series_id,
+            "replay_ids": list(group.record.game_replay_ids),
+            "max_candidates": max_candidates,
+            "runtime_major": runtime_major,
+            "entry": None if entry is None else entry.to_dict(),
+            "diagnostics": dict(counters),
+        }
+
+
+def _publish_dataset(
+    groups: tuple[GroupedSeries, ...],
+    root: Path,
+    rows: Mapping[str, dict[str, Any]],
+    runtime_major: str,
+    max_candidates: int,
+    created_at: str | None,
+    external_rejections: Iterable[str],
+) -> ShardBuildResult:
+    from p0.replays.dataset import assign_series_splits, write_split_manifest
+
+    entries = tuple(
+        ShardIndexEntry.from_dict(rows[group.record.series_id]["entry"])
+        for group in groups
+        if rows[group.record.series_id]["entry"] is not None
+    )
+    if not entries:
+        raise ValueError("No replay games passed the quality gates; nothing was published")
+    memberships = {group.record.series_id: group.record.game_replay_ids for group in groups}
+    rejected = tuple(external_rejections)
+    memberships.update((f"rejected:{replay_id}", (replay_id,)) for replay_id in rejected)
+    config = {"max_candidates": max_candidates}
+    latest = root / "latest.json"
+    if latest.exists():
+        latest_id = orjson.loads(latest.read_bytes())["dataset_id"]
+        path = root / latest_id / "manifest.json"
+        manifest = ShardManifest.from_dict(orjson.loads(path.read_bytes()))
+        if (
+            manifest.source_series == memberships
+            and manifest.shards == entries
+            and manifest.runtime_major == runtime_major
+            and manifest.build_config == config
+        ):
+            return ShardBuildResult(path, manifest)
+    counters: Counter[str] = Counter()
+    for group in groups:
+        counters.update(rows[group.record.series_id]["diagnostics"])
+    counters["replays"] += len(rejected)
+    counters["rejected_games"] += len(rejected)
+    dataset_id = str(uuid.uuid4())
+    manifest = ShardManifest(
+        runtime_major=runtime_major,
+        shards=entries,
+        diagnostics=dict(counters),
+        created_at=created_at or datetime.now(UTC).isoformat(),
+        dataset_id=dataset_id,
+        source_format_id=groups[0].record.format_id,
+        build_config=config,
+        source_series=memberships,
+        source_games=counters["replays"],
+        accepted_games=counters["accepted_games"],
+        rejected_games=counters["rejected_games"],
+    )
+    temporary = Path(tempfile.mkdtemp(prefix=".dataset-", dir=root))
+    destination = root / dataset_id
+    try:
+        for entry in entries:
+            os.link(root / "tensors" / entry.filename, temporary / entry.filename)
+        split = assign_series_splits((entry.series_id for entry in entries), dataset_id=dataset_id)
+        write_split_manifest(split, temporary / "splits.json")
+        atomic_json_save(temporary / "manifest.json", manifest.to_dict())
+        os.replace(temporary, destination)
+        atomic_json_save(latest, {"dataset_id": dataset_id})
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return ShardBuildResult(destination / "manifest.json", manifest)
 
 
 def write_tensor_shards(
     result: CompilationResult,
     output_dir: str | Path,
     *,
-    max_decisions_per_shard: int = 4096,
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     max_candidates: int = 256,
-    external_rejections: Mapping[str, str] | None = None,
+    external_rejections: Iterable[str] = (),
 ) -> ShardBuildResult:
-    """
-    Persist compiled replays as immutable, runtime-bound tensor shards.
-
-    The dataset hash covers source replay identities, series membership, format,
-    build configuration, and the runtime contract, but not reconstruction code.
-    Existing builds are validated and reused. Shards split only between series;
-    a series goes to a new shard when the whole series would exceed the limit,
-    so only a series larger than the limit produces an oversized shard.
-    Files are published atomically; failed builds are removed.
-
-    Raises ValueError for invalid limits, no accepted series, overlapping rejected
-    replay ids, or an invalid existing build.
-
-    Arguments:
-        result: Output of compile_documents.
-        output_dir: Root directory for shard builds.
-        max_decisions_per_shard: Target decision count per shard; must be positive.
-        resources: Runtime resources for the observation builder; None uses the defaults.
-        created_at: ISO timestamp for the manifest; None uses the current UTC time.
-        max_candidates: Candidate cap recorded in the build configuration; must
-            be positive. It should match the value passed to compile_documents;
-            this function does not apply it.
-        external_rejections: Replay id to content SHA-256 for replays rejected
-            before compilation. They are recorded in the manifest and counted
-            as rejected games.
-
-    Returns:
-        ShardBuildResult with the path to manifest.json and the manifest.
-    """
+    """Save reconstructed series and publish a dataset with default splits."""
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
     if not result.accepted_series:
         raise ValueError("No replay games passed the quality gates; nothing was published")
-    source_format_id = result.accepted_series[0].games[0].document.metadata.format_id
-    identity = _build_identity(
-        result.series,
-        source_format_id,
-        max_candidates,
-        max_decisions_per_shard,
-        external_rejections,
+    rejected = _validate_build_inputs(result.series, created_at, external_rejections)
+    runtime_major = (
+        active_runtime_contract()
+        if resources is None
+        else RuntimeContract.from_resources(resources.vocab, resources.dex)
+    ).major_sha256
+    resources = default_runtime_resources() if resources is None else resources
+    root = Path(output_dir)
+    rows = _read_compilation_index(root)
+    _cache_compilation(
+        result, root, rows, ObservationBuilder(resources), runtime_major, max_candidates
     )
-    runtime_hash = identity["global_contract_sha256"]
-    dataset_hash = canonical_json_sha256(identity)
-    rejected_count = len(external_rejections or ())
-    runtime_root = Path(output_dir) / runtime_hash
-    runtime_root.mkdir(parents=True, exist_ok=True)
-    destination = runtime_root / dataset_hash
-    if destination.exists():
-        return _validate_existing_build(
-            destination,
-            dataset_hash=dataset_hash,
-        )
-    root = Path(tempfile.mkdtemp(prefix=f".{dataset_hash}.", dir=runtime_root))
-    builder = ObservationBuilder(default_runtime_resources() if resources is None else resources)
-    entries: list[ShardIndexEntry] = []
-    diagnostics = Counter(result.metrics.counters)
-    diagnostics["rejected_input_files"] += rejected_count
-    try:
-        current_games: list[tuple[CompiledGame, ProjectedPerspective]] = []
-        current_decisions = 0
-        for accepted in sorted(
-            result.accepted_series, key=lambda item: item.group.record.series_id
-        ):
-            series_items = [
-                (game, perspective) for game in accepted.games for perspective in game.perspectives
-            ]
-            series_decisions = sum(len(perspective.decisions) for _, perspective in series_items)
-            if current_games and current_decisions + series_decisions > max_decisions_per_shard:
-                entries.append(
-                    _write_shard(
-                        root, len(entries), current_games, builder, runtime_hash, dataset_hash
-                    )
-                )
-                current_games, current_decisions = [], 0
-
-            current_games.extend(series_items)
-            current_decisions += series_decisions
-
-        if current_games:
-            entries.append(
-                _write_shard(root, len(entries), current_games, builder, runtime_hash, dataset_hash)
-            )
-        artifact_hashes = {entry.filename: entry.sha256 for entry in entries}
-        timestamp = created_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        manifest = ShardManifest(
-            global_contract_sha256=runtime_hash,
-            dataset_hash=dataset_hash,
-            source_format_id=source_format_id,
-            build_config=identity["build_config"],
-            raw_replays={
-                entry["replay_id"]: entry["content_sha256"] for entry in identity["raw_replays"]
-            },
-            source_series=identity["source_series"],
-            source_games=diagnostics["replays"] + rejected_count,
-            accepted_games=diagnostics["accepted_games"],
-            rejected_games=diagnostics.get("rejected_games", 0) + rejected_count,
-            artifact_hashes=artifact_hashes,
-            shards=tuple(entries),
-            diagnostics={key: int(value) for key, value in diagnostics.items() if value >= 0},
-            created_at=timestamp,
-        )
-        validate_artifact_runtime_contract(manifest.to_dict())
-        atomic_json_save(root / "manifest.json", manifest.to_dict())
-
-        os.replace(root, destination)
-        return ShardBuildResult(destination / "manifest.json", manifest)
-    except BaseException:
-        shutil.rmtree(root, ignore_errors=True)
-        raise
+    _save_compilation_index(root, rows)
+    return _publish_dataset(
+        result.series, root, rows, runtime_major, max_candidates, created_at, rejected
+    )
 
 
 def _write_shard(
     root: Path,
-    index: int,
+    shard_id: str,
     games: list[tuple[CompiledGame, ProjectedPerspective]],
     builder: ObservationBuilder,
-    runtime_hash: str,
-    dataset_hash: str,
+    runtime_major: str,
 ) -> ShardIndexEntry:
     """Tensorize the given game perspectives and save them as one shard."""
     field_values = {name: [] for name, _, _ in observation_field_specs()}
     final_observations: list[StructuredObservation] = []
     scalar_values = _empty_scalar_values()
     game_offsets = [0]
-    series_offsets = [0]
     summaries: list[dict[str, Any]] = []
-    last_series_id: str | None = None
     for game, perspective in games:
         fields, values, final_observation = _perspective_tensors(game, perspective, builder)
         final_observations.append(final_observation)
 
-        if last_series_id is not None and game.series_id != last_series_id:
-            series_offsets.append(game_offsets[-1])
-        last_series_id = game.series_id
         for name in field_values:
             field_values[name].extend(fields[name])
         candidate_base = len(scalar_values["candidate_values"])
@@ -539,7 +507,6 @@ def _write_shard(
                 ),
             }
         )
-    series_offsets.append(game_offsets[-1])
     tensors = _tensorize_values(field_values, scalar_values)
     tensors.update(
         {
@@ -552,8 +519,8 @@ def _write_shard(
         }
     )
     tensors["game_offsets"] = torch.tensor(game_offsets, dtype=torch.long)
-    tensors["series_offsets"] = torch.tensor(series_offsets, dtype=torch.long)
-    return _save_shard(root, index, tensors, summaries, runtime_hash, dataset_hash)
+    tensors["series_offsets"] = torch.tensor([0, game_offsets[-1]], dtype=torch.long)
+    return _save_shard(root, shard_id, tensors, summaries, runtime_major)
 
 
 def _count_label(counters: Counter[str], kind: int) -> None:
@@ -855,6 +822,9 @@ def _compile_groups(
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
     counters = _initial_compilation_counters(grouping)
+    rejection_counters: dict[str, Counter[str]] = {
+        group.record.series_id: Counter() for group in grouping.series
+    }
     failed_series: set[str] = set()
     for group in grouping.series:
         blocking_codes = {
@@ -864,6 +834,7 @@ def _compile_groups(
             failed_series.add(group.record.series_id)
             for code in blocking_codes:
                 counters[f"rejected_{code}"] += 1
+                rejection_counters[group.record.series_id][f"rejected_{code}"] += 1
 
     jobs = []
     for group in grouping.series:
@@ -900,6 +871,7 @@ def _compile_groups(
         series_id = job[1]
         if reason is not None:
             counters[f"rejected_reconstruction_{reason.value}"] += 1
+            rejection_counters[series_id][f"rejected_reconstruction_{reason.value}"] += 1
             failed_series.add(series_id)
             continue
         if compiled is None:
@@ -909,6 +881,7 @@ def _compile_groups(
         if reasons:
             for quality_reason in reasons:
                 counters[f"rejected_{quality_reason}"] += 1
+                rejection_counters[series_id][f"rejected_{quality_reason}"] += 1
             failed_series.add(series_id)
             continue
 
@@ -927,6 +900,7 @@ def _compile_groups(
         if actual_numbers != tuple(range(1, len(group.games) + 1)):
             failed_series.add(series_id)
             counters["rejected_non_contiguous_game_numbers"] += 1
+            rejection_counters[series_id]["rejected_non_contiguous_game_numbers"] += 1
             continue
         accepted_series.append(CompiledSeries(group, tuple(retained)))
         for game in retained:
@@ -951,7 +925,10 @@ def _compile_groups(
     metric_values: dict[str, int | float] = dict(counters)
     metric_values["imputation_confidence_sum"] = confidence_sum
     return CompilationResult(
-        grouping.series, tuple(accepted_series), CompilationMetrics(metric_values)
+        grouping.series,
+        tuple(accepted_series),
+        CompilationMetrics(metric_values),
+        {series_id: dict(values) for series_id, values in rejection_counters.items()},
     )
 
 
@@ -978,47 +955,58 @@ def compile_to_shards(
     *,
     format_id: str | None = None,
     max_candidates: int = 256,
-    max_decisions_per_shard: int = 4096,
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
     chunksize: int | None = None,
-    external_rejections: Mapping[str, str] | None = None,
+    external_rejections: Iterable[str] = (),
+    force_reconstruct: bool = False,
 ) -> ShardBuildResult:
-    """
-    Compile documents and write a validated tensor shard build.
-
-    With a single source format, the dataset hash is known before compilation,
-    so an existing build at that hash is validated and returned without
-    reconstructing any replay. This happens even if none of the documents
-    would pass the quality gates now. Mixed-format input is compiled first,
-    because the build's format is taken from the first accepted game.
-    """
+    """Reuse compiled series by replay IDs; force rebuilding after reconstruction edits."""
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
     grouping = _group_documents(documents, format_id)
-    formats = {group.record.format_id for group in grouping.series}
-    if len(formats) == 1:
-        identity = _build_identity(
-            grouping.series,
-            next(iter(formats)),
-            max_candidates,
-            max_decisions_per_shard,
-            external_rejections,
+    rejected = _validate_build_inputs(grouping.series, created_at, external_rejections)
+    runtime_major = (
+        active_runtime_contract()
+        if resources is None
+        else RuntimeContract.from_resources(resources.vocab, resources.dex)
+    ).major_sha256
+    root = Path(output_dir)
+    rows = _read_compilation_index(root)
+    pending = []
+    for group in grouping.series:
+        row = rows.get(group.record.series_id)
+        if row is not None and not force_reconstruct:
+            if row["runtime_major"] != runtime_major:
+                raise ValueError(
+                    "Cached vocabulary or encoding is incompatible; use --force-reconstruct"
+                )
+            entry = row["entry"]
+            exists = entry is None or (root / "tensors" / entry["filename"]).is_file()
+            if (
+                tuple(row["replay_ids"]) == group.record.game_replay_ids
+                and row["max_candidates"] == max_candidates
+                and exists
+            ):
+                continue
+        pending.append(group)
+    if pending:
+        pending_replays = {replay for group in pending for replay in group.record.game_replay_ids}
+        diagnostics = tuple(
+            diagnostic
+            for diagnostic in grouping.diagnostics
+            if pending_replays.intersection(diagnostic.replay_ids)
         )
-        dataset_hash = canonical_json_sha256(identity)
-        destination = Path(output_dir) / identity["global_contract_sha256"] / dataset_hash
-        if destination.exists():
-            return _validate_existing_build(
-                destination,
-                dataset_hash=dataset_hash,
-            )
-    result = _compile_groups(grouping, max_candidates, chunksize)
-    return write_tensor_shards(
-        result,
-        output_dir,
-        max_decisions_per_shard=max_decisions_per_shard,
-        resources=resources,
-        created_at=created_at,
-        max_candidates=max_candidates,
-        external_rejections=external_rejections,
+        result = _compile_groups(
+            GroupingResult(tuple(pending), diagnostics), max_candidates, chunksize
+        )
+        resources = default_runtime_resources() if resources is None else resources
+        _cache_compilation(
+            result, root, rows, ObservationBuilder(resources), runtime_major, max_candidates
+        )
+        _save_compilation_index(root, rows)
+    return _publish_dataset(
+        grouping.series, root, rows, runtime_major, max_candidates, created_at, rejected
     )
 
 

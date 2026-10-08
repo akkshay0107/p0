@@ -23,7 +23,6 @@ class TestBuildCorpus:
             (v1, v2),
             tokenizer=tokenizer,
             validator=validate_many,
-            global_contract_sha256="a" * 64,
             format_id=FORMAT.battle_format,
         )
         assert len(manifest.entries) == 2
@@ -41,7 +40,6 @@ class TestBuildCorpus:
             (v_valid, v_oov),
             tokenizer=tokenizer,
             validator=validate_many,
-            global_contract_sha256="a" * 64,
         )
         assert len(manifest.entries) == 1
         assert audit["admitted_count"] == 1

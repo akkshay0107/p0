@@ -3,7 +3,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const ts = require('../pokemon-showdown/node_modules/typescript');
 
 const ROOT = path.resolve(__dirname, '..', 'pokemon-showdown');
@@ -153,7 +152,7 @@ function scan(file) {
     ts.forEachChild(node, visit);
   }
   visit(source);
-  return {path: path.relative(ROOT, file).replaceAll(path.sep, '/'), sha256: crypto.createHash('sha256').update(text).digest('hex'), entries};
+  return {path: path.relative(ROOT, file).replaceAll(path.sep, '/'), entries};
 }
 
 function volatileTable() {

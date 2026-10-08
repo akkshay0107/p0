@@ -12,7 +12,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
-from p0.format_config import checkpoint_contract_compatibility, load_active_global_contract
+from p0.contracts import RuntimeContract, compare_runtime_contracts
 from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
 from p0.model.factory import (
@@ -52,8 +52,8 @@ class CheckpointStore:
         *,
         resources: RuntimeResources | None = None,
     ) -> None:
-        self._manifest = load_active_global_contract()
-        self._resources = resources
+        self._resources = default_runtime_resources() if resources is None else resources
+        self._contract = RuntimeContract.from_resources(self._resources.vocab, self._resources.dex)
 
     def read(self, path: Path) -> LoadedCheckpoint:
         """Read and hash the same open file, even if its path is replaced."""
@@ -95,7 +95,7 @@ class CheckpointStore:
         self._match_metadata(artifact, path, expected_metadata)
         try:
             config = ModelConfig.from_dict(artifact["model_config"])
-            policy = build_policy(config, self._runtime_resources()).to(device)
+            policy = build_policy(config, self._resources).to(device)
             load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
             return policy
         except Exception as exc:
@@ -244,8 +244,7 @@ class CheckpointStore:
         return {
             "artifact_schema": CHECKPOINT_ARTIFACT_SCHEMA,
             "artifact_type": artifact_type,
-            "global_contract_sha256": self._manifest.global_sha256,
-            "global_contract": self._manifest.to_dict(),
+            "runtime_contract": self._contract.to_dict(),
             "model_config": policy.config.to_dict(),
             "model_state_dict": canonical_policy_state_dict(policy),
             "provenance": dict(metadata or {}),
@@ -273,23 +272,12 @@ class CheckpointStore:
             raise ValueError(f"Invalid model configuration in checkpoint {path}") from exc
 
     def _validate_contract(self, artifact: Mapping[str, Any], path: Path) -> None:
-        comp = checkpoint_contract_compatibility(artifact)
-        if not comp.is_compatible:
-            diffs = "; ".join(comp.major_differences)
-            raise ValueError(
-                f"Checkpoint {path} is incompatible with the active global contract: {diffs}"
-            )
-        if comp.status == "warning":
-            LOGGER.warning(
-                "Checkpoint %s has non-breaking contract differences: %s",
-                path,
-                "; ".join(comp.minor_differences),
-            )
-
-    def _runtime_resources(self) -> RuntimeResources:
-        if self._resources is None:
-            self._resources = default_runtime_resources()
-        return self._resources
+        historical = RuntimeContract.from_dict(artifact["runtime_contract"])
+        status = compare_runtime_contracts(historical, self._contract)
+        if status == "incompatible":
+            raise ValueError(f"Checkpoint {path} vocabulary or encoding is incompatible")
+        if status == "warning":
+            LOGGER.warning("Checkpoint %s was trained with different dex data", path)
 
     @staticmethod
     def _match_metadata(

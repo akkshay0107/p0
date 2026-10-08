@@ -17,14 +17,7 @@ from p0.battle.events import (
     EVENT_CATEGORICAL_WIDTH,
     EVENT_NUMERICAL_WIDTH,
     MAX_EVENT_RECORDS,
-    EffectNamespace,
-    EventDetail,
-    EventKind,
-    EventPosition,
-    EventRecord,
 )
-from p0.contracts import MODEL_CONTRACT as _MODEL_CONTRACT
-from p0.contracts import canonical_json_sha256
 from p0.model.architecture_contract import (
     OBSERVATION_ENTITY_COUNT,
     SELF_TARGET_SENTINEL,
@@ -137,94 +130,6 @@ class CounterKind(IntEnum):
     ACTION_COUNT = 2
     STACK_COUNT = 3
     KNOWN_REMAINING = 4
-
-
-def _observation_layout_descriptor() -> dict[str, object]:
-    """Return observation layout metadata to verify manifest compatibility."""
-    return {
-        "team_size": TEAM_SIZE,
-        "move_slots": MOVE_SLOTS,
-        "max_effects": MAX_EFFECTS,
-        "sequence_length": SEQUENCE_LENGTH,
-        "pokemon_identity_width": POKEMON_IDENTITY_WIDTH,
-        "categorical": {
-            "status": CAT_IDX_STATUS,
-            "nature": CAT_IDX_NATURE,
-            "status_counter_kind": CAT_IDX_STATUS_COUNTER_KIND,
-            "identity_knownness": CAT_IDX_IDENTITY_KNOWNNESS,
-            "stat_provenance": CAT_IDX_STAT_PROVENANCE,
-            "presence_status": CAT_IDX_PRESENCE_STATUS,
-            "mechanic_state": CAT_IDX_MECHANIC_STATE,
-            "effect_start": CAT_EFFECT_START,
-            "effect_width": EFFECT_CATEGORICAL_WIDTH,
-            "width": CATEGORICAL_WIDTH,
-        },
-        "numerical": {
-            "base_width": NUM_BASE_WIDTH,
-            "effect_start": NUM_EFFECT_START,
-            "effect_width": EFFECT_NUMERICAL_WIDTH,
-            "effect_count": NUM_IDX_EFFECT_COUNT,
-            "effect_overflow": NUM_IDX_EFFECT_OVERFLOW,
-            "width": NUMERICAL_WIDTH,
-        },
-        "spatial_events": {
-            "count": MAX_EVENT_RECORDS,
-            "categorical_width": EVENT_CATEGORICAL_WIDTH,
-            "categorical_fields": EventRecord._fields[:EVENT_CATEGORICAL_WIDTH],
-            "numerical_width": EVENT_NUMERICAL_WIDTH,
-        },
-        "tokens": {
-            "global_field": TOKEN_IDX_GLOBAL_FIELD,
-            "ally_side": TOKEN_IDX_ALLY_SIDE,
-            "opponent_side": TOKEN_IDX_OPPONENT_SIDE,
-            "ally_pokemon": ALLY_POKE_TOKENS,
-            "opponent_pokemon": OPPONENT_POKE_TOKENS,
-            "target_sequence": TARGET_SEQ_INDICES,
-        },
-        "numerical_indices": {
-            "slot_condition": NUM_IDX_SLOT_CONDITION,
-            "slot_condition_unknown": NUM_IDX_SLOT_CONDITION_UNKNOWN,
-            "team_preview": NUM_IDX_TEAM_PREVIEW,
-            "hp_fraction": NUM_IDX_HP_FRACTION,
-            "move_pp": NUM_IDX_MOVE_PP,
-            "orig_idx_ratio": NUM_IDX_ORIG_IDX_RATIO,
-            "fainted": NUM_IDX_FAINTED,
-            "can_mega": NUM_IDX_CAN_MEGA,
-            "move_last": NUM_IDX_MOVE_LAST,
-            "status_counter": NUM_IDX_STATUS_COUNTER,
-            "preparing": NUM_IDX_PREPARING,
-            "level_stats": NUM_IDX_LEVEL_STATS,
-            "stat_provenance": NUM_IDX_STAT_PROVENANCE,
-            "move_legal": NUM_IDX_MOVE_LEGAL,
-            "can_switch_out": NUM_IDX_CAN_SWITCH_OUT,
-            "revealed": NUM_IDX_REVEALED,
-            "legality_unknown": NUM_IDX_LEGALITY_UNKNOWN,
-            "slot_legality_unknown": NUM_IDX_SLOT_LEGALITY_UNKNOWN,
-        },
-        "enum_encodings": {
-            key: {member.name.lower(): member.value for member in encoding}
-            for key, encoding in (
-                ("token_type", TokenType),
-                ("side_id", SideId),
-                ("identity_knownness", IdentityKnownness),
-                ("stat_provenance", StatProvenance),
-                ("presence_status", PresenceStatus),
-                ("mechanic_state", MechanicState),
-                ("effect_namespace", EffectNamespace),
-                ("counter_kind", CounterKind),
-                ("event_kind", EventKind),
-                ("event_position", EventPosition),
-                ("event_detail", EventDetail),
-            )
-        },
-    }
-
-
-if (
-    canonical_json_sha256(_observation_layout_descriptor())
-    != _MODEL_CONTRACT["observation_layout_sha256"]
-):
-    raise RuntimeError("Structured observation layout does not match the global model contract")
 
 
 def effect_cat_slice(index: int) -> slice:

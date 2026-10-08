@@ -19,7 +19,6 @@ from p0.replays.identity import ReplayMemberId, ReplaySide, linked_replay_ids
 from p0.replays.protocol import ReplayInputContractError, ReplayParseError, parse_replay_payload
 from p0.replays.reconstruction.projection import impute_replay_stats
 from p0.replays.schema import (
-    FetchMetadata,
     GameEndReason,
     OTSData,
     OTSMember,
@@ -350,16 +349,7 @@ class TestReplayInputContract:
         assert bulbasaur_stat.confidence == 0.0
 
     def test_new_schema_records_round_trip(self) -> None:
-        """Verify FetchMetadata, OTSData, and ReplayOutcome serialize and deserialize without loss."""
-        fetch = FetchMetadata(
-            source_url="https://example.invalid/replay.json",
-            fetched_at="2026-07-19T00:00:00Z",
-            http_status=200,
-            attempt=2,
-            retry_count=1,
-            elapsed_ms=12,
-        )
-        assert FetchMetadata.from_dict(fetch.to_dict()) == fetch
+        """Verify OTSData and ReplayOutcome serialize and deserialize without loss."""
         member = OTSMember(
             member_id=ReplayMemberId(ReplaySide.P1, 0),
             nickname="Pikachu",
@@ -415,7 +405,7 @@ class TestReplayInputContract:
             assert fallback.record.grouping_method.name == "FALLBACK_SAME_PLAYERS"
 
     def test_grouping_preserves_authoritative_numbers_and_stable_series_id(self) -> None:
-        """Verify series grouping maintains stable series hashes as additional games in the match are discovered."""
+        """Verify series grouping maintains stable series references as additional games in the match are discovered."""
         first = parse_replay_payload(sample_replay_payload("g1", game_number=1))
         second = parse_replay_payload(sample_replay_payload("g2", game_number=2))
 
@@ -426,7 +416,7 @@ class TestReplayInputContract:
         assert [membership.game_number for membership in complete.memberships] == [1, 2]
         assert complete.record.is_complete
 
-    def test_grouping_quarantines_missing_and_duplicate_game_numbers(self) -> None:
+    def test_grouping_reports_missing_and_duplicate_game_numbers(self) -> None:
         """Verify series grouping marks series with non-contiguous or duplicate game numbers as incomplete with diagnostics."""
         second = parse_replay_payload(sample_replay_payload("g2", game_number=2))
         third = parse_replay_payload(sample_replay_payload("g3", game_number=3))
@@ -445,8 +435,8 @@ class TestReplayInputContract:
         assert not duplicate.record.is_complete
         assert "duplicate_game_number" in {diagnostic.code for diagnostic in duplicate.diagnostics}
 
-    def test_grouping_quarantines_games_after_series_won(self) -> None:
-        """Verify matches with extra games played after a 2-0 win are quarantined with game_after_series_won diagnostic."""
+    def test_grouping_rejects_games_after_series_won(self) -> None:
+        """Verify matches with extra games after a 2-0 win are rejected with diagnostics."""
         games = tuple(
             parse_replay_payload(sample_replay_payload(f"g{number}", game_number=number))
             for number in (1, 2, 3)
@@ -459,7 +449,7 @@ class TestReplayInputContract:
         assert "game_after_series_won" in {diagnostic.code for diagnostic in group.diagnostics}
         assert validated_bo3_series(games) == ()
 
-    def test_grouping_quarantines_missing_outcomes_and_team_conflicts(self) -> None:
+    def test_grouping_reports_missing_outcomes_and_team_conflicts(self) -> None:
         """Verify series grouping flags incomplete outcomes and team roster changes across games in a BO3."""
         unresolved_payload = sample_replay_payload(
             "unresolved", game_number=1, parent="unresolved-series"
@@ -518,8 +508,8 @@ class TestReplayInputContract:
             for game in validated_bo3_series((same_side_second, first))[0].games
         ) == ("g1", "g2")
 
-    def test_replay_fixture_compiles_to_runtime_bound_schema_v5_shard(self, tmp_path: Path) -> None:
-        """Verify compile_payloads serializes into PyTorch schema v5 shards with valid action masks and CSR offsets."""
+    def test_replay_fixture_compiles_to_runtime_bound_shard(self, tmp_path: Path) -> None:
+        """Verify compile_payloads serializes into PyTorch shards with valid action masks and CSR offsets."""
         result = compile_payloads((sample_replay_payload("shard-fixture"),))
         built = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
 
@@ -527,7 +517,7 @@ class TestReplayInputContract:
         assert manifest.decisions == 4
         assert manifest.games == 2
         assert manifest.series == 1
-        assert manifest.diagnostics["label_unknown"] == 0
+        assert manifest.diagnostics.get("label_unknown", 0) == 0
 
         shard_path = built.manifest_path.parent / manifest.shards[0].filename
         payload = torch.load(shard_path, weights_only=True, map_location="cpu")
@@ -553,13 +543,3 @@ class TestReplayInputContract:
         tensors["mask_provenance"] = stale_provenance
         with pytest.raises(ValueError, match="unsupported value"):
             validate_shard_tensors(tensors)
-
-    def test_shard_bytes_are_deterministic_for_fixed_inputs(self, tmp_path: Path) -> None:
-        """Verify write_tensor_shards produces byte-identical files and manifests across independent invocations with identical inputs."""
-        result = compile_payloads((sample_replay_payload("shard-fixture"),))
-        first = write_tensor_shards(result, tmp_path / "first", created_at="2026-01-01T00:00:00Z")
-        second = write_tensor_shards(result, tmp_path / "second", created_at="2026-01-01T00:00:00Z")
-        first_path = first.manifest_path.parent / first.manifest.shards[0].filename
-        second_path = second.manifest_path.parent / second.manifest.shards[0].filename
-        assert first_path.read_bytes() == second_path.read_bytes()
-        assert first.manifest.to_dict() == second.manifest.to_dict()

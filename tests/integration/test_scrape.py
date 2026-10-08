@@ -14,7 +14,6 @@ from p0.replays.scrape import (
     ReplayFetchError,
     ScrapeConfig,
     load_raw_replay,
-    read_fetch_index,
 )
 from tests.replay_http_server import ReplayHTTPServer
 from tests.unit.replay_fixtures import sample_replay_payload
@@ -52,10 +51,7 @@ class TestReplayHTTP:
             assert load_raw_replay(raw_path) == body
             original = raw_path.read_bytes()
             modified_at = raw_path.stat().st_mtime_ns
-            metadata = json.loads((tmp_path / "f/metadata/f-1.json").read_text())
-            assert metadata["attempt"] == 2
-            assert metadata["retry_count"] == 1
-            assert metadata["http_status"] == 200
+            assert entries[0].http_status == 200
 
             assert ReplayFetcher(config).acquire((replay_id,)) == entries
             assert server.calls == {search_path: 2, path: 2}
@@ -249,23 +245,30 @@ class TestReplayHTTP:
                 ReplayFetcher(config).acquire(("../escape",))
             assert not (tmp_path / "f/escape.json.gz").exists()
 
-    def test_corrupt_raw_cache_is_fetched_again(self, tmp_path: Path) -> None:
-        body = b'{"log":["|turn|1"]}'
-        raw = tmp_path / "f/raw/f-1.json.gz"
-        raw.parent.mkdir(parents=True)
-        raw.write_bytes(b"not gzip")
-        with ReplayHTTPServer({"/f-1.json": ((200, body),)}) as server:
+    def test_later_queries_fetch_new_games_without_repeating_cached_games(
+        self, tmp_path: Path
+    ) -> None:
+        with ReplayHTTPServer(
+            {
+                "/f-1.json": (
+                    (200, b'{"id":"f-1","p1":"Alice","p2":"Bob","rating":1500,"uploadtime":120}'),
+                ),
+                "/f-2.json": (
+                    (200, b'{"id":"f-2","p1":"Carol","p2":"Dan","rating":1800,"uploadtime":240}'),
+                ),
+            }
+        ) as server:
             config = ScrapeConfig(
                 format_id="f",
                 cache_dir=tmp_path,
                 replay_url_template=f"{server.url}/{{replay_id}}.json",
-                retries=1,
+                limit_games=1,
                 rate_limit_per_second=0,
             )
-            fetcher = ReplayFetcher(config)
-            entries = fetcher.acquire(("f-1",))
-
-            assert [entry.replay_id for entry in entries] == ["f-1"]
-            assert load_raw_replay(raw) == body
-            assert read_fetch_index(fetcher.index_path) == entries
-            assert server.calls == {"/f-1.json": 1}
+            first = ReplayFetcher(config).acquire(("f-1",))
+            second = ReplayFetcher(config).acquire(("f-1", "f-2"))
+            assert [row.replay_id for row in first] == ["f-1"]
+            assert [row.replay_id for row in second] == ["f-1", "f-2"]
+            assert server.calls == {"/f-1.json": 1, "/f-2.json": 1}
+            assert second[1].rating == 1800
+            assert second[1].players == ("Carol", "Dan")

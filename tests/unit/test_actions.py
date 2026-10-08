@@ -15,7 +15,6 @@ from p0.battle.actions import (
     encode_team_pair,
     team_selection,
 )
-from p0.contracts import ACTION_CONTRACT
 from p0.format_config import FORMAT
 
 
@@ -23,17 +22,7 @@ class TestActions:
     def test_action_codec_matches_literal_contract_boundaries(self) -> None:
         """Pin literal action meanings at every category boundary."""
         assert ACT_SIZE == 49
-        assert ACTION_CONTRACT["action_count"] == 49
         assert FORMAT.action_size == 49
-        assert [(entry["start"], entry["end"]) for entry in ACTION_CONTRACT["ranges"]] == [
-            (0, 1),
-            (1, 7),
-            (7, 27),
-            (27, 47),
-            (47, 48),
-            (48, 49),
-        ]
-
         action_cases = (
             (0, SlotAction(ActionKind.PASS)),
             (1, SlotAction(ActionKind.SWITCH, switch_slot=0)),

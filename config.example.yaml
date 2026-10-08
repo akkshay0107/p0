@@ -57,7 +57,7 @@ bc:
   enable_optim: true
   # Placeholders: replace with the manifest_path printed by `p0-replays build-shards`
   # `p0-replays create-splits` writes splits.json beside this manifest.
-  shard_manifest: artifacts/shards/<global-contract-hash>/<dataset-hash>/manifest.json
+  shard_manifest: artifacts/datasets/<dataset-uuid>/manifest.json
   output_dir: artifacts/checkpoints/bc
   resume_checkpoint: null
 

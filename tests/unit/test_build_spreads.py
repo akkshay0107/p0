@@ -32,7 +32,8 @@ class TestBuildSpreads:
             MIN_NATURE_SHARE,
             month,
         )
-        assert generated["source"] == source
+        assert generated["source"]["month"] == source["month"]
+        assert generated["source"]["exports"] == sorted(source["exports"])
         assert generated["format_id"] == dex_source["battleFormat"]
         after = {
             path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in cache.iterdir()

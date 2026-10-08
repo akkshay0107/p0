@@ -474,7 +474,7 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
             end_reason = pending_message_reason
     turns = max((line.turn or 0 for line in lines), default=0)
     if terminal is None:
-        # Incomplete captures are retained for grouping/quarantine.  A
+        # Incomplete captures are retained for grouping diagnostics. A
         # terminal marker is required before reconstruction, but its absence
         # is not malformed transport input.
         return ReplayOutcome(-1, GameEndReason.NORMAL, turns, None)

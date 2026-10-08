@@ -52,7 +52,7 @@ MAX_SPREADS_PER_BUCKET = 15
 # discarded buckets are the ones whose rankings are dominated by sampling noise.
 MIN_NATURE_SHARE = 0.005
 
-# Weights are stored as scaled integers so the artifact hashes identically across
+# Weights are stored as scaled integers so the artifact serializes identically across
 # platforms, which float formatting cannot guarantee.
 WEIGHT_SCALE = 1_000_000
 

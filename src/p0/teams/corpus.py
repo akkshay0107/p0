@@ -1,50 +1,28 @@
-"""
-Team corpus manifest schema and validation.
-
-Each entry records both the CanonicalTeam hash (order-independent JSON SHA-256)
-and the packed Showdown string hash for runtime sampling.
-"""
+"""Validated team variants grouped by canonical team UUID."""
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
-from p0.contracts import (
-    canonical_json_sha256,
-    is_sha256,
-    require_dataclass_fields,
-)
-from p0.format_config import validate_artifact_runtime_contract
+from p0.contracts import require_dataclass_fields
 
-CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v1"
+CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v2"
 
 
 @dataclass(frozen=True, slots=True)
 class CorpusEntry:
     """One admitted team: canonical identity plus its packed runtime form."""
 
-    canonical_hash: str
+    canonical_id: str
     packed: str
-    packed_sha256: str
     usage_count: int
     spread_provenance: str = "imputed"
 
     def __post_init__(self) -> None:
-        if not is_sha256(self.canonical_hash):
-            raise ValueError("CorpusEntry.canonical_hash must be a lowercase SHA-256 digest")
-
-        if not self.packed:
-            raise ValueError("CorpusEntry.packed must be a non-empty packed team")
-
-        actual = hashlib.sha256(self.packed.encode()).hexdigest()
-        if self.packed_sha256 != actual:
-            raise ValueError(
-                "CorpusEntry.packed_sha256 does not match the packed team: "
-                f"declared={self.packed_sha256}, actual={actual}"
-            )
+        if not self.canonical_id or not self.packed:
+            raise ValueError("Corpus entries require a canonical team ID and packed team")
 
         if type(self.usage_count) is not int or self.usage_count < 1:
             raise ValueError("CorpusEntry.usage_count must be a positive integer")
@@ -59,27 +37,19 @@ class CorpusEntry:
     def from_dict(cls, value: Mapping[str, Any]) -> CorpusEntry:
         require_dataclass_fields(value, cls)
         return cls(
-            canonical_hash=str(value["canonical_hash"]),
+            canonical_id=str(value["canonical_id"]),
             packed=str(value["packed"]),
-            packed_sha256=str(value["packed_sha256"]),
             usage_count=int(value["usage_count"]),
             spread_provenance=str(value["spread_provenance"]),
         )
-
-
-def corpus_content_hash(entries: tuple[CorpusEntry, ...]) -> str:
-    """Identity of the corpus content, deterministic under entry reordering."""
-    ordered = sorted(entries, key=lambda entry: (entry.canonical_hash, entry.packed_sha256))
-    return canonical_json_sha256([entry.to_dict() for entry in ordered])
 
 
 @dataclass(frozen=True, slots=True)
 class TeamCorpusManifest:
     """The single loadable description of a validated team corpus."""
 
-    global_contract_sha256: str
     format_id: str
-    corpus_hash: str
+    corpus_id: str
     entries: tuple[CorpusEntry, ...]
     created_at: str
     sampling_metadata: Mapping[str, Any]
@@ -92,27 +62,15 @@ class TeamCorpusManifest:
                 f"expected {CORPUS_MANIFEST_SCHEMA}"
             )
 
-        if not is_sha256(self.global_contract_sha256):
-            raise ValueError(
-                "TeamCorpusManifest.global_contract_sha256 must be a lowercase SHA-256 digest"
-            )
-
         if not self.format_id:
             raise ValueError("TeamCorpusManifest.format_id must be non-empty")
 
         seen: set[tuple[str, str]] = set()
         for entry in self.entries:
-            key = (entry.canonical_hash, entry.packed_sha256)
+            key = (entry.canonical_id, entry.packed)
             if key in seen:
-                raise ValueError(f"Duplicate corpus entry {entry.canonical_hash}")
+                raise ValueError(f"Duplicate corpus entry {entry.canonical_id}")
             seen.add(key)
-
-        actual = corpus_content_hash(self.entries)
-        if self.corpus_hash != actual:
-            raise ValueError(
-                "TeamCorpusManifest.corpus_hash does not match the entries: "
-                f"declared={self.corpus_hash}, actual={actual}"
-            )
 
         try:
             datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
@@ -126,9 +84,8 @@ class TeamCorpusManifest:
     def to_dict(self) -> dict[str, Any]:
         return {
             "artifact_schema": self.artifact_schema,
-            "global_contract_sha256": self.global_contract_sha256,
             "format_id": self.format_id,
-            "corpus_hash": self.corpus_hash,
+            "corpus_id": self.corpus_id,
             "entries": [entry.to_dict() for entry in self.entries],
             "created_at": self.created_at,
             "sampling_metadata": dict(self.sampling_metadata),
@@ -142,18 +99,9 @@ class TeamCorpusManifest:
             raise ValueError("TeamCorpusManifest.sampling_metadata must be a JSON object")
         return cls(
             artifact_schema=str(value["artifact_schema"]),
-            global_contract_sha256=str(value["global_contract_sha256"]),
             format_id=str(value["format_id"]),
-            corpus_hash=str(value["corpus_hash"]),
+            corpus_id=str(value["corpus_id"]),
             entries=tuple(CorpusEntry.from_dict(entry) for entry in value["entries"]),
             created_at=str(value["created_at"]),
             sampling_metadata=dict(metadata),
         )
-
-
-def load_corpus_manifest(
-    value: Mapping[str, Any],
-) -> TeamCorpusManifest:
-    """Validate a corpus manifest against the active runtime before use."""
-    validate_artifact_runtime_contract(value)
-    return TeamCorpusManifest.from_dict(value)

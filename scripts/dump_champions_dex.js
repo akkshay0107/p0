@@ -6,7 +6,6 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const crypto = require("node:crypto");
 
 const showdownRoot = path.resolve(__dirname, "..", "pokemon-showdown");
 const { Dex } = require(path.join(showdownRoot, "dist", "sim", "dex"));
@@ -420,7 +419,6 @@ console.log(
   JSON.stringify(
     {
       output: path.relative(process.cwd(), outputPath),
-      sha256: crypto.createHash("sha256").update(serialized).digest("hex"),
       counts: Object.fromEntries(
         Object.entries(output)
           .filter(([, value]) => Array.isArray(value))

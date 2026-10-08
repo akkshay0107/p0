@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Mapping, cast
@@ -94,9 +93,9 @@ class CanonicalTeam:
         )
 
     @property
-    def team_hash(self) -> str:
+    def team_key(self) -> str:
         encoded = orjson.dumps(self.to_dict(), option=orjson.OPT_SORT_KEYS)
-        return hashlib.sha256(encoded).hexdigest()
+        return encoded.decode("utf-8")
 
     def to_dict(self) -> dict[str, object]:
         return {"members": [member.to_dict() for member in self.canonical().members]}
@@ -148,16 +147,16 @@ def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ..
                 )
             )
 
-        hash_key = (variant.team.team_hash, canonical_spreads)
-        previous = deduped.get(hash_key)
+        key = (variant.team.team_key, canonical_spreads)
+        previous = deduped.get(key)
 
         if previous is None:
-            deduped[hash_key] = variant
+            deduped[key] = variant
             continue
 
         metadata = TeamMetadata(
             usage_count=previous.metadata.usage_count + variant.metadata.usage_count,
         )
-        deduped[hash_key] = replace(previous, metadata=metadata)
+        deduped[key] = replace(previous, metadata=metadata)
 
     return tuple(deduped[k] for k in sorted(deduped, key=lambda item: (item[0], repr(item[1]))))

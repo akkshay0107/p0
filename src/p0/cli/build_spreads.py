@@ -2,14 +2,13 @@
 Build the empirical Stat Point spread priors from Showdown usage exports.
 
 Raw exports are cached by month. --fetch downloads missing exports and reuses
-existing bytes so regeneration preserves the recorded source hashes.
+existing bytes without downloading them again.
 """
 
 from __future__ import annotations
 
 import argparse
 import gzip
-import hashlib
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -94,13 +93,10 @@ def build(
         min_nature_share=min_nature_share,
     )
 
-    # Record the usage month and exact downloaded bytes.
+    # Record the usage month and downloaded export names.
     payload["source"] = {
         "month": month,
-        "exports": {
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in (bo1_path, bo3_path)
-        },
+        "exports": [bo1_path.name, bo3_path.name],
     }
 
     # Round-trip before writing so a malformed artifact fails here rather than at

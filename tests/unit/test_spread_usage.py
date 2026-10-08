@@ -291,20 +291,14 @@ class TestSpreadValidation:
             "https://www.smogon.com/stats/2026-09/chaos/gen9championsvgc2026regmc-1760.json.gz"
         )
 
-    def test_shipped_spread_table_pins_its_source_exports(self) -> None:
-        """Verify the committed spread table names the 2026-09 exports and their SHA-256 digests."""
+    def test_shipped_spread_table_records_source_references(self) -> None:
         source = orjson.loads(DEFAULT_SPREAD_TABLE_PATH.read_bytes())["source"]
-
         assert source == {
             "month": "2026-09",
-            "exports": {
-                "gen9championsvgc2026regmc-1760.json": (
-                    "923a9744a1210a9957313ee505e0735e5f0437746bd4e6e030f8b6f9113ed000"
-                ),
-                "gen9championsvgc2026regmcbo3-1760.json": (
-                    "f944e2de85ee262f20caa75b6a7b500dc8cfe6347264c142c16c1b0829813ee7"
-                ),
-            },
+            "exports": [
+                "gen9championsvgc2026regmc-1760.json",
+                "gen9championsvgc2026regmcbo3-1760.json",
+            ],
         }
 
     def test_usage_prior_beats_fallback_and_reports_confidence(self) -> None:

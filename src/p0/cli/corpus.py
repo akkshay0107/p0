@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import FORMAT, active_global_contract
+from p0.format_config import FORMAT
 from p0.model.tokenizer import PokemonTokenizer
 from p0.paths import DEFAULT_PATHS
 from p0.teams.corpus import TeamCorpusManifest
@@ -45,7 +45,7 @@ def _variants_from_showdown(
         dex: Optional dex data used for stat-spread imputation.
 
     Returns:
-        One deduplicated team record per canonical team hash.
+        One deduplicated team record per canonical team key.
     """
     from p0.teams.source import _PACKER
 
@@ -98,8 +98,8 @@ def _variants_from_showdown(
         team = CanonicalTeam(team_members)
         usage = team_counts[unique_teams[i // 6]]
 
-        previous = canonical_dict.get(team.team_hash)
-        canonical_dict[team.team_hash] = (team, usage + (0 if previous is None else previous[1]))
+        previous = canonical_dict.get(team.team_key)
+        canonical_dict[team.team_key] = (team, usage + (0 if previous is None else previous[1]))
 
     # Corpus teams sample the usage priors rather than taking the argmax, so generated
     # teams carry the meta's real spread variety. Seeded so builds stay reproducible.
@@ -193,7 +193,6 @@ def main(argv: list[str] | None = None) -> None:
             variants,
             tokenizer=tokenizer,
             validator=partial(validate_many, format_id=format_id),
-            global_contract_sha256=active_global_contract().global_sha256,
             format_id=format_id,
         )
         if not manifest.entries:

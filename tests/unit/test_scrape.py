@@ -19,11 +19,13 @@ from p0.replays.compile import (
     _replay_observation,
     compile_payloads,
 )
-from p0.replays.schema import FetchMetadata
+from p0.replays.schema import FetchIndexEntry
 from p0.replays.scrape import (
     ReplayFetcher,
     ScrapeConfig,
     read_fetch_index,
+    select_replays,
+    write_fetch_index,
 )
 from tests.unit.replay_fixtures import payload_with_ots_natures
 
@@ -93,32 +95,63 @@ class TestReplayScraping:
         ).encode()
         raw_path.write_bytes(gzip.compress(raw_payload, mtime=0))
 
-        meta_path = tmp_path / config.format_id / "metadata" / f"{replay_id}.json"
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta = FetchMetadata(
-            source_url=f"https://replay.pokemonshowdown.com/{replay_id}.json",
-            fetched_at="2026-01-01T00:00:00Z",
-            http_status=200,
-            attempt=1,
-            retry_count=0,
-            elapsed_ms=42,
-        )
-        meta_bytes = json.dumps(meta.to_dict()).encode() + b"\n"
-        meta_path.write_bytes(meta_bytes)
-        initial_mtime = meta_path.stat().st_mtime_ns
-
         fetcher = ReplayFetcher(config)
         entries = fetcher.acquire((replay_id,))
 
         assert len(entries) == 1
         assert entries[0].replay_id == replay_id
-        assert entries[0].byte_size == len(raw_payload)
+        assert entries[0].raw_path == f"raw/{replay_id}.json.gz"
         assert read_fetch_index(fetcher.index_path) == tuple(entries)
-        assert meta_path.read_bytes() == meta_bytes
-        assert meta_path.stat().st_mtime_ns == initial_mtime
 
     def test_fetch_index_rejects_invalid_json(self, tmp_path: Path) -> None:
         index = tmp_path / "index.jsonl"
         index.write_bytes(b"not-json\n")
         with pytest.raises(ValueError, match="Malformed fetch index"):
             read_fetch_index(index)
+
+
+class TestReplayCatalog:
+    def test_filters_ratings_dates_and_players_and_excludes_unknown_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        rows = (
+            FetchIndexEntry(
+                "r1",
+                "f",
+                "https://example.com/r1",
+                "2026-01-01T00:00:00Z",
+                200,
+                "raw/r1.json.gz",
+                "2026-01-05T00:00:00Z",
+                1800,
+                ("Alice", "Bob"),
+            ),
+            FetchIndexEntry(
+                "r2",
+                "f",
+                "https://example.com/r2",
+                "2026-01-01T00:00:00Z",
+                200,
+                "raw/r2.json.gz",
+                "2025-12-31T00:00:00Z",
+                1400,
+                ("Alice", "Carol"),
+            ),
+            FetchIndexEntry(
+                "r3", "f", "https://example.com/r3", "2026-01-01T00:00:00Z", 200, "raw/r3.json.gz"
+            ),
+        )
+        path = tmp_path / "index.jsonl"
+        write_fetch_index(path, rows)
+        catalog = read_fetch_index(path)
+        selected = select_replays(
+            catalog,
+            format_id="f",
+            min_rating=1500,
+            max_rating=1900,
+            after="2026-01-01",
+            before="2026-01-06",
+            player="alice",
+        )
+        assert [row.replay_id for row in selected] == ["r1"]
+        assert len(select_replays(catalog)) == 3

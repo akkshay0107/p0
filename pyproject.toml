@@ -40,7 +40,14 @@ where = ["src"]
 include = ["p0*"]
 
 [tool.setuptools.data-files]
-"share/p0" = ["data/*.json"]
+"share/p0" = [
+    "data/champions_coverage.json",
+    "data/champions_dex.json",
+    "data/replay_protocol_contract.json",
+    "data/showdown_raw_emission_inventory.json",
+    "data/spread_usage.json",
+    "data/vocab.json",
+]
 
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]

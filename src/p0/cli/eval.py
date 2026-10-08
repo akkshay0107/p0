@@ -15,7 +15,7 @@ import torch
 
 from p0.cli import LOG_FORMAT
 from p0.evaluation.harness import EvaluationHarness, MatchupResult
-from p0.format_config import load_active_global_contract
+from p0.format_config import active_runtime_contract
 from p0.model.policy import PolicyNet
 from p0.persistence import atomic_json_save
 from p0.runtime.showdown import local_server_configuration, start_showdown_servers
@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     device = default_device()
 
     try:
-        manifest = load_active_global_contract()
+        manifest = active_runtime_contract()
     except (OSError, KeyError, TypeError, ValueError) as exc:
         logger.error("Could not validate runtime contract: %s", exc)
         return 1
@@ -162,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "episodes": episodes,
         "seed": seed,
-        "global_contract_sha256": manifest.global_sha256,
+        "runtime_contract": manifest.to_dict(),
         "policy_a": str(args.checkpoint) if args.checkpoint else "Random",
         "policy_b": (
             str(args.opponent_checkpoint)

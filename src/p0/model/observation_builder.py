@@ -12,7 +12,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from p0.battle.events import EVENT_CATEGORICAL_WIDTH, MAX_EVENT_RECORDS
+from p0.battle.events import EVENT_CATEGORICAL_WIDTH, MAX_EVENT_RECORDS, EffectNamespace
 from p0.battle.views import BattleView, MoveView, PokemonView, TransformedPokemonView
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.model.structured_observation import (
@@ -40,7 +40,6 @@ from p0.model.structured_observation import (
     SEQUENCE_LENGTH,
     TEAM_SIZE,
     CounterKind,
-    EffectNamespace,
     IdentityKnownness,
     MechanicState,
     PresenceStatus,

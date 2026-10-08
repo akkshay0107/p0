@@ -48,12 +48,20 @@ class TestReplayCompile:
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
-            max_decisions_per_shard=1,
             created_at="2026-01-01T00:00:00Z",
         )
         assert built.manifest.source_games == count
         assert built.manifest.accepted_games == count
-        assert Counter(tuple(built.manifest.raw_replays)) == expected_ids
+        assert (
+            Counter(
+                tuple(
+                    replay
+                    for members in built.manifest.source_series.values()
+                    for replay in members
+                )
+            )
+            == expected_ids
+        )
         assert len(built.manifest.shards) == count
         assert Counter(
             (summary["source_replay_id"], summary["player"])
@@ -67,7 +75,7 @@ class TestReplayCompile:
         """
         Verify that games belonging to the same Best-of-3 series are never split across shard files.
 
-        Even when max_decisions_per_shard is set to 1, series atomicity requires all games within
+        Series atomicity requires all games within
         a single match series to reside within the same shard file for correct recurrent training context.
         """
         series_count = stress_count("P0_STRESS_COMPILE_SERIES", 64)
@@ -88,7 +96,6 @@ class TestReplayCompile:
         built = write_tensor_shards(
             result,
             tmp_path / "series-boundaries",
-            max_decisions_per_shard=1,
             created_at="2026-01-01T00:00:00Z",
         )
         summaries = [_summaries(built, shard.filename) for shard in built.manifest.shards]

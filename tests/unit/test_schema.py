@@ -63,7 +63,7 @@ def _series_record() -> SeriesRecord:
         players=("alice", "bob"),
         game_replay_ids=("r1", "r2"),
         game_player_roles=((0, 1), (1, 0)),
-        team_hashes=("a" * 64, "b" * 64),
+        team_keys=("a" * 64, "b" * 64),
         is_complete=True,
         score=(2, 0),
         grouping_method=GroupingMethod.PARENT_ROOM,
@@ -118,8 +118,7 @@ class TestReplaySchemas:
             source_url="https://replay.pokemonshowdown.com/r1",
             fetched_at="2026-07-17T00:00:00Z",
             http_status=200,
-            content_sha256="d" * 64,
-            byte_size=100,
+            raw_path="raw/r1.json.gz",
         )
         assert FetchIndexEntry.from_dict(fetch.to_dict()) == fetch
 
@@ -142,8 +141,7 @@ class TestReplaySchemas:
                 source_url="https://example.invalid/r1",
                 fetched_at="2026-07-17T00:00:00",
                 http_status=200,
-                content_sha256="d" * 64,
-                byte_size=1,
+                raw_path="raw/r1.json.gz",
             )
 
     def test_observation_specs_are_derived(self) -> None:

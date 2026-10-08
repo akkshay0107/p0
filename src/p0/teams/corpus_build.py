@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
+import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from p0.format_config import FORMAT, active_global_contract
+from p0.format_config import FORMAT
 from p0.model.tokenizer import PokemonTokenizer, Resolution
 from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_json_save
@@ -17,7 +17,6 @@ from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
     TeamCorpusManifest,
-    corpus_content_hash,
 )
 from p0.teams.stat_points import STAT_POINT_LIMIT, STAT_POINT_TOTAL_LIMIT
 from p0.teams.team import TeamRecord, deduplicate_variants
@@ -101,7 +100,6 @@ def build_corpus(
     *,
     tokenizer: PokemonTokenizer | None = None,
     validator: Callable[..., Sequence[AdmissionResult]] = validate_many,
-    global_contract_sha256: str = "",
     format_id: str = FORMAT.battle_format,
     created_at: str | None = None,
 ) -> tuple[TeamCorpusManifest, dict[str, Any]]:
@@ -112,7 +110,6 @@ def build_corpus(
         variants: Candidate teams with metadata.
         tokenizer: Vocabulary used to reject out-of-vocabulary team content.
         validator: Callable that validates the deduplicated candidates.
-        global_contract_sha256: Global major-contract identity recorded in the manifest.
         format_id: Battle format associated with the corpus.
         created_at: Optional manifest timestamp.
 
@@ -121,8 +118,6 @@ def build_corpus(
     """
     if tokenizer is None:
         tokenizer = PokemonTokenizer.from_file(DEFAULT_PATHS.data_root / "vocab.json")
-    if not global_contract_sha256:
-        global_contract_sha256 = active_global_contract().global_sha256
 
     deduped = deduplicate_variants(variants)
     validation_results = validator(deduped)
@@ -132,6 +127,7 @@ def build_corpus(
     entries: list[CorpusEntry] = []
     rejections: Counter[str] = Counter()
 
+    canonical_ids: dict[str, str] = {}
     for variant, result in zip(deduped, validation_results, strict=True):
         if not result.valid or not result.packed_team:
             reason = (
@@ -146,13 +142,14 @@ def build_corpus(
         packed = result.packed_team
         if not isinstance(packed, str):
             raise RuntimeError("Admitted team is missing its packed representation")
-        packed_sha256 = hashlib.sha256(packed.encode("utf-8")).hexdigest()
+        key = variant.team.team_key
+        if key not in canonical_ids:
+            canonical_ids[key] = str(uuid.uuid4())
 
         try:
             entry = CorpusEntry(
-                canonical_hash=variant.team.team_hash,
+                canonical_id=canonical_ids[key],
                 packed=packed,
-                packed_sha256=packed_sha256,
                 usage_count=variant.metadata.usage_count,
                 spread_provenance=variant.spread_provenance,
             )
@@ -165,14 +162,11 @@ def build_corpus(
     if created_at is None:
         created_at = datetime.now(timezone.utc).isoformat()
 
-    ordered_entries = tuple(
-        sorted(entries, key=lambda item: (item.canonical_hash, item.packed_sha256))
-    )
+    ordered_entries = tuple(sorted(entries, key=lambda item: (item.canonical_id, item.packed)))
     manifest = TeamCorpusManifest(
         artifact_schema=CORPUS_MANIFEST_SCHEMA,
-        global_contract_sha256=global_contract_sha256,
         format_id=format_id,
-        corpus_hash=corpus_content_hash(ordered_entries),
+        corpus_id=str(uuid.uuid4()),
         entries=ordered_entries,
         created_at=created_at,
         sampling_metadata={

@@ -29,10 +29,10 @@ The two extras are mutually exclusive. Run the commands below from the repositor
 
 After pulling changes, run `git submodule update --init --recursive`, `uv sync --extra cpu`
 and `bash scripts/init-data.sh` with training stopped. The script installs and builds
-Showdown, then generates all seven local JSON resources. Its `FORMAT` and
+Showdown, then generates the local JSON resources. Its `FORMAT` and
 `USAGE_MONTH` settings select the game data and usage priors; cached usage exports
-live under `data/raw/usage/<month>/`. It writes the runtime manifest last, after
-coverage and protocol validation. If generation fails, rerun the script before
+live under `data/raw/usage/<month>/`. It validates coverage and protocol support
+after generation. If generation fails, rerun the script before
 training. Generated JSON is ignored by Git. Team exports and corpus builds remain
 separate inputs.
 
@@ -76,13 +76,12 @@ uv run p0-replays build-shards
 ```
 
 `build-shards` prints a `manifest_path`. Replace the example path below with that
-actual path; there is no fixed default. `create-splits` writes `splits.json` beside it.
+actual path. The build also writes `splits.json` beside it. Use `create-splits` only
+when you intentionally want to change assignments.
 Set `bc.shard_manifest` in `config.yaml` to that manifest path before training. BC reads
 `splits.json` beside it, so the split file has no separate path setting.
 
 ```bash
-shard_manifest="/absolute/path/from/build-shards/manifest.json"
-uv run p0-replays create-splits --shard-manifest "$shard_manifest"
 uv run p0-bc train
 ```
 
@@ -90,10 +89,31 @@ The best BC policy is saved to `artifacts/checkpoints/bc/bc_best_policy.pt` by d
 Set `paths.initial_policy_checkpoint` to that file before starting PPO. The shard path
 in `config.example.yaml` is a placeholder; replace it in `config.yaml`.
 
-After changing replay reconstruction, remove the old dataset build directory before
-rebuilding shards and recreating the splits. Update `bc.shard_manifest` if the new
-manifest path differs. Existing builds are reused, and the dataset hash does not include
-reconstruction code changes.
+Replays are recorded once by Showdown ID in a JSONL catalog. Each scrape's
+`--limit-games` is a soft cap for new games; fetching linked siblings can take the
+count over the cap so a discovered series stays together. Later queries can extend
+the same cache.
+Use `p0-replays list --min-elo 1500 --after 2026-01-01 --player Alice` to inspect
+matches. The same filters work on `build-shards`; selecting a game includes its
+known series siblings so games from one series stay together.
+
+Compiled series get UUID filenames. Repeating a build reuses existing tensors;
+adding a game to a series rebuilds that series. After changing reconstruction or
+spread estimates, use `p0-replays build-shards --force-reconstruct`. This creates
+new tensors and a new dataset snapshot while preserving previous snapshots.
+Update `bc.shard_manifest` to the printed path for a new training run. Exact resume
+requires the same dataset and split IDs. No replay or tensor checksums are computed.
+
+Checkpoints contain one runtime compatibility record: vocabulary mappings and
+`MODEL_ENCODING_VERSION` define the major identity; dex data defines the minor
+identity. A major mismatch rejects loading. A dex-only mismatch warns and allows
+loading. Bump `MODEL_ENCODING_VERSION` when observation/action meanings change
+without changing their tensor shapes. PyTorch validates weight names and shapes.
+
+Old shard, corpus, and checkpoint schemas are deliberately unsupported. Rebuild
+corpora with `p0-corpus build`, rebuild shards from cached replay bodies, and start
+new checkpoints. The raw replay bodies can be kept; rebuild the JSONL catalog from
+those bodies by removing the old index and running `p0-replays scrape`.
 
 ### Evaluate or play a checkpoint
 
@@ -144,8 +164,8 @@ refreshed periodically.
 - [Configuration](config.example.yaml): training, paths, team pools, BC, and evaluation.
 - [Model](src/p0/model/): [model dimensions](src/p0/model/config.py) and
   [tensor layout constants](src/p0/model/architecture_contract.py).
-- [Compatibility schemas](src/p0/contracts.py): source definitions used to generate the runtime
-  manifest and check artifact compatibility.
+- [Model compatibility](src/p0/contracts.py): the vocabulary/encoding major identity
+  and dex minor identity.
 - [Command-line entry points](src/p0/cli/): run each command with `--help` for options.
 
 From the repository root:
@@ -164,6 +184,8 @@ The default and heavy suites must pass before a commit. Integration tests need N
 the Showdown submodule and dependencies, and loopback sockets. The default run excludes
 heavy, stress, network, and GPU tests. Keep the heavy replay workload at 50 games or
 fewer per run. GPU checks are deferred; CPU passes do not validate CUDA execution.
+On a memory-limited machine, set `PYTHON_CPU_COUNT=2` to cap compiler workers,
+run heavy files separately, and reduce the `P0_STRESS_*` workload settings.
 
 ## About
 

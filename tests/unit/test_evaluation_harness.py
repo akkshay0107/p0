@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import random
 from pathlib import Path
@@ -20,11 +19,11 @@ from p0.evaluation.harness import (
     create_eval_player,
     wilson_score_interval,
 )
-from p0.format_config import FORMAT, active_global_contract
+from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.teams.corpus import CorpusEntry, TeamCorpusManifest, corpus_content_hash
+from p0.teams.corpus import CorpusEntry, TeamCorpusManifest
 from p0.teams.source import CorpusTeamSource, FixedTeamSource
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
@@ -41,16 +40,14 @@ class TestEvaluationHarness:
     def test_evaluation_harness_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
         entries = (
             CorpusEntry(
-                canonical_hash=hashlib.sha256(b"canonical-1").hexdigest(),
+                canonical_id="team-1",
                 packed="packed-team-1",
-                packed_sha256=hashlib.sha256(b"packed-team-1").hexdigest(),
                 usage_count=1,
             ),
         )
         manifest = TeamCorpusManifest(
-            global_contract_sha256=active_global_contract().global_sha256,
             format_id=FORMAT.battle_format,
-            corpus_hash=corpus_content_hash(entries),
+            corpus_id="corpus-test",
             entries=entries,
             created_at="2026-08-19T00:00:00Z",
             sampling_metadata={},
@@ -133,7 +130,7 @@ class TestEvaluationHarness:
         assert wilson_score_interval(0, 0) == (0.0, 0.0)
         expected_interval = (0.23071993220883702, 0.8823817688407467)
         assert wilson_score_interval(3, 5) == pytest.approx(expected_interval, abs=1e-12)
-        team_hash = hashlib.sha256(b"team-data").hexdigest()[:8]
+        team_id = "team-1"
         result = MatchupResult(
             policy_a="live",
             policy_b="random",
@@ -144,11 +141,11 @@ class TestEvaluationHarness:
             ties=0,
             win_rate_a=0.6,
             confidence_interval_a=expected_interval,
-            per_team_results={team_hash: {"wins": 3, "games": 5, "win_rate": 0.6}},
+            per_team_results={team_id: {"wins": 3, "games": 5, "win_rate": 0.6}},
         )
         serialized = result.to_dict()
         assert serialized["confidence_interval_a"] == [
             0.23071993220883702,
             0.8823817688407467,
         ]
-        assert serialized["per_team_results"][team_hash]["games"] == 5
+        assert serialized["per_team_results"][team_id]["games"] == 5

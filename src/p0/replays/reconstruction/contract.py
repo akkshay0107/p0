@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import subprocess
@@ -99,11 +98,6 @@ def validate_raw_emission_inventory(value: dict[str, Any] | None = None) -> None
         raise ValueError("raw emission inventory omits or adds Showdown source files")
     if len(files) != len(expected_files):
         raise ValueError("raw emission inventory contains duplicate source files")
-    for item in files:
-        source = showdown_root / item["path"]
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        if digest != item["sha256"]:
-            raise ValueError(f"Showdown source drifted: {item['path']}")
 
     entries = value.get("entries")
     if not isinstance(entries, list):

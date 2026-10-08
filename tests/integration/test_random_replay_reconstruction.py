@@ -1161,7 +1161,6 @@ class TestRandomReplayReconstruction:
             tmp_path / "tensor-shards",
             resources=resources,
             max_candidates=max_candidates,
-            max_decisions_per_shard=4096,
         )
         assert build.manifest.source_games == game_count
         assert build.manifest.accepted_games == accepted_count

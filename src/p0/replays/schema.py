@@ -8,7 +8,7 @@ from enum import IntEnum
 from typing import Any, Mapping
 
 from p0.battle.actions import ACT_SIZE
-from p0.contracts import is_sha256, require_dataclass_fields
+from p0.contracts import require_dataclass_fields
 from p0.replays.identity import ReplayMemberId, ReplaySide
 
 
@@ -44,51 +44,6 @@ class LabelKind(IntEnum):
 class MaskProvenance(IntEnum):
     UNSPECIFIED = 0
     CONSERVATIVE_RECONSTRUCTED = 1
-
-
-@dataclass(frozen=True, slots=True)
-class FetchMetadata:
-    """Transport facts for one request, kept separate from replay content."""
-
-    source_url: str
-    fetched_at: str
-    http_status: int
-    attempt: int
-    retry_count: int
-    elapsed_ms: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source_url, str) or not self.source_url:
-            raise ValueError("FetchMetadata.source_url must be non-empty")
-        _require_iso_timestamp(self.fetched_at, "FetchMetadata.fetched_at")
-        if type(self.http_status) is not int or not 100 <= self.http_status <= 599:
-            raise ValueError("FetchMetadata.http_status must be an HTTP status code")
-        for name, value in (
-            ("attempt", self.attempt),
-            ("retry_count", self.retry_count),
-            ("elapsed_ms", self.elapsed_ms),
-        ):
-            if type(value) is not int or value < 0:
-                raise ValueError(f"FetchMetadata.{name} must be a nonnegative integer")
-        if self.attempt == 0:
-            raise ValueError("FetchMetadata.attempt must start at one")
-        if self.retry_count >= self.attempt:
-            raise ValueError("FetchMetadata.retry_count must be less than attempt")
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> FetchMetadata:
-        require_dataclass_fields(value, cls)
-        return cls(
-            source_url=str(value["source_url"]),
-            fetched_at=str(value["fetched_at"]),
-            http_status=int(value["http_status"]),
-            attempt=int(value["attempt"]),
-            retry_count=int(value["retry_count"]),
-            elapsed_ms=int(value["elapsed_ms"]),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,26 +374,23 @@ def _require_iso_timestamp(value: str, owner: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class FetchIndexEntry:
-    """One entry in the append-only raw-cache fetch index."""
+    """Replay catalog row; unknown ratings and upload times remain absent."""
 
     replay_id: str
     format_id: str
     source_url: str
     fetched_at: str
     http_status: int
-    content_sha256: str
-    byte_size: int
+    raw_path: str
+    upload_time: str = ""
+    rating: int | None = None
+    players: tuple[str, ...] = ()
+    parent_room: str = ""
 
     def __post_init__(self) -> None:
-        if not self.replay_id or not self.format_id or not self.source_url:
-            raise ValueError("Fetch index entries require replay_id, format_id, and source_url")
+        if not self.replay_id or not self.format_id or not self.raw_path:
+            raise ValueError("Fetch index entries require replay_id, format_id, and raw_path")
         _require_iso_timestamp(self.fetched_at, "FetchIndexEntry.fetched_at")
-        if type(self.http_status) is not int or not 100 <= self.http_status <= 599:
-            raise ValueError("FetchIndexEntry.http_status must be an HTTP status code")
-        if not is_sha256(self.content_sha256):
-            raise ValueError("FetchIndexEntry.content_sha256 must be a lowercase SHA-256 digest")
-        if type(self.byte_size) is not int or self.byte_size < 0:
-            raise ValueError("FetchIndexEntry.byte_size must be a nonnegative integer")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -446,15 +398,7 @@ class FetchIndexEntry:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> FetchIndexEntry:
         require_dataclass_fields(value, cls)
-        return cls(
-            replay_id=str(value["replay_id"]),
-            format_id=str(value["format_id"]),
-            source_url=str(value["source_url"]),
-            fetched_at=str(value["fetched_at"]),
-            http_status=int(value["http_status"]),
-            content_sha256=str(value["content_sha256"]),
-            byte_size=int(value["byte_size"]),
-        )
+        return cls(**{**value, "players": tuple(value["players"])})
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,7 +592,7 @@ class SeriesRecord:
     players: tuple[str, str]
     game_replay_ids: tuple[str, ...]
     game_player_roles: tuple[tuple[int, int], ...]
-    team_hashes: tuple[str, str]
+    team_keys: tuple[str, str]
     is_complete: bool
     score: tuple[int, int]
     grouping_method: GroupingMethod
@@ -666,8 +610,6 @@ class SeriesRecord:
         for roles in self.game_player_roles:
             if sorted(roles) != [0, 1]:
                 raise ValueError("Each game's roles must be a permutation of (0, 1)")
-        if len(self.team_hashes) != 2 or not all(is_sha256(digest) for digest in self.team_hashes):
-            raise ValueError("SeriesRecord.team_hashes must be two lowercase SHA-256 digests")
         if len(self.score) != 2 or any(type(wins) is not int or wins < 0 for wins in self.score):
             raise ValueError("SeriesRecord.score must be two nonnegative win counts")
         if sum(self.score) > len(self.game_replay_ids) or max(self.score) > 2:
@@ -686,7 +628,7 @@ class SeriesRecord:
             "players": list(self.players),
             "game_replay_ids": list(self.game_replay_ids),
             "game_player_roles": [list(roles) for roles in self.game_player_roles],
-            "team_hashes": list(self.team_hashes),
+            "team_keys": list(self.team_keys),
             "is_complete": self.is_complete,
             "score": list(self.score),
             "grouping_method": int(self.grouping_method),
@@ -698,7 +640,7 @@ class SeriesRecord:
         require_dataclass_fields(value, cls)
         try:
             players = tuple(str(name) for name in value["players"])
-            team_hashes = tuple(str(digest) for digest in value["team_hashes"])
+            team_keys = tuple(str(key) for key in value["team_keys"])
             score = tuple(int(wins) for wins in value["score"])
             return cls(
                 series_id=str(value["series_id"]),
@@ -708,7 +650,7 @@ class SeriesRecord:
                 game_player_roles=tuple(
                     (int(roles[0]), int(roles[1])) for roles in value["game_player_roles"]
                 ),
-                team_hashes=(team_hashes[0], team_hashes[1]),
+                team_keys=(team_keys[0], team_keys[1]),
                 is_complete=bool(value["is_complete"]),
                 score=(score[0], score[1]),
                 grouping_method=GroupingMethod(value["grouping_method"]),

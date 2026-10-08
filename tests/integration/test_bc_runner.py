@@ -36,7 +36,7 @@ class TestBCRunner:
             ("validation", "train split has no accepted series"),
         ],
     )
-    def test_training_rejects_empty_splits_and_tampered_shards(
+    def test_training_rejects_empty_splits(
         self,
         tmp_path: Path,
         split_assignment: str,
@@ -46,17 +46,16 @@ class TestBCRunner:
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
-            max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
         split_path = built.manifest_path.parent / "splits.json"
         only_series = next(iter(built.manifest.source_series))
         write_split_manifest(
             SeriesSplitManifest(
-                built.manifest.global_contract_sha256,
                 0,
                 {only_series: split_assignment},
-                dataset_hash=built.manifest.dataset_hash,
+                dataset_id=built.manifest.dataset_id,
+                split_id="split-test",
             ),
             split_path,
         )
@@ -69,15 +68,6 @@ class TestBCRunner:
             shard_manifest=built.manifest_path,
             output_dir=tmp_path / "output",
         )
-
-        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
-        original_shard = shard_path.read_bytes()
-        tampered_shard = bytearray(original_shard)
-        tampered_shard[-1] ^= 1
-        shard_path.write_bytes(tampered_shard)
-        with pytest.raises(ValueError, match="Shard hash mismatch"):
-            train_bc(config, device="cpu")
-        shard_path.write_bytes(original_shard)
 
         with pytest.raises(ValueError, match=match_error):
             train_bc(config, device="cpu")
@@ -119,7 +109,6 @@ class TestBCRunner:
         built = write_tensor_shards(
             exact_compiled,
             tmp_path / "shards",
-            max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
         series_by_replay = {
@@ -129,13 +118,13 @@ class TestBCRunner:
         split_path = built.manifest_path.parent / "splits.json"
         write_split_manifest(
             SeriesSplitManifest(
-                built.manifest.global_contract_sha256,
                 0,
                 {
                     series_by_replay["train-replay"]: "train",
                     series_by_replay["validation-replay"]: "validation",
                 },
-                dataset_hash=built.manifest.dataset_hash,
+                dataset_id=built.manifest.dataset_id,
+                split_id="split-test",
             ),
             split_path,
         )
@@ -173,7 +162,6 @@ class TestBCRunner:
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
-            max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
         split_path = built.manifest_path.parent / "splits.json"
@@ -183,13 +171,13 @@ class TestBCRunner:
         }
         write_split_manifest(
             SeriesSplitManifest(
-                built.manifest.global_contract_sha256,
                 0,
                 {
                     series_by_replay["resume-train"]: "train",
                     series_by_replay["resume-validation"]: "validation",
                 },
-                dataset_hash=built.manifest.dataset_hash,
+                dataset_id=built.manifest.dataset_id,
+                split_id="split-test",
             ),
             split_path,
         )
@@ -207,7 +195,7 @@ class TestBCRunner:
         first_best = Path(first["best_policy_checkpoint"])
         with pytest.raises(ValueError, match="already contains an experiment"):
             train_bc(first_config, device="cpu")
-        occupied_output = tmp_path / "occupied-output" / built.manifest.dataset_hash
+        occupied_output = tmp_path / "occupied-output"
         occupied_output.mkdir(parents=True)
         sentinel = occupied_output / "unrelated.txt"
         sentinel.write_text("keep", encoding="utf-8")
@@ -343,7 +331,6 @@ class TestBCRunner:
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
-            max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
         split_path = built.manifest_path.parent / "splits.json"
@@ -353,13 +340,13 @@ class TestBCRunner:
         }
         write_split_manifest(
             SeriesSplitManifest(
-                built.manifest.global_contract_sha256,
                 0,
                 {
                     series_by_replay["eval-train"]: "train",
                     series_by_replay["eval-validation"]: "validation",
                 },
-                dataset_hash=built.manifest.dataset_hash,
+                dataset_id=built.manifest.dataset_id,
+                split_id="split-test",
             ),
             split_path,
         )
@@ -444,7 +431,6 @@ class TestBCRunner:
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
-            max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
         split_path = built.manifest_path.parent / "splits.json"
@@ -454,13 +440,13 @@ class TestBCRunner:
         }
         write_split_manifest(
             SeriesSplitManifest(
-                built.manifest.global_contract_sha256,
                 0,
                 {
                     series_by_replay["cancel-train"]: "train",
                     series_by_replay["cancel-validation"]: "validation",
                 },
-                dataset_hash=built.manifest.dataset_hash,
+                dataset_id=built.manifest.dataset_id,
+                split_id="split-test",
             ),
             split_path,
         )

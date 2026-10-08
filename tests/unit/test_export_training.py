@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import tarfile
 from dataclasses import asdict
@@ -12,7 +11,6 @@ import pytest
 import torch
 
 from p0.cli.export_training import export_checkpoint
-from p0.contracts import sha256_file
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
@@ -55,9 +53,6 @@ class TestExportTraining:
         with tarfile.open(output) as archive:
             archive.extractall(target, filter="data")
         assert (target / "run/checkpoint.pt").read_bytes() == checkpoint.read_bytes()
-        hashes = json.loads((target / "run/checksums.json").read_text())
-        for name, digest in hashes.items():
-            assert hashlib.sha256((target / name).read_bytes()).hexdigest() == digest
         config_path = target / "run/config.yaml"
         config_value = json.loads(config_path.read_text())
         config_value["paths"]["repository_root"] = str(target)
@@ -80,16 +75,15 @@ class TestExportTraining:
         built = write_tensor_shards(
             compiled,
             tmp_path / "shards",
-            max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
         split_path = built.manifest_path.parent / "splits.json"
         write_split_manifest(
             SeriesSplitManifest(
-                built.manifest.global_contract_sha256,
                 0,
                 {next(iter(built.manifest.source_series)): "train"},
-                dataset_hash=built.manifest.dataset_hash,
+                dataset_id=built.manifest.dataset_id,
+                split_id="split-test",
             ),
             split_path,
         )
@@ -113,8 +107,8 @@ class TestExportTraining:
                 1,
                 policy,
                 metadata={
-                    "dataset_hash": built.manifest.dataset_hash,
-                    "split_manifest_sha256": sha256_file(split_path),
+                    "dataset_id": built.manifest.dataset_id,
+                    "split_id": "split-test",
                     "epoch_budget": 2,
                 },
             )
@@ -129,8 +123,8 @@ class TestExportTraining:
         config_path.write_text(json.dumps(value))
         config = load_config(config_path).bc
         restored = LazyReplayDataset(
-            config.shard_manifest, split_manifest=config.split_manifest_path, verify_hashes=True
+            config.shard_manifest, split_manifest=config.split_manifest_path
         )
-        assert restored.manifest.dataset_hash == built.manifest.dataset_hash
+        assert restored.manifest.dataset_id == built.manifest.dataset_id
         assert len(list(restored.for_split("train"))) == 2
         assert config.epochs == 2

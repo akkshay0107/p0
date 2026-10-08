@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import random
 from dataclasses import replace
@@ -10,12 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from p0.format_config import FORMAT, active_global_contract
+from p0.format_config import FORMAT
 from p0.teams.corpus import (
     CORPUS_MANIFEST_SCHEMA,
     CorpusEntry,
     TeamCorpusManifest,
-    corpus_content_hash,
 )
 from p0.teams.source import (
     CorpusTeamSource,
@@ -35,13 +33,12 @@ def _make_entry(
     if canonical_index is None:
         canonical_index = index
     canonical = f"canonical_{canonical_index:04d}"
-    canonical_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    canonical_id = canonical
     packed = f"Nickname|Species{index}|item|ability|move1,move2|nature"
-    packed_sha256 = hashlib.sha256(packed.encode("utf-8")).hexdigest()
+
     return CorpusEntry(
-        canonical_hash=canonical_hash,
+        canonical_id=canonical_id,
         packed=packed,
-        packed_sha256=packed_sha256,
         usage_count=usage_count,
         spread_provenance="imputed",
     )
@@ -52,9 +49,8 @@ def _write_manifest(
 ) -> tuple[Path, TeamCorpusManifest]:
     manifest = TeamCorpusManifest(
         artifact_schema=CORPUS_MANIFEST_SCHEMA,
-        global_contract_sha256=active_global_contract().global_sha256,
         format_id=FORMAT.battle_format,
-        corpus_hash=corpus_content_hash(entries),
+        corpus_id="corpus-test",
         entries=entries,
         created_at="2026-07-19T12:00:00Z",
         sampling_metadata={"pool_size": len(entries)},
@@ -79,11 +75,8 @@ class TestTeamSources:
 
         desc = source.describe()
         assert desc["kind"] == "corpus"
-        assert desc["corpus_hash"] == manifest.corpus_hash
+        assert desc["corpus_id"] == manifest.corpus_id
         assert desc["pool_size"] == 5
-        hashes = desc["team_hashes"]
-        assert isinstance(hashes, tuple)
-        assert len(hashes) == 5
 
     def test_corpus_source_validates_path(self, tmp_path: Path) -> None:
         """Verify CorpusTeamSource rejects nonexistent paths and empty manifests."""
@@ -109,17 +102,12 @@ class TestTeamSources:
         for _ in range(600):
             t = source.sample(rng)
             # Find which canonical_index t belongs to
-            e = next(entry for entry in entries_1 + entries_2 if entry.packed_sha256 == t.team_hash)
-            canonical_counts[e.canonical_hash] = canonical_counts.get(e.canonical_hash, 0) + 1
+            e = next(entry for entry in entries_1 + entries_2 if entry.packed == t.packed)
+            canonical_counts[e.canonical_id] = canonical_counts.get(e.canonical_id, 0) + 1
         # Should be close to 50/50 across the two canonical teams, not 90/10
         assert len(canonical_counts) == 2
         for count in canonical_counts.values():
             assert 220 <= count <= 380
-
-    def test_validated_team_requires_64_character_sha256(self) -> None:
-        """Verify ValidatedTeam rejects a packed-team hash shorter than 64 characters."""
-        with pytest.raises(ValueError, match="SHA-256"):
-            ValidatedTeam("packed", "short")
 
     def test_fixed_team_source(self) -> None:
         team = ValidatedTeam.from_showdown(DEFAULT_TEST_TEAM)
@@ -167,12 +155,10 @@ class TestBuildTeamSource:
         rng = random.Random(0)
         sampled = source.sample(rng)
         assert sampled.packed == expected_team.packed
-        assert sampled.team_hash == expected_team.team_hash
         assert source.describe() == {
             "kind": "file_pool",
             "format": "showdown-export",
-            "pool_id": hashlib.sha256(expected_team.team_hash.encode()).hexdigest(),
-            "team_hashes": (expected_team.team_hash,),
+            "teams": (expected_team.packed,),
         }
 
     def test_rejects_invalid_manifest(self, tmp_path: Path) -> None:

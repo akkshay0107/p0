@@ -53,4 +53,4 @@ class TestProjectPaths:
         assert (checkout / "pyproject.toml").is_file()
         assert DEFAULT_PATHS.repository_root == checkout
         assert DEFAULT_PATHS.data_root == checkout / "data"
-        assert (DEFAULT_PATHS.data_root / "runtime_manifest.json").is_file()
+        assert (DEFAULT_PATHS.data_root / "champions_dex.json").is_file()

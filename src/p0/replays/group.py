@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,7 +67,7 @@ def _time(document: ReplayDocument) -> datetime:
     return datetime.fromisoformat(document.metadata.upload_time.replace("Z", "+00:00"))
 
 
-def _team_hash(document: ReplayDocument, side: int) -> str:
+def _team_key(document: ReplayDocument, side: int) -> str:
     members = sorted(
         (
             member.species.casefold(),
@@ -86,13 +85,13 @@ def _team_hash(document: ReplayDocument, side: int) -> str:
         ],
         option=orjson.OPT_SORT_KEYS,
     )
-    return hashlib.sha256(payload).hexdigest()
+    return payload.decode("utf-8")
 
 
-def _team_hashes(document: ReplayDocument, players: tuple[str, str]) -> tuple[str, str]:
-    """Return both canonical players' team hashes in canonical player order."""
+def _team_keys(document: ReplayDocument, players: tuple[str, str]) -> tuple[str, str]:
+    """Return both canonical players' team keys in canonical player order."""
     roles = _roles(document, players)
-    return _team_hash(document, roles[0]), _team_hash(document, roles[1])
+    return _team_key(document, roles[0]), _team_key(document, roles[1])
 
 
 def _incomplete_series(group: GroupedSeries) -> GroupingDiagnostic:
@@ -104,8 +103,7 @@ def _incomplete_series(group: GroupedSeries) -> GroupingDiagnostic:
 
 
 def _series_id(format_id: str, key: str, players: tuple[str, str]) -> str:
-    value = "\n".join((format_id, key, *players))
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+    return orjson.dumps((format_id, key, players)).decode("utf-8")
 
 
 def _ordered_games(documents: tuple[ReplayDocument, ...]) -> tuple[ReplayDocument, ...]:
@@ -224,11 +222,11 @@ def _make_group(
     numbering_diagnostics = _numbering_diagnostics(ordered, numbers)
     score, outcome_diagnostics = _series_score(ordered, players)
 
-    team_hashes = _team_hashes(ordered[0], players)
+    team_keys = _team_keys(ordered[0], players)
     conflicts = []
 
     for game in ordered[1:]:
-        if _team_hashes(game, players) != team_hashes:
+        if _team_keys(game, players) != team_keys:
             conflicts.append(
                 GroupingDiagnostic(
                     "team_identity_conflict",
@@ -267,7 +265,7 @@ def _make_group(
         players=players,
         game_replay_ids=tuple(game.metadata.replay_id for game in ordered),
         game_player_roles=tuple(membership.canonical_player_roles for membership in memberships),
-        team_hashes=team_hashes,
+        team_keys=team_keys,
         is_complete=complete,
         score=score,
         grouping_method=method,
@@ -291,7 +289,7 @@ def group_replays(
         max_games: Maximum number of games retained in one series.
 
     Returns:
-        Deterministically ordered groups and quarantine diagnostics.
+        Deterministically ordered groups and diagnostics for unusable series.
     """
     if max_games < 1 or max_games > 3:
         raise ValueError("max_games must be between one and three")
@@ -338,10 +336,10 @@ def group_replays(
 
         if method is GroupingMethod.FALLBACK_SAME_PLAYERS and len(games) > 1:
             chunks: list[list[ReplayDocument]] = [[]]
-            previous_hashes: tuple[str, str] | None = None
+            previous_keys: tuple[str, str] | None = None
             for game in games:
-                hashes = _team_hashes(game, bucket[2])
-                if previous_hashes is not None and hashes != previous_hashes:
+                keys = _team_keys(game, bucket[2])
+                if previous_keys is not None and keys != previous_keys:
                     diagnostics.append(
                         GroupingDiagnostic(
                             "fallback_team_conflict",
@@ -351,7 +349,7 @@ def group_replays(
                     )
                     chunks.append([])
                 chunks[-1].append(game)
-                previous_hashes = hashes
+                previous_keys = keys
             if len(chunks) > 1:
                 for chunk_index, chunk in enumerate(chunks):
                     group = _make_group(

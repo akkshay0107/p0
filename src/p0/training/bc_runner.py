@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-from p0.contracts import sha256_file
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, compile_policy
 from p0.model.resources import default_runtime_resources
@@ -26,15 +25,15 @@ from p0.training.utils import default_device, seed_everything
 def _training_metadata(
     config: BCConfig,
     *,
-    dataset_hash: str,
-    split_manifest: Path,
+    dataset_id: str,
+    split_manifest: SeriesSplitManifest,
 ) -> dict[str, Any]:
     trainer_config = asdict(config)
     for name in ("epochs", "shard_manifest", "output_dir", "resume_checkpoint"):
         del trainer_config[name]
     return {
-        "dataset_hash": dataset_hash,
-        "split_manifest_sha256": sha256_file(split_manifest),
+        "dataset_id": dataset_id,
+        "split_id": split_manifest.split_id,
         "trainer_config": trainer_config,
         "epoch_budget": config.epochs,
         **value_objective_metadata(config.gamma),
@@ -117,9 +116,7 @@ def train_bc(
         The final training and validation metrics plus selected checkpoint state.
     """
     store = CheckpointStore()
-    dataset = LazyReplayDataset(
-        config.shard_manifest, split_manifest=config.split_manifest_path, verify_hashes=True
-    )
+    dataset = LazyReplayDataset(config.shard_manifest, split_manifest=config.split_manifest_path)
     shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
     assert split_manifest is not None
     accepted_series = frozenset(dataset.accepted_series_ids())
@@ -128,14 +125,14 @@ def train_bc(
             raise ValueError(f"BC {split} split has no accepted series")
     train_dataset = dataset.for_split("train")
     validation_dataset = dataset.for_split("validation")
-    dataset_output = config.output_dir / shard_manifest.dataset_hash
+    dataset_output = config.output_dir
     latest_path = dataset_output / "bc_latest_training.pt"
     best_path = dataset_output / "bc_best_policy.pt"
     metrics_path = dataset_output / "metrics.json"
     metadata = _training_metadata(
         config,
-        dataset_hash=shard_manifest.dataset_hash,
-        split_manifest=config.split_manifest_path,
+        dataset_id=shard_manifest.dataset_id,
+        split_manifest=split_manifest,
     )
     with training_run(
         store,
@@ -239,7 +236,7 @@ def train_bc(
             validation_values = validation.to_dict()
             record = {
                 "epoch": epoch,
-                "dataset_hash": shard_manifest.dataset_hash,
+                "dataset_id": shard_manifest.dataset_id,
                 "train_update": training,
                 "training": training,
                 "validation": validation_values,
@@ -262,8 +259,7 @@ def train_bc(
             latest_artifact = latest_path.resolve()
             completed_epoch = epoch
         result = {
-            "dataset_hash": shard_manifest.dataset_hash,
-            "global_hash": shard_manifest.global_contract_sha256,
+            "dataset_id": shard_manifest.dataset_id,
             "completed_epoch": completed_epoch,
             "cancelled": cancelled,
             "initial_training": initial_training.to_dict(),
@@ -290,9 +286,7 @@ def evaluate_bc(
     store = CheckpointStore()
     objective = value_objective_metadata(config.gamma)
     policy = store.load_policy(checkpoint, selected_device, expected_metadata=objective)
-    dataset = LazyReplayDataset(
-        config.shard_manifest, split_manifest=config.split_manifest_path, verify_hashes=True
-    )
+    dataset = LazyReplayDataset(config.shard_manifest, split_manifest=config.split_manifest_path)
     shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
     assert split_manifest is not None
     accepted_series = frozenset(dataset.accepted_series_ids())
@@ -304,8 +298,7 @@ def evaluate_bc(
     if _validation_is_failed(metrics):
         raise RuntimeError("BC evaluation contains invalid predictions or non-finite values")
     return {
-        "dataset_hash": shard_manifest.dataset_hash,
-        "global_hash": shard_manifest.global_contract_sha256,
+        "dataset_id": shard_manifest.dataset_id,
         "split": split,
         "checkpoint": str(checkpoint.resolve()),
         "objective": objective,

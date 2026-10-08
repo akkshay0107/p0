@@ -1,29 +1,27 @@
-"""Resumable acquisition of public replay JSON into an immutable raw cache."""
+"""Replay acquisition and a searchable JSONL catalog."""
 
 from __future__ import annotations
 
 import gzip
-import hashlib
 import logging
-import os
 import re
-import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import orjson
 
+from p0.persistence import atomic_output
 from p0.replays.identity import linked_replay_ids, replay_matches_format
-from p0.replays.schema import FetchIndexEntry, FetchMetadata
+from p0.replays.schema import FetchIndexEntry
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,13 +34,9 @@ class ReplayUnavailableError(ReplayFetchError):
     """Raised when a replay listed by search is no longer publicly available."""
 
 
-@dataclass(frozen=True, slots=True)
-class HttpResponse:
+class HttpResponse(NamedTuple):
     status: int
     body: bytes
-
-
-Transport = Callable[[str, float], HttpResponse]
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,28 +109,26 @@ def _request_with_retry(
     url: str,
     *,
     config: ScrapeConfig,
-    transport: Transport,
     limiter: _RateLimiter,
-    sleeper: Callable[[float], None] = time.sleep,
-) -> tuple[HttpResponse, int]:
+) -> HttpResponse:
     last_error: Exception | None = None
     for attempt in range(1, config.retries + 1):
         limiter.wait()
         try:
-            response = transport(url, config.timeout_seconds)
+            response = _default_transport(url, config.timeout_seconds)
             if response.status == 404:
                 raise ReplayUnavailableError(f"HTTP status 404 for {url}")
             if response.status == 429 or response.status >= 500:
                 raise ReplayFetchError(f"retryable HTTP status {response.status} for {url}")
             if not 200 <= response.status < 300:
                 raise ReplayFetchError(f"HTTP status {response.status} for {url}")
-            return response, attempt
+            return response
         except ReplayUnavailableError:
             raise
         except (OSError, ReplayFetchError) as exc:
             last_error = exc
             if attempt < config.retries:
-                sleeper(config.backoff_seconds * (2 ** (attempt - 1)))
+                time.sleep(config.backoff_seconds * (2 ** (attempt - 1)))
 
     raise ReplayFetchError(
         f"Replay request failed after {config.retries} attempts: {url}"
@@ -185,9 +177,8 @@ def _upload_time(item: object) -> datetime | None:
 class ReplayFetcher:
     """Fetch pages and replay bodies while keeping filesystem writes resumable."""
 
-    def __init__(self, config: ScrapeConfig, *, transport: Transport | None = None):
+    def __init__(self, config: ScrapeConfig):
         self.config = config
-        self.transport = transport or _default_transport
         self._limiter = _RateLimiter(config.rate_limit_per_second)
         self._unavailable_ids: set[str] = set()
 
@@ -201,10 +192,9 @@ class ReplayFetcher:
 
     def _discover_page(self, page: int) -> tuple[tuple[str, ...], bool]:
         cutoff = None if self.config.cutoff is None else _parse_utc(self.config.cutoff)
-        response, _ = _request_with_retry(
+        response = _request_with_retry(
             self._page_url(page),
             config=self.config,
-            transport=self.transport,
             limiter=self._limiter,
         )
         value = _json_object(response.body, self._page_url(page))
@@ -242,151 +232,56 @@ class ReplayFetcher:
     def discover_ids(self) -> tuple[str, ...]:
         return tuple(sorted(set(self._iter_discovered_ids())))
 
-    def _write_immutable(self, replay_id: str, body: bytes) -> tuple[str, int]:
-        """Store raw bytes once and link them to the replay ID."""
+    def _fetch_one(self, replay_id: str) -> tuple[FetchIndexEntry, tuple[str, ...]]:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", replay_id):
             raise ReplayFetchError(f"Replay id contains unsafe path characters: {replay_id!r}")
-
-        directory = self.config.cache_dir / self.config.format_id / "raw"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{replay_id}.json.gz"
-
-        if path.exists():
-            try:
-                with gzip.open(path, "rb") as stream:
-                    existing = stream.read()
-                return hashlib.sha256(existing).hexdigest(), len(existing)
-            except (OSError, EOFError):
-                # The local file is corrupt. Unlink it so we can write the fresh copy.
-                with suppress(OSError):
-                    path.unlink()
-
-        digest = hashlib.sha256(body).hexdigest()
-
-        canonical_directory = directory / ".sha256"
-        canonical_directory.mkdir(exist_ok=True)
-        canonical_path = canonical_directory / f"{digest}.json.gz"
-
-        if not canonical_path.exists():
-            compressed = gzip.compress(body, mtime=0)
-            with tempfile.NamedTemporaryFile(
-                dir=canonical_directory, prefix=f".{digest}.", delete=False
-            ) as stream:
-                temporary = Path(stream.name)
-                stream.write(compressed)
-            os.replace(temporary, canonical_path)
-
-        with suppress(FileExistsError):
-            os.link(canonical_path, path)
-
-        return digest, len(body)
-
-    def _fetch_one(self, replay_id: str) -> tuple[FetchIndexEntry, tuple[str, ...]]:
         url = self.config.replay_url_template.format(replay_id=replay_id)
-        started = time.monotonic()
-        response, attempt = _request_with_retry(
+        response = _request_with_retry(url, config=self.config, limiter=self._limiter)
+        path = self._raw_path(replay_id)
+        with atomic_output(path) as temporary:
+            temporary.write_bytes(gzip.compress(response.body, mtime=0))
+        entry = _catalog_entry(
+            response.body,
+            replay_id,
+            self.config.format_id,
             url,
-            config=self.config,
-            transport=self.transport,
-            limiter=self._limiter,
+            datetime.now(UTC).isoformat(),
+            response.status,
         )
-        digest, size = self._write_immutable(replay_id, response.body)
-        fetched_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        metadata = FetchMetadata(
-            source_url=url,
-            fetched_at=fetched_at,
-            http_status=response.status,
-            attempt=attempt,
-            retry_count=attempt - 1,
-            elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
-        )
-        self._write_fetch_metadata(replay_id, metadata)
-        entry = FetchIndexEntry(
-            replay_id=replay_id,
-            format_id=self.config.format_id,
-            source_url=url,
-            fetched_at=fetched_at,
-            http_status=response.status,
-            content_sha256=digest,
-            byte_size=size,
-        )
-        links = linked_replay_ids(response.body, format_id=self.config.format_id)
-        return entry, tuple(links)
-
-    def _write_fetch_metadata(self, replay_id: str, metadata: FetchMetadata) -> None:
-        directory = self.config.cache_dir / self.config.format_id / "metadata"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{replay_id}.json"
-        encoded = orjson.dumps(metadata.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n"
-        if path.exists():
-            if path.read_bytes() != encoded:
-                raise ReplayFetchError(f"Fetch metadata changed on disk: {path}")
-            return
-        temporary = path.with_suffix(".tmp")
-        temporary.write_bytes(encoded)
-        os.replace(temporary, path)
-
-    def _append_index(self, entries: Iterable[FetchIndexEntry]) -> None:
-        if not entries:
-            return
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.index_path.open("ab") as stream:
-            for entry in entries:
-                stream.write(_index_line(entry))
-
-    def _write_index(self, entries: Iterable[FetchIndexEntry]) -> None:
-        ordered = tuple(sorted(entries, key=lambda entry: entry.replay_id))
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.index_path.with_suffix(".tmp")
-        temporary.write_bytes(b"".join(_index_line(entry) for entry in ordered))
-        os.replace(temporary, self.index_path)
+        return entry, tuple(linked_replay_ids(response.body, format_id=self.config.format_id))
 
     def _raw_path(self, replay_id: str) -> Path:
-        return self.config.cache_dir / self.config.format_id / "raw" / f"{replay_id}.json.gz"
+        return self.index_path.parent / "raw" / f"{replay_id}.json.gz"
 
     def _recover_unindexed(self, known: dict[str, FetchIndexEntry]) -> None:
-        """Index cached replays whose fetch finished but whose index append was lost."""
-        metadata_dir = self.config.cache_dir / self.config.format_id / "metadata"
-        if not metadata_dir.is_dir():
-            return
-        recovered = []
-        for meta_path in sorted(metadata_dir.glob("*.json")):
-            replay_id = meta_path.stem
-            raw_path = self._raw_path(replay_id)
-            if replay_id in known or not raw_path.is_file():
+        for path in sorted((self.index_path.parent / "raw").glob("*.json.gz")):
+            replay_id = path.name.removesuffix(".json.gz")
+            if replay_id in known:
                 continue
-            try:
-                body = load_raw_replay(raw_path)
-                meta = FetchMetadata.from_dict(orjson.loads(meta_path.read_bytes()))
-                entry = FetchIndexEntry(
-                    replay_id=replay_id,
-                    format_id=self.config.format_id,
-                    source_url=meta.source_url,
-                    fetched_at=meta.fetched_at,
-                    http_status=meta.http_status,
-                    content_sha256=hashlib.sha256(body).hexdigest(),
-                    byte_size=len(body),
-                )
-            except (OSError, ValueError, orjson.JSONDecodeError):
-                continue
-            recovered.append(entry)
-            known[replay_id] = entry
-        if recovered:
-            self._append_index(recovered)
+            body = load_raw_replay(path)
+            known[replay_id] = _catalog_entry(
+                body,
+                replay_id,
+                self.config.format_id,
+                self.config.replay_url_template.format(replay_id=replay_id),
+                datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat(),
+                200,
+            )
 
     def acquire(self, replay_ids: Iterable[str] | None = None) -> tuple[FetchIndexEntry, ...]:
-        known = {entry.replay_id: entry for entry in read_fetch_index(self.index_path)}
+        known = {
+            entry.replay_id: entry
+            for entry in read_fetch_index(self.index_path)
+            if (self.index_path.parent / entry.raw_path).is_file()
+        }
         self._recover_unindexed(known)
         known_keys = set(known)
 
-        if replay_ids is None and len(known_keys) >= self.config.limit_games:
-            return tuple(sorted(known.values(), key=lambda entry: entry.replay_id))
-
         seeds = replay_ids if replay_ids is not None else self._iter_discovered_ids()
-        selected: set[str] = set()
+        fetched_count = 0
 
         for seed in seeds:
-            if replay_ids is None and len(selected | known_keys) >= self.config.limit_games:
+            if replay_ids is None and fetched_count >= self.config.limit_games:
                 break
 
             frontier = {seed}
@@ -399,7 +294,6 @@ class ReplayFetcher:
                 discovered = set()
 
                 for replay_id in cached_scan:
-                    selected.add(replay_id)
                     scanned.add(replay_id)
                     discovered.update(
                         linked_replay_ids(
@@ -422,7 +316,6 @@ class ReplayFetcher:
                                 entry, links = futures[replay_id].result()
                                 new_entries.append(entry)
                                 discovered.update(links)
-                                selected.add(replay_id)
                                 scanned.add(replay_id)
                             except ReplayUnavailableError as exc:
                                 self._unavailable_ids.add(replay_id)
@@ -441,19 +334,88 @@ class ReplayFetcher:
                         for entry in new_entries:
                             known[entry.replay_id] = entry
                             known_keys.add(entry.replay_id)
-                        self._append_index(new_entries)
+                        fetched_count += len(new_entries)
+                        write_fetch_index(self.index_path, known.values())
 
                     if fetch_error is not None:
                         raise fetch_error
 
                 frontier = discovered - scanned
 
-        self._write_index(known.values())
+        write_fetch_index(self.index_path, known.values())
         return tuple(sorted(known.values(), key=lambda entry: entry.replay_id))
 
 
-def _index_line(entry: FetchIndexEntry) -> bytes:
-    return orjson.dumps(entry.to_dict(), option=orjson.OPT_SORT_KEYS) + b"\n"
+def _catalog_entry(
+    body: bytes, replay_id: str, format_id: str, url: str, fetched_at: str, status: int
+) -> FetchIndexEntry:
+    value = orjson.loads(body)
+    timestamp = _upload_time(value)
+    rating = value.get("rating")
+    players = value.get("players", ())
+    if not players:
+        players = tuple(value[name] for name in ("p1", "p2") if value.get(name))
+    return FetchIndexEntry(
+        replay_id=replay_id,
+        format_id=format_id,
+        source_url=url,
+        fetched_at=fetched_at,
+        http_status=status,
+        raw_path=f"raw/{replay_id}.json.gz",
+        upload_time="" if timestamp is None else timestamp.isoformat(),
+        rating=None if rating in (None, "") else int(rating),
+        players=tuple(players),
+        parent_room=value.get("parent", value.get("parentid", value.get("parent_room", ""))) or "",
+    )
+
+
+def write_fetch_index(path: Path, entries: Iterable[FetchIndexEntry]) -> None:
+    ordered = sorted(entries, key=lambda entry: entry.replay_id)
+    with atomic_output(path) as temporary:
+        with temporary.open("wb") as stream:
+            for entry in ordered:
+                stream.write(orjson.dumps(entry.to_dict()) + b"\n")
+
+
+def select_replays(
+    entries: Iterable[FetchIndexEntry],
+    *,
+    format_id: str | None = None,
+    min_rating: int | None = None,
+    max_rating: int | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    player: str | None = None,
+) -> tuple[FetchIndexEntry, ...]:
+    """Filter metadata; unknown ratings/dates do not satisfy corresponding filters."""
+    lower_date = None if after is None else _parse_utc(after)
+    upper_date = None if before is None else _parse_utc(before)
+    if lower_date is not None and upper_date is not None and lower_date > upper_date:
+        raise ValueError("after must be before before")
+    if min_rating is not None and max_rating is not None and min_rating > max_rating:
+        raise ValueError("min_rating must not exceed max_rating")
+    selected = []
+    for entry in entries:
+        if format_id is not None and entry.format_id != format_id:
+            continue
+        if min_rating is not None and (entry.rating is None or entry.rating < min_rating):
+            continue
+        if max_rating is not None and (entry.rating is None or entry.rating > max_rating):
+            continue
+        if player is not None and player.casefold() not in {
+            name.casefold() for name in entry.players
+        }:
+            continue
+        if lower_date is not None or upper_date is not None:
+            if not entry.upload_time:
+                continue
+            timestamp = _parse_utc(entry.upload_time)
+            if lower_date is not None and timestamp < lower_date:
+                continue
+            if upper_date is not None and timestamp > upper_date:
+                continue
+        selected.append(entry)
+    return tuple(sorted(selected, key=lambda entry: entry.replay_id))
 
 
 def read_fetch_index(path: str | Path) -> tuple[FetchIndexEntry, ...]:
@@ -489,11 +451,12 @@ def load_raw_replay(path: str | Path) -> bytes:
 
 
 __all__ = [
-    "FetchMetadata",
     "HttpResponse",
     "ReplayFetchError",
     "ReplayFetcher",
     "ScrapeConfig",
     "load_raw_replay",
     "read_fetch_index",
+    "write_fetch_index",
+    "select_replays",
 ]

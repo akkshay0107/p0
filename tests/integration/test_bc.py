@@ -31,7 +31,6 @@ class TestBCTrainingIntegration:
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
-            max_decisions_per_shard=1,
             created_at="2026-01-01T00:00:00Z",
         )
         dataset = LazyReplayDataset(built.manifest_path)
@@ -64,7 +63,6 @@ class TestBCTrainingIntegration:
         built = write_tensor_shards(
             result,
             tmp_path / "shards",
-            max_decisions_per_shard=8,
             created_at="2026-01-01T00:00:00Z",
         )
         dataset = LazyReplayDataset(built.manifest_path)

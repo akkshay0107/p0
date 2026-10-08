@@ -110,11 +110,11 @@ class TestCanonicalTeam:
         with pytest.raises(ValueError, match="exactly six members"):
             CanonicalTeam((m,) * 7)
 
-    def test_team_hash_ignores_display_and_member_order(self) -> None:
+    def test_team_key_ignores_display_and_member_order(self) -> None:
         first = team_variant()
         reversed_members = tuple(reversed(first.team.members))
         second = team_variant(members=reversed_members)
-        assert first.team.team_hash == second.team.team_hash
+        assert first.team.team_key == second.team.team_key
 
         pikachu = first.team.members[0]
         display_variant = replace(
@@ -126,11 +126,11 @@ class TestCanonicalTeam:
             nature="JOLLY",
         )
         display_team = CanonicalTeam((display_variant, *first.team.members[1:]))
-        assert display_team.team_hash == first.team.team_hash
+        assert display_team.team_key == first.team.team_key
 
         semantic_variant = replace(display_variant, ability="Lightning Rod")
         semantic_team = CanonicalTeam((semantic_variant, *first.team.members[1:]))
-        assert semantic_team.team_hash != first.team.team_hash
+        assert semantic_team.team_key != first.team.team_key
 
     def test_team_dict_roundtrip(self) -> None:
         variant = team_variant()

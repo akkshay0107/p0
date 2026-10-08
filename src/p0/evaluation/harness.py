@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import math
 import random
@@ -353,8 +352,8 @@ class EvaluationHarness:
             player_a.history, player_b.history, strict=True
         ):
             if team_a and team_b:
-                ha = hashlib.sha256(team_a.encode()).hexdigest()[:8]
-                hb = hashlib.sha256(team_b.encode()).hexdigest()[:8]
+                ha = team_a
+                hb = team_b
                 _record(per_team, f"{ha}:{hb}", won_a)
                 _record(per_team_a, ha, won_a)
                 _record(per_team_b, hb, won_b)

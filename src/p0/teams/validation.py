@@ -16,7 +16,7 @@ from p0.teams.team import TeamRecord
 
 
 class AdmissionResult(NamedTuple):
-    team_hash: str
+    team_key: str
     valid: bool
     packed_team: str | None
     problems: tuple[str, ...]
@@ -124,7 +124,7 @@ def validate_many_batched(
             for variant, item in zip(chunk, parsed, strict=True):
                 results.append(
                     AdmissionResult(
-                        team_hash=variant.team.team_hash,
+                        team_key=variant.team.team_key,
                         valid=bool(item["valid"]),
                         packed_team=item["packedTeam"],
                         problems=tuple(item["problems"]),

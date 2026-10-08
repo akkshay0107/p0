@@ -21,12 +21,12 @@ class TestTeams:
 
         Ensures that our fixture legal team complies with Showdown's format rules (moves, abilities,
         item clauses, EV limits) and that team validation produces a valid packed wire representation
-        with matching hash identity.
+        with matching team key.
         """
         variant = team_variant()
         result = validate_variant(variant)
         assert result.valid, result.problems
-        assert result.team_hash == variant.team.team_hash
+        assert result.team_key == variant.team.team_key
         assert result.packed_team
 
 
@@ -51,8 +51,8 @@ class TestTeamScale:
             format_id=FORMAT.bo3_format,
         )
 
-        assert [result.team_hash for result in results] == [
-            variant.team.team_hash for variant in variants
+        assert [result.team_key for result in results] == [
+            variant.team.team_key for variant in variants
         ]
         assert all(result.valid for result in results)
         assert all(result.packed_team for result in results)

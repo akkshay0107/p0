@@ -1,10 +1,10 @@
-"""Operational replay acquisition, Bo1 shard compilation, and split commands."""
+"""Fetch, filter, and reconstruct replays using JSONL indexes and cached series."""
 
 from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Iterator
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -12,154 +12,158 @@ from p0.format_config import FORMAT
 from p0.replays.compile import compile_to_shards
 from p0.replays.dataset import LazyReplayDataset, assign_series_splits, write_split_manifest
 from p0.replays.group import group_replays
-from p0.replays.protocol import ReplayDocument, parse_replay_payload
-from p0.replays.scrape import ReplayFetcher, ScrapeConfig, load_raw_replay
+from p0.replays.protocol import ReplayInputContractError, parse_replay_payload
+from p0.replays.scrape import (
+    ReplayFetcher,
+    ScrapeConfig,
+    load_raw_replay,
+    read_fetch_index,
+    select_replays,
+)
+
+DEFAULT_REPLAY_CACHE = Path("artifacts/replays")
+DEFAULT_TENSOR_CACHE = Path("artifacts/datasets")
+LOGGER = logging.getLogger(__name__)
 
 
 def _parser() -> argparse.ArgumentParser:
-    """Build the argument parser for replay operations."""
     parser = argparse.ArgumentParser(prog="p0-replays")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    scrape = commands.add_parser("scrape")
+    scrape.add_argument("--cache-dir", type=Path, default=DEFAULT_REPLAY_CACHE)
+    scrape.add_argument("--format", default=FORMAT.bo3_format)
+    scrape.add_argument(
+        "--limit-games",
+        type=int,
+        default=50,
+        help="Soft cap for new games; fetching linked siblings can exceed it",
+    )
+    scrape.add_argument("--replay-id", action="append")
+    scrape.add_argument("--after", help="Earliest upload date, ISO-8601")
 
-    scrape = subparsers.add_parser("scrape")
-    scrape.add_argument("--cache-dir", type=Path, default=Path("artifacts/replays"))
-    scrape.add_argument("--limit-games", type=int, default=50)
-    scrape.add_argument("--replay-id", action="append", default=None)
+    for name in ("list", "build-shards"):
+        command = commands.add_parser(name)
+        command.add_argument("--cache-dir", type=Path, default=DEFAULT_REPLAY_CACHE)
+        command.add_argument("--format", default=FORMAT.bo3_format)
+        command.add_argument("--min-elo", type=int)
+        command.add_argument("--max-elo", type=int)
+        command.add_argument("--after", help="Earliest upload date, ISO-8601")
+        command.add_argument("--before", help="Latest upload date, ISO-8601")
+        command.add_argument("--player")
+        if name == "build-shards":
+            command.add_argument("--output-dir", type=Path, default=DEFAULT_TENSOR_CACHE)
+            command.add_argument("--force-reconstruct", action="store_true")
 
-    build = subparsers.add_parser("build-shards")
-    build.add_argument("--cache-dir", type=Path, default=Path("artifacts/replays"))
-    build.add_argument("--output-dir", type=Path, default=Path("artifacts/shards"))
-
-    splits = subparsers.add_parser("create-splits")
+    splits = commands.add_parser("create-splits")
     splits.add_argument("--shard-manifest", type=Path, required=True)
-
+    splits.add_argument("--seed", type=int, default=0)
     return parser
 
 
-def _scrape(
-    cache_dir: Path,
-    limit_games: int,
-    replay_ids: list[str] | None,
-) -> dict[str, Any]:
-    """Scrape Pokemon Showdown replays up to the selected game limit."""
-    config = ScrapeConfig(
-        format_id=FORMAT.bo3_format,
-        cache_dir=cache_dir,
-        limit_games=limit_games,
+def _scrape(args: argparse.Namespace) -> dict[str, Any]:
+    fetcher = ReplayFetcher(
+        ScrapeConfig(
+            format_id=args.format,
+            cache_dir=args.cache_dir,
+            limit_games=args.limit_games,
+            cutoff=args.after,
+        )
     )
+    entries = fetcher.acquire(args.replay_id)
+    return {"index_path": str(fetcher.index_path.resolve()), "cached_games": len(entries)}
 
-    fetcher = ReplayFetcher(config)
-    entries = fetcher.acquire(replay_ids)
+
+def _build(args: argparse.Namespace, selected_ids: set[str]) -> dict[str, Any]:
+    index = args.cache_dir / args.format / "index.jsonl"
+    entries = read_fetch_index(index)
+    selected_parents = {
+        entry.parent_room
+        for entry in entries
+        if entry.replay_id in selected_ids and entry.parent_room
+    }
     documents = []
-    unparsed = 0
-
+    rejected_ids: set[str] = set()
+    rejected_parents: set[str] = set()
     for entry in entries:
         try:
-            documents.append(
-                parse_replay_payload(
-                    load_raw_replay(
-                        cache_dir / FORMAT.bo3_format / "raw" / f"{entry.replay_id}.json.gz"
-                    ),
-                    replay_id=entry.replay_id,
-                    format_id=FORMAT.bo3_format,
-                )
+            document = parse_replay_payload(
+                load_raw_replay(index.parent / entry.raw_path),
+                replay_id=entry.replay_id,
+                format_id=args.format,
             )
-        except (TypeError, ValueError):
-            unparsed += 1
-
-    source_series = len(group_replays(documents, format_id=FORMAT.bo3_format).series) + unparsed
-
-    return {
-        "format_id": FORMAT.bo3_format,
-        "index_path": str(fetcher.index_path.resolve()),
-        "source_games": len(entries),
-        "source_series": source_series,
-        "accepted_games": None,
-        "rejected_games": None,
-        "dataset_hash": None,
-        "limit_games": limit_games,
-    }
-
-
-def _yield_documents(cache_dir: Path) -> Iterator[ReplayDocument]:
-    """Yield parsed replay documents from the cache."""
-    for path in sorted((cache_dir / FORMAT.bo3_format / "raw").glob("*.json.gz")):
-        identity = path.name.removesuffix(".json.gz")
-        try:
-            payload = load_raw_replay(path)
-            yield parse_replay_payload(
-                payload,
-                replay_id=identity,
-                format_id=FORMAT.bo3_format,
-            )
+            if any(not sheet.is_complete for sheet in document.ots):
+                raise ReplayInputContractError("Replay requires complete six-member OTS")
+            if document.outcome.terminal_line_index is None:
+                raise ReplayInputContractError("Replay has no terminal protocol line")
+            documents.append(document)
         except (OSError, TypeError, ValueError) as exc:
-            raise ValueError(f"Malformed cached replay: {path}") from exc
-
-
-def _build(cache_dir: Path, output_dir: Path) -> dict[str, Any]:
-    """Compile a folder of scraped raw replays into PyTorch tensor shards."""
+            LOGGER.warning("Skipping unusable replay %s: %s", entry.replay_id, exc)
+            if entry.replay_id in selected_ids or entry.parent_room in selected_parents:
+                rejected_ids.add(entry.replay_id)
+                if entry.parent_room:
+                    rejected_parents.add(entry.parent_room)
+    # Selecting one game selects its complete cached series, preserving BC history.
+    groups = group_replays(documents, format_id=args.format).series
+    selected = []
+    for group in groups:
+        parent = group.games[0].metadata.parent_room
+        if not selected_ids.intersection(group.record.game_replay_ids) and (
+            not parent or parent not in selected_parents
+        ):
+            continue
+        if parent and parent in rejected_parents:
+            rejected_ids.update(group.record.game_replay_ids)
+        else:
+            selected.extend(group.games)
     built = compile_to_shards(
-        documents=_yield_documents(cache_dir),
-        output_dir=output_dir,
-        format_id=FORMAT.bo3_format,
+        selected,
+        args.output_dir,
+        format_id=args.format,
+        force_reconstruct=args.force_reconstruct,
+        external_rejections=sorted(rejected_ids),
     )
-
-    manifest = built.manifest
-
     return {
         "manifest_path": str(built.manifest_path.resolve()),
-        "dataset_hash": manifest.dataset_hash,
-        "global_hash": manifest.global_contract_sha256,
-        "source_games": manifest.source_games,
-        "accepted_games": manifest.accepted_games,
-        "rejected_games": manifest.rejected_games,
-        "source_series": len(manifest.source_series),
+        "dataset_id": built.manifest.dataset_id,
+        "source_games": built.manifest.source_games,
+        "accepted_games": built.manifest.accepted_games,
+        "rejected_games": built.manifest.rejected_games,
     }
 
 
-def _create_splits(shard_manifest: Path) -> dict[str, Any]:
-    """Assign validation and test splits uniformly across all compiled series."""
+def _create_splits(shard_manifest: Path, seed: int) -> dict[str, Any]:
     dataset = LazyReplayDataset(shard_manifest)
-    manifest = dataset.manifest
-    series_ids = dataset.accepted_series_ids()
     split = assign_series_splits(
-        series_ids,
-        global_contract_sha256=manifest.global_contract_sha256,
-        dataset_hash=manifest.dataset_hash,
+        dataset.accepted_series_ids(),
+        dataset_id=dataset.manifest.dataset_id,
+        seed=seed,
     )
-
-    output = shard_manifest.parent / "splits.json"
-    write_split_manifest(split, output)
-
-    counts = {
-        name: sum(assigned == name for assigned in split.assignments.values())
-        for name in ("train", "validation", "test")
-    }
-
-    return {
-        "split_manifest_path": str(output.resolve()),
-        "shard_manifest_path": str(shard_manifest.resolve()),
-        "dataset_hash": manifest.dataset_hash,
-        "global_hash": manifest.global_contract_sha256,
-        "source_series": len(series_ids),
-        "source_games": manifest.source_games,
-        "accepted_games": manifest.accepted_games,
-        "rejected_games": manifest.rejected_games,
-        "split_series": counts,
-    }
+    path = shard_manifest.parent / "splits.json"
+    write_split_manifest(split, path)
+    return {"split_manifest_path": str(path.resolve()), "split_id": split.split_id}
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Replay CLI entrypoint."""
     args = _parser().parse_args(argv)
-
     if args.command == "scrape":
-        result = _scrape(args.cache_dir, args.limit_games, args.replay_id)
-    elif args.command == "build-shards":
-        result = _build(args.cache_dir, args.output_dir)
+        result = _scrape(args)
+    elif args.command == "create-splits":
+        result = _create_splits(args.shard_manifest, args.seed)
     else:
-        result = _create_splits(args.shard_manifest)
-
+        entries = select_replays(
+            read_fetch_index(args.cache_dir / args.format / "index.jsonl"),
+            format_id=args.format,
+            min_rating=args.min_elo,
+            max_rating=args.max_elo,
+            after=args.after,
+            before=args.before,
+            player=args.player,
+        )
+        result = (
+            [entry.to_dict() for entry in entries]
+            if args.command == "list"
+            else _build(args, {entry.replay_id for entry in entries})
+        )
     print(json.dumps(result, sort_keys=True))
 
 

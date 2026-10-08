@@ -28,7 +28,6 @@ def _build_dataset_from_payloads(tmp_path: Path, payloads: Sequence[dict[str, An
     return write_tensor_shards(
         result,
         tmp_path / "dataset",
-        max_decisions_per_shard=1,
         created_at="2026-01-01T00:00:00Z",
     )
 
@@ -77,7 +76,7 @@ class TestDataset:
             {"multiprocessing_context": PROCESS_CONTEXT} if num_workers else {}
         )
         loader = DataLoader(
-            LazyReplayDataset(built.manifest_path, verify_hashes=True),
+            LazyReplayDataset(built.manifest_path),
             batch_size=None,
             num_workers=num_workers,
             collate_fn=_dataset_identity,
@@ -100,7 +99,7 @@ class TestDataset:
         count = stress_count("P0_STRESS_DATASET_PREFETCH_REPLAYS", 64)
         built = _build_dataset(tmp_path, count)
         loader = DataLoader(
-            LazyReplayDataset(built.manifest_path, verify_hashes=True),
+            LazyReplayDataset(built.manifest_path),
             batch_size=None,
             num_workers=2,
             collate_fn=_dataset_identity,

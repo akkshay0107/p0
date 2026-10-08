@@ -165,23 +165,25 @@ def decision_payload() -> dict[str, Any]:
 
 
 def torch_summaries(built: ShardBuildResult) -> list[dict[str, Any]]:
-    """Return the series summaries from the first shard file of a built dataset."""
-    payload_path = built.manifest_path.parent / built.manifest.shards[0].filename
-    payload = torch.load(payload_path, weights_only=True, map_location="cpu")
-    return payload["series_summaries"]
+    """Return all game summaries across the dataset's series shards."""
+    return [
+        summary
+        for entry in built.manifest.shards
+        for summary in torch.load(
+            built.manifest_path.parent / entry.filename, weights_only=True, map_location="cpu"
+        )["series_summaries"]
+    ]
 
 
 def build_dataset_from_payloads(
     tmp_path: Path,
     payloads: tuple[dict[str, Any], ...],
-    max_decisions_per_shard: int = 1,
 ) -> ShardBuildResult:
     """Compile payloads and write shards to a temporary directory."""
     result = compile_payloads(payloads, format_id=payloads[0]["formatid"])
     return write_tensor_shards(
         result,
         tmp_path / "dataset",
-        max_decisions_per_shard=max_decisions_per_shard,
         created_at="2026-01-01T00:00:00Z",
     )
 

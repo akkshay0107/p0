@@ -28,7 +28,7 @@ class TestCheckpoints:
         Verify that checkpoint saving captures required schema metadata and strips immutable runtime statics.
 
         Verifies that:
-        1. Saved artifact contains global contract SHA-256 and configuration envelopes.
+        1. Saved artifact contains runtime major/minor identity and configuration envelopes.
         2. Static lookup tables (species stats, move stats, mechanic tags) are omitted from state_dict
            to avoid checkpoint bloat and decouple model weights from static dex data.
         3. Loading restores matching policy architecture and training step count.
@@ -44,8 +44,7 @@ class TestCheckpoints:
         assert artifact["artifact_schema"] == CHECKPOINT_ARTIFACT_SCHEMA
         assert artifact["artifact_type"] == "training"
         assert "runtime_manifest_sha256" not in artifact
-        assert len(artifact["global_contract_sha256"]) == 64
-        assert artifact["global_contract"]["global_sha256"] == artifact["global_contract_sha256"]
+        assert set(artifact["runtime_contract"]) == {"major_sha256", "minor_sha256"}
         assert artifact["model_config"]["d_model"] == 32
         assert artifact["provenance"] == {}
 
@@ -163,7 +162,7 @@ class TestCheckpoints:
             policy,
             optimizer=optimizer,
             magnet=magnet,
-            metadata={"dataset_hash": "d" * 64},
+            metadata={"dataset_id": "d" * 64},
             trainer_kind="ppo",
         )
 
@@ -176,7 +175,7 @@ class TestCheckpoints:
             optimizer=restored_optimizer,
             magnet=restored_magnet,
             expected_trainer_kind="ppo",
-            expected_metadata={"dataset_hash": "d" * 64},
+            expected_metadata={"dataset_id": "d" * 64},
             require_training_state=True,
         )
         assert episode == 17
@@ -229,17 +228,17 @@ class TestCheckpoints:
         assert game.requires_grad is False
         torch.testing.assert_close(game, torch.ones((3, policy.d_model)))
 
-    def test_checkpoint_rejects_global_contract_tampering(self, tmp_path: Path) -> None:
-        """Verify checkpoint loading rejects files whose global contract checksum has been altered."""
+    def test_checkpoint_rejects_incompatible_vocabulary(self, tmp_path: Path) -> None:
+        """Verify checkpoint loading rejects files whose vocabulary/encoding identity has been altered."""
         path = tmp_path / "policy.pt"
         store = CheckpointStore()
         store.save_policy(
             path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
         )
         artifact = dict(store.read(path).artifact)
-        artifact["global_contract_sha256"] = "0" * 64
+        artifact["runtime_contract"]["major_sha256"] = "older-vocabulary"
         torch.save(artifact, path)
-        with pytest.raises(ValueError, match="global_contract_sha256"):
+        with pytest.raises(ValueError, match="incompatible"):
             store.load_policy(path, "cpu")
 
     def test_checkpoint_rejects_weights_only_resume_when_training_is_required(
@@ -328,14 +327,14 @@ class TestCheckpoints:
         policy = _small_policy()
         metadata = {
             "parent_checkpoint_sha256": "f" * 64,
-            "dataset_hash": "e" * 64,
+            "dataset_id": "e" * 64,
             "gamma": 0.99,
         }
         store.save_training(path, 5, policy, metadata=metadata, trainer_kind="ppo")
 
         loaded_metadata = store.load_metadata(path)
         assert loaded_metadata["parent_checkpoint_sha256"] == "f" * 64
-        assert loaded_metadata["dataset_hash"] == "e" * 64
+        assert loaded_metadata["dataset_id"] == "e" * 64
         assert loaded_metadata["trainer_kind"] == "ppo"
 
         # Matching expected metadata succeeds
@@ -345,7 +344,7 @@ class TestCheckpoints:
                 path,
                 restored,
                 expected_trainer_kind="ppo",
-                expected_metadata={"dataset_hash": "e" * 64},
+                expected_metadata={"dataset_id": "e" * 64},
             )
             == 5
         )
@@ -355,7 +354,7 @@ class TestCheckpoints:
             store.load_training(
                 path,
                 restored,
-                expected_metadata={"dataset_hash": "wrong"},
+                expected_metadata={"dataset_id": "wrong"},
             )
 
 
@@ -399,3 +398,23 @@ class TestStrictTrainingResume:
         assert loaded.sha256 == expected_hash
         assert store.load_episode(loaded) == 1
         assert store.load_episode(path) == 2
+
+
+class TestRuntimeCompatibility:
+    def test_dex_only_change_warns_and_loads_weights(self, tmp_path: Path, caplog) -> None:
+        from copy import deepcopy
+
+        from p0.model.resources import RuntimeResources
+
+        original = default_runtime_resources()
+        path = tmp_path / "policy.pt"
+        CheckpointStore(resources=original).save_policy(
+            path, build_policy(ModelConfig(32, 4, 1, 128), original)
+        )
+        dex = deepcopy(original.dex)
+        dex["moves"][0]["basePower"] = 999
+        changed = RuntimeResources.from_data(original.vocab, dex)
+        with caplog.at_level("WARNING", logger="p0.training.checkpoint"):
+            restored = CheckpointStore(resources=changed).load_policy(path, "cpu")
+        assert restored.config == ModelConfig(32, 4, 1, 128)
+        assert "different dex data" in caplog.text

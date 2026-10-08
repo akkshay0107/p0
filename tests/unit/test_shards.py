@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from p0.battle.actions import ACT_SIZE
-from p0.format_config import load_active_global_contract
+from p0.format_config import active_runtime_contract
 from p0.replays.schema import MaskProvenance
 from p0.replays.shards import (
     ShardIndexEntry,
@@ -20,31 +20,29 @@ from p0.replays.shards import (
 
 def _valid_shard_entry() -> ShardIndexEntry:
     return ShardIndexEntry(
-        filename="shard-00000.pt",
-        sha256="a" * 64,
+        shard_id="shard-1",
+        filename="shard-1.pt",
+        series_id="series-1",
+        replay_ids=("game-1", "game-2"),
         decisions=10,
         games=4,
-        series=1,
-        byte_size=2048,
     )
 
 
 def _valid_shard_manifest() -> ShardManifest:
-    global_sha = load_active_global_contract().global_sha256
+    global_sha = active_runtime_contract().major_sha256
     return ShardManifest(
-        global_contract_sha256=global_sha,
+        runtime_major=global_sha,
         shards=(_valid_shard_entry(),),
         diagnostics={"replays": 2, "accepted_games": 2, "rejected_games": 0},
         created_at="2026-01-01T00:00:00Z",
-        dataset_hash="b" * 64,
+        dataset_id="b" * 64,
         source_format_id="gen9championsvgc2026regmcbo3",
         build_config={"max_candidates": 256},
-        raw_replays={"game-1": "c" * 64, "game-2": "d" * 64},
         source_series={"series-1": ("game-1", "game-2")},
         source_games=2,
         accepted_games=2,
         rejected_games=0,
-        artifact_hashes={"shard-00000.pt": "a" * 64},
     )
 
 
@@ -82,29 +80,10 @@ class TestShardIndexEntry:
         entry = _valid_shard_entry()
         assert ShardIndexEntry.from_dict(entry.to_dict()) == entry
 
-    @pytest.mark.parametrize(
-        "kwargs, match",
-        [
-            ({"filename": ""}, "must be non-empty"),
-            ({"sha256": "not-sha256"}, "must be a lowercase SHA-256"),
-            ({"decisions": -1}, "must be a nonnegative integer"),
-            ({"games": -1}, "must be a nonnegative integer"),
-            ({"series": -1}, "must be a nonnegative integer"),
-            ({"byte_size": -1}, "must be a nonnegative integer"),
-        ],
-    )
-    def test_validation_errors(self, kwargs: dict[str, object], match: str) -> None:
-        base = {
-            "filename": "shard-00000.pt",
-            "sha256": "a" * 64,
-            "decisions": 10,
-            "games": 2,
-            "series": 1,
-            "byte_size": 2048,
-        }
-        base.update(kwargs)
-        with pytest.raises(ValueError, match=match):
-            ShardIndexEntry(**base)  # type: ignore[arg-type]
+    def test_invalid_counts(self) -> None:
+        value = _valid_shard_entry().to_dict()
+        with pytest.raises(ValueError, match="two perspectives"):
+            ShardIndexEntry.from_dict({**value, "games": 3})
 
 
 class TestShardManifest:
@@ -128,23 +107,14 @@ class TestShardManifest:
         assert load_shard_manifest(value) == manifest
 
         with pytest.raises(ValueError, match="incompatible"):
-            load_shard_manifest({**value, "global_contract_sha256": "0" * 64})
+            load_shard_manifest({**value, "runtime_major": "0" * 64})
         with pytest.raises(ValueError, match="unknown"):
             load_shard_manifest({**value, "runtime_manifest_sha256": "0" * 64})
 
-    @pytest.mark.parametrize("omit_source_membership", (False, True))
-    def test_rejects_partition_mismatch(self, omit_source_membership: bool) -> None:
-        manifest = _valid_shard_manifest()
-        data = manifest.to_dict()
-        assert ShardManifest.from_dict(data) == manifest
-        if omit_source_membership:
-            data["source_series"] = {"series-1": ["game-1"]}
-            error = "source_series"
-        else:
-            data["raw_replays"]["game-extra"] = "e" * 64
-            data["source_games"] = 3
-            error = "partition all raw replays"
-        with pytest.raises(ValueError, match=error):
+    def test_rejects_partition_mismatch(self) -> None:
+        data = _valid_shard_manifest().to_dict()
+        data["source_series"] = {"series-1": ["game-1"]}
+        with pytest.raises(ValueError, match="source_series"):
             ShardManifest.from_dict(data)
 
 
