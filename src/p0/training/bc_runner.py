@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
-from collections.abc import Callable, Mapping
-from dataclasses import asdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,28 +16,12 @@ from p0.model.resources import default_runtime_resources
 from p0.persistence import atomic_json_save
 from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest
 from p0.training.bc import BCCancelled, BCEvaluationMetrics, BCTrainer
-from p0.training.checkpoint import CheckpointStore, LoadedCheckpoint, value_objective_metadata
+from p0.training.checkpoint import CheckpointStore, value_objective_metadata
 from p0.training.config import BCConfig
-from p0.training.files import TrainingRun, training_run
+from p0.training.files import training_run
 from p0.training.utils import default_device, seed_everything
 
-
-def _training_metadata(
-    config: BCConfig,
-    *,
-    dataset_id: str,
-    split_manifest: SeriesSplitManifest,
-) -> dict[str, Any]:
-    trainer_config = asdict(config)
-    for name in ("epochs", "shard_manifest", "output_dir", "resume_checkpoint"):
-        del trainer_config[name]
-    return {
-        "dataset_id": dataset_id,
-        "split_id": split_manifest.split_id,
-        "trainer_config": trainer_config,
-        "epoch_budget": config.epochs,
-        **value_objective_metadata(config.gamma),
-    }
+LOGGER = logging.getLogger(__name__)
 
 
 def _validation_is_failed(metrics: BCEvaluationMetrics) -> bool:
@@ -59,36 +43,6 @@ def _has_accepted_series(
     return any(
         assigned_split == split and series_id in accepted_series
         for series_id, assigned_split in split_manifest.assignments.items()
-    )
-
-
-def _restore_best_policy(
-    files: TrainingRun,
-    selection: Mapping[str, Any],
-    step: int,
-    expected_metadata: Mapping[str, Any],
-) -> None:
-    """Restore the embedded best policy from the resume checkpoint."""
-    score, epoch = selection.get("best_validation_nll"), selection.get("selected_epoch")
-    if (
-        not isinstance(score, (float, int))
-        or not math.isfinite(score)
-        or type(epoch) is not int
-        or epoch <= 0
-    ):
-        raise ValueError("BC resume checkpoint has incomplete selected-policy state")
-    if epoch > step:
-        raise ValueError("BC resume checkpoint has stale selected-policy state")
-    best = files.state.get("best_policy")
-    if best is None:
-        raise ValueError("BC resume checkpoint has no embedded selected policy")
-    source = files.source
-    assert source is not None
-    files.store.validate_artifact(best, source.path)
-    files.store.load_policy(
-        LoadedCheckpoint(source.path, best, ""),
-        "cpu",
-        expected_metadata={**expected_metadata, "selected_epoch": epoch},
     )
 
 
@@ -128,32 +82,26 @@ def train_bc(
     dataset_output = config.output_dir
     latest_path = dataset_output / "bc_latest_training.pt"
     best_path = dataset_output / "bc_best_policy.pt"
-    metrics_path = dataset_output / "metrics.json"
-    metadata = _training_metadata(
-        config,
-        dataset_id=shard_manifest.dataset_id,
-        split_manifest=split_manifest,
-    )
+    metadata = {
+        "dataset_id": shard_manifest.dataset_id,
+        "split_id": split_manifest.split_id,
+        **value_objective_metadata(config.gamma),
+    }
     with training_run(
         store,
         latest_path,
         dataset_output,
         trainer_kind="bc",
-        settings=metadata["trainer_config"],
         source_path=config.resume_checkpoint,
         resume=config.resume_checkpoint is not None,
     ) as files:
-        files.metadata["inputs"] = {
-            "shard_manifest": str(config.shard_manifest.resolve()),
-            "split_manifest": str(config.split_manifest_path.resolve()),
-        }
         selected_device = default_device() if device is None else torch.device(device)
         seed_everything(config.seed)
         policy = (
             store.load_policy(
                 files.source,
                 selected_device,
-                expected_metadata=value_objective_metadata(config.gamma),
+                expected_objective=value_objective_metadata(config.gamma),
             )
             if files.source is not None
             else build_policy(ModelConfig.baseline(), default_runtime_resources())
@@ -167,24 +115,30 @@ def train_bc(
         )
         if files.source is not None:
             source_metadata = store.load_metadata(files.source)
-            if source_metadata.get("trainer_config", {}).get("overfit") is True:
-                raise ValueError("Cannot resume an overfit training run")
-            resume_metadata = {
-                key: value for key, value in metadata.items() if key != "epoch_budget"
-            }
-            selection_state = dict(source_metadata.get("selection_state", {}))
-            completed_epoch = store.load_episode(files.source)
-            _restore_best_policy(files, selection_state, completed_epoch, resume_metadata)
-            # Restore randomness after constructing the selected-policy validation model.
-            store.load_training(
+            for name in ("dataset_id", "split_id"):
+                if source_metadata.get(name) != metadata[name]:
+                    LOGGER.warning(
+                        "BC resume checkpoint was trained with a different %s; "
+                        "its best validation score is not comparable with this run",
+                        name,
+                    )
+
+            completed_epoch = store.load_training(
                 files.source,
                 trainer.policy,
+                trainer_kind="bc",
                 optimizer=trainer.optimizer,
                 scaler=trainer.scaler,
-                expected_trainer_kind="bc",
-                expected_metadata=resume_metadata,
-                require_training_state=True,
             )
+
+            selection_state = dict(source_metadata.get("selection_state", {}))
+            if not best_path.is_file():
+                LOGGER.warning(
+                    "No best policy exists at %s; the next epoch starts a new selection",
+                    best_path,
+                )
+                selection_state = {}
+
             latest_artifact: Path | None = files.source.path
         else:
             completed_epoch = 0
@@ -220,14 +174,10 @@ def train_bc(
             last_training_update = training
             final_validation = validation
             if validation.overall_nll < selection_state.get("best_validation_nll", float("inf")):
-                files.state["best_policy"] = store.snapshot_policy(
+                store.save_policy(
+                    best_path,
                     trainer.policy,
-                    {
-                        **metadata,
-                        "trainer_kind": "bc",
-                        "selected_epoch": epoch,
-                        "run": files.metadata,
-                    },
+                    metadata={**metadata, "trainer_kind": "bc", "selected_epoch": epoch},
                 )
                 selection_state = {
                     "best_validation_nll": validation.overall_nll,
@@ -237,7 +187,6 @@ def train_bc(
             record = {
                 "epoch": epoch,
                 "dataset_id": shard_manifest.dataset_id,
-                "train_update": training,
                 "training": training,
                 "validation": validation_values,
             }
@@ -267,7 +216,7 @@ def train_bc(
             "final_validation": (None if final_validation is None else final_validation.to_dict()),
             "latest_training_checkpoint": _reported_path(latest_artifact),
             "best_policy_checkpoint": _reported_path(best_path),
-            "metrics_path": _reported_path(metrics_path),
+            "metrics_path": _reported_path(files.metrics_path),
         }
         atomic_json_save(dataset_output / "bc-result.json", result)
         return result
@@ -285,7 +234,7 @@ def evaluate_bc(
     selected_device = default_device() if device is None else torch.device(device)
     store = CheckpointStore()
     objective = value_objective_metadata(config.gamma)
-    policy = store.load_policy(checkpoint, selected_device, expected_metadata=objective)
+    policy = store.load_policy(checkpoint, selected_device, expected_objective=objective)
     dataset = LazyReplayDataset(config.shard_manifest, split_manifest=config.split_manifest_path)
     shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
     assert split_manifest is not None

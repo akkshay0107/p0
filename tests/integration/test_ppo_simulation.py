@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
@@ -12,7 +11,6 @@ from p0.runtime import poke_env_patches
 from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
 from p0.teams.source import FixedTeamSource
-from p0.training.checkpoint import CheckpointStore
 from p0.training.config import TrainingConfig
 from p0.training.rollout import RolloutCollector
 from p0.training.trajectory import CollectedTrajectory
@@ -55,9 +53,6 @@ class TestPpoSimulation:
                 )
 
             vector_env = ThreadVecEnv(envs)
-            initial_state = envs[0].training_state()
-            assert isinstance(initial_state["agent_team"], str)
-            assert isinstance(initial_state["opponent_team"], str)
             vector_env.reset()
             collector = RolloutCollector(
                 vector_env,
@@ -125,118 +120,6 @@ class TestPpoSimulation:
                 )
                 assert not pass_only.all(dim=-1).any()
                 assert not trajectory.rewards[:-1].any()
-            collector_state = collector.training_state()
-            store1 = collector_state["series_store1"]
-            store2 = collector_state["series_store2"]
-            history1 = collector_state["series_history1"]
-            history2 = collector_state["series_history2"]
-            assert isinstance(store1, dict) and isinstance(store2, dict)
-            assert isinstance(history1, dict) and isinstance(history2, dict)
-            assert not completed_series_ids.intersection(store1)
-            assert not completed_series_ids.intersection(store2)
-            assert not completed_series_ids.intersection(history1)
-            assert not completed_series_ids.intersection(history2)
-        finally:
-            if vector_env is not None:
-                vector_env.shutdown()
-            poke_env_patches.uninstall_for_tests()
-
-
-@pytest.mark.heavy
-class TestThirdGameCheckpointResume:
-    @pytest.mark.integration
-    def test_checkpoint_during_third_game_resumes_the_same_series(
-        self, showdown_server, model_policy, tmp_path: Path
-    ) -> None:
-        """A checkpoint taken during game 3 must not start a new series on save or resume."""
-        server_port = urlparse(showdown_server.websocket_url).port
-        if server_port is None:
-            raise ValueError("The integration server configuration has no websocket port")
-        # Resume with different team sources, so matching teams can only come from restore.
-        members = DEFAULT_TEST_TEAM.strip().split("\n\n")
-        other_team = "\n\n".join(reversed(members))
-        store = CheckpointStore()
-        checkpoint = tmp_path / "third_game.pt"
-        vector_env: ThreadVecEnv | None = None
-
-        poke_env_patches.install()
-        try:
-            env = build_sim_env(
-                account_configuration1=AccountConfiguration("ResumeAgent0", None),
-                account_configuration2=AccountConfiguration("ResumeOpponent0", None),
-                server_port=server_port,
-                agent_team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
-                opponent_team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
-                observation_builder=ObservationBuilder(model_policy.resources),
-            )
-            vector_env = ThreadVecEnv([env])
-            vector_env.reset()
-            collector = RolloutCollector(
-                vector_env, model_policy, TrainingConfig(n_envs=1, rollout_steps=1)
-            )
-            for _ in range(3_000):
-                if env.series_games_played == 3:
-                    break
-                collector.collect()
-            assert env.series_games_played == 3
-            active = env.training_state()
-
-            collector.prepare_for_checkpoint()
-            store.save_policy(
-                checkpoint,
-                model_policy,
-                metadata={
-                    "environment_state": vector_env.training_state(),
-                    "collector_state": collector.training_state(),
-                },
-            )
-            vector_env.shutdown()
-            vector_env = None
-
-            metadata = store.load_metadata(store.read(checkpoint))
-            resumed_env = build_sim_env(
-                account_configuration1=AccountConfiguration("ResumeAgent1", None),
-                account_configuration2=AccountConfiguration("ResumeOpponent1", None),
-                server_port=server_port,
-                agent_team_source=FixedTeamSource(other_team),
-                opponent_team_source=FixedTeamSource(other_team),
-                observation_builder=ObservationBuilder(model_policy.resources),
-            )
-            vector_env = ThreadVecEnv([resumed_env])
-            resumed_collector = RolloutCollector(
-                vector_env, model_policy, TrainingConfig(n_envs=1, rollout_steps=1)
-            )
-            vector_env.restore_training_state(metadata["environment_state"])
-            resumed_collector.restore_training_state(metadata["collector_state"])
-            _, _, infos = vector_env.reset()
-
-            resumed = resumed_env.training_state()
-            assert infos[0]["series_id"] == active["series_id"]
-            assert resumed["series_id"] == active["series_id"]
-            assert resumed["series_scores"] == active["series_scores"]
-            assert resumed["series_games_played"] == 3
-            assert resumed["agent_team"] == active["agent_team"]
-            assert resumed["opponent_team"] == active["opponent_team"]
-            collector_state = resumed_collector.training_state()
-            for index in (1, 2):
-                history = collector_state[f"series_history{index}"]
-                assert isinstance(history, dict)
-                series = history[active["series_id"]]
-                assert [number for number, _ in series["completed_games"]] == [1, 2]
-
-            # The restored third game ends the series.
-            finished_game = None
-            for _ in range(3_000):
-                resumed_collector.collect()
-                assert vector_env.last_finished is not None
-                finished_game = vector_env.last_finished[0]
-                if finished_game is not None:
-                    break
-            assert finished_game is not None
-            assert finished_game.series_id == active["series_id"]
-            assert finished_game.series_complete is True
-            assert resumed_env.series_id != active["series_id"]
-            assert resumed_env.series_games_played == 1
         finally:
             if vector_env is not None:
                 vector_env.shutdown()

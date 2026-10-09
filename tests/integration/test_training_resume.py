@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from dataclasses import replace
@@ -68,7 +67,8 @@ class TestTrainingResume:
 
         saved = store.read(paths.checkpoint_path)
         assert store.load_episode(saved) == 3
-        metrics = saved.artifact["training_state"]["run"]["metrics"]
+        metrics_path = paths.runs_dir / "ppo_training" / "metrics.jsonl"
+        metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in metrics] == [1, 2, 3]
         assert all(record["trajectory_count"] > 0 for record in metrics)
 
@@ -82,7 +82,7 @@ class TestTrainingResume:
         assert store.load_episode(paths.checkpoint_path) == 3
 
     @pytest.mark.integration
-    def test_ppo_resume_preserves_history_and_parent(self, tmp_path: Path) -> None:
+    def test_ppo_resume_continues_training_and_metrics(self, tmp_path: Path) -> None:
         team = tmp_path / "team.txt"
         team.write_text(DEFAULT_TEST_TEAM)
         store = CheckpointStore()
@@ -124,9 +124,9 @@ class TestTrainingResume:
         interrupted = store.read(paths.checkpoint_path)
         completed = store.load_episode(interrupted)
         assert 0 < completed < 3
-        history = interrupted.artifact["training_state"]["run"]["metrics"]
+        metrics_path = paths.runs_dir / "ppo_training" / "metrics.jsonl"
+        history = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert history and history[-1]["step"] == completed
-        parent_hash = hashlib.sha256(paths.checkpoint_path.read_bytes()).hexdigest()
         resumed = replace(
             config,
             paths=replace(
@@ -136,10 +136,7 @@ class TestTrainingResume:
         run_training(resumed)
         final = store.read(paths.checkpoint_path)
         assert store.load_episode(final) == 3
-        assert final.artifact["provenance"]["run"]["parent"]["sha256"] == parent_hash
-        metrics = json.loads((paths.runs_dir / "ppo_training" / "metrics.json").read_text())[
-            "metrics"
-        ]
+        metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in metrics] == [1, 2, 3]
         assert metrics[: len(history)] == history
         assert any(
@@ -181,8 +178,8 @@ class TestTrainingResume:
         assert store.load_episode(saved) == 0
         state = saved.artifact["training_state"]
         assert "optimizer_state_dict" in state
-        assert state["run"]["metrics"] == []
-        assert saved.artifact["provenance"]["environment_state"][0]["series_games_played"] == 1
+        assert "magnet_state_dict" in state
+        assert not (paths.runs_dir / "ppo_training" / "metrics.jsonl").exists()
         resumed = replace(
             config,
             paths=replace(
@@ -233,7 +230,6 @@ class TestTrainingResume:
             ),
             episode=0,
             alpha=0.0,
-            cancel_requested=lambda: False,
         )
         assert stats["optimizer_updates"] == 1
         assert all(math.isfinite(value) for value in stats.values())
@@ -244,18 +240,22 @@ class TestTrainingResume:
 
         checkpoint = tmp_path / "checkpoint.pt"
         store = CheckpointStore()
-        with training_run(
-            store, checkpoint, tmp_path / "metrics", trainer_kind="ppo", settings={}
-        ) as run:
+        optimizer = torch.optim.SGD(policy.parameters(), lr=1e-3)
+        with training_run(store, checkpoint, tmp_path / "metrics", trainer_kind="ppo") as run:
             run.start(0)
             run.record(1, {}, {"train": {"policy_loss": stats["policy_loss"]}})
-            run.save(1, policy, metadata={})
+            run.save(
+                1,
+                policy,
+                optimizer=optimizer,
+                metadata={},
+                scaler=torch.amp.GradScaler("cpu", enabled=False),
+            )
         with training_run(
             store,
             checkpoint,
             tmp_path / "metrics",
             trainer_kind="ppo",
-            settings={},
             source_path=checkpoint,
             resume=True,
         ) as resumed:

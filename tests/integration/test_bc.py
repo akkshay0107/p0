@@ -101,6 +101,7 @@ class TestBCTrainingIntegration:
             optimizer=trainer.optimizer,
             scaler=trainer.scaler,
             trainer_kind="bc",
+            metadata={},
         )
 
         restored = build_policy(trainer.policy.config, default_runtime_resources())
@@ -114,10 +115,9 @@ class TestBCTrainingIntegration:
             store.load_training(
                 checkpoint,
                 restored_trainer.policy,
+                trainer_kind="bc",
                 optimizer=restored_trainer.optimizer,
                 scaler=restored_trainer.scaler,
-                expected_trainer_kind="bc",
-                require_training_state=True,
             )
             == 1
         )

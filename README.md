@@ -60,8 +60,13 @@ The opponent still samples from `teams/all/`; the reduced pool is optional.
 
 Set `paths.resume_checkpoint` in `config.yaml` to resume a training checkpoint,
 or `paths.initial_policy_checkpoint` to start a new run from policy weights.
-These settings are mutually exclusive. Resume keeps the saved settings and PPO budget;
-use policy initialization for a new schedule. PPO drops unfinished games when saving.
+These settings are mutually exclusive. Resume restores the weights, optimizer state,
+progress and (for PPO) the magnet; the current `config.yaml` supplies every setting, so
+a resumed run can change them. Resume is not bit-for-bit: random state is not saved,
+PPO starts new series, and BC repeats the interrupted epoch. Ctrl-C saves a checkpoint
+after the PPO update in progress finishes. A run that resumes its own checkpoint keeps
+writing to the same output; any other run needs an output directory without a
+checkpoint or `metrics.jsonl`. Metrics are appended to `metrics.jsonl` and TensorBoard.
 
 ## Other workflows
 
@@ -103,8 +108,9 @@ reconstruction code, replay bodies kept under the same ID, spread estimates, or
 dex/resource data used to build observations. After any such change, run
 `p0-replays build-shards --force-reconstruct`. A forced build creates new tensors
 and a new dataset snapshot while preserving previous snapshots.
-Update `bc.shard_manifest` to the printed path for a new training run. Exact resume
-requires the same dataset and split IDs. No replay or tensor checksums are computed.
+Update `bc.shard_manifest` to the printed path for a new training run. Resuming BC
+on a different dataset or split logs a warning, because the saved best validation
+score is no longer comparable. No replay or tensor checksums are computed.
 
 Checkpoints contain one runtime compatibility record: vocabulary mappings and
 `MODEL_ENCODING_VERSION` define the major identity; dex data defines the minor

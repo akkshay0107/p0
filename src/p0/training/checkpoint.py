@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import random
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-import numpy as np
 import torch
+from torch.amp import GradScaler
+from torch.optim import Optimizer
 
 from p0.contracts import RuntimeContract, compare_runtime_contracts
 from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
@@ -23,6 +22,7 @@ from p0.model.factory import (
 from p0.model.policy import PolicyNet
 from p0.model.resources import RuntimeResources, default_runtime_resources
 from p0.persistence import atomic_torch_save
+from p0.training.magnet import Magnet
 
 POLICY_ARTIFACT = "policy"
 TRAINING_ARTIFACT = "training"
@@ -38,7 +38,6 @@ def value_objective_metadata(gamma: float) -> dict[str, Any]:
 class LoadedCheckpoint(NamedTuple):
     path: Path
     artifact: Mapping[str, Any]
-    sha256: str
 
     def __str__(self) -> str:
         return str(self.path)
@@ -56,13 +55,10 @@ class CheckpointStore:
         self._contract = RuntimeContract.from_resources(self._resources.vocab, self._resources.dex)
 
     def read(self, path: Path) -> LoadedCheckpoint:
-        """Read and hash the same open file, even if its path is replaced."""
-        with path.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            stream.seek(0)
-            artifact = torch.load(stream, weights_only=True, map_location="cpu")
+        """Read and validate a checkpoint once so later loads do not reopen the file."""
+        artifact = torch.load(path, weights_only=True, map_location="cpu")
         self.validate_artifact(artifact, path)
-        return LoadedCheckpoint(path.resolve(), artifact, digest)
+        return LoadedCheckpoint(path.resolve(), artifact)
 
     def save_policy(
         self,
@@ -74,30 +70,33 @@ class CheckpointStore:
         """Atomically write a weights-only policy checkpoint."""
         atomic_torch_save(path, self._build_artifact(policy, POLICY_ARTIFACT, metadata))
 
-    def snapshot_policy(self, policy: PolicyNet, metadata: Mapping[str, Any]) -> dict[str, Any]:
-        """Copy a selected policy to CPU so later updates cannot change it."""
-        artifact = self._build_artifact(policy, POLICY_ARTIFACT, metadata)
-        artifact["model_state_dict"] = {
-            name: tensor.detach().to("cpu", copy=True)
-            for name, tensor in artifact["model_state_dict"].items()
-        }
-        return artifact
-
     def load_policy(
         self,
         path: Path | LoadedCheckpoint,
         device: torch.device | str,
         *,
-        expected_metadata: Mapping[str, Any] | None = None,
+        expected_objective: Mapping[str, Any] | None = None,
     ) -> PolicyNet:
         """Build and return a policy restored from a checkpoint."""
         artifact = self._load_artifact(path)
-        self._match_metadata(artifact, path, expected_metadata)
+
+        for key, value in (expected_objective or {}).items():
+            saved = artifact["provenance"].get(key)
+            if saved != value:
+                LOGGER.warning(
+                    "Checkpoint %s was trained with %s=%r; this run uses %r",
+                    path,
+                    key,
+                    saved,
+                    value,
+                )
+
         try:
             config = ModelConfig.from_dict(artifact["model_config"])
             policy = build_policy(config, self._resources).to(device)
             load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
             return policy
+        # Any failure here means the saved policy does not fit this code; name the file.
         except Exception as exc:
             raise ValueError(f"Invalid policy state in checkpoint {path}") from exc
 
@@ -107,35 +106,26 @@ class CheckpointStore:
         episode: int,
         policy: PolicyNet,
         *,
-        optimizer: Any = None,
-        scheduler: Any = None,
-        scaler: Any = None,
-        magnet: Any = None,
-        metadata: Mapping[str, Any] | None = None,
-        trainer_kind: str | None = None,
-        run_state: Mapping[str, Any] | None = None,
+        trainer_kind: str,
+        optimizer: Optimizer,
+        scaler: GradScaler,
+        magnet: Magnet | None = None,
+        metadata: Mapping[str, Any],
     ) -> None:
-        """Atomically write a full training checkpoint with optimizer and RNG states."""
-        if type(episode) is not int or episode < 0:
-            raise ValueError("Completed step must be a non-negative integer")
-        details = dict(metadata or {})
-        if trainer_kind is not None:
-            details["trainer_kind"] = trainer_kind
+        """Atomically write the weights and state needed to continue training."""
+        artifact = self._build_artifact(
+            policy, TRAINING_ARTIFACT, {**metadata, "trainer_kind": trainer_kind}
+        )
 
-        artifact = self._build_artifact(policy, TRAINING_ARTIFACT, details)
-        state: dict[str, Any] = {"episode": int(episode), "rng_state": _capture_rng()}
+        state: dict[str, Any] = {
+            "episode": episode,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+        }
+        # Behavior cloning trains without a magnet.
+        if magnet is not None:
+            state["magnet_state_dict"] = magnet.state_dict()
 
-        for name, svc in (
-            ("optimizer", optimizer),
-            ("scheduler", scheduler),
-            ("scaler", scaler),
-            ("magnet", magnet),
-        ):
-            if svc is not None:
-                state[f"{name}_state_dict"] = svc.state_dict()
-
-        if run_state is not None:
-            state["run"] = dict(run_state)
         artifact["training_state"] = state
         atomic_torch_save(path, artifact)
 
@@ -144,92 +134,50 @@ class CheckpointStore:
         path: Path | LoadedCheckpoint,
         policy: PolicyNet,
         *,
-        optimizer: Any = None,
-        scheduler: Any = None,
-        scaler: Any = None,
-        magnet: Any = None,
-        expected_trainer_kind: str | None = None,
-        expected_metadata: Mapping[str, Any] | None = None,
-        require_training_state: bool = False,
+        trainer_kind: str,
+        optimizer: Optimizer,
+        scaler: GradScaler,
+        magnet: Magnet | None = None,
     ) -> int:
-        """Restore policy weights and training services. Returns completed episode."""
-        if isinstance(path, Path) and not path.exists():
-            if require_training_state:
-                raise FileNotFoundError(path)
-            return 0
-
+        """Restore weights and training state. Returns the completed episode."""
         artifact = self._load_artifact(path)
+        if artifact["artifact_type"] != TRAINING_ARTIFACT:
+            raise ValueError(f"Checkpoint {path} is weights-only and cannot resume training")
+
+        saved_kind = artifact["provenance"].get("trainer_kind")
+        if saved_kind != trainer_kind:
+            raise ValueError(
+                f"Checkpoint {path} belongs to trainer {saved_kind!r}, not {trainer_kind!r}"
+            )
+
         if artifact["model_config"] != policy.config.to_dict():
             raise ValueError(f"Checkpoint {path} model configuration does not match the policy")
 
-        if artifact["artifact_type"] == POLICY_ARTIFACT:
-            if require_training_state:
-                raise ValueError(f"Checkpoint {path} is weights-only and cannot resume training")
-            load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
-            return 0
-
-        if expected_trainer_kind is not None:
-            trainer = artifact["provenance"].get("trainer_kind")
-            if trainer != expected_trainer_kind:
-                raise ValueError(
-                    f"Checkpoint {path} belongs to trainer {trainer!r}, "
-                    f"not {expected_trainer_kind!r}"
-                )
-
-        self._match_metadata(artifact, path, expected_metadata)
-
-        training_state = artifact.get("training_state")
-        if not isinstance(training_state, Mapping):
-            raise ValueError(f"Training checkpoint {path} has no valid training_state")
-
-        services = (
-            ("optimizer", optimizer),
-            ("scheduler", scheduler),
-            ("scaler", scaler),
-            ("magnet", magnet),
-        )
-        if require_training_state:
-            required = [f"{name}_state_dict" for name, service in services if service is not None]
-            missing = [key for key in required if key not in training_state]
-            rng = training_state.get("rng_state")
-            if (
-                not isinstance(rng, Mapping)
-                or not isinstance(rng.get("python"), tuple)
-                or not isinstance(rng.get("torch"), torch.Tensor)
-            ):
-                missing.append("rng_state")
-            if missing:
-                raise ValueError(f"Checkpoint {path} is missing required training state: {missing}")
-
         try:
+            state = artifact["training_state"]
             load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
-            for name, service in services:
-                key = f"{name}_state_dict"
-                if service is not None and key in training_state:
-                    service.load_state_dict(training_state[key])
-                elif name == "magnet" and service is not None:
-                    service.refresh(policy)
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            scaler.load_state_dict(state["scaler_state_dict"])
 
-            episode = training_state["episode"]
-            if type(episode) is not int or episode < 0:
-                raise ValueError("episode must be a non-negative integer")
+            if magnet is not None:
+                # A checkpoint without a magnet restarts it from the restored policy.
+                if "magnet_state_dict" in state:
+                    magnet.load_state_dict(state["magnet_state_dict"])
+                else:
+                    magnet.refresh(policy)
 
-            _restore_rng(training_state.get("rng_state"))
-            return episode
+            return state["episode"]
+        # Any failure here means the saved state does not fit this run; name the file.
         except Exception as exc:
             raise ValueError(f"Invalid training state in checkpoint {path}") from exc
 
     def load_episode(self, path: Path | LoadedCheckpoint) -> int:
-        """Read saved progress without constructing a policy."""
-        if isinstance(path, Path) and not path.exists():
-            return 0
+        """Return the completed episode; a weights-only checkpoint reports zero."""
         artifact = self._load_artifact(path)
-        if artifact.get("artifact_type") == POLICY_ARTIFACT:
+        if artifact["artifact_type"] == POLICY_ARTIFACT:
             return 0
-        state = artifact.get("training_state")
-        if isinstance(state, Mapping) and isinstance(state.get("episode"), int):
-            return max(0, state["episode"])
-        return 0
+
+        return artifact["training_state"]["episode"]
 
     def load_metadata(self, path: Path | LoadedCheckpoint) -> Mapping[str, Any]:
         """Return validated checkpoint metadata without constructing a policy."""
@@ -279,46 +227,5 @@ class CheckpointStore:
         if status == "warning":
             LOGGER.warning("Checkpoint %s was trained with different dex data", path)
 
-    @staticmethod
-    def _match_metadata(
-        artifact: Mapping[str, Any],
-        path: Path | LoadedCheckpoint,
-        expected: Mapping[str, Any] | None,
-    ) -> None:
-        for k, v in (expected or {}).items():
-            if artifact["provenance"].get(k) != v:
-                raise ValueError(f"Checkpoint {path} provenance field {k!r} is incompatible")
-
 
 DEFAULT_CHECKPOINT_STORE = CheckpointStore()
-
-
-def _capture_rng() -> dict[str, Any]:
-    numpy_state: Any = np.random.get_state()
-    state: dict[str, Any] = {
-        "numpy": (numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]),
-        "python": random.getstate(),
-        "torch": torch.get_rng_state(),
-    }
-    if torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    return state
-
-
-def _restore_rng(state: Any) -> None:
-    if not isinstance(state, Mapping):
-        return
-    numpy_state = state.get("numpy")
-    if numpy_state is not None:
-        np.random.set_state(
-            (numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32), *numpy_state[2:])
-        )
-    py_state = state.get("python")
-    if py_state is not None:
-        random.setstate(py_state)
-    torch_state = state.get("torch")
-    if isinstance(torch_state, torch.Tensor):
-        torch.set_rng_state(torch_state)
-    cuda_state = state.get("cuda")
-    if torch.cuda.is_available() and isinstance(cuda_state, list):
-        torch.cuda.set_rng_state_all(cuda_state)

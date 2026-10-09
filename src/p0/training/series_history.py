@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-
 import torch
 from torch import Tensor
 
@@ -130,55 +128,6 @@ class SeriesHistoryStore:
     def clear(self) -> None:
         """Remove all series histories."""
         self._states.clear()
-
-    def training_state(self) -> dict[str, dict[str, object]]:
-        """Capture series history for checkpointing."""
-        return {
-            key: {
-                "completed_games": tuple((number, values.clone()) for number, values in completed),
-                "ended": ended,
-            }
-            for key, (completed, ended) in self._states.items()
-        }
-
-    def restore_training_state(self, state: Mapping[str, object]) -> None:
-        """Restore series history captured by training_state."""
-        restored: dict[str, tuple[CompletedGames, bool]] = {}
-        for raw_key, raw_val in state.items():
-            if not isinstance(raw_key, str) or not raw_key:
-                raise ValueError("Series history checkpoint keys must be non-empty strings")
-            if not isinstance(raw_val, Mapping):
-                raise ValueError("Series history checkpoint entries must be mappings")
-
-            raw_completed = raw_val.get("completed_games")
-            raw_ended = raw_val.get("ended")
-
-            if not isinstance(raw_completed, Sequence):
-                raise ValueError("Series history checkpoint state is malformed")
-            if type(raw_ended) is not bool:
-                raise ValueError("Series history ended flag is invalid")
-
-            completed: list[tuple[int, Tensor]] = []
-            for item in raw_completed:
-                if (
-                    not isinstance(item, Sequence)
-                    or len(item) != 2
-                    or type(item[0]) is not int
-                    or not 1 <= item[0] <= 3
-                    or not isinstance(item[1], Tensor)
-                ):
-                    raise ValueError("Series history completed game is malformed")
-                number, tensor = item
-                if completed and number != completed[-1][0] + 1:
-                    raise ValueError("Series history completed games are not consecutive")
-                self._validate_tensor(tensor)
-                completed.append((number, tensor.detach().to("cpu", torch.float32).clone()))
-
-            if len(completed) > self.max_games:
-                raise ValueError("Series history checkpoint contains too many completed games")
-
-            restored[raw_key] = tuple(completed), raw_ended
-        self._states = restored
 
     def _validate_tensor(self, tensor: Tensor) -> None:
         if (

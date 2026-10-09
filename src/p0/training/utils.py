@@ -71,21 +71,6 @@ class PPOScheduler:
         del t
         return self.alpha_value
 
-    def state_dict(self) -> dict[str, float | int]:
-        """Export scheduler parameters for checkpointing."""
-        return {
-            "alpha_value": self.alpha_value,
-            "lr_max": self.lr_max,
-            "lr_min": self.lr_min,
-            "ramp_up_end": self.ramp_up_end,
-            "decay_len": self.decay_len,
-        }
-
-    def load_state_dict(self, value: dict[str, float | int]) -> None:
-        """Restore scheduler parameters and verify they match the active run."""
-        if value != self.state_dict():
-            raise ValueError("PPO scheduler configuration does not match the checkpoint")
-
     def lr(self, t: int) -> float:
         """Compute the learning rate at episode t."""
         if not isinstance(t, int) or isinstance(t, bool) or t < 0:

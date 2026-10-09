@@ -81,24 +81,6 @@ class TestPPOScheduler:
         with pytest.raises(ValueError, match="non-negative integer"):
             scheduler.lr(True)  # type: ignore[arg-type]
 
-    def test_state_dict_round_trip(self) -> None:
-        """Verify scheduler configuration exports and validates matching restore."""
-        config = TrainingConfig(num_episodes=50, lr=2e-4, ramp_up_phase=0.1)
-        scheduler = PPOScheduler(config)
-
-        state = scheduler.state_dict()
-        assert state["lr_max"] == 2e-4
-        assert state["ramp_up_end"] == 5
-
-        # Matching configuration restores cleanly
-        scheduler.load_state_dict(state)
-
-        # Mismatched configuration is rejected
-        tampered = dict(state)
-        tampered["lr_max"] = 5e-4
-        with pytest.raises(ValueError, match="does not match"):
-            scheduler.load_state_dict(tampered)
-
 
 class TestAdamWParamGroups:
     def test_param_groups_weight_decay_filtering(self) -> None:

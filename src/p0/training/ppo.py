@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -280,7 +280,6 @@ def ppo_update(
     config: TrainingConfig,
     episode: int,
     alpha: float,
-    cancel_requested: Callable[[], bool],
 ) -> dict[str, float | int]:
     """
     Apply PPO epochs to a collection of completed trajectories.
@@ -294,7 +293,6 @@ def ppo_update(
         config: PPO optimization settings.
         episode: Current training episode index.
         alpha: Active magnet regularization coefficient.
-        cancel_requested: Callback polled for cooperative cancellation.
 
     Returns:
         Scalar optimization and stability metrics.
@@ -317,16 +315,11 @@ def ppo_update(
     ordered_episodes = episodes.copy()
 
     for epoch_idx in range(config.ppo_epochs):
-        if cancel_requested():
-            break
         random.Random(config.seed + episode * config.ppo_epochs + epoch_idx).shuffle(
             ordered_episodes
         )
 
         for batch_start in range(0, len(ordered_episodes), config.batch_size):
-            if cancel_requested():
-                break
-
             minibatch = ordered_episodes[batch_start : batch_start + config.batch_size]
 
             optimizer.zero_grad(set_to_none=True)
@@ -336,14 +329,10 @@ def ppo_update(
             minibatch_metrics = torch.zeros_like(metric_totals)
             expected_minibatch_steps = sum(ep.length for ep in minibatch)
             should_skip = False
-            cancelled = False
             non_finite_loss = False
             minibatch_mean_kl = 0.0
 
             for chunk_idx in range(0, len(minibatch), config.minibatch_size):
-                if cancel_requested():
-                    cancelled = True
-                    break
                 chunk = minibatch[chunk_idx : chunk_idx + config.minibatch_size]
                 chunk.sort(key=lambda ep: ep.length, reverse=True)
 
@@ -383,9 +372,6 @@ def ppo_update(
                 if should_skip:
                     break
 
-            if cancelled:
-                optimizer.zero_grad(set_to_none=True)
-                break
             if should_skip or non_finite_loss:
                 reason = (
                     "non-finite loss"

@@ -1,6 +1,6 @@
 """Self-play rollout collection with history memory."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import NamedTuple, cast
 
 import numpy as np
@@ -285,33 +285,6 @@ class RolloutCollector:
 
     def reset_completed(self) -> None:
         self.completed_trajectories.clear()
-
-    def prepare_for_checkpoint(self) -> None:
-        """Restart at a clean battle boundary before persisting PPO state."""
-        self.completed_trajectories.clear()
-        for seat in self._seats:
-            seat.trajectories.step_counts.zero_()
-        for env in self.vector_env.envs:
-            env.prepare_for_checkpoint()
-        self.vector_env.reset()
-
-    def training_state(self) -> dict[str, object]:
-        """Capture cross-game context retained by the collector."""
-        state: dict[str, object] = {}
-        for index, seat in enumerate(self._seats, start=1):
-            state[f"series_store{index}"] = seat.series_tokens.training_state()
-            state[f"series_history{index}"] = seat.series_history.training_state()
-        return state
-
-    def restore_training_state(self, state: Mapping[str, object]) -> None:
-        """Restore cross-game context captured at an episode boundary."""
-        for index, seat in enumerate(self._seats, start=1):
-            tokens = state.get(f"series_store{index}")
-            history = state.get(f"series_history{index}")
-            if not isinstance(tokens, Mapping) or not isinstance(history, Mapping):
-                raise ValueError("Invalid PPO collector training state")
-            seat.series_tokens.restore_training_state(tokens)
-            seat.series_history.restore_training_state(history)
 
     def get_batches(self, device: torch.device) -> list[PreparedTrajectory]:
         return prepare_trajectory_batches(

@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
-from dataclasses import asdict
+from collections.abc import Callable
 
 import torch.optim as optim
 from poke_env import AccountConfiguration
@@ -81,26 +80,14 @@ def run_training(
 
     agent_source = build_team_source(agent_team_path, expected_format_id=FORMAT.bo3_format)
     opponent_source = build_team_source(config.teams.all, expected_format_id=FORMAT.bo3_format)
-    settings = {
-        "training": asdict(training),
-        "teams": [
-            {key: value for key, value in source.describe().items() if key != "corpus_path"}
-            for source in (agent_source, opponent_source)
-        ],
-    }
     with training_run(
         policy_store,
         paths.checkpoint_path,
         paths.runs_dir / "ppo_training",
         trainer_kind="ppo",
-        settings=settings,
         source_path=paths.resume_checkpoint or paths.initial_policy_checkpoint,
         resume=paths.resume_checkpoint is not None,
     ) as files:
-        files.metadata["inputs"] = {
-            "agent_teams": str(agent_team_path.resolve()),
-            "opponent_teams": str(config.teams.all.resolve()),
-        }
         seed_everything(training.seed)
         resources = default_runtime_resources()
         device = default_device()
@@ -108,7 +95,7 @@ def run_training(
             policy_store.load_policy(
                 files.source,
                 device,
-                expected_metadata=value_objective_metadata(training.gamma),
+                expected_objective=value_objective_metadata(training.gamma),
             )
             if files.source is not None
             else build_policy(ModelConfig.baseline(), resources).to(device)
@@ -122,30 +109,16 @@ def run_training(
         scaler = GradScaler(device.type, enabled=precision.grad_scaler)
         magnet = Magnet(policy)
         scheduler = PPOScheduler(training)
-        resume_environment_state: object | None = None
-        resume_collector_state: object | None = None
         start = 0
         if paths.resume_checkpoint is not None and files.source is not None:
             start = policy_store.load_training(
                 files.source,
                 policy,
+                trainer_kind="ppo",
                 optimizer=optimizer,
-                scheduler=scheduler,
                 scaler=scaler,
                 magnet=magnet,
-                expected_trainer_kind="ppo",
-                require_training_state=True,
             )
-            resume_metadata = policy_store.load_metadata(files.source)
-            environment_state = resume_metadata.get("environment_state")
-            collector_state = resume_metadata.get("collector_state")
-            if isinstance(environment_state, (tuple, list)) and isinstance(
-                collector_state, Mapping
-            ):
-                resume_environment_state = environment_state
-                resume_collector_state = collector_state
-            else:
-                LOGGER.warning("PPO checkpoint has incomplete rollout state; starting fresh series")
         policy = compile_policy(policy, enable=training.enable_optim and device.type == "cuda")
 
         files.start(start)
@@ -181,18 +154,6 @@ def run_training(
                     policy,
                     training,
                 )
-                if resume_environment_state is not None and resume_collector_state is not None:
-                    fresh_environment_state = vector_env.training_state()
-                    try:
-                        vector_env.restore_training_state(resume_environment_state)
-                        collector.restore_training_state(resume_collector_state)
-                    except (TypeError, ValueError) as exc:
-                        vector_env.restore_training_state(fresh_environment_state)
-                        collector = RolloutCollector(vector_env, policy, training)
-                        LOGGER.warning(
-                            "PPO checkpoint has malformed rollout state; starting fresh series: %s",
-                            exc,
-                        )
                 trainer = PPOTrainer(
                     policy=policy,
                     files=files,

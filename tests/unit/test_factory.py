@@ -158,11 +158,11 @@ class TestFactoryAndSeries:
         compiled_cpu = compile_policy(policy, enable=True)
         assert compiled_cpu is policy
 
-    def test_factory_shares_resources_and_preserves_state_dict_layout(self) -> None:
-        """Verify build_policy shares one RuntimeResources object with the policy, encoder and builder."""
+    def test_factory_preserves_resources_and_model_config(self) -> None:
+        """Verify the policy and observation builder keep the supplied resources."""
         resources = default_runtime_resources()
         config = ModelConfig(32, 2, 1, 128)
         policy = build_policy(config, resources)
         builder = ObservationBuilder(resources=resources)
-        assert policy.resources is policy.encoder.resources is builder.resources is resources
+        assert policy.resources is builder.resources is resources
         assert policy.config == config == ModelConfig.from_dict(config.to_dict())

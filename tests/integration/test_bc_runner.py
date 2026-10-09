@@ -149,7 +149,7 @@ class TestBCRunner:
             result["initial_training"]["overall_nll"] * 0.5
         )
 
-    def test_resume_restores_selected_policy_and_metrics_without_external_files(
+    def test_resume_continues_epochs_best_policy_and_metrics(
         self,
         tmp_path: Path,
     ) -> None:
@@ -195,22 +195,11 @@ class TestBCRunner:
         first_best = Path(first["best_policy_checkpoint"])
         with pytest.raises(ValueError, match="already contains an experiment"):
             train_bc(first_config, device="cpu")
-        occupied_output = tmp_path / "occupied-output"
-        occupied_output.mkdir(parents=True)
-        sentinel = occupied_output / "unrelated.txt"
-        sentinel.write_text("keep", encoding="utf-8")
-        with pytest.raises(ValueError, match="already contains an experiment"):
-            train_bc(
-                replace(
-                    first_config,
-                    output_dir=tmp_path / "occupied-output",
-                    resume_checkpoint=first_latest,
-                ),
-                device="cpu",
-            )
-        assert sentinel.read_text(encoding="utf-8") == "keep"
+        first_artifact = torch.load(first_latest, weights_only=True)
+        first_best_bytes = first_best.read_bytes()
 
-        resumed = train_bc(
+        # Resuming a finished run elsewhere trains nothing and leaves the source alone.
+        finished = train_bc(
             replace(
                 first_config,
                 output_dir=tmp_path / "second-output",
@@ -218,108 +207,56 @@ class TestBCRunner:
             ),
             device="cpu",
         )
-
-        assert resumed["completed_epoch"] == 1
-        assert resumed["latest_training_checkpoint"] == str(first_latest)
-        assert Path(resumed["best_policy_checkpoint"]).is_file()
-        assert json.loads(Path(resumed["metrics_path"]).read_text())["completed_step"] == 1
-        assert first_latest.is_file()
-        assert first_best.is_file()
-
-        overfit_checkpoint_path = tmp_path / "legacy_overfit.pt"
-        overfit_artifact = dict(torch.load(first_latest, weights_only=True))
-        overfit_artifact["provenance"] = dict(overfit_artifact["provenance"])
-        overfit_artifact["provenance"]["trainer_config"] = {
-            **overfit_artifact["provenance"]["trainer_config"],
-            "overfit": True,
-        }
-        torch.save(overfit_artifact, overfit_checkpoint_path)
-        with pytest.raises(ValueError, match="Cannot resume an overfit training run"):
-            train_bc(
-                replace(
-                    first_config,
-                    output_dir=tmp_path / "overfit-output",
-                    resume_checkpoint=overfit_checkpoint_path,
-                ),
-                device="cpu",
-            )
+        assert finished["completed_epoch"] == 1
+        assert finished["latest_training_checkpoint"] == str(first_latest)
+        assert finished["best_policy_checkpoint"] is None
+        assert first_best.read_bytes() == first_best_bytes
 
         continued = train_bc(
-            replace(
-                first_config,
-                epochs=2,
-                resume_checkpoint=first_latest,
-            ),
-            device="cpu",
-        )
-        assert continued["completed_epoch"] == 2
-        control = train_bc(
-            replace(
-                first_config,
-                epochs=2,
-                output_dir=tmp_path / "control-output",
-            ),
-            device="cpu",
-        )
-        continued_artifact = torch.load(
-            Path(continued["latest_training_checkpoint"]),
-            weights_only=True,
-        )
-        control_artifact = torch.load(
-            Path(control["latest_training_checkpoint"]),
-            weights_only=True,
-        )
-        torch.testing.assert_close(
-            continued_artifact["model_state_dict"],
-            control_artifact["model_state_dict"],
-        )
-        torch.testing.assert_close(
-            continued_artifact["training_state"]["optimizer_state_dict"],
-            control_artifact["training_state"]["optimizer_state_dict"],
-        )
-
-        stale_checkpoint = tmp_path / "stale-selection.pt"
-        stale_artifact = torch.load(first_latest, weights_only=True)
-        stale_artifact["training_state"]["episode"] = 1
-        stale_artifact["provenance"]["selection_state"]["selected_epoch"] = 2
-        torch.save(stale_artifact, stale_checkpoint)
-        with pytest.raises(ValueError, match="stale selected-policy state"):
-            train_bc(
-                replace(
-                    first_config,
-                    output_dir=tmp_path / "stale-output",
-                    resume_checkpoint=stale_checkpoint,
-                ),
-                device="cpu",
-            )
-
-        # The inference file is replaceable; recovery comes from the training checkpoint.
-        first_best.write_bytes(b"interrupted replacement")
-        recovered = train_bc(
             replace(first_config, epochs=2, resume_checkpoint=first_latest),
             device="cpu",
         )
-        assert recovered["completed_epoch"] == 2
-        best = torch.load(first_best, weights_only=True)
-        torch.testing.assert_close(
-            best["model_state_dict"],
-            continued_artifact["training_state"]["run"]["best_policy"]["model_state_dict"],
+        assert continued["completed_epoch"] == 2
+        continued_artifact = torch.load(first_latest, weights_only=True)
+        assert continued_artifact["training_state"]["episode"] == 2
+        assert any(
+            not torch.equal(before, after)
+            for before, after in zip(
+                first_artifact["model_state_dict"].values(),
+                continued_artifact["model_state_dict"].values(),
+                strict=True,
+            )
         )
-        first_best.unlink()
+        history = [
+            json.loads(line) for line in Path(continued["metrics_path"]).read_text().splitlines()
+        ]
+        assert [record["step"] for record in history] == [1, 2]
+        selection = continued_artifact["provenance"]["selection_state"]
+        best = torch.load(first_best, weights_only=True)
+        assert best["provenance"]["selected_epoch"] == selection["selected_epoch"]
+        assert selection["best_validation_nll"] == min(
+            record["validation"]["overall_nll"] for record in history
+        )
+
+        # A checkpoint moved away from its best policy starts a new selection.
         portable = tmp_path / "moved.pt"
         portable.write_bytes(first_latest.read_bytes())
         restored = train_bc(
             replace(
                 first_config,
-                epochs=2,
+                epochs=3,
                 output_dir=tmp_path / "third-output",
                 resume_checkpoint=portable,
             ),
             device="cpu",
         )
-        assert Path(restored["best_policy_checkpoint"]).is_file()
-        history = json.loads(Path(restored["metrics_path"]).read_text())["metrics"]
-        assert [record["step"] for record in history] == [1, 2]
+        assert restored["completed_epoch"] == 3
+        moved_best = torch.load(Path(restored["best_policy_checkpoint"]), weights_only=True)
+        assert moved_best["provenance"]["selected_epoch"] == 3
+        moved_history = [
+            json.loads(line) for line in Path(restored["metrics_path"]).read_text().splitlines()
+        ]
+        assert [record["step"] for record in moved_history] == [3]
 
     def test_bc_evaluation_and_cli_parity(self, tmp_path: Path) -> None:
         result = compile_payloads(
@@ -411,13 +348,6 @@ class TestBCRunner:
         assert cli_evaluation["split"] == "validation"
         assert cli_evaluation["checkpoint"] == str(policy_checkpoint)
         assert cli_evaluation["metrics"] == evaluation["metrics"]
-        with pytest.raises(ValueError, match="provenance field 'gamma' is incompatible"):
-            evaluate_bc(
-                replace(config, gamma=0.5),
-                policy_checkpoint,
-                split="validation",
-                device="cpu",
-            )
         with pytest.raises(ValueError, match="test split has no accepted series"):
             evaluate_bc(config, policy_checkpoint, split="test", device="cpu")
 

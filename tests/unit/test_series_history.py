@@ -62,43 +62,6 @@ class TestSeriesHistoryStore:
         with pytest.raises(ValueError, match="after it ended"):
             store.append("series", 3, values, is_series_end=False)
 
-    def test_series_history_store_loads_checkpoints_with_empty_active_game_fields(self) -> None:
-        """Checkpoints written before active games left the store carry empty active fields."""
-        restored = SeriesHistoryStore(d_model=2)
-        restored.restore_training_state(
-            {
-                "series": {
-                    "completed_games": ((1, torch.ones(1, 2)),),
-                    "active_game_number": None,
-                    "active_fragments": (),
-                    "ended": False,
-                }
-            }
-        )
-
-        assert restored.next_game_number("series") == 2
-        torch.testing.assert_close(restored.snapshot("series")[0], torch.ones(1, 2))
-
-    def test_series_history_store_perspective_key_checkpoint_round_trip(self) -> None:
-        """Verify SeriesPerspectiveKey is supported in checkpoint state capture and restore."""
-        store = SeriesHistoryStore(d_model=2)
-        key = SeriesPerspectiveKey("series_123", 1)
-        store.append(
-            key,
-            1,
-            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-            is_series_end=False,
-        )
-
-        state = store.training_state()
-        restored = SeriesHistoryStore(d_model=2)
-        restored.restore_training_state(state)
-
-        snapshot = restored.snapshot(key)
-        assert len(snapshot) == 1
-        torch.testing.assert_close(snapshot[0], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
-        assert restored.next_game_number(key) == 2
-
 
 class TestAdvanceSeriesState:
     def test_rejects_a_game_change_before_the_active_game_ends(self) -> None:

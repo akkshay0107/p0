@@ -66,7 +66,6 @@ class TestPPO:
             config,
             episode=0,
             alpha=0.0,
-            cancel_requested=lambda: False,
         )
 
         assert stats["optimizer_updates"] == 3
@@ -121,7 +120,6 @@ class TestPPO:
             config,
             episode=0,
             alpha=0.0,
-            cancel_requested=lambda: False,
         )
 
         assert all(torch.isfinite(parameter).all() for parameter in policy.series.parameters())

@@ -384,8 +384,9 @@ def load_player_policy(
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
-    policy = policy_store.load_policy(checkpoint_path, device)
-    episode = policy_store.load_training(checkpoint_path, policy)
+    checkpoint = policy_store.read(checkpoint_path)
+    policy = policy_store.load_policy(checkpoint, device)
+    episode = policy_store.load_episode(checkpoint)
     LOGGER.info(
         "Loaded checkpoint from %s (episode %d)",
         checkpoint_path,

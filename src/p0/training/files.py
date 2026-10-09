@@ -1,12 +1,10 @@
-"""Shared training output, metric history, and signal handling."""
+"""Shared training output, metric files, and signal handling."""
 
 from __future__ import annotations
 
 import fcntl
-import math
 import signal
 import threading
-import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
 from datetime import UTC, datetime
@@ -14,11 +12,16 @@ from pathlib import Path
 from typing import Any
 
 import orjson
+from torch.amp import GradScaler
+from torch.optim import Optimizer
 from torch.utils.tensorboard import SummaryWriter
 
 from p0.model.policy import PolicyNet
-from p0.persistence import atomic_json_save, atomic_torch_save
+from p0.persistence import atomic_output
 from p0.training.checkpoint import CheckpointStore, LoadedCheckpoint
+from p0.training.magnet import Magnet
+
+METRICS_FILENAME = "metrics.jsonl"
 
 
 @contextmanager
@@ -42,7 +45,6 @@ def training_run(
     metrics_dir: Path,
     *,
     trainer_kind: str,
-    settings: Mapping[str, Any],
     source_path: Path | None = None,
     resume: bool = False,
 ) -> Iterator[TrainingRun]:
@@ -55,42 +57,23 @@ def training_run(
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise ValueError(f"Training output is already in use: {directory}") from exc
-        same_output = (
+
+        # Only a run that resumes its own checkpoint may reuse existing output.
+        resumes_in_place = (
             resume
             and source_path is not None
             and source_path.resolve() == checkpoint_path.resolve()
         )
-        source = store.read(source_path) if source_path is not None else None
-        run = TrainingRun(
-            store, checkpoint_path, metrics_dir, trainer_kind, settings, source, resume
-        )
-        occupied_metrics = any(
-            path.name != ".training.lock"
-            and not (same_output and path.resolve() == checkpoint_path.resolve())
-            for path in metrics_dir.iterdir()
-        )
-        owns_metrics = False
-        if resume and source is not None:
-            old_run = source.artifact["provenance"].get("run", {})
-            saved_directory = old_run.get("metrics_directory")
-            owns_metrics = (
-                saved_directory is not None
-                and Path(saved_directory).resolve() == metrics_dir.resolve()
-            )
-            if occupied_metrics and not owns_metrics and old_run.get("id"):
-                # Unreadable display files cannot prove ownership of a moved directory.
-                with suppress(OSError, orjson.JSONDecodeError):
-                    metrics = orjson.loads((metrics_dir / "metrics.json").read_bytes())
-                    owns_metrics = (
-                        isinstance(metrics, dict) and metrics.get("run_id") == old_run["id"]
-                    )
-        if (checkpoint_path.exists() and not same_output) or (
-            occupied_metrics and not owns_metrics
+        if not resumes_in_place and (
+            checkpoint_path.exists() or (metrics_dir / METRICS_FILENAME).exists()
         ):
             raise ValueError(
                 f"Training output already contains an experiment: {metrics_dir}; "
                 "choose a fresh output directory"
             )
+
+        source = store.read(source_path) if source_path is not None else None
+        run = TrainingRun(store, checkpoint_path, metrics_dir, trainer_kind, source)
         del source
         try:
             yield run
@@ -98,22 +81,8 @@ def training_run(
             run.close()
 
 
-def _validate_board(board: Mapping[str, Any]) -> None:
-    """Require named finite int or float scalars; bools are rejected, as on resume."""
-    if any(
-        not isinstance(phase, str)
-        or not isinstance(metrics, Mapping)
-        or any(
-            not isinstance(name, str) or type(value) not in (int, float) or not math.isfinite(value)
-            for name, value in metrics.items()
-        )
-        for phase, metrics in board.items()
-    ):
-        raise ValueError("Checkpoint board metrics must contain named finite scalars")
-
-
 class TrainingRun:
-    """Keep recoverable state in the checkpoint and rebuild display files from it."""
+    """Write one run's checkpoint, metric records, and TensorBoard scalars."""
 
     def __init__(
         self,
@@ -121,147 +90,71 @@ class TrainingRun:
         checkpoint_path: Path,
         metrics_dir: Path,
         trainer_kind: str,
-        settings: Mapping[str, Any],
         source: LoadedCheckpoint | None,
-        resume: bool,
     ) -> None:
         self.store = store
         self.checkpoint_path = checkpoint_path
         self.metrics_dir = metrics_dir
+        self.metrics_path = metrics_dir / METRICS_FILENAME
         self.trainer_kind = trainer_kind
         self.source = source
-        old_metadata = source.artifact["provenance"] if source is not None else {}
-        old_run = old_metadata.get("run", {})
-        if resume:
-            if (
-                not isinstance(old_run, Mapping)
-                or not old_run.get("id")
-                or not isinstance(old_run.get("settings"), Mapping)
-            ):
-                raise ValueError("Checkpoint run metadata must contain a valid ID and settings")
-            if old_run["settings"] != dict(settings):
-                raise ValueError("Training settings do not match the checkpoint")
-        training_state = source.artifact.get("training_state", {}) if source is not None else {}
-        saved_state = training_state.get("run", {}) if isinstance(training_state, Mapping) else {}
-        if resume and not isinstance(saved_state, Mapping):
-            raise ValueError("Checkpoint run state must be a mapping")
-        parent = None
-        if source is not None:
-            parent = {
-                "sha256": source.sha256,
-                "filename": source.path.name,
-                "trainer_kind": old_metadata.get("trainer_kind"),
-                "step": training_state.get("episode", 0),
-            }
-        origin = old_run.get("source")
-        if origin is None and parent is not None:
-            origin = {
-                **parent,
-                "metadata": {
-                    key: old_metadata[key]
-                    for key in (
-                        "dataset_id",
-                        "split_id",
-                        "trainer_config",
-                        "selected_epoch",
-                        "gamma",
-                        "value_target_semantics",
-                    )
-                    if key in old_metadata
-                },
-            }
-        self.metadata = {
-            # A resumed run keeps the ID validated above.
-            "id": old_run["id"] if resume else str(uuid.uuid4()),
-            "parent": parent,
-            "source": origin,
-            "settings": dict(settings),
-            "metrics_directory": str(metrics_dir.resolve()),
-        }
-        self.state = dict(saved_state) if resume and source is not None else {}
-        self.state.setdefault("metrics", [])
         self.writer: SummaryWriter | None = None
 
     def start(self, step: int) -> None:
-        """Restore display files only after the runner has validated recovery state."""
-        records = self.state["metrics"]
-        if (
-            not isinstance(records, list)
-            or any(
-                not isinstance(record, dict)
-                or type(record.get("step")) is not int
-                or not 0 < record["step"] <= step
-                for record in records
-            )
-            or any(left["step"] >= right["step"] for left, right in zip(records, records[1:]))
-        ):
-            raise ValueError("Checkpoint metric history has invalid steps")
-        for record in records:
-            board = record.get("board", {})
-            if not isinstance(board, Mapping):
-                raise ValueError("Checkpoint board metrics must be a mapping")
-            _validate_board(board)
-        self.writer = SummaryWriter(log_dir=str(self.metrics_dir / "tensorboard"), purge_step=0)
-        for record in records:
-            self.write_scalars(record["step"], record.get("board", {}))
-        if step:
-            self.write_outputs(step)
+        """Drop metrics recorded after the resumed step, then open TensorBoard."""
+        if self.metrics_path.exists():
+            kept = []
+            for line in self.metrics_path.read_bytes().splitlines():
+                # A killed process can leave a partial last line.
+                with suppress(orjson.JSONDecodeError):
+                    if orjson.loads(line)["step"] <= step:
+                        kept.append(line + b"\n")
+
+            with atomic_output(self.metrics_path) as temporary:
+                temporary.write_bytes(b"".join(kept))
+
+        # TensorBoard hides events it already holds from the first step this run records.
+        self.writer = SummaryWriter(
+            log_dir=str(self.metrics_dir / "tensorboard"), purge_step=step + 1
+        )
         # Optimizer state and the input model are no longer needed on CPU.
         self.source = None
 
     def record(
         self, step: int, values: Mapping[str, Any], board: Mapping[str, Mapping[str, float | int]]
     ) -> None:
-        """Record one completed training step and send its scalars to TensorBoard."""
-        # Validate with the resume rule so every recorded step can be restored later.
-        _validate_board(board)
-        self.state["metrics"].append(
-            {
-                **values,
-                "step": step,
-                "timestamp": datetime.now(UTC).isoformat(),
-                "board": dict(board),
-            }
-        )
-        self.write_scalars(step, board)
+        """Append one completed training step and send its scalars to TensorBoard."""
+        record = {**values, "step": step, "timestamp": datetime.now(UTC).isoformat()}
+        with self.metrics_path.open("ab") as stream:
+            stream.write(orjson.dumps(record, option=orjson.OPT_SORT_KEYS) + b"\n")
 
-    def write_scalars(self, step: int, board: Mapping[str, Mapping[str, float | int]]) -> None:
         if self.writer is not None:
             for phase, metrics in board.items():
                 for name, value in metrics.items():
                     self.writer.add_scalar(f"{phase}/{name}", value, step)
+            self.writer.flush()
 
     def save(
-        self, step: int, policy: PolicyNet, *, metadata: Mapping[str, Any], **services: Any
+        self,
+        step: int,
+        policy: PolicyNet,
+        *,
+        optimizer: Optimizer,
+        scaler: GradScaler,
+        magnet: Magnet | None = None,
+        metadata: Mapping[str, Any],
     ) -> None:
-        """Commit recovery state first; the other files are disposable copies."""
+        """Write the training checkpoint for a completed step."""
         self.store.save_training(
             self.checkpoint_path,
             step,
             policy,
-            metadata={**metadata, "run": self.metadata},
             trainer_kind=self.trainer_kind,
-            run_state=self.state,
-            **services,
+            optimizer=optimizer,
+            scaler=scaler,
+            magnet=magnet,
+            metadata=metadata,
         )
-        self.write_outputs(step)
-
-    def write_outputs(self, step: int) -> None:
-        """Regenerate files that are convenient to inspect or load for inference."""
-        atomic_json_save(
-            self.metrics_dir / "metrics.json",
-            {
-                "run_id": self.metadata["id"],
-                "completed_step": step,
-                "metrics": self.state["metrics"],
-            },
-        )
-        if "best_policy" in self.state:
-            atomic_torch_save(
-                self.checkpoint_path.parent / "bc_best_policy.pt", self.state["best_policy"]
-            )
-        if self.writer is not None:
-            self.writer.flush()
 
     def close(self) -> None:
         if self.writer is not None:

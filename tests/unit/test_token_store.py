@@ -71,24 +71,6 @@ class TestSeriesTokenStore:
             out_tokens[0, SERIES_TOKENS_PER_GAME : 2 * SERIES_TOKENS_PER_GAME], tokens3
         )
 
-    def test_token_store_training_state_round_trip(self) -> None:
-        """Verify SeriesTokenStore state dictionary roundtrips losslessly into a fresh instance."""
-        store = SeriesTokenStore(d_model=8)
-        first = torch.randn(SERIES_TOKENS_PER_GAME, 8)
-        second = torch.randn(SERIES_TOKENS_PER_GAME, 8)
-        store.append("series-1", first)
-        store.append("series-1", second)
-
-        restored = SeriesTokenStore(d_model=8)
-        restored.restore_training_state(store.training_state())
-
-        tokens, mask = restored.get_tokens(["series-1"], device=torch.device("cpu"))
-        assert torch.all(mask[0, : 2 * SERIES_TOKENS_PER_GAME])
-        assert torch.allclose(tokens[0, :SERIES_TOKENS_PER_GAME], first)
-        assert torch.allclose(
-            tokens[0, SERIES_TOKENS_PER_GAME : 2 * SERIES_TOKENS_PER_GAME], second
-        )
-
     def test_token_store_drop_and_clear(self) -> None:
         """Verify dropping one key preserves another until clear removes both stored values."""
         store = SeriesTokenStore(d_model=8)

@@ -19,6 +19,7 @@ from p0.training.trajectory import PreparedTrajectory
 from p0.training.utils import PPOScheduler
 
 LOGGER = logging.getLogger(__name__)
+CHECKPOINT_INTERVAL_EPISODES = 10
 
 PPO_BOARD_METRICS = (
     "policy_loss",
@@ -104,14 +105,10 @@ class PPOTrainer:
                     self.training_config,
                     episode,
                     alpha,
-                    cancel_requested=self.cancel_requested,
                 )
             finally:
                 # The next rollout does not need the previous update's GPU copies.
                 del trajectories
-            if self.cancel_requested() and int(stats["optimizer_updates"]) == 0:
-                self._save(episode)
-                return
             if int(stats["optimizer_updates"]) == 0:
                 raise RuntimeError("PPO completed an episode without an optimizer update")
             if (episode + 1) % refresh_interval == 0:
@@ -126,24 +123,20 @@ class PPOTrainer:
             if self.cancel_requested():
                 self._save(completed_episode)
                 return
-            if (episode + 1) % 10 == 0:
+            if (episode + 1) % CHECKPOINT_INTERVAL_EPISODES == 0:
                 self._save(episode + 1)
-        if completed_episode > start_episode and completed_episode % 10 != 0:
+        if (
+            completed_episode > start_episode
+            and completed_episode % CHECKPOINT_INTERVAL_EPISODES != 0
+        ):
             self._save(completed_episode)
 
     def _save(self, episode: int) -> None:
-        self.collector.prepare_for_checkpoint()
-        metadata: dict[str, object] = {
-            **value_objective_metadata(self.training_config.gamma),
-            "environment_state": self.collector.vector_env.training_state(),
-            "collector_state": self.collector.training_state(),
-        }
         self.files.save(
             episode,
             self.policy,
             optimizer=self.optimizer,
-            scheduler=self.scheduler,
             scaler=self.scaler,
             magnet=self.magnet,
-            metadata=metadata,
+            metadata=value_objective_metadata(self.training_config.gamma),
         )

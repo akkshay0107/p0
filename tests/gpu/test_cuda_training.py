@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -151,7 +152,6 @@ class TestCudaTraining:
             config,
             episode=0,
             alpha=0.0,
-            cancel_requested=lambda: False,
         )
         torch.cuda.synchronize()
 
@@ -164,7 +164,13 @@ class TestCudaTraining:
         checkpoint = tmp_path / "cuda-ppo.pt"
         store = CheckpointStore()
         store.save_training(
-            checkpoint, 1, policy, optimizer=optimizer, scaler=scaler, trainer_kind="ppo"
+            checkpoint,
+            1,
+            policy,
+            optimizer=optimizer,
+            scaler=scaler,
+            trainer_kind="ppo",
+            metadata={},
         )
         restored = build_policy(MODEL_CONFIG, default_runtime_resources()).to(cuda_device)
         restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
@@ -173,10 +179,9 @@ class TestCudaTraining:
             store.load_training(
                 checkpoint,
                 restored,
+                trainer_kind="ppo",
                 optimizer=restored_optimizer,
                 scaler=restored_scaler,
-                expected_trainer_kind="ppo",
-                require_training_state=True,
             )
             == 1
         )
@@ -200,7 +205,6 @@ class TestCudaTraining:
             config,
             episode=1,
             alpha=0.0,
-            cancel_requested=lambda: False,
         )
         assert resumed_stats["optimizer_updates"] == 1
         assert all(math.isfinite(value) for value in resumed_stats.values())
@@ -317,6 +321,7 @@ class TestCudaTraining:
             optimizer=optimizer,
             scaler=scaler,
             trainer_kind="ppo",
+            metadata={},
         )
         restored = build_policy(MODEL_CONFIG, default_runtime_resources()).to(cuda_device)
         restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
@@ -324,10 +329,9 @@ class TestCudaTraining:
         episode = store.load_training(
             checkpoint,
             restored,
+            trainer_kind="ppo",
             optimizer=restored_optimizer,
             scaler=restored_scaler,
-            expected_trainer_kind="ppo",
-            require_training_state=True,
         )
         assert episode == 1
         for name, value in policy.state_dict().items():
@@ -380,16 +384,24 @@ class TestCudaTrainingLoops:
         policy_path = tmp_path / "compiled-policy.pt"
         training_path = tmp_path / "compiled-training.pt"
         store.save_policy(policy_path, compiled)
-        store.save_training(training_path, 1, compiled, optimizer=optimizer, trainer_kind="ppo")
+        store.save_training(
+            training_path,
+            1,
+            compiled,
+            optimizer=optimizer,
+            trainer_kind="ppo",
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            metadata={},
+        )
         loaded = store.load_policy(policy_path, "cpu")
         restored = build_policy(MODEL_CONFIG, default_runtime_resources())
         restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
         episode = store.load_training(
             training_path,
             restored,
+            trainer_kind="ppo",
             optimizer=restored_optimizer,
-            expected_trainer_kind="ppo",
-            require_training_state=True,
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
         )
 
         assert episode == 1
@@ -443,7 +455,8 @@ class TestCudaTrainingLoops:
 
         saved = store.read(paths.checkpoint_path)
         assert store.load_episode(saved) == 3
-        metrics = saved.artifact["training_state"]["run"]["metrics"]
+        metrics_path = paths.runs_dir / "ppo_training" / "metrics.jsonl"
+        metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in metrics] == [1, 2, 3]
         assert all(record["trajectory_count"] > 0 for record in metrics)
         assert all(
@@ -452,7 +465,6 @@ class TestCudaTrainingLoops:
             for value in record.values()
             if isinstance(value, (int, float))
         )
-        assert "cuda" in saved.artifact["training_state"]["rng_state"]
 
         resumed = replace(
             config,
@@ -463,7 +475,7 @@ class TestCudaTrainingLoops:
         run_training(resumed)
         final = store.read(paths.checkpoint_path)
         assert store.load_episode(final) == 4
-        resumed_metrics = final.artifact["training_state"]["run"]["metrics"]
+        resumed_metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in resumed_metrics] == [1, 2, 3, 4]
         assert resumed_metrics[:3] == metrics
         assert resumed_metrics[-1]["optimizer_updates"] > 0

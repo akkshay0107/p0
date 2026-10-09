@@ -13,11 +13,18 @@ from p0.model.policy import PolicyNet
 from p0.model.resources import default_runtime_resources
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.magnet import Magnet
-from p0.training.series_history import SeriesHistoryStore
 
 
 def _small_policy() -> PolicyNet:
     return build_policy(ModelConfig(32, 4, 1, 128), default_runtime_resources())
+
+
+def _optimizer(policy: PolicyNet) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(policy.parameters())
+
+
+def _scaler() -> torch.amp.GradScaler:
+    return torch.amp.GradScaler("cpu", enabled=False)
 
 
 class TestCheckpoints:
@@ -35,18 +42,35 @@ class TestCheckpoints:
         """
         path = tmp_path / "policy.pt"
         original = _small_policy()
-        DEFAULT_CHECKPOINT_STORE.save_training(path, 7, original)
+        DEFAULT_CHECKPOINT_STORE.save_training(
+            path,
+            7,
+            original,
+            trainer_kind="ppo",
+            optimizer=_optimizer(original),
+            scaler=_scaler(),
+            metadata={},
+        )
 
         restored = DEFAULT_CHECKPOINT_STORE.load_policy(path, "cpu")
         assert restored.config == ModelConfig(32, 4, 1, 128)
-        assert DEFAULT_CHECKPOINT_STORE.load_training(path, restored) == 7
+        assert (
+            DEFAULT_CHECKPOINT_STORE.load_training(
+                path,
+                restored,
+                trainer_kind="ppo",
+                optimizer=_optimizer(restored),
+                scaler=_scaler(),
+            )
+            == 7
+        )
         artifact = DEFAULT_CHECKPOINT_STORE.read(path).artifact
         assert artifact["artifact_schema"] == CHECKPOINT_ARTIFACT_SCHEMA
         assert artifact["artifact_type"] == "training"
         assert "runtime_manifest_sha256" not in artifact
         assert set(artifact["runtime_contract"]) == {"major_sha256", "minor_sha256"}
         assert artifact["model_config"]["d_model"] == 32
-        assert artifact["provenance"] == {}
+        assert artifact["provenance"] == {"trainer_kind": "ppo"}
 
         DEFAULT_CHECKPOINT_STORE.save_policy(
             path,
@@ -120,7 +144,16 @@ class TestCheckpoints:
     def test_training_checkpoint_rejects_state_config_mismatch(self, tmp_path: Path) -> None:
         """Verify load_training detects architecture mismatch between checkpoint and target model instance."""
         path = tmp_path / "policy.pt"
-        DEFAULT_CHECKPOINT_STORE.save_training(path, 1, _small_policy())
+        saved = _small_policy()
+        DEFAULT_CHECKPOINT_STORE.save_training(
+            path,
+            1,
+            saved,
+            trainer_kind="ppo",
+            optimizer=_optimizer(saved),
+            scaler=_scaler(),
+            metadata={},
+        )
         artifact = dict(DEFAULT_CHECKPOINT_STORE.read(path).artifact)
         artifact["model_config"]["d_model"] = 64
         torch.save(artifact, path)
@@ -130,7 +163,13 @@ class TestCheckpoints:
             name: tensor.detach().clone() for name, tensor in policy.state_dict().items()
         }
         with pytest.raises(ValueError, match="model configuration does not match"):
-            DEFAULT_CHECKPOINT_STORE.load_training(path, policy)
+            DEFAULT_CHECKPOINT_STORE.load_training(
+                path,
+                policy,
+                trainer_kind="ppo",
+                optimizer=_optimizer(policy),
+                scaler=_scaler(),
+            )
         assert all(
             torch.equal(before_state[name], tensor) for name, tensor in policy.state_dict().items()
         )
@@ -164,6 +203,7 @@ class TestCheckpoints:
             magnet=magnet,
             metadata={"dataset_id": "d" * 64},
             trainer_kind="ppo",
+            scaler=_scaler(),
         )
 
         restored = build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
@@ -172,11 +212,10 @@ class TestCheckpoints:
         episode = store.load_training(
             path,
             restored,
+            trainer_kind="ppo",
             optimizer=restored_optimizer,
             magnet=restored_magnet,
-            expected_trainer_kind="ppo",
-            expected_metadata={"dataset_id": "d" * 64},
-            require_training_state=True,
+            scaler=_scaler(),
         )
         assert episode == 17
         # Confirm learning rate and Adam moment tensors were restored from checkpoint
@@ -187,46 +226,51 @@ class TestCheckpoints:
         for name, parameter in restored_magnet.state_dict().items():
             torch.testing.assert_close(parameter, magnet.state_dict()[name])
 
-    def test_training_checkpoint_round_trip_restores_collector_history_metadata(
-        self,
-        tmp_path: Path,
+    def test_checkpoint_without_a_magnet_restarts_it_from_the_restored_policy(
+        self, tmp_path: Path
     ) -> None:
-        """Verify detached completed-game history survives the checkpoint metadata envelope."""
-        path = tmp_path / "collector-training.pt"
-        policy = _small_policy()
-        history = SeriesHistoryStore(policy.d_model)
-        history.append(
-            "series",
-            1,
-            torch.ones((3, policy.d_model), requires_grad=True),
-            is_series_end=False,
-        )
-        collector_state = {
-            "series_store1": {},
-            "series_store2": {},
-            "series_history1": history.training_state(),
-            "series_history2": {},
-        }
+        path = tmp_path / "training.pt"
         store = CheckpointStore()
+        policy = _small_policy()
         store.save_training(
             path,
-            4,
+            3,
             policy,
-            metadata={"collector_state": collector_state},
             trainer_kind="ppo",
+            optimizer=_optimizer(policy),
+            scaler=_scaler(),
+            metadata={},
         )
 
-        metadata = store.load_metadata(path)
-        raw_collector_state = metadata["collector_state"]
-        assert isinstance(raw_collector_state, dict)
-        restored = SeriesHistoryStore(policy.d_model)
-        raw_history = raw_collector_state["series_history1"]
-        assert isinstance(raw_history, dict)
-        restored.restore_training_state(raw_history)
-        assert restored.next_game_number("series") == 2
-        (game,) = restored.snapshot("series")
-        assert game.requires_grad is False
-        torch.testing.assert_close(game, torch.ones((3, policy.d_model)))
+        restored = _small_policy()
+        magnet = Magnet(restored)
+        with torch.no_grad():
+            for parameter in restored.parameters():
+                parameter.add_(1.0)
+        store.load_training(
+            path,
+            restored,
+            trainer_kind="ppo",
+            optimizer=_optimizer(restored),
+            magnet=magnet,
+            scaler=_scaler(),
+        )
+
+        for name, parameter in magnet.state_dict().items():
+            torch.testing.assert_close(parameter, policy.state_dict()[name])
+
+    def test_changed_value_objective_warns_and_loads_weights(self, tmp_path: Path, caplog) -> None:
+        path = tmp_path / "policy.pt"
+        store = CheckpointStore()
+        policy = _small_policy()
+        store.save_policy(path, policy, metadata={"gamma": 0.99})
+
+        with caplog.at_level("WARNING", logger="p0.training.checkpoint"):
+            restored = store.load_policy(path, "cpu", expected_objective={"gamma": 0.9})
+
+        assert "gamma=0.99" in caplog.text
+        for name, tensor in policy.state_dict().items():
+            torch.testing.assert_close(restored.state_dict()[name], tensor)
 
     def test_checkpoint_rejects_incompatible_vocabulary(self, tmp_path: Path) -> None:
         """Verify checkpoint loading rejects files whose vocabulary/encoding identity has been altered."""
@@ -241,41 +285,22 @@ class TestCheckpoints:
         with pytest.raises(ValueError, match="incompatible"):
             store.load_policy(path, "cpu")
 
-    def test_checkpoint_rejects_weights_only_resume_when_training_is_required(
-        self, tmp_path: Path
-    ) -> None:
-        """Verify that requiring training state rejects weights-only inference checkpoints."""
+    def test_checkpoint_rejects_weights_only_resume(self, tmp_path: Path) -> None:
+        """Verify that resuming training rejects weights-only inference checkpoints."""
         path = tmp_path / "policy.pt"
         store = CheckpointStore()
         store.save_policy(
             path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
         )
+        target = build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
         with pytest.raises(ValueError, match="weights-only"):
             store.load_training(
                 path,
-                build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources()),
-                require_training_state=True,
+                target,
+                trainer_kind="ppo",
+                optimizer=_optimizer(target),
+                scaler=_scaler(),
             )
-
-    def test_policy_checkpoint_loads_weights_when_training_state_not_required(
-        self, tmp_path: Path
-    ) -> None:
-        """Verify load_training loads policy weights even when require_training_state is False."""
-        path = tmp_path / "weights.pt"
-        store = CheckpointStore()
-        config = ModelConfig(16, 2, 1, 64)
-        original = build_policy(config, default_runtime_resources())
-        with torch.no_grad():
-            for param in original.parameters():
-                param.add_(1.5)
-        store.save_policy(path, original)
-
-        target = build_policy(config, default_runtime_resources())
-        # Target starts with fresh randomly initialized weights
-        episode = store.load_training(path, target, require_training_state=False)
-        assert episode == 0
-        for name, param in original.state_dict().items():
-            torch.testing.assert_close(target.state_dict()[name], param)
 
     def test_training_checkpoint_rejects_other_trainer_but_policy_weights_transfer(
         self, tmp_path: Path
@@ -290,112 +315,98 @@ class TestCheckpoints:
             policy,
             optimizer=torch.optim.AdamW(policy.parameters()),
             trainer_kind="bc",
+            scaler=_scaler(),
+            metadata={},
         )
 
+        target = _small_policy()
         with pytest.raises(ValueError, match="trainer"):
             store.load_training(
                 path,
-                _small_policy(),
-                expected_trainer_kind="ppo",
-                require_training_state=True,
+                target,
+                trainer_kind="ppo",
+                optimizer=_optimizer(target),
+                scaler=_scaler(),
             )
 
         restored = store.load_policy(path, "cpu")
         for name, tensor in policy.state_dict().items():
             torch.testing.assert_close(restored.state_dict()[name], tensor)
 
+    def test_training_checkpoint_without_optimizer_state_is_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / "training.pt"
+        store = CheckpointStore()
+        policy = _small_policy()
+        store.save_training(
+            path,
+            1,
+            policy,
+            trainer_kind="ppo",
+            optimizer=_optimizer(policy),
+            scaler=_scaler(),
+            metadata={},
+        )
+        artifact = torch.load(path, weights_only=True)
+        del artifact["training_state"]["optimizer_state_dict"]
+        torch.save(artifact, path)
+
+        target = _small_policy()
+        with pytest.raises(ValueError, match="Invalid training state"):
+            store.load_training(
+                path,
+                target,
+                trainer_kind="ppo",
+                optimizer=_optimizer(target),
+                scaler=_scaler(),
+            )
+
     def test_load_episode_helper(self, tmp_path: Path) -> None:
         """Verify load_episode reads episode without full model restoration."""
         store = CheckpointStore()
         policy = _small_policy()
-
-        missing = tmp_path / "missing.pt"
-        assert store.load_episode(missing) == 0
 
         policy_path = tmp_path / "policy.pt"
         store.save_policy(policy_path, policy)
         assert store.load_episode(policy_path) == 0
 
         training_path = tmp_path / "training.pt"
-        store.save_training(training_path, 42, policy)
+        store.save_training(
+            training_path,
+            42,
+            policy,
+            trainer_kind="ppo",
+            optimizer=_optimizer(policy),
+            scaler=_scaler(),
+            metadata={},
+        )
         assert store.load_episode(training_path) == 42
 
-    def test_lineage_metadata_preservation(self, tmp_path: Path) -> None:
-        """Verify upstream lineage metadata persists and can be validated."""
-        path = tmp_path / "lineage.pt"
-        store = CheckpointStore()
-        policy = _small_policy()
-        metadata = {
-            "parent_checkpoint_sha256": "f" * 64,
-            "dataset_id": "e" * 64,
-            "gamma": 0.99,
-        }
-        store.save_training(path, 5, policy, metadata=metadata, trainer_kind="ppo")
 
-        loaded_metadata = store.load_metadata(path)
-        assert loaded_metadata["parent_checkpoint_sha256"] == "f" * 64
-        assert loaded_metadata["dataset_id"] == "e" * 64
-        assert loaded_metadata["trainer_kind"] == "ppo"
-
-        # Matching expected metadata succeeds
-        restored = _small_policy()
-        assert (
-            store.load_training(
-                path,
-                restored,
-                expected_trainer_kind="ppo",
-                expected_metadata={"dataset_id": "e" * 64},
-            )
-            == 5
-        )
-
-        # Mismatched expected metadata is rejected
-        with pytest.raises(ValueError, match="is incompatible"):
-            store.load_training(
-                path,
-                restored,
-                expected_metadata={"dataset_id": "wrong"},
-            )
-
-
-class TestStrictTrainingResume:
-    def test_missing_optimizer_state_fails_before_weights_change(self, tmp_path: Path) -> None:
-        store = CheckpointStore()
-        path = tmp_path / "missing-optimizer.pt"
-        store.save_training(path, 1, _small_policy())
-        target = _small_policy()
-        before = next(target.parameters()).detach().clone()
-        optimizer = torch.optim.AdamW(target.parameters())
-        with pytest.raises(ValueError, match="missing required training state"):
-            store.load_training(path, target, optimizer=optimizer, require_training_state=True)
-        torch.testing.assert_close(next(target.parameters()), before)
-
-    def test_resume_restores_all_cpu_random_generators(self, tmp_path: Path) -> None:
-        import random
-
-        import numpy as np
-
-        store = CheckpointStore()
-        path = tmp_path / "rng.pt"
-        policy = _small_policy()
-        store.save_training(path, 1, policy)
-        expected = (random.random(), np.random.random(), torch.rand(4))
-        store.load_training(path, policy, require_training_state=True)
-        assert random.random() == expected[0]
-        assert np.random.random() == expected[1]
-        torch.testing.assert_close(torch.rand(4), expected[2], rtol=0, atol=0)
-
+class TestLoadedCheckpoint:
     def test_loaded_input_survives_atomic_replacement(self, tmp_path: Path) -> None:
-        import hashlib
-
         store = CheckpointStore()
         path = tmp_path / "input.pt"
         policy = _small_policy()
-        store.save_training(path, 1, policy)
-        expected_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        optimizer = _optimizer(policy)
+        store.save_training(
+            path,
+            1,
+            policy,
+            trainer_kind="ppo",
+            optimizer=optimizer,
+            scaler=_scaler(),
+            metadata={},
+        )
         loaded = store.read(path)
-        store.save_training(path, 2, policy)
-        assert loaded.sha256 == expected_hash
+        store.save_training(
+            path,
+            2,
+            policy,
+            trainer_kind="ppo",
+            optimizer=optimizer,
+            scaler=_scaler(),
+            metadata={},
+        )
         assert store.load_episode(loaded) == 1
         assert store.load_episode(path) == 2
 
