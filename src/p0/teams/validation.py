@@ -27,32 +27,28 @@ def _variant_dict(
     *,
     format_id: str = FORMAT.battle_format,
 ) -> dict[str, Any]:
-    canonical_members = variant.team.canonical().members
-    if variant.team.members == canonical_members:
-        pairs = list(zip(variant.team.members, variant.spreads, strict=True))
-    else:
-        pairs = sorted(
-            zip(variant.team.members, variant.spreads, strict=True),
-            key=lambda pair: pair[0].canonical().species,
-        )
+    pairs = [
+        (member.canonical(), spread)
+        for member, spread in zip(variant.team.members, variant.spreads, strict=True)
+    ]
+    pairs.sort(key=lambda pair: pair[0].species)
 
     team = []
     for member, spread in pairs:
-        canon_member = member.canonical()
         team.append(
             {
                 # An inferred canonical species ID is not a nickname. Sending it
                 # as name makes Showdown reject long form IDs as nicknames.
                 "name": "",
-                "species": canon_member.species,
-                "item": canon_member.item,
-                "ability": canon_member.ability,
-                "moves": list(canon_member.moves),
-                "nature": canon_member.nature,
+                "species": member.species,
+                "item": member.item,
+                "ability": member.ability,
+                "moves": list(member.moves),
+                "nature": member.nature,
                 "evs": spread.as_dict(),
                 "ivs": dict.fromkeys(STAT_NAMES, 31),
-                "gender": canon_member.gender,
-                "level": canon_member.level,
+                "gender": member.gender,
+                "level": member.level,
             }
         )
 

@@ -252,10 +252,6 @@ class EvaluationHarness:
             expected_format_id=self.format_id,
         )
 
-    def build_team_sources(self) -> dict[str, TeamSource]:
-        """Build team sources mapping for evaluation."""
-        return {"default": self.build_team_source()}
-
     async def run_matchup(
         self,
         name_a: str,

@@ -35,7 +35,7 @@ class TestEvaluationHarness:
             teams_path=tmp_path / "missing", episodes_per_matchup=5, seed=91
         )
         with pytest.raises(FileNotFoundError):
-            harness.build_team_sources()
+            harness.build_team_source()
 
     def test_evaluation_harness_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
         entries = (

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import math
 import signal
 import threading
@@ -20,16 +19,6 @@ from torch.utils.tensorboard import SummaryWriter
 from p0.model.policy import PolicyNet
 from p0.persistence import atomic_json_save, atomic_torch_save
 from p0.training.checkpoint import CheckpointStore, LoadedCheckpoint
-
-
-def code_sha256() -> str:
-    """Identify the installed Python source, including uncommitted edits."""
-    root = Path(__file__).resolve().parents[1]
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*.py")):
-        digest.update(str(path.relative_to(root)).encode() + b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-    return digest.hexdigest()
 
 
 @contextmanager
@@ -187,7 +176,6 @@ class TrainingRun:
             "parent": parent,
             "source": origin,
             "settings": dict(settings),
-            "code_sha256": code_sha256(),
             "metrics_directory": str(metrics_dir.resolve()),
         }
         self.state = dict(saved_state) if resume and source is not None else {}

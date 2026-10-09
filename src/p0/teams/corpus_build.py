@@ -18,7 +18,6 @@ from p0.teams.corpus import (
     CorpusEntry,
     TeamCorpusManifest,
 )
-from p0.teams.stat_points import STAT_POINT_LIMIT, STAT_POINT_TOTAL_LIMIT
 from p0.teams.team import TeamRecord, deduplicate_variants
 from p0.teams.validation import AdmissionResult, validate_many
 
@@ -83,18 +82,6 @@ def _check_vocabulary(tokenizer: PokemonTokenizer, variant: TeamRecord) -> str |
     return None
 
 
-def _check_spreads(variant: TeamRecord) -> str | None:
-    if variant.spread_provenance not in ("imputed", "exact"):
-        return f"illegal_provenance: {variant.spread_provenance}"
-    for spread in variant.spreads:
-        values = spread.as_tuple()
-        if any(value < 0 or value > STAT_POINT_LIMIT for value in values):
-            return "illegal_spread_bounds"
-        if sum(values) > STAT_POINT_TOTAL_LIMIT:
-            return "illegal_spread_total"
-    return None
-
-
 def build_corpus(
     variants: Sequence[TeamRecord],
     *,
@@ -134,7 +121,7 @@ def build_corpus(
                 f"showdown_invalid: {result.problems[0]}" if result.problems else "showdown_invalid"
             )
         else:
-            reason = _check_vocabulary(tokenizer, variant) or _check_spreads(variant)
+            reason = _check_vocabulary(tokenizer, variant)
         if reason is not None:
             rejections[reason] += 1
             continue

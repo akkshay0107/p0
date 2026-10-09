@@ -63,22 +63,21 @@ class FileTeamSource:
     """A deterministically discovered and eagerly prepared file pool."""
 
     def __init__(self, directory: str | Path):
-        self.directory = Path(directory)
-        if not self.directory.exists():
-            raise FileNotFoundError(f"Teams directory not found: {self.directory}")
+        directory = Path(directory)
+        if not directory.exists():
+            raise FileNotFoundError(f"Teams directory not found: {directory}")
         files = tuple(
             path
-            for path in sorted(self.directory.iterdir(), key=lambda item: item.name)
+            for path in sorted(directory.iterdir(), key=lambda item: item.name)
             if path.is_file() and not path.name.startswith(".")
         )
         if not files:
-            raise FileNotFoundError(f"No team files found in {self.directory}")
+            raise FileNotFoundError(f"No team files found in {directory}")
         self._initialize(files)
 
     @classmethod
     def from_files(cls, paths: Sequence[str | Path]) -> FileTeamSource:
         source = cls.__new__(cls)
-        source.directory = Path(".")
         files = tuple(
             sorted(
                 (Path(path) for path in paths if not Path(path).name.startswith(".")),
@@ -140,34 +139,43 @@ class CorpusTeamSource:
         for entry in manifest.entries:
             by_canonical.setdefault(entry.canonical_id, []).append(entry)
 
-        self._manifest = manifest
         self._corpus_path = corpus_path
+        self._corpus_id = manifest.corpus_id
+        self._format_id = manifest.format_id
+        self._pool_size = len(manifest.entries)
         self._canonical_pools = tuple(tuple(by_canonical[key]) for key in sorted(by_canonical))
 
     @classmethod
-    def from_path(cls, path: str | Path) -> CorpusTeamSource:
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        expected_format_id: str | None = None,
+    ) -> CorpusTeamSource:
         """Load and validate one corpus manifest from disk."""
         resolved = Path(path)
         if not resolved.exists():
             raise FileNotFoundError(f"Corpus manifest file not found: {resolved}")
 
         try:
-            raw_data = orjson.loads(resolved.read_bytes())
-        except (OSError, UnicodeError, orjson.JSONDecodeError) as exc:
-            raise ValueError(f"Malformed corpus manifest file: {resolved}") from exc
+            manifest = TeamCorpusManifest.from_dict(orjson.loads(resolved.read_bytes()))
+        except (OSError, UnicodeError, orjson.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid corpus manifest: {resolved}") from exc
 
-        manifest = TeamCorpusManifest.from_dict(raw_data)
+        if expected_format_id is not None and not is_corpus_format_compatible(
+            expected_format_id, manifest.format_id
+        ):
+            raise ValueError(
+                f"Corpus format mismatch: manifest={manifest.format_id!r}, "
+                f"expected={expected_format_id!r}"
+            )
+
         return cls(manifest, corpus_path=str(resolved))
-
-    def _sample_entry(
-        self,
-        rng: random.Random,
-    ) -> CorpusEntry:
-        return rng.choice(rng.choice(self._canonical_pools))
 
     def sample(self, rng: random.Random) -> ValidatedTeam:
         """Return a single validated team sampled uniformly by canonical team."""
-        entry = self._sample_entry(rng)
+        pool = rng.choice(self._canonical_pools)
+        entry = rng.choice(pool)
         return ValidatedTeam(packed=entry.packed)
 
     def describe(self) -> Mapping[str, JsonScalar | tuple[str, ...]]:
@@ -175,10 +183,10 @@ class CorpusTeamSource:
         return {
             "kind": "corpus",
             "corpus_path": self._corpus_path,
-            "corpus_id": self._manifest.corpus_id,
-            "format_id": self._manifest.format_id,
+            "corpus_id": self._corpus_id,
+            "format_id": self._format_id,
             "sampling": "uniform_canonical",
-            "pool_size": len(self._manifest.entries),
+            "pool_size": self._pool_size,
         }
 
 
@@ -205,32 +213,12 @@ def build_team_source(
     if resolved.is_dir():
         manifest_path = resolved / CORPUS_MANIFEST_NAME
         if manifest_path.is_file():
-            return _build_corpus_source(manifest_path, expected_format_id)
+            return CorpusTeamSource.from_path(manifest_path, expected_format_id=expected_format_id)
         return FileTeamSource(resolved)
 
     if resolved.is_file():
         if resolved.name == CORPUS_MANIFEST_NAME:
-            return _build_corpus_source(resolved, expected_format_id)
+            return CorpusTeamSource.from_path(resolved, expected_format_id=expected_format_id)
         return FileTeamSource.from_files((resolved,))
 
     raise ValueError(f"Unsupported team source path: {resolved}")
-
-
-def _build_corpus_source(
-    manifest_path: Path,
-    expected_format_id: str | None,
-) -> CorpusTeamSource:
-    try:
-        manifest = TeamCorpusManifest.from_dict(orjson.loads(manifest_path.read_bytes()))
-    except (OSError, UnicodeError, orjson.JSONDecodeError, TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid corpus manifest: {manifest_path}") from exc
-
-    if expected_format_id is not None and not is_corpus_format_compatible(
-        expected_format_id, manifest.format_id
-    ):
-        raise ValueError(
-            f"Corpus format mismatch: manifest={manifest.format_id!r}, "
-            f"expected={expected_format_id!r}"
-        )
-
-    return CorpusTeamSource(manifest, corpus_path=str(manifest_path))

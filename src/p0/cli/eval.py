@@ -183,7 +183,6 @@ def main(argv: list[str] | None = None) -> int:
             ),
         },
         "matchup": matchup,
-        "matchups": [matchup],
     }
 
     try:

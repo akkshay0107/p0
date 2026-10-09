@@ -267,11 +267,10 @@ class FusedTokenEncoder(nn.Module):
         resources: RuntimeResources,
     ):
         super().__init__()
-        self.resources = resources
         self.d_model = d_model
         d_raw = EVENT_RAW_WIDTH
 
-        sizes = _load_vocab_sizes(self.resources)
+        sizes = _load_vocab_sizes(resources)
         self.species_emb = nn.Embedding(sizes["species"], d_raw)
         self.ability_emb = nn.Embedding(sizes["abilities"], d_raw)
         self.item_emb = nn.Embedding(sizes["items"], d_raw)
@@ -294,13 +293,11 @@ class FusedTokenEncoder(nn.Module):
 
         self.species_proj = nn.Linear(d_raw, d_model)
         self.species_static_proj = nn.Linear(SPECIES_STATIC_WIDTH, d_model)
-        self.register_buffer(
-            "_species_statics", _load_species_statics(self.resources), persistent=False
-        )
+        self.register_buffer("_species_statics", _load_species_statics(resources), persistent=False)
 
         self.ability_proj = nn.Linear(d_raw, d_model)
         self.item_proj = nn.Linear(d_raw, d_model)
-        mechanic_tags = _load_mechanic_tag_tables(self.resources)
+        mechanic_tags = _load_mechanic_tag_tables(resources)
         item_tags = mechanic_tags["items"]
         ability_tags = mechanic_tags["abilities"]
         self.item_mechanic_proj = nn.Linear(item_tags.shape[1], d_model, bias=False)
@@ -319,7 +316,7 @@ class FusedTokenEncoder(nn.Module):
         # and down-projected for the pointer keys (key side)
         self.move_proj = nn.Linear(3 * d_raw + MOVE_STATIC_WIDTH + MOVE_DYNAMIC_WIDTH, d_model)
         self.move_pos_emb = nn.Embedding(4, d_model)
-        self.register_buffer("_move_statics", _load_move_statics(self.resources), persistent=False)
+        self.register_buffer("_move_statics", _load_move_statics(resources), persistent=False)
 
         # the status owns its identity and its counter dynamics as one record
         self.status_proj = nn.Linear(d_raw + 16 + STATUS_DYNAMIC_WIDTH, d_model)

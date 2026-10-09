@@ -98,9 +98,11 @@ matches. The same filters work on `build-shards`; selecting a game includes its
 known series siblings so games from one series stay together.
 
 Compiled series get UUID filenames. Repeating a build reuses existing tensors;
-adding a game to a series rebuilds that series. After changing reconstruction or
-spread estimates, use `p0-replays build-shards --force-reconstruct`. This creates
-new tensors and a new dataset snapshot while preserving previous snapshots.
+adding a game to a series rebuilds that series. The cache does not fingerprint
+reconstruction code, replay bodies kept under the same ID, spread estimates, or
+dex/resource data used to build observations. After any such change, run
+`p0-replays build-shards --force-reconstruct`. A forced build creates new tensors
+and a new dataset snapshot while preserving previous snapshots.
 Update `bc.shard_manifest` to the printed path for a new training run. Exact resume
 requires the same dataset and split IDs. No replay or tensor checksums are computed.
 

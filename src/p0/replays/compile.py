@@ -961,7 +961,7 @@ def compile_to_shards(
     external_rejections: Iterable[str] = (),
     force_reconstruct: bool = False,
 ) -> ShardBuildResult:
-    """Reuse compiled series by replay IDs; force rebuilding after reconstruction edits."""
+    """Reuse cached series by replay IDs; force rebuilding after input changes."""
     if max_candidates < 1:
         raise ValueError("max_candidates must be positive")
     grouping = _group_documents(documents, format_id)

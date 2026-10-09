@@ -248,14 +248,7 @@ def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
     root = _resolve_path(config.paths.repository_root)
     path_fields = {f.name for f in fields(ProjectPaths)}
     paths = _resolve_fields(config.paths, root, path_fields)
-    bot = replace(
-        config.bot,
-        checkpoint_path=(
-            _resolve_path(config.bot.checkpoint_path, root)
-            if config.bot.checkpoint_path is not None
-            else None
-        ),
-    )
+    bot = _resolve_fields(config.bot, root, {"checkpoint_path"})
     teams = _resolve_fields(config.teams, paths.teams_root, {"all", "reduced"})
     bc = _resolve_fields(
         config.bc,

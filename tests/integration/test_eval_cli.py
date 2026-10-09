@@ -40,4 +40,3 @@ class TestEvaluationCLI:
         report = json.loads((report_dir / "evaluation_report.json").read_text())
         assert report["episodes"] == 1
         assert report["matchup"]["total_games"] == 1
-        assert report["matchups"] == [report["matchup"]]

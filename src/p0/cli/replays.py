@@ -52,7 +52,11 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--player")
         if name == "build-shards":
             command.add_argument("--output-dir", type=Path, default=DEFAULT_TENSOR_CACHE)
-            command.add_argument("--force-reconstruct", action="store_true")
+            command.add_argument(
+                "--force-reconstruct",
+                action="store_true",
+                help="Rebuild cached tensors after reconstruction or resource changes",
+            )
 
     splits = commands.add_parser("create-splits")
     splits.add_argument("--shard-manifest", type=Path, required=True)

@@ -230,7 +230,7 @@ class ReplayFetcher:
                 break
 
     def discover_ids(self) -> tuple[str, ...]:
-        return tuple(sorted(set(self._iter_discovered_ids())))
+        return tuple(sorted(self._iter_discovered_ids()))
 
     def _fetch_one(self, replay_id: str) -> tuple[FetchIndexEntry, tuple[str, ...]]:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", replay_id):
@@ -275,7 +275,6 @@ class ReplayFetcher:
             if (self.index_path.parent / entry.raw_path).is_file()
         }
         self._recover_unindexed(known)
-        known_keys = set(known)
 
         seeds = replay_ids if replay_ids is not None else self._iter_discovered_ids()
         fetched_count = 0
@@ -288,8 +287,8 @@ class ReplayFetcher:
             scanned: set[str] = set()
 
             while frontier:
-                cached_scan = (frontier & known_keys) - scanned
-                pending = list(frontier - known_keys - self._unavailable_ids)
+                cached_scan = (frontier & known.keys()) - scanned
+                pending = list(frontier - known.keys() - self._unavailable_ids)
 
                 discovered = set()
 
@@ -333,7 +332,6 @@ class ReplayFetcher:
                     if new_entries:
                         for entry in new_entries:
                             known[entry.replay_id] = entry
-                            known_keys.add(entry.replay_id)
                         fetched_count += len(new_entries)
                         write_fetch_index(self.index_path, known.values())
 
