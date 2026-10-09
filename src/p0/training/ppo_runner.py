@@ -17,7 +17,7 @@ from p0.model.resources import default_runtime_resources
 from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
 from p0.runtime.showdown import start_showdown_servers
-from p0.teams.source import build_team_source
+from p0.teams.corpus import load_team_corpus
 from p0.training.checkpoint import (
     DEFAULT_CHECKPOINT_STORE,
     CheckpointStore,
@@ -56,7 +56,7 @@ def run_training(
     *,
     policy_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
     cancel_requested: Callable[[], bool] = lambda: False,
-    agent_team_source: str = "all",
+    reduced: bool = False,
 ) -> None:
     """
     Set up self-play environments and run PPO training.
@@ -65,21 +65,16 @@ def run_training(
         config: Validated global runtime and training configuration.
         policy_store: Checkpoint persistence implementation.
         cancel_requested: Callback polled for cooperative cancellation.
-        agent_team_source: Team pool name used for the self-play agent.
+        reduced: Sample one seat's teams from the reduced corpus instead of all.
 
     Returns:
         None.
     """
     training, paths = config.training, config.paths
-    if agent_team_source == "all":
-        agent_team_path = config.teams.all
-    elif agent_team_source == "reduced":
-        agent_team_path = config.teams.reduced
-    else:
-        raise ValueError("agent_team_source must be 'all' or 'reduced'")
-
-    agent_source = build_team_source(agent_team_path, expected_format_id=FORMAT.bo3_format)
-    opponent_source = build_team_source(config.teams.all, expected_format_id=FORMAT.bo3_format)
+    opponent_source = load_team_corpus(config.teams.all, FORMAT.bo3_format)
+    agent_source = (
+        load_team_corpus(config.teams.reduced, FORMAT.bo3_format) if reduced else opponent_source
+    )
     with training_run(
         policy_store,
         paths.checkpoint_path,

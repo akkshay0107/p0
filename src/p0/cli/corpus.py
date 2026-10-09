@@ -6,7 +6,6 @@ import argparse
 import json
 import logging
 import random
-from collections import Counter
 from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
@@ -15,16 +14,15 @@ from typing import Any
 from p0.format_config import FORMAT
 from p0.model.tokenizer import PokemonTokenizer
 from p0.paths import DEFAULT_PATHS
-from p0.teams.corpus import TeamCorpusManifest
+from p0.teams.corpus import SHOWDOWN_TEAMBUILDER, TEAM_SIZE, load_team_corpus
 from p0.teams.corpus_build import (
     audit_corpus,
     build_corpus,
     write_corpus_manifest,
 )
-from p0.teams.source import corpus_manifest_path
 from p0.teams.spread_usage import load_spread_table_file
 from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord, normalize_id
+from p0.teams.team import CanonicalTeam, TeamMember, TeamRecord, normalize_id
 from p0.teams.validation import validate_many
 
 # Fixed so repeated corpus builds from the same export are byte-identical.
@@ -47,24 +45,20 @@ def _variants_from_showdown(
     Returns:
         One deduplicated team record per canonical team key.
     """
-    from p0.teams.source import _PACKER
-
     lines = text.replace("\r\n", "\n").split("\n")
     lines = [line for line in lines if not line.strip().startswith("===")]
     clean_text = "\n".join(lines)
 
     blocks = [b.strip() for b in clean_text.split("\n\n") if b.strip()]
-    if len(blocks) % 6 != 0:
-        raise ValueError(f"Showdown text contains {len(blocks)} blocks, not a multiple of 6")
-
-    team_counts = Counter("\n\n".join(blocks[i : i + 6]) for i in range(0, len(blocks), 6))
-    unique_teams = list(team_counts)
-    unique_text = "\n\n\n".join(unique_teams)
-    members = _PACKER.parse_showdown_team(unique_text)
-
-    if not members or len(members) != len(unique_teams) * 6:
+    if len(blocks) % TEAM_SIZE != 0:
         raise ValueError(
-            f"Showdown text parsed into {len(members)} members, expected {len(unique_teams) * 6}"
+            f"Showdown text contains {len(blocks)} blocks, not a multiple of {TEAM_SIZE}"
+        )
+
+    members = SHOWDOWN_TEAMBUILDER.parse_showdown_team("\n\n".join(blocks))
+    if not members or len(members) != len(blocks):
+        raise ValueError(
+            f"Showdown text parsed into {len(members)} members, expected {len(blocks)}"
         )
 
     # Only move categories are needed from the dex now: spreads come from the usage
@@ -81,8 +75,8 @@ def _variants_from_showdown(
         else {}
     )
 
-    canonical_dict: dict[str, tuple[CanonicalTeam, int]] = {}
-    for i in range(0, len(members), 6):
+    canonical_teams: dict[str, CanonicalTeam] = {}
+    for i in range(0, len(members), TEAM_SIZE):
         team_members = tuple(
             TeamMember(
                 species=m.species or m.nickname or "",
@@ -93,13 +87,10 @@ def _variants_from_showdown(
                 gender=m.gender or "",
                 level=m.level if m.level is not None else 100,
             )
-            for m in members[i : i + 6]
+            for m in members[i : i + TEAM_SIZE]
         )
         team = CanonicalTeam(team_members)
-        usage = team_counts[unique_teams[i // 6]]
-
-        previous = canonical_dict.get(team.team_key)
-        canonical_dict[team.team_key] = (team, usage + (0 if previous is None else previous[1]))
+        canonical_teams.setdefault(team.team_key, team)
 
     # Corpus teams sample the usage priors rather than taking the argmax, so generated
     # teams carry the meta's real spread variety. Seeded so builds stay reproducible.
@@ -107,7 +98,7 @@ def _variants_from_showdown(
     table = load_spread_table_file()
 
     variants: list[TeamRecord] = []
-    for team, usage in canonical_dict.values():
+    for team in canonical_teams.values():
         spreads_list: list[StatPoints] = []
         for m in team.members:
             categories = tuple(
@@ -125,9 +116,7 @@ def _variants_from_showdown(
                 continue
             spreads_list.append(estimate.points)
 
-        variants.append(
-            TeamRecord(team=team, spreads=tuple(spreads_list), metadata=TeamMetadata(usage))
-        )
+        variants.append(TeamRecord(team=team, spreads=tuple(spreads_list)))
 
     return tuple(variants)
 
@@ -173,7 +162,7 @@ def _parser() -> argparse.ArgumentParser:
         "--path",
         type=Path,
         required=True,
-        help="Team pool directory or corpus manifest path",
+        help="Team pool directory holding a built corpus manifest",
     )
     return parser
 
@@ -189,24 +178,22 @@ def main(argv: list[str] | None = None) -> None:
         tokenizer = PokemonTokenizer.from_file()
         format_id = FORMAT.battle_format
 
-        manifest, audit = build_corpus(
+        corpus, audit = build_corpus(
             variants,
             tokenizer=tokenizer,
             validator=partial(validate_many, format_id=format_id),
             format_id=format_id,
         )
-        if not manifest.entries:
-            raise ValueError(f"No admitted teams found in input path: {args.input}")
         output_dir = args.output_dir
         if output_dir is None:
             output_dir = args.input if args.input.is_dir() else args.input.parent
-        write_corpus_manifest(manifest, output_dir)
+        write_corpus_manifest(corpus, output_dir)
         print(json.dumps(audit, sort_keys=True))
         return
 
     if args.command == "audit":
-        raw = json.loads(corpus_manifest_path(args.path).read_text(encoding="utf-8"))
-        print(json.dumps(audit_corpus(TeamCorpusManifest.from_dict(raw)), sort_keys=True))
+        corpus = load_team_corpus(args.path, FORMAT.battle_format)
+        print(json.dumps(audit_corpus(corpus), sort_keys=True))
         return
 
 

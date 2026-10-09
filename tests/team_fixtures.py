@@ -4,24 +4,27 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from p0.format_config import FORMAT
+from p0.teams.corpus import TeamCorpus, pack_showdown_team
 from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
+from p0.teams.team import CanonicalTeam, TeamMember, TeamRecord
 
 
-def metadata(usage: int = 1) -> TeamMetadata:
-    """Build stable metadata for a team fixture."""
-    return TeamMetadata(usage_count=usage)
+def default_test_corpus() -> TeamCorpus:
+    """Build a one-team corpus holding the standard test team."""
+    return TeamCorpus(
+        format_id=FORMAT.battle_format,
+        teams=((pack_showdown_team(DEFAULT_TEST_TEAM),),),
+    )
 
 
 def team_variant(
     species: str = "Pikachu",
     item: str = "Light Ball",
     source_series: tuple[str, ...] = ("series-1",),
-    usage_count: int = 1,
     move: str = "Fake Out",
     members: Sequence[TeamMember] | None = None,
     spreads: tuple[StatPoints, ...] | None = None,
-    metadata: TeamMetadata | None = None,
 ) -> TeamRecord:
     """Build a valid six-member team record for corpus and validation tests."""
     if members is None:
@@ -73,7 +76,6 @@ def team_variant(
     return TeamRecord(
         team=CanonicalTeam(tuple(members)),
         spreads=spreads or tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
-        metadata=metadata or TeamMetadata(usage_count=usage_count),
     )
 
 

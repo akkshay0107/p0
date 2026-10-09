@@ -18,8 +18,7 @@ from p0.format_config import FORMAT
 from p0.paths import DEFAULT_PATHS
 from p0.runtime import poke_env_patches
 from p0.runtime.showdown import allocate_loopback_ports
-from p0.teams.source import FixedTeamSource
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from tests.team_fixtures import default_test_corpus
 
 
 @pytest.fixture(scope="module")
@@ -123,7 +122,7 @@ class TestEvaluation:
             name_a if outcome == "a" else name_b if outcome == "b" else "tie"
             for outcome in outcomes
         )
-        source = FixedTeamSource(DEFAULT_TEST_TEAM)
+        source = default_test_corpus()
         poke_env_patches.install()
         first = _ResultDrivingPlayer(
             outcomes=commands,
@@ -178,7 +177,7 @@ class TestEvaluation:
             episodes_per_matchup=1,
             seed=42,
         )
-        fallback = FixedTeamSource(DEFAULT_TEST_TEAM)
+        fallback = default_test_corpus()
 
         try:
             result = await harness.run_matchup(
@@ -219,7 +218,6 @@ class TestEvaluation:
             "win_rate_a",
             "confidence_interval_a",
             "per_team_results",
-            "source_description",
             "per_team_a_results",
             "per_team_b_results",
         }
@@ -254,7 +252,7 @@ class TestEvaluation:
                 name_b=name_b,
                 policy_b=policy_b,
                 team_category="fallback",
-                team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
+                team_source=default_test_corpus(),
                 server_configuration=showdown_server,
             )
         finally:
@@ -283,7 +281,7 @@ class TestEvaluation:
                 name_b="random-b",
                 policy_b=None,
                 team_category="fallback",
-                team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
+                team_source=default_test_corpus(),
                 server_configuration=showdown_server,
             )
         finally:
@@ -332,7 +330,7 @@ class TestEvaluation:
                 name_b=f"Opponent_{opponent_type}",
                 policy_b=opponent_type,
                 team_category="test_heuristics",
-                team_source=FixedTeamSource(DEFAULT_TEST_TEAM),
+                team_source=default_test_corpus(),
                 server_configuration=showdown_server,
             )
         finally:

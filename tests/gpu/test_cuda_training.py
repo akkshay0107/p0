@@ -19,6 +19,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.paths import DEFAULT_PATHS
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
+from p0.teams.corpus_build import write_corpus_manifest
 from p0.training.bc import BCTrainer
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig, GlobalConfig, TeamsConfig, TrainingConfig
@@ -27,7 +28,7 @@ from p0.training.ppo import ppo_update
 from p0.training.ppo_runner import run_training
 from p0.training.trajectory import CollectedTrajectory, prepare_trajectory_batches
 from p0.training.utils import select_optimization_precision
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from tests.team_fixtures import default_test_corpus
 
 pytestmark = pytest.mark.gpu
 MODEL_CONFIG = ModelConfig(32, 4, 1, 64)
@@ -416,8 +417,8 @@ class TestCudaTrainingLoops:
     def test_optimized_ppo_runner_trains_and_resumes_on_cuda(
         self, cuda_device: torch.device, tmp_path: Path
     ) -> None:
-        team = tmp_path / "team.txt"
-        team.write_text(DEFAULT_TEST_TEAM)
+        team = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), team)
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         store.save_policy(

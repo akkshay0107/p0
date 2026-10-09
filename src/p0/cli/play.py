@@ -16,7 +16,7 @@ from p0.cli import LOG_FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.rl_player import DEFAULT_BATTLE_FORMAT, RLPlayer, load_player_policy
 from p0.runtime import poke_env_patches
-from p0.teams.source import FileTeamSource, TeamSource, build_team_source
+from p0.teams.corpus import TeamCorpus, corpus_from_team_files, load_team_corpus
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.config import BotConfig, GlobalConfig, load_config
 
@@ -69,7 +69,7 @@ def _server_configuration(bot: BotConfig) -> ServerConfiguration:
 async def run_bot(
     app_config: GlobalConfig,
     checkpoint_path: Path | None,
-    team_source: TeamSource,
+    team_source: TeamCorpus,
     account_configuration: AccountConfiguration,
     server_configuration: ServerConfiguration,
     *,
@@ -136,11 +136,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         server_configuration = _server_configuration(app_config.bot)
         team_source = (
-            FileTeamSource.from_files(args.team_file)
+            corpus_from_team_files(args.team_file, DEFAULT_BATTLE_FORMAT)
             if args.team_file
-            else build_team_source(
+            else load_team_corpus(
                 app_config.teams.all if args.team_pool != "reduced" else app_config.teams.reduced,
-                expected_format_id=DEFAULT_BATTLE_FORMAT,
+                DEFAULT_BATTLE_FORMAT,
             )
         )
     except (OSError, KeyError, TypeError, ValueError) as exc:

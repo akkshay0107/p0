@@ -11,8 +11,7 @@ from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.rl_player import RLPlayer
 from p0.runtime import poke_env_patches
-from p0.teams.source import FixedTeamSource
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from tests.team_fixtures import default_test_corpus
 
 
 class TestLiveBo3:
@@ -24,8 +23,8 @@ class TestLiveBo3:
     ) -> None:
         """Play one complete local Showdown Bo3 and verify public player state is reclaimed."""
         poke_env_patches.install()
-        source = FixedTeamSource(DEFAULT_TEST_TEAM)
-        random_source = FixedTeamSource(DEFAULT_TEST_TEAM)
+        source = default_test_corpus()
+        random_source = default_test_corpus()
         rl_player = RLPlayer(
             policy=model_policy,
             battle_format=FORMAT.bo3_format,
@@ -39,7 +38,7 @@ class TestLiveBo3:
         random_player = RandomPlayer(
             battle_format=FORMAT.bo3_format,
             server_configuration=showdown_server,
-            team=random_source.sample(random.Random(19)).packed,
+            team=random_source.sample(random.Random(19)),
             account_configuration=AccountConfiguration("StressBo3Random", None),
             accept_open_team_sheet=True,
             max_concurrent_battles=1,

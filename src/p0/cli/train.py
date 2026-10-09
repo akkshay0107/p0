@@ -13,10 +13,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the p0 VGC policy.")
     parser.add_argument("--config", help="Path to the YAML application configuration.")
     parser.add_argument(
-        "--agent-team-source",
-        choices=("all", "reduced"),
-        default="all",
-        help="Team pool used by the self-play agent; the opponent always uses all.",
+        "--reduced",
+        action="store_true",
+        help="Sample one seat's teams from the reduced corpus; the other seat keeps all.",
     )
     return parser
 
@@ -27,6 +26,6 @@ def main(argv: list[str] | None = None) -> int:
         run_training(
             load_config(args.config),
             cancel_requested=cancel_requested,
-            agent_team_source=args.agent_team_source,
+            reduced=args.reduced,
         )
     return 0

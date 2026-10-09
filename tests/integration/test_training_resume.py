@@ -15,6 +15,7 @@ from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.paths import DEFAULT_PATHS
+from p0.teams.corpus_build import write_corpus_manifest
 from p0.training.checkpoint import CheckpointStore
 from p0.training.config import GlobalConfig, TeamsConfig, TrainingConfig
 from p0.training.files import training_run
@@ -25,15 +26,15 @@ from p0.training.trajectory import (
     CollectedTrajectory,
     prepare_trajectory_batches,
 )
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from tests.team_fixtures import default_test_corpus
 
 
 @pytest.mark.heavy
 class TestTrainingResume:
     @pytest.mark.integration
     def test_short_rollout_windows_reach_updates_and_resume(self, tmp_path: Path) -> None:
-        team = tmp_path / "team.txt"
-        team.write_text(DEFAULT_TEST_TEAM)
+        team = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), team)
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
@@ -83,8 +84,8 @@ class TestTrainingResume:
 
     @pytest.mark.integration
     def test_ppo_resume_continues_training_and_metrics(self, tmp_path: Path) -> None:
-        team = tmp_path / "team.txt"
-        team.write_text(DEFAULT_TEST_TEAM)
+        team = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), team)
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
@@ -152,8 +153,8 @@ class TestTrainingResume:
     def test_cancel_at_initial_team_preview_saves_a_resumable_checkpoint(
         self, tmp_path: Path
     ) -> None:
-        team = tmp_path / "team.txt"
-        team.write_text(DEFAULT_TEST_TEAM)
+        team = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), team)
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())

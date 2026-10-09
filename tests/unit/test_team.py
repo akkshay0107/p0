@@ -11,12 +11,11 @@ from p0.teams.stat_points import StatPoints
 from p0.teams.team import (
     CanonicalTeam,
     TeamMember,
-    TeamMetadata,
     TeamRecord,
     deduplicate_variants,
     normalize_id,
 )
-from tests.team_fixtures import metadata, team_variant
+from tests.team_fixtures import team_variant
 
 
 class TestNormalizeId:
@@ -150,12 +149,6 @@ class TestCanonicalTeam:
         assert restored == team.canonical()
 
 
-class TestTeamMetadata:
-    def test_validation(self) -> None:
-        with pytest.raises(ValueError, match="Usage count must be positive"):
-            TeamMetadata(usage_count=0)
-
-
 class TestTeamRecord:
     def test_spread_count_must_match_members(self) -> None:
         variant = team_variant()
@@ -163,22 +156,11 @@ class TestTeamRecord:
             TeamRecord(
                 team=variant.team,
                 spreads=variant.spreads[:5],
-                metadata=variant.metadata,
-            )
-
-    def test_invalid_spread_provenance_raises(self) -> None:
-        variant = team_variant()
-        with pytest.raises(ValueError, match="spread_provenance='imputed'"):
-            TeamRecord(
-                team=variant.team,
-                spreads=variant.spreads,
-                metadata=variant.metadata,
-                spread_provenance="exact",
             )
 
 
 class TestDeduplicateVariants:
-    def test_merges_metadata_and_preserves_spread_variants(self) -> None:
+    def test_merges_reordered_duplicates_and_preserves_spread_variants(self) -> None:
         first = team_variant()
         first = replace(
             first,
@@ -191,11 +173,10 @@ class TestDeduplicateVariants:
                 StatPoints(spe=6),
             ),
         )
-        duplicate = replace(first, metadata=metadata(usage=2))
         reordered = replace(
-            duplicate,
-            team=CanonicalTeam(tuple(reversed(duplicate.team.members))),
-            spreads=tuple(reversed(duplicate.spreads)),
+            first,
+            team=CanonicalTeam(tuple(reversed(first.team.members))),
+            spreads=tuple(reversed(first.spreads)),
         )
         alternate = replace(
             first,
@@ -204,7 +185,6 @@ class TestDeduplicateVariants:
         result = deduplicate_variants((reordered, alternate, first))
         assert len(result) == 2
         merged = next(item for item in result if len(set(item.spreads)) == 6)
-        assert merged.metadata.usage_count == 3
         associations = tuple(
             (member.canonical().species, spread.as_tuple())
             for member, spread in sorted(

@@ -11,7 +11,7 @@ from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.runtime.showdown import allocate_loopback_ports, start_showdown_servers
-from p0.teams.source import ValidatedTeam
+from p0.teams.corpus import pack_showdown_team
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
@@ -29,7 +29,7 @@ def sample_team() -> str:
     Packed format is required for direct wire transmission when initializing
     Showdown player sessions.
     """
-    return ValidatedTeam.from_showdown(DEFAULT_TEST_TEAM).packed
+    return pack_showdown_team(DEFAULT_TEST_TEAM)
 
 
 @pytest.fixture(scope="function")

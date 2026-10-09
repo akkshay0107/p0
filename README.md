@@ -54,9 +54,14 @@ Training starts from random weights and manages its own Showdown servers. By def
 it saves to `artifacts/checkpoints/ppo_checkpoint.pt`, with metrics and TensorBoard
 logs under `artifacts/runs/ppo_training/`. Use empty output locations for a new run.
 
-For a smaller agent pool, supply exports in `teams/reduced/`, build it with
-`p0-corpus build --input teams/reduced`, and run `p0-train --agent-team-source reduced`.
-The opponent still samples from `teams/all/`; the reduced pool is optional.
+Both self-play seats sample teams from the built corpus in `teams/all/`. Training,
+evaluation, and pool-based live play read only the built corpus, so rebuild it after
+adding or changing team exports. A corpus built by an older version must be rebuilt.
+
+To fine-tune on a smaller set, supply exports in `teams/reduced/`, build it with
+`p0-corpus build --input teams/reduced`, and run `p0-train --reduced`. One seat then
+samples from `teams/reduced/` and the other still samples from `teams/all/`; both
+seats contribute gradients. The reduced pool is optional.
 
 Set `paths.resume_checkpoint` in `config.yaml` to resume a training checkpoint,
 or `paths.initial_policy_checkpoint` to start a new run from policy weights.

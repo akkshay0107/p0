@@ -1,107 +1,107 @@
-"""Validated team variants grouped by canonical team UUID."""
+"""The built team corpus that live players sample their teams from."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from typing import Any, Mapping
+import random
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import orjson
+from poke_env.teambuilder import Teambuilder
 
 from p0.contracts import require_dataclass_fields
+from p0.format_config import is_corpus_format_compatible
 
-CORPUS_MANIFEST_SCHEMA = "p0.team_corpus.v2"
+CORPUS_MANIFEST_NAME = "corpus_manifest.json"
+TEAM_SIZE = 6
 
 
-@dataclass(frozen=True, slots=True)
-class CorpusEntry:
-    """One admitted team: canonical identity plus its packed runtime form."""
+class _ShowdownTeambuilder(Teambuilder):
+    def yield_team(self) -> str:
+        raise RuntimeError("The parsing helper is not a runtime team builder")
 
-    canonical_id: str
-    packed: str
-    usage_count: int
-    spread_provenance: str = "imputed"
 
-    def __post_init__(self) -> None:
-        if not self.canonical_id or not self.packed:
-            raise ValueError("Corpus entries require a canonical team ID and packed team")
-
-        if type(self.usage_count) is not int or self.usage_count < 1:
-            raise ValueError("CorpusEntry.usage_count must be a positive integer")
-
-        if self.spread_provenance not in ("imputed", "exact"):
-            raise ValueError("CorpusEntry.spread_provenance must be 'imputed' or 'exact'")
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> CorpusEntry:
-        require_dataclass_fields(value, cls)
-        return cls(
-            canonical_id=str(value["canonical_id"]),
-            packed=str(value["packed"]),
-            usage_count=int(value["usage_count"]),
-            spread_provenance=str(value["spread_provenance"]),
-        )
+SHOWDOWN_TEAMBUILDER = _ShowdownTeambuilder()
 
 
 @dataclass(frozen=True, slots=True)
-class TeamCorpusManifest:
-    """The single loadable description of a validated team corpus."""
+class TeamCorpus:
+    """Packed teams for one format; each group holds the variants of one canonical team."""
 
     format_id: str
-    corpus_id: str
-    entries: tuple[CorpusEntry, ...]
-    created_at: str
-    sampling_metadata: Mapping[str, Any]
-    artifact_schema: str = CORPUS_MANIFEST_SCHEMA
+    teams: tuple[tuple[str, ...], ...]
 
     def __post_init__(self) -> None:
-        if self.artifact_schema != CORPUS_MANIFEST_SCHEMA:
-            raise ValueError(
-                f"Unsupported corpus manifest schema {self.artifact_schema!r}; "
-                f"expected {CORPUS_MANIFEST_SCHEMA}"
-            )
-
         if not self.format_id:
-            raise ValueError("TeamCorpusManifest.format_id must be non-empty")
+            raise ValueError("TeamCorpus.format_id must be non-empty")
 
-        seen: set[tuple[str, str]] = set()
-        for entry in self.entries:
-            key = (entry.canonical_id, entry.packed)
-            if key in seen:
-                raise ValueError(f"Duplicate corpus entry {entry.canonical_id}")
-            seen.add(key)
+        if not self.teams or not all(group and all(group) for group in self.teams):
+            raise ValueError("A team corpus requires at least one team and no empty entries")
 
-        try:
-            datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError("TeamCorpusManifest.created_at must be ISO-8601") from exc
-
-        for key in self.sampling_metadata:
-            if not isinstance(key, str):
-                raise ValueError("Sampling metadata keys must be strings")
+    def sample(self, rng: random.Random) -> str:
+        """Return one packed team, uniform over canonical teams and then over variants."""
+        return rng.choice(rng.choice(self.teams))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "artifact_schema": self.artifact_schema,
-            "format_id": self.format_id,
-            "corpus_id": self.corpus_id,
-            "entries": [entry.to_dict() for entry in self.entries],
-            "created_at": self.created_at,
-            "sampling_metadata": dict(self.sampling_metadata),
-        }
+        return {"format_id": self.format_id, "teams": [list(group) for group in self.teams]}
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> TeamCorpusManifest:
+    def from_dict(cls, value: Mapping[str, Any]) -> TeamCorpus:
         require_dataclass_fields(value, cls)
-        metadata = value["sampling_metadata"]
-        if not isinstance(metadata, Mapping):
-            raise ValueError("TeamCorpusManifest.sampling_metadata must be a JSON object")
         return cls(
-            artifact_schema=str(value["artifact_schema"]),
             format_id=str(value["format_id"]),
-            corpus_id=str(value["corpus_id"]),
-            entries=tuple(CorpusEntry.from_dict(entry) for entry in value["entries"]),
-            created_at=str(value["created_at"]),
-            sampling_metadata=dict(metadata),
+            teams=tuple(tuple(str(team) for team in group) for group in value["teams"]),
         )
+
+
+def pack_showdown_team(text: str) -> str:
+    """Convert one six-member Showdown export into the packed team format."""
+    try:
+        members = SHOWDOWN_TEAMBUILDER.parse_showdown_team(text)
+        if len(members) != TEAM_SIZE:
+            raise ValueError(f"Expected exactly {TEAM_SIZE} team members")
+        packed = SHOWDOWN_TEAMBUILDER.join_team(members)
+    # The third-party teambuilder exposes several parser exception types;
+    # normalize all of them at this boundary.
+    except Exception as exc:
+        raise ValueError("Malformed Showdown team") from exc
+
+    if not packed:
+        raise ValueError("Malformed Showdown team")
+    return packed
+
+
+def corpus_from_team_files(paths: Sequence[str | Path], format_id: str) -> TeamCorpus:
+    """Build a corpus from export files of one team each, without Showdown validation."""
+    teams: list[tuple[str, ...]] = []
+    for path in paths:
+        try:
+            teams.append((pack_showdown_team(Path(path).read_text(encoding="utf-8")),))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Malformed team file: {path}") from exc
+
+    return TeamCorpus(format_id=format_id, teams=tuple(teams))
+
+
+def load_team_corpus(directory: str | Path, expected_format_id: str) -> TeamCorpus:
+    """Load the built corpus of a team pool directory and check its format."""
+    manifest_path = Path(directory) / CORPUS_MANIFEST_NAME
+    build_command = f"`p0-corpus build --input {directory}`"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"No team corpus at {manifest_path}; build it with {build_command}")
+
+    try:
+        corpus = TeamCorpus.from_dict(orjson.loads(manifest_path.read_bytes()))
+    except (OSError, AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid corpus manifest {manifest_path}; rebuild it with {build_command}: {exc}"
+        ) from exc
+
+    if not is_corpus_format_compatible(expected_format_id, corpus.format_id):
+        raise ValueError(
+            f"Corpus format mismatch: manifest={corpus.format_id!r}, "
+            f"expected={expected_format_id!r}"
+        )
+    return corpus

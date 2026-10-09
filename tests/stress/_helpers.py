@@ -16,7 +16,7 @@ from p0.format_config import FORMAT
 from p0.model.resources import default_runtime_resources
 from p0.paths import DEFAULT_PATHS
 from p0.teams.stat_points import StatPoints
-from p0.teams.team import CanonicalTeam, TeamMember, TeamMetadata, TeamRecord
+from p0.teams.team import CanonicalTeam, TeamMember, TeamRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +230,6 @@ def stress_random_team_record(rng: random.Random, *, label: str = "stress") -> T
     return TeamRecord(
         team=CanonicalTeam(members),
         spreads=tuple(_random_stat_points(rng) for _ in members),
-        metadata=TeamMetadata(),
     )
 
 

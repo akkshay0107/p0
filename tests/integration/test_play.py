@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +15,7 @@ from poke_env.player import RandomPlayer
 
 from p0.format_config import FORMAT
 from p0.runtime import poke_env_patches
-from p0.teams.source import FixedTeamSource
+from p0.teams.corpus import pack_showdown_team
 from p0.training.checkpoint import CheckpointStore
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
@@ -46,7 +45,7 @@ class TestPlayCommand:
         opponent = RandomPlayer(
             battle_format=FORMAT.bo3_format,
             server_configuration=showdown_server,
-            team=FixedTeamSource(DEFAULT_TEST_TEAM).sample(random.Random(1)).packed,
+            team=pack_showdown_team(DEFAULT_TEST_TEAM),
             account_configuration=AccountConfiguration("PlayOpponent", None),
             accept_open_team_sheet=True,
             max_concurrent_battles=1,

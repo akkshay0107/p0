@@ -10,12 +10,11 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.runtime import poke_env_patches
 from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
-from p0.teams.source import FixedTeamSource
 from p0.training.config import TrainingConfig
 from p0.training.rollout import RolloutCollector
 from p0.training.trajectory import CollectedTrajectory
 from p0.training.vector_env import ThreadVecEnv
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from tests.team_fixtures import default_test_corpus
 
 
 @pytest.mark.heavy
@@ -27,8 +26,8 @@ class TestPpoSimulation:
         if server_port is None:
             raise ValueError("The integration server configuration has no websocket port")
 
-        agent_sources = [FixedTeamSource(DEFAULT_TEST_TEAM) for _ in range(2)]
-        opponent_sources = [FixedTeamSource(DEFAULT_TEST_TEAM) for _ in range(2)]
+        agent_sources = [default_test_corpus() for _ in range(2)]
+        opponent_sources = [default_test_corpus() for _ in range(2)]
         envs: list[SimEnv] = []
         vector_env: ThreadVecEnv | None = None
         completed_series: set[int] = set()

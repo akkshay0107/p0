@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import random
 from pathlib import Path
 
@@ -23,9 +22,9 @@ from p0.format_config import FORMAT
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
-from p0.teams.corpus import CorpusEntry, TeamCorpusManifest
-from p0.teams.source import CorpusTeamSource, FixedTeamSource
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from p0.teams.corpus import TeamCorpus
+from p0.teams.corpus_build import write_corpus_manifest
+from tests.team_fixtures import default_test_corpus
 
 
 class TestEvaluationHarness:
@@ -38,33 +37,16 @@ class TestEvaluationHarness:
             harness.build_team_source()
 
     def test_evaluation_harness_accepts_regular_manifest_for_bo3(self, tmp_path: Path) -> None:
-        entries = (
-            CorpusEntry(
-                canonical_id="team-1",
-                packed="packed-team-1",
-                usage_count=1,
-            ),
-        )
-        manifest = TeamCorpusManifest(
-            format_id=FORMAT.battle_format,
-            corpus_id="corpus-test",
-            entries=entries,
-            created_at="2026-08-19T00:00:00Z",
-            sampling_metadata={},
-        )
+        corpus = TeamCorpus(format_id=FORMAT.battle_format, teams=(("packed-team-1",),))
         pool_dir = tmp_path / "all"
-        pool_dir.mkdir()
-        (pool_dir / "corpus_manifest.json").write_text(
-            json.dumps(manifest.to_dict()), encoding="utf-8"
-        )
+        write_corpus_manifest(corpus, pool_dir)
 
         harness = EvaluationHarness(teams_path=pool_dir)
-        source = harness.build_team_source()
-        assert isinstance(source, CorpusTeamSource)
+        assert harness.build_team_source() == corpus
 
     def test_create_eval_player_constructs_supported_opponents(self) -> None:
         """Verify create_eval_player instantiates the expected baseline or policy players."""
-        team_source = FixedTeamSource(DEFAULT_TEST_TEAM)
+        team_source = default_test_corpus()
         rng = random.Random(42)
         server_config = LocalhostServerConfiguration
         account_config = AccountConfiguration("evaluser", None)

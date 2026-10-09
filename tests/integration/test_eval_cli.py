@@ -8,15 +8,16 @@ from pathlib import Path
 import pytest
 
 from p0.cli.eval import main
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from p0.teams.corpus_build import write_corpus_manifest
+from tests.team_fixtures import default_test_corpus
 
 
 @pytest.mark.heavy
 class TestEvaluationCLI:
     @pytest.mark.integration
     def test_completed_matchup_writes_report(self, tmp_path: Path) -> None:
-        team_path = tmp_path / "team.txt"
-        team_path.write_text(DEFAULT_TEST_TEAM)
+        team_path = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), team_path)
         config_path = tmp_path / "config.yaml"
         config_path.write_text("{}\n", encoding="utf-8")
         report_dir = tmp_path / "reports"

@@ -11,7 +11,7 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.runtime.env import SimEnv
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.runtime.showdown import local_server_configuration
-from p0.teams.source import TeamSource
+from p0.teams.corpus import TeamCorpus
 
 
 def build_sim_env(
@@ -19,8 +19,8 @@ def build_sim_env(
     account_configuration1: AccountConfiguration,
     account_configuration2: AccountConfiguration,
     server_port: int,
-    agent_team_source: TeamSource,
-    opponent_team_source: TeamSource,
+    agent_team_source: TeamCorpus,
+    opponent_team_source: TeamCorpus,
     observation_builder: ObservationBuilder,
     agent_seed: int = 0,
     opponent_seed: int = 1,
@@ -38,7 +38,7 @@ def build_sim_env(
         accept_open_team_sheet=True,
         start_timer_on_battle_start=False,
         log_level=25,
-        team=initial_agent_team.packed,
+        team=initial_agent_team,
         observation_builder=observation_builder,
         battle_view_factory=battle_view,
         agent_team_source=agent_team_source,
@@ -47,5 +47,5 @@ def build_sim_env(
         opponent_rng=opponent_rng,
     )
 
-    env.agent2.update_team(opponent_team_source.sample(random.Random(opponent_seed)).packed)
+    env.agent2.update_team(opponent_team_source.sample(random.Random(opponent_seed)))
     return env

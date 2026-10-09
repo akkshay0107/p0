@@ -19,7 +19,7 @@ from p0.format_config import active_runtime_contract
 from p0.model.policy import PolicyNet
 from p0.persistence import atomic_json_save
 from p0.runtime.showdown import local_server_configuration, start_showdown_servers
-from p0.teams.source import TeamSource
+from p0.teams.corpus import TeamCorpus
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE
 from p0.training.config import load_config
 from p0.training.utils import default_device
@@ -51,7 +51,7 @@ def _parser() -> argparse.ArgumentParser:
 
 async def _run_matchup(
     harness: EvaluationHarness,
-    source: TeamSource,
+    source: TeamCorpus,
     policy_a: PolicyNet | None,
     opponent_name: str,
     opponent: PolicyNet | str,

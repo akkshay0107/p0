@@ -31,7 +31,7 @@ from p0.runtime import poke_env_patches
 from p0.runtime.live_event_capture import consume_events, is_retry
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view
-from p0.teams.source import TeamSource
+from p0.teams.corpus import TeamCorpus
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
 from p0.training.utils import default_device
 
@@ -73,9 +73,9 @@ class _LiveSeriesState:
 
 
 class TeamPlayerMixin:
-    """Mixin adding team sampling and resampling from a TeamSource to any Player."""
+    """Mixin adding team sampling and resampling from a TeamCorpus to any Player."""
 
-    team_source: TeamSource | None
+    team_source: TeamCorpus | None
     team_rng: random.Random
     current_team_packed: str | None
 
@@ -83,7 +83,7 @@ class TeamPlayerMixin:
         self,
         *args,
         team_rng: random.Random,
-        team_source: TeamSource | None = None,
+        team_source: TeamCorpus | None = None,
         **kwargs,
     ):
         self.team_source = team_source
@@ -92,7 +92,7 @@ class TeamPlayerMixin:
         if team_source is not None:
             if "team" in kwargs:
                 raise ValueError("Pass either team or team_source, not both")
-            self.current_team_packed = team_source.sample(team_rng).packed
+            self.current_team_packed = team_source.sample(team_rng)
             kwargs["team"] = self.current_team_packed
         else:
             self.current_team_packed = kwargs.get("team")
@@ -112,7 +112,7 @@ class TeamPlayerMixin:
         super()._battle_finished_callback(battle)  # pyright: ignore[reportAttributeAccessIssue]
 
         if resample_team and self.team_source is not None:
-            self.update_team(self.team_source.sample(self.team_rng).packed)
+            self.update_team(self.team_source.sample(self.team_rng))
 
         battle_id = getattr(battle, "battle_tag", None)
         battles = getattr(self, "_battles", None)
@@ -139,7 +139,7 @@ class RLPlayer(TeamPlayerMixin, Player):
         *,
         observation_builder: ObservationBuilder,
         team_rng: random.Random,
-        team_source: TeamSource | None = None,
+        team_source: TeamCorpus | None = None,
         top_p: float = 0.9,
         battle_format: str = DEFAULT_BATTLE_FORMAT,
         **kwargs,

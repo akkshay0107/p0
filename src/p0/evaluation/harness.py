@@ -21,7 +21,7 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.policy import PolicyNet
 from p0.rl_player import RLPlayer, TeamPlayerMixin
 from p0.runtime import poke_env_patches
-from p0.teams.source import TeamSource, build_team_source
+from p0.teams.corpus import TeamCorpus, load_team_corpus
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ def create_eval_player(
     spec: PolicyNet | str | None,
     *,
     team_rng: random.Random,
-    team_source: TeamSource,
+    team_source: TeamCorpus,
     battle_format: str,
     server_configuration: ServerConfiguration,
     account_configuration: AccountConfiguration,
@@ -194,7 +194,6 @@ class MatchupResult:
     confidence_interval_a: tuple[float, float]
     team_category: str = "default"
     per_team_results: Mapping[str, Any] = field(default_factory=dict)
-    source_description: Mapping[str, Any] = field(default_factory=dict)
     per_team_a_results: Mapping[str, Any] = field(default_factory=dict)
     per_team_b_results: Mapping[str, Any] = field(default_factory=dict)
 
@@ -210,7 +209,6 @@ class MatchupResult:
             "win_rate_a": self.win_rate_a,
             "confidence_interval_a": list(self.confidence_interval_a),
             "per_team_results": dict(self.per_team_results),
-            "source_description": dict(self.source_description),
             "per_team_a_results": dict(self.per_team_a_results),
             "per_team_b_results": dict(self.per_team_b_results),
         }
@@ -240,17 +238,12 @@ class EvaluationHarness:
         self.episodes_per_matchup = episodes_per_matchup
         self.rng = random.Random(seed)
 
-    def build_team_source(self) -> TeamSource:
-        """Build team source from the configured teams path."""
+    def build_team_source(self) -> TeamCorpus:
+        """Load the team corpus from the configured teams path."""
         if self.teams_path is None:
             raise ValueError("Evaluation requires teams_path to build a team source")
-        if not self.teams_path.exists():
-            raise FileNotFoundError(f"Evaluation teams path not found: {self.teams_path}")
 
-        return build_team_source(
-            self.teams_path,
-            expected_format_id=self.format_id,
-        )
+        return load_team_corpus(self.teams_path, self.format_id)
 
     async def run_matchup(
         self,
@@ -259,7 +252,7 @@ class EvaluationHarness:
         name_b: str,
         policy_b: PolicyNet | str | None,
         *,
-        team_source: TeamSource,
+        team_source: TeamCorpus,
         server_configuration: ServerConfiguration,
         team_category: str = "default",
     ) -> MatchupResult:
@@ -365,7 +358,6 @@ class EvaluationHarness:
             confidence_interval_a=ci_a,
             team_category=team_category,
             per_team_results=per_team,
-            source_description=dict(team_source.describe()),
             per_team_a_results=per_team_a,
             per_team_b_results=per_team_b,
         )

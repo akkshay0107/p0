@@ -25,7 +25,7 @@ from p0.runtime import poke_env_patches
 from p0.runtime.live_event_capture import consume_events, is_retry
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view, current_battle_view
-from p0.teams.source import TeamSource
+from p0.teams.corpus import TeamCorpus
 
 ACT_SIZE = FORMAT.action_size
 DECISION_STEP_LIMIT = 198
@@ -105,8 +105,8 @@ class SimEnv(MegaEnv):
         *,
         observation_builder: ObservationBuilder,
         battle_view_factory: Callable[[DoubleBattle], BattleView],
-        agent_team_source: TeamSource,
-        opponent_team_source: TeamSource,
+        agent_team_source: TeamCorpus,
+        opponent_team_source: TeamCorpus,
         agent_rng: random.Random,
         opponent_rng: random.Random,
         **kwargs,
@@ -169,8 +169,8 @@ class SimEnv(MegaEnv):
             self._series_scores = [0, 0]
             self._series_games_played = 0
             self.series_id = str(uuid.uuid4())
-            self.agent1.update_team(self._agent_team_source.sample(self._agent_rng).packed)
-            self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng).packed)
+            self.agent1.update_team(self._agent_team_source.sample(self._agent_rng))
+            self.agent2.update_team(self._opponent_team_source.sample(self._opponent_rng))
 
         self._decision_steps = 0
         # Count the game that reset is about to start.

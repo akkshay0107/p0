@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Mapping, cast
 
 import orjson
@@ -108,27 +108,13 @@ class CanonicalTeam:
 
 
 @dataclass(frozen=True, slots=True)
-class TeamMetadata:
-    usage_count: int = 1
-
-    def __post_init__(self) -> None:
-        if self.usage_count < 1:
-            raise ValueError("Usage count must be positive")
-
-
-@dataclass(frozen=True, slots=True)
 class TeamRecord:
     team: CanonicalTeam
     spreads: tuple[StatPoints, ...]
-    metadata: TeamMetadata = TeamMetadata()
-    spread_provenance: str = "imputed"
 
     def __post_init__(self) -> None:
         if len(self.spreads) != len(self.team.members):
             raise ValueError("Each team member requires one Stat Point spread")
-
-        if self.spread_provenance != "imputed":
-            raise ValueError("Reconstructed public teams must have spread_provenance='imputed'")
 
 
 def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ...]:
@@ -147,16 +133,6 @@ def deduplicate_variants(variants: Sequence[TeamRecord]) -> tuple[TeamRecord, ..
                 )
             )
 
-        key = (variant.team.team_key, canonical_spreads)
-        previous = deduped.get(key)
-
-        if previous is None:
-            deduped[key] = variant
-            continue
-
-        metadata = TeamMetadata(
-            usage_count=previous.metadata.usage_count + variant.metadata.usage_count,
-        )
-        deduped[key] = replace(previous, metadata=metadata)
+        deduped.setdefault((variant.team.team_key, canonical_spreads), variant)
 
     return tuple(deduped[k] for k in sorted(deduped, key=lambda item: (item[0], repr(item[1]))))

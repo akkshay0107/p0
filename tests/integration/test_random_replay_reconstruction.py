@@ -64,11 +64,11 @@ from p0.runtime import poke_env_patches
 from p0.runtime.live_event_capture import captured_protocol_lines, consume_events
 from p0.runtime.poke_env_action_adapter import order_to_action
 from p0.runtime.poke_env_battle_adapter import battle_view
-from p0.teams.source import FileTeamSource
+from p0.teams.corpus import TeamCorpus, corpus_from_team_files
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import TeamMember
 from tests.stress._helpers import stress_count, stress_random_team_record
-from tests.team_fixtures import DEFAULT_TEST_TEAM
+from tests.team_fixtures import default_test_corpus
 
 # Cant reasons emitted by the checked-in Showdown commit for the champions
 # format.  The source locations are data/conditions.ts, data/abilities.ts,
@@ -189,7 +189,7 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         observation_dir: Path,
         replay_dir: Path | None = None,
         write_replays: bool = False,
-        team_source: FileTeamSource,
+        team_source: TeamCorpus,
         team_rng: random.Random,
         handler_failure: Future[None],
         **kwargs: Any,
@@ -382,7 +382,7 @@ def _stress_timeout(game_count: int) -> float:
 
 
 def _showdown_team_text(team: tuple[TeamMember, ...], spreads: tuple[StatPoints, ...]) -> str:
-    """Serialize a generated team into the Showdown text format used by FileTeamSource."""
+    """Serialize a generated team into the Showdown text format read by corpus_from_team_files."""
     stat_names = {
         "hp": "HP",
         "atk": "Atk",
@@ -408,8 +408,8 @@ def _showdown_team_text(team: tuple[TeamMember, ...], spreads: tuple[StatPoints,
     return "\n\n".join(sets) + "\n"
 
 
-def _random_team_source(directory: Path, *, seed: int, count: int) -> FileTeamSource:
-    """Create a temporary FileTeamSource populated only with generated legal teams."""
+def _random_team_source(directory: Path, *, seed: int, count: int) -> TeamCorpus:
+    """Create a corpus populated only with generated legal teams."""
     directory.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     for index in range(count):
@@ -417,7 +417,7 @@ def _random_team_source(directory: Path, *, seed: int, count: int) -> FileTeamSo
         (directory / f"random-{index:04d}.txt").write_text(
             _showdown_team_text(record.team.members, record.spreads), encoding="utf-8"
         )
-    return FileTeamSource(directory)
+    return corpus_from_team_files(sorted(directory.iterdir()), FORMAT.battle_format)
 
 
 def _load_live_artifact(path: Path) -> dict[str, Any]:
@@ -954,10 +954,7 @@ class TestReplayCaptureHarness:
         self, showdown_server, tmp_path: Path
     ) -> None:
         # A real filesystem error exercises failure delivery from poke-env's completion callback.
-        teams = tmp_path / "teams"
-        teams.mkdir()
-        (teams / "team.txt").write_text(DEFAULT_TEST_TEAM)
-        team_source = FileTeamSource(teams)
+        team_source = default_test_corpus()
         blocked_output = tmp_path / "observations"
         blocked_output.write_text("An existing file cannot be an artifact directory")
         failure: Future[None] = Future()
@@ -978,7 +975,7 @@ class TestReplayCaptureHarness:
             account_configuration=AccountConfiguration("StressFailureB", None),
             battle_format=FORMAT.battle_format,
             server_configuration=showdown_server,
-            team=team_source.sample(random.Random(4)).packed,
+            team=team_source.sample(random.Random(4)),
             accept_open_team_sheet=True,
             max_concurrent_battles=1,
         )
