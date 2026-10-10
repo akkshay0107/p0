@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import os
 import shutil
@@ -63,7 +62,6 @@ from p0.replays.shards import (
     validate_shard_summaries,
     validate_shard_tensors,
 )
-from p0.runtime.process_context import PROCESS_CONTEXT
 
 LOGGER = logging.getLogger(__name__)
 
@@ -677,21 +675,17 @@ def _initial_compilation_counters(grouping: GroupingResult) -> Counter[str]:
     return counters
 
 
-def _compile_worker(
-    args: tuple[
-        ReplayDocument,
-        str,
-        int,
-        tuple[int, int],
-        int,
-    ],
-) -> tuple[CompiledGame | None, ReplayRejectionCategory | None]:
-    document, series_id, game_number, roles, max_candidates = args
-    runtime_dex = default_runtime_resources().dex
-
+def _compile_game(
+    document: ReplayDocument,
+    series_id: str,
+    game_number: int,
+    roles: tuple[int, int],
+    max_candidates: int,
+    runtime_dex: Mapping[str, Any],
+) -> CompiledGame | ReplayRejectionCategory:
     resolved = resolve_replay_events(document, dex=runtime_dex)
     if resolved.diagnostics:
-        return None, resolved.diagnostics[0].category
+        return resolved.diagnostics[0].category
     events = resolved.require_accepted()
     windows = infer_decision_windows(events)
 
@@ -704,7 +698,7 @@ def _compile_worker(
     )
 
     if state.diagnostics:
-        return None, state.diagnostics[0].category
+        return state.diagnostics[0].category
     decisions = tuple(
         reconstruct_decisions_from_trace(
             document,
@@ -722,7 +716,7 @@ def _compile_worker(
         diagnostic for result in decisions for diagnostic in result.diagnostics
     )
     if decision_diagnostics:
-        return None, decision_diagnostics[0].category
+        return decision_diagnostics[0].category
 
     perspectives = project_replay_perspectives(
         document,
@@ -733,17 +727,14 @@ def _compile_worker(
     )
     estimates = impute_replay_stats(document, dex=runtime_dex)
 
-    return (
-        CompiledGame(
-            series_id=series_id,
-            game_number=game_number,
-            replay_id=document.metadata.replay_id,
-            canonical_player_roles=roles,
-            document=document,
-            perspectives=perspectives,
-            stat_estimates=estimates,
-        ),
-        None,
+    return CompiledGame(
+        series_id=series_id,
+        game_number=game_number,
+        replay_id=document.metadata.replay_id,
+        canonical_player_roles=roles,
+        document=document,
+        perspectives=perspectives,
+        stat_estimates=estimates,
     )
 
 
@@ -752,14 +743,12 @@ def compile_documents(
     *,
     format_id: str | None = None,
     max_candidates: int = 256,
-    chunksize: int | None = None,
 ) -> CompilationResult:
     """
     Compile documents through event resolution, state reduction, decisions, and projection.
 
-    Documents are grouped into Bo3 series and each game is compiled on its own,
-    in worker processes when there are more jobs than CPUs. Series are
-    all-or-nothing: if a series has a blocking grouping diagnostic, or any of
+    Documents are grouped into Bo3 series and each game is compiled on its own.
+    Series are all-or-nothing: if a series has a blocking grouping diagnostic, or any of
     its games fails reconstruction or a quality gate, or a game is missing,
     every game in that series is dropped. Dropped games are counted in the
     metrics under rejected_* keys; they do not raise.
@@ -773,13 +762,11 @@ def compile_documents(
         documents: Parsed replay documents. Replay ids must be unique.
         format_id: Required format for every document; None accepts any supported format.
         max_candidates: Maximum joint-action candidates kept per reconstructed decision.
-        chunksize: Jobs per worker task; None picks one from the job and CPU
-            counts. A value of zero or less compiles in this process.
 
     Returns:
         CompilationResult with all source groups, accepted series, and metrics.
     """
-    return _compile_groups(_group_documents(documents, format_id), max_candidates, chunksize)
+    return _compile_groups(_group_documents(documents, format_id), max_candidates)
 
 
 def _group_documents(
@@ -813,16 +800,13 @@ def _group_documents(
     return group_replays(docs, format_id=format_id)
 
 
-def _compile_groups(
-    grouping: GroupingResult, max_candidates: int, chunksize: int | None
-) -> CompilationResult:
+def _compile_groups(grouping: GroupingResult, max_candidates: int) -> CompilationResult:
     """
     Reconstruct games and retain accepted series.
 
     Arguments:
         grouping: Validated source groups.
         max_candidates: Candidate limit per decision.
-        chunksize: Worker batch size; nonpositive values run serially.
 
     Returns:
         Source groups, accepted series, and compilation metrics.
@@ -844,56 +828,43 @@ def _compile_groups(
                 counters[f"rejected_{code}"] += 1
                 rejection_counters[group.record.series_id][f"rejected_{code}"] += 1
 
-    jobs = []
+    runtime_dex = default_runtime_resources().dex
+    compiled_by_series: dict[str, list[CompiledGame]] = {}
+    confidence_sum = 0.0
     for group in grouping.series:
-        if group.record.series_id in failed_series:
+        series_id = group.record.series_id
+        if series_id in failed_series:
             continue
         membership_by_replay = {
             membership.replay_id: membership for membership in group.memberships
         }
+        # A failed game does not stop the series: every game is still compiled
+        # so each rejection reason is counted.
         for document in group.games:
             membership = membership_by_replay[document.metadata.replay_id]
-            jobs.append(
-                (
-                    document,
-                    group.record.series_id,
-                    membership.game_number,
-                    membership.canonical_player_roles,
-                    max_candidates,
-                )
+            compiled = _compile_game(
+                document,
+                series_id,
+                membership.game_number,
+                membership.canonical_player_roles,
+                max_candidates,
+                runtime_dex,
             )
+            if isinstance(compiled, ReplayRejectionCategory):
+                counters[f"rejected_reconstruction_{compiled.value}"] += 1
+                rejection_counters[series_id][f"rejected_reconstruction_{compiled.value}"] += 1
+                failed_series.add(series_id)
+                continue
 
-    cpu_count = os.cpu_count() or 1
-    if chunksize is None:
-        chunksize = max(1, len(jobs) // (cpu_count * 4))
+            reasons = _quality_reasons(compiled)
+            if reasons:
+                for quality_reason in reasons:
+                    counters[f"rejected_{quality_reason}"] += 1
+                    rejection_counters[series_id][f"rejected_{quality_reason}"] += 1
+                failed_series.add(series_id)
+                continue
 
-    if len(jobs) <= cpu_count or chunksize <= 0:
-        results = [_compile_worker(job) for job in jobs]
-    else:
-        with concurrent.futures.ProcessPoolExecutor(mp_context=PROCESS_CONTEXT) as executor:
-            results = list(executor.map(_compile_worker, jobs, chunksize=chunksize))
-
-    compiled_by_series: dict[str, list[CompiledGame]] = {}
-    confidence_sum = 0.0
-    for job, (compiled, reason) in zip(jobs, results, strict=True):
-        series_id = job[1]
-        if reason is not None:
-            counters[f"rejected_reconstruction_{reason.value}"] += 1
-            rejection_counters[series_id][f"rejected_reconstruction_{reason.value}"] += 1
-            failed_series.add(series_id)
-            continue
-        if compiled is None:
-            continue
-
-        reasons = _quality_reasons(compiled)
-        if reasons:
-            for quality_reason in reasons:
-                counters[f"rejected_{quality_reason}"] += 1
-                rejection_counters[series_id][f"rejected_{quality_reason}"] += 1
-            failed_series.add(series_id)
-            continue
-
-        compiled_by_series.setdefault(series_id, []).append(compiled)
+            compiled_by_series.setdefault(series_id, []).append(compiled)
 
     accepted_series: list[CompiledSeries] = []
     for group in grouping.series:
@@ -945,16 +916,10 @@ def compile_payloads(
     *,
     format_id: str | None = None,
     max_candidates: int = 256,
-    chunksize: int | None = None,
 ) -> CompilationResult:
     """Parse raw replay payloads and compile them through the replay pipeline."""
     documents = tuple(parse_replay_payload(payload, format_id=format_id) for payload in payloads)
-    return compile_documents(
-        documents,
-        format_id=format_id,
-        max_candidates=max_candidates,
-        chunksize=chunksize,
-    )
+    return compile_documents(documents, format_id=format_id, max_candidates=max_candidates)
 
 
 def compile_to_shards(
@@ -965,7 +930,6 @@ def compile_to_shards(
     max_candidates: int = 256,
     resources: RuntimeResources | None = None,
     created_at: str | None = None,
-    chunksize: int | None = None,
     external_rejections: Iterable[str] = (),
     force_reconstruct: bool = False,
 ) -> ShardBuildResult:
@@ -1005,9 +969,7 @@ def compile_to_shards(
             for diagnostic in grouping.diagnostics
             if pending_replays.intersection(diagnostic.replay_ids)
         )
-        result = _compile_groups(
-            GroupingResult(tuple(pending), diagnostics), max_candidates, chunksize
-        )
+        result = _compile_groups(GroupingResult(tuple(pending), diagnostics), max_candidates)
         resources = default_runtime_resources() if resources is None else resources
         _cache_compilation(
             result, root, rows, ObservationBuilder(resources), runtime_major, max_candidates

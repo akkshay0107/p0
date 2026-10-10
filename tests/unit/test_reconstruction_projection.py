@@ -220,7 +220,7 @@ class TestReconstructionProjection:
         self,
     ) -> None:
         """Verify opposing perspectives mirror each other with correct roster states, side roles, and flags."""
-        result = compile_payloads((decision_payload(),), chunksize=0)
+        result = compile_payloads((decision_payload(),))
 
         first, second = result.accepted_series[0].games[0].perspectives
         assert first.player == 0
@@ -273,8 +273,8 @@ class TestReconstructionProjection:
             )
         )
 
-        first_result = compile_payloads((first_payload,), chunksize=0)
-        second_result = compile_payloads((second_payload,), chunksize=0)
+        first_result = compile_payloads((first_payload,))
+        second_result = compile_payloads((second_payload,))
         first = first_result.accepted_series[0].games[0].perspectives[0]
         second = second_result.accepted_series[0].games[0].perspectives[0]
         first_preview = first.snapshots[0].view
@@ -302,7 +302,7 @@ class TestReconstructionProjection:
         assert all(estimate.provenance != "KNOWN" for estimate in estimates)
 
     def test_shards_preserve_explicit_unknown_stat_provenance(self, tmp_path: Path) -> None:
-        result = compile_payloads((decision_payload(),), chunksize=0)
+        result = compile_payloads((decision_payload(),))
         built = write_tensor_shards(
             result,
             tmp_path,

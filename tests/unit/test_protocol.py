@@ -151,13 +151,13 @@ class TestReplayInputContract:
         for suffix in ("|win|Bob", "|tie", "|win|Alice", "|turn|99"):
             invalid = {**payload, "log": f"{payload['log']}\n{suffix}"}
             with pytest.raises(ReplayInputContractError, match="after terminal result"):
-                compile_payloads((invalid,), chunksize=0)
+                compile_payloads((invalid,))
 
         trailing_display = {
             **payload,
             "log": f"{payload['log']}\n|t:|1700000000\n|message|Battle ended.",
         }
-        assert len(compile_payloads((trailing_display,), chunksize=0).accepted_series[0].games) == 1
+        assert len(compile_payloads((trailing_display,)).accepted_series[0].games) == 1
 
     def test_player_names_that_normalize_to_same_identity_are_rejected(self) -> None:
         invalid = sample_replay_payload("input-colliding-players", players=("Alice", "A lice"))

@@ -579,7 +579,6 @@ def _assert_reconstruction_labels(
     compilation = compile_documents(
         (document,),
         max_candidates=max_candidates,
-        chunksize=0,
     )
     if not compilation.accepted_series:
         rejected = {

@@ -195,8 +195,8 @@ The default and heavy suites must pass before a commit. Integration tests need N
 the Showdown submodule and dependencies, and loopback sockets. The default run excludes
 heavy, stress, network, and GPU tests. Keep the heavy replay workload at 50 games or
 fewer per run. GPU checks are deferred; CPU passes do not validate CUDA execution.
-On a memory-limited machine, set `PYTHON_CPU_COUNT=2` to cap compiler workers,
-run heavy files separately, and reduce the `P0_STRESS_*` workload settings.
+On a memory-limited machine, run heavy files separately and reduce the
+`P0_STRESS_*` workload settings.
 
 ## About
 

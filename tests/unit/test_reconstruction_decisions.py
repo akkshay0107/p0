@@ -378,7 +378,7 @@ class TestDecisionTargets:
             "|-start|p1b: Eevee|Encore\n|move|p1b: Eevee|Tackle|p2b: Charmander",
         )
 
-        result = compile_payloads((payload,), chunksize=0)
+        result = compile_payloads((payload,))
 
         assert result.metrics.counters["accepted_games"] == 1
         affected = result.accepted_series[0].games[0].perspectives[0].decisions[-1]
@@ -409,7 +409,7 @@ class TestDecisionTargets:
             "|move|p1b: Eevee|Tackle|p2b: Charmander\n|-start|p1b: Eevee|Encore",
         )
 
-        result = compile_payloads((payload,), chunksize=0)
+        result = compile_payloads((payload,))
 
         affected = result.accepted_series[0].games[0].perspectives[0].decisions[-1]
         assert "mid_turn_encore_override" not in affected.evidence.tags
