@@ -11,7 +11,7 @@ from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
 from p0.training.config import PPOConfig
-from p0.training.series_history import SeriesHistoryStore
+from p0.training.series_history import SeriesHistoryStore, pad_game_histories
 from p0.training.trajectory import (
     CollectedTrajectory,
     PreparedTrajectory,
@@ -261,12 +261,9 @@ class RolloutCollector:
                 seat.series_history.drop(series_id)
         else:
             # Seats record different decision counts, so pad to a shared length.
-            lengths = torch.tensor([history.size(1) for history in complete_histories])
-            game_history = torch.nn.utils.rnn.pad_sequence(
-                [history[0] for history in complete_histories], batch_first=True
+            summary_tokens = policy.series(
+                *pad_game_histories([history[0] for history in complete_histories])
             )
-            game_mask = torch.arange(game_history.size(1)).unsqueeze(0) < lengths.unsqueeze(1)
-            summary_tokens = policy.series(game_history, game_mask.to(game_history.device))
             for seat, history, summary in zip(
                 self._seats, complete_histories, summary_tokens, strict=True
             ):

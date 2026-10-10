@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from p0.battle.series import SeriesPerspectiveKey
-from p0.training.series_history import SeriesHistoryStore, advance_series_state
+from p0.model.architecture_contract import SERIES_TOKENS_PER_GAME
+from p0.training.series_history import (
+    SeriesHistoryStore,
+    advance_series_state,
+    pack_series_context,
+)
 
 
 class TestSeriesHistoryStore:
@@ -80,3 +85,37 @@ class TestAdvanceSeriesState:
         assert active_game is None
         assert fragments == ()
         assert ended is False
+
+
+class TestPackSeriesContext:
+    def test_shared_game_is_summarized_once_and_repeated_over_each_group(self) -> None:
+        short = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        long = torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 5.0]])
+        resampled_games: list[int] = []
+
+        def sum_real_rows(padded: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            resampled_games.append(padded.size(0))
+            total = (padded * mask.unsqueeze(-1)).sum(dim=1, keepdim=True)
+            return total.expand(-1, SERIES_TOKENS_PER_GAME, -1)
+
+        # Three groups of 2, 1 and 1 rows: two prior games, one shared game, none.
+        tokens, mask = pack_series_context(
+            [(short, long), (short,), ()],
+            torch.tensor([2, 1, 1]),
+            sum_real_rows,
+            torch.zeros(4, 2),
+        )
+
+        assert resampled_games == [2]
+        assert tokens.shape == (4, 2 * SERIES_TOKENS_PER_GAME, 2)
+        short_sum, long_sum = torch.tensor([4.0, 6.0]), torch.tensor([3.0, 5.0])
+        for row in (0, 1):
+            assert mask[row].all()
+            assert (tokens[row, :SERIES_TOKENS_PER_GAME] == short_sum).all()
+            assert (tokens[row, SERIES_TOKENS_PER_GAME:] == long_sum).all()
+        assert (
+            mask[2].tolist() == [True] * SERIES_TOKENS_PER_GAME + [False] * SERIES_TOKENS_PER_GAME
+        )
+        assert (tokens[2, :SERIES_TOKENS_PER_GAME] == short_sum).all()
+        assert not tokens[2, SERIES_TOKENS_PER_GAME:].any()
+        assert not mask[3].any() and not tokens[3].any()
