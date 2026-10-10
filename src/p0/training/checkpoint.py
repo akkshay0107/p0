@@ -12,7 +12,6 @@ from torch.amp import GradScaler
 from torch.optim import Optimizer
 
 from p0.contracts import RuntimeContract, compare_runtime_contracts
-from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
 from p0.model.factory import (
     build_policy,
@@ -26,13 +25,7 @@ from p0.training.magnet import Magnet
 
 POLICY_ARTIFACT = "policy"
 TRAINING_ARTIFACT = "training"
-VALUE_TARGET_SEMANTICS = "discounted_terminal_outcome.v1"
 LOGGER = logging.getLogger(__name__)
-
-
-def value_objective_metadata(gamma: float) -> dict[str, Any]:
-    """Return the checkpoint metadata that pins the value-target definition."""
-    return {"gamma": gamma, "value_target_semantics": VALUE_TARGET_SEMANTICS}
 
 
 class LoadedCheckpoint(NamedTuple):
@@ -75,21 +68,20 @@ class CheckpointStore:
         path: Path | LoadedCheckpoint,
         device: torch.device | str,
         *,
-        expected_objective: Mapping[str, Any] | None = None,
+        gamma: float | None = None,
     ) -> PolicyNet:
         """Build and return a policy restored from a checkpoint."""
         artifact = self._load_artifact(path)
 
-        for key, value in (expected_objective or {}).items():
-            saved = artifact["provenance"].get(key)
-            if saved != value:
-                LOGGER.warning(
-                    "Checkpoint %s was trained with %s=%r; this run uses %r",
-                    path,
-                    key,
-                    saved,
-                    value,
-                )
+        # The value head predicts returns discounted with the gamma it was trained on.
+        saved_gamma = artifact["provenance"].get("gamma")
+        if gamma is not None and saved_gamma != gamma:
+            LOGGER.warning(
+                "Checkpoint %s was trained with gamma=%r; this run uses %r",
+                path,
+                saved_gamma,
+                gamma,
+            )
 
         try:
             config = ModelConfig.from_dict(artifact["model_config"])
@@ -190,7 +182,6 @@ class CheckpointStore:
         metadata: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         return {
-            "artifact_schema": CHECKPOINT_ARTIFACT_SCHEMA,
             "artifact_type": artifact_type,
             "runtime_contract": self._contract.to_dict(),
             "model_config": policy.config.to_dict(),
@@ -205,13 +196,17 @@ class CheckpointStore:
         if not isinstance(artifact, Mapping):
             raise ValueError(f"Malformed checkpoint {path}: expected a mapping")
 
-        schema = artifact.get("artifact_schema")
-        if schema != CHECKPOINT_ARTIFACT_SCHEMA:
-            raise ValueError(f"Unsupported checkpoint schema {schema!r} at {path}")
         if artifact.get("artifact_type") not in {POLICY_ARTIFACT, TRAINING_ARTIFACT}:
             raise ValueError(f"Unsupported checkpoint artifact type at {path}")
         if not isinstance(artifact.get("provenance"), Mapping):
             raise ValueError(f"Checkpoint {path} metadata must be a mapping")
+
+        missing = sorted({"runtime_contract", "model_config", "model_state_dict"} - set(artifact))
+        if missing:
+            raise ValueError(
+                f"Checkpoint {path} was written by an older layout (missing {missing}); "
+                "train a new checkpoint"
+            )
 
         self._validate_contract(artifact, path)
         try:

@@ -18,14 +18,10 @@ class TestEvaluationCLI:
     def test_completed_matchup_writes_report(self, tmp_path: Path) -> None:
         team_path = tmp_path / "teams"
         write_corpus_manifest(default_test_corpus(), team_path)
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text("{}\n", encoding="utf-8")
         report_dir = tmp_path / "reports"
 
         code = main(
             [
-                "--config",
-                str(config_path),
                 "--teams-path",
                 str(team_path),
                 "--episodes",

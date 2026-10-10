@@ -17,14 +17,16 @@ from p0.cli import LOG_FORMAT
 from p0.evaluation.harness import EvaluationHarness, MatchupResult
 from p0.format_config import active_runtime_contract
 from p0.model.policy import PolicyNet
+from p0.paths import DEFAULT_PATHS
 from p0.persistence import atomic_json_save
 from p0.runtime.showdown import local_server_configuration, start_showdown_servers
 from p0.teams.corpus import TeamCorpus
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE
-from p0.training.config import load_config
 from p0.training.utils import default_device
 
 logger = logging.getLogger("p0.cli.eval")
+
+DEFAULT_EPISODES_PER_MATCHUP = 20
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,11 +43,25 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Opponent policy checkpoint.",
     )
-    parser.add_argument("--teams-path", type=Path, default=None, help="Team pool directory.")
-    parser.add_argument("--episodes", type=int, help="Number of episodes per matchup.")
-    parser.add_argument("--seed", type=int, help="Random seed for evaluations.")
-    parser.add_argument("--report-dir", type=Path, help="Directory to save evaluation reports.")
-    parser.add_argument("--config", type=Path, help="Path to global YAML configuration file.")
+    parser.add_argument(
+        "--teams-path",
+        type=Path,
+        default=DEFAULT_PATHS.teams_root / "all",
+        help="Team pool directory.",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=DEFAULT_EPISODES_PER_MATCHUP,
+        help="Number of episodes per matchup.",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for evaluations.")
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=DEFAULT_PATHS.artifacts_root / "eval",
+        help="Directory to save evaluation reports.",
+    )
     return parser
 
 
@@ -73,20 +89,12 @@ def main(argv: list[str] | None = None) -> int:
     """Run evaluation against baseline opponents or checkpoints and persist report."""
     args = _parser().parse_args(argv)
 
-    try:
-        config = load_config(args.config)
-    except (OSError, KeyError, TypeError, ValueError) as exc:
-        print(f"Error loading configuration: {exc}", file=sys.stderr)
-        return 1
-
     logging.basicConfig(
         level=logging.INFO,
         format=LOG_FORMAT,
     )
 
-    episodes = config.evaluation.episodes_per_matchup if args.episodes is None else args.episodes
-    seed = args.seed if args.seed is not None else config.evaluation.seed
-    report_dir = config.evaluation.report_dir if args.report_dir is None else args.report_dir
+    episodes, seed, report_dir = args.episodes, args.seed, args.report_dir
     if episodes <= 0:
         print("Error: --episodes must be a positive integer.", file=sys.stderr)
         return 1
@@ -127,10 +135,8 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("Failed to load opponent checkpoint: %s", exc)
             return 1
 
-    teams_path = config.teams.all if args.teams_path is None else args.teams_path
-
     harness = EvaluationHarness(
-        teams_path=teams_path,
+        teams_path=args.teams_path,
         episodes_per_matchup=episodes,
         seed=seed,
     )
@@ -169,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.opponent_checkpoint
             else f"Baseline:{opponent_name}"
         ),
-        "teams_path": str(teams_path.resolve()) if teams_path else None,
+        "teams_path": str(args.teams_path.resolve()),
         "checkpoints": {
             "policy_a_sha256": (
                 hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()

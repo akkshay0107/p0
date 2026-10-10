@@ -11,7 +11,7 @@ from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
-from p0.training.config import TrainingConfig
+from p0.training.config import PPOConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import compute_ppo_objective, magnet_kl_per_step, ppo_update
 from p0.training.trajectory import (
@@ -46,7 +46,7 @@ class TestPPO:
             collected, torch.device("cpu"), gamma=0.99, gae_lambda=0.95
         )
         original_order = tuple(id(trajectory) for trajectory in prepared)
-        config = TrainingConfig(
+        config = PPOConfig(
             num_episodes=20,
             n_envs=1,
             rollout_steps=1,
@@ -97,7 +97,7 @@ class TestPPO:
         )
         optimizer = torch.optim.SGD(policy.parameters(), lr=1e-3)
         magnet = Magnet(policy)
-        config = TrainingConfig(
+        config = PPOConfig(
             num_episodes=20,
             n_envs=1,
             rollout_steps=1,
@@ -131,7 +131,7 @@ class TestPPO:
 
     def test_ppo_objective_weights_each_row_independently(self) -> None:
         """Verify distinct rows keep their own clipping, value, entropy and Magnet terms."""
-        config = TrainingConfig(clip_range=0.2, value_coef=0.5, entropy_coef=0.1)
+        config = PPOConfig(clip_range=0.2, value_coef=0.5, entropy_coef=0.1)
         total, policy, value, ratio, log_ratio = compute_ppo_objective(
             torch.log(torch.tensor([2.0, 0.5, 1.5])),
             torch.tensor([0.0, 3.0, 0.5]),
@@ -193,7 +193,7 @@ class TestPPO:
     def test_ppo_clipping_respects_advantage_sign(
         self, ratio: float, advantage: float, expected_policy: float
     ) -> None:
-        config = TrainingConfig(clip_range=0.2, value_coef=0.0, entropy_coef=0.0)
+        config = PPOConfig(clip_range=0.2, value_coef=0.0, entropy_coef=0.0)
         total, policy, value, actual_ratio, log_ratio = compute_ppo_objective(
             torch.tensor([math.log(ratio)]),
             torch.zeros(1),
@@ -225,7 +225,7 @@ class TestPPO:
     def test_ppo_loss_terms_have_the_expected_sign_and_weight(
         self, value_coef: float, entropy_coef: float, alpha: float, expected_total: float
     ) -> None:
-        config = TrainingConfig(value_coef=value_coef, entropy_coef=entropy_coef)
+        config = PPOConfig(value_coef=value_coef, entropy_coef=entropy_coef)
         total, policy, value, _, _ = compute_ppo_objective(
             torch.zeros(1),
             torch.tensor([3.0]),

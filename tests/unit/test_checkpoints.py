@@ -6,7 +6,6 @@ from typing import Any
 import pytest
 import torch
 
-from p0.model.architecture_contract import CHECKPOINT_ARTIFACT_SCHEMA
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.policy import PolicyNet
@@ -65,7 +64,6 @@ class TestCheckpoints:
             == 7
         )
         artifact = DEFAULT_CHECKPOINT_STORE.read(path).artifact
-        assert artifact["artifact_schema"] == CHECKPOINT_ARTIFACT_SCHEMA
         assert artifact["artifact_type"] == "training"
         assert "runtime_manifest_sha256" not in artifact
         assert set(artifact["runtime_contract"]) == {"major_sha256", "minor_sha256"}
@@ -259,14 +257,14 @@ class TestCheckpoints:
         for name, parameter in magnet.state_dict().items():
             torch.testing.assert_close(parameter, policy.state_dict()[name])
 
-    def test_changed_value_objective_warns_and_loads_weights(self, tmp_path: Path, caplog) -> None:
+    def test_changed_gamma_warns_and_loads_weights(self, tmp_path: Path, caplog) -> None:
         path = tmp_path / "policy.pt"
         store = CheckpointStore()
         policy = _small_policy()
         store.save_policy(path, policy, metadata={"gamma": 0.99})
 
         with caplog.at_level("WARNING", logger="p0.training.checkpoint"):
-            restored = store.load_policy(path, "cpu", expected_objective={"gamma": 0.9})
+            restored = store.load_policy(path, "cpu", gamma=0.9)
 
         assert "gamma=0.99" in caplog.text
         for name, tensor in policy.state_dict().items():
@@ -283,6 +281,19 @@ class TestCheckpoints:
         artifact["runtime_contract"]["major_sha256"] = "older-vocabulary"
         torch.save(artifact, path)
         with pytest.raises(ValueError, match="incompatible"):
+            store.load_policy(path, "cpu")
+
+    def test_checkpoint_from_an_older_layout_says_to_train_a_new_one(self, tmp_path: Path) -> None:
+        path = tmp_path / "policy.pt"
+        store = CheckpointStore()
+        store.save_policy(
+            path, build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
+        )
+        artifact = dict(store.read(path).artifact)
+        del artifact["runtime_contract"]
+        torch.save(artifact, path)
+
+        with pytest.raises(ValueError, match="older layout.*train a new checkpoint"):
             store.load_policy(path, "cpu")
 
     def test_checkpoint_rejects_weights_only_resume(self, tmp_path: Path) -> None:

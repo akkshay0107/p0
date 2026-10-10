@@ -34,7 +34,6 @@ from p0.teams.spread_usage import cosmetic_forme_aliases, load_spread_table_file
 from p0.teams.stat_points import BaseStats, calculate_stats
 
 _STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
-_IMPUTATION_SOURCE_VERSION = 1
 
 
 def _enum_name(value: str) -> str:
@@ -272,7 +271,6 @@ class ReplayStatValue:
     values: tuple[int, int, int, int, int, int] | None
     provenance: str
     confidence: float
-    source_version: int = _IMPUTATION_SOURCE_VERSION
 
     def __post_init__(self) -> None:
         if self.provenance not in {"IMPUTED", "UNKNOWN"}:
@@ -285,8 +283,6 @@ class ReplayStatValue:
             raise ValueError("IMPUTED replay stats require values")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("Replay stat confidence must be in [0, 1]")
-        if type(self.source_version) is not int or self.source_version < 1:
-            raise ValueError("Replay stat source version must be positive")
 
 
 @dataclass(frozen=True, slots=True)

@@ -132,7 +132,6 @@ def build(
 
     protocol_ids = {normalize(value) for value in dex.get("protocolEffects", [])}
     coverage = {
-        "schemaVersion": 1,
         "missingLegalContent": missing_content,
         # Legal effects were assigned to a known namespace above and added to its table.
         "unmappedLegalEffects": [],

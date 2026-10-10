@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import os
 import shutil
 import tempfile
@@ -55,14 +56,16 @@ from p0.replays.reconstruction.state import reduce_replay_state
 from p0.replays.schema import DecisionType, LabelKind, _require_iso_timestamp
 from p0.replays.shards import (
     FINAL_OBSERVATION_PREFIX,
-    SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
     ShardIndexEntry,
     ShardManifest,
     observation_field_specs,
+    validate_shard_summaries,
     validate_shard_tensors,
 )
 from p0.runtime.process_context import PROCESS_CONTEXT
+
+LOGGER = logging.getLogger(__name__)
 
 EMPTY_CANDIDATE_ACTION = (-1, -1)
 
@@ -272,11 +275,11 @@ def _save_shard(
     runtime_major: str,
 ) -> ShardIndexEntry:
     validate_shard_tensors(tensors)
+    validate_shard_summaries(tensors, summaries)
     filename = f"{shard_id}.pt"
     atomic_torch_save(
         root / filename,
         {
-            "artifact_schema": SHARD_ARTIFACT_SCHEMA,
             "runtime_major": runtime_major,
             "shard_id": shard_id,
             "tensors": tensors,
@@ -389,14 +392,19 @@ def _publish_dataset(
     if latest.exists():
         latest_id = orjson.loads(latest.read_bytes())["dataset_id"]
         path = root / latest_id / "manifest.json"
-        manifest = ShardManifest.from_dict(orjson.loads(path.read_bytes()))
-        if (
-            manifest.source_series == memberships
-            and manifest.shards == entries
-            and manifest.runtime_major == runtime_major
-            and manifest.build_config == config
-        ):
-            return ShardBuildResult(path, manifest)
+        try:
+            manifest = ShardManifest.from_dict(orjson.loads(path.read_bytes()))
+        except ValueError:
+            # A manifest from an older layout cannot be compared, so it is not reused.
+            LOGGER.warning("Dataset %s uses an older layout; publishing a new one", path)
+        else:
+            if (
+                manifest.source_series == memberships
+                and manifest.shards == entries
+                and manifest.runtime_major == runtime_major
+                and manifest.build_config == config
+            ):
+                return ShardBuildResult(path, manifest)
     counters: Counter[str] = Counter()
     for group in groups:
         counters.update(rows[group.record.series_id]["diagnostics"])

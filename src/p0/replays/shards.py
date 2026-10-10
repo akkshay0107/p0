@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -17,8 +17,6 @@ from p0.replays.schema import (
     MaskProvenance,
     _require_iso_timestamp,
 )
-
-SHARD_ARTIFACT_SCHEMA = "p0.replay_shard.v2"
 
 # Non-observation tensors stored per shard. -1 marks a variable dimension:
 # T is the shard's decision count and C its total candidate count. Candidates
@@ -117,11 +115,8 @@ class ShardManifest:
     source_games: int
     accepted_games: int
     rejected_games: int
-    artifact_schema: str = SHARD_ARTIFACT_SCHEMA
 
     def __post_init__(self) -> None:
-        if self.artifact_schema != SHARD_ARTIFACT_SCHEMA:
-            raise ValueError(f"Unsupported shard artifact schema {self.artifact_schema!r}")
         if not self.dataset_id or not self.runtime_major or not self.source_format_id:
             raise ValueError("Dataset requires an ID, runtime reference, and source format")
         replay_ids = [replay for members in self.source_series.values() for replay in members]
@@ -175,12 +170,11 @@ def load_shard_manifest(value: Mapping[str, Any]) -> ShardManifest:
     return ShardManifest.from_dict(value)
 
 
-def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
+def validate_shard_layout(tensors: Mapping[str, Any]) -> None:
     """
-    Check a shard tensor payload against the frozen layout above.
+    Check tensor names, dtypes, and shapes against the frozen layout above.
 
-    Shared by compilation and loading so a writer cannot emit a payload the
-    reader would reject.
+    This also runs on load because a cached tensor may use an older layout.
     """
     expected = {
         name: (shape, dtype)
@@ -208,6 +202,11 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
             raise ValueError(
                 f"Shard tensor {name} has shape {tuple(tensor.shape)}, expected {shape}"
             )
+
+
+def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
+    """Check every tensor invariant of a shard once, before the compiler saves it."""
+    validate_shard_layout(tensors)
 
     decisions = tensors["loss_mask"].shape[0]
     candidate_offsets = tensors["candidate_offsets"]
@@ -341,3 +340,54 @@ def validate_shard_tensors(tensors: Mapping[str, Any]) -> None:
         raise ValueError("Shard decision_type contains an unsupported value")
     if torch.any((tensors["outcome"] < -1) | (tensors["outcome"] > 1)):
         raise ValueError("Shard outcomes must be in [-1, 1]")
+
+
+def validate_shard_summaries(
+    tensors: Mapping[str, torch.Tensor], summaries: Sequence[Mapping[str, Any]]
+) -> None:
+    """Check that each game has valid, ordered summaries for both players."""
+    required = {
+        "series_id",
+        "game_number",
+        "player",
+        "canonical_player",
+        "source_replay_id",
+        "outcome_valid",
+    }
+    if any(not isinstance(item, Mapping) or not required <= item.keys() for item in summaries):
+        raise ValueError("Shard summaries must contain the required fields")
+    if any(
+        not isinstance(item["series_id"], str)
+        or type(item["game_number"]) is not int
+        or type(item["player"]) is not int
+        or type(item["canonical_player"]) is not int
+        or not isinstance(item["source_replay_id"], str)
+        or type(item["outcome_valid"]) is not bool
+        or item["player"] not in (0, 1)
+        or item["canonical_player"] not in (0, 1)
+        for item in summaries
+    ):
+        raise ValueError("Shard summaries contain invalid field values")
+
+    if len(summaries) != tensors["game_offsets"].numel() - 1:
+        raise ValueError("Shard summary count does not match game offsets")
+    if (
+        tensors["series_offsets"].numel() != 2
+        or len({item["series_id"] for item in summaries}) != 1
+    ):
+        raise ValueError("A shard must hold exactly one series")
+
+    perspectives: dict[int, list[tuple[int, int]]] = {}
+    game_numbers: dict[int, list[int]] = {}
+    for item in summaries:
+        perspectives.setdefault(item["game_number"], []).append(
+            (item["player"], item["canonical_player"])
+        )
+        game_numbers.setdefault(item["canonical_player"], []).append(item["game_number"])
+
+    if any(
+        sorted(rows) not in ([(0, 0), (1, 1)], [(0, 1), (1, 0)]) for rows in perspectives.values()
+    ):
+        raise ValueError("Shard games must contain both player perspectives")
+    if any(numbers != list(range(1, len(numbers) + 1)) for numbers in game_numbers.values()):
+        raise ValueError("Shard game summaries are not chronological")

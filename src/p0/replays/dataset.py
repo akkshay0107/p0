@@ -20,16 +20,15 @@ from p0.contracts import require_dataclass_fields
 from p0.model.structured_observation import StructuredObservation
 from p0.persistence import atomic_json_save
 from p0.replays.shards import (
-    SHARD_ARTIFACT_SCHEMA,
     SHARD_SUMMARY_KEY,
     ShardIndexEntry,
     final_observation_field_specs,
     load_shard_manifest,
     observation_field_specs,
-    validate_shard_tensors,
+    validate_shard_layout,
+    validate_shard_summaries,
 )
 
-SPLIT_ARTIFACT_SCHEMA = "p0.replay_split.v2"
 SPLITS = frozenset({"train", "validation", "test"})
 
 
@@ -41,15 +40,8 @@ class SeriesSplitManifest:
     assignments: Mapping[str, str]
     dataset_id: str
     split_id: str
-    artifact_schema: str = SPLIT_ARTIFACT_SCHEMA
 
     def __post_init__(self) -> None:
-        if self.artifact_schema != SPLIT_ARTIFACT_SCHEMA:
-            raise ValueError(
-                f"Unsupported split artifact schema {self.artifact_schema!r}; "
-                f"expected {SPLIT_ARTIFACT_SCHEMA}"
-            )
-
         if type(self.seed) is not int:
             raise ValueError("SeriesSplitManifest.seed must be an integer")
 
@@ -62,7 +54,6 @@ class SeriesSplitManifest:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "artifact_schema": self.artifact_schema,
             "dataset_id": self.dataset_id,
             "split_id": self.split_id,
             "seed": self.seed,
@@ -79,7 +70,6 @@ class SeriesSplitManifest:
             raise ValueError("SeriesSplitManifest.assignments must be an object")
 
         return cls(
-            artifact_schema=str(value["artifact_schema"]),
             seed=int(value["seed"]),
             assignments={str(series_id): str(split) for series_id, split in assignments.items()},
             dataset_id=str(value["dataset_id"]),
@@ -235,7 +225,13 @@ class LazyReplayDataset(IterableDataset):
     ) -> None:
         self.manifest_path = Path(manifest_path)
         value = orjson.loads(self.manifest_path.read_bytes())
-        self.manifest = load_shard_manifest(value)
+        try:
+            self.manifest = load_shard_manifest(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot use dataset manifest {self.manifest_path}: {exc}. "
+                "Run 'p0-replays build-shards' to publish the dataset again"
+            ) from exc
         if split is not None and split not in SPLITS:
             raise ValueError(f"Unsupported dataset split {split!r}")
 
@@ -254,7 +250,7 @@ class LazyReplayDataset(IterableDataset):
 
         self.split = split
         self.split_manifest = loaded_split
-        self._root = self.manifest_path.parent
+        self._root = self.manifest_path.parent.resolve()
 
         # Resolving the selection here keeps the streaming loop free of split branching.
         self._selected_series: frozenset[str] | None = (
@@ -318,25 +314,16 @@ class LazyReplayDataset(IterableDataset):
         self, entry: ShardIndexEntry
     ) -> tuple[Mapping[str, torch.Tensor], list[Mapping[str, Any]]]:
         path = (self._root / entry.filename).resolve()
-        if self._root.resolve() not in path.parents:
+        if self._root not in path.parents:
             raise ValueError(f"Shard filename escapes the manifest directory: {entry.filename!r}")
-
-        if not path.is_file():
-            raise ValueError(f"Shard file is missing: {path}")
 
         try:
             payload = torch.load(path, weights_only=True, map_location="cpu")
         except (OSError, RuntimeError, EOFError, UnpicklingError) as exc:
-            raise ValueError(f"Unable to load shard {path}") from exc
+            raise ValueError(f"Unable to load shard {path}; rebuild the dataset") from exc
 
         if not isinstance(payload, Mapping):
             raise ValueError(f"Malformed shard {path}: expected a mapping")
-
-        if payload.get("artifact_schema") != SHARD_ARTIFACT_SCHEMA:
-            raise ValueError(f"Unsupported shard schema in {path}")
-
-        if payload.get("shard_id") != entry.shard_id:
-            raise ValueError(f"Shard and index reference different compilations: {path}")
         if payload.get("runtime_major") != self.manifest.runtime_major:
             raise ValueError(f"Shard vocabulary or encoding is incompatible: {path}")
 
@@ -345,95 +332,29 @@ class LazyReplayDataset(IterableDataset):
         if not isinstance(tensors, Mapping) or not isinstance(summaries, list):
             raise ValueError(f"Malformed shard payload {path}")
 
-        validate_shard_tensors(tensors)
-        if len(summaries) != tensors["game_offsets"].numel() - 1:
-            raise ValueError(f"Shard summary count does not match game offsets in {path}")
+        try:
+            validate_shard_layout(tensors)
+        except ValueError as exc:
+            raise ValueError(
+                f"Shard {path} does not match the current tensor layout; "
+                "rebuild it with --force-reconstruct"
+            ) from exc
+
+        try:
+            validate_shard_summaries(tensors, summaries)
+        except ValueError as exc:
+            raise ValueError(
+                f"Malformed shard summaries in {path}: {exc}; rebuild the dataset"
+            ) from exc
 
         if (
             len(summaries) != entry.games
             or tensors["loss_mask"].shape[0] != entry.decisions
-            or tensors["series_offsets"].numel() - 1 != 1
+            or any(item["series_id"] != entry.series_id for item in summaries)
         ):
-            raise ValueError(f"Shard index metadata does not match payload {path}")
-
-        # outcome_valid gates every value-head decision, so a shard that omitted
-        # it would silently train the critic on nothing.
-        required_summary_fields = {
-            "series_id",
-            "game_number",
-            "player",
-            "canonical_player",
-            "source_replay_id",
-            "outcome_valid",
-        }
-        if not all(
-            isinstance(item, Mapping) and required_summary_fields <= set(item) for item in summaries
-        ):
-            raise ValueError(f"Shard summaries must be objects in {path}")
-        if any(item["series_id"] != entry.series_id for item in summaries):
-            raise ValueError(f"Shard summaries do not match their indexed series in {path}")
-
-        self._validate_summaries(tensors, summaries, path)
+            raise ValueError(f"Shard content does not match its manifest entry: {path}")
 
         return tensors, summaries
-
-    def _validate_summaries(
-        self,
-        tensors: Mapping[str, torch.Tensor],
-        summaries: list[Mapping[str, Any]],
-        path: Path,
-    ) -> None:
-        game_offsets = tensors["game_offsets"].tolist()
-        expected_series_offsets: list[int] = []
-        seen_series: set[str] = set()
-        last_series = ""
-        games: dict[tuple[str, int], list[tuple[int, int]]] = {}
-        sequences: dict[SeriesPerspectiveKey, list[int]] = {}
-
-        for index, item in enumerate(summaries):
-            series_id = item["series_id"]
-            replay_id = item["source_replay_id"]
-            game_number = item["game_number"]
-            player = item["player"]
-            canonical_player = item["canonical_player"]
-            if (
-                not isinstance(series_id, str)
-                or not isinstance(replay_id, str)
-                or type(game_number) is not int
-                or type(player) is not int
-                or type(canonical_player) is not int
-                or type(item["outcome_valid"]) is not bool
-                or player not in (0, 1)
-                or canonical_player not in (0, 1)
-            ):
-                raise ValueError(f"Shard summary has invalid field types in {path}")
-
-            replay_ids = self.manifest.source_series.get(series_id)
-            if (
-                replay_ids is None
-                or not 1 <= game_number <= len(replay_ids)
-                or replay_ids[game_number - 1] != replay_id
-            ):
-                raise ValueError(f"Shard summary does not match source series in {path}")
-
-            if series_id != last_series:
-                if series_id in seen_series:
-                    raise ValueError(f"Shard series summaries are not contiguous in {path}")
-                seen_series.add(series_id)
-                expected_series_offsets.append(game_offsets[index])
-                last_series = series_id
-
-            games.setdefault((series_id, game_number), []).append((player, canonical_player))
-            key = SeriesPerspectiveKey(series_id, canonical_player)
-            sequences.setdefault(key, []).append(game_number)
-
-        expected_series_offsets.append(game_offsets[-1])
-        if tensors["series_offsets"].tolist() != expected_series_offsets:
-            raise ValueError(f"Shard series offsets do not match summaries in {path}")
-        if any(sorted(rows) not in ([(0, 0), (1, 1)], [(0, 1), (1, 0)]) for rows in games.values()):
-            raise ValueError(f"Shard games must contain both player perspectives in {path}")
-        if any(numbers != list(range(1, len(numbers) + 1)) for numbers in sequences.values()):
-            raise ValueError(f"Shard game summaries are not chronological in {path}")
 
     @staticmethod
     def _chunk(
@@ -482,7 +403,6 @@ class LazyReplayDataset(IterableDataset):
 __all__ = [
     "LazyReplayDataset",
     "ReplayGameChunk",
-    "SPLIT_ARTIFACT_SCHEMA",
     "SeriesSplitManifest",
     "assign_series_splits",
     "load_split_manifest",

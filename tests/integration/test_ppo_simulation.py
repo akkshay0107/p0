@@ -10,7 +10,7 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.runtime import poke_env_patches
 from p0.runtime.composition import build_sim_env
 from p0.runtime.env import SimEnv
-from p0.training.config import TrainingConfig
+from p0.training.config import PPOConfig
 from p0.training.rollout import RolloutCollector
 from p0.training.trajectory import CollectedTrajectory
 from p0.training.vector_env import ThreadVecEnv
@@ -56,7 +56,7 @@ class TestPpoSimulation:
             collector = RolloutCollector(
                 vector_env,
                 model_policy,
-                TrainingConfig(n_envs=2, rollout_steps=1),
+                PPOConfig(n_envs=2, rollout_steps=1),
             )
 
             uneven_game = False

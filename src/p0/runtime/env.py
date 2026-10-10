@@ -233,5 +233,5 @@ class SimEnv(MegaEnv):
         if out is None:
             return self._observation_builder.build(view)
 
-        self._observation_builder.build_into_prevalidated(view, out)
+        self._observation_builder.build_into(view, out)
         return out

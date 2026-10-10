@@ -10,7 +10,7 @@ from p0.format_config import FORMAT
 from p0.model.policy import MemoryInputs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.model.token_store import SeriesTokenStore
-from p0.training.config import TrainingConfig
+from p0.training.config import PPOConfig
 from p0.training.series_history import SeriesHistoryStore
 from p0.training.trajectory import (
     CollectedTrajectory,
@@ -50,7 +50,7 @@ class RolloutCollector:
         self,
         vector_env: ThreadVecEnv,
         policy: PolicyNet,
-        config: TrainingConfig,
+        config: PPOConfig,
         *,
         max_trajectory_steps: int = MAX_TRAJECTORY_STEPS,
     ) -> None:

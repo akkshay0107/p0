@@ -9,8 +9,7 @@ from torch.amp import GradScaler
 from torch.optim import Optimizer
 
 from p0.model.policy import PolicyNet
-from p0.training.checkpoint import value_objective_metadata
-from p0.training.config import TrainingConfig
+from p0.training.config import PPOConfig
 from p0.training.files import TrainingRun
 from p0.training.magnet import Magnet
 from p0.training.ppo import ppo_update
@@ -59,7 +58,7 @@ class PPOTrainer:
         scaler: GradScaler,
         magnet: Magnet,
         scheduler: PPOScheduler,
-        training_config: TrainingConfig,
+        training_config: PPOConfig,
         cancel_requested: Callable[[], bool] = lambda: False,
     ) -> None:
         self.policy = policy
@@ -138,5 +137,5 @@ class PPOTrainer:
             optimizer=self.optimizer,
             scaler=self.scaler,
             magnet=self.magnet,
-            metadata=value_objective_metadata(self.training_config.gamma),
+            metadata={"gamma": self.training_config.gamma},
         )

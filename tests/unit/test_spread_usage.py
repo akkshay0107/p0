@@ -13,7 +13,6 @@ from p0.teams.spread_usage import (
     DEFAULT_SPREAD_TABLE_PATH,
     IMPUTED_FROM_FALLBACK,
     IMPUTED_FROM_USAGE,
-    SPREAD_USAGE_SCHEMA,
     build_spread_table,
     cosmetic_forme_aliases,
     load_spread_table,
@@ -38,7 +37,6 @@ _BASE_STATS = {"hp": 78, "atk": 65, "def": 68, "spa": 112, "spd": 154, "spe": 75
 
 def _payload(spreads: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
     return {
-        "schema": SPREAD_USAGE_SCHEMA,
         "format_id": FORMAT.battle_format,
         "weight_scale": 1_000_000,
         "aliases": aliases or {},
@@ -142,18 +140,6 @@ class TestSpreadParsing:
         assert [prior.weight for prior in bucket] == pytest.approx(
             [20 / 90, 19 / 90, 18 / 90, 17 / 90, 16 / 90], abs=3e-7
         )
-
-    def test_spread_table_rejects_unsupported_schema(self) -> None:
-        """Verify load_spread_table rejects invalid or unsupported schema versions."""
-        payload = build_spread_table(
-            _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
-            _chaos("Garchomp", {"Jolly:2/32/0/0/0/32": 1.0}),
-            format_id=FORMAT.battle_format,
-            dex=_dex(),
-        )
-        payload["schema"] = SPREAD_USAGE_SCHEMA + 1
-        with pytest.raises(ValueError, match="schema"):
-            load_spread_table(payload)
 
     def test_spread_table_lookup_normalizes_species_and_nature(self) -> None:
         """Verify spread table lookups normalize species names and natures case-insensitively."""

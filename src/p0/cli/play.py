@@ -14,13 +14,17 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration, ServerC
 
 from p0.cli import LOG_FORMAT
 from p0.model.observation_builder import ObservationBuilder
+from p0.paths import DEFAULT_PATHS
 from p0.rl_player import DEFAULT_BATTLE_FORMAT, RLPlayer, load_player_policy
 from p0.runtime import poke_env_patches
 from p0.teams.corpus import TeamCorpus, corpus_from_team_files, load_team_corpus
 from p0.training.checkpoint import DEFAULT_CHECKPOINT_STORE, CheckpointStore
-from p0.training.config import BotConfig, GlobalConfig, load_config
+from p0.training.config import BotConfig, load_config
 
 logger = logging.getLogger("p0.cli.play")
+
+DEFAULT_CHALLENGE_LIMIT = 1_000_000
+DEFAULT_TOP_P = 0.9
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -30,7 +34,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        help="Path to the policy checkpoint; defaults to bot.checkpoint_path.",
+        help="Path to the policy checkpoint; omit only with --allow-random-init.",
     )
     team_source = parser.add_mutually_exclusive_group()
     team_source.add_argument(
@@ -47,11 +51,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--challenge-limit",
         type=int,
-        help="Number of challenges to accept; defaults to bot.challenge_limit.",
+        default=DEFAULT_CHALLENGE_LIMIT,
+        help="Number of challenges to accept.",
     )
     parser.add_argument(
         "--opponent",
-        help="Only accept challenges from this opponent username; defaults to bot.opponent.",
+        help="Only accept challenges from this opponent username.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=DEFAULT_TOP_P,
+        help="Sample each action from the smallest set of actions with this total probability.",
+    )
+    parser.add_argument(
+        "--allow-random-init",
+        action="store_true",
+        help="Play with untrained random weights when no checkpoint is given.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        help="Logging level.",
     )
     return parser
 
@@ -67,7 +89,6 @@ def _server_configuration(bot: BotConfig) -> ServerConfiguration:
 
 
 async def run_bot(
-    app_config: GlobalConfig,
     checkpoint_path: Path | None,
     team_source: TeamCorpus,
     account_configuration: AccountConfiguration,
@@ -75,6 +96,8 @@ async def run_bot(
     *,
     challenge_limit: int,
     opponent: str | None,
+    top_p: float = DEFAULT_TOP_P,
+    allow_random_init: bool = False,
     policy_store: CheckpointStore = DEFAULT_CHECKPOINT_STORE,
 ) -> None:
     """Boot the RL bot and run its Showdown listener."""
@@ -82,12 +105,12 @@ async def run_bot(
 
     policy = load_player_policy(
         checkpoint_path,
-        allow_random_init=app_config.bot.allow_random_init,
+        allow_random_init=allow_random_init,
         policy_store=policy_store,
     )
     bot_player = RLPlayer(
         policy=policy,
-        top_p=app_config.bot.top_p,
+        top_p=top_p,
         observation_builder=ObservationBuilder(policy.resources),
         team_rng=random.Random(),
         account_configuration=account_configuration,
@@ -117,29 +140,24 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point for running the bot."""
     args = _build_parser().parse_args(argv)
     try:
-        app_config = load_config(args.config)
-        checkpoint_path = (
-            args.checkpoint if args.checkpoint is not None else app_config.bot.checkpoint_path
-        )
-        challenge_limit = (
-            app_config.bot.challenge_limit if args.challenge_limit is None else args.challenge_limit
-        )
-        if challenge_limit < 1:
+        bot = load_config(args.config).bot
+        if args.challenge_limit < 1:
             raise ValueError("--challenge-limit must be a positive integer.")
-        opponent = app_config.bot.opponent if args.opponent is None else args.opponent
-        username = os.getenv("SHOWDOWN_USERNAME", app_config.bot.username)
+        if not 0.0 < args.top_p <= 1.0:
+            raise ValueError("--top-p must be in (0, 1].")
+        username = os.getenv("SHOWDOWN_USERNAME", bot.username)
         if not username.strip():
             raise ValueError("SHOWDOWN_USERNAME must not be empty.")
         account_configuration = AccountConfiguration(
             username,
             os.getenv("SHOWDOWN_PASSWORD") or None,
         )
-        server_configuration = _server_configuration(app_config.bot)
+        server_configuration = _server_configuration(bot)
         team_source = (
             corpus_from_team_files(args.team_file, DEFAULT_BATTLE_FORMAT)
             if args.team_file
             else load_team_corpus(
-                app_config.teams.all if args.team_pool != "reduced" else app_config.teams.reduced,
+                DEFAULT_PATHS.teams_root / (args.team_pool or "all"),
                 DEFAULT_BATTLE_FORMAT,
             )
         )
@@ -148,20 +166,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     logging.basicConfig(
-        level=logging.getLevelNamesMapping()[app_config.bot.log_level.upper()],
+        level=logging.getLevelNamesMapping()[args.log_level],
         format=LOG_FORMAT,
     )
 
     try:
         asyncio.run(
             run_bot(
-                app_config,
-                checkpoint_path,
+                args.checkpoint,
                 team_source,
                 account_configuration,
                 server_configuration,
-                challenge_limit=challenge_limit,
-                opponent=opponent,
+                challenge_limit=args.challenge_limit,
+                opponent=args.opponent,
+                top_p=args.top_p,
+                allow_random_init=args.allow_random_init,
             )
         )
     except (KeyboardInterrupt, SystemExit):

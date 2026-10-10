@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from omegaconf import OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
-from p0.paths import DEFAULT_PATHS, ProjectPaths
+from p0.paths import DEFAULT_PATHS
 
 
 def _positive_ints(obj: object, *names: str) -> None:
@@ -47,14 +46,52 @@ def _unit_interval(obj: object, *names: str) -> None:
             raise ValueError(f"{type(obj).__name__}.{name} must be between 0 and 1")
 
 
+# The value head is trained by BC and then by PPO, so both read one gamma.
+DEFAULT_GAMMA = 0.99
+
+# Settings config.yaml may contain. Every other field below keeps its default in code.
+SHARED_YAML_FIELDS = frozenset({"gamma", "seed", "enable_optim"})
+PPO_YAML_FIELDS = frozenset(
+    {
+        "output_dir",
+        "resume_checkpoint",
+        "initial_policy_checkpoint",
+        "num_episodes",
+        "n_envs",
+        "rollout_steps",
+        "batch_size",
+        "lr",
+        "entropy_coef",
+        "magnet_alpha",
+    }
+)
+BC_YAML_FIELDS = frozenset(
+    {
+        "dataset_dir",
+        "output_dir",
+        "resume_checkpoint",
+        "epochs",
+        "batch_decisions",
+        "learning_rate",
+        "num_workers",
+    }
+)
+BOT_YAML_FIELDS = frozenset({"username", "websocket_url", "authentication_url"})
+
+
 @dataclass(frozen=True, slots=True)
-class TrainingConfig:
+class PPOConfig:
+    """Every value PPO training reads; config.yaml sets the PPO_YAML_FIELDS subset."""
+
+    output_dir: Path = Path("artifacts/runs/ppo")
+    resume_checkpoint: Path | None = None
+    initial_policy_checkpoint: Path | None = None
     num_episodes: int = 2000
     n_envs: int = 8
     rollout_steps: int = 320
     batch_size: int = 128
     minibatch_size: int = 32
-    gamma: float = 0.99
+    gamma: float = DEFAULT_GAMMA
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     lr: float = 3e-4
@@ -69,7 +106,17 @@ class TrainingConfig:
     seed: int = 0
     ramp_up_phase: float = 0.1
 
+    @property
+    def checkpoint_path(self) -> Path:
+        """Return the training checkpoint written inside the output directory."""
+        return self.output_dir / "ppo_checkpoint.pt"
+
     def __post_init__(self) -> None:
+        if self.resume_checkpoint is not None and self.initial_policy_checkpoint is not None:
+            raise ValueError(
+                "ppo.resume_checkpoint and ppo.initial_policy_checkpoint are mutually exclusive"
+            )
+
         _positive_ints(
             self,
             "num_episodes",
@@ -82,7 +129,7 @@ class TrainingConfig:
         )
         _unit_interval(self, "gamma", "gae_lambda", "ramp_up_phase")
         if self.gamma >= 1.0:
-            raise ValueError("TrainingConfig.gamma must be less than 1")
+            raise ValueError("gamma must be less than 1")
 
         _non_negative(
             self,
@@ -95,30 +142,16 @@ class TrainingConfig:
         _positive(self, "lr", "max_grad_norm")
 
         if type(self.seed) is not int or self.seed < 0:
-            raise ValueError("training.seed must be a nonnegative integer")
+            raise ValueError("seed must be a nonnegative integer")
         if not 0.0 < self.ramp_up_phase < 1.0:
-            raise ValueError("training.ramp_up_phase must be strictly between 0 and 1")
+            raise ValueError("PPOConfig.ramp_up_phase must be strictly between 0 and 1")
 
         ramp_end = int(self.ramp_up_phase * self.num_episodes)
         if not 0 < ramp_end < self.num_episodes - 1:
             raise ValueError(
-                "training.ramp_up_phase must produce an endpoint before the final episode"
+                f"ppo.num_episodes={self.num_episodes} is too short for the learning-rate "
+                f"warmup, which takes {self.ramp_up_phase:.0%} of the run"
             )
-        if self.magnet_refresh_interval > self.num_episodes:
-            raise ValueError(
-                "training.magnet_refresh_interval must not exceed training.num_episodes"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class TeamsConfig:
-    all: Path = Path("all")
-    reduced: Path = Path("reduced")
-
-    def __post_init__(self) -> None:
-        for name, path in (("all", self.all), ("reduced", self.reduced)):
-            if not str(path).strip():
-                raise ValueError(f"teams.{name} must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,18 +159,8 @@ class BotConfig:
     username: str = "Bot"
     websocket_url: str | None = None
     authentication_url: str | None = None
-    checkpoint_path: Path | None = None
-    top_p: float = 0.9
-    challenge_limit: int = 1_000_000
-    opponent: str | None = None
-    allow_random_init: bool = False
-    log_level: str = "INFO"
 
     def __post_init__(self) -> None:
-        if not 0.0 < self.top_p <= 1.0:
-            raise ValueError("bot.top_p must be in (0, 1]")
-        if type(self.challenge_limit) is not int or self.challenge_limit < 1:
-            raise ValueError("bot.challenge_limit must be a positive integer")
         if (self.websocket_url is None) != (self.authentication_url is None):
             raise ValueError(
                 "bot.websocket_url and bot.authentication_url must be configured together"
@@ -148,133 +171,77 @@ class BotConfig:
         ):
             if url is not None and not url.strip():
                 raise ValueError(f"bot.{name} must not be empty")
-        if self.log_level.upper() not in logging.getLevelNamesMapping():
-            raise ValueError(f"bot.log_level is not a known logging level: {self.log_level!r}")
 
 
 @dataclass(frozen=True, slots=True)
 class BCConfig:
+    """Every value BC training reads; config.yaml sets the BC_YAML_FIELDS subset."""
+
+    dataset_dir: Path = Path("artifacts/datasets")
+    output_dir: Path = Path("artifacts/checkpoints/bc")
+    resume_checkpoint: Path | None = None
+    epochs: int = 1
     batch_decisions: int = 256
     max_chunk_size: int = 1024
     learning_rate: float = 3e-4
-    gamma: float = 0.99
+    gamma: float = DEFAULT_GAMMA
     value_coef: float = 0.5
-    epochs: int = 1
     num_workers: int = 0
     prefetch_factor: int = 2
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     seed: int = 0
     enable_optim: bool = True
-    shard_manifest: Path = Path("artifacts/shards/manifest.json")
-    output_dir: Path = Path("artifacts/checkpoints/bc")
-    resume_checkpoint: Path | None = None
-
-    @property
-    def split_manifest_path(self) -> Path:
-        """Return the split manifest stored beside the shard manifest."""
-        return self.shard_manifest.parent / "splits.json"
 
     def __post_init__(self) -> None:
         _positive_ints(self, "batch_decisions", "max_chunk_size", "epochs")
         if self.num_workers < 0:
             raise ValueError("bc.num_workers must be non-negative")
         if self.prefetch_factor <= 0:
-            raise ValueError("bc.prefetch_factor must be positive")
+            raise ValueError("BCConfig.prefetch_factor must be positive")
 
         _positive(self, "learning_rate", "max_grad_norm")
         _unit_interval(self, "gamma")
         if self.gamma >= 1.0:
-            raise ValueError("BCConfig.gamma must be less than 1")
+            raise ValueError("gamma must be less than 1")
         _non_negative(self, "value_coef", "weight_decay")
 
         if type(self.seed) is not int:
-            raise ValueError("bc.seed must be an integer")
-
-        for name, value in (
-            ("shard_manifest", self.shard_manifest),
-            ("output_dir", self.output_dir),
-        ):
-            if not str(value).strip():
-                raise ValueError(f"bc.{name} must not be empty")
+            raise ValueError("seed must be an integer")
 
 
-@dataclass(frozen=True, slots=True)
-class EvalConfig:
-    episodes_per_matchup: int = 20
-    seed: int = 0
-    report_dir: Path = Path("artifacts/eval")
-
-    def __post_init__(self) -> None:
-        _positive_ints(self, "episodes_per_matchup")
-        _non_negative(self, "seed")
-
-        if not str(self.report_dir).strip():
-            raise ValueError("evaluation.report_dir must not be empty")
-
-
-@dataclass(frozen=True, slots=True)
-class GlobalConfig:
-    training: TrainingConfig = TrainingConfig()
-    paths: ProjectPaths = DEFAULT_PATHS
-    teams: TeamsConfig = TeamsConfig()
-    bot: BotConfig = BotConfig()
+class GlobalConfig(NamedTuple):
+    ppo: PPOConfig = PPOConfig()
     bc: BCConfig = BCConfig()
-    evaluation: EvalConfig = EvalConfig()
-
-    def __post_init__(self) -> None:
-        if self.bc.gamma != self.training.gamma:
-            raise ValueError("bc.gamma must match training.gamma")
-        if self.bc.value_coef != self.training.value_coef:
-            raise ValueError("bc.value_coef must match training.value_coef")
+    bot: BotConfig = BotConfig()
 
 
-def _resolve_path(value: str | Path, root: Path = DEFAULT_PATHS.repository_root) -> Path:
-    path = Path(value).expanduser()
-    return path.resolve() if path.is_absolute() else (root / path).resolve()
-
-
-def _resolve_fields(section: Any, base: Path, path_field_names: set[str]) -> Any:
-    """Return the config section with its set path fields resolved against base."""
+def _resolve_fields(section: Any, path_field_names: set[str]) -> Any:
+    """Return the config section with its set path fields resolved against the repository root."""
     updates = {
-        name: _resolve_path(value, base)
+        name: (DEFAULT_PATHS.repository_root / Path(value).expanduser()).resolve()
         for name in path_field_names
         if (value := getattr(section, name)) is not None
     }
     return replace(section, **updates)
 
 
-def _resolve_paths(config: GlobalConfig) -> GlobalConfig:
-    root = _resolve_path(config.paths.repository_root)
-    path_fields = {f.name for f in fields(ProjectPaths)}
-    paths = _resolve_fields(config.paths, root, path_fields)
-    bot = _resolve_fields(config.bot, root, {"checkpoint_path"})
-    teams = _resolve_fields(config.teams, paths.teams_root, {"all", "reduced"})
-    bc = _resolve_fields(
-        config.bc,
-        root,
-        {"shard_manifest", "output_dir", "resume_checkpoint"},
-    )
-    evaluation = _resolve_fields(config.evaluation, root, {"report_dir"})
+def _section(values: Mapping[str, Any], name: str, allowed: frozenset[str]) -> dict[str, Any]:
+    """Return one YAML section after rejecting settings the file may not contain."""
+    section = values.get(name)
+    if section is None:
+        section = {}
+    if not isinstance(section, Mapping):
+        raise ValueError(f"{name} must be a mapping")
 
-    return replace(config, paths=paths, bot=bot, teams=teams, bc=bc, evaluation=evaluation)
-
-
-def _build_section(cls: type, values: Any) -> Any:
-    if not isinstance(values, Mapping):
-        raise ValueError(f"{cls.__name__} must be a mapping")
-
-    names = {field.name for field in fields(cls)}
-    unknown = set(values) - names
+    unknown = set(section) - allowed
     if unknown:
-        names_str = ", ".join(sorted(unknown))
-        raise ValueError(f"unknown {cls.__name__} field(s): {names_str}")
-
-    return cls(**values)
+        raise ValueError(f"unknown {name} setting(s): {', '.join(sorted(unknown))}")
+    return dict(section)
 
 
 def load_config(config_path: str | Path | None = None) -> GlobalConfig:
-    """Load configuration from config.yaml and merge with source defaults."""
+    """Load config.yaml; settings it omits keep their defaults."""
     path = (
         DEFAULT_PATHS.repository_root / "config.yaml" if config_path is None else Path(config_path)
     )
@@ -285,40 +252,26 @@ def load_config(config_path: str | Path | None = None) -> GlobalConfig:
         raise FileNotFoundError(f"Configuration file not found: {path}")
 
     try:
-        loaded: Any = OmegaConf.load(path)
-        loaded_bc = loaded.get("bc", {})
-        if loaded_bc is not None and not isinstance(loaded_bc, Mapping):
-            raise ValueError("BCConfig must be a mapping")
-        if isinstance(loaded_bc, Mapping):
-            duplicated_objective_fields = {"gamma", "value_coef"} & set(loaded_bc)
-            if duplicated_objective_fields:
-                fields_text = ", ".join(sorted(duplicated_objective_fields))
-                raise ValueError(
-                    f"bc.{fields_text} is derived from training; configure it under training"
-                )
-        merged = OmegaConf.merge(OmegaConf.create(asdict(GlobalConfig())), loaded)
-        values = OmegaConf.to_container(merged, resolve=True)
+        values = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
         if not isinstance(values, Mapping):
             raise ValueError("configuration root must be a mapping")
 
-        sections = {field.name for field in fields(GlobalConfig)}
-        unknown = set(values) - sections
+        unknown = set(values) - SHARED_YAML_FIELDS - {"ppo", "bc", "bot"}
         if unknown:
             names = ", ".join(sorted(str(name) for name in unknown))
-            raise ValueError(f"unknown root configuration section(s): {names}")
+            raise ValueError(f"unknown root setting(s): {names}")
 
-        training = _build_section(TrainingConfig, values["training"])
-        bc_values = dict(values["bc"])
-        bc_values["gamma"] = training.gamma
-        bc_values["value_coef"] = training.value_coef
-        config = GlobalConfig(
-            training=training,
-            paths=_build_section(ProjectPaths, values["paths"]),
-            teams=_build_section(TeamsConfig, values["teams"]),
-            bot=_build_section(BotConfig, values["bot"]),
-            bc=_build_section(BCConfig, bc_values),
-            evaluation=_build_section(EvalConfig, values["evaluation"]),
+        # gamma, seed, and enable_optim are set once and given to both trainers.
+        shared = {name: values[name] for name in SHARED_YAML_FIELDS if name in values}
+        ppo = PPOConfig(**_section(values, "ppo", PPO_YAML_FIELDS), **shared)
+        bc = BCConfig(**_section(values, "bc", BC_YAML_FIELDS), **shared)
+        bot = BotConfig(**_section(values, "bot", BOT_YAML_FIELDS))
+        return GlobalConfig(
+            ppo=_resolve_fields(
+                ppo, {"output_dir", "resume_checkpoint", "initial_policy_checkpoint"}
+            ),
+            bc=_resolve_fields(bc, {"dataset_dir", "output_dir", "resume_checkpoint"}),
+            bot=bot,
         )
-        return _resolve_paths(config)
     except (OSError, OmegaConfBaseException, TypeError, ValueError) as exc:
         raise ValueError(f"Could not load configuration from {path}: {exc}") from exc

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -282,6 +283,24 @@ class TestReplayCompiler:
         assert forced.manifest.shards[0].shard_id != first.manifest.shards[0].shard_id
         assert len(list(LazyReplayDataset(first.manifest_path))) == 2
         assert len(list(LazyReplayDataset(forced.manifest_path))) == 2
+
+    def test_build_over_an_older_manifest_layout_publishes_a_new_dataset(
+        self, tmp_path: Path
+    ) -> None:
+        """A manifest with another field set must not stop build-shards from rebuilding."""
+        payload = golden_replay_payload("older-layout", series_id="older-layout-series")
+        result = compile_payloads((payload,), chunksize=0)
+        first = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
+        older = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+        older["artifact_schema"] = "p0.replay_shard.v2"
+        first.manifest_path.write_text(json.dumps(older), encoding="utf-8")
+
+        rebuilt = compile_to_shards(iter((result.series[0].games[0],)), tmp_path)
+
+        assert rebuilt.manifest.dataset_id != first.manifest.dataset_id
+        # The compiled tensor is reused; only the dataset index is written again.
+        assert rebuilt.manifest.shards[0].shard_id == first.manifest.shards[0].shard_id
+        assert len(list(LazyReplayDataset(rebuilt.manifest_path))) == 2
 
     def test_extra_game_after_series_won_rejected(self) -> None:
         """Verify that a 2-0 series followed by a 3rd game is rejected under precision-first policy."""

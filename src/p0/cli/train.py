@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     with cancellation_signals() as cancel_requested:
         run_training(
-            load_config(args.config),
+            load_config(args.config).ppo,
             cancel_requested=cancel_requested,
             reduced=args.reduced,
         )

@@ -1,67 +1,40 @@
 # Copy this file to config.yaml for a machine-local configuration.
-training:
+# Every setting is optional; the values below are the defaults.
+# Relative paths start at the repository root.
+
+# Shared by BC and PPO.
+gamma: 0.99
+seed: 0
+# Mixed precision and torch.compile on CUDA; no effect on CPU.
+enable_optim: true
+
+ppo:
+  # Holds ppo_checkpoint.pt, metrics.jsonl, TensorBoard files, and server logs.
+  output_dir: artifacts/runs/ppo
+  # Set at most one: continue a PPO run, or start a new run from policy weights.
+  resume_checkpoint: null
+  initial_policy_checkpoint: null
   num_episodes: 2000
   n_envs: 8
   rollout_steps: 320
   batch_size: 128
-  minibatch_size: 32
-  gamma: 0.99
-  gae_lambda: 0.95
-  clip_range: 0.2
   lr: 0.0003
-  value_coef: 0.5
-  magnet_alpha: 0.03
-  magnet_refresh_interval: 20
   entropy_coef: 0.01
-  max_grad_norm: 0.5
-  target_kl: 0.01
-  ppo_epochs: 10
-  enable_optim: true
-  seed: 0
-  ramp_up_phase: 0.1
+  magnet_alpha: 0.03
 
-paths:
-  repository_root: .
-  data_root: data
-  teams_root: teams
-  artifacts_root: artifacts
-  showdown_root: pokemon-showdown
-  checkpoint_path: artifacts/checkpoints/ppo_checkpoint.pt
+bc:
+  # The `p0-replays build-shards` output folder; the newest dataset in it is used.
+  # Point it at one <dataset-uuid> folder to train on that dataset instead.
+  dataset_dir: artifacts/datasets
+  output_dir: artifacts/checkpoints/bc
   resume_checkpoint: null
-  initial_policy_checkpoint: null
-  runs_dir: artifacts/runs
-  replays_dir: artifacts/replays
-  log_path: artifacts/training.log
-
-teams:
-  all: all
-  reduced: reduced
+  epochs: 1
+  batch_decisions: 256
+  learning_rate: 0.0003
+  num_workers: 0
 
 bot:
   username: Bot
-  # Set both URLs to use a remote Showdown server; omit both for localhost.
+  # Set both URLs to use a remote Showdown server; leave both null for localhost.
   websocket_url: null
   authentication_url: null
-  top_p: 0.9
-  challenge_limit: 1000000
-  allow_random_init: false
-  log_level: INFO
-
-bc:
-  batch_decisions: 256
-  learning_rate: 0.0003
-  epochs: 1
-  weight_decay: 0.0
-  max_grad_norm: 1.0
-  seed: 0
-  enable_optim: true
-  # Placeholders: replace with the manifest_path printed by `p0-replays build-shards`
-  # `p0-replays create-splits` writes splits.json beside this manifest.
-  shard_manifest: artifacts/datasets/<dataset-uuid>/manifest.json
-  output_dir: artifacts/checkpoints/bc
-  resume_checkpoint: null
-
-evaluation:
-  episodes_per_matchup: 20
-  seed: 0
-  report_dir: artifacts/eval

@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import orjson
 import torch
 
 from p0.model.config import ModelConfig
@@ -16,7 +17,7 @@ from p0.model.resources import default_runtime_resources
 from p0.persistence import atomic_json_save
 from p0.replays.dataset import LazyReplayDataset, SeriesSplitManifest
 from p0.training.bc import BCCancelled, BCEvaluationMetrics, BCTrainer
-from p0.training.checkpoint import CheckpointStore, value_objective_metadata
+from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
 from p0.training.files import training_run
 from p0.training.utils import default_device, seed_everything
@@ -52,6 +53,26 @@ def _reported_path(path: Path | None) -> str | None:
     return str(path.resolve())
 
 
+def open_bc_dataset(dataset_dir: Path) -> LazyReplayDataset:
+    """
+    Open one published dataset together with the splits stored beside it.
+
+    dataset_dir is either one dataset folder, or the build-shards output folder, in
+    which case latest.json names the most recently published dataset.
+    """
+    if not (dataset_dir / "manifest.json").is_file():
+        latest = dataset_dir / "latest.json"
+        if not latest.is_file():
+            raise ValueError(
+                f"No dataset found in {dataset_dir}; build one with 'p0-replays build-shards'"
+            )
+        dataset_dir = dataset_dir / orjson.loads(latest.read_bytes())["dataset_id"]
+
+    return LazyReplayDataset(
+        dataset_dir / "manifest.json", split_manifest=dataset_dir / "splits.json"
+    )
+
+
 def train_bc(
     config: BCConfig,
     *,
@@ -70,7 +91,7 @@ def train_bc(
         The final training and validation metrics plus selected checkpoint state.
     """
     store = CheckpointStore()
-    dataset = LazyReplayDataset(config.shard_manifest, split_manifest=config.split_manifest_path)
+    dataset = open_bc_dataset(config.dataset_dir)
     shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
     assert split_manifest is not None
     accepted_series = frozenset(dataset.accepted_series_ids())
@@ -85,7 +106,7 @@ def train_bc(
     metadata = {
         "dataset_id": shard_manifest.dataset_id,
         "split_id": split_manifest.split_id,
-        **value_objective_metadata(config.gamma),
+        "gamma": config.gamma,
     }
     with training_run(
         store,
@@ -98,11 +119,7 @@ def train_bc(
         selected_device = default_device() if device is None else torch.device(device)
         seed_everything(config.seed)
         policy = (
-            store.load_policy(
-                files.source,
-                selected_device,
-                expected_objective=value_objective_metadata(config.gamma),
-            )
+            store.load_policy(files.source, selected_device, gamma=config.gamma)
             if files.source is not None
             else build_policy(ModelConfig.baseline(), default_runtime_resources())
         )
@@ -233,9 +250,8 @@ def evaluate_bc(
     """Evaluate a weights-only or BC training checkpoint on one bound split."""
     selected_device = default_device() if device is None else torch.device(device)
     store = CheckpointStore()
-    objective = value_objective_metadata(config.gamma)
-    policy = store.load_policy(checkpoint, selected_device, expected_objective=objective)
-    dataset = LazyReplayDataset(config.shard_manifest, split_manifest=config.split_manifest_path)
+    policy = store.load_policy(checkpoint, selected_device, gamma=config.gamma)
+    dataset = open_bc_dataset(config.dataset_dir)
     shard_manifest, split_manifest = dataset.manifest, dataset.split_manifest
     assert split_manifest is not None
     accepted_series = frozenset(dataset.accepted_series_ids())
@@ -250,6 +266,6 @@ def evaluate_bc(
         "dataset_id": shard_manifest.dataset_id,
         "split": split,
         "checkpoint": str(checkpoint.resolve()),
-        "objective": objective,
+        "gamma": config.gamma,
         "metrics": metrics.to_dict(),
     }

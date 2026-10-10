@@ -592,7 +592,7 @@ class TestObservationBuilder:
         invalid = StructuredObservation.empty_batch(1)[0]
         invalid.numerical = invalid.numerical.to(torch.float64)
         with pytest.raises(ValueError, match="Invalid numerical"):
-            _OBSERVATION_BUILDER.build_into(battle, invalid)
+            _OBSERVATION_BUILDER.validate_output(invalid)
 
     def test_observation_builder_identity_knownness_and_stat_provenance(self) -> None:
         """Verify IdentityKnownness (KNOWN/OOV/UNKNOWN/PAD) and StatProvenance (KNOWN/IMPUTED/UNKNOWN/PAD)."""

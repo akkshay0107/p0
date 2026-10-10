@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +10,7 @@ import pytest
 from p0.training.config import (
     BCConfig,
     GlobalConfig,
-    TrainingConfig,
+    PPOConfig,
     load_config,
 )
 
@@ -30,154 +29,116 @@ class TestConfig:
         with pytest.raises(FileNotFoundError, match="Configuration file not found"):
             load_config(tmp_path / "missing.yaml")
 
-    def test_load_config_applies_partial_yaml_to_source_defaults(self, tmp_path: Path) -> None:
-        """Verify partial YAML overrides update specified sections while retaining intentional defaults."""
+    def test_empty_file_keeps_every_default(self, tmp_path: Path) -> None:
+        config = load_config(write_config(tmp_path, "{}\n"))
+
+        assert isinstance(config, GlobalConfig)
+        assert config.ppo.num_episodes == 2000
+        assert config.ppo.gamma == 0.99
+        assert config.ppo.output_dir == ROOT / "artifacts" / "runs" / "ppo"
+        assert config.bc.batch_decisions == 256
+        assert config.bc.dataset_dir == ROOT / "artifacts" / "datasets"
+        assert config.bot.username == "Bot"
+
+    def test_partial_yaml_changes_only_the_named_settings(self, tmp_path: Path) -> None:
         config = load_config(
             write_config(
                 tmp_path,
                 """
-                training:
-                  n_envs: 8
+                ppo:
+                  n_envs: 4
                   magnet_alpha: 0.05
-                  gamma: 0.95
-                  value_coef: 0.4
+                bc:
+                  epochs: 3
+                bot:
+                  username: Tester
                 """,
             )
         )
 
-        assert isinstance(config, GlobalConfig)
-        assert config.training.n_envs == 8
-        assert config.training.magnet_alpha == 0.05
-        assert config.training.gamma == 0.95
-        assert config.training.value_coef == 0.4
-        # Pinned intentional product defaults
-        assert config.training.num_episodes == 2000
-        assert config.training.magnet_refresh_interval == 20
-        assert config.bc.batch_decisions == 256
-        assert config.evaluation.episodes_per_matchup == 20
-        # BC inherits nondefault objective coefficients from training
-        assert config.bc.gamma == 0.95
-        assert config.bc.value_coef == 0.4
+        assert config.ppo.n_envs == 4
+        assert config.ppo.magnet_alpha == 0.05
+        assert config.ppo.rollout_steps == 320
+        assert config.bc.epochs == 3
+        assert config.bc.learning_rate == 3e-4
+        assert config.bot.username == "Tester"
+
+    def test_shared_settings_reach_both_trainers(self, tmp_path: Path) -> None:
+        """gamma, seed, and enable_optim are written once and read by PPO and BC."""
+        config = load_config(write_config(tmp_path, "gamma: 0.95\nseed: 7\nenable_optim: false\n"))
+
+        assert (config.ppo.gamma, config.bc.gamma) == (0.95, 0.95)
+        assert (config.ppo.seed, config.bc.seed) == (7, 7)
+        assert (config.ppo.enable_optim, config.bc.enable_optim) == (False, False)
 
     @pytest.mark.parametrize(
         ("label", "contents", "message"),
         [
+            ("unknown ppo setting", "ppo:\n  unknown_value: 1\n", "unknown ppo setting"),
+            ("unknown bc setting", "bc:\n  bogus: 1\n", "unknown bc setting"),
+            ("unknown bot setting", "bot:\n  battle_format: x\n", "unknown bot setting"),
+            ("unknown root setting", "bo3: 1\n", "unknown root setting"),
+            ("old training section", "training:\n  n_envs: 2\n", "unknown root setting"),
+            ("old paths section", "paths:\n  runs_dir: runs\n", "unknown root setting"),
+            ("old evaluation section", "evaluation:\n  seed: 1\n", "unknown root setting"),
+            ("ppo value fixed in code", "ppo:\n  clip_range: 0.3\n", "unknown ppo setting"),
+            ("bc value fixed in code", "bc:\n  weight_decay: 0.1\n", "unknown bc setting"),
+            ("gamma is a root setting", "bc:\n  gamma: 0.9\n", "unknown bc setting"),
+            ("seed is a root setting", "ppo:\n  seed: 3\n", "unknown ppo setting"),
+            ("bot option that is a p0-play flag", "bot:\n  top_p: 0.5\n", "unknown bot setting"),
+            ("section is not a mapping", "ppo: 3\n", "ppo must be a mapping"),
+            ("false section is not a mapping", "ppo: false\n", "ppo must be a mapping"),
+            ("run too short for warmup", "ppo:\n  num_episodes: 5\n", "too short"),
             (
-                "unknown training field",
-                "training:\n  unknown_value: 1\n",
-                "unknown TrainingConfig field",
+                "resume and initial policy together",
+                "ppo:\n  resume_checkpoint: a.pt\n  initial_policy_checkpoint: b.pt\n",
+                "mutually exclusive",
             ),
             (
-                "unknown bc field",
-                "bc:\n  bogus: 1\n",
-                "unknown BCConfig field",
-            ),
-            (
-                "magnet refresh exceeds episodes",
-                "training:\n  num_episodes: 10\n  magnet_refresh_interval: 20\n",
-                "magnet_refresh_interval",
-            ),
-            (
-                "removed bot format setting",
-                "bot:\n  battle_format: gen9anythinggoes\n",
-                "unknown BotConfig field",
-            ),
-            (
-                "removed bo3 switch",
-                "bo3: 1\n",
-                "unknown root configuration section",
+                "one server url without the other",
+                "bot:\n  websocket_url: ws://localhost:8000\n",
+                "must be configured together",
             ),
         ],
     )
-    def test_load_config_rejects_invalid_contracts_with_specific_errors(
+    def test_load_config_rejects_invalid_files_with_specific_errors(
         self, tmp_path: Path, label: str, contents: str, message: str
     ) -> None:
-        """Verify load_config detects and rejects schema violations with informative errors."""
         with pytest.raises(ValueError, match=message):
             load_config(write_config(tmp_path, contents))
 
     def test_config_is_immutable(self, tmp_path: Path) -> None:
-        """Verify GlobalConfig dataclasses are frozen against accidental mutation."""
+        """Verify configuration values cannot be changed after construction."""
         config = load_config(write_config(tmp_path, "{}\n"))
 
-        with pytest.raises(FrozenInstanceError):
-            setattr(config, "training", TrainingConfig())
-        with pytest.raises(FrozenInstanceError):
-            setattr(config.training, "n_envs", 1)
+        with pytest.raises(AttributeError):
+            setattr(config, "ppo", PPOConfig())
+        with pytest.raises(AttributeError):
+            setattr(config.ppo, "n_envs", 1)
 
-    def test_paths_and_team_pool_paths_resolve_once_from_project_root(self, tmp_path: Path) -> None:
-        """Verify relative paths in YAML resolve deterministically against repository root."""
+    def test_relative_paths_start_at_the_repository_root(self, tmp_path: Path) -> None:
         config = load_config(
             write_config(
                 tmp_path,
                 """
-    paths:
-      data_root: relative-data
-    teams:
-      all: team-pool
-      reduced: reduced-pool
-    """,
+                ppo:
+                  output_dir: relative-run
+                  resume_checkpoint: /absolute/ppo.pt
+                bc:
+                  dataset_dir: relative-data
+                  output_dir: relative-bc
+                """,
             )
         )
 
-        assert config.paths.repository_root.is_absolute()
-        assert config.paths.data_root == (ROOT / "relative-data").resolve()
-        assert config.teams.all == (ROOT / "teams" / "team-pool").resolve()
-        assert config.teams.reduced == (ROOT / "teams" / "reduced-pool").resolve()
+        assert config.ppo.output_dir == ROOT / "relative-run"
+        assert config.ppo.resume_checkpoint == Path("/absolute/ppo.pt")
+        assert config.ppo.initial_policy_checkpoint is None
+        assert config.bc.dataset_dir == ROOT / "relative-data"
+        assert config.bc.output_dir == ROOT / "relative-bc"
 
-    def test_config_sections(self) -> None:
-        """Verify example configuration loads with compatible shared objectives."""
-        config = load_config("config.example.yaml")
-        assert config.bc.gamma == 0.99
-        assert config.bc.value_coef == 0.5
-        assert config.training.gamma == 0.99
-        assert config.training.value_coef == 0.5
-
-    @pytest.mark.parametrize(
-        ("training_kwargs", "bc_kwargs", "expected_error"),
-        [
-            ({"gamma": 0.95}, {"gamma": 0.90}, "bc.gamma must match training.gamma"),
-            (
-                {"value_coef": 0.4},
-                {"value_coef": 0.6},
-                "bc.value_coef must match training.value_coef",
-            ),
-        ],
-    )
-    def test_objective_coefficient_mismatch_rejected(
-        self,
-        training_kwargs: dict[str, Any],
-        bc_kwargs: dict[str, Any],
-        expected_error: str,
-    ) -> None:
-        """Verify mismatched objective coefficients between training and BC are rejected."""
-        with pytest.raises(ValueError, match=expected_error):
-            GlobalConfig(
-                training=TrainingConfig(**training_kwargs),
-                bc=BCConfig(**bc_kwargs),
-            )
-
-    @pytest.mark.parametrize(
-        ("yaml_text", "expected_error"),
-        [
-            ("training:\n  gamma: 0.95\nbc:\n  gamma: 0.90\n", "bc.gamma is derived from training"),
-            (
-                "training:\n  value_coef: 0.4\nbc:\n  value_coef: 0.6\n",
-                "bc.value_coef is derived from training",
-            ),
-        ],
-    )
-    def test_yaml_objective_override_rejected(
-        self,
-        tmp_path: Path,
-        yaml_text: str,
-        expected_error: str,
-    ) -> None:
-        """Verify YAML files attempting to configure bc objective coefficients directly are rejected."""
-        path = tmp_path / "config.yaml"
-        path.write_text(yaml_text, encoding="utf-8")
-        with pytest.raises(ValueError, match=expected_error):
-            load_config(path)
+    def test_ppo_checkpoint_is_written_inside_the_output_directory(self, tmp_path: Path) -> None:
+        assert PPOConfig(output_dir=tmp_path).checkpoint_path == tmp_path / "ppo_checkpoint.pt"
 
     @pytest.mark.parametrize(
         ("field", "value"),

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from p0.training.config import TrainingConfig
+from p0.training.config import PPOConfig
 
 
 class OptimizationPrecision(NamedTuple):
@@ -59,7 +59,7 @@ def select_optimization_precision(
 class PPOScheduler:
     """Linear warmup followed by cosine learning rate decay."""
 
-    def __init__(self, config: TrainingConfig) -> None:
+    def __init__(self, config: PPOConfig) -> None:
         self.alpha_value = config.magnet_alpha
         self.lr_max = config.lr
         self.lr_min = 0.1 * config.lr

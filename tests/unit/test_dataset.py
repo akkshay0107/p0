@@ -19,6 +19,7 @@ from p0.replays.dataset import (
     load_split_manifest,
     write_split_manifest,
 )
+from p0.replays.shards import validate_shard_summaries
 from tests.unit.replay_fixtures import (
     build_dataset,
     sample_replay_payload,
@@ -156,16 +157,74 @@ class TestReplayDatasets:
             assert slot_unknown.tolist() == [1.0, 1.0]
             assert not torch.equal(final.numerical[0], chunk.observations.numerical[-1])
 
-    def test_dataset_rejects_missing_golden_shard(self, tmp_path: Path) -> None:
-        """Verify LazyReplayDataset detects missing physical shard files on disk and raises ValueError."""
+    def test_dataset_names_the_rebuild_command_for_an_older_manifest_layout(
+        self, tmp_path: Path
+    ) -> None:
+        built = build_dataset(tmp_path, 1)
+        older = json.loads(built.manifest_path.read_text(encoding="utf-8"))
+        older["artifact_schema"] = "p0.replay_shard.v2"
+        built.manifest_path.write_text(json.dumps(older), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="p0-replays build-shards"):
+            LazyReplayDataset(built.manifest_path)
+
+    def test_dataset_rejects_missing_shard_file(self, tmp_path: Path) -> None:
         built = build_dataset(tmp_path, 1)
         shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
         shard_path.unlink()
-        with pytest.raises(ValueError, match="Shard file is missing"):
+        with pytest.raises(ValueError, match="Unable to load shard"):
             next(iter(LazyReplayDataset(built.manifest_path)))
 
-    def test_dataset_rejects_duplicate_persisted_summaries(self, tmp_path: Path) -> None:
-        """Verify LazyReplayDataset detects and rejects duplicate persisted summaries at the reader boundary."""
+    def test_dataset_rejects_shard_path_outside_dataset(self, tmp_path: Path) -> None:
+        built = build_dataset(tmp_path, 1)
+        manifest = built.manifest.to_dict()
+        manifest["shards"][0]["filename"] = "../outside.pt"
+        altered_manifest_path = built.manifest_path.parent / "altered.json"
+        altered_manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="escapes the manifest directory"):
+            next(iter(LazyReplayDataset(altered_manifest_path)))
+
+    def test_dataset_rejects_shard_written_with_another_tensor_layout(self, tmp_path: Path) -> None:
+        """A cached tensor from older code must stop training and name the rebuild flag."""
+        built = build_dataset(tmp_path, 1)
+        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
+        payload = torch.load(shard_path, weights_only=True, map_location="cpu")
+        payload["tensors"]["outcome"] = payload["tensors"]["outcome"].to(torch.float64)
+        torch.save(payload, shard_path)
+
+        with pytest.raises(ValueError, match="--force-reconstruct"):
+            next(iter(LazyReplayDataset(built.manifest_path)))
+
+    def test_dataset_rejects_missing_game_summary_instead_of_dropping_a_game(
+        self, tmp_path: Path
+    ) -> None:
+        built = write_dataset_replay_dataset(
+            tmp_path,
+            (sample_replay_payload("game-1"), sample_replay_payload("game-2")),
+        )
+        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
+        payload = torch.load(shard_path, weights_only=True, map_location="cpu")
+        payload["series_summaries"].pop()
+        torch.save(payload, shard_path)
+
+        with pytest.raises(ValueError, match="summary count does not match game offsets"):
+            next(iter(LazyReplayDataset(built.manifest_path)))
+
+    def test_writer_check_rejects_duplicate_summaries(self, tmp_path: Path) -> None:
+        built = write_dataset_replay_dataset(
+            tmp_path,
+            (sample_replay_payload("game-1"), sample_replay_payload("game-2")),
+        )
+        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
+        payload = torch.load(shard_path, weights_only=True, map_location="cpu")
+        with pytest.raises(ValueError, match="summary count does not match game offsets"):
+            validate_shard_summaries(
+                payload["tensors"],
+                [*payload["series_summaries"], payload["series_summaries"][0]],
+            )
+
+    def test_writer_check_rejects_nonchronological_summaries(self, tmp_path: Path) -> None:
         built = write_dataset_replay_dataset(
             tmp_path,
             (sample_replay_payload("game-1"), sample_replay_payload("game-2")),
@@ -173,35 +232,17 @@ class TestReplayDatasets:
         shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
         payload = torch.load(shard_path, weights_only=True, map_location="cpu")
         summaries = payload["series_summaries"]
-        payload["series_summaries"] = [*summaries, summaries[0]]
-        torch.save(payload, shard_path)
-
-        manifest = built.manifest.to_dict()
-
-        altered = built.manifest_path.parent / "altered.json"
-        altered.write_text(json.dumps(manifest), encoding="utf-8")
-
-        with pytest.raises(
-            ValueError,
-            match="Shard summary count does not match game offsets|Shard summaries do not cover",
-        ):
-            list(LazyReplayDataset(altered))
-
-    def test_dataset_rejects_nonchronological_game_summaries(self, tmp_path: Path) -> None:
-        built = write_dataset_replay_dataset(
-            tmp_path,
-            (sample_replay_payload("game-1"), sample_replay_payload("game-2")),
-        )
-        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
-        payload = torch.load(shard_path, weights_only=True, map_location="cpu")
-        summaries = payload["series_summaries"]
-        payload["series_summaries"] = [*summaries[2:4], *summaries[0:2]]
-        torch.save(payload, shard_path)
-
-        manifest = built.manifest.to_dict()
-
-        altered = built.manifest_path.parent / "altered.json"
-        altered.write_text(json.dumps(manifest), encoding="utf-8")
-
         with pytest.raises(ValueError, match="not chronological"):
-            list(LazyReplayDataset(altered))
+            validate_shard_summaries(payload["tensors"], [*summaries[2:4], *summaries[0:2]])
+
+    def test_writer_check_rejects_game_missing_a_perspective(self, tmp_path: Path) -> None:
+        built = write_dataset_replay_dataset(
+            tmp_path,
+            (sample_replay_payload("game-1"), sample_replay_payload("game-2")),
+        )
+        shard_path = built.manifest_path.parent / built.manifest.shards[0].filename
+        payload = torch.load(shard_path, weights_only=True, map_location="cpu")
+        summaries = payload["series_summaries"]
+        one_sided = [{**item, "player": 0, "canonical_player": 0} for item in summaries]
+        with pytest.raises(ValueError, match="both player perspectives"):
+            validate_shard_summaries(payload["tensors"], one_sided)

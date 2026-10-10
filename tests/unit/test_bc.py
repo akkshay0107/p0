@@ -27,187 +27,8 @@ from p0.training.bc import (
     BCGameWindow,
     BCTrainer,
     collate_bc_batches,
-    compute_bc_objective,
 )
 from p0.training.config import BCConfig
-
-
-class TestBCObjectives:
-    def test_exact_and_partial_losses_match_probability_definitions(self) -> None:
-        """Check exact, candidate-marginal, and unknown-label loss definitions."""
-        log_probs = torch.tensor([math.log(0.25), math.log(0.5), math.log(0.25)])
-        offsets = torch.tensor([0, 1, 3, 3], dtype=torch.long)
-        labels = torch.tensor(
-            [int(LabelKind.EXACT), int(LabelKind.PARTIAL), int(LabelKind.UNKNOWN)]
-        )
-        loss_mask = torch.tensor([1.0, 1.0, 0.0])
-
-        result = compute_bc_objective(log_probs, offsets, labels, loss_mask)
-
-        expected_exact = -math.log(0.25)
-        # Partial candidate set contains probs 0.5 and 0.25 -> sum = 0.75
-        expected_partial = -math.log(0.75)
-        assert result.exact_count == 1 and result.partial_count == 1
-        assert result.labeled_count == 2
-        assert result.loss_weight == 2.0
-        assert result.exact_nll.item() == pytest.approx(expected_exact)
-        assert result.partial_nll.item() == pytest.approx(expected_partial)
-        assert result.loss.item() == pytest.approx((expected_exact + expected_partial) / 2)
-        assert result.marginal_log_probs[2].isneginf()
-
-    @pytest.mark.parametrize(
-        ("probabilities", "weights", "expected_loss", "expected_gradient"),
-        [
-            pytest.param(
-                (0.25, 0.75),
-                (0.25, 0.75),
-                0.5623351446188083,
-                (-0.25, -0.75),
-                id="unit-total-weight",
-            ),
-            pytest.param(
-                (0.25, 0.5),
-                (0.1, 0.15),
-                0.9704060527839233,
-                (-0.4, -0.6),
-                id="below-one-total-weight",
-            ),
-        ],
-    )
-    def test_fractional_weights_use_the_true_weighted_mean(
-        self,
-        probabilities: tuple[float, float],
-        weights: tuple[float, float],
-        expected_loss: float,
-        expected_gradient: tuple[float, float],
-    ) -> None:
-        """Pin weighted loss, gradient, and discrete label counts for fractional weights."""
-        log_probs = torch.log(torch.tensor(probabilities)).requires_grad_()
-
-        result = compute_bc_objective(
-            log_probs,
-            torch.tensor([0, 1, 2], dtype=torch.long),
-            torch.tensor([int(LabelKind.EXACT), int(LabelKind.EXACT)]),
-            torch.tensor(weights),
-        )
-        result.loss.backward()
-
-        assert result.labeled_count.item() == 2
-        assert result.exact_count.item() == 2
-        assert result.loss_weight.item() == pytest.approx(sum(weights))
-        assert result.loss.item() == pytest.approx(expected_loss)
-        torch.testing.assert_close(log_probs.grad, torch.tensor(expected_gradient))
-
-    def test_unknown_steps_have_zero_loss_and_preserve_boundaries(self) -> None:
-        """Verify UNKNOWN labels produce zero loss and empty gradients without breaking backprop graph."""
-        log_probs = torch.empty(0, requires_grad=True)
-        offsets = torch.tensor([0, 0, 0], dtype=torch.long)
-        labels = torch.tensor([int(LabelKind.UNKNOWN), int(LabelKind.UNKNOWN)])
-        loss_mask = torch.zeros(2)
-
-        result = compute_bc_objective(log_probs, offsets, labels, loss_mask)
-        assert result.loss.item() == 0.0
-        result.loss.backward()
-        assert log_probs.grad is not None and log_probs.grad.numel() == 0
-
-    def test_partial_loss_is_candidate_order_invariant(self) -> None:
-        """Verify marginal log-sum-exp over candidate actions is invariant to internal candidate permutation."""
-        first = compute_bc_objective(
-            torch.log(torch.tensor([0.2, 0.3, 0.5])),
-            torch.tensor([0, 3], dtype=torch.long),
-            torch.tensor([int(LabelKind.PARTIAL)]),
-            torch.ones(1),
-        )
-        second = compute_bc_objective(
-            torch.log(torch.tensor([0.5, 0.2, 0.3])),
-            torch.tensor([0, 3], dtype=torch.long),
-            torch.tensor([int(LabelKind.PARTIAL)]),
-            torch.ones(1),
-        )
-        torch.testing.assert_close(first.loss, second.loss)
-
-    def test_partial_loss_allows_an_impossible_candidate_when_total_mass_is_valid(self) -> None:
-        result = compute_bc_objective(
-            torch.tensor([math.log(0.5), float("-inf")]),
-            torch.tensor([0, 2], dtype=torch.long),
-            torch.tensor([int(LabelKind.PARTIAL)], dtype=torch.long),
-            torch.ones(1),
-        )
-
-        assert result.loss.item() == pytest.approx(math.log(2.0))
-
-    def test_candidate_objective_preserves_gradients(self) -> None:
-        """Verify backward gradient flow through marginal candidate loss calculations."""
-        probabilities = torch.tensor([0.2, 0.3, 0.5], requires_grad=True)
-        log_probs = probabilities.log()
-        result = compute_bc_objective(
-            log_probs,
-            torch.tensor([0, 3], dtype=torch.long),
-            torch.tensor([int(LabelKind.PARTIAL)]),
-            torch.ones(1),
-        )
-        result.loss.backward()
-        assert probabilities.grad is not None
-        # -log(p0 + p1 + p2) has derivative -1 / (p0 + p1 + p2) for each input.
-        torch.testing.assert_close(probabilities.grad, torch.tensor([-1.0, -1.0, -1.0]))
-
-    @pytest.mark.parametrize(
-        ("log_probs", "offsets", "labels", "message"),
-        [
-            ([float("nan")], [0, 1], [int(LabelKind.EXACT)], "valid log probabilities"),
-            ([float("-inf")], [0, 1], [int(LabelKind.EXACT)], "positive finite"),
-            (
-                [math.log(0.75), math.log(0.75)],
-                [0, 2],
-                [int(LabelKind.PARTIAL)],
-                "must not exceed one",
-            ),
-        ],
-    )
-    def test_invalid_candidate_probability_mass_is_rejected(
-        self,
-        log_probs: list[float],
-        offsets: list[int],
-        labels: list[int],
-        message: str,
-    ) -> None:
-        with pytest.raises(ValueError, match=message):
-            compute_bc_objective(
-                torch.tensor(log_probs),
-                torch.tensor(offsets, dtype=torch.long),
-                torch.tensor(labels, dtype=torch.long),
-                torch.ones(len(labels)),
-            )
-
-    def test_nonfinite_loss_weight_is_rejected(self) -> None:
-        with pytest.raises(ValueError, match="finite"):
-            compute_bc_objective(
-                torch.tensor([math.log(0.5)]),
-                torch.tensor([0, 1], dtype=torch.long),
-                torch.tensor([int(LabelKind.EXACT)], dtype=torch.long),
-                torch.tensor([float("nan")]),
-            )
-
-    @pytest.mark.parametrize(
-        ("labels", "offsets", "mask", "message"),
-        [
-            ([int(LabelKind.EXACT)], [0, 2], [1.0], "EXACT"),
-            ([int(LabelKind.PARTIAL)], [0, 1], [1.0], "PARTIAL"),
-            ([int(LabelKind.UNKNOWN)], [0, 1], [0.0], "UNKNOWN"),
-            ([99], [0, 0], [0.0], "unsupported"),
-        ],
-    )
-    def test_invalid_label_and_candidate_shapes_are_rejected(
-        self, labels, offsets, mask, message
-    ) -> None:
-        """Verify compute_bc_objective detects candidate count and label type mismatches."""
-        with pytest.raises(ValueError, match=message):
-            compute_bc_objective(
-                torch.full((offsets[-1],), math.log(0.5)),
-                torch.tensor(offsets, dtype=torch.long),
-                torch.tensor(labels),
-                torch.tensor(mask),
-            )
 
 
 def _chunk(
@@ -386,6 +207,30 @@ class TestBCTrainer:
 
         assert metrics.exact_nll == pytest.approx(math.log(90.0), rel=1e-5)
         assert metrics.exact_joint_accuracy == 1.0
+
+    def test_evaluation_uses_total_mass_for_partial_labels(self) -> None:
+        game = _chunk(
+            [int(LabelKind.EXACT), int(LabelKind.PARTIAL)],
+            [(7, 8), (7, 8), (9, 10)],
+            [0, 1, 3],
+            is_series_end=True,
+        )
+        policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
+        with torch.no_grad():
+            for parameter in policy.parameters():
+                parameter.zero_()
+        trainer = BCTrainer(
+            policy,
+            (game,),
+            BCConfig(batch_decisions=2, enable_optim=False),
+            device="cpu",
+        )
+
+        metrics = trainer.evaluate()
+
+        assert metrics.exact_nll == pytest.approx(math.log(4.0), rel=1e-5)
+        assert metrics.partial_nll == pytest.approx(math.log(2.0), rel=1e-5)
+        assert metrics.overall_nll == pytest.approx(1.5 * math.log(2.0), rel=1e-5)
 
     def test_bc_trainer_updates_policy_in_game_local_chunks(self) -> None:
         chunk = _chunk(

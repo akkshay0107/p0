@@ -829,15 +829,7 @@ class ObservationBuilder:
         out: StructuredObservation,
         stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
     ) -> None:
-        self.validate_output(out)
-        self.build_into_prevalidated(battle, out, stat_overrides)
-
-    def build_into_prevalidated(
-        self,
-        battle: BattleView,
-        out: StructuredObservation,
-        stat_overrides: Mapping[Any, tuple[int, int, int, int, int, int] | None] | None = None,
-    ) -> None:
+        """Write into out, which the caller checked once with validate_output."""
         _write_observation(battle, out, self.tokenizer, stat_overrides)
 
     @staticmethod
@@ -859,5 +851,5 @@ class ObservationBuilder:
                 for _, shape, dtype in StructuredObservation._FIELD_SPECS
             )
         )
-        self.build_into_prevalidated(battle, obs, stat_overrides)
+        self.build_into(battle, obs, stat_overrides)
         return obs

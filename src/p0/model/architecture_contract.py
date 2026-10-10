@@ -19,5 +19,3 @@ REDUCER_MAX_LENGTH = SERIES_SLOTS + HISTORY_WINDOW + CURRENT_REDUCER_TOKEN_COUNT
 # The pointer head has a semantic sentinel for self-targeting. It is not a
 # sequence position and therefore cannot drift when observation rows change.
 SELF_TARGET_SENTINEL = -1
-
-CHECKPOINT_ARTIFACT_SCHEMA = "p0.policy_checkpoint.v2"

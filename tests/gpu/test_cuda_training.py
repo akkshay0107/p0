@@ -16,13 +16,12 @@ from p0.model.factory import build_policy, canonical_policy_state_dict, compile_
 from p0.model.policy import MemoryInputs
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
-from p0.paths import DEFAULT_PATHS
 from p0.replays.dataset import ReplayGameChunk
 from p0.replays.schema import LabelKind
 from p0.teams.corpus_build import write_corpus_manifest
 from p0.training.bc import BCTrainer
 from p0.training.checkpoint import CheckpointStore
-from p0.training.config import BCConfig, GlobalConfig, TeamsConfig, TrainingConfig
+from p0.training.config import BCConfig, PPOConfig
 from p0.training.magnet import Magnet
 from p0.training.ppo import ppo_update
 from p0.training.ppo_runner import run_training
@@ -131,7 +130,7 @@ class TestCudaTraining:
             for index in range(2)
         ]
         batches = prepare_trajectory_batches(collected, cuda_device, gamma=0.99, gae_lambda=0.95)
-        config = TrainingConfig(
+        config = PPOConfig(
             num_episodes=20,
             n_envs=1,
             rollout_steps=1,
@@ -417,22 +416,18 @@ class TestCudaTrainingLoops:
     def test_optimized_ppo_runner_trains_and_resumes_on_cuda(
         self, cuda_device: torch.device, tmp_path: Path
     ) -> None:
-        team = tmp_path / "teams"
-        write_corpus_manifest(default_test_corpus(), team)
+        teams_root = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), teams_root / "all")
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         store.save_policy(
             initial,
             build_policy(MODEL_CONFIG, default_runtime_resources()),
-            metadata={"gamma": 0.99, "value_target_semantics": "discounted_terminal_outcome.v1"},
+            metadata={"gamma": 0.99},
         )
-        paths = replace(
-            DEFAULT_PATHS,
+        config = PPOConfig(
+            output_dir=tmp_path / "run",
             initial_policy_checkpoint=initial,
-            checkpoint_path=tmp_path / "checkpoints" / "ppo.pt",
-            runs_dir=tmp_path / "runs",
-        )
-        training = TrainingConfig(
             num_episodes=4,
             n_envs=2,
             rollout_steps=8,
@@ -443,20 +438,18 @@ class TestCudaTrainingLoops:
             ramp_up_phase=0.34,
             magnet_refresh_interval=1,
         )
-        config = GlobalConfig(
-            training=training, paths=paths, teams=TeamsConfig(all=team, reduced=team)
-        )
 
         run_training(
             config,
             cancel_requested=lambda: (
-                paths.checkpoint_path.is_file() and store.load_episode(paths.checkpoint_path) >= 3
+                config.checkpoint_path.is_file() and store.load_episode(config.checkpoint_path) >= 3
             ),
+            teams_root=teams_root,
         )
 
-        saved = store.read(paths.checkpoint_path)
+        saved = store.read(config.checkpoint_path)
         assert store.load_episode(saved) == 3
-        metrics_path = paths.runs_dir / "ppo_training" / "metrics.jsonl"
+        metrics_path = config.output_dir / "metrics.jsonl"
         metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in metrics] == [1, 2, 3]
         assert all(record["trajectory_count"] > 0 for record in metrics)
@@ -468,13 +461,10 @@ class TestCudaTrainingLoops:
         )
 
         resumed = replace(
-            config,
-            paths=replace(
-                paths, initial_policy_checkpoint=None, resume_checkpoint=paths.checkpoint_path
-            ),
+            config, initial_policy_checkpoint=None, resume_checkpoint=config.checkpoint_path
         )
-        run_training(resumed)
-        final = store.read(paths.checkpoint_path)
+        run_training(resumed, teams_root=teams_root)
+        final = store.read(config.checkpoint_path)
         assert store.load_episode(final) == 4
         resumed_metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in resumed_metrics] == [1, 2, 3, 4]

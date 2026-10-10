@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from p0.training.config import TrainingConfig
+from p0.training.config import PPOConfig
 from p0.training.utils import (
     PPOScheduler,
     adamw_param_groups,
@@ -47,7 +47,7 @@ class TestTrainingPrecision:
 class TestPPOScheduler:
     def test_warmup_and_cosine_decay(self) -> None:
         """Verify linear warmup ramp followed by cosine decay to minimum LR."""
-        config = TrainingConfig(
+        config = PPOConfig(
             num_episodes=100,
             lr=1e-3,
             ramp_up_phase=0.2,
@@ -75,7 +75,7 @@ class TestPPOScheduler:
 
     def test_invalid_episode_rejected(self) -> None:
         """Verify invalid or negative episode values are rejected."""
-        scheduler = PPOScheduler(TrainingConfig())
+        scheduler = PPOScheduler(PPOConfig())
         with pytest.raises(ValueError, match="non-negative integer"):
             scheduler.lr(-1)
         with pytest.raises(ValueError, match="non-negative integer"):

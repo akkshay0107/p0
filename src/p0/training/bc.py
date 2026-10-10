@@ -30,13 +30,11 @@ from p0.training._bc_history import (
 )
 from p0.training._bc_metrics import (
     BCEvaluationMetrics,
-    BCObjective,
     _BCEvaluationAccumulator,
     _policy_loss_sum,
     _ragged_logsumexp,
     _swap_preview_pair,
-    _validate_objective_inputs,
-    compute_bc_objective,
+    label_masks,
 )
 from p0.training.config import BCConfig
 from p0.training.series_history import SeriesHistoryStore
@@ -327,7 +325,9 @@ class BCTrainer:
         effective_value_count: int,
     ) -> Tensor:
         """
-        Backpropagate one validated decision chunk and update running totals.
+        Backpropagate one decision chunk and update running totals.
+
+        Label and candidate rules are checked once, when the compiler saves a shard.
 
         Arguments:
           batch: Collated CPU batch containing one contiguous set of decisions.
@@ -338,21 +338,6 @@ class BCTrainer:
         Returns:
           Detached policy-loss numerator. Gradients are accumulated for the update.
         """
-        _validate_objective_inputs(
-            batch.candidate_values.size(0),
-            batch.candidate_offsets,
-            batch.label_kind,
-            batch.loss_mask,
-        )
-        candidate_values = batch.candidate_values
-        if candidate_values.dim() != 2 or candidate_values.shape[1] != 2:
-            raise ValueError("candidate_values must have shape (candidates, 2)")
-        if candidate_values.dtype != torch.long:
-            raise ValueError("candidate_values must use torch.long action ids")
-        if candidate_values.numel() and torch.any(
-            (candidate_values < 0) | (candidate_values >= self.policy.actor.act_size)
-        ):
-            raise ValueError("candidate action ids are outside the action contract")
         loss_mask = batch.loss_mask.to(self.device)
         with self.precision.autocast_context(self.device):
             prepared, action_mask, candidate_values, candidate_offsets, window_tokens = (
@@ -404,12 +389,6 @@ class BCTrainer:
 
         try:
             for batch in collate_bc_batches(source, chunk_size):
-                validated_masks = _validate_objective_inputs(
-                    batch.candidate_values.size(0),
-                    batch.candidate_offsets,
-                    batch.label_kind,
-                    batch.loss_mask,
-                )
                 (
                     prepared,
                     action_mask,
@@ -431,7 +410,7 @@ class BCTrainer:
                     prepared.encoded.numerical,
                 )
                 value_targets, value_mask = _prepare_value_targets(batch, self.device, self._gamma)
-                masks = tuple(mask.to(self.device) for mask in validated_masks)
+                masks = tuple(mask.to(self.device) for mask in label_masks(batch.label_kind))
                 marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
                 greedy = self.policy.act(prepared, action_mask, deterministic=True)
                 accumulator.add(
@@ -459,8 +438,6 @@ __all__ = [
     "BCDecisionBatch",
     "BCEvaluationMetrics",
     "BCGameWindow",
-    "BCObjective",
     "BCTrainer",
     "collate_bc_batches",
-    "compute_bc_objective",
 ]

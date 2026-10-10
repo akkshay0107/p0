@@ -63,8 +63,6 @@ def _load_species_pools() -> tuple[StressSpeciesPool, ...]:
     except json.JSONDecodeError as exc:
         raise RuntimeError("Stress team catalog contains malformed JSON") from exc
 
-    if not isinstance(payload, Mapping) or payload.get("schemaVersion") != 1:
-        raise RuntimeError("Stress team catalog has an unsupported schema")
     if payload.get("format") != FORMAT.bo3_format:
         raise RuntimeError("Stress team catalog was built for the wrong format")
 

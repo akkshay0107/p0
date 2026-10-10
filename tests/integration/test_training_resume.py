@@ -14,10 +14,9 @@ from p0.model.config import ModelConfig
 from p0.model.factory import build_policy
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
-from p0.paths import DEFAULT_PATHS
 from p0.teams.corpus_build import write_corpus_manifest
 from p0.training.checkpoint import CheckpointStore
-from p0.training.config import GlobalConfig, TeamsConfig, TrainingConfig
+from p0.training.config import PPOConfig
 from p0.training.files import training_run
 from p0.training.magnet import Magnet
 from p0.training.ppo import ppo_update
@@ -33,23 +32,19 @@ from tests.team_fixtures import default_test_corpus
 class TestTrainingResume:
     @pytest.mark.integration
     def test_short_rollout_windows_reach_updates_and_resume(self, tmp_path: Path) -> None:
-        team = tmp_path / "teams"
-        write_corpus_manifest(default_test_corpus(), team)
+        teams_root = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), teams_root / "all")
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
         store.save_policy(
             initial,
             policy,
-            metadata={"gamma": 0.99, "value_target_semantics": "discounted_terminal_outcome.v1"},
+            metadata={"gamma": 0.99},
         )
-        paths = replace(
-            DEFAULT_PATHS,
+        config = PPOConfig(
+            output_dir=tmp_path / "run",
             initial_policy_checkpoint=initial,
-            checkpoint_path=tmp_path / "checkpoints" / "ppo.pt",
-            runs_dir=tmp_path / "runs",
-        )
-        training = TrainingConfig(
             num_episodes=3,
             n_envs=1,
             rollout_steps=1,
@@ -60,47 +55,37 @@ class TestTrainingResume:
             ramp_up_phase=0.34,
             magnet_refresh_interval=1,
         )
-        config = GlobalConfig(
-            training=training, paths=paths, teams=TeamsConfig(all=team, reduced=team)
-        )
 
-        run_training(config)
+        run_training(config, teams_root=teams_root)
 
-        saved = store.read(paths.checkpoint_path)
+        saved = store.read(config.checkpoint_path)
         assert store.load_episode(saved) == 3
-        metrics_path = paths.runs_dir / "ppo_training" / "metrics.jsonl"
+        metrics_path = config.output_dir / "metrics.jsonl"
         metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in metrics] == [1, 2, 3]
         assert all(record["trajectory_count"] > 0 for record in metrics)
 
         resumed = replace(
-            config,
-            paths=replace(
-                paths, initial_policy_checkpoint=None, resume_checkpoint=paths.checkpoint_path
-            ),
+            config, initial_policy_checkpoint=None, resume_checkpoint=config.checkpoint_path
         )
-        run_training(resumed)
-        assert store.load_episode(paths.checkpoint_path) == 3
+        run_training(resumed, teams_root=teams_root)
+        assert store.load_episode(config.checkpoint_path) == 3
 
     @pytest.mark.integration
     def test_ppo_resume_continues_training_and_metrics(self, tmp_path: Path) -> None:
-        team = tmp_path / "teams"
-        write_corpus_manifest(default_test_corpus(), team)
+        teams_root = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), teams_root / "all")
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
         store.save_policy(
             initial,
             policy,
-            metadata={"gamma": 0.99, "value_target_semantics": "discounted_terminal_outcome.v1"},
+            metadata={"gamma": 0.99},
         )
-        paths = replace(
-            DEFAULT_PATHS,
+        config = PPOConfig(
+            output_dir=tmp_path / "run",
             initial_policy_checkpoint=initial,
-            checkpoint_path=tmp_path / "checkpoints" / "ppo.pt",
-            runs_dir=tmp_path / "runs",
-        )
-        training = TrainingConfig(
             num_episodes=3,
             n_envs=1,
             rollout_steps=220,
@@ -111,9 +96,6 @@ class TestTrainingResume:
             ramp_up_phase=0.34,
             magnet_refresh_interval=1,
         )
-        config = GlobalConfig(
-            training=training, paths=paths, teams=TeamsConfig(all=team, reduced=team)
-        )
         checks = 0
 
         def cancelled() -> bool:
@@ -121,21 +103,18 @@ class TestTrainingResume:
             checks += 1
             return checks >= 280
 
-        run_training(config, cancel_requested=cancelled)
-        interrupted = store.read(paths.checkpoint_path)
+        run_training(config, cancel_requested=cancelled, teams_root=teams_root)
+        interrupted = store.read(config.checkpoint_path)
         completed = store.load_episode(interrupted)
         assert 0 < completed < 3
-        metrics_path = paths.runs_dir / "ppo_training" / "metrics.jsonl"
+        metrics_path = config.output_dir / "metrics.jsonl"
         history = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert history and history[-1]["step"] == completed
         resumed = replace(
-            config,
-            paths=replace(
-                paths, initial_policy_checkpoint=None, resume_checkpoint=paths.checkpoint_path
-            ),
+            config, initial_policy_checkpoint=None, resume_checkpoint=config.checkpoint_path
         )
-        run_training(resumed)
-        final = store.read(paths.checkpoint_path)
+        run_training(resumed, teams_root=teams_root)
+        final = store.read(config.checkpoint_path)
         assert store.load_episode(final) == 3
         metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in metrics] == [1, 2, 3]
@@ -153,42 +132,34 @@ class TestTrainingResume:
     def test_cancel_at_initial_team_preview_saves_a_resumable_checkpoint(
         self, tmp_path: Path
     ) -> None:
-        team = tmp_path / "teams"
-        write_corpus_manifest(default_test_corpus(), team)
+        teams_root = tmp_path / "teams"
+        write_corpus_manifest(default_test_corpus(), teams_root / "all")
         store = CheckpointStore()
         initial = tmp_path / "initial.pt"
         policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
         store.save_policy(
             initial,
             policy,
-            metadata={"gamma": 0.99, "value_target_semantics": "discounted_terminal_outcome.v1"},
+            metadata={"gamma": 0.99},
         )
-        paths = replace(
-            DEFAULT_PATHS,
+        config = PPOConfig(
+            output_dir=tmp_path / "run",
             initial_policy_checkpoint=initial,
-            checkpoint_path=tmp_path / "checkpoints" / "ppo.pt",
-            runs_dir=tmp_path / "runs",
+            n_envs=1,
+            enable_optim=False,
         )
-        config = GlobalConfig(
-            training=TrainingConfig(n_envs=1, enable_optim=False),
-            paths=paths,
-            teams=TeamsConfig(all=team, reduced=team),
-        )
-        run_training(config, cancel_requested=lambda: True)
-        saved = store.read(paths.checkpoint_path)
+        run_training(config, cancel_requested=lambda: True, teams_root=teams_root)
+        saved = store.read(config.checkpoint_path)
         assert store.load_episode(saved) == 0
         state = saved.artifact["training_state"]
         assert "optimizer_state_dict" in state
         assert "magnet_state_dict" in state
-        assert not (paths.runs_dir / "ppo_training" / "metrics.jsonl").exists()
+        assert not (config.output_dir / "metrics.jsonl").exists()
         resumed = replace(
-            config,
-            paths=replace(
-                paths, initial_policy_checkpoint=None, resume_checkpoint=paths.checkpoint_path
-            ),
+            config, initial_policy_checkpoint=None, resume_checkpoint=config.checkpoint_path
         )
-        run_training(resumed, cancel_requested=lambda: True)
-        assert store.load_episode(paths.checkpoint_path) == 0
+        run_training(resumed, cancel_requested=lambda: True, teams_root=teams_root)
+        assert store.load_episode(config.checkpoint_path) == 0
 
     @pytest.mark.integration
     def test_invalid_minibatch_does_not_poison_saved_success(self, tmp_path: Path) -> None:
@@ -219,7 +190,7 @@ class TestTrainingResume:
             Magnet(policy),
             torch.optim.SGD(policy.parameters(), lr=1e-3),
             torch.amp.GradScaler("cpu", enabled=False),
-            TrainingConfig(
+            PPOConfig(
                 num_episodes=20,
                 n_envs=1,
                 rollout_steps=1,

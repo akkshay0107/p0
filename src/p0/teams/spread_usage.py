@@ -33,8 +33,6 @@ from p0.teams.stat_points import (
 )
 from p0.teams.team import normalize_id
 
-SPREAD_USAGE_SCHEMA = 2
-
 # Recorded on each estimate so downstream metrics can separate a usage-backed spread
 # from a move-category shape, which are not comparably reliable.
 IMPUTED_FROM_USAGE = "usage"
@@ -351,7 +349,6 @@ def build_spread_table(
     }
 
     return {
-        "schema": SPREAD_USAGE_SCHEMA,
         "format_id": format_id,
         "bo3_blend_weight": BO3_BLEND_WEIGHT,
         "max_spreads_per_bucket": max_spreads,
@@ -364,12 +361,6 @@ def build_spread_table(
 
 def load_spread_table(payload: Mapping[str, Any]) -> SpreadTable:
     """Rebuild the runtime lookup from a serialized spread-prior artifact."""
-    schema = payload.get("schema")
-    if schema != SPREAD_USAGE_SCHEMA:
-        raise ValueError(
-            f"Unsupported spread table schema: expected={SPREAD_USAGE_SCHEMA}, actual={schema}"
-        )
-
     spreads = payload.get("spreads")
     if not isinstance(spreads, Mapping):
         raise ValueError("Spread table is missing its 'spreads' object")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import NamedTuple
 
 import torch
 from torch import Tensor
@@ -14,21 +13,6 @@ from p0.model.structured_observation import (
     TOKEN_IDX_ALLY_SIDE,
 )
 from p0.replays.schema import LabelKind
-
-LOG_PROBABILITY_TOLERANCE = 1e-6
-
-
-class BCObjective(NamedTuple):
-    """Loss and detached reporting values for one candidate-scored batch."""
-
-    loss: Tensor
-    exact_nll: Tensor
-    partial_nll: Tensor
-    marginal_log_probs: Tensor
-    exact_count: Tensor
-    partial_count: Tensor
-    labeled_count: Tensor
-    loss_weight: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,58 +40,12 @@ def _swap_preview_pair[Action: (Tensor, int)](action: Action) -> Action:
     return (action % TEAM_SIZE) * TEAM_SIZE + action // TEAM_SIZE
 
 
-def _validate_objective_inputs(
-    candidate_count: int,
-    candidate_offsets: Tensor,
-    label_kind: Tensor,
-    loss_mask: Tensor,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    if candidate_offsets.dim() != 1 or candidate_offsets.dtype != torch.long:
-        raise ValueError("candidate_offsets must be a one-dimensional torch.long tensor")
-    if label_kind.dim() != 1 or loss_mask.dim() != 1:
-        raise ValueError("label_kind and loss_mask must be one-dimensional")
-    if label_kind.dtype != torch.long:
-        raise ValueError("label_kind must use torch.long labels")
-    if not loss_mask.is_floating_point():
-        raise ValueError("loss_mask must use a floating-point dtype")
-    if label_kind.numel() + 1 != candidate_offsets.numel():
-        raise ValueError("candidate_offsets must have one boundary per decision")
-    if label_kind.numel() != loss_mask.numel():
-        raise ValueError("label_kind and loss_mask must have matching lengths")
-    if (
-        candidate_offsets.device != label_kind.device
-        or candidate_offsets.device != loss_mask.device
-    ):
-        raise ValueError("candidate label-contract tensors must share a device")
-
-    if candidate_offsets[0].item() != 0 or candidate_offsets[-1].item() != candidate_count:
-        raise ValueError("candidate_offsets must start at zero and end at candidate count")
-    if torch.any(candidate_offsets[1:] < candidate_offsets[:-1]):
-        raise ValueError("candidate_offsets must be nondecreasing")
-    if torch.any(~torch.isfinite(loss_mask)) or torch.any((loss_mask < 0) | (loss_mask > 1)):
-        raise ValueError("loss_mask values must be finite and in [0, 1]")
-
+def label_masks(label_kind: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Return the exact, partial, unknown, and labeled decision masks."""
     exact = label_kind == int(LabelKind.EXACT)
     partial = label_kind == int(LabelKind.PARTIAL)
     unknown = label_kind == int(LabelKind.UNKNOWN)
-    labeled = exact | partial
-
-    if torch.any(~(labeled | unknown)):
-        raise ValueError("label_kind contains an unsupported label")
-
-    counts = candidate_offsets[1:] - candidate_offsets[:-1]
-    if torch.any(exact & (counts != 1)):
-        raise ValueError("EXACT labels must have exactly one candidate")
-    if torch.any(partial & (counts < 2)):
-        raise ValueError("PARTIAL labels must have at least two candidates")
-    if torch.any(unknown & (counts != 0)):
-        raise ValueError("UNKNOWN labels must not have candidates")
-    if torch.any(unknown & (loss_mask != 0)):
-        raise ValueError("UNKNOWN labels must have a zero loss mask")
-    if torch.any(labeled & (loss_mask == 0)):
-        raise ValueError("Labeled decisions must have a nonzero loss mask")
-
-    return exact, partial, unknown, labeled
+    return exact, partial, unknown, exact | partial
 
 
 def _ragged_logsumexp(candidate_log_probs: Tensor, offsets: Tensor) -> Tensor:
@@ -145,65 +83,6 @@ def _policy_loss_sum(
         torch.zeros_like(marginal_log_probs),
     ).sum()
     return policy_sum, loss_weight
-
-
-def compute_bc_objective(
-    candidate_log_probs: Tensor,
-    candidate_offsets: Tensor,
-    label_kind: Tensor,
-    loss_mask: Tensor,
-) -> BCObjective:
-    """Compute exact and candidate-marginalized NLL without dropping unknown steps."""
-    if candidate_log_probs.dim() != 1:
-        raise ValueError("candidate_log_probs must be one-dimensional")
-    if not candidate_log_probs.is_floating_point():
-        raise ValueError("candidate_log_probs must use a floating-point dtype")
-    if (
-        candidate_offsets.device != candidate_log_probs.device
-        or label_kind.device != candidate_log_probs.device
-        or loss_mask.device != candidate_log_probs.device
-    ):
-        raise ValueError("objective tensors must share a device")
-
-    if torch.any(torch.isnan(candidate_log_probs)) or torch.any(
-        candidate_log_probs > LOG_PROBABILITY_TOLERANCE
-    ):
-        raise ValueError("candidate_log_probs must contain valid log probabilities")
-
-    exact, partial, _, labeled = _validate_objective_inputs(
-        candidate_log_probs.numel(),
-        candidate_offsets,
-        label_kind,
-        loss_mask,
-    )
-    marginal_log_probs = _ragged_logsumexp(candidate_log_probs, candidate_offsets)
-    labeled_marginals = marginal_log_probs[labeled]
-    if torch.any(~torch.isfinite(labeled_marginals)):
-        raise ValueError("Every labeled decision must have positive finite candidate mass")
-    if torch.any(labeled_marginals > LOG_PROBABILITY_TOLERANCE):
-        raise ValueError("Candidate probability mass must not exceed one")
-    weighted_loss_sum, loss_weight = _policy_loss_sum(marginal_log_probs, loss_mask)
-    exact_count = exact.sum()
-    partial_count = partial.sum()
-    exact_nll = (-marginal_log_probs[exact]).sum() / exact_count.clamp_min(1)
-    partial_nll = (-marginal_log_probs[partial]).sum() / partial_count.clamp_min(1)
-    denominator = torch.where(
-        loss_weight > 0,
-        loss_weight,
-        torch.ones_like(loss_weight),
-    )
-    loss = weighted_loss_sum / denominator
-
-    return BCObjective(
-        loss=loss,
-        exact_nll=exact_nll,
-        partial_nll=partial_nll,
-        marginal_log_probs=marginal_log_probs,
-        exact_count=exact_count,
-        partial_count=partial_count,
-        labeled_count=labeled.sum(),
-        loss_weight=loss_weight,
-    )
 
 
 def slot_legality_unknown(numerical: Tensor) -> Tensor:

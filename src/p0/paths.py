@@ -14,35 +14,18 @@ class ProjectPaths:
     teams_root: Path
     artifacts_root: Path
     showdown_root: Path
-    checkpoint_path: Path
-    runs_dir: Path
-    replays_dir: Path
-    log_path: Path
-    resume_checkpoint: Path | None = None
-    initial_policy_checkpoint: Path | None = None
-
-    def __post_init__(self) -> None:
-        if self.resume_checkpoint is not None and self.initial_policy_checkpoint is not None:
-            raise ValueError(
-                "paths.resume_checkpoint and paths.initial_policy_checkpoint are mutually exclusive"
-            )
 
     @classmethod
     def from_root(cls, repository_root: str | Path) -> ProjectPaths:
         """Construct ProjectPaths anchored at repository_root."""
         root = Path(repository_root).expanduser().resolve()
-        artifacts = root / "artifacts"
 
         return cls(
             repository_root=root,
             data_root=root / "data",
             teams_root=root / "teams",
-            artifacts_root=artifacts,
+            artifacts_root=root / "artifacts",
             showdown_root=root / "pokemon-showdown",
-            checkpoint_path=artifacts / "checkpoints" / "ppo_checkpoint.pt",
-            runs_dir=artifacts / "runs",
-            replays_dir=artifacts / "replays",
-            log_path=artifacts / "training.log",
         )
 
 

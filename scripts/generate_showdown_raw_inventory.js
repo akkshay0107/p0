@@ -258,7 +258,7 @@ function main() {
       : dynamicTags.length ? 'source expression expanded from structural call-site values'
       : 'source emission retained for exact format and effect review';
   }
-  const output = {schema: 1, showdown_commit: catalog.source.commit, formats: FORMATS, generated_by: 'TypeScript compiler AST', files, entries,
+  const output = {showdown_commit: catalog.source.commit, formats: FORMATS, generated_by: 'TypeScript compiler AST', files, entries,
     reachability_counts: entries.reduce((counts, entry) => { counts[entry.reachability] = (counts[entry.reachability] || 0) + 1; return counts; }, {}),
     review_status: entries.some(entry => entry.reachability === 'unresolved')
       ? 'raw_inventory_unresolved_sites' : 'raw_inventory_reachable_sites_classified',

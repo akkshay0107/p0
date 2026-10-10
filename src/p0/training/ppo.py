@@ -19,7 +19,7 @@ from p0.model.architecture_contract import (
 )
 from p0.model.policy import EncodedObs, MemoryInputs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
-from p0.training.config import TrainingConfig
+from p0.training.config import PPOConfig
 from p0.training.magnet import Magnet
 from p0.training.series_history import SeriesHistorySnapshot
 from p0.training.trajectory import PreparedTrajectory
@@ -59,7 +59,7 @@ def compute_ppo_objective(
     old_log_probs: torch.Tensor,
     advantages: torch.Tensor,
     returns: torch.Tensor,
-    config: TrainingConfig,
+    config: PPOConfig,
     *,
     alpha: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -198,7 +198,7 @@ def _run_batched_ppo(
     episodes: list[PreparedTrajectory],
     policy: PolicyNet,
     magnet: Magnet,
-    config: TrainingConfig,
+    config: PPOConfig,
     device: torch.device,
     precision: OptimizationPrecision,
     alpha: float,
@@ -277,7 +277,7 @@ def ppo_update(
     magnet: Magnet,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
-    config: TrainingConfig,
+    config: PPOConfig,
     episode: int,
     alpha: float,
 ) -> dict[str, float | int]:

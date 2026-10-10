@@ -161,7 +161,6 @@ def main() -> None:
             }
         )
     value = {
-        "schema": 1,
         "showdown_commit": raw_inventory["showdown_commit"],
         "formats": raw_inventory["formats"],
         "unsupported_tags": sorted(UNSUPPORTED_TAGS),

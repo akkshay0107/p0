@@ -43,7 +43,7 @@ Teams must be legal for Champions VGC Regulation M-C. Team files and generated
 corpus manifests are local inputs and are not included in the repository.
 
 Review [config.example.yaml](config.example.yaml) and adjust your `config.yaml`,
-particularly `training.n_envs` and the training budget. Then build the pool and train:
+particularly `ppo.n_envs` and the training budget. Then build the pool and train:
 
 ```bash
 uv run p0-corpus build --input teams/all
@@ -51,8 +51,8 @@ uv run p0-train
 ```
 
 Training starts from random weights and manages its own Showdown servers. By default,
-it saves to `artifacts/checkpoints/ppo_checkpoint.pt`, with metrics and TensorBoard
-logs under `artifacts/runs/ppo_training/`. Use empty output locations for a new run.
+it writes everything to `artifacts/runs/ppo/`: the checkpoint `ppo_checkpoint.pt`,
+metrics, and TensorBoard logs. Set `ppo.output_dir` to an empty folder for a new run.
 
 Both self-play seats sample teams from the built corpus in `teams/all/`. Training,
 evaluation, and pool-based live play read only the built corpus, so rebuild it after
@@ -63,8 +63,8 @@ To fine-tune on a smaller set, supply exports in `teams/reduced/`, build it with
 samples from `teams/reduced/` and the other still samples from `teams/all/`; both
 seats contribute gradients. The reduced pool is optional.
 
-Set `paths.resume_checkpoint` in `config.yaml` to resume a training checkpoint,
-or `paths.initial_policy_checkpoint` to start a new run from policy weights.
+Set `ppo.resume_checkpoint` in `config.yaml` to resume a training checkpoint,
+or `ppo.initial_policy_checkpoint` to start a new run from policy weights.
 These settings are mutually exclusive. Resume restores the weights, optimizer state,
 progress and (for PPO) the magnet; the current `config.yaml` supplies every setting, so
 a resumed run can change them. Resume is not bit-for-bit: random state is not saved,
@@ -85,19 +85,18 @@ uv run p0-replays scrape --limit-games 50
 uv run p0-replays build-shards
 ```
 
-`build-shards` prints a `manifest_path`. Replace the example path below with that
-actual path. The build also writes `splits.json` beside it. Use `create-splits` only
-when you intentionally want to change assignments.
-Set `bc.shard_manifest` in `config.yaml` to that manifest path before training. BC reads
-`splits.json` beside it, so the split file has no separate path setting.
+`build-shards` publishes a dataset folder holding `manifest.json` and `splits.json`,
+and prints the `manifest_path`. Use `create-splits` only when you intentionally want to
+change assignments. BC trains on the newest dataset in `bc.dataset_dir`, which defaults
+to the `build-shards` output folder, so no path needs to be copied into `config.yaml`.
+To train on an older dataset, set `bc.dataset_dir` to its `<dataset-uuid>` folder.
 
 ```bash
 uv run p0-bc train
 ```
 
 The best BC policy is saved to `artifacts/checkpoints/bc/bc_best_policy.pt` by default.
-Set `paths.initial_policy_checkpoint` to that file before starting PPO. The shard path
-in `config.example.yaml` is a placeholder; replace it in `config.yaml`.
+Set `ppo.initial_policy_checkpoint` to that file before starting PPO.
 
 Replays are recorded once by Showdown ID in a JSONL catalog. Each scrape's
 `--limit-games` is a soft cap for new games; fetching linked siblings can take the
@@ -113,7 +112,7 @@ reconstruction code, replay bodies kept under the same ID, spread estimates, or
 dex/resource data used to build observations. After any such change, run
 `p0-replays build-shards --force-reconstruct`. A forced build creates new tensors
 and a new dataset snapshot while preserving previous snapshots.
-Update `bc.shard_manifest` to the printed path for a new training run. Resuming BC
+The next BC run uses the new dataset, because it is now the newest. Resuming BC
 on a different dataset or split logs a warning, because the saved best validation
 score is no longer comparable. No replay or tensor checksums are computed.
 
@@ -133,7 +132,7 @@ those bodies by removing the old index and running `p0-replays scrape`.
 Evaluate against a baseline on a server managed by p0:
 
 ```bash
-uv run p0-eval --checkpoint artifacts/checkpoints/ppo_checkpoint.pt --opponent random
+uv run p0-eval --checkpoint artifacts/runs/ppo/ppo_checkpoint.pt --opponent random
 ```
 
 The default report is `artifacts/eval/evaluation_report.json`. Use `--help` for other
@@ -150,22 +149,21 @@ Then, from the p0 repository root:
 
 ```bash
 SHOWDOWN_USERNAME=MyBot uv run p0-play \
-  --checkpoint artifacts/checkpoints/ppo_checkpoint.pt \
+  --checkpoint artifacts/runs/ppo/ppo_checkpoint.pt \
   --team-pool all
 ```
 
 Challenge `MyBot` in the Champions Bo3 format selected by `scripts/init-data.sh`.
 Set `SHOWDOWN_PASSWORD` in the environment when the account needs a password. The
 `--no-security` server setup above is for local use. For a remote server, configure
-both `bot.websocket_url` and `bot.authentication_url` in `config.yaml`. The YAML config
-also owns sampling, random initialization, and logging settings; `p0-play --help` shows
-the remaining per-run choices.
+both `bot.websocket_url` and `bot.authentication_url` in `config.yaml`. Sampling
+(`--top-p`), random initialization (`--allow-random-init`), and logging (`--log-level`)
+are `p0-play` flags; `p0-play --help` lists every per-run choice.
 
-When updating an older local config, remove `bot.battle_format`,
-`bot.max_concurrent_battles`, `bot.team_files`, and `bot.password`; the format and live
-concurrency are fixed, per-run team files use `--team-file`, and passwords come from
-`SHOWDOWN_PASSWORD`. Also remove `bc.split_manifest`; its path is derived from
-`bc.shard_manifest`.
+An older local `config.yaml` no longer loads: any setting that is not in
+[config.example.yaml](config.example.yaml) is rejected by name. Copy the example file
+again and reapply your values. Values that are no longer settings are fixed in
+`src/p0/training/config.py`, and `p0-eval` takes its options as flags only.
 
 ## Code and development
 
@@ -174,7 +172,7 @@ and prior-game summaries, and selects the two actions in sequence with legality 
 PPO runs the policy on both sides and regularizes it toward a frozen copy that is
 refreshed periodically.
 
-- [Configuration](config.example.yaml): training, paths, team pools, BC, and evaluation.
+- [Configuration](config.example.yaml): training, paths, team pools, the bot, and BC.
 - [Model](src/p0/model/): [model dimensions](src/p0/model/config.py) and
   [tensor layout constants](src/p0/model/architecture_contract.py).
 - [Model compatibility](src/p0/contracts.py): the vocabulary/encoding major identity

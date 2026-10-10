@@ -21,7 +21,7 @@ from p0.replays.dataset import (
 )
 from p0.replays.schema import LabelKind
 from p0.training.bc_runner import evaluate_bc, train_bc
-from p0.training.checkpoint import CheckpointStore, value_objective_metadata
+from p0.training.checkpoint import CheckpointStore
 from p0.training.config import BCConfig
 from tests.unit.replay_fixtures import sample_replay_payload
 
@@ -65,7 +65,7 @@ class TestBCRunner:
             epochs=1,
             num_workers=0,
             enable_optim=False,
-            shard_manifest=built.manifest_path,
+            dataset_dir=built.manifest_path.parent,
             output_dir=tmp_path / "output",
         )
 
@@ -135,7 +135,7 @@ class TestBCRunner:
             epochs=20,
             num_workers=0,
             enable_optim=False,
-            shard_manifest=built.manifest_path,
+            dataset_dir=built.manifest_path.parent,
             output_dir=tmp_path / "output",
         )
 
@@ -187,7 +187,7 @@ class TestBCRunner:
             epochs=1,
             num_workers=0,
             enable_optim=False,
-            shard_manifest=built.manifest_path,
+            dataset_dir=built.manifest_path.parent,
             output_dir=tmp_path / "first-output",
         )
         first = train_bc(first_config, device="cpu")
@@ -293,7 +293,7 @@ class TestBCRunner:
             epochs=1,
             num_workers=0,
             enable_optim=False,
-            shard_manifest=built.manifest_path,
+            dataset_dir=built.manifest_path.parent,
             output_dir=tmp_path / "output",
         )
         policy_checkpoint = tmp_path / "best_policy.pt"
@@ -303,24 +303,23 @@ class TestBCRunner:
             policy_checkpoint,
             policy,
             metadata={
-                **value_objective_metadata(config.gamma),
+                "gamma": 0.99,
                 "trainer_kind": "bc",
                 "selected_epoch": 1,
             },
         )
 
-        evaluation = evaluate_bc(config, policy_checkpoint, split="validation", device="cpu")
-        assert evaluation["objective"] == {
-            "gamma": config.gamma,
-            "value_target_semantics": "discounted_terminal_outcome.v1",
-        }
+        evaluation = evaluate_bc(
+            replace(config, gamma=0.95), policy_checkpoint, split="validation", device="cpu"
+        )
+        assert evaluation["gamma"] == 0.95
         cli_config = tmp_path / "bc-config.yaml"
         cli_config.write_text(
             json.dumps(
                 {
-                    "bc": {
-                        "shard_manifest": str(built.manifest_path),
-                    }
+                    "gamma": 0.95,
+                    # The build output folder; latest.json names the dataset to read.
+                    "bc": {"dataset_dir": str(built.manifest_path.parent.parent)},
                 }
             ),
             encoding="utf-8",
@@ -346,6 +345,8 @@ class TestBCRunner:
         )
         cli_evaluation = json.loads(cli.stdout)
         assert cli_evaluation["split"] == "validation"
+        # The top-level gamma reaches BC, and the newest dataset in the folder is used.
+        assert cli_evaluation["gamma"] == 0.95
         assert cli_evaluation["checkpoint"] == str(policy_checkpoint)
         assert cli_evaluation["metrics"] == evaluation["metrics"]
         with pytest.raises(ValueError, match="test split has no accepted series"):
@@ -386,7 +387,7 @@ class TestBCRunner:
             epochs=1,
             num_workers=0,
             enable_optim=False,
-            shard_manifest=built.manifest_path,
+            dataset_dir=built.manifest_path.parent,
             output_dir=tmp_path / "cancelled-output",
         )
 

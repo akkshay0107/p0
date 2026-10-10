@@ -94,13 +94,6 @@ class TestShardManifest:
         assert manifest.games == 4
         assert manifest.series == 1
 
-    def test_rejects_unsupported_schema(self) -> None:
-        with pytest.raises(ValueError, match="Unsupported shard artifact schema"):
-            manifest = _valid_shard_manifest()
-            data = manifest.to_dict()
-            data["artifact_schema"] = "unknown.v99"
-            ShardManifest.from_dict(data)
-
     def test_loader_rejects_runtime_contract_and_obsolete_field(self) -> None:
         manifest = _valid_shard_manifest()
         value = manifest.to_dict()

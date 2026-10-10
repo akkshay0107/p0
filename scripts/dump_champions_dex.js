@@ -388,7 +388,6 @@ const serializedLegalEffects = Object.fromEntries(
 );
 
 const output = {
-  schemaVersion: 2,
   source: {
     repository: "https://github.com/smogon/pokemon-showdown",
     commit: showdownCommit,
@@ -492,7 +491,6 @@ fs.writeFileSync(
   path.join(path.dirname(outputPath), "stress_team_catalog.json"),
   JSON.stringify(
     sortedObject({
-      schemaVersion: 1,
       format: bo3Format,
       species: stressSpecies.sort((a, b) => a.id.localeCompare(b.id)),
     }),
