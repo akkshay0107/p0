@@ -20,7 +20,6 @@ from p0.model.factory import build_policy
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.rl_player import RLPlayer
-from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_battle_adapter import battle_view
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
@@ -38,10 +37,7 @@ def player():
         account_configuration=AccountConfiguration("StressRandomB", None),
         start_listening=False,
     )
-    try:
-        yield rl_player
-    finally:
-        poke_env_patches.uninstall_for_tests()
+    yield rl_player
 
 
 def _battle(tag: str, *, with_request: bool) -> DoubleBattle:

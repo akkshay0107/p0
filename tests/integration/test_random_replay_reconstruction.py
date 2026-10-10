@@ -27,6 +27,7 @@ from concurrent.futures import Future
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
+from weakref import WeakKeyDictionary
 
 import orjson
 import pytest
@@ -61,12 +62,12 @@ from p0.replays.schema import LabelKind
 from p0.replays.shards import validate_shard_tensors
 from p0.rl_player import TeamPlayerMixin
 from p0.runtime import poke_env_patches
-from p0.runtime.live_event_capture import captured_protocol_lines, consume_events
-from p0.runtime.poke_env_action_adapter import order_to_action
+from p0.runtime.live_event_capture import consume_events
 from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.teams.corpus import TeamCorpus, corpus_from_team_files
 from p0.teams.stat_points import StatPoints
 from p0.teams.team import TeamMember
+from tests.integration.helpers import order_to_action
 from tests.stress._helpers import stress_count, stress_random_team_record
 from tests.team_fixtures import default_test_corpus
 
@@ -124,6 +125,25 @@ def _message_tag(line: str) -> str:
     """Extract Showdown protocol message identifier (e.g. '|move|' -> 'move')."""
     parts = line.split("|")
     return parts[1] if len(parts) > 1 else ""
+
+
+# Protocol lines each live battle parsed, in arrival order.
+_PROTOCOL_LINES: WeakKeyDictionary[DoubleBattle, list[str]] = WeakKeyDictionary()
+# Best-of room notices that are not battle events.
+_ROOM_NOTICES = frozenset({"tempnotify", "tempnotifyoff"})
+
+
+def _install_patches_and_record_lines() -> None:
+    """Install the p0 patches and record every line a battle parses; conftest undoes both."""
+    poke_env_patches.install()
+    parse_message = DoubleBattle.parse_message
+
+    def record_and_parse(battle: DoubleBattle, split_message: list[str]):
+        if len(split_message) < 2 or split_message[1] not in _ROOM_NOTICES:
+            _PROTOCOL_LINES.setdefault(battle, []).append("|".join(split_message))
+        return parse_message(battle, split_message)
+
+    setattr(DoubleBattle, "parse_message", record_and_parse)
 
 
 def _battle_log_lines(lines: tuple[str, ...]) -> tuple[str, ...]:
@@ -265,7 +285,7 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         replay_cursor = len(
             tuple(
                 line
-                for line in _battle_log_lines(view.protocol_lines)
+                for line in _battle_log_lines(tuple(_PROTOCOL_LINES.get(battle, ())))
                 if _message_tag(line) != "showteam"
             )
         )
@@ -312,7 +332,7 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
             # is what makes the line-stream comparison a real check.
             "lines": [
                 line
-                for line in _battle_log_lines(captured_protocol_lines(double_battle))
+                for line in _battle_log_lines(tuple(_PROTOCOL_LINES.get(double_battle, ())))
                 if _message_tag(line) != "showteam"
             ],
         }
@@ -327,8 +347,7 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
 
         double_battle = cast(DoubleBattle, battle)
         replay_id = battle.battle_tag.removeprefix("battle-")
-        view = battle_view(double_battle)
-        replay_events = list(_battle_log_lines(view.replay_events()))
+        replay_events = list(_battle_log_lines(tuple(double_battle._build_replay_events())))
         showteam_lines = self._showteam_lines.pop(battle.battle_tag, [])
 
         if showteam_lines:
@@ -957,7 +976,7 @@ class TestReplayCaptureHarness:
         blocked_output = tmp_path / "observations"
         blocked_output.write_text("An existing file cannot be an artifact directory")
         failure: Future[None] = Future()
-        poke_env_patches.install(capture_protocol_lines=True)
+        _install_patches_and_record_lines()
         player = JsonCapturingRandomPlayer(
             account_configuration=AccountConfiguration("StressFailureA", None),
             battle_format=FORMAT.battle_format,
@@ -989,7 +1008,6 @@ class TestReplayCaptureHarness:
             await asyncio.gather(
                 player.ps_client.stop_listening(), opponent.ps_client.stop_listening()
             )
-            poke_env_patches.uninstall_for_tests()
 
 
 class TestRandomReplayReconstruction:
@@ -1027,9 +1045,8 @@ class TestRandomReplayReconstruction:
         )
         random_state = random.getstate()
         random.seed(seed)
-        poke_env_patches.install(capture_protocol_lines=True)
+        _install_patches_and_record_lines()
         request.addfinalizer(partial(random.setstate, random_state))
-        request.addfinalizer(poke_env_patches.uninstall_for_tests)
         handler_failure: Future[None] = Future()
         players: list[JsonCapturingRandomPlayer] = []
         try:

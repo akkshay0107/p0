@@ -29,28 +29,20 @@ from p0.model.resources import default_runtime_resources
 from p0.replays.reconstruction.contract import COPYABLE_VOLATILES
 from p0.runtime.live_event_capture import capture_message, transform_target_reference
 
-_ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
 _ORIGINAL_STOP_LISTENING = PSClient.stop_listening
 _ORIGINAL_HANDLE_MESSAGE = PSClient._handle_message
 _ORIGINAL_SEND_MESSAGE = PSClient.send_message
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
 _ORIGINAL_GET_POKEMON = DoubleBattle.get_pokemon
 _ORIGINAL_PARSE_REQUEST = DoubleBattle.parse_request
-_ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
 _ORIGINAL_START_EFFECT = Pokemon.start_effect
-_ORIGINAL_COPY_BOOSTS = Pokemon.copy_boosts
-_installed = False
-_capture_protocol_lines = False
-_filtered_loggers: set[logging.Logger] = set()
-_original_gen_data: dict[str, dict[str, Any]] = {}
 
 
 def _install_champions_data() -> None:
     """Synchronize poke-env's read-only mechanics with the active Champions dex."""
     dex = default_runtime_resources().dex
     gen_data = GenData.from_gen(9)
-    _original_gen_data.update(pokedex=gen_data.pokedex, moves=gen_data.moves)
     gen_data.pokedex = {
         **gen_data.pokedex,
         **{
@@ -80,18 +72,11 @@ def _install_champions_data() -> None:
     Move.should_be_stored.cache_clear()
 
 
-_CRITICAL_COPY_EFFECTS = (
-    Effect.DRAGON_CHEER,
-    Effect.FOCUS_ENERGY,
-    Effect.G_MAX_CHI_STRIKE,
-    Effect.LASER_FOCUS,
-)
-_MAX_G_MAX_CHI_STRIKE_LAYERS = 3
+_CRITICAL_COPY_EFFECTS = (Effect.DRAGON_CHEER, Effect.FOCUS_ENERGY)
 _LEPPA_PP_RECOVERY = 10
 _RIPEN_LEPPA_PP_RECOVERY = 20
 # Showdown emits these through -singleturn, but they protect the whole side until the turn ends.
 _SIDE_GUARDS = {
-    "craftyshield": SideCondition.CRAFTY_SHIELD,
     "quickguard": SideCondition.QUICK_GUARD,
     "wideguard": SideCondition.WIDE_GUARD,
 }
@@ -204,16 +189,10 @@ async def _wait_for_login(self: PSClient, checking_interval: float = 0.1, wait_f
 
 
 def _start_effect(self: Pokemon, effect_str: str, details: Any = None) -> None:
-    """Track the counters and metadata needed by Showdown's copied volatiles."""
+    """Record whether Dragon Cheer reached a Dragon type, which a copy must keep."""
     _ORIGINAL_START_EFFECT(self, effect_str, details)
-    effect = Effect.from_showdown_message(effect_str)
-    if effect == Effect.G_MAX_CHI_STRIKE:
-        self.effects[effect] = min(
-            self.effects.get(effect, 0) + 1,
-            _MAX_G_MAX_CHI_STRIKE_LAYERS,
-        )
-    elif effect == Effect.DRAGON_CHEER:
-        self.effects[effect] = int(PokemonType.DRAGON in self.types)
+    if Effect.from_showdown_message(effect_str) == Effect.DRAGON_CHEER:
+        self.effects[Effect.DRAGON_CHEER] = int(PokemonType.DRAGON in self.types)
 
 
 def _copy_boosts(self: Pokemon, mon: Pokemon) -> None:
@@ -354,11 +333,7 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
         captured = getattr(self, "_p0_transform_targets", {}).get(id(fainted))
         if captured is not None:
             original_size = (captured.original_height, captured.original_weight)
-    capture_message(
-        self,
-        split_message,
-        capture_protocol_line=_capture_protocol_lines,
-    )
+    capture_message(self, split_message)
     transferred_boosts: dict[str, int] | None = None
     transferred_effects: dict[Effect, int] = {}
     revealed_status = None
@@ -533,8 +508,8 @@ async def _handle_message(self: PSClient, message: str):
 
 async def _send_message(self: PSClient, message: str, room: str = "", message_2=None):
     # A Bo3 format with Force Open Team Sheets has no accept/reject negotiation.
-    # The pinned client unconditionally sends one of those commands for every VGC
-    # battle, which Showdown rejects before the first request is processed.
+    # The pinned client sends one of those commands for every VGC battle. Showdown
+    # answers with an error line, which poke-env logs at CRITICAL once per game.
     if getattr(self, "_p0_force_open_team_sheet", False) and message in {
         "/acceptopenteamsheets",
         "/rejectopenteamsheets",
@@ -579,71 +554,31 @@ async def _stop_listening_cleanly(self: PSClient) -> None:
         )
 
 
-# Every patched attribute with its original and its replacement. install sets the
-# replacements and uninstall_for_tests restores the originals.
+# Every patched attribute with its replacement.
 _PATCHES = (
-    (PSClient, "wait_for_login", _ORIGINAL_WAIT_FOR_LOGIN, _wait_for_login),
-    (PSClient, "stop_listening", _ORIGINAL_STOP_LISTENING, _stop_listening_cleanly),
-    (PSClient, "_handle_message", _ORIGINAL_HANDLE_MESSAGE, _handle_message),
-    (PSClient, "send_message", _ORIGINAL_SEND_MESSAGE, _send_message),
-    (DoubleBattle, "parse_message", _ORIGINAL_PARSE_MESSAGE, _parse_message),
-    (DoubleBattle, "get_pokemon", _ORIGINAL_GET_POKEMON, _get_pokemon),
-    (DoubleBattle, "parse_request", _ORIGINAL_PARSE_REQUEST, _parse_request),
-    (Pokemon, "forme_change", _ORIGINAL_FORME_CHANGE, _forme_change),
-    (
-        Pokemon,
-        "_update_from_teambuilder",
-        _ORIGINAL_UPDATE_FROM_TEAMBUILDER,
-        _update_from_teambuilder,
-    ),
-    (Pokemon, "start_effect", _ORIGINAL_START_EFFECT, _start_effect),
-    (Pokemon, "copy_boosts", _ORIGINAL_COPY_BOOSTS, _copy_boosts),
+    (PSClient, "wait_for_login", _wait_for_login),
+    (PSClient, "stop_listening", _stop_listening_cleanly),
+    (PSClient, "_handle_message", _handle_message),
+    (PSClient, "send_message", _send_message),
+    (DoubleBattle, "parse_message", _parse_message),
+    (DoubleBattle, "get_pokemon", _get_pokemon),
+    (DoubleBattle, "parse_request", _parse_request),
+    (Pokemon, "forme_change", _forme_change),
+    (Pokemon, "_update_from_teambuilder", _update_from_teambuilder),
+    (Pokemon, "start_effect", _start_effect),
+    (Pokemon, "copy_boosts", _copy_boosts),
 )
 
 
-def install(
-    logger: logging.Logger | None = None,
-    *,
-    capture_protocol_lines: bool = False,
-) -> None:
+def install(logger: logging.Logger | None = None) -> None:
     """Install compatibility patches for the pinned poke-env release."""
-    global _capture_protocol_lines, _installed
     target = logger if logger is not None else logging.getLogger("poke_env")
+    # addFilter ignores a filter the logger already has.
+    target.addFilter(_INACTIVE_POKEMON_FILTER)
 
-    if target not in _filtered_loggers:
-        target.addFilter(_INACTIVE_POKEMON_FILTER)
-        _filtered_loggers.add(target)
-
-    if _installed:
-        _capture_protocol_lines = _capture_protocol_lines or capture_protocol_lines
+    if PSClient.wait_for_login is _wait_for_login:
         return
 
-    _capture_protocol_lines = capture_protocol_lines
     _install_champions_data()
-    for owner, name, _, patched in _PATCHES:
+    for owner, name, patched in _PATCHES:
         setattr(owner, name, patched)
-    _installed = True
-
-
-def uninstall_for_tests() -> None:
-    """Uninstall monkey patches for unit test isolation."""
-    global _capture_protocol_lines, _installed
-    _capture_protocol_lines = False
-    for logger in _filtered_loggers:
-        logger.removeFilter(_INACTIVE_POKEMON_FILTER)
-
-    _filtered_loggers.clear()
-    if _installed:
-        for owner, name, original, _ in _PATCHES:
-            setattr(owner, name, original)
-        _installed = False
-        gen_data = GenData.from_gen(9)
-        gen_data.pokedex = _original_gen_data["pokedex"]
-        gen_data.moves = _original_gen_data["moves"]
-        _original_gen_data.clear()
-        Move.should_be_stored.cache_clear()
-
-
-def is_installed() -> bool:
-    """Return whether poke-env monkey patches are active."""
-    return _installed

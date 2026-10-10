@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import numpy.typing as npt
-from poke_env.battle import DoubleBattle, Pokemon
+from poke_env.battle import DoubleBattle
 from poke_env.player.battle_order import (
     BattleOrder,
     DefaultBattleOrder,
@@ -16,13 +16,8 @@ from poke_env.player.battle_order import (
 from poke_env.player.player import Player
 
 from p0.battle.actions import (
-    FORCED_ACTION,
-    MEGA_FORCED_ACTION,
     ActionKind,
-    SlotAction,
-    canonical_team_actions,
     decode_action,
-    encode_action,
     team_selection,
 )
 from p0.runtime.poke_env_battle_adapter import action_move_slots
@@ -34,7 +29,12 @@ def action_to_order(
     fake: bool = False,
     strict: bool = True,
 ) -> BattleOrder:
-    """Translate a policy joint action vector into a poke-env BattleOrder."""
+    """
+    Translate a policy joint action vector into a poke-env BattleOrder.
+
+    PokeEnv.step passes fake and strict on every call. p0 leaves both at
+    poke-env's defaults, so every order is validated and an invalid action raises.
+    """
     if battle.teampreview:
         selection = team_selection(int(action[0]), int(action[1]), len(battle.team))
         return SingleBattleOrder("/team " + "".join(str(index + 1) for index in selection))
@@ -46,25 +46,16 @@ def action_to_order(
     if act0 == -1 or act1 == -1:
         return ForfeitBattleOrder()
 
-    try:
-        first = action_to_single_order(act0, battle, fake, 0)
-        second = action_to_single_order(act1, battle, fake, 1)
-        joined = DoubleBattleOrder.join_orders([first], [second])
-        if joined:
-            return joined[0]
-
+    first = action_to_single_order(act0, battle, fake, 0)
+    second = action_to_single_order(act1, battle, fake, 1)
+    joined = DoubleBattleOrder.join_orders([first], [second])
+    if not joined:
         raise ValueError(
             f"Invalid action {action} from player {battle.player_username} in battle "
             f"{battle.battle_tag}: converted orders {first} and {second} are incompatible"
         )
-    except ValueError as error:
-        if strict:
-            raise
 
-        if battle.logger is not None:
-            battle.logger.warning("%s; defaulting to a random move", error)
-
-        return Player.choose_random_doubles_move(battle)
+    return joined[0]
 
 
 def action_to_single_order(
@@ -121,85 +112,3 @@ def action_to_single_order(
             )
 
     return order
-
-
-def order_to_action(
-    order: BattleOrder,
-    battle: DoubleBattle,
-    fake: bool = False,
-    strict: bool = True,
-) -> npt.NDArray[np.int64]:
-    """Encode a poke-env BattleOrder back into a policy joint action vector."""
-    if battle.teampreview:
-        digits = tuple(int(char) - 1 for char in order.message[6:] if char.isdigit())
-        return np.asarray(canonical_team_actions(digits, len(battle.team)), dtype=np.int64)
-
-    if isinstance(order, DefaultBattleOrder):
-        return np.array([-2, -2], dtype=np.int64)
-
-    if isinstance(order, ForfeitBattleOrder):
-        return np.array([-1, -1], dtype=np.int64)
-
-    if not isinstance(order, DoubleBattleOrder):
-        raise TypeError(f"Expected a doubles order, got {type(order).__name__}")
-
-    try:
-        if not fake and not DoubleBattleOrder.join_orders(
-            [order.first_order], [order.second_order]
-        ):
-            raise ValueError(f"Orders in {order} are incompatible")
-
-        return np.array(
-            [
-                single_order_to_action(order.first_order, battle, fake, 0),
-                single_order_to_action(order.second_order, battle, fake, 1),
-            ],
-            dtype=np.int64,
-        )
-    except ValueError as error:
-        if strict:
-            raise
-
-        if battle.logger is not None:
-            battle.logger.warning("%s; defaulting to a random move", error)
-
-        return order_to_action(Player.choose_random_doubles_move(battle), battle, fake, True)
-
-
-def single_order_to_action(
-    order: SingleBattleOrder, battle: DoubleBattle, fake: bool, position: int
-) -> np.int64:
-    """Encode a SingleBattleOrder into a single slot action integer."""
-    if isinstance(order.order, str):
-        if isinstance(order, DefaultBattleOrder):
-            return np.int64(-2)
-        if not isinstance(order, PassBattleOrder):
-            raise ValueError(f"Unsupported string order {order}")
-        return np.int64(0)
-
-    if not fake:
-        if str(order) not in map(str, battle.valid_orders[position]):
-            raise ValueError(f"Order {order} is not valid for position {position}")
-
-    if isinstance(order.order, Pokemon):
-        species = tuple(pokemon.base_species for pokemon in battle.team.values())
-        return np.int64(species.index(order.order.base_species) + 1)
-
-    active = battle.active_pokemon[position]
-    if active is None:
-        raise ValueError(f"Move order targets empty position {position}")
-
-    available = battle.available_moves[position]
-    if len(available) == 1 and available[0].id in {"struggle", "recharge"}:
-        return np.int64(MEGA_FORCED_ACTION if order.mega else FORCED_ACTION)
-
-    move_slot = next(
-        i for i, move in enumerate(action_move_slots(battle, position)) if move.id == order.order.id
-    )
-    return np.int64(
-        encode_action(
-            SlotAction(
-                ActionKind.MOVE, move_slot=move_slot, target=order.move_target, mega=order.mega
-            )
-        )
-    )

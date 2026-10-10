@@ -159,7 +159,6 @@ class TestEvaluation:
         finally:
             await first.ps_client.stop_listening()
             await second.ps_client.stop_listening()
-            poke_env_patches.uninstall_for_tests()
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -179,18 +178,15 @@ class TestEvaluation:
         )
         fallback = default_test_corpus()
 
-        try:
-            result = await harness.run_matchup(
-                name_a="RandomA",
-                policy_a=None,
-                name_b="RandomB",
-                policy_b=None,
-                team_category="fallback",
-                team_source=fallback,
-                server_configuration=showdown_server,
-            )
-        finally:
-            poke_env_patches.uninstall_for_tests()
+        result = await harness.run_matchup(
+            name_a="RandomA",
+            policy_a=None,
+            name_b="RandomB",
+            policy_b=None,
+            team_category="fallback",
+            team_source=fallback,
+            server_configuration=showdown_server,
+        )
 
         assert result.policy_a == "RandomA"
         assert result.policy_b == "RandomB"
@@ -242,21 +238,18 @@ class TestEvaluation:
         name_b = "ModelB" if policy_b is not None else "RandomB"
 
         poke_env_patches.install()
-        try:
-            result = await EvaluationHarness(
-                episodes_per_matchup=1,
-                seed=23,
-            ).run_matchup(
-                name_a=name_a,
-                policy_a=policy_a,
-                name_b=name_b,
-                policy_b=policy_b,
-                team_category="fallback",
-                team_source=default_test_corpus(),
-                server_configuration=showdown_server,
-            )
-        finally:
-            poke_env_patches.uninstall_for_tests()
+        result = await EvaluationHarness(
+            episodes_per_matchup=1,
+            seed=23,
+        ).run_matchup(
+            name_a=name_a,
+            policy_a=policy_a,
+            name_b=name_b,
+            policy_b=policy_b,
+            team_category="fallback",
+            team_source=default_test_corpus(),
+            server_configuration=showdown_server,
+        )
 
         assert (result.policy_a, result.policy_b) == (name_a, name_b)
         assert result.total_games == 1
@@ -273,19 +266,16 @@ class TestEvaluation:
         self, showdown_server
     ) -> None:
         poke_env_patches.install()
-        try:
-            harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
-            result = await harness.run_matchup(
-                name_a="random-a",
-                policy_a=None,
-                name_b="random-b",
-                policy_b=None,
-                team_category="fallback",
-                team_source=default_test_corpus(),
-                server_configuration=showdown_server,
-            )
-        finally:
-            poke_env_patches.uninstall_for_tests()
+        harness = EvaluationHarness(episodes_per_matchup=2, seed=17)
+        result = await harness.run_matchup(
+            name_a="random-a",
+            policy_a=None,
+            name_b="random-b",
+            policy_b=None,
+            team_category="fallback",
+            team_source=default_test_corpus(),
+            server_configuration=showdown_server,
+        )
 
         assert result.total_games == 2
         assert result.wins_a + result.wins_b + result.ties == result.total_games
@@ -322,19 +312,16 @@ class TestEvaluation:
     ) -> None:
         """Verify live evaluation completes matchups against MaxBasePowerPlayer and SimpleHeuristicsPlayer."""
         poke_env_patches.install()
-        try:
-            harness = EvaluationHarness(episodes_per_matchup=1, seed=42)
-            result = await harness.run_matchup(
-                name_a="ModelPlayer",
-                policy_a=model_policy,
-                name_b=f"Opponent_{opponent_type}",
-                policy_b=opponent_type,
-                team_category="test_heuristics",
-                team_source=default_test_corpus(),
-                server_configuration=showdown_server,
-            )
-        finally:
-            poke_env_patches.uninstall_for_tests()
+        harness = EvaluationHarness(episodes_per_matchup=1, seed=42)
+        result = await harness.run_matchup(
+            name_a="ModelPlayer",
+            policy_a=model_policy,
+            name_b=f"Opponent_{opponent_type}",
+            policy_b=opponent_type,
+            team_category="test_heuristics",
+            team_source=default_test_corpus(),
+            server_configuration=showdown_server,
+        )
 
         assert result.policy_a == "ModelPlayer"
         assert result.policy_b == f"Opponent_{opponent_type}"

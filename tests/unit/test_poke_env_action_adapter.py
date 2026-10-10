@@ -1,4 +1,4 @@
-"""Tests for converting a called move request to and from policy actions."""
+"""Tests for converting policy actions of a called move request to orders."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 from poke_env.battle import DoubleBattle
 
 from p0.battle.legality import legal_actions
-from p0.runtime.poke_env_action_adapter import action_to_order, order_to_action
+from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import battle_view, decision_view
 
 
@@ -46,6 +46,13 @@ class TestPokeEnvActionAdapter:
         first_actions = legal_actions(decision_view(battle), 0)
         assert set(first_actions) == {7, 10, 11}
         assert legal_actions(decision_view(battle), 1) == (0,)
-        for action in first_actions:
-            order = action_to_order(np.array([action, 0], dtype=np.int64), battle)
-            assert int(order_to_action(order, battle)[0]) == action
+        # Actions 7, 10 and 11 are move slot 0 aimed at the ally and at each opponent.
+        orders = {
+            action: action_to_order(np.array([action, 0], dtype=np.int64), battle).message
+            for action in first_actions
+        }
+        assert orders == {
+            7: "/choose move dive -2, pass",
+            10: "/choose move dive 1, pass",
+            11: "/choose move dive 2, pass",
+        }

@@ -86,16 +86,8 @@ def transform_target_reference(
     raise ValueError(f"Transform target {target_value!r} is not active")
 
 
-def capture_message(
-    battle: DoubleBattle,
-    split_message: Sequence[str],
-    *,
-    capture_protocol_line: bool = False,
-) -> None:
+def capture_message(battle: DoubleBattle, split_message: Sequence[str]) -> None:
     """Update the battle's pending event records from one Showdown protocol message."""
-    if capture_protocol_line:
-        vars(battle).setdefault("_p0_protocol_lines", []).append(tuple(split_message))
-
     recorder = _recorder_for(battle)
     if len(split_message) >= 4 and split_message[1] == "-transform":
         try:
@@ -185,8 +177,3 @@ def is_retry(battle: DoubleBattle) -> bool:
     request, so no line since the last submission means the choice was rejected.
     """
     return _recorder_for(battle).consumed
-
-
-def captured_protocol_lines(battle: DoubleBattle) -> tuple[str, ...]:
-    """Return opt-in protocol lines captured for a live battle in arrival order."""
-    return tuple("|".join(parts) for parts in getattr(battle, "_p0_protocol_lines", ()))

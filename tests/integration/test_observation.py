@@ -115,7 +115,6 @@ class TestObservation:
         finally:
             await p1.ps_client.stop_listening()
             await p2.ps_client.stop_listening()
-            poke_env_patches.uninstall_for_tests()
 
         # Ensure no builder exceptions occurred during any game turn
         assert not captured_errors

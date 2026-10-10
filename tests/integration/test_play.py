@@ -95,4 +95,3 @@ class TestPlayCommand:
                 process.terminate()
                 await asyncio.to_thread(process.wait, timeout=10)
             await opponent.ps_client.stop_listening()
-            poke_env_patches.uninstall_for_tests()

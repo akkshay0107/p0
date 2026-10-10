@@ -252,7 +252,6 @@ class TestDitto:
         finally:
             await first.ps_client.stop_listening()
             await second.ps_client.stop_listening()
-            poke_env_patches.uninstall_for_tests()
 
         if first.error is not None:
             raise first.error
