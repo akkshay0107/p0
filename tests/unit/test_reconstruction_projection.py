@@ -21,9 +21,11 @@ from p0.model.structured_observation import (
     StatProvenance,
 )
 from p0.replays.compile import compile_payloads, write_tensor_shards
-from p0.replays.group import group_replays
 from p0.replays.protocol import parse_replay_payload
-from p0.replays.reconstruction.decisions import reconstruct_decisions_from_trace
+from p0.replays.reconstruction.decisions import (
+    infer_decision_windows,
+    reconstruct_decisions_from_trace,
+)
 from p0.replays.reconstruction.projection import (
     impute_replay_stats,
     project_battle_view,
@@ -46,12 +48,11 @@ class TestReconstructionProjection:
         path = _ILLUSION_REPLAY
         document = parse_replay_payload(path.read_bytes())
         resources = default_runtime_resources()
-        events = resolve_replay_events(document, dex=resources.dex).require_accepted()
+        events = resolve_replay_events(document).require_accepted()
         original = reduce_replay_state(
             document.metadata.replay_id,
             document.ots,
             events,
-            dex=resources.dex,
             snapshot_line_indices=(111,),
         ).require_accepted()[0]
         hidden_id = original.sides[1].active[0]
@@ -76,31 +77,23 @@ class TestReconstructionProjection:
                 altered if member.member_id == hidden_id else member for member in original.members
             ),
         )
-        dex = default_runtime_resources().dex
-        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
-        replay_state = reduce_replay_state(
-            document.metadata.replay_id, document.ots, replay_events, dex=dex
-        )
+        replay_events = resolve_replay_events(document).require_accepted()
+        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
+        windows = infer_decision_windows(replay_events)
         decisions = (
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, dex=dex
+                document, replay_events, replay_state, perspective=0, windows=windows
             ),
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, dex=dex
+                document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(
-            document, replay_events, replay_state, decisions, dex=dex
-        )
+        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
         decision = next(
             item.view.decision for item in perspectives[0].snapshots if item.pre_line_index == 112
         )
-        first_view = project_battle_view(
-            original, document.ots, perspective=0, decision=decision, dex=resources.dex
-        )
-        second_view = project_battle_view(
-            changed, document.ots, perspective=0, decision=decision, dex=resources.dex
-        )
+        first_view = project_battle_view(original, document.ots, perspective=0, decision=decision)
+        second_view = project_battle_view(changed, document.ots, perspective=0, decision=decision)
         builder = ObservationBuilder(resources)
         first = builder.build(first_view)
         second = builder.build(second_view)
@@ -110,22 +103,18 @@ class TestReconstructionProjection:
     def test_unrevealed_illusion_uses_displayed_public_fields(self) -> None:
         path = _ILLUSION_REPLAY
         document = parse_replay_payload(path.read_bytes())
-        dex = default_runtime_resources().dex
-        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
-        replay_state = reduce_replay_state(
-            document.metadata.replay_id, document.ots, replay_events, dex=dex
-        )
+        replay_events = resolve_replay_events(document).require_accepted()
+        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
+        windows = infer_decision_windows(replay_events)
         decisions = (
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, dex=dex
+                document, replay_events, replay_state, perspective=0, windows=windows
             ),
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, dex=dex
+                document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(
-            document, replay_events, replay_state, decisions, dex=dex
-        )
+        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
         perspective = perspectives[0]
         snapshot = next(
             snapshot
@@ -162,34 +151,29 @@ class TestReconstructionProjection:
         path = _ILLUSION_REPLAY
         document = parse_replay_payload(path.read_bytes())
         resources = default_runtime_resources()
-        events = resolve_replay_events(document, dex=resources.dex).require_accepted()
+        events = resolve_replay_events(document).require_accepted()
         state = reduce_replay_state(
             document.metadata.replay_id,
             document.ots,
             events,
-            dex=resources.dex,
             snapshot_line_indices=(111,),
         ).require_accepted()[0]
         known_venusaur = state.sides[1].active[1]
         assert known_venusaur is not None
         bench_side = replace(state.sides[1], active=(state.sides[1].active[0], None))
         bench_state = replace(state, sides=(state.sides[0], bench_side))
-        dex = default_runtime_resources().dex
-        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
-        replay_state = reduce_replay_state(
-            document.metadata.replay_id, document.ots, replay_events, dex=dex
-        )
+        replay_events = resolve_replay_events(document).require_accepted()
+        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
+        windows = infer_decision_windows(replay_events)
         decisions = (
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, dex=dex
+                document, replay_events, replay_state, perspective=0, windows=windows
             ),
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, dex=dex
+                document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(
-            document, replay_events, replay_state, decisions, dex=dex
-        )
+        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
         decision = next(
             item.view.decision for item in perspectives[0].snapshots if item.pre_line_index == 112
         )
@@ -199,7 +183,6 @@ class TestReconstructionProjection:
             document.ots,
             perspective=0,
             decision=decision,
-            dex=resources.dex,
         )
 
         displayed = view.opponent_active_pokemon[0]
@@ -292,7 +275,7 @@ class TestReconstructionProjection:
 
     def test_replay_stats_are_explicit_for_both_sides_and_never_known(self) -> None:
         document = parse_replay_payload(decision_payload())
-        estimates = impute_replay_stats(document, dex=default_runtime_resources().dex)
+        estimates = impute_replay_stats(document)
 
         assert len(estimates) == 12
         assert {estimate.member_id for estimate in estimates} == {
@@ -323,68 +306,29 @@ class TestReconstructionProjection:
         not tuple(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")),
         reason="local golden replay corpus is not present",
     )
-    def test_golden_corpus_retains_only_resolved_illusion_histories(self) -> None:
+    def test_local_golden_replays_are_all_accepted(self) -> None:
         paths = tuple(sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")))
-        documents = tuple(parse_replay_payload(path.read_bytes()) for path in paths)
-        grouping = group_replays(documents)
-        dex = default_runtime_resources().dex
-        accepted_ids: set[str] = set()
-        rejections: list[str] = []
-        for document in documents:
-            resolved = resolve_replay_events(document, dex=dex)
-            if resolved.diagnostics:
-                rejections.append(resolved.diagnostics[0].category.value)
-                continue
-            events = resolved.require_accepted()
-            state = reduce_replay_state(document.metadata.replay_id, document.ots, events, dex=dex)
-            if state.diagnostics:
-                rejections.append(state.diagnostics[0].category.value)
-                continue
-            decisions = (
-                reconstruct_decisions_from_trace(document, events, state, perspective=0, dex=dex),
-                reconstruct_decisions_from_trace(document, events, state, perspective=1, dex=dex),
-            )
-            diagnostics = tuple(item for result in decisions for item in result.diagnostics)
-            if diagnostics:
-                rejections.append(diagnostics[0].category.value)
-                continue
-            perspectives = project_replay_perspectives(document, events, state, decisions, dex=dex)
-            assert all(len(item.snapshots) == len(item.decisions) for item in perspectives)
-            accepted_ids.add(document.metadata.replay_id)
 
-        assert len(paths) == 51
-        assert len(accepted_ids) == 40
-        assert len(rejections) == 11
-        accepted_groups = tuple(
-            group
-            for group in grouping.series
-            if not any(item.code == "non_contiguous_game_numbers" for item in group.diagnostics)
-            and all(game.metadata.replay_id in accepted_ids for game in group.games)
-        )
-        assert sum(len(group.games) for group in accepted_groups) == 33
-        assert sum(group.record.is_complete for group in accepted_groups) == 11
-        assert rejections.count("AMBIGUOUS_IDENTITY") == 11
-        assert sum(item.code == "non_contiguous_game_numbers" for item in grouping.diagnostics) == 1
+        result = compile_payloads(path.read_bytes() for path in paths)
+
+        assert result.metrics.counters["rejected_games"] == 0
+        assert result.metrics.counters["accepted_games"] == len(paths)
 
     def test_state_matches_independent_poke_env_cursors(self) -> None:
         path = _STATE_REPLAY
         document = parse_replay_payload(path.read_bytes())
-        dex = default_runtime_resources().dex
-        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
-        replay_state = reduce_replay_state(
-            document.metadata.replay_id, document.ots, replay_events, dex=dex
-        )
+        replay_events = resolve_replay_events(document).require_accepted()
+        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
+        windows = infer_decision_windows(replay_events)
         decisions = (
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, dex=dex
+                document, replay_events, replay_state, perspective=0, windows=windows
             ),
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, dex=dex
+                document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(
-            document, replay_events, replay_state, decisions, dex=dex
-        )
+        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
         perspective = perspectives[0]
         boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
         oracle = DoubleBattle(
@@ -436,22 +380,18 @@ class TestSpatialEventIntervals:
         payload = _STATE_REPLAY.read_bytes()
         raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
         document = parse_replay_payload(payload)
-        dex = default_runtime_resources().dex
-        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
-        replay_state = reduce_replay_state(
-            document.metadata.replay_id, document.ots, replay_events, dex=dex
-        )
+        replay_events = resolve_replay_events(document).require_accepted()
+        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
+        windows = infer_decision_windows(replay_events)
         decisions = (
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, dex=dex
+                document, replay_events, replay_state, perspective=0, windows=windows
             ),
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, dex=dex
+                document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(
-            document, replay_events, replay_state, decisions, dex=dex
-        )
+        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
         starts = [[snapshot.pre_line_index for snapshot in item.snapshots] for item in perspectives]
 
         spans_opponent_decision = 0
@@ -477,22 +417,18 @@ class TestSpatialEventIntervals:
         payload = _STATE_REPLAY.read_bytes()
         raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
         document = parse_replay_payload(payload)
-        dex = default_runtime_resources().dex
-        replay_events = resolve_replay_events(document, dex=dex).require_accepted()
-        replay_state = reduce_replay_state(
-            document.metadata.replay_id, document.ots, replay_events, dex=dex
-        )
+        replay_events = resolve_replay_events(document).require_accepted()
+        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
+        windows = infer_decision_windows(replay_events)
         decisions = (
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, dex=dex
+                document, replay_events, replay_state, perspective=0, windows=windows
             ),
             reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, dex=dex
+                document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(
-            document, replay_events, replay_state, decisions, dex=dex
-        )
+        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
 
         for perspective in perspectives:
             final_interval = raw_lines[perspective.snapshots[-1].pre_line_index :]

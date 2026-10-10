@@ -315,24 +315,8 @@ class TestReplayInputContract:
         )
         document = parse_replay_payload(payload)
         assert document.ots[0].members[0].moves == ("protect", "tackle")
-        dex = {
-            "species": [
-                {
-                    "id": "pikachu",
-                    "baseStats": {"hp": 35, "atk": 55, "def": 40, "spa": 50, "spd": 50, "spe": 90},
-                },
-                {
-                    "id": "bulbasaur",
-                    "baseStats": {"hp": 45, "atk": 49, "def": 49, "spa": 65, "spd": 65, "spe": 45},
-                },
-            ],
-            "moves": [
-                {"id": "protect", "category": "Status"},
-                {"id": "tackle", "category": "Physical"},
-            ],
-        }
-        first = impute_replay_stats(document, dex=dex)
-        second = impute_replay_stats(document, dex=dex)
+        first = impute_replay_stats(document)
+        second = impute_replay_stats(document)
         assert first == second
 
         # Pikachu is covered by the usage priors; Bulbasaur is not, and its sheet reveals

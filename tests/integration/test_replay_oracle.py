@@ -2,31 +2,40 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
+import subprocess
 
 import pytest
 from poke_env.battle import DoubleBattle
 
 from p0.model.resources import default_runtime_resources
+from p0.paths import DEFAULT_PATHS
 from p0.replays.protocol import parse_replay_payload
-from p0.replays.reconstruction.contract import run_pinned_showdown_oracle
 from p0.replays.reconstruction.resolution import resolve_replay_events
 from p0.replays.reconstruction.state import reduce_replay_state
+
+
+def _run_pinned_showdown_oracle() -> tuple[str, ...]:
+    """Play the scripted battle on the pinned simulator and return its protocol lines."""
+    root = DEFAULT_PATHS.repository_root
+    result = subprocess.run(
+        ["node", str(root / "scripts" / "showdown_battlestream_oracle.js")],
+        cwd=root,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10.0,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["commit"] == default_runtime_resources().dex["source"]["commit"]
+    return tuple(str(line) for line in payload["protocol"])
 
 
 @pytest.mark.heavy
 class TestReplayOracleIntegration:
     @pytest.mark.integration
-    def test_oracle_accepts_relative_repository_root(self, monkeypatch) -> None:
-        root = Path.cwd()
-        monkeypatch.chdir(root.parent)
-
-        assert run_pinned_showdown_oracle(repository_root=root.name)
-
-    @pytest.mark.integration
     def test_reconstruction_matches_independent_public_oracle_after_each_line(self) -> None:
         protocol_values: list[str] = []
-        for line in run_pinned_showdown_oracle(repository_root="."):
+        for line in _run_pinned_showdown_oracle():
             if line.startswith(("|split|", "|uhtml")):
                 continue
             if line.startswith("|switch|") and protocol_values:
@@ -70,13 +79,12 @@ class TestReplayOracleIntegration:
             ),
         }
         document = parse_replay_payload(payload)
-        resolved = resolve_replay_events(document, dex=None)
+        resolved = resolve_replay_events(document)
         assert not resolved.diagnostics
         state = reduce_replay_state(
             document.metadata.replay_id,
             document.ots,
             resolved.require_accepted(),
-            dex=default_runtime_resources().dex,
         )
         assert not state.diagnostics
         snapshots = {snapshot.line_index: snapshot for snapshot in state.snapshots}

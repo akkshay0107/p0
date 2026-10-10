@@ -1,0 +1,10 @@
+{
+  "-burst": "Ultra Burst needs a held Z crystal (sim/pokemon.ts formeChange, source.zMove); no legal item is a Z crystal.",
+  "-candynamax": "Emitted only when gameType is multi (sim/battle.ts endTurn); the format is doubles.",
+  "-center": "Emitted only when gameType is triples (sim/battle.ts endTurn); the format is doubles.",
+  "-clearpositiveboost": "Emitted only for a move with stealsBoosts (sim/battle-actions.ts); no legal move has it.",
+  "-primal": "Primal Reversion needs a held Primal orb (sim/pokemon.ts formeChange, source.isPrimalOrb); no legal item is a Primal orb.",
+  "-terastallize": "The champions mod's canTerastallize returns null (data/mods/champions/scripts.ts), so sim/side.ts rejects every terastallize choice.",
+  "-zpower": "A Z-move needs a held Z crystal (sim/battle-actions.ts getZMove); no legal item is a Z crystal.",
+  "debug": "Emitted only in debug mode (sim/battle.ts debug); only the Custom Game formats set it."
+}

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import MappingProxyType
-from typing import Any, Iterable, Mapping, NamedTuple
+from functools import cache
+from typing import Iterable, Mapping, NamedTuple
 
-from p0.model.resources import cache_default_dex
+from p0.model.resources import default_runtime_resources
 from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.diagnostics import (
@@ -31,15 +31,6 @@ class ResolvedPokemonRefArgument:
     pokemon_ref: ProtocolPokemonReference
     member_id: ReplayMemberId | None
 
-    def __post_init__(self) -> None:
-        if self.argument_index < 0:
-            raise ValueError("Resolved reference argument index must be nonnegative")
-        if self.pokemon_ref.active_slot is None:
-            if self.member_id is not None and self.member_id.side is not self.pokemon_ref.side:
-                raise ValueError("Slotless references require a member on the same side")
-        elif self.member_id is None or self.member_id.side is not self.pokemon_ref.side:
-            raise ValueError("Active-slot references require a member on the same side")
-
 
 @dataclass(frozen=True, slots=True)
 class ResolvedProtocolEvent:
@@ -47,12 +38,6 @@ class ResolvedProtocolEvent:
 
     event: ProtocolEvent
     pokemon_refs: tuple[ResolvedPokemonRefArgument, ...]
-
-    def __post_init__(self) -> None:
-        if tuple(reference.argument_index for reference in self.pokemon_refs) != tuple(
-            reference.argument_index for reference in self.event.pokemon_refs
-        ):
-            raise ValueError("Resolved references must match the event reference order")
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,14 +47,6 @@ class ResolvedReplayEvents:
     replay_id: str
     events: tuple[ResolvedProtocolEvent, ...]
     diagnostics: tuple[ReplayEventDiagnostic, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.replay_id:
-            raise ValueError("ResolvedReplayEvents.replay_id must not be empty")
-        if self.events and self.diagnostics:
-            raise ValueError("Rejected replays cannot retain resolved events")
-        if any(event.event.replay_id != self.replay_id for event in self.events):
-            raise ValueError("ResolvedReplayEvents cannot contain another replay")
 
     def require_accepted(self) -> tuple[ResolvedProtocolEvent, ...]:
         """Return resolved events or raise the replay rejection."""
@@ -353,19 +330,13 @@ def _required_active_slot(event: ProtocolEvent, reference: PokemonRefArgument) -
     return slot
 
 
-@cache_default_dex
-def _species_base_index(dex: Mapping[str, Any]) -> Mapping[str, str]:
-    index: dict[str, str] = {}
-    for value in dex.get("species", ()):
-        if not isinstance(value, Mapping):
-            continue
-        name = str(value.get("name", value.get("id", "")))
-        species_id = normalize_showdown_id(str(value.get("id", name)))
-        base_species = normalize_showdown_id(str(value.get("baseSpecies", name)))
-        if species_id and base_species:
-            index[species_id] = base_species
-            index[normalize_showdown_id(name)] = base_species
-    return MappingProxyType(index)
+@cache
+def _species_base_index() -> Mapping[str, str]:
+    """Map each dex species id to the id of its base species."""
+    return {
+        entry["id"]: normalize_showdown_id(entry["baseSpecies"])
+        for entry in default_runtime_resources().dex["species"]
+    }
 
 
 def _base_species_id(species: str, species_bases: Mapping[str, str]) -> str:
@@ -586,7 +557,7 @@ class _IdentityResolver:
         if pokemon_ref.active_slot is None:
             # Side-condition protocol arguments carry labels such as
             # ``p1: Player`` that are not roster nicknames.
-            if event.tag in {"-sidestart", "-sideend", "-cureteam"}:
+            if event.tag in {"-sidestart", "-sideend"}:
                 return ResolvedPokemonRefArgument(reference.argument_index, pokemon_ref, None)
             member_id = self._resolve_slotless(event, pokemon_ref)
             return ResolvedPokemonRefArgument(reference.argument_index, pokemon_ref, member_id)
@@ -673,8 +644,6 @@ def resolve_protocol_events(
     replay_id: str,
     ots: tuple[OTSData, OTSData],
     events: Iterable[ProtocolEvent],
-    *,
-    dex: Mapping[str, Any] | None = None,
 ) -> ResolvedReplayEvents:
     """Resolve one accepted event stream without retaining a partial result."""
     event_tuple = tuple(events)
@@ -683,15 +652,7 @@ def resolve_protocol_events(
     )
     if parser_diagnostics:
         return ResolvedReplayEvents(replay_id, (), parser_diagnostics)
-    if tuple(sheet.side for sheet in ots) != (ReplaySide.P1, ReplaySide.P2):
-        raise ValueError("OTS sheets must be ordered as p1 and p2")
-    if any(not sheet.is_complete for sheet in ots):
-        if not event_tuple:
-            raise ValueError("Identity resolution requires events and complete OTS")
-        reason = "identity resolution requires complete OTS for both sides"
-        return ResolvedReplayEvents(replay_id, (), (event_tuple[0].rejection(reason),))
-
-    species_bases = _species_base_index({} if dex is None else dex)
+    species_bases = _species_base_index()
     try:
         incoming_bindings = _resolve_incoming_histories(ots, event_tuple, species_bases)
     except _ResolutionError as exc:
@@ -707,23 +668,10 @@ def resolve_protocol_events(
     return ResolvedReplayEvents(replay_id, tuple(resolved))
 
 
-def resolve_replay_events(
-    document: ReplayDocument,
-    *,
-    dex: Mapping[str, Any] | None = None,
-) -> ResolvedReplayEvents:
+def resolve_replay_events(document: ReplayDocument) -> ResolvedReplayEvents:
     """Parse and resolve every event in one normalized replay document."""
-    if dex is None:
-        from p0.model.resources import default_runtime_resources
-
-        dex = default_runtime_resources().dex
     parsed = parse_replay_events(document)
-    return resolve_protocol_events(
-        document.metadata.replay_id,
-        document.ots,
-        parsed.events,
-        dex=dex,
-    )
+    return resolve_protocol_events(document.metadata.replay_id, document.ots, parsed.events)
 
 
 __all__ = [

@@ -108,9 +108,6 @@ class ObservationPokemon:
     preparing: Any = False
     last_move: ObservationMove | None = None
     level: int | None = 50
-    is_dynamaxed: bool = False
-    is_terastallized: bool = False
-    tera_type: Any = None
     types: tuple[Any, ...] = ()
 
 

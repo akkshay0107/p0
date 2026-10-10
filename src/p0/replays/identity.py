@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
@@ -55,6 +56,7 @@ class ReplayMemberId:
         return cls(ReplaySide(side), roster_index)
 
 
+@lru_cache(maxsize=1 << 16)
 def normalize_showdown_id(value: str) -> str:
     """Match Showdown's lowercase-alphanumeric identifier convention."""
     return "".join(

@@ -27,16 +27,6 @@ class ReplayEventDiagnostic:
     reason: str
     category: ReplayRejectionCategory = ReplayRejectionCategory.INVALID_INPUT_CONTRACT
 
-    def __post_init__(self) -> None:
-        if not self.replay_id:
-            raise ValueError("ReplayEventDiagnostic.replay_id must not be empty")
-        if type(self.line_index) is not int or self.line_index < 0:
-            raise ValueError("ReplayEventDiagnostic.line_index must be nonnegative")
-        if not self.raw_line.startswith("|"):
-            raise ValueError("ReplayEventDiagnostic.raw_line must be a protocol line")
-        if not self.reason:
-            raise ValueError("ReplayEventDiagnostic.reason must not be empty")
-
 
 class ReplayEventParseError(ValueError):
     """Raised when a replay contains malformed or unsupported state events."""

@@ -681,9 +681,8 @@ def _compile_game(
     game_number: int,
     roles: tuple[int, int],
     max_candidates: int,
-    runtime_dex: Mapping[str, Any],
 ) -> CompiledGame | ReplayRejectionCategory:
-    resolved = resolve_replay_events(document, dex=runtime_dex)
+    resolved = resolve_replay_events(document)
     if resolved.diagnostics:
         return resolved.diagnostics[0].category
     events = resolved.require_accepted()
@@ -693,7 +692,6 @@ def _compile_game(
         document.metadata.replay_id,
         document.ots,
         events,
-        dex=runtime_dex,
         snapshot_line_indices=_projection_snapshot_lines(events, windows),
     )
 
@@ -706,26 +704,18 @@ def _compile_game(
             state,
             perspective=perspective,
             max_candidates=max_candidates,
-            dex=runtime_dex,
             windows=windows,
         )
         for perspective in (0, 1)
     )
-
-    decision_diagnostics = tuple(
-        diagnostic for result in decisions for diagnostic in result.diagnostics
-    )
-    if decision_diagnostics:
-        return decision_diagnostics[0].category
 
     perspectives = project_replay_perspectives(
         document,
         events,
         state,
         (decisions[0], decisions[1]),
-        dex=runtime_dex,
     )
-    estimates = impute_replay_stats(document, dex=runtime_dex)
+    estimates = impute_replay_stats(document)
 
     return CompiledGame(
         series_id=series_id,
@@ -828,7 +818,6 @@ def _compile_groups(grouping: GroupingResult, max_candidates: int) -> Compilatio
                 counters[f"rejected_{code}"] += 1
                 rejection_counters[group.record.series_id][f"rejected_{code}"] += 1
 
-    runtime_dex = default_runtime_resources().dex
     compiled_by_series: dict[str, list[CompiledGame]] = {}
     confidence_sum = 0.0
     for group in grouping.series:
@@ -848,7 +837,6 @@ def _compile_groups(grouping: GroupingResult, max_candidates: int) -> Compilatio
                 membership.game_number,
                 membership.canonical_player_roles,
                 max_candidates,
-                runtime_dex,
             )
             if isinstance(compiled, ReplayRejectionCategory):
                 counters[f"rejected_reconstruction_{compiled.value}"] += 1

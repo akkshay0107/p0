@@ -150,9 +150,21 @@ class TestReconstructionEvents:
         event = parse_protocol_event("activation", _line("|-activate|p1a: A|move: Substitute"))
         assert event.classification is EventClassification.PUBLIC_STATE
 
-    def test_activation_stored_stat_family_remains_unsupported(self) -> None:
-        event = parse_protocol_event("activation", _line("|-activate|p1a: A|move: Power Split"))
-        assert event.classification is EventClassification.UNSUPPORTED_STATE
+    def test_instruct_single_turn_marker_is_accepted(self) -> None:
+        event = parse_protocol_event(
+            "activation", _line("|-singleturn|p1a: A|move: Instruct|[of] p1b: B")
+        )
+        assert event.classification is EventClassification.PUBLIC_STATE
+
+    def test_activation_stored_stat_family_is_accepted(self) -> None:
+        for raw in (
+            "|-activate|p1a: A|move: Power Split|[of] p2a: B",
+            "|-activate|p1a: A|move: Guard Split|[of] p2a: B",
+            "|-activate|p1a: A|move: Speed Swap|[of] p2a: B",
+            "|-start|p1a: A|Power Trick",
+        ):
+            event = parse_protocol_event("activation", _line(raw))
+            assert event.classification is EventClassification.PUBLIC_STATE
 
     def test_bare_separator_and_empty_tag_text_have_different_classifications(self) -> None:
         separator = parse_protocol_event("replay-1", _line("|"))
@@ -166,7 +178,7 @@ class TestReconstructionEvents:
     def test_team_preview_accepts_standard_and_selected_team_shapes(self, raw: str) -> None:
         event = parse_protocol_event("replay-1", _line(raw))
 
-        assert event.classification is EventClassification.BOUNDARY_SIGNAL
+        assert event.classification is EventClassification.NO_STATE_CHANGE
 
     def test_replace_accepts_the_pinned_showdown_shape_only(self) -> None:
         event = parse_protocol_event(
@@ -178,14 +190,14 @@ class TestReconstructionEvents:
             _line("|replace|p1a: Zoroark|Zoroark-Hisui, L50|50/100"),
         )
 
-        assert event.classification is EventClassification.ACTION_EXECUTION
+        assert event.classification is EventClassification.PUBLIC_STATE
         assert event.arguments == ("p1a: Zoroark", "Zoroark-Hisui, L50")
         assert extra_hp.classification is EventClassification.MALFORMED
 
     def test_player_departure_accepts_an_empty_username(self) -> None:
         event = parse_protocol_event("replay-1", _line("|player|p2|"))
 
-        assert event.classification is EventClassification.PUBLIC_STATE
+        assert event.classification is EventClassification.NO_STATE_CHANGE
         assert event.arguments == ("p2", "")
 
     def test_event_parsing_extracts_effect_cause_and_annotated_pokemon_ref(self) -> None:
@@ -226,7 +238,7 @@ class TestReconstructionEvents:
         assert event.effect.normalized == effect
         assert len(event.pokemon_refs) == pokemon_ref_count
 
-    def test_transform_accepts_species_and_reference_targets(self) -> None:
+    def test_transform_requires_a_reference_target(self) -> None:
         species_target = parse_protocol_event(
             "replay-1",
             _line("|-transform|p1a: Ditto|Pikachu|[from] ability: Imposter"),
@@ -236,11 +248,35 @@ class TestReconstructionEvents:
             _line("|-transform|p1a: Ditto|p2a: Pikachu|[from] ability: Imposter"),
         )
 
-        assert species_target.classification is EventClassification.PUBLIC_STATE
-        assert tuple(reference.argument_index for reference in species_target.pokemon_refs) == (0,)
+        assert species_target.classification is EventClassification.MALFORMED
+        assert reference_target.classification is EventClassification.PUBLIC_STATE
         assert tuple(reference.argument_index for reference in reference_target.pokemon_refs) == (
             0,
             1,
+        )
+
+    def test_state_neutral_source_shapes(self) -> None:
+        assert (
+            parse_protocol_event("r", _line("|-ohko")).classification
+            is EventClassification.NO_STATE_CHANGE
+        )
+        assert (
+            parse_protocol_event("r", _line("|bigerror|warning")).classification
+            is EventClassification.NO_STATE_CHANGE
+        )
+        assert (
+            parse_protocol_event("r", _line("|-sethp|p1a: A|50/100|[silent]")).classification
+            is EventClassification.PUBLIC_STATE
+        )
+
+    def test_malformed_shapes_fail_closed(self) -> None:
+        assert (
+            parse_protocol_event("r", _line("|-ohko|p1a: A")).classification
+            is EventClassification.MALFORMED
+        )
+        assert (
+            parse_protocol_event("r", _line("|-sethp|p1a: A|50/100|extra")).classification
+            is EventClassification.MALFORMED
         )
 
     def test_malformed_known_event_produces_structured_rejection(self) -> None:
@@ -335,20 +371,8 @@ class TestReconstructionEvents:
                 _line("|switch|p1a: Iku Z|Greninja-Mega, L50|50/100", index=3),
             ),
         )
-        dex = {
-            "species": (
-                {"id": "greninja", "name": "Greninja"},
-                {
-                    "id": "greninjamega",
-                    "name": "Greninja-Mega",
-                    "baseSpecies": "Greninja",
-                },
-            )
-        }
 
-        events = resolve_protocol_events(
-            "mega-reentry", ots, parsed.events, dex=dex
-        ).require_accepted()
+        events = resolve_protocol_events("mega-reentry", ots, parsed.events).require_accepted()
 
         greninja = ReplayMemberId(ReplaySide.P1, 0)
         assert events[0].pokemon_refs[0].member_id == greninja
@@ -600,10 +624,10 @@ class TestReconstructionEvents:
         assert tuple(event.line_index for event in result.events) == tuple(range(186))
         assert result.diagnostics == ()
         expected = {
-            "switch": EventClassification.ACTION_EXECUTION,
-            "move": EventClassification.ACTION_EXECUTION,
-            "turn": EventClassification.BOUNDARY_SIGNAL,
-            "win": EventClassification.BOUNDARY_SIGNAL,
+            "switch": EventClassification.PUBLIC_STATE,
+            "move": EventClassification.PUBLIC_STATE,
+            "turn": EventClassification.PUBLIC_STATE,
+            "win": EventClassification.NO_STATE_CHANGE,
             "-damage": EventClassification.PUBLIC_STATE,
             "-supereffective": EventClassification.NO_STATE_CHANGE,
         }

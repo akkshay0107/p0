@@ -16,18 +16,9 @@ class ProtocolPokemonReference:
     active_slot: int | None
     displayed_name: str
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.side, ReplaySide):
-            raise TypeError("ProtocolPokemonReference.side must be a ReplaySide")
-        if self.active_slot is not None and (
-            type(self.active_slot) is not int or not 0 <= self.active_slot < 4
-        ):
-            raise ValueError("ProtocolPokemonReference.active_slot must be in [0, 4) when present")
-        if not self.displayed_name:
-            raise ValueError("ProtocolPokemonReference.displayed_name must not be empty")
 
-
-_ENDPOINT_PATTERN = re.compile(r"^(p[12])([a-d])?:\s*(.+)$")
+# The displayed name must contain a visible character.
+_ENDPOINT_PATTERN = re.compile(r"^(p[12])([a-d])?:\s*(\S.*)$")
 
 
 def parse_protocol_pokemon_reference(value: str) -> ProtocolPokemonReference:

@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from enum import StrEnum
-from types import MappingProxyType
-from typing import Any, Iterable, Mapping, NamedTuple
+from functools import cache
+from typing import Iterable, Mapping
 
 from p0.battle.actions import (
     FORCED_ACTION,
@@ -18,7 +17,7 @@ from p0.battle.actions import (
     encode_team_pair,
 )
 from p0.battle.legality import DecisionView, SlotDecision
-from p0.model.resources import cache_default_dex, default_runtime_resources
+from p0.model.resources import default_runtime_resources
 from p0.replays.evidence import (
     EvidenceRequest,
     ObservedAction,
@@ -26,37 +25,21 @@ from p0.replays.evidence import (
 )
 from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
-from p0.replays.reconstruction.diagnostics import ReplayEventDiagnostic
+from p0.replays.reconstruction.contract import PIVOT_MOVES
 from p0.replays.reconstruction.events import EventClassification
 from p0.replays.reconstruction.resolution import (
     ResolvedPokemonRefArgument,
     ResolvedProtocolEvent,
-    resolve_replay_events,
 )
 from p0.replays.reconstruction.state import (
     MoveState,
     ReconstructedReplayState,
     ReplayBattleState,
     ReplayPokemonState,
-    reduce_replay_state,
 )
 from p0.replays.schema import DecisionRecord, DecisionType, OTSData
 
 _ACTION_TAGS = frozenset({"move", "switch", "cant"})
-_PIVOT_CAUSES = frozenset(
-    {
-        "uturn",
-        "flipturn",
-        "voltswitch",
-        "batonpass",
-        "partingshot",
-        "chillyreception",
-        "shedtail",
-    }
-)
-_FORCED_MOVES = frozenset({"struggle", "recharge"})
-# Struggle is hidden from the request while an opposing Imprison disables moves.
-_FORCED_MOVES_UNDER_IMPRISON = frozenset({"recharge"})
 _SELF_TARGETS = frozenset(
     {
         "self",
@@ -71,7 +54,6 @@ _SELF_TARGETS = frozenset(
         "scripted",
     }
 )
-_FOE_TARGETS = frozenset({"adjacentfoe"})
 _NORMAL_TARGETS = frozenset({"normal", "any"})
 _ALLY_TARGETS = frozenset({"adjacentally"})
 _ALLY_OR_SELF_TARGETS = frozenset({"adjacentallyorself"})
@@ -98,16 +80,9 @@ def _target_codes(move_target: str, actor_slot: int) -> tuple[int, ...]:
     if move_target in _ALLY_OR_SELF_TARGETS:
         # Live orders name the user by its own slot, like poke-env: ally first, then self.
         return (ally, own)
-    if move_target in _FOE_TARGETS:
-        return (1, 2)
     if move_target in _NORMAL_TARGETS:
         return (ally, 1, 2)
     return (0,)
-
-
-class _MegaRules(NamedTuple):
-    species_by_item: Mapping[str, frozenset[str]]
-    z_items: frozenset[str]
 
 
 def _effective_move_target(member: ReplayPokemonState, move: MoveState) -> str:
@@ -120,41 +95,13 @@ def _effective_move_target(member: ReplayPokemonState, move: MoveState) -> str:
     return move.target.casefold()
 
 
-class BoundaryKind(StrEnum):
-    """Classification of an update block before policy-row filtering."""
-
-    TEAM_PREVIEW = "team_preview"
-    NORMAL_TURN = "normal_turn"
-    FORCED_SWITCH = "forced_switch"
-    PIVOT_SWITCH = "pivot_switch"
-    FORCED_EXECUTION = "forced_execution"
-    RESIDUAL_TERMINAL = "residual_terminal"
-    WAITING = "waiting"
-    UNRECOVERABLE = "unrecoverable"
-
-
 @dataclass(frozen=True, slots=True)
 class DecisionWindow:
-    """One ordered protocol update block and its request classification."""
+    """One ordered protocol update block; decision_type is UNSPECIFIED when no player chose."""
 
     start_line_index: int
     end_line_index: int
-    kind: BoundaryKind
     decision_type: DecisionType
-
-    def __post_init__(self) -> None:
-        if self.start_line_index < 0 or self.end_line_index < self.start_line_index:
-            raise ValueError("DecisionWindow line indices must be ordered and nonnegative")
-        if self.kind in {
-            BoundaryKind.TEAM_PREVIEW,
-            BoundaryKind.NORMAL_TURN,
-            BoundaryKind.FORCED_SWITCH,
-            BoundaryKind.PIVOT_SWITCH,
-        }:
-            if self.decision_type is DecisionType.UNSPECIFIED:
-                raise ValueError("Policy windows require a decision type")
-        elif self.decision_type is not DecisionType.UNSPECIFIED:
-            raise ValueError("Non-policy windows cannot carry a decision type")
 
     @property
     def is_policy_request(self) -> bool:
@@ -170,20 +117,6 @@ class DecisionReconstruction:
     player: int
     windows: tuple[DecisionWindow, ...]
     decisions: tuple[DecisionRecord, ...]
-    diagnostics: tuple[ReplayEventDiagnostic, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.replay_id:
-            raise ValueError("DecisionReconstruction.replay_id must not be empty")
-        if self.player not in (0, 1):
-            raise ValueError("DecisionReconstruction.player must be 0 or 1")
-        if any(decision.player != self.player for decision in self.decisions):
-            raise ValueError("Decision records must belong to the reconstruction perspective")
-        if any(
-            left.start_line_index > right.start_line_index
-            for left, right in zip(self.windows, self.windows[1:])
-        ):
-            raise ValueError("Decision windows must be ordered")
 
 
 def _reference(
@@ -212,7 +145,7 @@ def _has_policy_action(event: ResolvedProtocolEvent) -> bool:
     if parsed.tag == "move":
         return parsed.cause is None
     if parsed.tag == "switch":
-        return parsed.cause is None or parsed.cause.normalized in _PIVOT_CAUSES
+        return parsed.cause is None or parsed.cause.normalized in PIVOT_MOVES
     return False
 
 
@@ -233,7 +166,7 @@ def _is_pivot(event: ResolvedProtocolEvent) -> bool:
     return (
         parsed.tag == "switch"
         and parsed.cause is not None
-        and parsed.cause.normalized in _PIVOT_CAUSES
+        and parsed.cause.normalized in PIVOT_MOVES
     )
 
 
@@ -264,31 +197,19 @@ def _classify_block(
     turn_seen_since_request: bool,
     has_preview: bool,
     policy_request_count: int,
-) -> tuple[BoundaryKind, DecisionType, bool]:
+) -> tuple[DecisionType, bool]:
     policy_events = tuple(event for event in events if _has_policy_action(event))
-    has_pivot = any(_is_pivot(event) for event in policy_events)
     has_turn = any(event.event.tag == "turn" for event in events)
 
     if not policy_events:
-        if any(event.event.tag == "-waiting" for event in events):
-            kind = BoundaryKind.WAITING
-        elif any(event.event.tag in {"move", "switch", "drag", "replace"} for event in events):
-            kind = BoundaryKind.FORCED_EXECUTION
-        else:
-            kind = BoundaryKind.RESIDUAL_TERMINAL
-        return (
-            kind,
-            DecisionType.UNSPECIFIED,
-            turn_seen_since_request or has_turn,
-        )
-
+        return DecisionType.UNSPECIFIED, turn_seen_since_request or has_turn
     if has_preview and policy_request_count == 0:
-        return BoundaryKind.TEAM_PREVIEW, DecisionType.TEAM_PREVIEW, has_turn
-    if has_pivot:
-        return BoundaryKind.PIVOT_SWITCH, DecisionType.PIVOT_SWITCH, has_turn
+        return DecisionType.TEAM_PREVIEW, has_turn
+    if any(_is_pivot(event) for event in policy_events):
+        return DecisionType.PIVOT_SWITCH, has_turn
     if turn_seen_since_request:
-        return BoundaryKind.NORMAL_TURN, DecisionType.TURN, has_turn
-    return BoundaryKind.FORCED_SWITCH, DecisionType.FORCED_SWITCH, has_turn
+        return DecisionType.TURN, has_turn
+    return DecisionType.FORCED_SWITCH, has_turn
 
 
 def infer_decision_windows(
@@ -298,9 +219,6 @@ def infer_decision_windows(
     event_tuple = tuple(events)
     if not event_tuple:
         return ()
-    if tuple(event.event.line_index for event in event_tuple) != tuple(range(len(event_tuple))):
-        raise ValueError("Decision inference requires contiguous resolved event line indices")
-
     has_separator = any(_is_separator(event) for event in event_tuple)
     has_action = any(_has_action(event) for event in event_tuple)
     if has_action and not has_separator:
@@ -315,13 +233,13 @@ def infer_decision_windows(
     windows: list[DecisionWindow] = []
     for start, end in _update_blocks(event_tuple):
         block = event_tuple[start:end]
-        kind, decision_type, turn_seen_since_request = _classify_block(
+        decision_type, turn_seen_since_request = _classify_block(
             block,
             turn_seen_since_request=turn_seen_since_request,
             has_preview=has_preview,
             policy_request_count=policy_request_count,
         )
-        windows.append(DecisionWindow(start, end, kind, decision_type))
+        windows.append(DecisionWindow(start, end, decision_type))
         if decision_type is not DecisionType.UNSPECIFIED:
             policy_request_count += 1
     return tuple(windows)
@@ -374,10 +292,9 @@ def _observed_move(
         return ObservedAction(tag="move_slot_or_target_unknown")
     member = state.member(actor.member_id)
     move_id = normalize_showdown_id(event.event.arguments[1])
-    forced = move_id in _FORCED_MOVES
     slot = actor.pokemon_ref.active_slot
     mega = slot is not None and (actor.pokemon_ref.side, slot) in mega_slots
-    if forced:
+    if move_id == "struggle":
         action = MEGA_FORCED_ACTION if mega else FORCED_ACTION
         return ObservedAction(action, tag="forced_move")
 
@@ -498,7 +415,7 @@ def _observed_actions(
             if action.tag and action.tag != "move":
                 tags.append(action.tag)
         elif parsed.tag == "switch" and (
-            parsed.cause is None or parsed.cause.normalized in _PIVOT_CAUSES
+            parsed.cause is None or parsed.cause.normalized in PIVOT_MOVES
         ):
             incoming = actor.member_id
             observed[slot] = ObservedAction(
@@ -574,37 +491,20 @@ def _preview_actions(
     )
 
 
-@cache_default_dex
-def _mega_rules(dex: Mapping[str, Any]) -> _MegaRules:
-    species_by_item: dict[str, set[str]] = {}
-    for entry in dex.get("items", ()):
-        if not isinstance(entry, Mapping) or not isinstance(entry.get("megaStone"), Mapping):
-            continue
-        item = normalize_showdown_id(str(entry.get("id", entry.get("name", ""))))
-        species_by_item[item] = {
-            normalize_showdown_id(str(species)) for species in entry["megaStone"]
-        }
-    z_items = frozenset(
-        normalize_showdown_id(str(entry.get("id", entry.get("name", ""))))
-        for entry in dex.get("items", ())
-        if isinstance(entry, Mapping) and entry.get("zMove")
-    )
-    return _MegaRules(
-        MappingProxyType({item: frozenset(species) for item, species in species_by_item.items()}),
-        z_items,
-    )
+@cache
+def _mega_species_by_item() -> Mapping[str, frozenset[str]]:
+    """Map each Mega Stone id to the species ids that can use it."""
+    return {
+        entry["id"]: frozenset(normalize_showdown_id(species) for species in entry["megaStone"])
+        for entry in default_runtime_resources().dex["items"]
+        if entry.get("megaStone")
+    }
 
 
-def _can_mega(member: ReplayPokemonState, rules: _MegaRules, used: bool) -> bool:
-    if used:
-        return False
+def _can_mega(member: ReplayPokemonState, used: bool) -> bool:
     item = normalize_showdown_id(member.item or "")
     species = normalize_showdown_id(member.current_form)
-    return species in rules.species_by_item.get(item, ()) or (
-        species == "rayquaza"
-        and "dragonascent" in {move.move_id for move in member.moves}
-        and item not in rules.z_items
-    )
+    return not used and species in _mega_species_by_item().get(item, ())
 
 
 def build_decision_view(
@@ -614,8 +514,6 @@ def build_decision_view(
     window_events: tuple[ResolvedProtocolEvent, ...],
     *,
     preview: bool,
-    dex: Mapping[str, Any],
-    mega_rules: _MegaRules | None = None,
 ) -> DecisionView:
     roster_size = len(ots.members)
     if preview:
@@ -626,7 +524,6 @@ def build_decision_view(
         )
 
     own_side = state.sides[perspective]
-    rules = _mega_rules(dex) if mega_rules is None else mega_rules
     active = own_side.active
     active_set = frozenset(member_id for member_id in active if member_id is not None)
     selected_count = sum(
@@ -643,17 +540,15 @@ def build_decision_view(
         and not member.fainted
         and (not selection_complete or member.selected is True)
     )
-    forced_moves = (
-        _FORCED_MOVES_UNDER_IMPRISON
-        if _opponent_imprison_active(state, perspective)
-        else _FORCED_MOVES
-    )
+    # Struggle is hidden from the request while an opposing Imprison disables moves.
+    struggle_is_forced = not _opponent_imprison_active(state, perspective)
     forced_slots = frozenset(
         reference.pokemon_ref.active_slot
         for event in window_events
-        if event.event.tag == "move"
+        if struggle_is_forced
+        and event.event.tag == "move"
         and len(event.event.arguments) >= 2
-        and normalize_showdown_id(event.event.arguments[1]) in forced_moves
+        and normalize_showdown_id(event.event.arguments[1]) == "struggle"
         and (reference := _reference(event, 0)) is not None
         and reference.member_id is not None
         and reference.member_id.side.side_index == perspective
@@ -670,7 +565,7 @@ def build_decision_view(
                 for move in _move_states(member)
             )
         )
-        can_mega = bool(member is not None and _can_mega(member, rules, own_side.used_mega))
+        can_mega = member is not None and _can_mega(member, own_side.used_mega)
         slots.append(
             SlotDecision(
                 switch_slots=switches,
@@ -696,8 +591,6 @@ def _decision_for_window(
     perspective: int,
     max_candidates: int,
     animation_targets: Mapping[tuple[ReplayMemberId, str], ResolvedPokemonRefArgument],
-    dex: Mapping[str, Any],
-    mega_rules: _MegaRules,
 ) -> DecisionRecord | None:
     window_events = events[window.start_line_index : window.end_line_index]
     if window.decision_type in {
@@ -705,7 +598,7 @@ def _decision_for_window(
         DecisionType.PIVOT_SWITCH,
     } and not _has_player_policy_action(window_events, perspective):
         return None
-    if window.kind is BoundaryKind.TEAM_PREVIEW:
+    if window.decision_type is DecisionType.TEAM_PREVIEW:
         final_state = snapshots[len(events) - 1]
         observed = _preview_actions(
             window_events, document.ots[perspective], final_state, perspective
@@ -716,12 +609,8 @@ def _decision_for_window(
             perspective,
             window_events,
             preview=True,
-            dex=dex,
-            mega_rules=mega_rules,
         )
     else:
-        if window.start_line_index == 0:
-            raise ValueError("Policy decision window has no pre-decision state")
         pre_state = snapshots[window.start_line_index - 1]
         observed = _observed_actions(window_events, pre_state, perspective, animation_targets)
         view = build_decision_view(
@@ -730,8 +619,6 @@ def _decision_for_window(
             perspective,
             window_events,
             preview=False,
-            dex=dex,
-            mega_rules=mega_rules,
         )
         if window.decision_type is DecisionType.FORCED_SWITCH and any(
             action is not None for action in observed[:2]
@@ -771,8 +658,7 @@ def reconstruct_decisions_from_trace(
     *,
     perspective: int,
     max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
-    windows: tuple[DecisionWindow, ...] | None = None,
+    windows: tuple[DecisionWindow, ...],
 ) -> DecisionReconstruction:
     """
     Build decisions from an already resolved and reduced replay trace.
@@ -783,47 +669,14 @@ def reconstruct_decisions_from_trace(
         state: Accepted immutable state snapshots for the same event stream.
         perspective: The player index to reconstruct, either 0 or 1.
         max_candidates: Maximum joint-action candidates to retain per decision.
-        dex: Optional runtime dex used for mega legality metadata.
-        windows: Optional shared boundary classification for both perspectives.
+        windows: Boundary classification from infer_decision_windows, shared by both perspectives.
 
     Returns:
         A decision reconstruction containing shared windows and player-owned records.
     """
-    if perspective not in (0, 1):
-        raise ValueError("perspective must be 0 or 1")
-    if max_candidates < 1:
-        raise ValueError("max_candidates must be positive")
-    if state.diagnostics:
-        return DecisionReconstruction(
-            document.metadata.replay_id,
-            perspective,
-            (),
-            (),
-            state.diagnostics,
-        )
     event_tuple = tuple(events)
-    snapshots = state.require_accepted()
-    snapshots_by_line = {snapshot.line_index: snapshot for snapshot in snapshots}
-    event_lines = {event.event.line_index for event in event_tuple}
-    if not snapshots_by_line.keys() <= event_lines:
-        raise ValueError("State snapshots must match resolved event line indices")
-    if any(event.event.replay_id != document.metadata.replay_id for event in event_tuple):
-        raise ValueError("Decision events must belong to the document replay")
-
-    runtime_dex = default_runtime_resources().dex if dex is None else dex
+    snapshots_by_line = {snapshot.line_index: snapshot for snapshot in state.snapshots}
     animation_targets = _animation_targets(event_tuple)
-    mega_rules = _mega_rules(runtime_dex)
-    if windows is None:
-        try:
-            windows = infer_decision_windows(event_tuple)
-        except ValueError as exc:
-            return DecisionReconstruction(
-                document.metadata.replay_id,
-                perspective,
-                (),
-                (),
-                (event_tuple[0].event.rejection(str(exc)),),
-            )
     records: list[DecisionRecord] = []
     for window in windows:
         if not window.is_policy_request:
@@ -836,8 +689,6 @@ def reconstruct_decisions_from_trace(
             perspective,
             max_candidates,
             animation_targets,
-            runtime_dex,
-            mega_rules,
         )
         if record is not None:
             records.append(record)
@@ -851,56 +702,10 @@ def reconstruct_decisions_from_trace(
     )
 
 
-def reconstruct_replay_decisions_both(
-    document: ReplayDocument,
-    *,
-    max_candidates: int = 256,
-    dex: Mapping[str, Any] | None = None,
-) -> tuple[DecisionReconstruction, DecisionReconstruction]:
-    """Resolve and reduce once, then reconstruct both player perspectives."""
-    if max_candidates < 1:
-        raise ValueError("max_candidates must be positive")
-    replay_id = document.metadata.replay_id
-    runtime_dex = default_runtime_resources().dex if dex is None else dex
-    resolved = resolve_replay_events(document, dex=runtime_dex)
-    if resolved.diagnostics:
-        return _rejected_perspectives(replay_id, resolved.diagnostics)
-    state = reduce_replay_state(replay_id, document.ots, resolved.events, dex=runtime_dex)
-
-    results: list[DecisionReconstruction] = []
-    windows: tuple[DecisionWindow, ...] | None = None
-    for perspective in (0, 1):
-        result = reconstruct_decisions_from_trace(
-            document,
-            resolved.events,
-            state,
-            perspective=perspective,
-            max_candidates=max_candidates,
-            dex=runtime_dex,
-            windows=windows,
-        )
-        if result.diagnostics:
-            return _rejected_perspectives(replay_id, result.diagnostics)
-        results.append(result)
-        windows = result.windows
-    return results[0], results[1]
-
-
-def _rejected_perspectives(
-    replay_id: str, diagnostics: tuple[ReplayEventDiagnostic, ...]
-) -> tuple[DecisionReconstruction, DecisionReconstruction]:
-    return (
-        DecisionReconstruction(replay_id, 0, (), (), diagnostics),
-        DecisionReconstruction(replay_id, 1, (), (), diagnostics),
-    )
-
-
 __all__ = [
-    "BoundaryKind",
     "DecisionReconstruction",
     "DecisionWindow",
     "build_decision_view",
     "infer_decision_windows",
     "reconstruct_decisions_from_trace",
-    "reconstruct_replay_decisions_both",
 ]

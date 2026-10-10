@@ -113,15 +113,6 @@ class PokemonView(Protocol):
     def level(self) -> int | None: ...
 
     @property
-    def is_dynamaxed(self) -> bool: ...
-
-    @property
-    def is_terastallized(self) -> bool: ...
-
-    @property
-    def tera_type(self) -> Any: ...
-
-    @property
     def types(self) -> Sequence[Any]: ...
 
 
@@ -291,19 +282,11 @@ class TransformedPokemonView:
     def level(self) -> int | None:
         return self._base.level
 
-    @property
-    def is_dynamaxed(self) -> bool:
-        """Dynamax belongs to the actual active Pokémon, not its copied target."""
-        return self._base.is_dynamaxed
-
-    @property
-    def is_terastallized(self) -> bool:
-        """Terastallization belongs to the actual active Pokémon."""
-        return self._base.is_terastallized
-
-    @property
-    def tera_type(self) -> Any:
-        return self._base.tera_type
+    # poke-env reads the next three members when it lists move targets. The format
+    # has no Dynamax and no Terastallization.
+    is_dynamaxed = False
+    is_terastallized = False
+    tera_type = None
 
     @property
     def types(self) -> Sequence[Any]:
