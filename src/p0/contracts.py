@@ -11,7 +11,7 @@ from typing import Any, Mapping
 import orjson
 
 # Bump when observation/action meanings or same-shape model behavior become incompatible.
-MODEL_ENCODING_VERSION = 1
+MODEL_ENCODING_VERSION = 0
 
 
 def canonical_json_sha256(value: Any) -> str:

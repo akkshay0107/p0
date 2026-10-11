@@ -281,6 +281,20 @@ def _target_code(
     return target_slot + 1
 
 
+def _is_locked_move(event: ResolvedProtocolEvent) -> bool:
+    """A locked Pokemon is given no choice, so its request is a forced move."""
+    cause = event.event.cause
+    return cause is not None and cause.normalized == "lockedmove"
+
+
+def _request_slot(
+    reference: ResolvedPokemonRefArgument, line_slot: int, state: ReplayBattleState
+) -> int:
+    """Return the slot the Pokemon held at the request; Ally Switch can move it before it acts."""
+    active = state.sides[reference.pokemon_ref.side.side_index].active
+    return active.index(reference.member_id) if reference.member_id in active else line_slot
+
+
 def _observed_move(
     event: ResolvedProtocolEvent,
     state: ReplayBattleState,
@@ -402,6 +416,11 @@ def _observed_actions(
             if key in generated_slots:
                 generated_slots.remove(key)
                 tags.append("externally_generated_move")
+                continue
+            slot = _request_slot(actor, slot, state)
+            if _is_locked_move(event):
+                observed[slot] = ObservedAction(FORCED_ACTION, tag="forced_move")
+                tags.append("forced_move")
                 continue
             if parsed.cause is not None:
                 tags.append("externally_generated_move")
@@ -543,16 +562,20 @@ def build_decision_view(
     # Struggle is hidden from the request while an opposing Imprison disables moves.
     struggle_is_forced = not _opponent_imprison_active(state, perspective)
     forced_slots = frozenset(
-        reference.pokemon_ref.active_slot
+        _request_slot(reference, line_slot, state)
         for event in window_events
-        if struggle_is_forced
-        and event.event.tag == "move"
+        if event.event.tag == "move"
         and len(event.event.arguments) >= 2
-        and normalize_showdown_id(event.event.arguments[1]) == "struggle"
+        and (
+            _is_locked_move(event)
+            or (
+                struggle_is_forced and normalize_showdown_id(event.event.arguments[1]) == "struggle"
+            )
+        )
         and (reference := _reference(event, 0)) is not None
         and reference.member_id is not None
         and reference.member_id.side.side_index == perspective
-        and reference.pokemon_ref.active_slot is not None
+        and (line_slot := reference.pokemon_ref.active_slot) is not None
     )
     slots: list[SlotDecision] = []
     for slot, member_id in enumerate(active):

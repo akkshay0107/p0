@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from poke_env.battle import DoubleBattle, Effect, Pokemon, PokemonType, SideCondition, Status
+from poke_env.player.battle_order import DoubleBattleOrder
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
 
@@ -699,6 +700,96 @@ def _request_pokemon(ident: str, details: str, condition: str, active: bool) -> 
         "commanding": False,
         "reviving": False,
     }
+
+
+def _request_move(name: str, target: str) -> dict[str, object]:
+    return {
+        "move": name,
+        "id": name.replace(" ", "").lower(),
+        "pp": 8,
+        "maxpp": 8,
+        "target": target,
+        "disabled": False,
+    }
+
+
+def _rotom_houndstone_request(houndstone_moves: list[dict[str, object]]) -> dict[str, object]:
+    """A move request for Rotom-Wash beside a Houndstone offered the given moves."""
+    rotom = _request_pokemon("p1: Rotom", "Rotom-Wash, L50", "157/157", True)
+    rotom["moves"] = ["rest", "nightshade"]
+    houndstone = _request_pokemon("p1: Houndstone", "Houndstone, L50, M", "179/179", True)
+    houndstone["moves"] = ["facade", "uproar"]
+    return {
+        "active": [
+            {"moves": [_request_move("Rest", "self"), _request_move("Night Shade", "normal")]},
+            {"moves": houndstone_moves},
+        ],
+        "side": {"name": "Alice", "id": "p1", "pokemon": [rotom, houndstone]},
+    }
+
+
+class TestLockedMoveChoice:
+    def test_locked_move_is_sent_by_position_and_the_partner_is_unchanged(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("locked-uproar", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Rotom", "Rotom-Wash, L50", "157/157"])
+        battle.parse_message(["", "switch", "p1b: Houndstone", "Houndstone, L50, M", "179/179"])
+        battle.parse_message(["", "switch", "p2a: Blissey", "Blissey, L50, F", "100/100"])
+        battle.parse_message(["", "switch", "p2b: Snorlax", "Snorlax, L50, F", "100/100"])
+        # Showdown's request entry for a Pokemon on a later turn of Uproar.
+        battle.parse_request(_rotom_houndstone_request([{"move": "Uproar", "id": "uproar"}]))
+
+        free, locked = battle.valid_orders
+        night_shade = next(order for order in free if order.message == "/choose move nightshade 1")
+        order = DoubleBattleOrder(night_shade, locked[0])
+
+        assert order.message == "/choose move nightshade 1, move uproar"
+        assert (
+            poke_env_patches.locked_choice(battle, order.message)
+            == "/choose move nightshade 1, move 1"
+        )
+
+    def test_choice_is_unchanged_when_no_pokemon_is_locked(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("free-uproar", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Rotom", "Rotom-Wash, L50", "157/157"])
+        battle.parse_message(["", "switch", "p1b: Houndstone", "Houndstone, L50, M", "179/179"])
+        battle.parse_request(
+            _rotom_houndstone_request(
+                [_request_move("Facade", "normal"), _request_move("Uproar", "randomNormal")]
+            )
+        )
+
+        message = "/choose move rest, move uproar"
+        assert poke_env_patches.locked_choice(battle, message) == message
+
+    def test_struggle_is_not_treated_as_locked(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("struggle", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Rotom", "Rotom-Wash, L50", "157/157"])
+        battle.parse_message(["", "switch", "p1b: Houndstone", "Houndstone, L50, M", "179/179"])
+        # Showdown gives Struggle its target, so naming it by id is accepted.
+        battle.parse_request(_rotom_houndstone_request([_request_move("Struggle", "randomNormal")]))
+
+        message = "/choose move rest, move struggle"
+        assert poke_env_patches.locked_choice(battle, message) == message
+
+    def test_default_choice_is_unchanged_beside_a_locked_pokemon(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("locked-default", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Rotom", "Rotom-Wash, L50", "157/157"])
+        battle.parse_message(["", "switch", "p1b: Houndstone", "Houndstone, L50, M", "179/179"])
+        battle.parse_request(_rotom_houndstone_request([{"move": "Uproar", "id": "uproar"}]))
+
+        assert poke_env_patches.locked_choice(battle, "/choose default") == "/choose default"
 
 
 class TestIllusionTracking:

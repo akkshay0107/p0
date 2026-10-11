@@ -28,6 +28,7 @@ from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
 from p0.model.resources import default_runtime_resources
 from p0.replays.reconstruction.contract import COPYABLE_VOLATILES
 from p0.runtime.live_event_capture import capture_message, transform_target_reference
+from p0.runtime.poke_env_battle_adapter import locked_slots
 
 _ORIGINAL_STOP_LISTENING = PSClient.stop_listening
 _ORIGINAL_HANDLE_MESSAGE = PSClient._handle_message
@@ -489,6 +490,30 @@ def _parse_request(
     _ORIGINAL_PARSE_REQUEST(self, request, strict_battle_tracking)
 
 
+def locked_choice(battle: DoubleBattle, message: str) -> str:
+    """
+    Name a locked Pokemon's move by position in a choice.
+
+    Showdown reads a move named by id in a locked request as single-target and rejects
+    it without one, then ignores the target it was given. poke-env names moves by id
+    and only works around this for recharge.
+
+    Arguments:
+      battle: battle whose latest request the choice answers.
+      message: choice command poke-env built.
+
+    Returns:
+      The command with each locked slot's move sent as "move 1".
+    """
+    if not message.startswith("/choose "):
+        return message
+    choices = message.removeprefix("/choose ").split(", ")
+    for position, locked in enumerate(locked_slots(battle)[: len(choices)]):
+        if locked and choices[position].startswith("move "):
+            choices[position] = "move 1"
+    return "/choose " + ", ".join(choices)
+
+
 async def _handle_message(self: PSClient, message: str):
     # Showdown sends the Bo3 parent room as >game-bestof..., while poke-env only
     # understands >battle rooms and otherwise indexes a non-existent protocol field.
@@ -515,6 +540,11 @@ async def _send_message(self: PSClient, message: str, room: str = "", message_2=
         "/rejectopenteamsheets",
     }:
         return None
+    # The client holds its player's bound battle callback, which leads to the room's battle.
+    player = getattr(self._on_battle_message, "__self__", None)
+    battle = getattr(player, "_battles", {}).get(room)
+    if battle is not None:
+        message = locked_choice(battle, message)
     return await _ORIGINAL_SEND_MESSAGE(self, message, room, message_2)
 
 

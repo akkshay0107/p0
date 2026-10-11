@@ -36,6 +36,7 @@ from p0.model.structured_observation import StructuredObservation
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import action_to_order
 from p0.runtime.poke_env_battle_adapter import action_move_slots, battle_view
+from p0.runtime.poke_env_patches import locked_choice
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
 
@@ -109,8 +110,7 @@ def single_order_to_action(
     if active is None:
         raise ValueError(f"Move order targets empty position {position}")
 
-    available = battle.available_moves[position]
-    if len(available) == 1 and available[0].id in {"struggle", "recharge"}:
+    if battle_view(battle).decision.slots[position].forced_move:
         return np.int64(MEGA_FORCED_ACTION if order.mega else FORCED_ACTION)
 
     move_slot = next(
@@ -203,8 +203,9 @@ class _GroundTruthPlayer(RandomPlayer):
                 ),
                 legal_joint_actions=legal_joint_actions,
                 chosen_action=(int(action[0]), int(action[1])),
-                chosen_order=str(order),
-                regenerated_order=str(action_to_order(action, battle)),
+                # A locked slot is sent by position, so compare the commands as sent.
+                chosen_order=locked_choice(battle, order.message),
+                regenerated_order=locked_choice(battle, action_to_order(action, battle).message),
                 battle_tag=battle.battle_tag,
             )
         )

@@ -323,3 +323,44 @@ class TestDecisionTargets:
         assert "mid_turn_encore_override" not in affected.evidence.tags
         assert (9, 11) in affected.evidence.candidates
         assert (9, 13) not in affected.evidence.candidates
+
+
+class TestForcedMoves:
+    def test_locked_move_is_the_forced_action(self) -> None:
+        # Eevee does not own Dig: it copied the move and is on its second turn.
+        payload = decision_payload()
+        payload["log"] = str(payload["log"]).replace(
+            "|move|p1b: Eevee|Tackle|p2b: Charmander",
+            "|move|p1b: Eevee|Dig|p2b: Charmander|[from] lockedmove",
+        )
+
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        evidence = result.decisions[-1].evidence
+        assert evidence.label_kind is LabelKind.EXACT
+        # Pikachu chose Protect (move slot 0, no target); Eevee had the forced action.
+        assert evidence.candidates == ((9, 48),)
+
+    def test_struggle_after_ally_switch_belongs_to_the_slot_held_at_the_request(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Ally Switch"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n|move|p1b: Eevee|Tackle|p2b: Charmander",
+                "|move|p1b: Eevee|Ally Switch|p1b: Eevee\n"
+                "|swap|p1b: Eevee|0|[from] move: Ally Switch\n"
+                "|-activate|p1b: Pikachu|move: Struggle\n"
+                "|move|p1b: Pikachu|Struggle|p2a: Bulbasaur",
+            )
+        )
+
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        evidence = result.decisions[-1].evidence
+        assert evidence.label_kind is LabelKind.EXACT
+        # Pikachu was in the first slot when it was asked, so the forced action is there.
+        assert evidence.candidates == ((48, 9),)

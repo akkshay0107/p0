@@ -137,7 +137,7 @@ _VIEWS: WeakKeyDictionary[DoubleBattle, PokeEnvBattleView] = WeakKeyDictionary()
 
 
 class _CalledMoveView:
-    """Show a sole called continuation in the action move slot for this request."""
+    """Show a sole called move as the Pokemon's only move for this request."""
 
     __slots__ = ("_pokemon", "moves", "is_transformed")
 
@@ -156,14 +156,24 @@ class _CalledMoveView:
         return self._pokemon == getattr(other, "_pokemon", other)
 
 
+def locked_slots(battle: DoubleBattle) -> tuple[bool, ...]:
+    """
+    Mark each active slot whose Pokemon is locked into its move.
+
+    Showdown lists a locked Pokemon's one move without a target (Outrage, a charging
+    Dig, recharge). Struggle keeps its target, so it is not marked.
+    """
+    return tuple(
+        len(moves := active.get("moves", ())) == 1 and "target" not in moves[0]
+        for active in battle.last_request.get("active", ())
+    )
+
+
 def action_move_slots(battle: DoubleBattle, position: int) -> tuple[Any, ...]:
     """Return move slots used by the current action request."""
     active = battle.active_pokemon[position]
     if active is None:
         return ()
-    available = battle.available_moves[position]
-    if len(available) == 1 and available[0].id not in active.moves:
-        return (available[0],)
     return tuple(active.moves.values())
 
 
@@ -218,6 +228,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
     maybe_trapped = battle.maybe_trapped
     force_switch = battle.force_switch
     can_mega_evolve = battle.can_mega_evolve
+    locked = locked_slots(battle) or (False, False)
     slots: list[SlotDecision] = []
 
     for position in (0, 1):
@@ -240,11 +251,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
         switches = {id(pokemon) for pokemon in available_switches[position]}
         switch_slots = tuple(index for index, pokemon in enumerate(team) if id(pokemon) in switches)
 
-        forced_move = (
-            not any(move_targets)
-            and len(position_moves) == 1
-            and position_moves[0].id in {"struggle", "recharge"}
-        )
+        forced_move = locked[position] or [move.id for move in position_moves] == ["struggle"]
 
         slots.append(
             SlotDecision(

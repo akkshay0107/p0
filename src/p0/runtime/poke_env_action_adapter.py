@@ -88,7 +88,9 @@ def action_to_single_order(
             except IndexError as error:
                 raise ValueError(f"No forced move is available at position {position}") from error
 
-            order = Player.create_order(move, mega=semantic.mega)
+            # A locked move may list targets; Showdown ignores the one it is sent.
+            target = battle.get_possible_showdown_targets(move, active)[0]
+            order = Player.create_order(move, move_target=target, mega=semantic.mega)
 
         else:
             moves = action_move_slots(battle, position)
