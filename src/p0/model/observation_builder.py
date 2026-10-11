@@ -140,8 +140,11 @@ def _pad_team(
         # only happens when an active slot placeholder pushes a 6-mon team list
         # (opponent with open team sheet) over the row budget. Eviction must stay
         # decidable from public state, so it never consults team selection.
+        # The placeholder is a second display of one species, which proves the
+        # Illusion user is active, so its bench row goes first.
         actives, rest = res[:2], res[2:]
         for predicate in (
+            lambda mon: PokemonTokenizer.normalize_id(mon.ability or "") == "illusion",
             lambda mon: mon.fainted,
             lambda mon: not mon.revealed,
         ):
@@ -203,21 +206,6 @@ def _get_ordered_pokemon(
         else:
             res.append((mon, orig_idx_map.get(mon, -1), None if is_opponent else active_idx))
             assigned.add(mon)
-
-            # A replay keeps a previously seen disguise target in the team map
-            # with its own public state. While Illusion is active, that target
-            # occupies the active row, so it must not take a second bench row.
-            if is_opponent and getattr(mon, "identity_uncertain", False):
-                target = next(
-                    (
-                        member
-                        for member in team.values()
-                        if member not in assigned and member.species == mon.species
-                    ),
-                    None,
-                )
-                if target is not None:
-                    assigned.add(target)
 
     # Row order must not depend on team selection: a public replay cannot know it
     # until a reserve appears, and an order that drifts would break replay parity.

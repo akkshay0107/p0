@@ -227,10 +227,16 @@ def _promote_duplicate_partner(battle: DoubleBattle, slot: str, leaving: Pokemon
     if partner is None or partner.species != leaving.species:
         return
 
+    _replace_team_entry(battle, role, leaving, partner)
+    if leaving.fainted:
+        _battle_state(battle, "_p0_fainted_twins")[partner] = leaving
+
+
+def _replace_team_entry(battle: DoubleBattle, role: str, old: Pokemon, new: Pokemon) -> None:
     team = battle._team if role == battle.player_role else battle._opponent_team
     for key, member in team.items():
-        if member is leaving:
-            team[key] = partner
+        if member is old:
+            team[key] = new
             return
 
 
@@ -326,8 +332,14 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
                     # would assign the same Pokemon object to both slots; clone it for the partner.
                     duplicate = deepcopy(incoming)
                     active_by_slot[other_slot] = duplicate
+                    targets = getattr(self, "_p0_transform_targets", {})
+                    shown_types = incoming._temporary_types
                     # The partner keeps the shown volatile state; the incoming Pokemon enters fresh.
                     incoming.switch_out(self.fields)
+                    if id(incoming) in targets:
+                        # A disguise copies the transformed look, so both displays show it.
+                        targets[id(duplicate)] = targets[id(incoming)]
+                        incoming._temporary_types = shown_types
                     _battle_state(self, "_p0_duplicate_active")[other_slot] = duplicate
     elif event_type == "faint" and len(split_message) >= 3:
         fainted = self.get_pokemon(split_message[2])
@@ -409,6 +421,11 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     leaving = fainted if outgoing is None else outgoing
     if leaving is not None:
         _promote_duplicate_partner(self, split_message[2][:3], leaving)
+    if event_type == "replace" and outgoing is not None:
+        fainted_twin = getattr(self, "_p0_fainted_twins", {}).pop(outgoing, None)
+        if fainted_twin is not None:
+            # The revealed display was the disguise, so the twin that fainted was real.
+            _replace_team_entry(self, split_message[2][:2], outgoing, fainted_twin)
     if fainted is not None:
         # Showdown clears volatiles on faint; poke-env only clears a subset.
         fainted.switch_out(self.fields)
@@ -450,11 +467,16 @@ def _get_pokemon(
     details: str = "",
     request: dict[str, Any] | None = None,
 ) -> Pokemon:
-    """Resolve a duplicated Illusion display by its active slot."""
+    """Resolve a duplicated Illusion display by its active slot, and an off-field nickname."""
     if not force_self_team and len(identifier) >= 5 and identifier[3:5] == ": ":
         alias = getattr(self, "_p0_duplicate_active", {}).get(identifier[:3])
         if alias is not None and alias.identifies_as(identifier[5:]):
             return alias
+    if not details and identifier[2:4] == ": ":
+        # An off-field Pokemon is named without a slot and with no details. Its default
+        # nickname is the base species, while the team sheet keys it by the full species.
+        # An Illusion user that never showed itself has had no switch line to link the two.
+        details = identifier[4:]
     return _ORIGINAL_GET_POKEMON(self, identifier, force_self_team, details, request)
 
 
@@ -485,9 +507,17 @@ def _place_requested_actives(battle: DoubleBattle, side_pokemon: list[dict[str, 
 def _parse_request(
     self: DoubleBattle, request: dict[str, Any], strict_battle_tracking: bool = False
 ) -> None:
-    if not request.get("teamPreview", False):
+    preview = request.get("teamPreview", False)
+    if not preview:
         _place_requested_actives(self, request["side"]["pokemon"])
     _ORIGINAL_PARSE_REQUEST(self, request, strict_battle_tracking)
+    if not preview:
+        # poke-env takes Showdown's active flag (the first two party positions) as true
+        # even in the team preview request. A disguised Illusion user that leads from
+        # one of them is then never switched in, so it would never count as seen.
+        for pokemon in request["side"]["pokemon"]:
+            if pokemon["active"]:
+                self._team[pokemon["ident"]]._revealed = True
 
 
 def locked_choice(battle: DoubleBattle, message: str) -> str:

@@ -612,6 +612,26 @@ class TestReconstructionEvents:
         assert result.events == ()
         assert result.diagnostics[0].reason.startswith("unresolved_illusion:")
 
+    def test_fainted_member_returning_without_illusion_is_not_blamed_on_illusion(self) -> None:
+        # A Pokemon revived by Revival Blessing enters again; no roster member has Illusion.
+        ots = (
+            _complete_ots(ReplaySide.P1, ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")),
+            _test_ots()[1],
+        )
+        parsed = parse_protocol_events(
+            "revived-member",
+            (
+                _line("|switch|p1a: Alpha|Alpha, L50|100/100", index=0),
+                _line("|faint|p1a: Alpha", index=1),
+                _line("|switch|p1a: Alpha|Alpha, L50|50/100", index=2),
+            ),
+        )
+
+        result = resolve_protocol_events("revived-member", ots, parsed.events)
+
+        assert result.events == ()
+        assert result.diagnostics[0].reason == "active history has no valid roster assignment"
+
     def test_local_golden_replay_is_classified_once_without_rejections(self) -> None:
         document = parse_replay_payload(_GOLDEN_REPLAY.read_bytes())
         result = parse_protocol_events(document.metadata.replay_id, document.protocol_lines)

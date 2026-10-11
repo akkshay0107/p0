@@ -22,6 +22,9 @@ from p0.replays.reconstruction.events import (
 from p0.replays.reconstruction.identity import ProtocolPokemonReference
 from p0.replays.schema import OTSData, OTSMember
 
+# Tags whose second argument is the Pokémon's HP after the event.
+_HP_TAGS = frozenset({"-damage", "-heal", "-sethp"})
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedPokemonRefArgument:
@@ -66,11 +69,18 @@ class _ActiveHistory:
     side: ReplaySide
     entry_event: ProtocolEvent
     candidates: tuple[_HistoryCandidate, ...]
+    entry_hp: str
+    last_hp: str
     overlapping_history_ids: set[int] = field(default_factory=set)
     predecessor_history_id: int | None = None
     revealed_member: ReplayMemberId | None = None
     reveal_event: ProtocolEvent | None = None
     faint_line_index: int | None = None
+    # Moves the Pokémon chose from its own move slots.
+    own_moves: set[str] = field(default_factory=set)
+    transformed: bool = False
+    # A damaging hit ends Illusion, so a hit with no reveal shows the real Pokémon.
+    took_hit: bool = False
 
 
 class _ResolutionError(Exception):
@@ -84,7 +94,7 @@ class _ResolutionError(Exception):
 
 
 class _HistoryScanner:
-    """Collect active histories before assigning stable roster members."""
+    """Collect active histories and what each one shows about its roster member."""
 
     def __init__(
         self,
@@ -104,6 +114,12 @@ class _HistoryScanner:
         self._active: dict[tuple[ReplaySide, int], int] = {}
         self._last_occupant: dict[tuple[ReplaySide, int], int] = {}
         self._histories: list[_ActiveHistory] = []
+        self._last_mover_id: int | None = None
+        self.member_moves = {
+            member.member_id: frozenset(normalize_showdown_id(move) for move in member.moves)
+            for sheet in ots
+            for member in sheet.members
+        }
         self.team_sizes = {sheet.side: min(4, len(sheet.members)) for sheet in ots}
 
     def scan(self, events: tuple[ProtocolEvent, ...]) -> tuple[_ActiveHistory, ...]:
@@ -118,6 +134,12 @@ class _HistoryScanner:
                 self._faint_history(event)
             elif event.tag == "swap":
                 self._swap_history(event)
+            elif event.tag == "move":
+                self._record_move(event)
+            elif event.tag in _HP_TAGS:
+                self._record_hp(event)
+            elif event.tag == "-transform":
+                self._active_history(event, _event_reference(event)).transformed = True
         return tuple(self._histories)
 
     def _set_team_size(self, event: ProtocolEvent) -> None:
@@ -154,11 +176,14 @@ class _HistoryScanner:
             if active_side is side
         }
         history_id = len(self._histories)
+        entry_hp = _shown_hp(event.arguments[2])
         history = _ActiveHistory(
             history_id,
             side,
             event,
             candidates,
+            entry_hp,
+            entry_hp,
             overlaps,
             predecessor_history_id,
         )
@@ -214,6 +239,32 @@ class _HistoryScanner:
         else:
             self._active[source_key] = target_history
 
+    def _record_move(self, event: ProtocolEvent) -> None:
+        history = self._active_history(event, _event_reference(event))
+        self._last_mover_id = history.history_id
+        move_id = normalize_showdown_id(event.arguments[1])
+        # A move with a cause was called by another effect, Struggle is in no move slot,
+        # and a transformed Pokémon uses the moves of its target.
+        if event.cause is None and move_id != "struggle" and not history.transformed:
+            history.own_moves.add(move_id)
+
+    def _record_hp(self, event: ProtocolEvent) -> None:
+        reference = _event_reference(event)
+        # A benched Pokémon is named without a slot and belongs to no active history.
+        if reference.pokemon_ref.active_slot is None:
+            return
+
+        history = self._active_history(event, reference)
+        history.last_hp = _shown_hp(event.arguments[1])
+        # Damage with no cause comes from a move. A Pokémon's own move can cost it HP
+        # (Substitute, Belly Drum), so only a move of another Pokémon counts as a hit.
+        if (
+            event.tag == "-damage"
+            and event.cause is None
+            and self._last_mover_id not in {None, history.history_id}
+        ):
+            history.took_hit = True
+
     def _active_history(
         self,
         event: ProtocolEvent,
@@ -240,8 +291,10 @@ class _HistorySolver:
         self,
         histories: tuple[_ActiveHistory, ...],
         team_size: int,
+        member_moves: Mapping[ReplayMemberId, frozenset[str]],
     ) -> None:
         self._histories = histories
+        self._member_moves = member_moves
         self._histories_by_id = {history.history_id: history for history in histories}
         self._team_size = team_size
         self._assignments: dict[int, _HistoryCandidate] = {}
@@ -287,6 +340,8 @@ class _HistorySolver:
             and candidate.actual_member != history.revealed_member
         ):
             return False
+        # The benched HP of a member is the HP its last active history ended with.
+        benched_hp = None
         for previous_id, previous_candidate in self._assignments.items():
             previous = self._histories_by_id[previous_id]
             if (
@@ -301,7 +356,23 @@ class _HistorySolver:
                 in {candidate.actual_member, candidate.displayed_member}
             ):
                 return False
-        return True
+            if previous_candidate.actual_member == candidate.actual_member:
+                benched_hp = previous.last_hp
+
+        # Only the choice between an Illusion user and the Pokémon it copies needs evidence.
+        if len(history.candidates) == 1:
+            return True
+        if (
+            history.took_hit
+            and history.revealed_member is None
+            and candidate.actual_member != candidate.displayed_member
+        ):
+            return False
+        if not history.own_moves <= self._member_moves[candidate.actual_member]:
+            return False
+        if benched_hp is None:
+            return _is_full_hp(history.entry_hp)
+        return history.entry_hp == benched_hp
 
     def _selected_size_after(self, selected: frozenset[ReplayMemberId]) -> int:
         return len(self._selected_counts) + sum(
@@ -321,6 +392,16 @@ def _event_reference(event: ProtocolEvent, argument_index: int = 0) -> PokemonRe
             event,
             f"event {event.tag!r} has no Pokémon reference at argument {argument_index}",
         ) from exc
+
+
+def _shown_hp(condition: str) -> str:
+    """Return the HP text of a condition such as 61/100 par, without the status."""
+    return condition.split(" ", 1)[0]
+
+
+def _is_full_hp(shown_hp: str) -> bool:
+    hp, _, maximum = shown_hp.partition("/")
+    return hp == maximum
 
 
 def _required_active_slot(event: ProtocolEvent, reference: PokemonRefArgument) -> int:
@@ -424,7 +505,9 @@ def _resolve_incoming_histories(
         side_histories = tuple(history for history in histories if history.side is side)
         if not side_histories:
             continue
-        solutions = _HistorySolver(side_histories, scanner.team_sizes[side]).solve()
+        solutions = _HistorySolver(
+            side_histories, scanner.team_sizes[side], scanner.member_moves
+        ).solve()
         if not solutions:
             impossible_reveal = next(
                 (
@@ -439,10 +522,10 @@ def _resolve_incoming_histories(
             event = (
                 side_histories[0].entry_event if impossible_reveal is None else impossible_reveal
             )
-            raise _ResolutionError(
-                event,
-                "unresolved_illusion: active history has no valid roster assignment",
-            )
+            reason = "active history has no valid roster assignment"
+            if scanner.has_illusion_member(side):
+                reason = f"unresolved_illusion: {reason}"
+            raise _ResolutionError(event, reason)
         if len(solutions) > 1:
             first, second = solutions
             differing_index = next(

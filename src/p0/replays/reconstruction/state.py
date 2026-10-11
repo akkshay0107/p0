@@ -171,6 +171,7 @@ class ReplayPokemonState:
     effects: tuple[tuple[str, int], ...]
     perish_count: int | None
     transform: TransformSnapshot | None
+    # Seen on the field: under its own name, or as the Pokemon a disguise copied. Never reset.
     revealed: bool
     selected: bool | None
     fainted: bool
@@ -182,6 +183,12 @@ class ReplayPokemonState:
     effect_variants: tuple[tuple[str, str], ...] = ()
     effect_sources: tuple[tuple[str, ReplayMemberId], ...] = ()
     added_type: str | None = None
+    # The Illusion user that fainted unrevealed while it looked like this member.
+    disguised_faint: ReplayMemberId | None = None
+    # Fainted unrevealed beside the Pokemon it looked like, so no faint was shown to move.
+    faint_unseen: bool = False
+    # Protocol line of the latest switch or drag that brought this member in.
+    entered_line: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +289,9 @@ class _MutablePokemon:
     last_move: str | None = None
     added_type: str | None = None
     underlying_types: tuple[str, ...] = ()
+    disguised_faint: ReplayMemberId | None = None
+    faint_unseen: bool = False
+    entered_line: int = -1
 
     def move_snapshots(self) -> tuple[MoveState, ...]:
         """Return effective move slots without exposing mutable move objects."""
@@ -322,6 +332,9 @@ class _MutablePokemon:
             protect_counter=self.protect_counter,
             preparing=self.preparing,
             last_move=self.last_move,
+            disguised_faint=self.disguised_faint,
+            faint_unseen=self.faint_unseen,
+            entered_line=self.entered_line,
         )
 
 
@@ -500,6 +513,8 @@ class _StateReducer:
             self._clear_battle_state(outgoing)
 
         member = self._member(member_id)
+        # A fainted Pokemon cannot return, so an earlier faint shown on it was a disguise.
+        member.disguised_faint = None
         details_species = _details_species(resolved.event.arguments[1])
         details_data = self._species_data(details_species)
         original_data = self._species_data(member.original_species)
@@ -513,18 +528,23 @@ class _StateReducer:
                 )
             member.displayed_species = details_species
             member.effects["illusion"] = self.turn
+            # Both players see the copied Pokemon's name enter the field.
+            copied = self._copied_member(member_id, member.displayed_species)
+            if copied is not None:
+                self._member(copied).revealed = True
         else:
             self._set_form(member, details_species, persistent=True)
             member.effects.pop("illusion", None)
+            member.revealed = True
         hp_fraction, status = _parse_hp_status(resolved.event.arguments[2])
         member.hp_fraction = hp_fraction
         member.status = status
         if status != "slp":
             member.status_counter = 0
         member.fainted = hp_fraction == 0.0
-        member.revealed = not disguised
         member.selected = True
         member.active_turns = 0
+        member.entered_line = resolved.event.line_index
         self.active[key] = member_id
 
     def _handle_replace(self, resolved: ResolvedProtocolEvent) -> None:
@@ -572,6 +592,14 @@ class _StateReducer:
         member.hp_fraction = 0.0
         member.fainted = True
         member.status = None
+        if "illusion" in member.effects:
+            # The log names the disguise, so that is the Pokemon seen to faint.
+            copied = self._copied_member(member_id, member.displayed_species)
+            if copied in self.active.values():
+                # The copied Pokemon still stands, and the opponent never learns of the faint.
+                member.faint_unseen = True
+            elif copied is not None:
+                self._member(copied).disguised_faint = member_id
         self._clear_battle_state(member)
         self.active.pop(key)
         self._fainted_slots[member_id] = slot
@@ -1423,6 +1451,21 @@ class _StateReducer:
             member.moves[move_id] = replace(
                 move, current_pp=max(0, min(move.max_pp, move.current_pp + amount))
             )
+
+    def _copied_member(
+        self, member_id: ReplayMemberId, displayed_species: str
+    ) -> ReplayMemberId | None:
+        """Return the teammate a disguise copies; the species clause makes it unique."""
+        displayed = self._species_data(displayed_species).base_species
+        return next(
+            (
+                other_id
+                for other_id, other in self._members.items()
+                if other_id.side == member_id.side
+                and self._species_data(other.original_species).base_species == displayed
+            ),
+            None,
+        )
 
     def _member(self, member_id: ReplayMemberId) -> _MutablePokemon:
         """Return a member for reading or change. This is the only way to reach one."""

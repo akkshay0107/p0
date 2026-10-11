@@ -423,6 +423,31 @@ class TestObservationBuilder:
         assert obs.token_type_ids[TOKEN_IDX_OPPONENT_SIDE] == TokenType.FIELD
         assert obs.numerical[TOKEN_IDX_OPPONENT_SIDE, 4] == 0.0
 
+    def test_second_display_of_a_species_evicts_the_illusion_bench_row(self) -> None:
+        """Two active Clefable beside a one-Clefable sheet prove Zoroark is active, so its bench row is dropped."""
+        clefable = make_pokemon_view(species="clefable", ability="magicguard")
+        display = make_pokemon_view(species="clefable", ability="magicguard")
+        zoroark = make_pokemon_view(species="zoroark", ability="illusion")
+        bench = [
+            make_pokemon_view(species=species, ability=ability)
+            for species, ability in (
+                ("goodrahisui", "shellarmor"),
+                ("greninja", "protean"),
+                ("sceptile", "overgrow"),
+                ("rillaboom", "grassysurge"),
+            )
+        ]
+        battle = make_battle_view(
+            opponent_active_pokemon=[clefable, display],
+            opponent_team=[clefable, zoroark, *bench],
+        )
+
+        obs = _OBSERVATION_BUILDER.build(battle)
+
+        assert obs.categorical[6:12, 0].tolist() == [
+            tokenizer.species_id(pokemon) for pokemon in (clefable, display, *bench)
+        ]
+
     def test_opponent_mega_stone_does_not_claim_move_legality(self) -> None:
         """An opponent's stone does not provide a request-backed Mega option."""
         opponent = make_pokemon_view(species="mrrime", item="skarmorite")

@@ -857,7 +857,8 @@ def _assert_poke_env_state_agreement(
                 # poke-env can lose a slot when two Illusion displays share a
                 # species; the replay reducer still retains the active member.
                 if reconstructed is not None and (
-                    not reconstructed.revealed or reconstructed.identity_uncertain
+                    any(effect.name == "ILLUSION" for effect in reconstructed.effects)
+                    or reconstructed.identity_uncertain
                 ):
                     continue
                 if mon is None or reconstructed is None:

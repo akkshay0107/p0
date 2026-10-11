@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -15,9 +17,12 @@ from p0.battle.legality import GAME_END_DECISION
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
+    CAT_IDX_PRESENCE_STATUS,
     CAT_IDX_STAT_PROVENANCE,
     NUM_IDX_CAN_MEGA,
     NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_ORIG_IDX_RATIO,
+    PresenceStatus,
     StatProvenance,
 )
 from p0.replays.compile import compile_payloads, write_tensor_shards
@@ -142,12 +147,20 @@ class TestReconstructionProjection:
 
         observation = ObservationBuilder(default_runtime_resources()).build(snapshot.view)
         assert observation.numerical[6, 6].item() == pytest.approx(80 / 160)
-        assert observation.numerical[6, 26].item() == 0.0
+        # The disguise entered after the real Venusaur, so it takes Venusaur's team entry,
+        # as live tracking does, and the real Venusaur's row carries no roster index.
+        venusaur = next(
+            member.member_id.roster_index
+            for member in document.ots[1].members
+            if member.species == "Venusaur"
+        )
+        assert observation.numerical[6, 26].item() == pytest.approx((venusaur + 1) / 6)
+        assert observation.numerical[7, 26].item() == 0.0
         assert observation.numerical[6, NUM_IDX_CAN_MEGA].item() == 0.0
         assert observation.numerical[6, NUM_IDX_LEGALITY_UNKNOWN].item() == 1.0
         assert observation.categorical[6, 5:9].count_nonzero().item() == 0
 
-    def test_illusion_does_not_replace_a_known_bench_member(self) -> None:
+    def test_illusion_takes_the_team_entry_of_a_known_bench_member(self) -> None:
         path = _ILLUSION_REPLAY
         document = parse_replay_payload(path.read_bytes())
         resources = default_runtime_resources()
@@ -188,16 +201,20 @@ class TestReconstructionProjection:
         displayed = view.opponent_active_pokemon[0]
         assert displayed is not None and displayed.identity_uncertain
         assert displayed.species == "Venusaur"
-        bench = next(
+        # Live tracking files the display under the Venusaur seen earlier, so that
+        # Venusaur has no bench row of its own while the disguise is active.
+        entry = next(
             member for member in view.opponent_team.values() if member.member_id == known_venusaur
         )
-        assert bench.species == "Venusaur"
-        assert bench.revealed
-        assert not bench.identity_uncertain
+        assert entry is displayed
+        assert entry.revealed
 
         observation = ObservationBuilder(resources).build(view)
         displayed_species = observation.categorical[6, 0]
         assert (observation.categorical[6:12, 0] == displayed_species).sum().item() == 1
+        assert observation.numerical[6, 26].item() == pytest.approx(
+            (known_venusaur.roster_index + 1) / 6
+        )
 
     def test_compiled_game_projects_opposing_perspectives_with_correct_roster_and_sides(
         self,
@@ -447,3 +464,293 @@ class TestSpatialEventIntervals:
             ]
             assert damage_events
             assert all(r.amount_known == 1.0 and r.amount < 0.0 for r in damage_events)
+
+
+class TestDisguisedFaint:
+    def test_unrevealed_faint_shows_on_the_disguise_until_that_pokemon_enters(self) -> None:
+        # Zoroark leads looking like Wartortle and faints to Life Orb recoil, which does not
+        # reveal it. Pikachu faints in the same turn, so p1 is asked for a replacement before
+        # the real Wartortle enters.
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Charmander","name":"Charmander","ability":"Overgrow"',
+                '"species":"Zoroark","name":"Zoroark","ability":"Illusion"',
+            )
+            .replace(
+                "|switch|p2b: Charmander|Charmander, L50|100/100",
+                "|switch|p2b: Wartortle|Wartortle, L50|100/100",
+            )
+            .replace(
+                "|move|p1b: Eevee|Tackle|p2b: Charmander\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n"
+                "|\n",
+                "|move|p1b: Eevee|Protect|p1b: Eevee\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|move|p2b: Wartortle|Tackle|p1a: Pikachu\n"
+                "|-damage|p1a: Pikachu|0 fnt\n"
+                "|faint|p1a: Pikachu\n"
+                "|-damage|p2b: Wartortle|0 fnt|[from] item: Life Orb\n"
+                "|faint|p2b: Wartortle\n"
+                "|\n"
+                "|upkeep\n"
+                "|\n"
+                "|switch|p1a: Raichu|Raichu, L50|100/100\n"
+                "|switch|p2b: Wartortle|Wartortle, L50|100/100\n"
+                "|turn|2\n"
+                "|\n"
+                "|move|p1a: Raichu|Protect|p1a: Raichu\n"
+                "|move|p1b: Eevee|Protect|p1b: Eevee\n"
+                "|\n",
+            )
+        )
+
+        opponent, owner = compile_payloads((payload,)).accepted_series[0].games[0].perspectives
+
+        _, _, replacement, next_turn = opponent.snapshots
+        seen_at_replacement = {
+            mon.species: mon.fainted for mon in replacement.view.opponent_team.values()
+        }
+        assert seen_at_replacement["Wartortle"] is True
+        assert seen_at_replacement["Zoroark"] is False
+        seen_next_turn = {mon.species: mon.fainted for mon in next_turn.view.opponent_team.values()}
+        assert seen_next_turn["Wartortle"] is False
+        assert seen_next_turn["Zoroark"] is True
+        # Its owner always knows which Pokemon fainted.
+        own_replacement = owner.snapshots[2]
+        known = {mon.species: mon.fainted for mon in own_replacement.view.team.values()}
+        assert known["Zoroark"] is True
+        assert known["Wartortle"] is False
+
+
+def _illusion_payload(p2_members: tuple[tuple[str, str], ...], body: str) -> dict[str, Any]:
+    """Return the decision payload with a p2 sheet of (species, ability) and a new log body."""
+    payload = decision_payload()
+    lines = str(payload["log"]).splitlines()
+    preview = lines[: next(i for i, line in enumerate(lines) if line.startswith("|showteam|p2|"))]
+    entries = [
+        {
+            "species": species,
+            "name": species,
+            "ability": ability,
+            "moves": ["Protect", "Night Daze" if ability == "Illusion" else "Tackle"],
+            "item": "Leftovers",
+        }
+        for species, ability in p2_members
+    ]
+    payload["log"] = "\n".join(
+        (*preview, f"|showteam|p2|{json.dumps(entries, separators=(',', ':'))}", *body.splitlines())
+    )
+    return payload
+
+
+_ZOROARK_TEAM = (
+    ("Bulbasaur", "Overgrow"),
+    ("Zoroark", "Illusion"),
+    ("Squirtle", "Torrent"),
+    ("Ivysaur", "Overgrow"),
+    ("Charmeleon", "Blaze"),
+    ("Wartortle", "Torrent"),
+)
+_LEADS = "|\n|switch|p1a: Pikachu|Pikachu, L50|100/100\n|switch|p1b: Eevee|Eevee, L50|100/100\n"
+_PROTECT_TURN = "|\n|move|p1a: Pikachu|Protect|p1a: Pikachu\n|move|p1b: Eevee|Protect|p1b: Eevee\n"
+
+
+def _turn_view(perspective: Any, turn: int) -> Any:
+    return next(item.view for item in perspective.snapshots if item.view.turn == turn)
+
+
+class TestIllusionRoster:
+    def test_a_copied_pokemon_counts_as_seen_and_the_owner_sees_its_illusion_user(self) -> None:
+        # Zoroark leads looking like Wartortle and uses Night Daze, which Wartortle lacks.
+        payload = _illusion_payload(
+            _ZOROARK_TEAM,
+            _LEADS + "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100\n"
+            "|switch|p2b: Wartortle|Wartortle, L50|100/100\n"
+            "|turn|1\n" + _PROTECT_TURN + "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+            "|move|p2b: Wartortle|Night Daze|p1a: Pikachu\n"
+            "|-activate|p1a: Pikachu|move: Protect\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|2\n"
+            "|\n"
+            "|switch|p2b: Squirtle|Squirtle, L50|100/100\n"
+            "|move|p1a: Pikachu|Tackle|p2a: Bulbasaur\n"
+            "|-damage|p2a: Bulbasaur|90/100\n"
+            "|move|p1b: Eevee|Tackle|p2a: Bulbasaur\n"
+            "|-damage|p2a: Bulbasaur|80/100\n"
+            "|move|p2a: Bulbasaur|Tackle|p1a: Pikachu\n"
+            "|-damage|p1a: Pikachu|90/100\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|3\n" + _PROTECT_TURN + "|\n"
+            "|win|Alice",
+        )
+
+        opponent, owner = compile_payloads((payload,)).accepted_series[0].games[0].perspectives
+
+        # Live tracking files the disguise under Wartortle, so Wartortle counts as seen.
+        seen = {mon.species: mon.revealed for mon in _turn_view(opponent, 3).opponent_team.values()}
+        assert seen["Wartortle"] is True
+        assert seen["Zoroark"] is False
+        known = {mon.species: mon.revealed for mon in _turn_view(owner, 3).team.values()}
+        assert known["Zoroark"] is True
+
+    def test_a_revealed_illusion_user_stays_seen_when_it_returns_disguised(self) -> None:
+        payload = _illusion_payload(
+            _ZOROARK_TEAM,
+            _LEADS + "|switch|p2a: Bulbasaur|Bulbasaur, L50|100/100\n"
+            "|switch|p2b: Wartortle|Wartortle, L50|100/100\n"
+            "|turn|1\n"
+            "|\n"
+            "|move|p1a: Pikachu|Tackle|p2b: Wartortle\n"
+            "|-damage|p2b: Wartortle|90/100\n"
+            "|replace|p2b: Zoroark|Zoroark, L50\n"
+            "|-end|p2b: Zoroark|Illusion\n"
+            "|move|p1b: Eevee|Protect|p1b: Eevee\n"
+            "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+            "|move|p2b: Zoroark|Protect|p2b: Zoroark\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|2\n"
+            "|\n"
+            "|switch|p2b: Squirtle|Squirtle, L50|100/100\n"
+            "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+            "|move|p1b: Eevee|Protect|p1b: Eevee\n"
+            "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|3\n"
+            "|\n"
+            "|switch|p2b: Wartortle|Wartortle, L50|90/100\n"
+            "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+            "|move|p1b: Eevee|Protect|p1b: Eevee\n"
+            "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|4\n" + _PROTECT_TURN + "|\n"
+            "|win|Alice",
+        )
+
+        opponent, _ = compile_payloads((payload,)).accepted_series[0].games[0].perspectives
+
+        view = _turn_view(opponent, 4)
+        disguise = view.opponent_active_pokemon[1]
+        assert disguise is not None and disguise.identity_uncertain
+        zoroark = next(mon for mon in view.opponent_team.values() if mon.species == "Zoroark")
+        assert zoroark.revealed
+        observation = ObservationBuilder(default_runtime_resources()).build(view)
+        # Bench rows in sheet order: Zoroark and Squirtle were seen, Ivysaur and Charmeleon not.
+        assert observation.categorical[6:12, CAT_IDX_PRESENCE_STATUS].tolist() == [
+            PresenceStatus.ACTIVE,
+            PresenceStatus.ACTIVE,
+            PresenceStatus.BENCH_REVEALED,
+            PresenceStatus.BENCH_REVEALED,
+            PresenceStatus.RESERVE_UNCONFIRMED,
+            PresenceStatus.RESERVE_UNCONFIRMED,
+        ]
+
+    def test_a_disguise_fainting_beside_the_pokemon_it_copies_stays_unseen(self) -> None:
+        # The second Wartortle uses Night Daze, so it is the disguise, and Life Orb recoil
+        # makes it faint without a reveal while the real Wartortle stands beside it.
+        payload = _illusion_payload(
+            _ZOROARK_TEAM,
+            _LEADS + "|switch|p2a: Wartortle|Wartortle, L50|100/100\n"
+            "|switch|p2b: Bulbasaur|Bulbasaur, L50|100/100\n"
+            "|turn|1\n"
+            "|\n"
+            "|switch|p2b: Wartortle|Wartortle, L50|100/100\n"
+            "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+            "|move|p1b: Eevee|Protect|p1b: Eevee\n"
+            "|move|p2a: Wartortle|Protect|p2a: Wartortle\n"
+            "|move|p2b: Wartortle|Night Daze|p1a: Pikachu\n"
+            "|-activate|p1a: Pikachu|move: Protect\n"
+            "|-damage|p2b: Wartortle|0 fnt|[from] item: Life Orb\n"
+            "|faint|p2b: Wartortle\n"
+            "|\n"
+            "|upkeep\n"
+            "|\n"
+            "|switch|p2b: Bulbasaur|Bulbasaur, L50|100/100\n"
+            "|turn|2\n"
+            "|\n"
+            "|switch|p2a: Squirtle|Squirtle, L50|100/100\n"
+            "|move|p1a: Pikachu|Tackle|p2b: Bulbasaur\n"
+            "|-damage|p2b: Bulbasaur|90/100\n"
+            "|move|p1b: Eevee|Tackle|p2b: Bulbasaur\n"
+            "|-damage|p2b: Bulbasaur|80/100\n"
+            "|move|p2b: Bulbasaur|Protect|p2b: Bulbasaur\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|3\n"
+            "|\n"
+            "|switch|p2a: Wartortle|Wartortle, L50|100/100\n"
+            "|move|p1a: Pikachu|Tackle|p2b: Bulbasaur\n"
+            "|-damage|p2b: Bulbasaur|70/100\n"
+            "|move|p1b: Eevee|Tackle|p2b: Bulbasaur\n"
+            "|-damage|p2b: Bulbasaur|60/100\n"
+            "|move|p2b: Bulbasaur|Protect|p2b: Bulbasaur\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|4\n" + _PROTECT_TURN + "|\n"
+            "|win|Alice",
+        )
+
+        opponent, owner = compile_payloads((payload,)).accepted_series[0].games[0].perspectives
+
+        standing = _turn_view(opponent, 2).opponent_active_pokemon[0]
+        assert standing is not None and standing.species == "Wartortle"
+        assert not standing.fainted
+        # Live tracking never moves the faint onto Zoroark, even after Wartortle returns.
+        for turn in (2, 4):
+            fainted = {
+                mon.species: mon.fainted
+                for mon in _turn_view(opponent, turn).opponent_team.values()
+            }
+            assert fainted == dict.fromkeys(fainted, False)
+        known = {mon.species: mon.fainted for mon in _turn_view(owner, 4).team.values()}
+        assert known["Zoroark"] is True
+
+    def test_a_later_disguise_beside_a_changed_form_takes_the_team_entry(self) -> None:
+        # Aegislash turns to its Blade form, then a disguise of that form enters beside it.
+        payload = _illusion_payload(
+            (
+                ("Aegislash", "Stance Change"),
+                ("Zoroark", "Illusion"),
+                ("Squirtle", "Torrent"),
+                ("Ivysaur", "Overgrow"),
+                ("Charmeleon", "Blaze"),
+                ("Wartortle", "Torrent"),
+            ),
+            _LEADS + "|switch|p2a: Aegislash|Aegislash, L50|100/100\n"
+            "|switch|p2b: Squirtle|Squirtle, L50|100/100\n"
+            "|turn|1\n" + _PROTECT_TURN + "|-formechange|p2a: Aegislash|Aegislash-Blade|"
+            "[from] ability: Stance Change\n"
+            "|move|p2a: Aegislash|Tackle|p1a: Pikachu\n"
+            "|-activate|p1a: Pikachu|move: Protect\n"
+            "|move|p2b: Squirtle|Protect|p2b: Squirtle\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|2\n"
+            "|\n"
+            "|switch|p2b: Aegislash|Aegislash-Blade, L50|100/100\n"
+            "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+            "|move|p1b: Eevee|Protect|p1b: Eevee\n"
+            "|move|p2a: Aegislash|Protect|p2a: Aegislash\n"
+            "|move|p2b: Aegislash|Night Daze|p1a: Pikachu\n"
+            "|-activate|p1a: Pikachu|move: Protect\n"
+            "|\n"
+            "|upkeep\n"
+            "|turn|3\n" + _PROTECT_TURN + "|\n"
+            "|win|Alice",
+        )
+
+        opponent, _ = compile_payloads((payload,)).accepted_series[0].games[0].perspectives
+
+        view = _turn_view(opponent, 3)
+        observation = ObservationBuilder(default_runtime_resources()).build(view)
+        # Live tracking gives the team entry to the later of two displays, so the
+        # disguise in the second slot carries Aegislash's roster index.
+        assert observation.numerical[6, NUM_IDX_ORIG_IDX_RATIO].item() == 0.0
+        assert observation.numerical[7, NUM_IDX_ORIG_IDX_RATIO].item() == pytest.approx(1 / 6)

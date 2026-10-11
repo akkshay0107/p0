@@ -915,6 +915,71 @@ class TestIllusionTracking:
         assert active[1] is not None and active[1].species == "ditto"
         assert not active[1].fainted
 
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_reveal_after_a_twin_fainted_means_the_real_pokemon_fainted(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-twin-faint", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", f"{role}a: Hatterene", "Hatterene, L50, F", "74/100"])
+        battle.parse_message(["", "switch", f"{role}b: Hatterene", "Hatterene, L50, F", "36/100"])
+        battle.parse_message(["", "faint", f"{role}b: Hatterene"])
+        battle.parse_message(["", "replace", f"{role}a: Zoroark", "Zoroark-Hisui, L50, M"])
+
+        team = battle.team if role == "p1" else battle.opponent_team
+        active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+        hatterenes = [mon for mon in team.values() if mon.species == "hatterene"]
+        assert [mon.fainted for mon in hatterenes] == [True]
+        assert active[0] is not None and active[0].species == "zoroarkhisui"
+
+    def test_off_field_target_named_by_its_base_species_is_its_team_sheet_entry(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-notarget", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "poke", "p2", "Zoroark-Hisui, L50, F", ""])
+        battle.parse_message(["", "poke", "p2", "Typhlosion-Hisui, L50, F", ""])
+        battle.apply_teambuilder_team(
+            "p2",
+            Teambuilder.parse_packed_team(
+                "Zoroark-Hisui||Falinksite|Illusion|Agility,Substitute|Modest||F|||50|]"
+                "Typhlosion-Hisui||Salamencite|Frisk|HyperBeam,Substitute|Impish||F|||50|"
+            ),
+            battle.teampreview_opponent_team,
+        )
+        battle.parse_message(["", "teamsize", "p1", "2"])
+        battle.parse_message(["", "teamsize", "p2", "2"])
+        battle.parse_message(["", "switch", "p1a: Grapploct", "Grapploct, L50, M", "158/158"])
+        battle.parse_message(
+            ["", "switch", "p2a: Typhlosion", "Typhlosion-Hisui, L50, F", "100/100"]
+        )
+        battle.parse_message(["", "faint", "p2a: Typhlosion"])
+        # The disguised Zoroark-Hisui fainted, and Showdown names it by its default nickname.
+        battle.parse_message(
+            ["", "move", "p1a: Grapploct", "Giga Impact", "p2: Zoroark", "[notarget]"]
+        )
+
+        assert len(battle.opponent_team) == 2
+        assert battle.get_pokemon("p2: Zoroark").species == "zoroarkhisui"
+
+    def test_disguise_entering_as_a_transformed_ditto_leaves_the_ditto_transformed(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-transform", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Beedrill", "Beedrill, L50, M", "100/100"])
+        battle.parse_message(["", "switch", "p2b: Ditto", "Ditto, L50", "100/100"])
+        battle.parse_message(["", "-transform", "p2b: Ditto", "p1a: Beedrill"])
+        # The disguise copies the name and the transformed look of the real Ditto.
+        battle.parse_message(["", "switch", "p2a: Ditto", "Beedrill, L50", "94/100"])
+
+        shown = battle_view(battle).opponent_active_pokemon
+        assert [mon.species for mon in shown] == ["beedrill", "beedrill"]
+        assert [(mon.type_1, mon.type_2) for mon in shown] == [
+            (PokemonType.BUG, PokemonType.POISON),
+            (PokemonType.BUG, PokemonType.POISON),
+        ]
+
     def test_request_places_the_disguised_own_illusion_user_in_its_slot(self) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("illusion-request", "Alice", logging.getLogger("test"), gen=9)
@@ -960,6 +1025,51 @@ class TestIllusionTracking:
         assert revealed is not None and revealed.species == "zoroark"
         assert revealed.boosts["atk"] == 1
         assert not battle.team["p1: Farigiraf"].active
+
+    def test_own_illusion_user_leading_from_the_first_party_slot_counts_as_seen(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-lead", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        party = (
+            ("p1: Zoroark", "Zoroark-Hisui, L50, M", "150/150"),
+            ("p1: Swalot", "Swalot, L50, F", "177/177"),
+            ("p1: Hawlucha", "Hawlucha, L50, M", "135/135"),
+        )
+        # Showdown flags the first two party positions active even at team preview.
+        battle.parse_request(
+            {
+                "teamPreview": True,
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [
+                        _request_pokemon(ident, details, condition, index < 2)
+                        for index, (ident, details, condition) in enumerate(party)
+                    ],
+                },
+                "rqid": 1,
+            }
+        )
+        battle.parse_message(["", "switch", "p1a: Hawlucha", "Hawlucha, L50, M", "150/150"])
+        battle.parse_message(["", "switch", "p1b: Swalot", "Swalot, L50, F", "177/177"])
+        battle.parse_request(
+            {
+                "active": [{"moves": []}, {"moves": []}],
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [
+                        _request_pokemon(ident, details, condition, index < 2)
+                        for index, (ident, details, condition) in enumerate(party)
+                    ],
+                },
+                "rqid": 2,
+            }
+        )
+
+        assert battle.active_pokemon[0] is battle.team["p1: Zoroark"]
+        assert battle.team["p1: Zoroark"].revealed
 
     def test_request_keeps_the_real_own_pokemon_beside_its_disguise(self) -> None:
         poke_env_patches.install()

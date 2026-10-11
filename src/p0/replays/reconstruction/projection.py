@@ -103,6 +103,7 @@ class ReplayPokemonView:
     _moves: Mapping[str, ReplayMoveView]
     _effects: Mapping[ReplayNamedValue, int]
     _transformed: bool
+    _revealed: bool
     _boosts: Mapping[str, int] = field(default_factory=_FrozenMapping, repr=False, compare=False)
     identity_uncertain: bool = False
 
@@ -179,7 +180,7 @@ class ReplayPokemonView:
 
     @property
     def revealed(self) -> bool:
-        return self.state.revealed
+        return self._revealed
 
     @property
     def selected_in_teampreview(self) -> bool | None:
@@ -286,6 +287,11 @@ class ProjectedPerspective:
     final_view: ReplayBattleView
 
 
+def _base_species_id(species: str) -> str:
+    entry = _species_entries()[normalize_showdown_id(species)]
+    return normalize_showdown_id(entry["baseSpecies"])
+
+
 @cache
 def _species_entries() -> dict[str, Mapping[str, Any]]:
     """Index dex species by id, cosmetic alias, and forme name."""
@@ -361,6 +367,7 @@ def _pokemon_view(
     perspective: int,
     active: bool,
 ) -> ReplayPokemonView:
+    own = perspective == member.member_id.side.side_index
     transform = member.transform
     moves = transform.moves if transform is not None else member.moves
     move_views = _FrozenMapping({move.move_id: _move_view(move) for move in moves})
@@ -370,10 +377,8 @@ def _pokemon_view(
         ability = transform.ability
     else:
         base_stats = member.base_stats
-        own_or_public = (
-            perspective == member.member_id.side.side_index or not active or member.revealed
-        )
-        species = member.current_form if own_or_public else member.displayed_species
+        disguised = active and not own and _disguised(member)
+        species = member.displayed_species if disguised else member.current_form
         base_species = member.original_species
         ability = member.ability.current
     effects = _FrozenMapping(
@@ -382,7 +387,7 @@ def _pokemon_view(
     return ReplayPokemonView(
         member.member_id,
         member,
-        member.member_id.side.side_index != perspective,
+        not own,
         active,
         species,
         base_species,
@@ -392,8 +397,14 @@ def _pokemon_view(
         move_views,
         effects,
         transform is not None,
+        # The owner also knows its Illusion user entered while disguised.
+        member.revealed or (own and member.selected is True),
         _boosts=_FrozenMapping(member.boosts),
     )
+
+
+def _disguised(member: ReplayPokemonState) -> bool:
+    return any(name == "illusion" for name, _ in member.effects)
 
 
 def _mask_hidden_illusion(
@@ -420,7 +431,7 @@ def _mask_hidden_illusion(
         member_id
         for member_id in active_ids
         if member_id is not None
-        and not (member := state.member(member_id)).revealed
+        and _disguised(member := state.member(member_id))
         and normalize_showdown_id(member.displayed_species)
         != normalize_showdown_id(member.current_form)
     )
@@ -435,17 +446,25 @@ def _mask_hidden_illusion(
     for member_id in hidden:
         member = state.member(member_id)
         displayed_id = normalize_showdown_id(member.displayed_species)
+        # The copied Pokemon may have changed form since the sheet was shown.
+        displayed_base = _base_species_id(displayed_id)
         candidate = next(
             (
                 ots_member
                 for ots_member in ots[opponent].members
-                if normalize_showdown_id(ots_member.species) == displayed_id
-                and ots_member.member_id not in assigned
+                if _base_species_id(ots_member.species) == displayed_base
                 and ots_member.member_id not in hidden_ids
-                and not state.member(ots_member.member_id).revealed
             ),
             None,
         )
+        # Beside the Pokemon it copies, the disguise takes the team entry only if it
+        # entered later. Live tracking does the same, so neither display marks the fake.
+        if (
+            candidate is not None
+            and candidate.member_id in assigned
+            and state.member(candidate.member_id).entered_line > member.entered_line
+        ):
+            candidate = None
         displayed_species = species_index.get(displayed_id)
         if displayed_species is None:
             raise ValueError("Illusion display species is absent from the pinned dex")
@@ -519,7 +538,6 @@ def _mask_hidden_illusion(
             effect_sources=(),
             perish_count=None,
             transform=None,
-            revealed=False,
             selected=None,
             fainted=False,
             active_turns=0,
@@ -534,12 +552,40 @@ def _mask_hidden_illusion(
             identity_uncertain=True,
         )
         if candidate is not None:
+            if candidate.member_id in assigned:
+                active_overrides[candidate.member_id] = views[candidate.member_id]
             views[candidate.member_id] = displayed_view
             assigned.add(candidate.member_id)
         views[member_id] = _pokemon_view(static_state, perspective=perspective, active=False)
         active_overrides[member_id] = displayed_view
 
     return active_overrides
+
+
+def _show_disguised_faints(
+    state: ReplayBattleState,
+    perspective: int,
+    views: dict[ReplayMemberId, ReplayPokemonView],
+) -> None:
+    """
+    Show an unrevealed Illusion user's faint on the Pokemon it looked like.
+
+    The opponent saw the disguise faint and learns otherwise only when that Pokemon
+    enters again, which is also when live tracking corrects itself. A disguise that
+    fainted beside the Pokemon it looked like stays hidden for the rest of the game.
+    """
+    for member in state.members:
+        if member.member_id.side.side_index == perspective:
+            continue
+        if member.faint_unseen:
+            unseen = replace(member, hp_fraction=None, fainted=False)
+            views[member.member_id] = _pokemon_view(unseen, perspective=perspective, active=False)
+        if member.disguised_faint is None:
+            continue
+        shown = replace(member, hp_fraction=0.0, status=None, fainted=True)
+        hidden = replace(state.member(member.disguised_faint), hp_fraction=None, fainted=False)
+        views[shown.member_id] = _pokemon_view(shown, perspective=perspective, active=False)
+        views[hidden.member_id] = _pokemon_view(hidden, perspective=perspective, active=False)
 
 
 def _named_mapping(values: Iterable[tuple[str, int]]) -> Mapping[ReplayNamedValue, int]:
@@ -575,6 +621,7 @@ def project_battle_view(
             view = view_cache[key] = _pokemon_view(member, perspective=perspective, active=key[1])
         views[member.member_id] = view
     active_overrides = _mask_hidden_illusion(state, ots, perspective, views)
+    _show_disguised_faints(state, perspective, views)
     teams = tuple(
         _FrozenMapping(
             {
