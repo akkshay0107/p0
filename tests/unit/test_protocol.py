@@ -159,6 +159,18 @@ class TestReplayInputContract:
         }
         assert len(compile_payloads((trailing_display,)).accepted_series[0].games) == 1
 
+    def test_terminal_result_accepts_the_rest_of_the_action_that_ended_the_battle(self) -> None:
+        payload = sample_replay_payload("input-trailing-action")
+        # Showdown ends Attract on the winner once its source fainted, after the win line.
+        trailing_action = {
+            **payload,
+            "log": f"{payload['log']}\n|-end|p2a: Bulbasaur|Attract|[silent]",
+        }
+
+        document = parse_replay_payload(trailing_action)
+
+        assert document.outcome == parse_replay_payload(payload).outcome
+
     def test_player_names_that_normalize_to_same_identity_are_rejected(self) -> None:
         invalid = sample_replay_payload("input-colliding-players", players=("Alice", "A lice"))
         with pytest.raises(ReplayInputContractError, match="distinct players"):

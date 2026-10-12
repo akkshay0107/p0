@@ -364,3 +364,111 @@ class TestForcedMoves:
         assert evidence.label_kind is LabelKind.EXACT
         # Pikachu was in the first slot when it was asked, so the forced action is there.
         assert evidence.candidates == ((48, 9),)
+
+    def test_targets_after_ally_switch_are_coded_for_the_slot_held_at_the_request(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Ally Switch"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n|move|p1b: Eevee|Tackle|p2b: Charmander",
+                "|move|p1b: Eevee|Ally Switch|p1b: Eevee\n"
+                "|swap|p1b: Eevee|0|[from] move: Ally Switch\n"
+                "|move|p1b: Pikachu|Tackle|p2a: Bulbasaur",
+            )
+        )
+
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        # Pikachu chose Tackle (move slot 1) from the first slot, where its ally is target -2:
+        # 7 + 1 * 5 + (-2 + 2) = 12. The other two candidates are the opposing slots.
+        assert result.decisions[-1].evidence.candidates == ((12, 9), (15, 9), (16, 9))
+
+
+class TestReviveDecisions:
+    def test_revive_from_the_bench_is_the_user_slot_choosing_the_fainted_member(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Pikachu","name":"Pikachu","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Pikachu","name":"Pikachu","ability":"Static",'
+                '"moves":["Revival Blessing","Tackle"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+                "|move|p1b: Eevee|Tackle|p2b: Charmander\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n",
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n"
+                "|-damage|p1b: Eevee|0 fnt\n"
+                "|faint|p1b: Eevee\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|upkeep\n"
+                "|\n"
+                "|switch|p1b: Raichu|Raichu, L50|100/100\n"
+                "|turn|2\n"
+                "|\n"
+                "|move|p1a: Pikachu|Revival Blessing|p1a: Pikachu\n"
+                "|\n"
+                "|-heal|p1: Eevee|50/100|[from] move: Revival Blessing\n"
+                "|move|p1b: Raichu|Tackle|p2a: Bulbasaur\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n",
+            )
+        )
+        lines = str(payload["log"]).splitlines()
+        revive_request = lines.index("|-heal|p1: Eevee|50/100|[from] move: Revival Blessing") - 1
+
+        perspective = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        decision = next(
+            decision
+            for decision in perspective.decisions
+            if decision.pre_line_index == revive_request
+        )
+        assert decision.decision_type is DecisionType.FORCED_SWITCH
+        assert decision.evidence.label_kind is LabelKind.EXACT
+        # Pikachu in the first slot revives Eevee (roster index 1): 1 + 1 = 2. Raichu's
+        # Tackle answered the turn request, so the second slot passes.
+        assert decision.evidence.candidates == ((2, 0),)
+
+    def test_revive_into_its_own_empty_slot_is_not_a_switch_choice(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Pikachu","name":"Pikachu","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Pikachu","name":"Pikachu","ability":"Static",'
+                '"moves":["Revival Blessing","Tackle"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+                "|move|p1b: Eevee|Tackle|p2b: Charmander\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n",
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n"
+                "|-damage|p1b: Eevee|0 fnt\n"
+                "|faint|p1b: Eevee\n"
+                "|move|p1a: Pikachu|Revival Blessing|p1a: Pikachu\n"
+                "|\n"
+                "|-heal|p1: Eevee|50/100|[from] move: Revival Blessing\n"
+                "|switch|p1b: Eevee|Eevee, L50|50/100\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n",
+            )
+        )
+        lines = str(payload["log"]).splitlines()
+        revive_request = lines.index("|-heal|p1: Eevee|50/100|[from] move: Revival Blessing") - 1
+
+        perspective = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        decision = next(
+            decision
+            for decision in perspective.decisions
+            if decision.pre_line_index == revive_request
+        )
+        assert decision.evidence.label_kind is LabelKind.EXACT
+        # Showdown sends Eevee back into the second slot by itself; only Pikachu chose.
+        assert decision.evidence.candidates == ((2, 0),)

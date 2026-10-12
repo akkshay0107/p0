@@ -60,6 +60,7 @@ PIVOT_MOVES = frozenset(
 SLOT_CONDITION_MOVES = frozenset(
     move["id"] for move in _LEGAL_MOVES if move.get("slotCondition") and not move.get("selfSwitch")
 )
+REVIVAL_BLESSING = "revivalblessing"
 ALLOWED_CAUSE_NAMESPACES = frozenset(
     {"move", "ability", "item", "condition", "status", "pokemon", "format", "gem"}
 )

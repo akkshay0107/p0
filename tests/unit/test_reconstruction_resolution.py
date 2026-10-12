@@ -274,3 +274,79 @@ class TestIllusionEvidence:
         result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
 
         assert result.diagnostics[0].reason == _SEVERAL_ASSIGNMENTS
+
+
+class TestRevivedMemberEntry:
+    def test_member_revived_by_revival_blessing_enters_again(self) -> None:
+        events = _events(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|faint|p1a: Alpha",
+            "|-heal|p1: Alpha|50/100|[from] move: Revival Blessing",
+            "|switch|p1a: Alpha|Alpha, L50|50/100",
+        )
+        ots = (
+            _ots(ReplaySide.P1, ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")),
+            _PLAIN_SIDE,
+        )
+
+        resolved = resolve_protocol_events("resolution-test", ots, events).require_accepted()
+
+        assert resolved[2].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+        assert resolved[3].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+
+    def test_revive_names_a_member_without_a_nickname_by_its_base_species(self) -> None:
+        # Showdown names Vivillon-Sandstorm "Vivillon" when it has no nickname.
+        events = _events(
+            "|switch|p1a: Vivillon|Vivillon-Sandstorm, L50|100/100",
+            "|faint|p1a: Vivillon",
+            "|-heal|p1: Vivillon|50/100|[from] move: Revival Blessing",
+            "|switch|p1a: Vivillon|Vivillon-Sandstorm, L50|50/100",
+        )
+        ots = (
+            _ots(
+                ReplaySide.P1,
+                ("Vivillon-Sandstorm", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"),
+            ),
+            _PLAIN_SIDE,
+        )
+
+        resolved = resolve_protocol_events("resolution-test", ots, events).require_accepted()
+
+        assert resolved[3].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P1, 0)
+
+    def test_revive_of_another_member_does_not_bring_back_the_fainted_one(self) -> None:
+        events = _events(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|faint|p1a: Alpha",
+            "|-heal|p1: Bravo|50/100|[from] move: Revival Blessing",
+            "|switch|p1a: Alpha|Alpha, L50|50/100",
+        )
+        ots = (
+            _ots(ReplaySide.P1, ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")),
+            _PLAIN_SIDE,
+        )
+
+        result = resolve_protocol_events("resolution-test", ots, events)
+
+        assert result.events == ()
+        # No member has Illusion, so the rejection does not blame Illusion.
+        assert result.diagnostics[0].reason == "active history has no valid roster assignment"
+
+    def test_revive_before_a_later_faint_does_not_bring_the_member_back(self) -> None:
+        events = _events(
+            "|switch|p1a: Alpha|Alpha, L50|100/100",
+            "|faint|p1a: Alpha",
+            "|-heal|p1: Alpha|50/100|[from] move: Revival Blessing",
+            "|switch|p1a: Alpha|Alpha, L50|50/100",
+            "|faint|p1a: Alpha",
+            "|switch|p1a: Alpha|Alpha, L50|50/100",
+        )
+        ots = (
+            _ots(ReplaySide.P1, ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")),
+            _PLAIN_SIDE,
+        )
+
+        result = resolve_protocol_events("resolution-test", ots, events)
+
+        assert result.events == ()
+        assert result.diagnostics[0].reason == "active history has no valid roster assignment"

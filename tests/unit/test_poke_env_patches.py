@@ -598,6 +598,21 @@ class TestPokeEnvPatches:
             assert receiver.effects[expected_effect] == expected_payload
             assert donor.effects[expected_effect] == expected_payload
 
+    def test_round_moved_up_by_round_spends_the_users_unrevealed_round(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("round-boost", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Espeon", "Espeon, L50, M", "100/100"])
+        battle.parse_message(["", "switch", "p2b: Politoed", "Politoed, L50, F", "100/100"])
+        battle.parse_message(["", "move", "p1a: Espeon", "Round", "p2b: Politoed"])
+        battle.parse_message(
+            ["", "move", "p2b: Politoed", "Round", "p1a: Espeon", "[from] move: Round"]
+        )
+
+        round_move = battle.opponent_team["p2: Politoed"].moves["round"]
+        assert round_move.current_pp == round_move.max_pp - 1
+
     def test_leppa_berry_uses_ripen_and_clamps_pp(self) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("leppa-ripen", "Alice", logging.getLogger("test"), gen=9)
@@ -1201,3 +1216,29 @@ class TestRoost:
         dragonite = battle.opponent_active_pokemon[0]
         assert dragonite is not None
         assert dragonite.types == [PokemonType.WATER]
+
+
+class TestReviveTracking:
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_revived_pokemon_is_unfainted_on_the_bench_and_can_return(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("revive-tracking", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", f"{role}a: Pawmot", "Pawmot, L50, M", "100/100"])
+        battle.parse_message(["", "switch", f"{role}b: Vivillon", "Vivillon, L50, F", "100/100"])
+        battle.parse_message(["", "faint", f"{role}b: Vivillon"])
+        battle.parse_message(["", "switch", f"{role}b: Raichu", "Raichu, L50, F", "100/100"])
+        vivillon = battle.get_pokemon(f"{role}: Vivillon")
+        assert vivillon.fainted
+
+        battle.parse_message(
+            ["", "-heal", f"{role}: Vivillon", "49/100", "[from] move: Revival Blessing"]
+        )
+
+        assert not vivillon.fainted
+        assert vivillon.current_hp == 49
+        battle.parse_message(["", "switch", f"{role}b: Vivillon", "Vivillon, L50, F", "49/100"])
+        active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+        assert active[1] is vivillon
+        assert not vivillon.fainted

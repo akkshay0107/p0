@@ -9,6 +9,7 @@ from typing import Iterable, Mapping, NamedTuple
 from p0.model.resources import default_runtime_resources
 from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
+from p0.replays.reconstruction.contract import REVIVAL_BLESSING
 from p0.replays.reconstruction.diagnostics import (
     ReplayEventDiagnostic,
     ReplayEventParseError,
@@ -115,6 +116,8 @@ class _HistoryScanner:
         self._last_occupant: dict[tuple[ReplaySide, int], int] = {}
         self._histories: list[_ActiveHistory] = []
         self._last_mover_id: int | None = None
+        # The protocol lines where Revival Blessing revived each member.
+        self.revive_lines: dict[ReplayMemberId, list[int]] = {}
         self.member_moves = {
             member.member_id: frozenset(normalize_showdown_id(move) for move in member.moves)
             for sheet in ots
@@ -252,6 +255,8 @@ class _HistoryScanner:
         reference = _event_reference(event)
         # A benched Pokémon is named without a slot and belongs to no active history.
         if reference.pokemon_ref.active_slot is None:
+            if event.cause is not None and event.cause.normalized == REVIVAL_BLESSING:
+                self._record_revive(event, reference.pokemon_ref)
             return
 
         history = self._active_history(event, reference)
@@ -264,6 +269,22 @@ class _HistoryScanner:
             and self._last_mover_id not in {None, history.history_id}
         ):
             history.took_hit = True
+
+    def _record_revive(self, event: ProtocolEvent, pokemon_ref: ProtocolPokemonReference) -> None:
+        # Fainting ends Illusion, so the revive names the fainted member itself.
+        name = normalize_showdown_id(pokemon_ref.displayed_name)
+        matches = tuple(
+            member.member_id
+            for member in self._members[pokemon_ref.side]
+            if name in _slotless_names(member, self._species_bases)
+        )
+        if len(matches) != 1:
+            raise _ResolutionError(
+                event,
+                f"revived Pokémon {pokemon_ref.displayed_name!r} resolved to "
+                f"{len(matches)} roster members",
+            )
+        self.revive_lines.setdefault(matches[0], []).append(event.line_index)
 
     def _active_history(
         self,
@@ -292,9 +313,11 @@ class _HistorySolver:
         histories: tuple[_ActiveHistory, ...],
         team_size: int,
         member_moves: Mapping[ReplayMemberId, frozenset[str]],
+        revive_lines: Mapping[ReplayMemberId, list[int]],
     ) -> None:
         self._histories = histories
         self._member_moves = member_moves
+        self._revive_lines = revive_lines
         self._histories_by_id = {history.history_id: history for history in histories}
         self._team_size = team_size
         self._assignments: dict[int, _HistoryCandidate] = {}
@@ -349,11 +372,16 @@ class _HistorySolver:
                 or previous_id == history.predecessor_history_id
             ) and previous_candidate.actual_member == candidate.actual_member:
                 return False
+            # A fainted member stays fainted unless Revival Blessing revived it since.
             if (
                 previous.faint_line_index is not None
                 and previous.faint_line_index < history.entry_event.line_index
                 and previous_candidate.actual_member
                 in {candidate.actual_member, candidate.displayed_member}
+                and not any(
+                    previous.faint_line_index < line < history.entry_event.line_index
+                    for line in self._revive_lines.get(previous_candidate.actual_member, ())
+                )
             ):
                 return False
             if previous_candidate.actual_member == candidate.actual_member:
@@ -423,6 +451,16 @@ def _species_base_index() -> Mapping[str, str]:
 def _base_species_id(species: str, species_bases: Mapping[str, str]) -> str:
     species_id = normalize_showdown_id(species)
     return species_bases.get(species_id, species_id)
+
+
+def _slotless_names(member: OTSMember, species_bases: Mapping[str, str]) -> set[str]:
+    """Return the names a slotless reference can use for a member."""
+    # A Pokemon with no nickname is named by its base species: Vivillon-Sandstorm is Vivillon.
+    return {
+        normalize_showdown_id(member.nickname),
+        normalize_showdown_id(member.species),
+        _base_species_id(member.species, species_bases),
+    }
 
 
 def _matching_members(
@@ -506,7 +544,7 @@ def _resolve_incoming_histories(
         if not side_histories:
             continue
         solutions = _HistorySolver(
-            side_histories, scanner.team_sizes[side], scanner.member_moves
+            side_histories, scanner.team_sizes[side], scanner.member_moves, scanner.revive_lines
         ).solve()
         if not solutions:
             impossible_reveal = next(
@@ -564,12 +602,7 @@ class _IdentityResolver:
         slotless_matches: dict[tuple[ReplaySide, str], set[ReplayMemberId]] = {}
         for side, members in self._members.items():
             for member in members:
-                keys = {
-                    normalize_showdown_id(member.nickname),
-                    normalize_showdown_id(member.species),
-                    _base_species_id(member.species, species_bases),
-                }
-                for key in keys:
+                for key in _slotless_names(member, species_bases):
                     if key:
                         slotless_matches.setdefault((side, key), set()).add(member.member_id)
         self._slotless_matches = {

@@ -200,6 +200,17 @@ class TestReconstructionEvents:
         assert event.classification is EventClassification.NO_STATE_CHANGE
         assert event.arguments == ("p2", "")
 
+    def test_round_moved_up_by_round_is_the_users_own_move(self) -> None:
+        boosted = parse_protocol_event(
+            "replay-1", _line("|move|p1b: Politoed|Round|p2b: Espeon|[from] move: Round")
+        )
+        called = parse_protocol_event(
+            "replay-1", _line("|move|p1b: Politoed|Round|p2b: Espeon|[from] move: Sleep Talk")
+        )
+
+        assert boosted.cause is None
+        assert called.cause is not None and called.cause.normalized == "sleeptalk"
+
     def test_event_parsing_extracts_effect_cause_and_annotated_pokemon_ref(self) -> None:
         event = parse_protocol_event(
             "replay-1",
@@ -611,26 +622,6 @@ class TestReconstructionEvents:
 
         assert result.events == ()
         assert result.diagnostics[0].reason.startswith("unresolved_illusion:")
-
-    def test_fainted_member_returning_without_illusion_is_not_blamed_on_illusion(self) -> None:
-        # A Pokemon revived by Revival Blessing enters again; no roster member has Illusion.
-        ots = (
-            _complete_ots(ReplaySide.P1, ("Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot")),
-            _test_ots()[1],
-        )
-        parsed = parse_protocol_events(
-            "revived-member",
-            (
-                _line("|switch|p1a: Alpha|Alpha, L50|100/100", index=0),
-                _line("|faint|p1a: Alpha", index=1),
-                _line("|switch|p1a: Alpha|Alpha, L50|50/100", index=2),
-            ),
-        )
-
-        result = resolve_protocol_events("revived-member", ots, parsed.events)
-
-        assert result.events == ()
-        assert result.diagnostics[0].reason == "active history has no valid roster assignment"
 
     def test_local_golden_replay_is_classified_once_without_rejections(self) -> None:
         document = parse_replay_payload(_GOLDEN_REPLAY.read_bytes())

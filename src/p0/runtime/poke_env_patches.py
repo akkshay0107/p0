@@ -324,7 +324,8 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
             if event_type in {"switch", "drag"}:
                 incoming = _ORIGINAL_GET_POKEMON(self, identifier, details=split_message[3])
                 if incoming.fainted:
-                    # A fainted Pokemon cannot return, so a disguised Illusion user fainted.
+                    # A fainted Pokemon returns only after a revive heal clears its faint,
+                    # so a disguised Illusion user fainted.
                     _faint_illusion_user(self, role)
                 other_slot = f"{role}{'b' if slot == 'a' else 'a'}"
                 if active_by_slot.get(other_slot) is incoming:
@@ -401,7 +402,15 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     if event_type == "-formechange" and len(split_message) >= 4:
         current = self.get_pokemon(split_message[2])
         baselines.setdefault(current, current.species)
+    round_user = None
+    if event_type == "move" and split_message[-1] == "[from] move: Round":
+        # Round moves later Round users up and names itself as the cause. poke-env reads
+        # that as a move Round called, so it neither reveals nor spends the user's Round.
+        round_user = self.get_pokemon(split_message[2])
+        round_user._add_move("round")
     result = _ORIGINAL_PARSE_MESSAGE(self, split_message)
+    if round_user is not None:
+        round_user.moves["round"].use()
     if event_type == "-transform" and len(split_message) >= 4:
         # poke-env copies the target's species types; Showdown copies its current types.
         target = self.get_pokemon(split_message[3])

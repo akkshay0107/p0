@@ -32,28 +32,10 @@ from p0.replays.schema import (
     ReplayOutcome,
 )
 
-_TRAILING_RESULT_TAGS = frozenset(
-    {
-        "",
-        "t:",
-        "message",
-        "-message",
-        "raw",
-        "html",
-        "uhtml",
-        "uhtmlchange",
-        "allowleave",
-        "inactive",
-        "inactiveoff",
-        "j",
-        "l",
-        "player",
-        "c",
-        "chat",
-        "c:",
-        "chatmsg",
-    }
-)
+# Lines showing that a battle went on after its result. Other lines may follow the
+# result: Showdown finishes the action that ended the battle (an Attract ending
+# once its source has fainted).
+_CONTINUATION_TAGS = frozenset({"win", "tie", "forfeit", "turn"})
 
 
 class ReplayParseError(ValueError):
@@ -436,7 +418,7 @@ def _outcome(metadata: ReplayMetadata, lines: tuple[ProtocolLine, ...]) -> Repla
         if len(line.parts) < 2:
             continue
         tag = line.parts[1]
-        if result_seen and tag not in _TRAILING_RESULT_TAGS:
+        if result_seen and tag in _CONTINUATION_TAGS:
             raise ReplayInputContractError(
                 f"Battle event after terminal result at index {line.index}"
             )

@@ -497,7 +497,8 @@ class _StateReducer:
             self._clear_battle_state(outgoing)
 
         member = self._member(member_id)
-        # A fainted Pokemon cannot return, so an earlier faint shown on it was a disguise.
+        # A fainted Pokemon returns only after a revive, which names the Pokemon itself,
+        # so an earlier faint shown on this member was a disguise.
         member.disguised_faint = None
         details_species = _details_species(resolved.event.arguments[1])
         details_data = self._species_data(details_species)

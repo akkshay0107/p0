@@ -299,6 +299,10 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
     if tag == "move" and len(arguments) >= 3 and arguments[2] == "null":
         arguments = (*arguments[:2], "", *arguments[3:])
     cause = _cause(arguments)
+    if tag == "move" and cause is not None and cause.normalized == "round":
+        # Round moves every later Round user up and names itself as the cause, but each
+        # still uses its own chosen Round.
+        cause = None
 
     if line.raw == "|":
         return ProtocolEvent(

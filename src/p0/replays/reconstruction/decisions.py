@@ -25,7 +25,7 @@ from p0.replays.evidence import (
 )
 from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
-from p0.replays.reconstruction.contract import PIVOT_MOVES
+from p0.replays.reconstruction.contract import PIVOT_MOVES, REVIVAL_BLESSING
 from p0.replays.reconstruction.events import EventClassification
 from p0.replays.reconstruction.resolution import (
     ResolvedPokemonRefArgument,
@@ -140,9 +140,29 @@ def _is_separator(event: ResolvedProtocolEvent) -> bool:
     return parsed.classification is EventClassification.BOUNDARY_SIGNAL and parsed.tag == ""
 
 
+def _is_revive(event: ResolvedProtocolEvent) -> bool:
+    """A revive heal is the answer to the switch request Revival Blessing opens."""
+    parsed = event.event
+    return (
+        parsed.tag == "-heal"
+        and parsed.cause is not None
+        and parsed.cause.normalized == REVIVAL_BLESSING
+    )
+
+
+def _reviving_slot(state: ReplayBattleState, perspective: int) -> int:
+    """Return the slot of the active Pokemon whose Revival Blessing opened the request."""
+    for slot, member_id in enumerate(state.sides[perspective].active):
+        if member_id is not None and state.member(member_id).last_move == REVIVAL_BLESSING:
+            return slot
+    raise ValueError(
+        f"Replay {state.replay_id!r} has a revive with no active Revival Blessing user"
+    )
+
+
 def _has_policy_action(event: ResolvedProtocolEvent) -> bool:
     parsed = event.event
-    if parsed.tag == "cant":
+    if parsed.tag == "cant" or _is_revive(event):
         return True
     if parsed.tag == "move":
         return parsed.cause is None
@@ -296,14 +316,14 @@ def _observed_move(
     state: ReplayBattleState,
     animation_targets: Mapping[tuple[ReplayMemberId, str], ResolvedPokemonRefArgument],
     mega_slots: set[tuple[ReplaySide, int]],
+    slot: int,
 ) -> ObservedAction:
     actor = _reference(event, 0)
     if actor is None or actor.member_id is None:
         return ObservedAction(tag="move_slot_or_target_unknown")
     member = state.member(actor.member_id)
     move_id = normalize_showdown_id(event.event.arguments[1])
-    slot = actor.pokemon_ref.active_slot
-    mega = slot is not None and (actor.pokemon_ref.side, slot) in mega_slots
+    mega = (actor.pokemon_ref.side, slot) in mega_slots
     if move_id == "struggle":
         action = MEGA_FORCED_ACTION if mega else FORCED_ACTION
         return ObservedAction(action, tag="forced_move")
@@ -322,8 +342,11 @@ def _observed_move(
         target_tag = "move_anim_target"
     else:
         target_tag = "move"
-    allowed_targets = _target_codes(move_target, slot or 0)
+    allowed_targets = _target_codes(move_target, slot)
     target_code = 0 if move_target in _SELF_TARGETS else _target_code(actor, target)
+    if target_code is not None and target_code < 0 and slot != actor.pokemon_ref.active_slot:
+        # The line names own-side slots after an Ally Switch swap; the order named them before.
+        target_code = -3 - target_code
     if target_code is not None and target_code not in allowed_targets:
         target_code = None
     if target_code is None:
@@ -361,6 +384,22 @@ def _observed_actions(
     hidden_disables = _opponent_imprison_active(state, perspective)
     for event in events:
         parsed = event.event
+        if _is_revive(event):
+            target = _reference(event, 0)
+            if (
+                target is not None
+                and target.member_id is not None
+                and target.member_id.side.side_index == perspective
+            ):
+                # Only the user's slot answers a revive request. The lines after it,
+                # including the revived member's own return to an empty slot, are
+                # the rest of the turn.
+                observed[_reviving_slot(state, perspective)] = ObservedAction(
+                    SWITCH_START + target.member_id.roster_index,
+                    tag="revive",
+                )
+                break
+            continue
         if (
             parsed.tag == "-start"
             and len(parsed.arguments) >= 2
@@ -424,7 +463,7 @@ def _observed_actions(
                 observed[slot] = ObservedAction(tag="multiple_moves_same_slot", exact=False)
                 tags.append("multiple_moves_same_slot")
                 continue
-            action = _observed_move(event, state, animation_targets, mega_slots)
+            action = _observed_move(event, state, animation_targets, mega_slots, slot)
             observed[slot] = action
             if action.tag and action.tag != "move":
                 tags.append(action.tag)
@@ -554,6 +593,26 @@ def build_decision_view(
         and not member.fainted
         and (not selection_complete or member.selected is True)
     )
+    # A revive request offers the fainted members to the Revival Blessing user's slot.
+    revive_slot = (
+        _reviving_slot(state, perspective)
+        if any(
+            _is_revive(event)
+            and (target := _reference(event, 0)) is not None
+            and target.pokemon_ref.side.side_index == perspective
+            for event in window_events
+        )
+        else None
+    )
+    fainted = (
+        ()
+        if revive_slot is None
+        else tuple(
+            member.member_id.roster_index
+            for member in state.members
+            if member.member_id.side.side_index == perspective and member.fainted
+        )
+    )
     # Struggle is hidden from the request while an opposing Imprison disables moves.
     struggle_is_forced = not _opponent_imprison_active(state, perspective)
     forced_slots = frozenset(
@@ -585,10 +644,13 @@ def build_decision_view(
         can_mega = member is not None and _can_mega(member, own_side.used_mega)
         slots.append(
             SlotDecision(
-                switch_slots=switches,
+                switch_slots=fainted if slot == revive_slot else switches,
                 move_targets=moves,
                 active=member is not None,
-                force_switch=member is None and bool(switches),
+                # A revive request asks only the user's slot to choose.
+                force_switch=slot == revive_slot
+                if revive_slot is not None
+                else member is None and bool(switches),
                 can_mega=can_mega,
                 forced_move=slot in forced_slots,
                 legality_known=False,

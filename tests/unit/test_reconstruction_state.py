@@ -636,6 +636,25 @@ class TestReconstructionState:
             "Steel",
         )
 
+    def test_round_moved_up_by_round_spends_the_users_pp(self) -> None:
+        sheets = (
+            _ots(ReplaySide.P1, _P1_SPECIES, moves=("Round",)),
+            _ots(ReplaySide.P2, _P2_SPECIES, moves=("Round",)),
+        )
+        events = _resolved(
+            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
+            "|switch|p2a: Audino|Audino, L50|100/100",
+            "|move|p2a: Audino|Round|p1a: Lopunny",
+            "|move|p1a: Lopunny|Round|p2a: Audino|[from] move: Round",
+            ots=sheets,
+        )
+
+        snapshots = reduce_replay_state("state-test", sheets, events).require_accepted()
+
+        for member_id in (ReplayMemberId(ReplaySide.P1, 0), ReplayMemberId(ReplaySide.P2, 0)):
+            (round_move,) = snapshots[-1].member(member_id).moves
+            assert (round_move.current_pp, round_move.max_pp) == (15, 16)
+
     def test_spread_move_uses_champions_pp_formula_and_each_pressure_target(self) -> None:
         p1 = _ots(
             ReplaySide.P1,
@@ -1813,3 +1832,34 @@ class TestReconstructionState:
         assert result.diagnostics[0].reason == "side condition 'reflect' ended before it started"
         with pytest.raises(ReplayEventParseError, match="ended before it started"):
             result.require_accepted()
+
+
+class TestReviveState:
+    def test_revive_unfaints_the_benched_member_at_the_healed_hp(self) -> None:
+        ots = (
+            _ots(ReplaySide.P1, _P1_SPECIES, moves=("Protect", "Revival Blessing")),
+            _ots(ReplaySide.P2, _P2_SPECIES),
+        )
+        events = _resolved(
+            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
+            "|switch|p1b: Snorlax|Snorlax, L50|100/100 par",
+            "|switch|p2a: Audino|Audino, L50|100/100",
+            "|move|p2a: Audino|Tackle|p1b: Snorlax",
+            "|-damage|p1b: Snorlax|0 fnt",
+            "|faint|p1b: Snorlax",
+            "|move|p1a: Lopunny|Revival Blessing|p1a: Lopunny",
+            "|-heal|p1: Snorlax|49/100|[from] move: Revival Blessing",
+            ots=ots,
+        )
+
+        snapshots = reduce_replay_state("state-test", ots, events).require_accepted()
+        snorlax_id = ReplayMemberId(ReplaySide.P1, 1)
+
+        assert snapshots[-2].member(snorlax_id).fainted
+        revived = snapshots[-1].member(snorlax_id)
+        assert not revived.fainted
+        assert revived.hp_fraction == pytest.approx(0.49)
+        # Fainting cleared the paralysis, and the revive does not bring it back.
+        assert revived.status is None
+        # The revive leaves Snorlax on the bench; its slot stays empty.
+        assert snapshots[-1].sides[0].active == (ReplayMemberId(ReplaySide.P1, 0), None)

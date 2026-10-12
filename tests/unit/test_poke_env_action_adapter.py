@@ -154,3 +154,36 @@ def _request_pokemon(
         "commanding": False,
         "reviving": False,
     }
+
+
+class TestReviveRequest:
+    def test_revive_request_offers_only_fainted_members_to_the_user_slot(self) -> None:
+        battle = DoubleBattle("revive-request", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(cast(list[str], "|player|p1|Alice|1".split("|")))
+        battle.parse_message(cast(list[str], "|player|p2|Bob|1".split("|")))
+        pawmot = _request_pokemon("p1: Pawmot", "Pawmot, L50, M", "120/150", ["revivalblessing"])
+        pawmot["reviving"] = True
+        raichu = _request_pokemon("p1: Raichu", "Raichu, L50, F", "130/130", ["thunderbolt"])
+        vivillon = _request_pokemon("p1: Vivillon", "Vivillon, L50, F", "0 fnt", ["hurricane"])
+        vivillon["active"] = False
+        pikachu = _request_pokemon("p1: Pikachu", "Pikachu, L50, F", "110/110", ["thunderbolt"])
+        pikachu["active"] = False
+        # Showdown's request after Pawmot's Revival Blessing asks only Pawmot's slot.
+        battle.parse_request(
+            {
+                "forceSwitch": [True, False],
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [pawmot, raichu, vivillon, pikachu],
+                },
+            }
+        )
+
+        # Vivillon is roster index 2, so its switch action is 1 + 2 = 3. Pikachu is
+        # healthy on the bench and is not offered; Raichu's slot can only pass.
+        assert legal_actions(decision_view(battle), 0) == (3,)
+        assert legal_actions(decision_view(battle), 1) == (0,)
+        order = action_to_order(np.array([3, 0], dtype=np.int64), battle)
+        # Showdown matches the name without regard to case.
+        assert order.message == "/choose switch Vivillon, pass"
