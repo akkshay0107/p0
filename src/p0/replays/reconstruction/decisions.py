@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import cache
 from typing import Iterable, Mapping
 
@@ -117,6 +117,8 @@ class DecisionReconstruction:
     player: int
     windows: tuple[DecisionWindow, ...]
     decisions: tuple[DecisionRecord, ...]
+    # The request each decision answered, in the same order.
+    views: tuple[DecisionView, ...]
 
 
 def _reference(
@@ -263,12 +265,6 @@ def _animation_targets(
     return targets
 
 
-def _move_states(member: ReplayPokemonState) -> tuple[MoveState, ...]:
-    if member.transform is not None:
-        return member.transform.moves
-    return member.moves
-
-
 def _target_code(
     actor: ResolvedPokemonRefArgument,
     target: ResolvedPokemonRefArgument | None,
@@ -312,15 +308,14 @@ def _observed_move(
         action = MEGA_FORCED_ACTION if mega else FORCED_ACTION
         return ObservedAction(action, tag="forced_move")
 
-    move_states = _move_states(member)
     move_slot = next(
-        (index for index, move in enumerate(move_states) if move.move_id == move_id),
+        (index for index, move in enumerate(member.moves) if move.move_id == move_id),
         None,
     )
     if move_slot is None:
         return ObservedAction(tag="move_slot_or_target_unknown")
 
-    move_target = _effective_move_target(member, move_states[move_slot])
+    move_target = _effective_move_target(member, member.moves[move_slot])
     target = _reference(event, 2)
     if target is None:
         target = animation_targets.get((actor.member_id, move_id))
@@ -584,8 +579,7 @@ def build_decision_view(
             ()
             if member is None
             else tuple(
-                _target_codes(_effective_move_target(member, move), slot)
-                for move in _move_states(member)
+                _target_codes(_effective_move_target(member, move), slot) for move in member.moves
             )
         )
         can_mega = member is not None and _can_mega(member, own_side.used_mega)
@@ -614,7 +608,8 @@ def _decision_for_window(
     perspective: int,
     max_candidates: int,
     animation_targets: Mapping[tuple[ReplayMemberId, str], ResolvedPokemonRefArgument],
-) -> DecisionRecord | None:
+    decision_index: int,
+) -> tuple[DecisionRecord, DecisionView] | None:
     window_events = events[window.start_line_index : window.end_line_index]
     if window.decision_type in {
         DecisionType.FORCED_SWITCH,
@@ -664,14 +659,15 @@ def _decision_for_window(
             unknown=unknown,
         )
     )
-    return DecisionRecord(
-        decision_index=0,
+    record = DecisionRecord(
+        decision_index=decision_index,
         player=perspective,
         decision_type=window.decision_type,
         pre_line_index=window.start_line_index,
         post_line_index=window.end_line_index,
         evidence=evidence,
     )
+    return record, view
 
 
 def reconstruct_decisions_from_trace(
@@ -701,10 +697,11 @@ def reconstruct_decisions_from_trace(
     snapshots_by_line = {snapshot.line_index: snapshot for snapshot in state.snapshots}
     animation_targets = _animation_targets(event_tuple)
     records: list[DecisionRecord] = []
+    views: list[DecisionView] = []
     for window in windows:
         if not window.is_policy_request:
             continue
-        record = _decision_for_window(
+        decision = _decision_for_window(
             window,
             event_tuple,
             snapshots_by_line,
@@ -712,16 +709,18 @@ def reconstruct_decisions_from_trace(
             perspective,
             max_candidates,
             animation_targets,
+            len(records),
         )
-        if record is not None:
-            records.append(record)
+        if decision is not None:
+            records.append(decision[0])
+            views.append(decision[1])
 
-    decisions = tuple(replace(record, decision_index=index) for index, record in enumerate(records))
     return DecisionReconstruction(
         document.metadata.replay_id,
         perspective,
         windows,
-        decisions,
+        tuple(records),
+        tuple(views),
     )
 
 

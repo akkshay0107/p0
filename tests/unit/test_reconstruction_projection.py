@@ -93,12 +93,16 @@ class TestReconstructionProjection:
                 document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
+        perspectives = project_replay_perspectives(document, replay_state, decisions)
         decision = next(
             item.view.decision for item in perspectives[0].snapshots if item.pre_line_index == 112
         )
-        first_view = project_battle_view(original, document.ots, perspective=0, decision=decision)
-        second_view = project_battle_view(changed, document.ots, perspective=0, decision=decision)
+        first_view = project_battle_view(
+            original, document.ots, perspective=0, decision=decision, view_cache={}
+        )
+        second_view = project_battle_view(
+            changed, document.ots, perspective=0, decision=decision, view_cache={}
+        )
         builder = ObservationBuilder(resources)
         first = builder.build(first_view)
         second = builder.build(second_view)
@@ -119,7 +123,7 @@ class TestReconstructionProjection:
                 document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
+        perspectives = project_replay_perspectives(document, replay_state, decisions)
         perspective = perspectives[0]
         snapshot = next(
             snapshot
@@ -186,7 +190,7 @@ class TestReconstructionProjection:
                 document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
+        perspectives = project_replay_perspectives(document, replay_state, decisions)
         decision = next(
             item.view.decision for item in perspectives[0].snapshots if item.pre_line_index == 112
         )
@@ -196,6 +200,7 @@ class TestReconstructionProjection:
             document.ots,
             perspective=0,
             decision=decision,
+            view_cache={},
         )
 
         displayed = view.opponent_active_pokemon[0]
@@ -345,7 +350,7 @@ class TestReconstructionProjection:
                 document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
+        perspectives = project_replay_perspectives(document, replay_state, decisions)
         perspective = perspectives[0]
         boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
         oracle = DoubleBattle(
@@ -408,7 +413,7 @@ class TestSpatialEventIntervals:
                 document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
+        perspectives = project_replay_perspectives(document, replay_state, decisions)
         starts = [[snapshot.pre_line_index for snapshot in item.snapshots] for item in perspectives]
 
         spans_opponent_decision = 0
@@ -445,7 +450,7 @@ class TestSpatialEventIntervals:
                 document, replay_events, replay_state, perspective=1, windows=windows
             ),
         )
-        perspectives = project_replay_perspectives(document, replay_events, replay_state, decisions)
+        perspectives = project_replay_perspectives(document, replay_state, decisions)
 
         for perspective in perspectives:
             final_interval = raw_lines[perspective.snapshots[-1].pre_line_index :]

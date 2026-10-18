@@ -522,18 +522,11 @@ def _parse_request(
 
 def locked_choice(battle: DoubleBattle, message: str) -> str:
     """
-    Name a locked Pokemon's move by position in a choice.
+    Send each locked slot's move as "move 1" in a choice command.
 
     Showdown reads a move named by id in a locked request as single-target and rejects
     it without one, then ignores the target it was given. poke-env names moves by id
     and only works around this for recharge.
-
-    Arguments:
-      battle: battle whose latest request the choice answers.
-      message: choice command poke-env built.
-
-    Returns:
-      The command with each locked slot's move sent as "move 1".
     """
     if not message.startswith("/choose "):
         return message

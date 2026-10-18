@@ -18,7 +18,7 @@ class ProtocolPokemonReference:
 
 
 # The displayed name must contain a visible character.
-_ENDPOINT_PATTERN = re.compile(r"^(p[12])([a-d])?:\s*(\S.*)$")
+_ENDPOINT_PATTERN = re.compile(r"^(p[12])([ab])?:\s*(\S.*)$")
 
 
 def parse_protocol_pokemon_reference(value: str) -> ProtocolPokemonReference:
@@ -35,9 +35,7 @@ def parse_protocol_pokemon_reference(value: str) -> ProtocolPokemonReference:
 
 def looks_like_protocol_pokemon_reference(value: str) -> bool:
     """Return whether a value begins with a protocol side or active-slot prefix."""
-    return value.startswith(
-        ("p1:", "p2:", "p1a:", "p1b:", "p1c:", "p1d:", "p2a:", "p2b:", "p2c:", "p2d:")
-    )
+    return value.startswith(("p1:", "p2:", "p1a:", "p1b:", "p2a:", "p2b:"))
 
 
 __all__ = [

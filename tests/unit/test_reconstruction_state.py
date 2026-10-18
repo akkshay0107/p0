@@ -386,6 +386,19 @@ class TestReconstructionState:
             1.0,
         ]
 
+    def test_hp_before_holds_the_hp_each_damage_and_heal_line_started_from(self) -> None:
+        events = _resolved(
+            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
+            "|-damage|p1a: Lopunny|75/100|[from] item: Life Orb",
+            "|-sethp|p1a: Lopunny|80/100|[silent]",
+            "|-heal|p1a: Lopunny|100/100|[from] item: Leftovers",
+        )
+
+        state = reduce_replay_state("state-test", _complete_ots(), events, snapshot_line_indices=())
+
+        assert state.snapshots == ()
+        assert state.hp_before == {1: 1.0, 3: 0.8}
+
     def test_status_is_applied_before_it_is_cured(self) -> None:
         events = _resolved(
             "|switch|p1a: Lopunny|Lopunny, L50|100/100",
@@ -976,7 +989,9 @@ class TestReconstructionState:
             (),
             preview=False,
         )
-        view = project_battle_view(changed, _complete_ots(), perspective=0, decision=decision)
+        view = project_battle_view(
+            changed, _complete_ots(), perspective=0, decision=decision, view_cache={}
+        )
         assert view.active_pokemon[0] is not None
         assert tuple(value.name for value in view.active_pokemon[0].types) == ("Water",)
         assert snapshots[7].member(lopunny_id).transform is None

@@ -166,6 +166,7 @@ class ReplayPokemonState:
     current_types: tuple[str, ...]
     base_stats: tuple[tuple[str, int], ...]
     weight: float
+    # The move slots in use: a Transform's copied moves while it lasts.
     moves: tuple[MoveState, ...]
     boosts: tuple[tuple[str, int], ...]
     effects: tuple[tuple[str, int], ...]
@@ -217,15 +218,8 @@ class ReplayBattleState:
     team_sizes: tuple[int, int] = (4, 4)
 
     def member(self, member_id: ReplayMemberId) -> ReplayPokemonState:
-        """Return one member from its stable side and roster index."""
-        offset = member_id.side.side_index * 6 + member_id.roster_index
-        try:
-            member = self.members[offset]
-        except IndexError as exc:
-            raise KeyError(member_id) from exc
-        if member.member_id != member_id:
-            raise KeyError(member_id)
-        return member
+        """Return one member; members are stored in side order, then roster order."""
+        return self.members[member_id.side.side_index * 6 + member_id.roster_index]
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +229,8 @@ class ReconstructedReplayState:
     replay_id: str
     snapshots: tuple[ReplayBattleState, ...]
     diagnostics: tuple[ReplayEventDiagnostic, ...] = ()
+    # The HP fraction a -damage or -heal line's member had before that line, by line index.
+    hp_before: Mapping[int, float | None] = field(default_factory=dict)
 
     def require_accepted(self) -> tuple[ReplayBattleState, ...]:
         """Return snapshots or raise the structured whole-replay rejection."""
@@ -367,11 +363,12 @@ class _StateReducer:
         # Items that ended while their member held a different item, until the turn ends.
         self._unheld_item_ends: dict[ReplayMemberId, str] = {}
         self.slot_conditions: dict[tuple[ReplaySide, int, str], SlotConditionState] = {}
+        self.hp_before: dict[int, float | None] = {}
         # Most members do not change between snapshots. Projection reuses a member's
         # view while its snapshot is the same object.
         self._member_snapshots: dict[ReplayMemberId, ReplayPokemonState] = {}
-        # Members handed out by _member since the last snapshot.
-        self._touched: set[ReplayMemberId] = set()
+        # Members handed out by _member since the last snapshot; all of them before the first.
+        self._touched: set[ReplayMemberId] = set(self._members)
 
     def _member_from_ots(self, member: OTSMember) -> _MutablePokemon:
         species = self._species_data(member.species)
@@ -379,9 +376,7 @@ class _StateReducer:
             raise _StateTransitionError(
                 f"OTS member {member.member_id!r} has no recoverable base ability"
             )
-        moves = {
-            move.move_id: move for move in (self._move_from_name(name) for name in member.moves)
-        }
+        moves = {move.move_id: move for move in (_move_state(name) for name in member.moves)}
         return _MutablePokemon(
             member_id=member.member_id,
             nickname=member.nickname,
@@ -408,17 +403,6 @@ class _StateReducer:
             return self._species[normalize_showdown_id(name)]
         except KeyError as exc:
             raise _StateTransitionError(f"species {name!r} is absent from the pinned dex") from exc
-
-    def _move_from_name(self, name: str) -> MoveState:
-        move_id = normalize_showdown_id(name)
-        try:
-            data = self._moves[move_id]
-        except KeyError as exc:
-            raise _StateTransitionError(f"move {name!r} is absent from the pinned dex") from exc
-        max_pp = _maximum_pp(data, data["pp"])
-        return MoveState(
-            move_id, data["name"], data["type"], data["category"], data["target"], max_pp, max_pp
-        )
 
     def apply(self, resolved: ResolvedProtocolEvent) -> None:
         handler = _HANDLERS.get(resolved.event.tag)
@@ -866,6 +850,7 @@ class _StateReducer:
         hp_fraction, status = _parse_hp_status(resolved.event.arguments[1])
         if clear_status and status is not None:
             raise _StateTransitionError("Healing Wish heal must not retain a status")
+        self.hp_before[resolved.event.line_index] = member.hp_fraction
         member.hp_fraction = hp_fraction
         member.fainted = hp_fraction == 0.0
         if clear_status:
@@ -1472,24 +1457,15 @@ class _StateReducer:
         self._touched.add(member_id)
         return self._members[member_id]
 
-    def _member_snapshot(self, member_id: ReplayMemberId) -> ReplayPokemonState:
-        """Return the earlier snapshot object when the member did not change."""
-        previous = self._member_snapshots.get(member_id)
-        if previous is not None and member_id not in self._touched:
-            return previous
-        current = self._members[member_id].snapshot()
-        if previous is not None and current == previous:
-            return previous
-        self._member_snapshots[member_id] = current
-        return current
-
     def snapshot(self, line_index: int) -> ReplayBattleState:
+        for member_id in self._touched:
+            self._member_snapshots[member_id] = self._members[member_id].snapshot()
+        self._touched.clear()
         members = tuple(
-            self._member_snapshot(ReplayMemberId(side, roster_index))
+            self._member_snapshots[ReplayMemberId(side, roster_index)]
             for side in (ReplaySide.P1, ReplaySide.P2)
             for roster_index in range(6)
         )
-        self._touched.clear()
         sides = tuple(
             ReplaySideState(
                 side=side,
@@ -1616,11 +1592,18 @@ def _dex_indexes() -> tuple[
     return species, moves, legal_effects
 
 
-def _maximum_pp(data: Mapping[str, Any], base_pp: int) -> int:
-    if data.get("noPPBoosts"):
-        return base_pp
+def _move_state(name: str) -> MoveState:
+    """Return the full-PP move slot of a move name."""
+    move_id = normalize_showdown_id(name)
+    try:
+        data = _dex_indexes()[1][move_id]
+    except KeyError as exc:
+        raise _StateTransitionError(f"move {name!r} is absent from the pinned dex") from exc
     # The Champions mod uses the integer base-PP quotient before multiplying.
-    return (base_pp // 5 + 1) * 4
+    max_pp = data["pp"] if data.get("noPPBoosts") else (data["pp"] // 5 + 1) * 4
+    return MoveState(
+        move_id, data["name"], data["type"], data["category"], data["target"], max_pp, max_pp
+    )
 
 
 def _resolved_reference(
@@ -1739,7 +1722,7 @@ def reduce_replay_state(
                 snapshots.append(reducer.snapshot(resolved.event.line_index))
         except _StateTransitionError as exc:
             return ReconstructedReplayState(replay_id, (), (resolved.event.rejection(str(exc)),))
-    return ReconstructedReplayState(replay_id, tuple(snapshots))
+    return ReconstructedReplayState(replay_id, tuple(snapshots), hp_before=reducer.hp_before)
 
 
 __all__ = [

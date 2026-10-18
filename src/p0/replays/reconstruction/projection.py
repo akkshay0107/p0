@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from functools import cache
+from functools import cache, lru_cache
 from typing import Any, NamedTuple
 
 from p0.battle.events import EventRecord, SpatialEventRecorder
@@ -16,7 +16,6 @@ from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.decisions import (
     DecisionReconstruction,
     DecisionWindow,
-    build_decision_view,
 )
 from p0.replays.reconstruction.resolution import ResolvedProtocolEvent
 from p0.replays.reconstruction.state import (
@@ -26,13 +25,11 @@ from p0.replays.reconstruction.state import (
     ReplayBattleState,
     ReplayPokemonState,
     _dex_indexes,
-    _maximum_pp,
+    _move_state,
 )
 from p0.replays.schema import DecisionRecord, DecisionType, OTSData, ReplayDiagnostics
 from p0.teams.spread_usage import cosmetic_forme_aliases, load_spread_table_file
 from p0.teams.stat_points import BaseStats, calculate_stats
-
-_STAT_NAMES = ("hp", "atk", "def", "spa", "spd", "spe")
 
 
 def _enum_name(value: str) -> str:
@@ -287,11 +284,6 @@ class ProjectedPerspective:
     final_view: ReplayBattleView
 
 
-def _base_species_id(species: str) -> str:
-    entry = _species_entries()[normalize_showdown_id(species)]
-    return normalize_showdown_id(entry["baseSpecies"])
-
-
 @cache
 def _species_entries() -> dict[str, Mapping[str, Any]]:
     """Index dex species by id, cosmetic alias, and forme name."""
@@ -350,6 +342,8 @@ def impute_replay_stats(document: ReplayDocument) -> tuple[ReplayStatValue, ...]
     return tuple(estimates)
 
 
+# Move slots repeat across snapshots; most change only when their PP does.
+@lru_cache(maxsize=1 << 14)
 def _move_view(move: MoveState) -> ReplayMoveView:
     return ReplayMoveView(
         move.move_id,
@@ -369,8 +363,7 @@ def _pokemon_view(
 ) -> ReplayPokemonView:
     own = perspective == member.member_id.side.side_index
     transform = member.transform
-    moves = transform.moves if transform is not None else member.moves
-    move_views = _FrozenMapping({move.move_id: _move_view(move) for move in moves})
+    move_views = _FrozenMapping({move.move_id: _move_view(move) for move in member.moves})
     if transform is not None:
         base_stats = {**dict(member.base_stats), **dict(transform.non_hp_base_stats)}
         species = base_species = transform.species
@@ -438,21 +431,20 @@ def _mask_hidden_illusion(
     if not hidden:
         return {}
 
-    species_index = _species_entries()
-    _, move_index, _ = _dex_indexes()
+    species = _dex_indexes()[0]
     hidden_ids = set(hidden)
     assigned = {member_id for member_id in active_ids if member_id is not None} - hidden_ids
     active_overrides: dict[ReplayMemberId, ReplayPokemonView] = {}
     for member_id in hidden:
         member = state.member(member_id)
-        displayed_id = normalize_showdown_id(member.displayed_species)
         # The copied Pokemon may have changed form since the sheet was shown.
-        displayed_base = _base_species_id(displayed_id)
+        displayed = species[normalize_showdown_id(member.displayed_species)]
         candidate = next(
             (
                 ots_member
                 for ots_member in ots[opponent].members
-                if _base_species_id(ots_member.species) == displayed_base
+                if species[normalize_showdown_id(ots_member.species)].base_species
+                == displayed.base_species
                 and ots_member.member_id not in hidden_ids
             ),
             None,
@@ -465,30 +457,8 @@ def _mask_hidden_illusion(
             and state.member(candidate.member_id).entered_line > member.entered_line
         ):
             candidate = None
-        displayed_species = species_index.get(displayed_id)
-        if displayed_species is None:
-            raise ValueError("Illusion display species is absent from the pinned dex")
         true_sheet = ots[opponent].members[member_id.roster_index]
-        true_species = species_index.get(normalize_showdown_id(true_sheet.species))
-        if true_species is None:
-            raise ValueError("Illusion member species is absent from the pinned dex")
-
-        display_stats = tuple((k, int(displayed_species["baseStats"][k])) for k in _STAT_NAMES)
-        true_stats = tuple((k, int(true_species["baseStats"][k])) for k in _STAT_NAMES)
-        display_types = tuple(str(v) for v in displayed_species["types"])
-        true_types = tuple(str(v) for v in true_species["types"])
-        public_moves = tuple(
-            MoveState(
-                (m_id := normalize_showdown_id(name)),
-                str((data := move_index[m_id]).get("name", name)),
-                str(data["type"]),
-                str(data["category"]),
-                str(data["target"]),
-                (max_pp := _maximum_pp(data, int(data["pp"]))),
-                max_pp,
-            )
-            for name in true_sheet.moves
-        )
+        true_species = species[normalize_showdown_id(true_sheet.species)]
         public_effects = tuple(
             (name, count) for name, count in member.effects if name != "illusion"
         )
@@ -497,16 +467,16 @@ def _mask_hidden_illusion(
             member,
             member_id=member_id if candidate is None else candidate.member_id,
             nickname=member.displayed_species if candidate is None else candidate.nickname,
-            original_species=str(displayed_species.get("baseSpecies", member.displayed_species)),
+            original_species=displayed.base_species,
             current_form=member.displayed_species,
             displayed_species=member.displayed_species,
             nature="",
             item=None,
             ability=AbilityState("unknown"),
-            base_types=display_types,
-            current_types=display_types,
-            base_stats=display_stats,
-            weight=float(displayed_species["weightkg"]),
+            base_types=displayed.types,
+            current_types=displayed.types,
+            base_stats=displayed.base_stats,
+            weight=displayed.weight,
             moves=(),
             effects=public_effects,
             effect_variants=tuple(p for p in member.effect_variants if p[0] in public_effect_names),
@@ -519,19 +489,19 @@ def _mask_hidden_illusion(
         static_state = replace(
             member,
             nickname=true_sheet.nickname,
-            original_species=str(true_species.get("baseSpecies", true_sheet.species)),
+            original_species=true_species.base_species,
             current_form=true_sheet.species,
             displayed_species=true_sheet.species,
             nature=true_sheet.nature,
             hp_fraction=None,
             status=None,
             item=true_sheet.item,
-            ability=AbilityState(true_sheet.ability or member.ability.base),
-            base_types=true_types,
-            current_types=true_types,
-            base_stats=true_stats,
-            weight=float(true_species["weightkg"]),
-            moves=public_moves,
+            ability=AbilityState(true_sheet.ability),
+            base_types=true_species.types,
+            current_types=true_species.types,
+            base_stats=true_species.base_stats,
+            weight=true_species.weight,
+            moves=tuple(_move_state(name) for name in true_sheet.moves),
             boosts=tuple((name, 0) for name, _ in member.boosts),
             effects=(),
             effect_variants=(),
@@ -598,9 +568,9 @@ def project_battle_view(
     *,
     perspective: int,
     decision: DecisionView,
+    view_cache: dict[tuple[ReplayMemberId, bool], ReplayPokemonView],
     spatial_events: tuple[EventRecord, ...] = (),
     preview: bool = False,
-    view_cache: dict[tuple[ReplayMemberId, bool], ReplayPokemonView] | None = None,
 ) -> ReplayBattleView:
     """
     Project one immutable public snapshot into the observation-facing contract.
@@ -611,8 +581,6 @@ def project_battle_view(
     active_ids = {
         member_id for side in state.sides for member_id in side.active if member_id is not None
     }
-    if view_cache is None:
-        view_cache = {}
     views = {}
     for member in state.members:
         key = (member.member_id, member.member_id in active_ids)
@@ -688,25 +656,9 @@ def project_battle_view(
     )
 
 
-def _hp_before(
-    state: ReplayBattleState | None,
-    event: ResolvedProtocolEvent,
-) -> float | None:
-    if state is None:
-        return None
-    reference = next(
-        (reference for reference in event.pokemon_refs if reference.argument_index == 0),
-        None,
-    )
-    if reference is None or reference.member_id is None:
-        return None
-    return state.member(reference.member_id).hp_fraction
-
-
 def _spatial_records(
     document: ReplayDocument,
-    events: tuple[ResolvedProtocolEvent, ...],
-    state: Mapping[int, ReplayBattleState],
+    hp_before: Mapping[int, float | None],
     *,
     perspective: int,
     starts: tuple[int, ...],
@@ -717,12 +669,10 @@ def _spatial_records(
     cursor = 0
     for start in starts:
         for line_index in range(cursor, start):
-            event = events[line_index]
-            before = state.get(line_index - 1)
             recorder.apply_line(
                 document.protocol_lines[line_index].parts,
                 tokenizer,
-                lambda _identifier, before=before, event=event: _hp_before(before, event),
+                lambda _identifier, line_index=line_index: hp_before.get(line_index),
             )
         records[start] = recorder.consume()
         cursor = start
@@ -733,19 +683,14 @@ def _projection_snapshot_lines(
     events: tuple[ResolvedProtocolEvent, ...],
     windows: tuple[DecisionWindow, ...],
 ) -> frozenset[int]:
-    policy_windows = tuple(window for window in windows if window.is_policy_request)
     lines = {
         len(events) - 1,
         *(
             window.start_line_index
             if window.decision_type is DecisionType.TEAM_PREVIEW
             else window.start_line_index - 1
-            for window in policy_windows
-        ),
-        *(
-            event.event.line_index - 1
-            for event in events
-            if event.event.line_index > 0 and event.event.tag in {"-damage", "-heal"}
+            for window in windows
+            if window.is_policy_request
         ),
     }
     return frozenset(line for line in lines if line >= 0)
@@ -753,25 +698,19 @@ def _projection_snapshot_lines(
 
 def project_replay_perspectives(
     document: ReplayDocument,
-    events: Iterable[ResolvedProtocolEvent],
     state: ReconstructedReplayState,
     decisions: tuple[DecisionReconstruction, DecisionReconstruction],
 ) -> tuple[ProjectedPerspective, ProjectedPerspective]:
     """Build p1 and p2 views from one shared immutable trace."""
-    event_tuple = tuple(events)
     snapshots_by_line = {snapshot.line_index: snapshot for snapshot in state.snapshots}
-    window_by_bounds = {
-        (window.start_line_index, window.end_line_index): window for window in decisions[0].windows
-    }
     # Each player's interval closes only at that player's own decisions; a
     # waiting side keeps accumulating until it next chooses. The final interval
     # runs to the last line.
-    final_start = len(event_tuple)
+    final_start = len(document.protocol_lines)
     spatial = tuple(
         _spatial_records(
             document,
-            event_tuple,
-            snapshots_by_line,
+            state.hp_before,
             perspective=perspective,
             starts=(
                 *(decision.pre_line_index for decision in reconstruction.decisions),
@@ -785,22 +724,14 @@ def project_replay_perspectives(
     for perspective, reconstruction in enumerate(decisions):
         projected_snapshots: list[ProjectedSnapshot] = []
         view_cache: dict[tuple[ReplayMemberId, bool], ReplayPokemonView] = {}
-        for decision in reconstruction.decisions:
-            key = (decision.pre_line_index, decision.post_line_index)
-            window = window_by_bounds[key]
-            window_events = event_tuple[window.start_line_index : window.end_line_index]
+        for decision, decision_view in zip(
+            reconstruction.decisions, reconstruction.views, strict=True
+        ):
             preview = decision.decision_type is DecisionType.TEAM_PREVIEW
             if preview:
                 snapshot = snapshots_by_line[decision.pre_line_index]
             else:
                 snapshot = snapshots_by_line[decision.pre_line_index - 1]
-            decision_view = build_decision_view(
-                snapshot,
-                document.ots[perspective],
-                perspective,
-                window_events,
-                preview=preview,
-            )
             projected_snapshots.append(
                 ProjectedSnapshot(
                     decision.decision_index,

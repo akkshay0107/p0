@@ -9,29 +9,6 @@ from p0.replays.reconstruction.resolution import resolve_protocol_events
 from p0.replays.schema import OTSData, OTSMember, ProtocolLine
 
 
-def _ots(side: ReplaySide, names: tuple[str, ...]) -> OTSData:
-    return OTSData(
-        side,
-        "]".join(names),
-        tuple(
-            OTSMember(
-                ReplayMemberId(side, index),
-                name,
-                name,
-                "",
-                "Ability",
-                ("Protect",),
-                "Serious",
-                "",
-                50,
-                "",
-                name,
-            )
-            for index, name in enumerate(names)
-        ),
-    )
-
-
 def _sheet(side: ReplaySide, members: tuple[tuple[str, str, tuple[str, ...]], ...]) -> OTSData:
     """Build a team sheet from one (species, ability, moves) entry per member."""
     return OTSData(
@@ -54,6 +31,10 @@ def _sheet(side: ReplaySide, members: tuple[tuple[str, str, tuple[str, ...]], ..
             for index, (species, ability, moves) in enumerate(members)
         ),
     )
+
+
+def _ots(side: ReplaySide, names: tuple[str, ...]) -> OTSData:
+    return _sheet(side, tuple((name, "Ability", ("Protect",)) for name in names))
 
 
 _ILLUSION_SIDE = _sheet(

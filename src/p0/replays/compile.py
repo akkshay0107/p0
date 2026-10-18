@@ -709,12 +709,7 @@ def _compile_game(
         for perspective in (0, 1)
     )
 
-    perspectives = project_replay_perspectives(
-        document,
-        events,
-        state,
-        (decisions[0], decisions[1]),
-    )
+    perspectives = project_replay_perspectives(document, state, (decisions[0], decisions[1]))
     estimates = impute_replay_stats(document)
 
     return CompiledGame(
