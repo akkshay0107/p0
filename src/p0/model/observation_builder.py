@@ -552,17 +552,12 @@ def _pokemon_numeric_into(
     row[27] = pokemon.fainted
     row[28] = cond == 1
     row[29] = cond == 2
-    identity_uncertain = bool(getattr(pokemon, "identity_uncertain", False))
     row[NUM_IDX_CAN_MEGA] = (
         float(battle.can_mega_evolve[active_idx])
-        if active_idx is not None
-        and not identity_uncertain
-        and battle.decision.slots[active_idx].legality_known
+        if active_idx is not None and battle.decision.slots[active_idx].legality_known
         else 0.0
     )
     row[31] = _is_mega_form(pokemon)
-    if identity_uncertain:
-        row[NUM_IDX_LEGALITY_UNKNOWN] = 1.0
 
     last_move_id = None
     custom_last_move = battle.last_move(pokemon)

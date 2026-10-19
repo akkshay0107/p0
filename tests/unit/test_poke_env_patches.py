@@ -158,6 +158,38 @@ class TestPokeEnvPatches:
         assert transformed.species == "pikachu"
         assert transformed.base_species == "pikachu"
 
+    def test_transform_targets_a_pokemon_renamed_by_an_earlier_reveal(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("transform-reveal", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        for species in ("Ninetales-Alola", "Zoroark-Hisui"):
+            battle.get_pokemon(
+                f"p2: {species}",
+                request={
+                    "active": False,
+                    "baseAbility": "illusion" if species.startswith("Zoroark") else "snowwarning",
+                    "condition": "100/100",
+                    "details": f"{species}, L50",
+                    "ident": f"p2: {species}",
+                    "item": "",
+                    "moves": [],
+                },
+            )
+        battle.parse_message(["", "teamsize", "p1", "2"])
+        battle.parse_message(["", "teamsize", "p2", "2"])
+        battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
+        # Zoroark-Hisui leads looking like Ninetales and is revealed, then Ninetales enters.
+        battle.parse_message(["", "switch", "p2a: Ninetales", "Ninetales-Alola, L50", "100/100"])
+        battle.parse_message(["", "replace", "p2a: Zoroark", "Zoroark-Hisui, L50"])
+        battle.parse_message(["", "switch", "p2a: Ninetales", "Ninetales-Alola, L50", "100/100"])
+        battle.parse_message(["", "-transform", "p1a: Ditto", "p2a: Ninetales"])
+
+        transformed = battle_view(battle).active_pokemon[0]
+        assert isinstance(transformed, TransformedPokemonView)
+        assert transformed.species == "ninetalesalola"
+        assert len(battle.opponent_team) == 2
+
     def test_transform_keeps_the_form_copied_at_transform_time(self) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("transform-form", "Alice", logging.getLogger("test"), gen=9)
@@ -808,6 +840,47 @@ class TestLockedMoveChoice:
 
 
 class TestIllusionTracking:
+    def test_public_names_keep_targeting_the_own_disguise_after_a_private_request(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-slot-reference", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", "p1a: Weavile", "Weavile, L50", "100/100"])
+        battle.parse_message(["", "switch", "p1b: Eevee", "Eevee, L50", "100/100"])
+        battle.parse_message(["", "switch", "p2a: Pikachu", "Pikachu, L50", "100/100"])
+        weavile = _request_pokemon("p1: Weavile", "Weavile, L50", "100/100", False)
+        weavile.update(baseAbility="pressure", ability="pressure")
+        battle.parse_request(
+            {
+                "active": [{"moves": []}, {"moves": []}],
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [
+                        _request_pokemon("p1: Zoroark", "Zoroark, L50", "100/100", True),
+                        _request_pokemon("p1: Eevee", "Eevee, L50", "100/100", True),
+                        weavile,
+                    ],
+                },
+                "rqid": 1,
+            }
+        )
+
+        battle.parse_message(["", "move", "p2a: Pikachu", "Quick Attack", "p1a: Weavile"])
+        battle.parse_message(["", "-unboost", "p1a: Weavile", "atk", "1"])
+        battle.parse_message(["", "-item", "p1a: Weavile", "Life Orb"])
+
+        zoroark = battle.active_pokemon[0]
+        assert zoroark is not None and zoroark.species == "zoroark"
+        assert zoroark.boosts["atk"] == -1
+        assert zoroark.item == "lifeorb"
+        assert battle.team["p1: Weavile"].boosts["atk"] == 0
+        assert battle.team["p1: Weavile"].item != "lifeorb"
+        pikachu = battle.opponent_active_pokemon[0]
+        assert pikachu is not None
+        move = pikachu.moves["quickattack"]
+        assert move.current_pp == move.max_pp - 1
+
     @pytest.mark.parametrize("role", ("p1", "p2"))
     def test_real_pokemon_entering_beside_its_disguise_has_no_disguise_boosts(
         self, role: str
@@ -912,6 +985,129 @@ class TestIllusionTracking:
         assert corviknights == [active[1]]
 
     @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_display_fainting_in_another_form_leaves_the_active_display_as_its_team_entry(
+        self, role: str
+    ) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-forme-faint", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", f"{role}b: Morpeko", "Morpeko, L50, M", "100/100"])
+        battle.parse_message(["", "switch", f"{role}a: Morpeko", "Morpeko, L50, M", "38/100"])
+        battle.parse_message(
+            [
+                "",
+                "-formechange",
+                f"{role}a: Morpeko",
+                "Morpeko-Hangry",
+                "[from] ability: Hunger Switch",
+            ]
+        )
+        battle.parse_message(["", "faint", f"{role}a: Morpeko"])
+
+        team = battle.team if role == "p1" else battle.opponent_team
+        active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+        morpekos = [mon for mon in team.values() if mon.base_species == "morpeko"]
+        assert morpekos == [active[1]]
+        assert not morpekos[0].fainted
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_real_pokemon_returning_beside_its_disguise_keeps_its_changed_form(
+        self, role: str
+    ) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-busted", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", f"{role}a: Mimikyu", "Mimikyu, L50, M", "100/100"])
+        battle.parse_message(["", "switch", f"{role}b: Mimikyu", "Mimikyu, L50, M", "100/100"])
+        battle.parse_message(["", "detailschange", f"{role}b: Mimikyu", "Mimikyu-Busted, L50, M"])
+        battle.parse_message(["", "switch", f"{role}b: Glalie", "Glalie, L50, F", "100/100"])
+        battle.parse_message(
+            ["", "switch", f"{role}b: Mimikyu", "Mimikyu-Busted, L50, M", "84/100"]
+        )
+
+        active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+        assert active[0] is not None and active[0].species == "mimikyu"
+        assert active[1] is not None and active[1].species == "mimikyubusted"
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_ally_switch_moves_the_display_copy_with_its_slot(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-ally-switch", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        # Zoroark looks like Houndstone in slot b, then the real Houndstone enters slot a.
+        battle.parse_message(["", "switch", f"{role}b: Houndstone", "Houndstone, L50, F", "42/100"])
+        battle.parse_message(["", "switch", f"{role}a: Houndstone", "Houndstone, L50, F", "24/100"])
+        battle.parse_message(["", "swap", f"{role}a: Houndstone", "1", "[from] move: Ally Switch"])
+        battle.parse_message(["", "-damage", f"{role}a: Houndstone", "0 fnt"])
+        battle.parse_message(["", "replace", f"{role}a: Zoroark", "Zoroark-Hisui, L50, M"])
+        battle.parse_message(["", "faint", f"{role}a: Zoroark"])
+
+        team = battle.team if role == "p1" else battle.opponent_team
+        active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+        houndstones = [mon for mon in team.values() if mon.species == "houndstone"]
+        zoroarks = [mon for mon in team.values() if mon.species == "zoroarkhisui"]
+        assert houndstones == [active[1]]
+        assert not houndstones[0].fainted
+        assert [mon.fainted for mon in zoroarks] == [True]
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_disguise_of_a_transformed_ditto_leaves_the_ditto_species(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-ditto-copy", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", f"{role}a: Ditto", "Ditto, L50", "100/100"])
+        battle.parse_message(["", "switch", f"{role}b: Lapras", "Lapras, L50, F", "100/100"])
+        battle.parse_message(["", "switch", f"{role}b: Ditto", "Lapras, L50, F", "100/100"])
+
+        team = battle.team if role == "p1" else battle.opponent_team
+        assert [mon.species for mon in team.values() if mon.name == "Ditto"] == ["ditto"]
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_reveal_returns_the_team_entry_to_the_real_pokemon_that_left(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-hero", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        # Zoroark looks like Palafin in slot b; the real Palafin enters slot a and leaves.
+        battle.parse_message(["", "switch", f"{role}b: Palafin", "Palafin, L50, M", "100/100"])
+        battle.parse_message(["", "switch", f"{role}a: Palafin", "Palafin, L50, M", "100/100"])
+        battle.parse_message(["", "detailschange", f"{role}a: Palafin", "Palafin-Hero, L50, M"])
+        battle.parse_message(["", "switch", f"{role}a: Pinsir", "Pinsir, L50, F", "100/100"])
+        battle.parse_message(["", "replace", f"{role}b: Zoroark", "Zoroark-Hisui, L50, F"])
+
+        team = battle.team if role == "p1" else battle.opponent_team
+        palafins = [mon for mon in team.values() if mon.base_species == "palafin"]
+        assert [mon.species for mon in palafins] == ["palafinhero"]
+        assert not palafins[0].active
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_reveal_keeps_a_type_the_disguise_already_showed(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-trick", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", f"{role}a: Gourgeist", "Gourgeist, L50, M", "100/100"])
+        battle.parse_message(
+            [
+                "",
+                "-start",
+                f"{role}a: Gourgeist",
+                "typeadd",
+                "Ghost",
+                "[from] move: Trick-or-Treat",
+            ]
+        )
+        battle.parse_message(["", "replace", f"{role}a: Zoroark", "Zoroark, L50, M"])
+
+        active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+        assert active[0] is not None and active[0].species == "zoroark"
+        assert [type_.name for type_ in active[0].types] == ["DARK", "GHOST"]
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
     def test_fainted_display_returning_means_the_illusion_user_fainted(self, role: str) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("illusion-memento", "Alice", logging.getLogger("test"), gen=9)
@@ -931,6 +1127,23 @@ class TestIllusionTracking:
         assert not active[1].fainted
 
     @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_reveal_moves_the_disguise_type_change_to_the_illusion_user(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-reveal-soak", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.parse_message(["", "switch", f"{role}a: Ditto", "Ditto, L50", "100/100"])
+        battle.parse_message(["", "-start", f"{role}a: Ditto", "typechange", "Water"])
+        battle.parse_message(["", "replace", f"{role}a: Zoroark", "Zoroark-Hisui, L50, M"])
+
+        team = battle.team if role == "p1" else battle.opponent_team
+        active = battle.active_pokemon if role == "p1" else battle.opponent_active_pokemon
+        assert active[0] is not None and active[0].species == "zoroarkhisui"
+        assert [type_.name for type_ in active[0].types] == ["WATER"]
+        ditto = next(mon for mon in team.values() if mon.species == "ditto")
+        assert [type_.name for type_ in ditto.types] == ["NORMAL"]
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
     def test_reveal_after_a_twin_fainted_means_the_real_pokemon_fainted(self, role: str) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("illusion-twin-faint", "Alice", logging.getLogger("test"), gen=9)
@@ -946,6 +1159,54 @@ class TestIllusionTracking:
         hatterenes = [mon for mon in team.values() if mon.species == "hatterene"]
         assert [mon.fainted for mon in hatterenes] == [True]
         assert active[0] is not None and active[0].species == "zoroarkhisui"
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_reveal_elsewhere_after_a_twin_fainted_means_the_real_pokemon_fainted(
+        self, role: str
+    ) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-late-reveal", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        # Zoroark looks like Salazzle in slot a; the real Salazzle enters slot b and faints.
+        battle.parse_message(["", "switch", f"{role}a: Salazzle", "Salazzle, L50, F", "87/100"])
+        battle.parse_message(["", "switch", f"{role}b: Salazzle", "Salazzle, L50, F", "1/100"])
+        battle.parse_message(["", "faint", f"{role}b: Salazzle"])
+        # Zoroark leaves, then comes back looking like Glimmora and is revealed.
+        battle.parse_message(["", "switch", f"{role}a: Swampert", "Swampert, L50, M", "100/100"])
+        battle.parse_message(["", "switch", f"{role}b: Glimmora", "Glimmora, L50, F", "87/100"])
+        battle.parse_message(["", "replace", f"{role}b: Zoroark", "Zoroark, L50, F"])
+
+        team = battle.team if role == "p1" else battle.opponent_team
+        salazzles = [mon for mon in team.values() if mon.species == "salazzle"]
+        assert [mon.fainted for mon in salazzles] == [True]
+
+    def test_illusion_user_entering_as_itself_after_a_twin_fainted_means_the_twin_fainted(
+        self,
+    ) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-shows-itself", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        battle.apply_teambuilder_team(
+            "p2",
+            Teambuilder.parse_packed_team(
+                "Glimmora||FocusSash|ToxicDebris|Hex|Modest||F|||50|]"
+                "Rillaboom||WideLens|GrassySurge|LowKick|Hasty||F|||50|]"
+                "Zoroark-Hisui||SpellTag|Illusion|Hex|Naive||F|||50|"
+            ),
+            battle.teampreview_opponent_team,
+        )
+        # Zoroark looks like Glimmora in slot a; the real Glimmora enters slot b and faints.
+        battle.parse_message(["", "switch", "p2a: Glimmora", "Glimmora, L50, F", "100/100"])
+        battle.parse_message(["", "switch", "p2b: Glimmora", "Glimmora, L50, F", "100/100"])
+        battle.parse_message(["", "faint", "p2b: Glimmora"])
+        # Zoroark leaves, then comes back as itself because no ally is left to copy.
+        battle.parse_message(["", "switch", "p2a: Rillaboom", "Rillaboom, L50, F", "100/100"])
+        battle.parse_message(["", "switch", "p2b: Zoroark", "Zoroark-Hisui, L50, F", "100/100"])
+
+        glimmoras = [mon for mon in battle.opponent_team.values() if mon.species == "glimmora"]
+        assert [mon.fainted for mon in glimmoras] == [True]
 
     def test_off_field_target_named_by_its_base_species_is_its_team_sheet_entry(self) -> None:
         poke_env_patches.install()
@@ -1040,6 +1301,143 @@ class TestIllusionTracking:
         assert revealed is not None and revealed.species == "zoroark"
         assert revealed.boosts["atk"] == 1
         assert not battle.team["p1: Farigiraf"].active
+
+    def test_request_moves_the_disguise_type_change_to_the_illusion_user(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-soak", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        party = (
+            ("p1: Hawlucha", "Hawlucha, L50, F", "165/165"),
+            ("p1: Farigiraf", "Farigiraf, L50, M", "201/201"),
+            ("p1: Zoroark", "Zoroark, L50, M", "159/159"),
+        )
+        battle.parse_message(["", "switch", "p1a: Hawlucha", "Hawlucha, L50, F", "165/165"])
+        battle.parse_message(["", "switch", "p1b: Farigiraf", "Farigiraf, L50, M", "201/201"])
+        battle.parse_request(
+            {
+                "active": [{"moves": []}, {"moves": []}],
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [
+                        _request_pokemon(ident, details, condition, index < 2)
+                        for index, (ident, details, condition) in enumerate(party)
+                    ],
+                },
+                "rqid": 1,
+            }
+        )
+        # Zoroark comes in looking like Farigiraf, and is soaked and boosted that turn.
+        battle.parse_message(["", "switch", "p1b: Farigiraf", "Farigiraf, L50, M", "159/159"])
+        battle.parse_message(["", "-start", "p1b: Farigiraf", "typechange", "Water"])
+        battle.parse_message(["", "-boost", "p1b: Farigiraf", "spe", "1"])
+        battle.parse_request(
+            {
+                "active": [{"moves": []}, {"moves": []}],
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [
+                        _request_pokemon(*party[0], True),
+                        _request_pokemon(*party[2], True),
+                        _request_pokemon(*party[1], False),
+                    ],
+                },
+                "rqid": 2,
+            }
+        )
+
+        zoroark = battle.active_pokemon[1]
+        farigiraf = battle.team["p1: Farigiraf"]
+        assert zoroark is not None and zoroark.species == "zoroark"
+        assert [type_.name for type_ in zoroark.types] == ["WATER"]
+        assert zoroark.boosts["spe"] == 1
+        assert [type_.name for type_ in farigiraf.types] == ["NORMAL", "PSYCHIC"]
+        assert farigiraf.boosts["spe"] == 0
+        assert not farigiraf.effects
+
+    def test_type_change_after_a_request_reaches_the_own_disguise_beside_its_twin(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-twin-soak", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        party = [
+            _request_pokemon("p1: Gourgeist", "Gourgeist, L50, M", "40/138", True),
+            _request_pokemon("p1: Zoroark", "Zoroark-Hisui, L50, F", "38/132", True),
+        ]
+        battle.parse_request(
+            {"teamPreview": True, "side": {"name": "Alice", "id": "p1", "pokemon": party}}
+        )
+        # Zoroark enters slot b looking like Gourgeist, then the real Gourgeist enters slot a.
+        battle.parse_message(["", "switch", "p1b: Gourgeist", "Gourgeist, L50, M", "38/132"])
+        battle.parse_message(["", "switch", "p1a: Gourgeist", "Gourgeist, L50, M", "40/138"])
+        battle.parse_request(
+            {
+                "active": [{"moves": []}, {"moves": []}],
+                "side": {"name": "Alice", "id": "p1", "pokemon": party},
+                "rqid": 2,
+            }
+        )
+        battle.parse_message(["", "-start", "p1b: Gourgeist", "typechange", "Water"])
+
+        gourgeist, zoroark = battle.active_pokemon
+        assert zoroark is not None and zoroark is battle.team["p1: Zoroark"]
+        assert [type_.name for type_ in zoroark.types] == ["WATER"]
+        assert gourgeist is not None
+        assert [type_.name for type_ in gourgeist.types] == ["GHOST", "GRASS"]
+
+    def test_added_type_of_a_twin_stays_with_it_when_the_own_disguise_enters_beside_it(
+        self,
+    ) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("illusion-twin-typeadd", "Alice", logging.getLogger("test"), gen=9)
+        battle.parse_message(["", "player", "p1", "Alice", "", ""])
+        battle.parse_message(["", "player", "p2", "Bob", "", ""])
+        gourgeist = ("p1: Gourgeist", "Gourgeist, L50, F", "130/130")
+        scolipede = ("p1: Scolipede", "Scolipede, L50, M", "80/140")
+        zoroark = ("p1: Zoroark", "Zoroark, L50, F", "136/136")
+        battle.parse_request(
+            {
+                "teamPreview": True,
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [
+                        _request_pokemon(*gourgeist, True),
+                        _request_pokemon(*scolipede, True),
+                        _request_pokemon(*zoroark, False),
+                    ],
+                },
+            }
+        )
+        battle.parse_message(["", "switch", "p1a: Gourgeist", "Gourgeist, L50, F", "130/130"])
+        battle.parse_message(["", "switch", "p1b: Scolipede", "Scolipede, L50, M", "80/140"])
+        battle.parse_message(["", "-start", "p1b: Scolipede", "typeadd", "Ghost"])
+        battle.parse_message(["", "faint", "p1a: Gourgeist"])
+        # Zoroark replaces Gourgeist looking like the Scolipede beside it.
+        battle.parse_message(["", "switch", "p1a: Scolipede", "Scolipede, L50, M", "136/136"])
+        battle.parse_request(
+            {
+                "active": [{"moves": []}, {"moves": []}],
+                "side": {
+                    "name": "Alice",
+                    "id": "p1",
+                    "pokemon": [
+                        _request_pokemon(*zoroark, True),
+                        _request_pokemon(*scolipede, True),
+                        _request_pokemon("p1: Gourgeist", "Gourgeist, L50, F", "0 fnt", False),
+                    ],
+                },
+                "rqid": 2,
+            }
+        )
+
+        zoroark_shown, scolipede_shown = battle.active_pokemon
+        assert zoroark_shown is not None and zoroark_shown.species == "zoroark"
+        assert [type_.name for type_ in zoroark_shown.types] == ["DARK"]
+        assert scolipede_shown is not None
+        assert [type_.name for type_ in scolipede_shown.types] == ["BUG", "POISON", "GHOST"]
 
     def test_own_illusion_user_leading_from_the_first_party_slot_counts_as_seen(self) -> None:
         poke_env_patches.install()

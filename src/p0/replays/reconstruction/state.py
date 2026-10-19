@@ -24,6 +24,7 @@ from p0.replays.reconstruction.contract import (
 from p0.replays.reconstruction.diagnostics import (
     ReplayEventDiagnostic,
     ReplayEventParseError,
+    ReplayRejectionCategory,
 )
 from p0.replays.reconstruction.events import EffectReference
 from p0.replays.reconstruction.resolution import (
@@ -155,7 +156,6 @@ class ReplayPokemonState:
     nickname: str
     original_species: str
     current_form: str
-    displayed_species: str
     nature: str
     level: int
     hp_fraction: float | None
@@ -184,12 +184,13 @@ class ReplayPokemonState:
     effect_variants: tuple[tuple[str, str], ...] = ()
     effect_sources: tuple[tuple[str, ReplayMemberId], ...] = ()
     added_type: str | None = None
-    # The Illusion user that fainted unrevealed while it looked like this member.
-    disguised_faint: ReplayMemberId | None = None
-    # Fainted unrevealed beside the Pokemon it looked like, so no faint was shown to move.
-    faint_unseen: bool = False
-    # Protocol line of the latest switch or drag that brought this member in.
-    entered_line: int = -1
+
+
+class PublicSideState(NamedTuple):
+    """Causal team entries and active displays, including same-species copies."""
+
+    members: tuple[ReplayPokemonState, ...]
+    active: tuple[ReplayPokemonState | None, ReplayPokemonState | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +217,7 @@ class ReplayBattleState:
     delayed_moves: tuple[DelayedMoveState, ...] = ()
     slot_conditions: tuple[SlotConditionState, ...] = ()
     team_sizes: tuple[int, int] = (4, 4)
+    public_sides: tuple[PublicSideState | None, PublicSideState | None] = (None, None)
 
     def member(self, member_id: ReplayMemberId) -> ReplayPokemonState:
         """Return one member; members are stored in side order, then roster order."""
@@ -255,7 +257,6 @@ class _MutablePokemon:
     original_species: str
     current_form: str
     persistent_form: str
-    displayed_species: str
     nature: str
     level: int
     hp_fraction: float | None
@@ -285,9 +286,6 @@ class _MutablePokemon:
     last_move: str | None = None
     added_type: str | None = None
     underlying_types: tuple[str, ...] = ()
-    disguised_faint: ReplayMemberId | None = None
-    faint_unseen: bool = False
-    entered_line: int = -1
 
     def move_snapshots(self) -> tuple[MoveState, ...]:
         """Return effective move slots without exposing mutable move objects."""
@@ -301,7 +299,6 @@ class _MutablePokemon:
             nickname=self.nickname,
             original_species=self.original_species,
             current_form=self.current_form,
-            displayed_species=self.displayed_species,
             nature=self.nature,
             level=self.level,
             hp_fraction=self.hp_fraction,
@@ -328,14 +325,17 @@ class _MutablePokemon:
             protect_counter=self.protect_counter,
             preparing=self.preparing,
             last_move=self.last_move,
-            disguised_faint=self.disguised_faint,
-            faint_unseen=self.faint_unseen,
-            entered_line=self.entered_line,
         )
 
 
 class _StateTransitionError(ValueError):
-    pass
+    category = ReplayRejectionCategory.INVALID_INPUT_CONTRACT
+
+
+class _UnsupportedMechanic(_StateTransitionError):
+    """A public mechanic whose state is not supported."""
+
+    category = ReplayRejectionCategory.UNSUPPORTED_EVENT
 
 
 class _StateReducer:
@@ -383,7 +383,6 @@ class _StateReducer:
             original_species=member.species,
             current_form=member.species,
             persistent_form=member.species,
-            displayed_species=member.species,
             nature=member.nature,
             level=member.level,
             hp_fraction=None,
@@ -497,26 +496,28 @@ class _StateReducer:
             self._clear_battle_state(outgoing)
 
         member = self._member(member_id)
-        # A fainted Pokemon returns only after a revive, which names the Pokemon itself,
-        # so an earlier faint shown on this member was a disguise.
-        member.disguised_faint = None
         details_species = _details_species(resolved.event.arguments[1])
         details_data = self._species_data(details_species)
         original_data = self._species_data(member.original_species)
         disguised = normalize_showdown_id(details_data.base_species) != normalize_showdown_id(
             original_data.base_species
         )
-        if disguised:
+        copied = self._copied_member(member_id, details_species) if disguised else None
+        if (disguised and copied is None) or (
+            normalize_showdown_id(member.ability.current) == "illusion"
+            and self._transformed_into(member_id.side, details_data.base_species)
+        ):
+            # The disguise copies a transformed teammate, whose look neither side tracks.
+            # It can even show the Illusion user's own species (a Ditto copying Zoroark).
+            raise _UnsupportedMechanic("the disguise copies a transformed Pokemon")
+        if copied is not None:
             if normalize_showdown_id(member.ability.current) != "illusion":
                 raise _StateTransitionError(
                     "disguised switch resolved to a member without Illusion"
                 )
-            member.displayed_species = details_species
             member.effects["illusion"] = self.turn
             # Both players see the copied Pokemon's name enter the field.
-            copied = self._copied_member(member_id, member.displayed_species)
-            if copied is not None:
-                self._member(copied).revealed = True
+            self._member(copied).revealed = True
         else:
             self._set_form(member, details_species, persistent=True)
             member.effects.pop("illusion", None)
@@ -529,7 +530,6 @@ class _StateReducer:
         member.fainted = hp_fraction == 0.0
         member.selected = True
         member.active_turns = 0
-        member.entered_line = resolved.event.line_index
         self.active[key] = member_id
 
     def _handle_replace(self, resolved: ResolvedProtocolEvent) -> None:
@@ -544,7 +544,6 @@ class _StateReducer:
         if "illusion" not in member.effects:
             raise _StateTransitionError("replace requires an active Illusion history")
 
-        member.displayed_species = revealed_species
         member.revealed = True
         member.effects.pop("illusion")
 
@@ -577,14 +576,6 @@ class _StateReducer:
         member.hp_fraction = 0.0
         member.fainted = True
         member.status = None
-        if "illusion" in member.effects:
-            # The log names the disguise, so that is the Pokemon seen to faint.
-            copied = self._copied_member(member_id, member.displayed_species)
-            if copied in self.active.values():
-                # The copied Pokemon still stands, and the opponent never learns of the faint.
-                member.faint_unseen = True
-            elif copied is not None:
-                self._member(copied).disguised_faint = member_id
         self._clear_battle_state(member)
         self.active.pop(key)
         self._fainted_slots[member_id] = slot
@@ -992,7 +983,6 @@ class _StateReducer:
         member.current_form = form
         if persistent:
             member.persistent_form = form
-        member.displayed_species = form
         member.underlying_types = data.types
         member.added_type = None
         member.current_types = data.types
@@ -1073,6 +1063,9 @@ class _StateReducer:
             if len(references) != 1:
                 raise _StateTransitionError("Reflect Type requires one annotated target")
             target = self._member(_required_member(references[0]))
+            if "illusion" in member.effects or "illusion" in target.effects:
+                # Each player sees the types copied from what it believes the disguise is.
+                raise _UnsupportedMechanic("Reflect Type involves a disguised Pokemon")
             member.underlying_types = tuple(
                 type_name for type_name in target.current_types if type_name != target.added_type
             ) or ("Normal",)
@@ -1375,7 +1368,21 @@ class _StateReducer:
             )
 
     def _current_ability(self, member: _MutablePokemon) -> str:
-        return "" if "gastroacid" in member.effects else self._held_ability(member)
+        if "gastroacid" in member.effects:
+            return ""
+        ability = self._held_ability(member)
+        if normalize_showdown_id(ability) in {"pressure", "ripen"} and any(
+            normalize_showdown_id(self._held_ability(source := self._members[member_id]))
+            == "neutralizinggas"
+            and not source.fainted
+            and source.transform is None
+            and "gastroacid" not in source.effects
+            for member_id in self.active.values()
+        ):
+            raise _UnsupportedMechanic(
+                "Neutralizing Gas suppression of PP-related abilities is not reconstructed"
+            )
+        return ability
 
     @staticmethod
     def _held_ability(member: _MutablePokemon) -> str:
@@ -1437,6 +1444,15 @@ class _StateReducer:
             member.moves[move_id] = replace(
                 move, current_pp=max(0, min(move.max_pp, move.current_pp + amount))
             )
+
+    def _transformed_into(self, side: ReplaySide, base_species: str) -> bool:
+        """Whether an active member of the side is transformed into the given base species."""
+        return any(
+            member_id.side == side
+            and (transform := self._members[member_id].transform) is not None
+            and self._species_data(transform.species).base_species == base_species
+            for member_id in self.active.values()
+        )
 
     def _copied_member(
         self, member_id: ReplayMemberId, displayed_species: str
@@ -1713,16 +1729,46 @@ def reduce_replay_state(
     try:
         reducer = _StateReducer(replay_id, ots)
     except _StateTransitionError as exc:
-        return ReconstructedReplayState(replay_id, (), (event_tuple[0].event.rejection(str(exc)),))
+        return ReconstructedReplayState(
+            replay_id, (), (event_tuple[0].event.rejection(str(exc), exc.category),)
+        )
 
+    # Only Illusion needs a different public identity history. Import the live adapter
+    # here to keep ordinary replay reduction independent of its initialization.
+    from p0.replays.reconstruction.public_tracking import PublicReplayTracker
+
+    illusion_sides = tuple(
+        any(normalize_showdown_id(member.ability) == "illusion" for member in sheet.members)
+        for sheet in ots
+    )
+    initial = reducer.snapshot(-1).members if any(illusion_sides) else ()
+    public = tuple(
+        PublicReplayTracker(replay_id, ots, initial, perspective=1 - side) if has_illusion else None
+        for side, has_illusion in enumerate(illusion_sides)
+    )
     snapshots: list[ReplayBattleState] = []
     for resolved in event_tuple:
         try:
             reducer.apply(resolved)
+            if resolved.event.tag in _HANDLERS or resolved.event.pokemon_refs:
+                for tracker in public:
+                    if tracker is not None:
+                        tracker.apply(resolved)
             if requested_lines is None or resolved.event.line_index in requested_lines:
-                snapshots.append(reducer.snapshot(resolved.event.line_index))
+                snapshot = reducer.snapshot(resolved.event.line_index)
+                if initial:
+                    snapshot = replace(
+                        snapshot,
+                        public_sides=(
+                            None if public[0] is None else public[0].snapshot(),
+                            None if public[1] is None else public[1].snapshot(),
+                        ),
+                    )
+                snapshots.append(snapshot)
         except _StateTransitionError as exc:
-            return ReconstructedReplayState(replay_id, (), (resolved.event.rejection(str(exc)),))
+            return ReconstructedReplayState(
+                replay_id, (), (resolved.event.rejection(str(exc), exc.category),)
+            )
     return ReconstructedReplayState(replay_id, tuple(snapshots), hp_before=reducer.hp_before)
 
 

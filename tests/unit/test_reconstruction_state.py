@@ -8,7 +8,10 @@ import pytest
 
 from p0.replays.identity import ReplayMemberId, ReplaySide
 from p0.replays.reconstruction.decisions import build_decision_view
-from p0.replays.reconstruction.diagnostics import ReplayEventParseError
+from p0.replays.reconstruction.diagnostics import (
+    ReplayEventParseError,
+    ReplayRejectionCategory,
+)
 from p0.replays.reconstruction.events import parse_protocol_events
 from p0.replays.reconstruction.projection import project_battle_view
 from p0.replays.reconstruction.resolution import resolve_protocol_events
@@ -99,6 +102,48 @@ def _resolved(
 
 
 class TestReconstructionState:
+    def test_unmodelled_neutralizing_gas_pp_suppression_is_explicitly_unsupported(self) -> None:
+        p1 = _ots(
+            ReplaySide.P1,
+            ("Pikachu", "Weezing", "Mew", "Charizard", "Garchomp", "Incineroar"),
+            moves=("Thunderbolt", "Protect"),
+        )
+        p1 = replace(
+            p1,
+            members=tuple(
+                replace(member, ability="Neutralizing Gas")
+                if member.species == "Weezing"
+                else member
+                for member in p1.members
+            ),
+        )
+        p2 = _ots(
+            ReplaySide.P2, ("Corviknight", "Snorlax", "Tauros", "Maushold", "Ditto", "Audino")
+        )
+        p2 = replace(
+            p2,
+            members=tuple(
+                replace(member, ability="Pressure") if member.species == "Corviknight" else member
+                for member in p2.members
+            ),
+        )
+        sheets = (p1, p2)
+        events = _resolved(
+            "|switch|p1a: Pikachu|Pikachu, L50|100/100",
+            "|switch|p1b: Weezing|Weezing, L50|100/100",
+            "|switch|p2a: Corviknight|Corviknight, L50|100/100",
+            "|-ability|p1b: Weezing|Neutralizing Gas",
+            "|move|p1a: Pikachu|Thunderbolt|p2a: Corviknight",
+            ots=sheets,
+        )
+
+        result = reduce_replay_state("gas-pressure", sheets, events)
+
+        assert result.snapshots == ()
+        assert result.diagnostics[0].category is ReplayRejectionCategory.UNSUPPORTED_EVENT
+        assert result.diagnostics[0].line_index == 4
+        assert "Neutralizing Gas" in result.diagnostics[0].reason
+
     def test_requested_snapshots_still_apply_every_event(self) -> None:
         events = _resolved(
             "|switch|p1a: Lopunny|Lopunny, L50|100/100",
@@ -1765,17 +1810,20 @@ class TestReconstructionState:
         damaged = snapshots[2].member(snorlax_id)
         revealed = snapshots[4].member(snorlax_id)
         assert snapshots[0].sides[0].active[0] == snorlax_id
-        assert disguised.displayed_species == "Lopunny"
+        public = snapshots[0].public_sides[0]
+        assert public is not None and public.active[0] is not None
+        assert public.active[0].current_form == "Lopunny"
+        assert disguised.current_form == "Snorlax"
         assert not disguised.revealed
         assert dict(disguised.effects) == {"illusion": 0}
         assert damaged.hp_fraction == 0.25
         assert snapshots[2].member(lopunny_id).hp_fraction is None
-        assert revealed.displayed_species == "Snorlax"
+        assert revealed.current_form == "Snorlax"
         assert revealed.revealed
         assert revealed.hp_fraction == 0.25
         assert dict(revealed.boosts)["atk"] == 2
         assert "illusion" not in dict(revealed.effects)
-        assert snapshots[0].member(snorlax_id).displayed_species == "Lopunny"
+        assert public.active[0].current_form == "Lopunny"
 
     def test_duplicate_illusion_display_does_not_mutate_the_disguise_target(self) -> None:
         ots = _complete_ots(illusion_member="Snorlax")
@@ -1796,8 +1844,8 @@ class TestReconstructionState:
         assert final.sides[0].active == (lopunny_id, snorlax_id)
         assert final.member(lopunny_id).hp_fraction == 1.0
         assert final.member(snorlax_id).hp_fraction == 0.5
-        assert final.member(lopunny_id).displayed_species == "Lopunny"
-        assert final.member(snorlax_id).displayed_species == "Snorlax"
+        assert final.member(lopunny_id).current_form == "Lopunny"
+        assert final.member(snorlax_id).current_form == "Snorlax"
 
     def test_faint_before_illusion_reveal_updates_only_the_actual_member(self) -> None:
         ots = _complete_ots(illusion_member="Snorlax")
@@ -1818,6 +1866,95 @@ class TestReconstructionState:
         assert not final.member(lopunny_id).fainted
         assert final.member(snorlax_id).hp_fraction == 0.0
         assert final.member(snorlax_id).fainted
+
+    def test_disguise_of_a_transformed_teammate_is_unsupported(self) -> None:
+        ots = (
+            _ots(
+                ReplaySide.P1,
+                ("Ditto", "Zoroark", "Furfrou", "Persian", "Watchog", "Castform"),
+                illusion_member="Zoroark",
+            ),
+            _ots(ReplaySide.P2, _P2_SPECIES),
+        )
+        ots = (
+            replace(
+                ots[0],
+                members=(replace(ots[0].members[0], ability="Imposter"), *ots[0].members[1:]),
+            ),
+            ots[1],
+        )
+        events = _resolved(
+            "|switch|p1a: Ditto|Ditto, L50|100/100",
+            "|switch|p1b: Furfrou|Furfrou, L50|100/100",
+            "|switch|p2a: Audino|Audino, L50|100/100",
+            # A hit that does not reveal it shows the first Ditto is the real one.
+            "|move|p2a: Audino|Tackle|p1a: Ditto",
+            "|-damage|p1a: Ditto|90/100",
+            "|-transform|p1a: Ditto|p2a: Audino|[from] ability: Imposter",
+            # Zoroark copies the transformed Ditto, so it shows Ditto's name and Audino.
+            "|switch|p1b: Ditto|Audino, L50|100/100",
+            ots=ots,
+        )
+
+        result = reduce_replay_state("state-test", ots, events)
+
+        assert result.snapshots == ()
+        assert result.diagnostics[0].line_index == 6
+        assert result.diagnostics[0].category is ReplayRejectionCategory.UNSUPPORTED_EVENT
+        assert result.diagnostics[0].reason
+
+    def test_disguise_of_a_ditto_copying_zoroark_is_unsupported(self) -> None:
+        ots = (
+            _ots(
+                ReplaySide.P1,
+                ("Ditto", "Zoroark", "Furfrou", "Persian", "Watchog", "Castform"),
+                illusion_member="Zoroark",
+            ),
+            _ots(ReplaySide.P2, ("Zoroark", *_P2_SPECIES[1:])),
+        )
+        ots = (
+            replace(
+                ots[0],
+                members=(replace(ots[0].members[0], ability="Imposter"), *ots[0].members[1:]),
+            ),
+            ots[1],
+        )
+        events = _resolved(
+            "|switch|p1a: Ditto|Ditto, L50|100/100",
+            "|switch|p1b: Furfrou|Furfrou, L50|100/100",
+            "|switch|p2a: Zoroark|Zoroark, L50|100/100",
+            "|move|p2a: Zoroark|Tackle|p1a: Ditto",
+            "|-damage|p1a: Ditto|90/100",
+            "|-transform|p1a: Ditto|p2a: Zoroark|[from] ability: Imposter",
+            # p1's Zoroark copies its Ditto, which now looks like Zoroark.
+            "|switch|p1b: Ditto|Zoroark, L50|100/100",
+            ots=ots,
+        )
+
+        result = reduce_replay_state("state-test", ots, events)
+
+        assert result.snapshots == ()
+        assert result.diagnostics[0].line_index == 6
+        assert result.diagnostics[0].category is ReplayRejectionCategory.UNSUPPORTED_EVENT
+        assert result.diagnostics[0].reason
+
+    def test_reflect_type_on_a_disguise_is_unsupported(self) -> None:
+        ots = _complete_ots(illusion_member="Snorlax")
+        events = _resolved(
+            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
+            "|switch|p2a: Audino|Audino, L50|100/100",
+            "|-start|p2a: Audino|typechange|[from] move: Reflect Type|[of] p1a: Lopunny",
+            "|replace|p1a: Snorlax|Snorlax, L50",
+            "|-end|p1a: Snorlax|Illusion",
+            ots=ots,
+        )
+
+        result = reduce_replay_state("state-test", ots, events)
+
+        assert result.snapshots == ()
+        assert result.diagnostics[0].line_index == 2
+        assert result.diagnostics[0].category is ReplayRejectionCategory.UNSUPPORTED_EVENT
+        assert result.diagnostics[0].reason
 
     def test_invalid_reducer_transition_discards_all_snapshots(self) -> None:
         events = _resolved(

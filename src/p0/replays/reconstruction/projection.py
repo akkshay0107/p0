@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import cache, lru_cache
 from typing import Any, NamedTuple
 
@@ -19,13 +19,11 @@ from p0.replays.reconstruction.decisions import (
 )
 from p0.replays.reconstruction.resolution import ResolvedProtocolEvent
 from p0.replays.reconstruction.state import (
-    AbilityState,
     MoveState,
     ReconstructedReplayState,
     ReplayBattleState,
     ReplayPokemonState,
     _dex_indexes,
-    _move_state,
 )
 from p0.replays.schema import DecisionRecord, DecisionType, OTSData, ReplayDiagnostics
 from p0.teams.spread_usage import cosmetic_forme_aliases, load_spread_table_file
@@ -102,7 +100,6 @@ class ReplayPokemonView:
     _transformed: bool
     _revealed: bool
     _boosts: Mapping[str, int] = field(default_factory=_FrozenMapping, repr=False, compare=False)
-    identity_uncertain: bool = False
 
     @property
     def species(self) -> str:
@@ -370,8 +367,7 @@ def _pokemon_view(
         ability = transform.ability
     else:
         base_stats = member.base_stats
-        disguised = active and not own and _disguised(member)
-        species = member.displayed_species if disguised else member.current_form
+        species = member.current_form
         base_species = member.original_species
         ability = member.ability.current
     effects = _FrozenMapping(
@@ -396,168 +392,6 @@ def _pokemon_view(
     )
 
 
-def _disguised(member: ReplayPokemonState) -> bool:
-    return any(name == "illusion" for name, _ in member.effects)
-
-
-def _mask_hidden_illusion(
-    state: ReplayBattleState,
-    ots: tuple[OTSData, OTSData],
-    perspective: int,
-    views: dict[ReplayMemberId, ReplayPokemonView],
-) -> dict[ReplayMemberId, ReplayPokemonView]:
-    """
-    Keep later identity resolution out of an opponent's earlier view.
-
-    Arguments:
-      state: replay state at the current decision boundary
-      ots: public open team sheets for both sides
-      perspective: observing player's side index
-      views: roster views to replace when a disguise has a public match
-
-    Returns:
-      active views that show the disguise without exposing the true member
-    """
-    opponent = 1 - perspective
-    active_ids = state.sides[opponent].active
-    hidden = tuple(
-        member_id
-        for member_id in active_ids
-        if member_id is not None
-        and _disguised(member := state.member(member_id))
-        and normalize_showdown_id(member.displayed_species)
-        != normalize_showdown_id(member.current_form)
-    )
-    if not hidden:
-        return {}
-
-    species = _dex_indexes()[0]
-    hidden_ids = set(hidden)
-    assigned = {member_id for member_id in active_ids if member_id is not None} - hidden_ids
-    active_overrides: dict[ReplayMemberId, ReplayPokemonView] = {}
-    for member_id in hidden:
-        member = state.member(member_id)
-        # The copied Pokemon may have changed form since the sheet was shown.
-        displayed = species[normalize_showdown_id(member.displayed_species)]
-        candidate = next(
-            (
-                ots_member
-                for ots_member in ots[opponent].members
-                if species[normalize_showdown_id(ots_member.species)].base_species
-                == displayed.base_species
-                and ots_member.member_id not in hidden_ids
-            ),
-            None,
-        )
-        # Beside the Pokemon it copies, the disguise takes the team entry only if it
-        # entered later. Live tracking does the same, so neither display marks the fake.
-        if (
-            candidate is not None
-            and candidate.member_id in assigned
-            and state.member(candidate.member_id).entered_line > member.entered_line
-        ):
-            candidate = None
-        true_sheet = ots[opponent].members[member_id.roster_index]
-        true_species = species[normalize_showdown_id(true_sheet.species)]
-        public_effects = tuple(
-            (name, count) for name, count in member.effects if name != "illusion"
-        )
-        public_effect_names = {name for name, _ in public_effects}
-        displayed_state = replace(
-            member,
-            member_id=member_id if candidate is None else candidate.member_id,
-            nickname=member.displayed_species if candidate is None else candidate.nickname,
-            original_species=displayed.base_species,
-            current_form=member.displayed_species,
-            displayed_species=member.displayed_species,
-            nature="",
-            item=None,
-            ability=AbilityState("unknown"),
-            base_types=displayed.types,
-            current_types=displayed.types,
-            base_stats=displayed.base_stats,
-            weight=displayed.weight,
-            moves=(),
-            effects=public_effects,
-            effect_variants=tuple(p for p in member.effect_variants if p[0] in public_effect_names),
-            effect_sources=tuple(p for p in member.effect_sources if p[0] in public_effect_names),
-            transform=None,
-            revealed=True,
-            selected=None,
-            last_move=None,
-        )
-        static_state = replace(
-            member,
-            nickname=true_sheet.nickname,
-            original_species=true_species.base_species,
-            current_form=true_sheet.species,
-            displayed_species=true_sheet.species,
-            nature=true_sheet.nature,
-            hp_fraction=None,
-            status=None,
-            item=true_sheet.item,
-            ability=AbilityState(true_sheet.ability),
-            base_types=true_species.types,
-            current_types=true_species.types,
-            base_stats=true_species.base_stats,
-            weight=true_species.weight,
-            moves=tuple(_move_state(name) for name in true_sheet.moves),
-            boosts=tuple((name, 0) for name, _ in member.boosts),
-            effects=(),
-            effect_variants=(),
-            effect_sources=(),
-            perish_count=None,
-            transform=None,
-            selected=None,
-            fainted=False,
-            active_turns=0,
-            status_counter=0,
-            protect_counter=0,
-            preparing=None,
-            last_move=None,
-            added_type=None,
-        )
-        displayed_view = replace(
-            _pokemon_view(displayed_state, perspective=perspective, active=True),
-            identity_uncertain=True,
-        )
-        if candidate is not None:
-            if candidate.member_id in assigned:
-                active_overrides[candidate.member_id] = views[candidate.member_id]
-            views[candidate.member_id] = displayed_view
-            assigned.add(candidate.member_id)
-        views[member_id] = _pokemon_view(static_state, perspective=perspective, active=False)
-        active_overrides[member_id] = displayed_view
-
-    return active_overrides
-
-
-def _show_disguised_faints(
-    state: ReplayBattleState,
-    perspective: int,
-    views: dict[ReplayMemberId, ReplayPokemonView],
-) -> None:
-    """
-    Show an unrevealed Illusion user's faint on the Pokemon it looked like.
-
-    The opponent saw the disguise faint and learns otherwise only when that Pokemon
-    enters again, which is also when live tracking corrects itself. A disguise that
-    fainted beside the Pokemon it looked like stays hidden for the rest of the game.
-    """
-    for member in state.members:
-        if member.member_id.side.side_index == perspective:
-            continue
-        if member.faint_unseen:
-            unseen = replace(member, hp_fraction=None, fainted=False)
-            views[member.member_id] = _pokemon_view(unseen, perspective=perspective, active=False)
-        if member.disguised_faint is None:
-            continue
-        shown = replace(member, hp_fraction=0.0, status=None, fainted=True)
-        hidden = replace(state.member(member.disguised_faint), hp_fraction=None, fainted=False)
-        views[shown.member_id] = _pokemon_view(shown, perspective=perspective, active=False)
-        views[hidden.member_id] = _pokemon_view(hidden, perspective=perspective, active=False)
-
-
 def _named_mapping(values: Iterable[tuple[str, int]]) -> Mapping[ReplayNamedValue, int]:
     return _FrozenMapping({ReplayNamedValue(_enum_name(name)): value for name, value in values})
 
@@ -578,18 +412,33 @@ def project_battle_view(
     view_cache holds one perspective's earlier member views. A view is reused while
     the member's snapshot is the same object and its active flag is unchanged.
     """
+    opponent = 1 - perspective
+    public = state.public_sides[opponent]
     active_ids = {
         member_id for side in state.sides for member_id in side.active if member_id is not None
     }
     views = {}
     for member in state.members:
+        if public is not None and member.member_id.side.side_index == opponent:
+            continue
         key = (member.member_id, member.member_id in active_ids)
         view = view_cache.get(key)
         if view is None or view.state is not member:
             view = view_cache[key] = _pokemon_view(member, perspective=perspective, active=key[1])
         views[member.member_id] = view
-    active_overrides = _mask_hidden_illusion(state, ots, perspective, views)
-    _show_disguised_faints(state, perspective, views)
+    public_active = None
+    if public is not None:
+        public_active = tuple(
+            None if member is None else _pokemon_view(member, perspective=perspective, active=True)
+            for member in public.active
+        )
+        for member in public.members:
+            active_view = next(
+                (view for view in public_active if view is not None and view.state is member), None
+            )
+            views[member.member_id] = active_view or _pokemon_view(
+                member, perspective=perspective, active=False
+            )
     teams = tuple(
         _FrozenMapping(
             {
@@ -602,15 +451,16 @@ def project_battle_view(
         for side in (0, 1)
     )
     active = tuple(
-        tuple(
-            active_overrides.get(member_id, views.get(member_id)) if member_id is not None else None
-            for member_id in side.active
-        )
+        tuple(views.get(member_id) if member_id is not None else None for member_id in side.active)
         for side in state.sides
     )
     own_active = (active[perspective][0], active[perspective][1])
-    opponent = 1 - perspective
-    opponent_active = (active[opponent][0], active[opponent][1])
+    opponent_active = (
+        (active[opponent][0], active[opponent][1])
+        if public_active is None
+        else (public_active[0], public_active[1])
+    )
+    active = tuple(own_active if side == perspective else opponent_active for side in (0, 1))
     switches = tuple(
         view
         for member_id, view in views.items()

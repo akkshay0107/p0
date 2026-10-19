@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from p0.replays.identity import ReplayMemberId, ReplaySide
 from p0.replays.reconstruction.diagnostics import ReplayRejectionCategory
 from p0.replays.reconstruction.events import parse_protocol_events
@@ -61,7 +65,7 @@ _PLAIN_SIDE = _sheet(
 )
 _SIMISEAR = ReplayMemberId(ReplaySide.P1, 0)
 _ZOROARK = ReplayMemberId(ReplaySide.P1, 1)
-_SEVERAL_ASSIGNMENTS = "unresolved_illusion: active history has multiple valid assignments"
+_SEVERAL_ASSIGNMENTS = "active history has multiple valid assignments"
 
 
 def _events(*lines: str):
@@ -108,7 +112,7 @@ def test_unique_slotless_roster_reference_resolves_to_a_member() -> None:
     assert resolved[1].pokemon_refs[1].member_id == ReplayMemberId(ReplaySide.P2, 0)
 
 
-def test_ambiguous_slotless_reference_is_rejected_by_category() -> None:
+def test_duplicate_slotless_reference_is_invalid_input() -> None:
     ots = (
         _ots(ReplaySide.P1, ("Alpha", "Bravo", "C", "D", "E", "F")),
         _ots(ReplaySide.P2, ("Golf", "Golf", "I", "J", "K", "L")),
@@ -121,9 +125,158 @@ def test_ambiguous_slotless_reference_is_rejected_by_category() -> None:
     result = resolve_protocol_events("resolution-test", ots, events)
 
     assert result.events == ()
-    assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
+    assert result.diagnostics[0].category is ReplayRejectionCategory.INVALID_INPUT_CONTRACT
     assert "Golf" in result.diagnostics[0].reason
     assert "2 roster members" in result.diagnostics[0].reason
+
+
+class TestIdentityRejectionCategories:
+    def test_inconsistent_second_side_takes_precedence_over_ambiguous_first_side(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|switch|p2a: Jolteon|Jolteon, L50|100/100",
+            "|faint|p2a: Jolteon",
+            "|switch|p2a: Jolteon|Jolteon, L50|100/100",
+        )
+
+        result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
+
+        assert result.events == ()
+        assert result.diagnostics[0].category is ReplayRejectionCategory.INCONSISTENT_IDENTITY
+
+    def test_no_candidate_for_an_own_move_is_inconsistent(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|move|p1a: Simisear|Protect|p1a: Simisear",
+        )
+
+        result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
+
+        assert result.events == ()
+        assert result.diagnostics[0].category is ReplayRejectionCategory.INCONSISTENT_IDENTITY
+
+    def test_expired_budget_is_a_timeout_even_when_the_first_solution_is_easy(self) -> None:
+        events = _events("|switch|p2a: Jolteon|Jolteon, L50|100/100")
+
+        result = resolve_protocol_events(
+            "resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events, time_limit_seconds=0
+        )
+
+        assert result.events == ()
+        assert result.diagnostics[0].category is ReplayRejectionCategory.TIME_LIMIT_EXCEEDED
+
+    @pytest.mark.parametrize("limit", (-1.0, float("nan"), float("inf")))
+    def test_invalid_budget_is_rejected_at_the_api_boundary(self, limit: float) -> None:
+        with pytest.raises(ValueError, match="finite and nonnegative"):
+            resolve_protocol_events(
+                "resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), (), time_limit_seconds=limit
+            )
+
+    def test_long_games_without_illusion_do_not_require_recursive_search(self) -> None:
+        first_side = replace(
+            _PLAIN_SIDE,
+            side=ReplaySide.P1,
+            members=tuple(
+                replace(member, member_id=ReplayMemberId(ReplaySide.P1, index))
+                for index, member in enumerate(_PLAIN_SIDE.members)
+            ),
+        )
+        events = _events(
+            *(
+                f"|switch|p2a: {name}|{name}, L50|100/100"
+                for _ in range(1000)
+                for name in ("Jolteon", "Houndoom")
+            )
+        )
+
+        resolved = resolve_protocol_events(
+            "resolution-test", (first_side, _PLAIN_SIDE), events
+        ).require_accepted()
+
+        assert len(resolved) == 2000
+        assert resolved[-1].pokemon_refs[0].member_id == ReplayMemberId(ReplaySide.P2, 1)
+
+
+class TestOTSEvidence:
+    def test_native_ability_activation_identifies_the_displayed_member(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|-ability|p1a: Simisear|Gluttony",
+        )
+
+        resolved = resolve_protocol_events(
+            "resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events
+        ).require_accepted()
+
+        assert resolved[0].pokemon_refs[0].member_id == _SIMISEAR
+
+    def test_shell_bell_evidence_belongs_to_the_healed_member(self) -> None:
+        sheet = replace(
+            _ILLUSION_SIDE,
+            members=(
+                replace(_ILLUSION_SIDE.members[0], item="Leftovers"),
+                replace(_ILLUSION_SIDE.members[1], item="Shell Bell"),
+                *_ILLUSION_SIDE.members[2:],
+            ),
+        )
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|switch|p2a: Jolteon|Jolteon, L50|100/100",
+            "|-heal|p1a: Simisear|100/100|[from] item: Shell Bell|[of] p2a: Jolteon",
+        )
+
+        resolved = resolve_protocol_events(
+            "resolution-test", (sheet, _PLAIN_SIDE), events
+        ).require_accepted()
+
+        assert resolved[0].pokemon_refs[0].member_id == _ZOROARK
+
+    def test_rocky_helmet_recoil_does_not_identify_the_attacker(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|switch|p2a: Jolteon|Jolteon, L50|100/100",
+            "|-damage|p1a: Simisear|84/100|[from] item: Rocky Helmet|[of] p2a: Jolteon",
+        )
+
+        result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
+
+        assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
+
+    def test_skill_swap_stops_comparing_later_abilities_to_the_initial_sheet(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|switch|p2a: Jolteon|Jolteon, L50|100/100",
+            "|move|p2a: Jolteon|Skill Swap|p1a: Simisear",
+            "|-ability|p1a: Simisear|Volt Absorb",
+        )
+
+        result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
+
+        assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
+
+    def test_mummy_activation_changes_the_contacts_ability_without_an_ability_line(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|switch|p2a: Jolteon|Jolteon, L50|100/100",
+            "|-activate|p2a: Jolteon|ability: Mummy|p1a: Simisear|[ability] Gluttony",
+            "|-activate|p1a: Simisear|ability: Mummy|p2a: Jolteon|[ability] Volt Absorb",
+        )
+
+        result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
+
+        assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
+
+    def test_an_item_consumed_after_fling_need_not_be_on_the_targets_sheet(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|switch|p2a: Jolteon|Jolteon, L50|100/100",
+            "|move|p2a: Jolteon|Fling|p1a: Simisear",
+            "|-enditem|p1a: Simisear|Sitrus Berry|[eat]",
+        )
+
+        result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
+
+        assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
 
 
 class TestIllusionEvidence:
@@ -277,6 +430,21 @@ class TestIllusionEvidence:
 
 
 class TestRevivedMemberEntry:
+    def test_named_revive_proves_a_disguised_faint_and_sets_its_next_hp(self) -> None:
+        events = _events(
+            "|switch|p1a: Simisear|Simisear, L50|100/100",
+            "|faint|p1a: Simisear",
+            "|-heal|p1: Zoroark|50/100|[from] move: Revival Blessing",
+            "|switch|p1a: Simisear|Simisear, L50|50/100",
+        )
+
+        result = resolve_protocol_events("resolution-test", (_ILLUSION_SIDE, _PLAIN_SIDE), events)
+
+        resolved = result.require_accepted()
+        assert resolved[0].pokemon_refs[0].member_id == _ZOROARK
+        assert resolved[1].pokemon_refs[0].member_id == _ZOROARK
+        assert resolved[3].pokemon_refs[0].member_id == _ZOROARK
+
     def test_member_revived_by_revival_blessing_enters_again(self) -> None:
         events = _events(
             "|switch|p1a: Alpha|Alpha, L50|100/100",

@@ -76,13 +76,16 @@ def transform_target_reference(
     if player_role not in {"p1", "p2"}:
         raise ValueError("Transform target resolution requires a known player role")
     opponent_role = "p2" if player_role == "p1" else "p1"
-    for side, active_pokemon in (
-        (player_role, battle.active_pokemon),
-        (opponent_role, battle.opponent_active_pokemon),
+    for side, active_pokemon, team in (
+        (player_role, battle.active_pokemon, battle.team),
+        (opponent_role, battle.opponent_active_pokemon, battle.opponent_team),
     ):
         for slot, pokemon in enumerate(active_pokemon):
             if pokemon is target:
-                return f"{side}{'ab'[slot]}: {target.name}"
+                # A reveal can rename the Pokemon without changing its team key.
+                key = next((key for key, member in team.items() if member is target), None)
+                name = target.name if key is None else key[4:]
+                return f"{side}{'ab'[slot]}: {name}"
     raise ValueError(f"Transform target {target_value!r} is not active")
 
 

@@ -9,7 +9,7 @@ import pytest
 
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.classification import EventClassification
-from p0.replays.reconstruction.diagnostics import ReplayEventParseError
+from p0.replays.reconstruction.diagnostics import ReplayEventParseError, ReplayRejectionCategory
 from p0.replays.reconstruction.events import parse_protocol_event, parse_protocol_events
 from p0.replays.reconstruction.identity import (
     ReplayMemberId,
@@ -599,7 +599,7 @@ class TestReconstructionEvents:
         assert result.events == ()
         assert len(result.diagnostics) == 1
         assert result.diagnostics[0].line_index == 0
-        assert result.diagnostics[0].reason.startswith("unresolved_illusion:")
+        assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
 
     def test_switch_out_before_reveal_remains_unresolved(self) -> None:
         ots = (
@@ -621,7 +621,7 @@ class TestReconstructionEvents:
         result = resolve_protocol_events("illusion-switch-out", ots, parsed.events)
 
         assert result.events == ()
-        assert result.diagnostics[0].reason.startswith("unresolved_illusion:")
+        assert result.diagnostics[0].category is ReplayRejectionCategory.AMBIGUOUS_IDENTITY
 
     def test_local_golden_replay_is_classified_once_without_rejections(self) -> None:
         document = parse_replay_payload(_GOLDEN_REPLAY.read_bytes())

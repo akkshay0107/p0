@@ -131,6 +131,9 @@ def _message_tag(line: str) -> str:
 _PROTOCOL_LINES: WeakKeyDictionary[DoubleBattle, list[str]] = WeakKeyDictionary()
 # Best-of room notices that are not battle events.
 _ROOM_NOTICES = frozenset({"tempnotify", "tempnotifyoff"})
+# The "|"-split field holding the HP of each line that shows HP.
+_HP_FIELD_INDICES = {"switch": 4, "drag": 4, "-damage": 3, "-heal": 3, "-sethp": 3}
+_HP_BAR_COLOURS = "gyr"
 
 
 def _install_patches_and_record_lines() -> None:
@@ -196,7 +199,8 @@ def _live_boundary(record: dict[str, Any], splice_index: int, splice_count: int)
 
 class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
     """
-    Random player that saves pre-fusion decisions and completed replay JSON.
+    Random player that saves pre-fusion decisions, the open team sheets it receives
+    and its finished battles.
 
     Captures exact raw observation tensors, action decisions, and replay line stream offsets
     during live battle execution so offline replay reconstruction can be verified 1-to-1 against ground truth.
@@ -207,8 +211,6 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         *,
         observation_builder: ObservationBuilder,
         observation_dir: Path,
-        replay_dir: Path | None = None,
-        write_replays: bool = False,
         team_source: TeamCorpus,
         team_rng: random.Random,
         handler_failure: Future[None],
@@ -216,12 +218,11 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
     ) -> None:
         self.observation_builder = observation_builder
         self.observation_dir = observation_dir
-        self.replay_dir = replay_dir
-        self.write_replays = write_replays
-        self.replay_paths: list[Path] = []
         self.observation_paths: list[Path] = []
         self.teams_seen: list[str] = []
-        self._showteam_lines: dict[str, list[str]] = {}
+        self.showteam_lines: dict[str, list[str]] = {}
+        # The team mixin forgets a battle when it ends; the public replay needs both captures.
+        self.finished_battles: dict[str, DoubleBattle] = {}
         self._live_records: dict[str, list[dict[str, Any]]] = {}
         self.handler_failure = handler_failure
         super().__init__(team_source=team_source, team_rng=team_rng, **kwargs)
@@ -232,7 +233,7 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         try:
             for split_message in split_messages[1:]:
                 if len(split_message) > 1 and split_message[1] == "showteam":
-                    self._showteam_lines.setdefault(battle_tag, []).append("|".join(split_message))
+                    self.showteam_lines.setdefault(battle_tag, []).append("|".join(split_message))
             await super()._handle_battle_message(split_messages)
         except Exception as exc:
             if not self.handler_failure.done():
@@ -315,8 +316,7 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
 
     def _battle_finished_callback(self, battle: AbstractBattle) -> None:
         self._write_observation_tensors(battle)
-        if self.write_replays:
-            self._write_replay_json(battle)
+        self.finished_battles[battle.battle_tag] = cast(DoubleBattle, battle)
         if self.current_team_packed is not None:
             self.teams_seen.append(self.current_team_packed)
         super()._battle_finished_callback(battle)
@@ -327,9 +327,8 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         role = str(battle.player_role)
         payload = {
             "records": self._live_records.pop(battle.battle_tag, []),
-            # This side's own copy of the protocol stream. For the player that does not
-            # write the replay it is an independent capture of the same battle, which
-            # is what makes the line-stream comparison a real check.
+            # This side's own copy of the protocol stream, which the line-stream check
+            # compares with the public replay.
             "lines": [
                 line
                 for line in _battle_log_lines(tuple(_PROTOCOL_LINES.get(double_battle, ())))
@@ -340,49 +339,6 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         path = self.observation_dir / f"{replay_id}-{role}.pt"
         torch.save(payload, path)
         self.observation_paths.append(path)
-
-    def _write_replay_json(self, battle: AbstractBattle) -> None:
-        if self.replay_dir is None:
-            raise RuntimeError("Replay output is enabled without a replay directory")
-
-        double_battle = cast(DoubleBattle, battle)
-        replay_id = battle.battle_tag.removeprefix("battle-")
-        replay_events = list(_battle_log_lines(tuple(double_battle._build_replay_events())))
-        showteam_lines = self._showteam_lines.pop(battle.battle_tag, [])
-
-        if showteam_lines:
-            insertion_point = next(
-                (
-                    index
-                    for index, line in enumerate(replay_events)
-                    if _message_tag(line) == "switch"
-                ),
-                len(replay_events),
-            )
-            replay_events[insertion_point:insertion_point] = showteam_lines
-
-        players = battle.players
-        winner = next(
-            (line.split("|", 2)[2] for line in replay_events if _message_tag(line) == "win"),
-            "",
-        )
-        payload = {
-            "id": replay_id,
-            "formatid": FORMAT.battle_format,
-            "p1": players[0],
-            "p2": players[1],
-            "winner": winner,
-            "roomid": battle.battle_tag,
-            "parent": replay_id,
-            "game_number": 1,
-            "uploadtime": 0,
-            "log": "\n".join(replay_events),
-        }
-
-        self.replay_dir.mkdir(parents=True, exist_ok=True)
-        path = self.replay_dir / f"{replay_id}.json"
-        path.write_bytes(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS) + b"\n")
-        self.replay_paths.append(path)
 
 
 def _stress_game_count() -> int:
@@ -609,6 +565,8 @@ def _assert_reconstruction_labels(
         assert len(rejected) == 1
         assert rejected <= {
             "rejected_reconstruction_AMBIGUOUS_IDENTITY",
+            "rejected_reconstruction_INCONSISTENT_IDENTITY",
+            "rejected_reconstruction_TIME_LIMIT_EXCEEDED",
             "rejected_reconstruction_INVALID_INPUT_CONTRACT",
             "rejected_reconstruction_UNSUPPORTED_EVENT",
         }
@@ -780,13 +738,32 @@ def _assert_live_truth(
             and live_interval_start == replay_interval_starts[snapshot.pre_line_index]
         )
         try:
+            live = _live_tensors(record)
             _assert_expected_observation_fields(
-                _live_tensors(record),
+                live,
                 reconstructed,
                 compare_event_fields=exact_boundary and replay_cursor not in seen_replay_cursors,
                 compare_event_values=same_interval,
                 compare_dynamic_fields=exact_boundary,
             )
+            if exact_boundary and any(
+                normalize_showdown_id(member.ability) == "illusion"
+                for member in document.ots[1 - perspective.player].members
+            ):
+                # These are public opponent fields, compared with the actual live
+                # capture at the same cursor. Private stat estimates differ by source.
+                categorical = (*range(21), *range(22, live.categorical.shape[1]))
+                numerical = (*range(5, 30), 31, *range(32, 38), 50)
+                torch.testing.assert_close(
+                    live.categorical[6:12, categorical],
+                    reconstructed.categorical[6:12, categorical],
+                )
+                torch.testing.assert_close(
+                    live.numerical[6:12, numerical],
+                    reconstructed.numerical[6:12, numerical],
+                    atol=0.011,
+                    rtol=0,
+                )
         except AssertionError as exc:
             raise AssertionError(
                 f"Replay {document.metadata.replay_id}, observer p{perspective.player + 1}, "
@@ -858,7 +835,6 @@ def _assert_poke_env_state_agreement(
                 # species; the replay reducer still retains the active member.
                 if reconstructed is not None and (
                     any(effect.name == "ILLUSION" for effect in reconstructed.effects)
-                    or reconstructed.identity_uncertain
                 ):
                     continue
                 if mon is None or reconstructed is None:
@@ -921,6 +897,80 @@ def _protocol_lines_agree(left: str, right: str) -> bool:
         expected == actual or _hp_fields_agree(expected, actual)
         for expected, actual in zip(left_parts, right_parts, strict=True)
     )
+
+
+def _public_replay_events(battles: tuple[DoubleBattle, DoubleBattle]) -> list[str]:
+    """
+    Merge both players' captures of one battle into the log a spectator receives.
+
+    Each player sees its own Pokemon's HP exactly and the opponent's as a percentage,
+    so a line naming one side is taken from the other side's capture.
+    """
+    captures = {
+        battle.player_role: _battle_log_lines(tuple(battle._build_replay_events()))
+        for battle in battles
+    }
+    p1_lines, p2_lines = captures["p1"], captures["p2"]
+    if len(p1_lines) != len(p2_lines):
+        raise AssertionError(
+            f"The players captured {len(p1_lines)} and {len(p2_lines)} lines of one battle"
+        )
+
+    public = []
+    for p1_line, p2_line in zip(p1_lines, p2_lines, strict=True):
+        if p1_line == p2_line:
+            public.append(p1_line)
+            continue
+        if not _protocol_lines_agree(p1_line, p2_line):
+            raise AssertionError(f"The players captured {p1_line!r} and {p2_line!r}")
+        public.append(p2_line if p1_line.split("|")[2].startswith("p1") else p1_line)
+    return public
+
+
+def _write_public_replay(
+    battles: tuple[DoubleBattle, DoubleBattle], showteam_lines: list[str], replay_dir: Path
+) -> Path:
+    """Write one battle as replay JSON in the public form of Showdown's replay site."""
+    battle = battles[0]
+    replay_id = battle.battle_tag.removeprefix("battle-")
+    replay_events = _public_replay_events(battles)
+    insertion_point = next(
+        (index for index, line in enumerate(replay_events) if _message_tag(line) == "switch"),
+        len(replay_events),
+    )
+    replay_events[insertion_point:insertion_point] = showteam_lines
+
+    winner = next(
+        (line.split("|", 2)[2] for line in replay_events if _message_tag(line) == "win"),
+        "",
+    )
+    payload = {
+        "id": replay_id,
+        "formatid": FORMAT.battle_format,
+        "p1": battle.players[0],
+        "p2": battle.players[1],
+        "winner": winner,
+        "roomid": battle.battle_tag,
+        "parent": replay_id,
+        "game_number": 1,
+        "uploadtime": 0,
+        "log": "\n".join(replay_events),
+    }
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    path = replay_dir / f"{replay_id}.json"
+    path.write_bytes(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS) + b"\n")
+    return path
+
+
+def _shows_exact_hp(line: str) -> bool:
+    """Whether a line gives HP out of a maximum other than 100, which only its owner sees."""
+    parts = line.split("|")
+    index = _HP_FIELD_INDICES.get(_message_tag(line))
+    if index is None or len(parts) <= index:
+        return False
+    hp = parts[index].split(" ", 1)[0]
+    # Showdown may add the colour of the HP bar to a percentage (50/100y).
+    return "/" in hp and hp.split("/", 1)[1].rstrip(_HP_BAR_COLOURS) != "100"
 
 
 def _assert_line_stream_fidelity(
@@ -1023,7 +1073,8 @@ class TestRandomReplayReconstruction:
 
         Verifies that:
         1. A seeded workload of real live battles completes against local Showdown.
-        2. Spliced replay documents capture all turns with valid terminal line indices.
+        2. Public replay documents, merged from both players' captures, cover all turns
+           with valid terminal line indices.
         3. Reconstructed observations match ground truth live captured tensors at exact line boundaries.
         4. Offline reconstructed state machines perfectly agree with poke-env active pokemon/field state.
         5. Reconstructed action candidates encapsulate the actual live chosen actions.
@@ -1064,8 +1115,6 @@ class TestRandomReplayReconstruction:
             player_a = JsonCapturingRandomPlayer(
                 account_configuration=AccountConfiguration("StressRandomA", None),
                 team_rng=random.Random(seed + 1),
-                replay_dir=replay_dir,
-                write_replays=True,
                 **common_kwargs,
             )
             player_b = JsonCapturingRandomPlayer(
@@ -1106,7 +1155,17 @@ class TestRandomReplayReconstruction:
                     raise RuntimeError(f"Failed to stop stress players: {failures}")
                 logging.getLogger(__name__).error("Failed to stop stress players: %s", failures)
 
-        replay_paths = tuple(sorted(player_a.replay_paths))
+        # Each player sees only its own HP exactly, so the replay merges both captures.
+        replay_paths = tuple(
+            sorted(
+                _write_public_replay(
+                    (battle, player_b.finished_battles[battle_tag]),
+                    player_a.showteam_lines.pop(battle_tag, []),
+                    replay_dir,
+                )
+                for battle_tag, battle in player_a.finished_battles.items()
+            )
+        )
         assert len(replay_paths) == game_count
         assert all(path.is_file() and path.suffix == ".json" for path in replay_paths)
 
@@ -1120,6 +1179,10 @@ class TestRandomReplayReconstruction:
         )
         assert len(documents) == game_count
         assert all(document.outcome.terminal_line_index is not None for document in documents)
+        # A public replay shows every HP as a percentage.
+        assert not any(
+            _shows_exact_hp(line.raw) for document in documents for line in document.protocol_lines
+        )
 
         # Verify accepted games against live observations. Unsupported or
         # ambiguous traces must be rejected as whole games.

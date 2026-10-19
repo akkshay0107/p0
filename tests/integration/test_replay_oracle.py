@@ -107,7 +107,7 @@ class TestReplayOracleIntegration:
                 if live is None or projected is None:
                     continue
                 compared_members += 1
-                assert live.species.casefold() == projected.displayed_species.casefold()
+                assert live.species.casefold() == projected.current_form.casefold()
                 assert live.status == projected.status
                 assert live.current_hp_fraction == pytest.approx(projected.hp_fraction, abs=0.02)
                 assert dict(live.boosts) == dict(projected.boosts)

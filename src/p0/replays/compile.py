@@ -202,9 +202,7 @@ def _replay_observation(
     overrides: dict[Any, tuple[int, int, int, int, int, int] | None] = {}
     for pokemon in (*view.team.values(), *view.opponent_team.values()):
         try:
-            overrides[pokemon] = (
-                None if pokemon.identity_uncertain else stat_overrides[pokemon.member_id]
-            )
+            overrides[pokemon] = stat_overrides[pokemon.member_id]
         except KeyError as exc:
             raise ValueError("Replay stats are missing a roster member") from exc
     return builder.build(view, overrides)

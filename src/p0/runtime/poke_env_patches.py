@@ -224,12 +224,41 @@ def _promote_duplicate_partner(battle: DoubleBattle, slot: str, leaving: Pokemon
     partner = getattr(battle, "_p0_duplicate_active", {}).get(
         f"{role}{'b' if slot[2] == 'a' else 'a'}"
     )
-    if partner is None or partner.species != leaving.species:
+    # One display may have changed form since entering (Morpeko's Hunger Switch).
+    if partner is None or partner.base_species != leaving.base_species:
         return
 
     _replace_team_entry(battle, role, leaving, partner)
-    if leaving.fainted:
-        _battle_state(battle, "_p0_fainted_twins")[partner] = leaving
+    # Keep the real Pokemon: it returns to its team entry when the display is revealed
+    # as the Illusion user, when it comes back beside the display, or, once it has
+    # fainted, when the Illusion user is revealed or switches in as itself.
+    _battle_state(battle, "_p0_hidden_twins")[partner] = leaving
+
+
+def _restore_real_twins(battle: DoubleBattle, role: str, revealed: Pokemon) -> None:
+    """When the Illusion user shows itself, give disguise copies' team entries back."""
+    twins = getattr(battle, "_p0_hidden_twins", {})
+    team = battle._team if role == battle.player_role else battle._opponent_team
+    for key, member in team.items():
+        twin = twins.get(member)
+        # The revealed display was the disguise. A twin that fainted is real as well,
+        # because the Illusion user is alive at its reveal.
+        if twin is not None and (member is revealed or twin.fainted):
+            del twins[member]
+            team[key] = twin
+
+
+def _follow_swapped_duplicates(battle: DoubleBattle, role: str) -> None:
+    """Keep each same-species display copy keyed by the slot it holds after Ally Switch."""
+    duplicates = getattr(battle, "_p0_duplicate_active", {})
+    active_by_slot = (
+        battle._active_pokemon if role == battle.player_role else battle._opponent_active_pokemon
+    )
+    copies = [duplicates.pop(slot) for slot in (f"{role}a", f"{role}b") if slot in duplicates]
+    for copy in copies:
+        for slot in (f"{role}a", f"{role}b"):
+            if active_by_slot.get(slot) is copy:
+                duplicates[slot] = copy
 
 
 def _replace_team_entry(battle: DoubleBattle, role: str, old: Pokemon, new: Pokemon) -> None:
@@ -268,6 +297,11 @@ def _end_roost(battle: DoubleBattle) -> None:
         if mon._temporary_types is roosted:
             mon._temporary_types = previous
     roosting.clear()
+
+
+def _base_species(species: str) -> str:
+    entry = GenData.from_gen(9).pokedex.get(to_id_str(species), {})
+    return to_id_str(entry.get("baseSpecies", species))
 
 
 def _battle_state(battle: DoubleBattle, name: str) -> dict[Any, Any]:
@@ -328,7 +362,14 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
                     # so a disguised Illusion user fainted.
                     _faint_illusion_user(self, role)
                 other_slot = f"{role}{'b' if slot == 'a' else 'a'}"
-                if active_by_slot.get(other_slot) is incoming:
+                hidden_twin = getattr(self, "_p0_hidden_twins", {}).get(incoming)
+                if active_by_slot.get(other_slot) is incoming and hidden_twin is not None:
+                    # The display holding this team entry stays; the real Pokemon it took
+                    # the entry from comes back to it.
+                    del _battle_state(self, "_p0_hidden_twins")[incoming]
+                    _replace_team_entry(self, role, incoming, hidden_twin)
+                    _battle_state(self, "_p0_duplicate_active")[other_slot] = incoming
+                elif active_by_slot.get(other_slot) is incoming:
                     # In Illusion, two active slots may show the same species. poke-env
                     # would assign the same Pokemon object to both slots; clone it for the partner.
                     duplicate = deepcopy(incoming)
@@ -337,6 +378,9 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
                     shown_types = incoming._temporary_types
                     # The partner keeps the shown volatile state; the incoming Pokemon enters fresh.
                     incoming.switch_out(self.fields)
+                    added_types = getattr(self, "_p0_added_types", {})
+                    if incoming in added_types:
+                        added_types[duplicate] = added_types.pop(incoming)
                     if id(incoming) in targets:
                         # A disguise copies the transformed look, so both displays show it.
                         targets[id(duplicate)] = targets[id(incoming)]
@@ -352,8 +396,10 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     transferred_effects: dict[Effect, int] = {}
     revealed_status = None
     if event_type == "replace" and outgoing is not None:
-        transferred_boosts = dict(outgoing.boosts)
-        transferred_effects = dict(outgoing.effects)
+        revealed = self.get_pokemon(split_message[2], details=split_message[3])
+        if revealed is not outgoing:
+            # poke-env clears the display when it reveals, so its state moves first.
+            _move_active_state(outgoing, revealed, _battle_state(self, "_p0_added_types"))
         revealed_status = outgoing.status
     if event_type == "switch" and len(split_message) >= 6:
         causes = tuple(to_id_str(part.removeprefix("[from]")) for part in split_message[5:])
@@ -427,14 +473,18 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
             self.opponent_side_conditions.pop(guard, None)
     if event_type in {"switch", "drag", "replace"} and len(split_message) >= 3:
         getattr(self, "_p0_duplicate_active", {}).pop(split_message[2][:3], None)
+    if event_type == "swap" and len(split_message) >= 3:
+        _follow_swapped_duplicates(self, split_message[2][:2])
     leaving = fainted if outgoing is None else outgoing
     if leaving is not None:
         _promote_duplicate_partner(self, split_message[2][:3], leaving)
     if event_type == "replace" and outgoing is not None:
-        fainted_twin = getattr(self, "_p0_fainted_twins", {}).pop(outgoing, None)
-        if fainted_twin is not None:
-            # The revealed display was the disguise, so the twin that fainted was real.
-            _replace_team_entry(self, split_message[2][:2], outgoing, fainted_twin)
+        _restore_real_twins(self, split_message[2][:2], outgoing)
+    elif event_type in {"switch", "drag"} and len(split_message) >= 3:
+        shown = self.get_pokemon(split_message[2])
+        if shown.ability == "illusion":
+            # The Illusion user shows itself, so it is alive and no fainted twin was it.
+            _restore_real_twins(self, split_message[2][:2], shown)
     if fainted is not None:
         # Showdown clears volatiles on faint; poke-env only clears a subset.
         fainted.switch_out(self.fields)
@@ -444,10 +494,16 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
         current_types = target.types
         if added_type not in current_types:
             target._temporary_types = [*current_types, added_type]
+        # Kept apart from the types: a disguise can already show the added type.
+        _battle_state(self, "_p0_added_types")[target] = added_type
+    if event_type == "-start" and len(split_message) >= 4 and split_message[3] == "typechange":
+        # A type change replaces an added type too.
+        getattr(self, "_p0_added_types", {}).pop(self.get_pokemon(split_message[2]), None)
     cleared = fainted
     if cleared is None and event_type in {"switch", "drag"}:
         cleared = outgoing
     if cleared is not None:
+        getattr(self, "_p0_added_types", {}).pop(cleared, None)
         if original_size is not None:
             cleared._heightm, cleared._weightkg = original_size
         base_form = baselines.get(cleared)
@@ -457,15 +513,25 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     # outgoing and incoming Pokemon share one object.
     if event_type in {"switch", "drag", "replace", "detailschange"} and len(split_message) >= 4:
         current = self.get_pokemon(split_message[2])
+        shown_species = split_message[3].split(",", 1)[0]
+        if (
+            event_type in {"switch", "drag"}
+            and current.species != to_id_str(shown_species)
+            and _base_species(shown_species) == current.base_species
+        ):
+            # poke-env applies switch details only to a new Pokemon. A team entry that
+            # passed to a disguise's copy can hold a stale form (Mimikyu before Busted).
+            # Another species here is a disguise of a transformed Pokemon, not a form.
+            current.forme_change(shown_species)
         baselines[current] = current.species
     if transferred_boosts is not None or transferred_effects:
         incoming = self.get_pokemon(split_message[2])
         if transferred_boosts is not None:
             incoming.boosts = transferred_boosts
         incoming.effects.update(transferred_effects)
-        if event_type == "replace":
-            # poke-env copies the status to the revealed Pokemon, then clears it when copying HP.
-            incoming.status = revealed_status
+    if event_type == "replace" and outgoing is not None:
+        # poke-env copies the status to the revealed Pokemon, then clears it when copying HP.
+        self.get_pokemon(split_message[2]).status = revealed_status
     return result
 
 
@@ -476,8 +542,19 @@ def _get_pokemon(
     details: str = "",
     request: dict[str, Any] | None = None,
 ) -> Pokemon:
-    """Resolve a duplicated Illusion display by its active slot, and an off-field nickname."""
+    """Resolve active protocol references by slot, and off-field references by nickname."""
     if not force_self_team and len(identifier) >= 5 and identifier[3:5] == ": ":
+        if not details and request is None:
+            # The owner's request already names its disguised Illusion user. Later
+            # public lines still use the copied name, but always mean this active slot.
+            active = (
+                self._active_pokemon
+                if identifier[:2] == self.player_role
+                else self._opponent_active_pokemon
+            )
+            member = active.get(identifier[:3])
+            if member is not None:
+                return member
         alias = getattr(self, "_p0_duplicate_active", {}).get(identifier[:3])
         if alias is not None and alias.identifies_as(identifier[5:]):
             return alias
@@ -494,7 +571,9 @@ def _place_requested_actives(battle: DoubleBattle, side_pokemon: list[dict[str, 
     Put the request's active Pokemon in their slots.
 
     poke-env detects a disguised own Illusion user from the request but leaves the
-    disguise display in its slot, which then reads as empty.
+    disguise display in its slot, which then reads as empty. Until the request, the
+    display was the team entry of the benched Pokemon it copies, so the state the
+    disguise gained moves to the Illusion user and the benched Pokemon is reset.
     """
     # Showdown lists the active Pokemon first, in slot order.
     for position, pokemon in zip("ab", side_pokemon):
@@ -503,14 +582,39 @@ def _place_requested_actives(battle: DoubleBattle, side_pokemon: list[dict[str, 
         member = battle._team.get(pokemon["ident"])
         if not pokemon["active"] or shown is None or member is None or shown is member:
             continue
-        if shown.species == member.species:
+        if shown.base_species == member.base_species:
             # The clone made for two same-species displays holds this member's state.
             battle._team[pokemon["ident"]] = shown
             continue
 
-        member.boosts = dict(shown.boosts)
-        member.effects.update(shown.effects)
+        _move_active_state(shown, member, _battle_state(battle, "_p0_added_types"))
+        # The request that follows sets the benched Pokemon's HP and status.
+        shown.switch_out(battle.fields)
         battle._active_pokemon[slot] = member
+        # A display copy no longer names this slot, so later lines reach the Illusion user.
+        getattr(battle, "_p0_duplicate_active", {}).pop(slot, None)
+
+
+def _move_active_state(
+    shown: Pokemon, member: Pokemon, added_types: dict[Pokemon, PokemonType]
+) -> None:
+    """Give the Illusion user the battle state its disguise display gained on the field."""
+    member.boosts = dict(shown.boosts)
+    member.effects.update(shown.effects)
+    member._active_turns = shown._active_turns
+    member._protect_counter = shown._protect_counter
+    member._must_recharge = shown._must_recharge
+    member._preparing_move = shown._preparing_move
+    member._preparing_target = shown._preparing_target
+    if Effect.TYPECHANGE in shown.effects:
+        # A type change replaces the types, so the display's types are the user's.
+        member._temporary_types = list(shown._temporary_types)
+    added = added_types.pop(shown, None)
+    if added is not None:
+        # An added type (Forest's Curse, Trick-or-Treat) joins the user's own types.
+        added_types[member] = added
+        if added not in member.types:
+            member._temporary_types = [*member.types, added]
 
 
 def _parse_request(
