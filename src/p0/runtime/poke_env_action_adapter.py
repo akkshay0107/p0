@@ -20,7 +20,6 @@ from p0.battle.actions import (
     decode_action,
     team_selection,
 )
-from p0.runtime.poke_env_battle_adapter import action_move_slots
 
 
 def action_to_order(
@@ -93,7 +92,7 @@ def action_to_single_order(
             order = Player.create_order(move, move_target=target, mega=semantic.mega)
 
         else:
-            moves = action_move_slots(battle, position)
+            moves = tuple(active.moves.values())
             try:
                 move = moves[semantic.move_slot]
             except IndexError as error:

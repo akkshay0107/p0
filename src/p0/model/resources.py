@@ -19,6 +19,10 @@ class RuntimeResources:
     tokenizer: PokemonTokenizer
     mega_items: frozenset[str]
     mega_forms: frozenset[str]
+    # Species id to the id of its base species (Vivillon-Sandstorm to vivillon).
+    species_bases: dict[str, str]
+    # Mega Stone id to the ids of the species that can use it.
+    mega_species_by_item: dict[str, frozenset[str]]
 
     @classmethod
     def from_data(
@@ -48,12 +52,25 @@ class RuntimeResources:
             for entry in transformations
             if entry.get("isMega")
         )
+        species_bases = {
+            entry["id"]: PokemonTokenizer.normalize_id(entry["baseSpecies"])
+            for entry in dex["species"]
+        }
+        mega_species_by_item = {
+            PokemonTokenizer.normalize_id(item["id"]): frozenset(
+                PokemonTokenizer.normalize_id(species) for species in item["megaStone"]
+            )
+            for item in dex["items"]
+            if item.get("megaStone")
+        }
         return cls(
             vocab=vocab,
             dex=dex,
             tokenizer=shared_tokenizer or PokemonTokenizer(vocab),
             mega_items=mega_items,
             mega_forms=mega_forms,
+            species_bases=species_bases,
+            mega_species_by_item=mega_species_by_item,
         )
 
 

@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cache
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, NamedTuple
 
 from p0.battle.actions import (
     FORCED_ACTION,
@@ -23,7 +22,7 @@ from p0.replays.evidence import (
     ObservedAction,
     extract_action_evidence,
 )
-from p0.replays.identity import ReplayMemberId, ReplaySide, normalize_showdown_id
+from p0.replays.identity import ReplayMemberId, normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.contract import PIVOT_MOVES, REVIVAL_BLESSING
 from p0.replays.reconstruction.events import EventClassification
@@ -55,8 +54,6 @@ _SELF_TARGETS = frozenset(
     }
 )
 _NORMAL_TARGETS = frozenset({"normal", "any"})
-_ALLY_TARGETS = frozenset({"adjacentally"})
-_ALLY_OR_SELF_TARGETS = frozenset({"adjacentallyorself"})
 
 
 def _opponent_imprison_active(state: ReplayBattleState, perspective: int) -> bool:
@@ -75,9 +72,9 @@ def _opponent_imprison_active(state: ReplayBattleState, perspective: int) -> boo
 
 def _target_codes(move_target: str, actor_slot: int) -> tuple[int, ...]:
     ally, own = (-2, -1) if actor_slot == 0 else (-1, -2)
-    if move_target in _ALLY_TARGETS:
+    if move_target == "adjacentally":
         return (ally,)
-    if move_target in _ALLY_OR_SELF_TARGETS:
+    if move_target == "adjacentallyorself":
         # Live orders name the user by its own slot, like poke-env: ally first, then self.
         return (ally, own)
     if move_target in _NORMAL_TARGETS:
@@ -109,13 +106,9 @@ class DecisionWindow:
         return self.decision_type is not DecisionType.UNSPECIFIED
 
 
-@dataclass(frozen=True, slots=True)
-class DecisionReconstruction:
-    """Decision records for one perspective plus all classified windows."""
+class DecisionReconstruction(NamedTuple):
+    """Decision records and their observation-facing requests for one perspective."""
 
-    replay_id: str
-    player: int
-    windows: tuple[DecisionWindow, ...]
     decisions: tuple[DecisionRecord, ...]
     # The request each decision answered, in the same order.
     views: tuple[DecisionView, ...]
@@ -192,10 +185,6 @@ def _is_pivot(event: ResolvedProtocolEvent) -> bool:
     )
 
 
-def _has_action(event: ResolvedProtocolEvent) -> bool:
-    return event.event.tag in _ACTION_TAGS
-
-
 def _update_blocks(
     events: tuple[ResolvedProtocolEvent, ...],
 ) -> tuple[tuple[int, int], ...]:
@@ -241,10 +230,8 @@ def infer_decision_windows(
     event_tuple = tuple(events)
     if not event_tuple:
         return ()
-    has_separator = any(_is_separator(event) for event in event_tuple)
-    has_action = any(_has_action(event) for event in event_tuple)
-    if has_action and not has_separator:
-        first_action = next(event for event in event_tuple if _has_action(event))
+    first_action = next((event for event in event_tuple if event.event.tag in _ACTION_TAGS), None)
+    if first_action is not None and not any(_is_separator(event) for event in event_tuple):
         raise ValueError(
             f"Replay {first_action.event.replay_id!r} has actions but no update separators"
         )
@@ -277,8 +264,6 @@ def _animation_targets(
         actor = _reference(event, 0)
         target = _reference(event, 2)
         if actor is None or actor.member_id is None or target is None:
-            continue
-        if len(event.event.arguments) < 2:
             continue
         key = (actor.member_id, normalize_showdown_id(event.event.arguments[1]))
         targets.setdefault(key, target)
@@ -315,7 +300,7 @@ def _observed_move(
     event: ResolvedProtocolEvent,
     state: ReplayBattleState,
     animation_targets: Mapping[tuple[ReplayMemberId, str], ResolvedPokemonRefArgument],
-    mega_slots: set[tuple[ReplaySide, int]],
+    mega_slots: set[int],
     slot: int,
 ) -> ObservedAction:
     actor = _reference(event, 0)
@@ -323,7 +308,7 @@ def _observed_move(
         return ObservedAction(tag="move_slot_or_target_unknown")
     member = state.member(actor.member_id)
     move_id = normalize_showdown_id(event.event.arguments[1])
-    mega = (actor.pokemon_ref.side, slot) in mega_slots
+    mega = slot in mega_slots
     if move_id == "struggle":
         action = MEGA_FORCED_ACTION if mega else FORCED_ACTION
         return ObservedAction(action, tag="forced_move")
@@ -378,38 +363,35 @@ def _observed_actions(
 ) -> tuple[ObservedAction | None, ObservedAction | None, tuple[str, ...]]:
     observed: list[ObservedAction | None] = [None, None]
     tags: list[str] = []
-    mega_slots: set[tuple[ReplaySide, int]] = set()
-    generated_slots: set[tuple[ReplaySide, int]] = set()
-    encored_before_action: set[tuple[ReplaySide, int]] = set()
+    mega_slots: set[int] = set()
+    generated_slots: set[int] = set()
+    encored_before_action: set[int] = set()
     hidden_disables = _opponent_imprison_active(state, perspective)
     for event in events:
         parsed = event.event
+        actor = _reference(event, 0)
+        if (
+            actor is None
+            or actor.member_id is None
+            or actor.pokemon_ref.side.side_index != perspective
+        ):
+            continue
         if _is_revive(event):
-            target = _reference(event, 0)
-            if (
-                target is not None
-                and target.member_id is not None
-                and target.member_id.side.side_index == perspective
-            ):
-                # Only the user's slot answers a revive request. The lines after it,
-                # including the revived member's own return to an empty slot, are
-                # the rest of the turn.
-                observed[_reviving_slot(state, perspective)] = ObservedAction(
-                    SWITCH_START + target.member_id.roster_index,
-                    tag="revive",
-                )
-                break
+            # Only the user's slot answers a revive request. Later lines resume the turn.
+            observed[_reviving_slot(state, perspective)] = ObservedAction(
+                SWITCH_START + actor.member_id.roster_index,
+                tag="revive",
+            )
+            break
+        slot = actor.pokemon_ref.active_slot
+        if slot is None:
             continue
         if (
             parsed.tag == "-start"
-            and len(parsed.arguments) >= 2
             and normalize_showdown_id(parsed.arguments[1]) == "encore"
+            and observed[slot] is None
         ):
-            actor = _reference(event, 0)
-            if actor is not None and actor.pokemon_ref.active_slot is not None:
-                slot = actor.pokemon_ref.active_slot
-                if actor.pokemon_ref.side.side_index == perspective and observed[slot] is None:
-                    encored_before_action.add((actor.pokemon_ref.side, slot))
+            encored_before_action.add(slot)
         if parsed.tag == "-mega" or (
             parsed.tag == "-singleturn"
             and any(
@@ -417,38 +399,18 @@ def _observed_actions(
                 for argument in parsed.arguments
             )
         ):
-            actor = _reference(event, 0)
-            if (
-                actor is not None
-                and actor.member_id is not None
-                and actor.pokemon_ref.active_slot is not None
-            ):
-                marked_slots = mega_slots if parsed.tag == "-mega" else generated_slots
-                marked_slots.add((actor.pokemon_ref.side, actor.pokemon_ref.active_slot))
-
-        if parsed.tag not in _ACTION_TAGS:
-            continue
-        actor = _reference(event, 0)
-        if actor is None or actor.member_id is None or actor.pokemon_ref.active_slot is None:
-            continue
-        if actor.pokemon_ref.side.side_index != perspective:
-            continue
-        slot = actor.pokemon_ref.active_slot
-        key = (actor.pokemon_ref.side, slot)
+            marked_slots = mega_slots if parsed.tag == "-mega" else generated_slots
+            marked_slots.add(slot)
 
         if parsed.tag == "move":
-            if key in encored_before_action:
+            if slot in encored_before_action:
                 tags.append("mid_turn_encore_override")
                 continue
-            if (
-                hidden_disables
-                and len(parsed.arguments) >= 2
-                and normalize_showdown_id(parsed.arguments[1]) == "struggle"
-            ):
+            if hidden_disables and normalize_showdown_id(parsed.arguments[1]) == "struggle":
                 tags.append("hidden_disable_struggle")
                 continue
-            if key in generated_slots:
-                generated_slots.remove(key)
+            if slot in generated_slots:
+                generated_slots.remove(slot)
                 tags.append("externally_generated_move")
                 continue
             slot = _request_slot(actor, slot, state)
@@ -503,8 +465,6 @@ def _preview_actions(
 
     team_size = len(ots.members)
     lead_indices = tuple(member.roster_index for member in leads)
-    if len(set(lead_indices)) != 2:
-        return None, None, ("preview_duplicate_lead",)
     first = encode_team_pair(lead_indices[0], lead_indices[1], team_size=team_size)
 
     selected = tuple(
@@ -544,20 +504,10 @@ def _preview_actions(
     )
 
 
-@cache
-def _mega_species_by_item() -> Mapping[str, frozenset[str]]:
-    """Map each Mega Stone id to the species ids that can use it."""
-    return {
-        entry["id"]: frozenset(normalize_showdown_id(species) for species in entry["megaStone"])
-        for entry in default_runtime_resources().dex["items"]
-        if entry.get("megaStone")
-    }
-
-
 def _can_mega(member: ReplayPokemonState, used: bool) -> bool:
     item = normalize_showdown_id(member.item or "")
     species = normalize_showdown_id(member.current_form)
-    return not used and species in _mega_species_by_item().get(item, ())
+    return not used and species in default_runtime_resources().mega_species_by_item.get(item, ())
 
 
 def build_decision_view(
@@ -619,7 +569,6 @@ def build_decision_view(
         _request_slot(reference, line_slot, state)
         for event in window_events
         if event.event.tag == "move"
-        and len(event.event.arguments) >= 2
         and (
             _is_locked_move(event)
             or (
@@ -777,13 +726,7 @@ def reconstruct_decisions_from_trace(
             records.append(decision[0])
             views.append(decision[1])
 
-    return DecisionReconstruction(
-        document.metadata.replay_id,
-        perspective,
-        windows,
-        tuple(records),
-        tuple(views),
-    )
+    return DecisionReconstruction(tuple(records), tuple(views))
 
 
 __all__ = [

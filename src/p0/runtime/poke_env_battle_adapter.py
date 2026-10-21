@@ -50,28 +50,12 @@ class PokeEnvBattleView:
         return _transformed_active_pokemon(self._battle, opponent=True)
 
     @property
-    def available_moves(self):
-        return self._battle.available_moves
-
-    @property
     def available_switches(self):
         return self._battle.available_switches
 
     @property
     def can_mega_evolve(self):
         return self._battle.can_mega_evolve
-
-    @property
-    def force_switch(self):
-        return self._battle.force_switch
-
-    @property
-    def trapped(self):
-        return self._battle.trapped
-
-    @property
-    def maybe_trapped(self):
-        return self._battle.maybe_trapped
 
     @property
     def teampreview(self):
@@ -126,9 +110,6 @@ class PokeEnvBattleView:
     def spatial_events(self):
         return pending_events(self._battle)
 
-    def get_pokemon(self, identifier: str):
-        return self._battle.get_pokemon(identifier)
-
     def last_move(self, pokemon):
         return last_move(pokemon)
 
@@ -167,14 +148,6 @@ def locked_slots(battle: DoubleBattle) -> tuple[bool, ...]:
         len(moves := active.get("moves", ())) == 1 and "target" not in moves[0]
         for active in battle.last_request.get("active", ())
     )
-
-
-def action_move_slots(battle: DoubleBattle, position: int) -> tuple[Any, ...]:
-    """Return move slots used by the current action request."""
-    active = battle.active_pokemon[position]
-    if active is None:
-        return ()
-    return tuple(active.moves.values())
 
 
 def battle_view(battle: DoubleBattle) -> PokeEnvBattleView:

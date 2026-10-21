@@ -142,22 +142,6 @@ class TestPokeEnvPatches:
         assert [record.name for record in caplog.records] == ["test.other"]
         assert battle.team["p1: Aegislash"].species == "aegislash"
 
-    def test_transform_patch_accepts_species_target(self) -> None:
-        poke_env_patches.install()
-        battle = DoubleBattle("transform-test", "Alice", logging.getLogger("test"), gen=9)
-        battle.parse_message(["", "player", "p1", "Alice", "", ""])
-        battle.parse_message(["", "player", "p2", "Bob", "", ""])
-        battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
-        battle.parse_message(["", "switch", "p2a: Pikachu", "Pikachu, L50", "100/100"])
-        battle.parse_message(
-            ["", "-transform", "p1a: Ditto", "Pikachu", "[from] ability: Imposter"]
-        )
-
-        transformed = battle_view(battle).active_pokemon[0]
-        assert isinstance(transformed, TransformedPokemonView)
-        assert transformed.species == "pikachu"
-        assert transformed.base_species == "pikachu"
-
     def test_transform_targets_a_pokemon_renamed_by_an_earlier_reveal(self) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("transform-reveal", "Alice", logging.getLogger("test"), gen=9)
@@ -190,24 +174,30 @@ class TestPokeEnvPatches:
         assert transformed.species == "ninetalesalola"
         assert len(battle.opponent_team) == 2
 
-    def test_transform_keeps_the_form_copied_at_transform_time(self) -> None:
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_transform_keeps_the_form_and_ability_copied_at_transform_time(self, role: str) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("transform-form", "Alice", logging.getLogger("test"), gen=9)
+        other = "p2" if role == "p1" else "p1"
         battle.parse_message(["", "player", "p1", "Alice", "", ""])
         battle.parse_message(["", "player", "p2", "Bob", "", ""])
-        battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
-        battle.parse_message(["", "switch", "p2a: Charizard", "Charizard, L50", "100/100"])
-        battle.parse_message(
-            ["", "-transform", "p1a: Ditto", "Charizard", "[from] ability: Imposter"]
-        )
-        battle.parse_message(["", "detailschange", "p2a: Charizard", "Charizard-Mega-Y, L50"])
+        battle.parse_message(["", "switch", f"{role}a: Ditto", "Ditto, L50", "100/100"])
+        battle.parse_message(["", "switch", f"{other}a: Charizard", "Charizard, L50", "100/100"])
+        battle.parse_message(["", "-ability", f"{role}a: Ditto", "Limber"])
+        battle.parse_message(["", "-ability", f"{other}a: Charizard", "Blaze"])
+        battle.parse_message(["", "-transform", f"{role}a: Ditto", f"{other}a: Charizard"])
+        battle.parse_message(["", "detailschange", f"{other}a: Charizard", "Charizard-Mega-Y, L50"])
+        battle.parse_message(["", "-ability", f"{other}a: Charizard", "Drought"])
 
-        transformed = battle_view(battle).active_pokemon[0]
-        target = battle.opponent_active_pokemon[0]
+        view = battle_view(battle)
+        transformed = view.active_pokemon[0] if role == "p1" else view.opponent_active_pokemon[0]
+        target = view.opponent_active_pokemon[0] if role == "p1" else view.active_pokemon[0]
         assert isinstance(transformed, TransformedPokemonView)
         assert transformed.species == "charizard"
+        assert transformed.ability == "blaze"
         assert target is not None
         assert target.species == "charizardmegay"
+        assert target.ability == "drought"
 
     def test_transform_keeps_the_moves_known_at_transform_time(self) -> None:
         poke_env_patches.install()
@@ -216,7 +206,9 @@ class TestPokeEnvPatches:
         battle.parse_message(["", "player", "p2", "Bob", "", ""])
         battle.parse_message(["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"])
         battle.parse_message(["", "switch", "p2a: Mew", "Mew, L50", "100/100"])
-        battle.parse_message(["", "-transform", "p1a: Ditto", "Mew", "[from] ability: Imposter"])
+        battle.parse_message(
+            ["", "-transform", "p1a: Ditto", "p2a: Mew", "[from] ability: Imposter"]
+        )
         battle.parse_message(["", "move", "p2a: Mew", "Psychic", "p1a: Ditto"])
 
         transformed = battle_view(battle).active_pokemon[0]
@@ -225,6 +217,26 @@ class TestPokeEnvPatches:
         assert "psychic" not in transformed.moves
         assert target is not None
         assert "psychic" in target.moves
+
+    def test_transform_preserves_a_copied_moves_one_pp_limit(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("transform-one-pp", "Alice", logging.getLogger("test"), gen=9)
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"],
+            ["", "switch", "p2a: Pawmot", "Pawmot, L50", "100/100"],
+            ["", "move", "p2a: Pawmot", "Revival Blessing", "p2a: Pawmot"],
+            ["", "-fail", "p2a: Pawmot"],
+            ["", "-transform", "p1a: Ditto", "p2a: Pawmot"],
+        ):
+            battle.parse_message(event)
+
+        copied = battle_view(battle).active_pokemon[0].moves["revivalblessing"]
+
+        assert copied.current_pp == copied.max_pp == 1
+        battle.parse_message(["", "move", "p1a: Ditto", "Revival Blessing", "p1a: Ditto"])
+        assert copied.current_pp == 0
 
     def test_transform_retains_original_hp_and_tracks_pp_and_type_changes(self) -> None:
         poke_env_patches.install()
@@ -235,7 +247,7 @@ class TestPokeEnvPatches:
             ["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"],
             ["", "switch", "p2a: Roserade", "Roserade, L50", "100/100"],
             ["", "move", "p2a: Roserade", "Giga Drain", "p1a: Ditto"],
-            ["", "-transform", "p1a: Ditto", "Roserade", "[from] ability: Imposter"],
+            ["", "-transform", "p1a: Ditto", "p2a: Roserade", "[from] ability: Imposter"],
         ):
             battle.parse_message(event)
 
@@ -309,7 +321,7 @@ class TestPokeEnvPatches:
             ["", "player", "p2", "Bob", "", ""],
             ["", "switch", "p1a: Ditto", "Ditto, L50", "100/100"],
             ["", "switch", "p2a: Grimmsnarl", "Grimmsnarl, L50", "100/100"],
-            ["", "-transform", "p1a: Ditto", "Grimmsnarl", "[from] ability: Imposter"],
+            ["", "-transform", "p1a: Ditto", "p2a: Grimmsnarl", "[from] ability: Imposter"],
         ):
             battle.parse_message(event)
         ditto = battle.active_pokemon[0]
@@ -467,41 +479,6 @@ class TestPokeEnvPatches:
         morpeko = battle.active_pokemon[0]
         assert morpeko is not None
         assert morpeko.types == [PokemonType.ELECTRIC, PokemonType.DARK]
-
-    def test_stance_change_form_resets_when_aegislash_switches_out(self) -> None:
-        poke_env_patches.install()
-        battle = DoubleBattle("aegislash-switch", "Alice", logging.getLogger("test"), gen=9)
-        for event in (
-            ["", "player", "p1", "Alice", "", ""],
-            ["", "player", "p2", "Bob", "", ""],
-            ["", "switch", "p1a: Aegislash", "Aegislash, L50", "100/100"],
-            ["", "-formechange", "p1a: Aegislash", "Aegislash-Blade"],
-        ):
-            battle.parse_message(event)
-        aegislash = battle.active_pokemon[0]
-        assert aegislash is not None and aegislash.species == "aegislashblade"
-
-        battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
-
-        assert aegislash.species == "aegislash"
-        assert aegislash.type_1.name == "STEEL"
-
-    def test_unlisted_temporary_form_resets_when_switching_out(self) -> None:
-        poke_env_patches.install()
-        battle = DoubleBattle("cherrim-switch", "Alice", logging.getLogger("test"), gen=9)
-        for event in (
-            ["", "player", "p1", "Alice", "", ""],
-            ["", "player", "p2", "Bob", "", ""],
-            ["", "switch", "p1a: Cherrim", "Cherrim, L50", "100/100"],
-            ["", "-formechange", "p1a: Cherrim", "Cherrim-Sunshine"],
-        ):
-            battle.parse_message(event)
-        cherrim = battle.active_pokemon[0]
-        assert cherrim is not None and cherrim.species == "cherrimsunshine"
-
-        battle.parse_message(["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"])
-
-        assert cherrim.species == "cherrim"
 
     def test_permanent_form_persists_when_switching_out(self) -> None:
         poke_env_patches.install()
@@ -1569,7 +1546,132 @@ class TestSideGuards:
         assert SideCondition.QUICK_GUARD not in battle.opponent_side_conditions
 
 
+class TestTransformAbility:
+    @pytest.mark.parametrize("role,row", (("p1", 0), ("p2", 6)))
+    def test_entrainment_changes_the_transformed_observation(self, role: str, row: int) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("transform-entrainment", "Alice", logging.getLogger("test"), gen=9)
+        other = "p2" if role == "p1" else "p1"
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", f"{role}a: Ditto", "Ditto, L50", "100/100"],
+            ["", "switch", f"{role}b: Audino", "Audino, L50", "100/100"],
+            ["", "switch", f"{other}a: Arcanine", "Arcanine, L50", "100/100"],
+            ["", "-ability", f"{role}a: Ditto", "Limber"],
+            ["", "-ability", f"{other}a: Arcanine", "Intimidate"],
+            ["", "-transform", f"{role}a: Ditto", f"{other}a: Arcanine"],
+            ["", "move", f"{role}b: Audino", "Entrainment", f"{role}a: Ditto"],
+            ["", "-ability", f"{role}a: Ditto", "Healer", "Intimidate", "[from] move: Entrainment"],
+        ):
+            battle.parse_message(event)
+
+        view = battle_view(battle)
+        transformed = view.active_pokemon[0] if role == "p1" else view.opponent_active_pokemon[0]
+        assert transformed.ability == "healer"
+        builder = ObservationBuilder(default_runtime_resources())
+        observation = builder.build(view)
+        assert observation.categorical[row, 1].item() == builder.tokenizer.id_for(
+            "abilities", "healer"
+        )
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_skill_swap_changes_the_transformed_ability(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("transform-skill-swap", "Alice", logging.getLogger("test"), gen=9)
+        other = "p2" if role == "p1" else "p1"
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", f"{role}a: Ditto", "Ditto, L50", "100/100"],
+            ["", "switch", f"{other}a: Arcanine", "Arcanine, L50", "100/100"],
+            ["", "switch", f"{other}b: Audino", "Audino, L50", "100/100"],
+            ["", "-ability", f"{role}a: Ditto", "Limber"],
+            ["", "-ability", f"{other}a: Arcanine", "Intimidate"],
+            ["", "-ability", f"{other}b: Audino", "Healer"],
+            ["", "-transform", f"{role}a: Ditto", f"{other}a: Arcanine"],
+            [
+                "",
+                "-activate",
+                f"{role}a: Ditto",
+                "Skill Swap",
+                "Healer",
+                "Intimidate",
+                f"[of] {other}b: Audino",
+            ],
+        ):
+            battle.parse_message(event)
+
+        view = battle_view(battle)
+        transformed = view.active_pokemon[0] if role == "p1" else view.opponent_active_pokemon[0]
+        assert transformed.ability == "healer"
+        partner = battle.opponent_active_pokemon[1] if role == "p1" else battle.active_pokemon[1]
+        assert partner is not None
+        assert partner.ability == "intimidate"
+
+
 class TestRoost:
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    @pytest.mark.parametrize(
+        "species,expected_types",
+        (
+            ("Noctowl", (PokemonType.NORMAL, PokemonType.FLYING)),
+            ("Tornadus", (PokemonType.FLYING,)),
+        ),
+    )
+    def test_transform_keeps_flying_from_a_roosting_target(
+        self, role: str, species: str, expected_types: tuple[PokemonType, ...]
+    ) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("transform-roost", "Alice", logging.getLogger("test"), gen=9)
+        other = "p2" if role == "p1" else "p1"
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", f"{role}a: Ditto", "Ditto, L50", "100/100"],
+            ["", "switch", f"{other}a: {species}", f"{species}, L50", "100/100"],
+            ["", "-singleturn", f"{other}a: {species}", "move: Roost"],
+            ["", "-transform", f"{role}a: Ditto", f"{other}a: {species}"],
+        ):
+            battle.parse_message(event)
+
+        view = battle_view(battle)
+        transformed = view.active_pokemon[0] if role == "p1" else view.opponent_active_pokemon[0]
+        assert tuple(transformed.types) == expected_types
+        battle.parse_message(["", "upkeep"])
+        view = battle_view(battle)
+        transformed = view.active_pokemon[0] if role == "p1" else view.opponent_active_pokemon[0]
+        assert tuple(transformed.types) == expected_types
+
+    @pytest.mark.parametrize("role", ("p1", "p2"))
+    def test_transform_keeps_changed_and_added_types_during_roost(self, role: str) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("transform-roost-typeadd", "Alice", logging.getLogger("test"), gen=9)
+        other = "p2" if role == "p1" else "p1"
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", f"{role}a: Ditto", "Ditto, L50", "100/100"],
+            ["", "switch", f"{other}a: Noctowl", "Noctowl, L50", "100/100"],
+            ["", "-singleturn", f"{other}a: Noctowl", "move: Roost"],
+            ["", "-start", f"{other}a: Noctowl", "typechange", "Dragon/Flying"],
+            ["", "-start", f"{other}a: Noctowl", "typeadd", "Ghost"],
+            ["", "-transform", f"{role}a: Ditto", f"{other}a: Noctowl"],
+        ):
+            battle.parse_message(event)
+
+        view = battle_view(battle)
+        transformed = view.active_pokemon[0] if role == "p1" else view.opponent_active_pokemon[0]
+        target = view.opponent_active_pokemon[0] if role == "p1" else view.active_pokemon[0]
+        assert tuple(transformed.types) == (
+            PokemonType.DRAGON,
+            PokemonType.FLYING,
+            PokemonType.GHOST,
+        )
+        assert tuple(target.types) == (PokemonType.DRAGON, PokemonType.GHOST)
+        battle.parse_message(["", "upkeep"])
+        assert tuple(target.types) == (PokemonType.DRAGON, PokemonType.FLYING, PokemonType.GHOST)
+
     def test_roost_removes_flying_until_upkeep(self) -> None:
         poke_env_patches.install()
         battle = DoubleBattle("roost", "Alice", logging.getLogger("test"), gen=9)

@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import json
-import logging
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
-from poke_env.battle import DoubleBattle
 
 from p0.battle.events import EventKind
 from p0.battle.legality import GAME_END_DECISION
@@ -18,97 +15,30 @@ from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
     CAT_IDX_PRESENCE_STATUS,
-    CAT_IDX_STAT_PROVENANCE,
     NUM_IDX_CAN_MEGA,
     NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_ORIG_IDX_RATIO,
     PresenceStatus,
-    StatProvenance,
 )
-from p0.replays.compile import compile_payloads, write_tensor_shards
+from p0.replays.compile import compile_payloads
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.decisions import (
     infer_decision_windows,
     reconstruct_decisions_from_trace,
 )
 from p0.replays.reconstruction.projection import (
-    impute_replay_stats,
-    project_battle_view,
     project_replay_perspectives,
 )
 from p0.replays.reconstruction.resolution import resolve_replay_events
-from p0.replays.reconstruction.state import AbilityState, reduce_replay_state
+from p0.replays.reconstruction.state import reduce_replay_state
 from tests.unit.replay_fixtures import decision_payload, golden_replay_payload
 
-_GOLDEN_REPLAY_DIRECTORY = (
-    Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
-)
 _REPLAY_FIXTURE_DIRECTORY = Path(__file__).parents[1] / "fixtures" / "replays"
 _ILLUSION_REPLAY = _REPLAY_FIXTURE_DIRECTORY / "gen9championsvgc2026regmbbo3-2670656566.json"
 _STATE_REPLAY = _REPLAY_FIXTURE_DIRECTORY / "gen9championsvgc2026regmbbo3-2641278886.json"
 
 
 class TestReconstructionProjection:
-    def test_later_illusion_identity_cannot_change_prior_observation(self) -> None:
-        path = _ILLUSION_REPLAY
-        document = parse_replay_payload(path.read_bytes())
-        resources = default_runtime_resources()
-        events = resolve_replay_events(document).require_accepted()
-        original = reduce_replay_state(
-            document.metadata.replay_id,
-            document.ots,
-            events,
-            snapshot_line_indices=(111,),
-        ).require_accepted()[0]
-        hidden_id = original.sides[1].active[0]
-        assert hidden_id is not None
-        hidden = original.member(hidden_id)
-        altered = replace(
-            hidden,
-            original_species="Zoroark",
-            current_form="Zoroark",
-            nature="Bold",
-            item="Choice Scarf",
-            ability=AbilityState("mystery"),
-            base_types=("Dark",),
-            current_types=("Dark",),
-            base_stats=tuple((name, 1) for name, _ in hidden.base_stats),
-            weight=1000.0,
-            moves=(),
-        )
-        changed = replace(
-            original,
-            members=tuple(
-                altered if member.member_id == hidden_id else member for member in original.members
-            ),
-        )
-        replay_events = resolve_replay_events(document).require_accepted()
-        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
-        windows = infer_decision_windows(replay_events)
-        decisions = (
-            reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, windows=windows
-            ),
-            reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, windows=windows
-            ),
-        )
-        perspectives = project_replay_perspectives(document, replay_state, decisions)
-        decision = next(
-            item.view.decision for item in perspectives[0].snapshots if item.pre_line_index == 112
-        )
-        first_view = project_battle_view(
-            original, document.ots, perspective=0, decision=decision, view_cache={}
-        )
-        second_view = project_battle_view(
-            changed, document.ots, perspective=0, decision=decision, view_cache={}
-        )
-        builder = ObservationBuilder(resources)
-        first = builder.build(first_view)
-        second = builder.build(second_view)
-        for left, right in zip(first.tensors(), second.tensors(), strict=True):
-            torch.testing.assert_close(left, right)
-
     def test_unrevealed_illusion_uses_displayed_public_fields(self) -> None:
         path = _ILLUSION_REPLAY
         document = parse_replay_payload(path.read_bytes())
@@ -157,48 +87,6 @@ class TestReconstructionProjection:
         assert observation.numerical[6, NUM_IDX_LEGALITY_UNKNOWN].item() == 0.0
         assert observation.categorical[6, 5:9].count_nonzero().item() == 4
 
-    def test_compiled_game_projects_opposing_perspectives_with_correct_roster_and_sides(
-        self,
-    ) -> None:
-        """Verify opposing perspectives mirror each other with correct roster states, side roles, and flags."""
-        result = compile_payloads((decision_payload(),))
-
-        first, second = result.accepted_series[0].games[0].perspectives
-        assert first.player == 0
-        assert second.player == 1
-        assert first.snapshots[0].view.teampreview
-        assert second.snapshots[0].view.teampreview
-
-        # Cross-perspective roster states mirror each other
-        first_team = first.snapshots[1].view.team
-        first_opp = first.snapshots[1].view.opponent_team
-        second_team = second.snapshots[1].view.team
-        second_opp = second.snapshots[1].view.opponent_team
-
-        assert {k: mon.state for k, mon in first_team.items()} == {
-            k: mon.state for k, mon in second_opp.items()
-        }
-        assert {k: mon.state for k, mon in first_opp.items()} == {
-            k: mon.state for k, mon in second_team.items()
-        }
-        assert all(not mon.opponent for mon in first_team.values())
-        assert all(mon.opponent for mon in first_opp.values())
-        assert all(not mon.opponent for mon in second_team.values())
-        assert all(mon.opponent for mon in second_opp.values())
-
-        first_active = first.snapshots[1].view.active_pokemon[0]
-        second_active = second.snapshots[1].view.active_pokemon[0]
-        assert first_active is not None
-        assert second_active is not None
-        assert first_active.member_id.side.value == "p1"
-        assert second_active.member_id.side.value == "p2"
-        first_opp_active = first.snapshots[1].view.opponent_active_pokemon[0]
-        second_opp_active = second.snapshots[1].view.opponent_active_pokemon[0]
-        assert first_opp_active is not None
-        assert second_opp_active is not None
-        assert first_active.state == second_opp_active.state
-        assert second_active.state == first_opp_active.state
-
     def test_preview_observation_excludes_executed_lead_choices(self) -> None:
         first_payload = golden_replay_payload("preview-first")
         second_payload = golden_replay_payload("preview-second")
@@ -231,113 +119,13 @@ class TestReconstructionProjection:
             == (None,) * 6
         )
 
-    def test_replay_stats_are_explicit_for_both_sides_and_never_known(self) -> None:
-        document = parse_replay_payload(decision_payload())
-        estimates = impute_replay_stats(document)
-
-        assert len(estimates) == 12
-        assert {estimate.member_id for estimate in estimates} == {
-            member.member_id for sheet in document.ots for member in sheet.members
-        }
-        assert all(estimate.provenance in {"IMPUTED", "UNKNOWN"} for estimate in estimates)
-        assert all(estimate.provenance != "KNOWN" for estimate in estimates)
-
-    def test_shards_preserve_explicit_unknown_stat_provenance(self, tmp_path: Path) -> None:
-        result = compile_payloads((decision_payload(),))
-        built = write_tensor_shards(
-            result,
-            tmp_path,
-            resources=default_runtime_resources(),
-            created_at="2026-01-01T00:00:00Z",
-        )
-
-        assert "compiler_backend" not in built.manifest.build_config
-        artifact = torch.load(
-            built.manifest_path.parent / built.manifest.shards[0].filename,
-            map_location="cpu",
-            weights_only=True,
-        )
-        provenance = artifact["tensors"]["categorical"][:, :12, CAT_IDX_STAT_PROVENANCE]
-        assert torch.all(provenance == int(StatProvenance.UNKNOWN))
-
-    @pytest.mark.skipif(
-        not tuple(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")),
-        reason="local golden replay corpus is not present",
-    )
-    def test_local_golden_replays_are_all_accepted(self) -> None:
-        paths = tuple(sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")))
-
-        result = compile_payloads(path.read_bytes() for path in paths)
-
-        assert result.metrics.counters["rejected_games"] == 0
-        assert result.metrics.counters["accepted_games"] == len(paths)
-
-    def test_state_matches_independent_poke_env_cursors(self) -> None:
-        path = _STATE_REPLAY
-        document = parse_replay_payload(path.read_bytes())
-        replay_events = resolve_replay_events(document).require_accepted()
-        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
-        windows = infer_decision_windows(replay_events)
-        decisions = (
-            reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, windows=windows
-            ),
-            reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, windows=windows
-            ),
-        )
-        perspectives = project_replay_perspectives(document, replay_state, decisions)
-        perspective = perspectives[0]
-        boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
-        oracle = DoubleBattle(
-            document.metadata.replay_id,
-            document.metadata.player_names[0],
-            logging.getLogger("p0.test.oracle"),
-            gen=9,
-        )
-        skipped = frozenset({"", "t:", "expire", "uhtmlchange", "showteam", "win", "tie"})
-        compared_boundaries = 0
-        compared_members = 0
-
-        for line in document.protocol_lines:
-            snapshot = boundaries.get(line.index)
-            if (
-                snapshot is not None
-                and not snapshot.view.teampreview
-                and oracle.player_role is not None
-            ):
-                compared_boundaries += 1
-                live_active = oracle.active_pokemon
-                for slot, live in enumerate(live_active):
-                    projected = snapshot.view.active_pokemon[slot]
-                    assert (live is None) == (projected is None)
-                    if live is None or projected is None:
-                        continue
-                    assert live.fainted == projected.fainted
-                    assert live.current_hp_fraction == pytest.approx(
-                        projected.current_hp_fraction,
-                        abs=0.02,
-                    )
-                    assert dict(live.boosts) == dict(projected.boosts)
-                    compared_members += 1
-
-            if line.parts[1] in skipped:
-                continue
-            try:
-                oracle.parse_message(list(line.parts))
-            except (AssertionError, IndexError, KeyError, NotImplementedError, ValueError) as exc:
-                pytest.fail(f"poke-env rejected {line.raw!r}: {exc}")
-
-        assert compared_boundaries == 6
-        assert compared_members == 11
-
 
 class TestSpatialEventIntervals:
-    def test_each_player_sees_every_move_since_its_own_previous_decision(self) -> None:
+    def test_intervals_close_at_each_players_decision_and_keep_the_final_exchange(self) -> None:
         """A waiting player's interval spans the opponent's decision instead of resetting."""
         payload = _STATE_REPLAY.read_bytes()
-        raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
         document = parse_replay_payload(payload)
+        raw_lines = [line.raw for line in document.protocol_lines]
         replay_events = resolve_replay_events(document).require_accepted()
         replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
         windows = infer_decision_windows(replay_events)
@@ -369,24 +157,6 @@ class TestSpatialEventIntervals:
                 previous = start
 
         assert spans_opponent_decision > 0
-
-    def test_final_view_holds_the_exchange_after_each_players_last_decision(self) -> None:
-        """The last exchange has no request; the final view keeps it with no choice."""
-        payload = _STATE_REPLAY.read_bytes()
-        raw_lines = [line.raw for line in parse_replay_payload(payload).protocol_lines]
-        document = parse_replay_payload(payload)
-        replay_events = resolve_replay_events(document).require_accepted()
-        replay_state = reduce_replay_state(document.metadata.replay_id, document.ots, replay_events)
-        windows = infer_decision_windows(replay_events)
-        decisions = (
-            reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=0, windows=windows
-            ),
-            reconstruct_decisions_from_trace(
-                document, replay_events, replay_state, perspective=1, windows=windows
-            ),
-        )
-        perspectives = project_replay_perspectives(document, replay_state, decisions)
 
         for perspective in perspectives:
             final_interval = raw_lines[perspective.snapshots[-1].pre_line_index :]

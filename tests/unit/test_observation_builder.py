@@ -76,8 +76,6 @@ class ObservationMove:
     category: Any
     current_pp: int
     max_pp: int
-    non_ghost_target: bool = True
-    deduced_target: Any = None
 
 
 @dataclass(eq=False, slots=True)
@@ -119,12 +117,8 @@ class FixtureBattleView:
     opponent_team: Mapping[str, Any]
     active_pokemon: Sequence[Any | None]
     opponent_active_pokemon: Sequence[Any | None]
-    available_moves: Sequence[Sequence[Any]]
     available_switches: Sequence[Sequence[Any]]
     can_mega_evolve: Sequence[bool]
-    force_switch: Sequence[bool]
-    trapped: Sequence[bool]
-    maybe_trapped: Sequence[bool]
     teampreview: bool
     player_role: str | None
     wait: bool
@@ -136,12 +130,8 @@ class FixtureBattleView:
     used_mega_evolve: bool
     opponent_used_mega_evolve: bool
     decision: DecisionView
-    identifiers: Mapping[str, Any] = field(default_factory=dict)
     spatial_events: Sequence[EventRecord] = ()
     stat_cache: dict[Any, Any] = field(default_factory=dict)
-
-    def get_pokemon(self, identifier: str) -> Any:
-        return self.identifiers[identifier]
 
     def last_move(self, pokemon: Any) -> str | None:
         move = pokemon.last_move
@@ -180,8 +170,6 @@ def make_pokemon_view(
             category=source_move.category,
             current_pp=move_pp,
             max_pp=source_move.max_pp or move_pp,
-            non_ghost_target=source_move.non_ghost_target,
-            deduced_target=source_move.deduced_target,
         )
 
     base_stats = dict(source.base_stats)
@@ -250,14 +238,8 @@ def make_battle_view(
         opponent_team={f"p2:{index}": pokemon for index, pokemon in enumerate(opponents)},
         active_pokemon=active,
         opponent_active_pokemon=opponent_active,
-        available_moves=tuple(
-            tuple(pokemon.moves.values()) if pokemon is not None else () for pokemon in active
-        ),
         available_switches=available_switches or [[], []],
         can_mega_evolve=can_mega_evolve or [False, False],
-        force_switch=(False, False),
-        trapped=(False, False),
-        maybe_trapped=(False, False),
         teampreview=teampreview,
         player_role="p1",
         wait=False,
@@ -273,11 +255,6 @@ def make_battle_view(
 
 
 _OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
-
-
-def from_battle(battle, tok=tokenizer, stat_overrides=None):
-    assert tok is _OBSERVATION_BUILDER.tokenizer
-    return _OBSERVATION_BUILDER.build(battle, stat_overrides)
 
 
 class TestObservationBuilder:

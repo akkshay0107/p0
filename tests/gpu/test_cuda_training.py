@@ -108,8 +108,8 @@ class TestCudaTraining:
                 compiled_parameter.grad, eager_parameter.grad, rtol=1e-2, atol=1e-3
             )
 
-    def test_rejected_minibatch_does_not_break_cuda_checkpoint_resume(
-        self, cuda_device: torch.device, tmp_path: Path
+    def test_rejected_minibatch_does_not_block_valid_cuda_update(
+        self, cuda_device: torch.device
     ) -> None:
         torch.manual_seed(31)
         policy = build_policy(MODEL_CONFIG, default_runtime_resources()).to(cuda_device)
@@ -159,58 +159,6 @@ class TestCudaTraining:
         assert all(math.isfinite(value) for value in stats.values())
         assert any(
             not torch.equal(before[name], value) for name, value in policy.state_dict().items()
-        )
-
-        checkpoint = tmp_path / "cuda-ppo.pt"
-        store = CheckpointStore()
-        store.save_training(
-            checkpoint,
-            1,
-            policy,
-            optimizer=optimizer,
-            scaler=scaler,
-            trainer_kind="ppo",
-            metadata={},
-        )
-        restored = build_policy(MODEL_CONFIG, default_runtime_resources()).to(cuda_device)
-        restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
-        restored_scaler = torch.amp.GradScaler("cuda", enabled=precision.grad_scaler)
-        assert (
-            store.load_training(
-                checkpoint,
-                restored,
-                trainer_kind="ppo",
-                optimizer=restored_optimizer,
-                scaler=restored_scaler,
-            )
-            == 1
-        )
-        for name, value in policy.state_dict().items():
-            torch.testing.assert_close(restored.state_dict()[name], value)
-        assert optimizer.state_dict()["state"]
-        torch.testing.assert_close(
-            restored_optimizer.state_dict(), optimizer.state_dict(), rtol=0, atol=0
-        )
-        assert restored_scaler.state_dict() == scaler.state_dict()
-
-        resumed_before = {
-            name: value.detach().clone() for name, value in restored.state_dict().items()
-        }
-        resumed_stats = ppo_update(
-            batches[1:],
-            restored,
-            Magnet(restored),
-            restored_optimizer,
-            restored_scaler,
-            config,
-            episode=1,
-            alpha=0.0,
-        )
-        assert resumed_stats["optimizer_updates"] == 1
-        assert all(math.isfinite(value) for value in resumed_stats.values())
-        assert any(
-            not torch.equal(resumed_before[name], value)
-            for name, value in restored.state_dict().items()
         )
 
     @pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))

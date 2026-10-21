@@ -43,14 +43,19 @@ from p0.format_config import FORMAT
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import (
+    CAT_IDX_STAT_PROVENANCE,
+    CATEGORICAL_WIDTH,
     NUM_IDX_CAN_MEGA,
     NUM_IDX_CAN_SWITCH_OUT,
     NUM_IDX_HP_FRACTION,
     NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_LEVEL_STATS,
     NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_REVEALED,
     NUM_IDX_SLOT_CONDITION_UNKNOWN,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STATUS_COUNTER,
+    TEAM_SIZE,
     TOKEN_IDX_ALLY_SIDE,
     StructuredObservation,
 )
@@ -119,6 +124,16 @@ _REPLAY_AMBIGUITY_TAGS = frozenset(
 
 _OBSERVATION_EVENT_FIELDS = ("spatial_cat",)
 _PUBLIC_CATEGORICAL_INDICES = (0, 3, 4)
+# Public HP is rounded to percent; the owner's live request has exact HP totals.
+_PUBLIC_HP_TOLERANCE = 0.011
+_PUBLIC_OPPONENT_CATEGORICAL_INDICES = tuple(
+    index for index in range(CATEGORICAL_WIDTH) if index != CAT_IDX_STAT_PROVENANCE
+)
+_PUBLIC_OPPONENT_NUMERICAL_INDICES = (
+    *range(NUM_IDX_HP_FRACTION, NUM_IDX_CAN_MEGA),
+    *range(NUM_IDX_CAN_MEGA + 1, NUM_IDX_LEVEL_STATS),
+    NUM_IDX_REVEALED,
+)
 
 
 def _message_tag(line: str) -> str:
@@ -695,6 +710,10 @@ def _assert_live_truth(
     splice_index, splice_count = _showteam_offset(document)
     starts = tuple(snapshot.pre_line_index for snapshot in perspective.snapshots)
     replay_interval_starts = dict(zip(starts, (0, *starts[:-1]), strict=True))
+    opponent_has_illusion = any(
+        normalize_showdown_id(member.ability) == "illusion"
+        for member in document.ots[1 - perspective.player].members
+    )
     for snapshot, record, exact_boundary in _match_live_records(
         perspective, live_records, document
     ):
@@ -746,22 +765,23 @@ def _assert_live_truth(
                 compare_event_values=same_interval,
                 compare_dynamic_fields=exact_boundary,
             )
-            if exact_boundary and any(
-                normalize_showdown_id(member.ability) == "illusion"
-                for member in document.ots[1 - perspective.player].members
-            ):
+            if exact_boundary and opponent_has_illusion:
                 # These are public opponent fields, compared with the actual live
                 # capture at the same cursor. Private stat estimates differ by source.
-                categorical = (*range(21), *range(22, live.categorical.shape[1]))
-                numerical = (*range(5, 30), 31, *range(32, 38), 50)
                 torch.testing.assert_close(
-                    live.categorical[6:12, categorical],
-                    reconstructed.categorical[6:12, categorical],
+                    live.categorical[
+                        TEAM_SIZE : 2 * TEAM_SIZE, _PUBLIC_OPPONENT_CATEGORICAL_INDICES
+                    ],
+                    reconstructed.categorical[
+                        TEAM_SIZE : 2 * TEAM_SIZE, _PUBLIC_OPPONENT_CATEGORICAL_INDICES
+                    ],
                 )
                 torch.testing.assert_close(
-                    live.numerical[6:12, numerical],
-                    reconstructed.numerical[6:12, numerical],
-                    atol=0.011,
+                    live.numerical[TEAM_SIZE : 2 * TEAM_SIZE, _PUBLIC_OPPONENT_NUMERICAL_INDICES],
+                    reconstructed.numerical[
+                        TEAM_SIZE : 2 * TEAM_SIZE, _PUBLIC_OPPONENT_NUMERICAL_INDICES
+                    ],
+                    atol=_PUBLIC_HP_TOLERANCE,
                     rtol=0,
                 )
         except AssertionError as exc:
@@ -899,17 +919,22 @@ def _protocol_lines_agree(left: str, right: str) -> bool:
     )
 
 
-def _public_replay_events(battles: tuple[DoubleBattle, DoubleBattle]) -> list[str]:
+def _public_replay_events(
+    battles: tuple[DoubleBattle, DoubleBattle], replay_dir: Path
+) -> list[str]:
     """
     Merge both players' captures of one battle into the log a spectator receives.
 
     Each player sees its own Pokemon's HP exactly and the opponent's as a percentage,
     so a line naming one side is taken from the other side's capture.
     """
-    captures = {
-        battle.player_role: _battle_log_lines(tuple(battle._build_replay_events()))
-        for battle in battles
-    }
+    captures = {}
+    for battle in battles:
+        path = battle.save_replay(replay_dir / f"{battle.player_role}.html")
+        html = path.read_text(encoding="utf-8")
+        log = html.split('<script type="text/plain" class="battle-log-data">', 1)[1]
+        lines = tuple(log.split("</script>", 1)[0].strip().splitlines())
+        captures[battle.player_role] = _battle_log_lines(lines)
     p1_lines, p2_lines = captures["p1"], captures["p2"]
     if len(p1_lines) != len(p2_lines):
         raise AssertionError(
@@ -933,7 +958,7 @@ def _write_public_replay(
     """Write one battle as replay JSON in the public form of Showdown's replay site."""
     battle = battles[0]
     replay_id = battle.battle_tag.removeprefix("battle-")
-    replay_events = _public_replay_events(battles)
+    replay_events = _public_replay_events(battles, replay_dir / replay_id)
     insertion_point = next(
         (index for index, line in enumerate(replay_events) if _message_tag(line) == "switch"),
         len(replay_events),

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from functools import lru_cache
 
 from poke_env.battle import DoubleBattle, Pokemon
@@ -18,8 +17,8 @@ from p0.replays.reconstruction.state import (
     PublicSideState,
     ReplayPokemonState,
     TransformSnapshot,
-    _dex_indexes,
-    _move_state,
+    dex_indexes,
+    move_state,
 )
 from p0.replays.schema import OTSData
 from p0.runtime.poke_env_battle_adapter import PokeEnvBattleView
@@ -46,13 +45,12 @@ class PublicReplayTracker:
             self._battle.parse_message(["", "player", f"p{side + 1}", username, "", ""])
         self._view = PokeEnvBattleView(self._battle)
         self._perspective = perspective
-        self._opponent = 1 - perspective
         self._ots = ots
-        self._initial = initial
-        self._bases: list[tuple[str, ...]] = []
+        initial_by_member = {member.member_id: member for member in initial}
+        self._initial: dict[str, ReplayPokemonState] = {}
+        self._snapshots: dict[Pokemon, tuple[tuple[object, ...], ReplayPokemonState]] = {}
         for sheet in ots:
             role = sheet.side.value
-            bases = []
             for member in sheet.members:
                 key = f"{role}: {member.nickname}"
                 mon = self._battle.get_pokemon(key, details=f"{member.species}, L{member.level}")
@@ -66,8 +64,8 @@ class PublicReplayTracker:
                     level=member.level,
                 )
                 self._battle.apply_teambuilder_team(role, [team_member], [mon])
-                bases.append(mon.base_species)
-            self._bases.append(tuple(bases))
+                if sheet.side.side_index != perspective:
+                    self._initial[mon.base_species] = initial_by_member[member.member_id]
 
     def apply(self, resolved: ResolvedProtocolEvent) -> None:
         event = resolved.event
@@ -93,80 +91,117 @@ class PublicReplayTracker:
         active = self._battle.opponent_active_pokemon
         shown = self._view.opponent_active_pokemon
         by_base = {mon.base_species: mon for mon in team.values()}
-        entries = tuple(by_base[base] for base in self._bases[self._opponent])
-        snapshots: dict[Pokemon, ReplayPokemonState] = {}
-        for index, mon in enumerate(entries):
-            view = next((view for raw, view in zip(active, shown, strict=True) if raw is mon), mon)
-            snapshots[mon] = _snapshot(mon, view, self._initial[self._opponent * 6 + index])
-        active_states = []
-        for mon, view in zip(active, shown, strict=True):
-            if mon is None:
-                active_states.append(None)
-                continue
-            if mon not in snapshots:
-                index = next(
-                    index
-                    for index, entry in enumerate(entries)
-                    if entry.base_species == mon.base_species
-                )
-                snapshots[mon] = _snapshot(mon, view, self._initial[self._opponent * 6 + index])
-            active_states.append(snapshots[mon])
+        entries = tuple(by_base[base] for base in self._initial)
+        views = dict(zip(active, shown, strict=True))
+        snapshots = {
+            mon: self._snapshot(mon, views.get(mon, mon))
+            for mon in dict.fromkeys((*entries, *active))
+            if mon is not None
+        }
+        active_states = tuple(None if mon is None else snapshots[mon] for mon in active)
+        self._snapshots = {mon: self._snapshots[mon] for mon in snapshots}
         return PublicSideState(
             tuple(snapshots[mon] for mon in entries), (active_states[0], active_states[1])
         )
 
+    def _snapshot(self, raw: Pokemon, view: PokemonView) -> ReplayPokemonState:
+        """
+        Copy changed public values, retaining an earlier immutable state otherwise.
 
-def _snapshot(raw: Pokemon, view: PokemonView, initial: ReplayPokemonState) -> ReplayPokemonState:
-    moves = tuple(
-        _public_move(move.id, move.current_pp, move.max_pp) for move in view.moves.values()
-    )
-    types = tuple(value.name.title() for value in view.types)
-    base_stats = tuple(view.base_stats.items())
-    ability = view.ability or "unknown"
-    species = _dex_indexes()[0]
-    form = species[normalize_showdown_id(view.species or initial.current_form)].species
-    transform = (
-        TransformSnapshot(
-            initial.member_id,
-            form,
-            types,
-            view.weight,
-            tuple((name, value) for name, value in base_stats if name != "hp"),
+        Arguments:
+          raw: tracked Pokemon, including separate copies of the same disguise
+          view: live values, with the live adapter's Transform handling
+
+        Returns:
+          an immutable member state shared while its tracked values stay equal
+        """
+        form_name, base_name = view.species, view.base_species
+        nature, hp, status = view.nature, view.current_hp_fraction, view.status
+        item, ability = view.item, view.ability or "unknown"
+        types, base_stats, weight = tuple(view.types), tuple(view.base_stats.items()), view.weight
+        moves = tuple((move.id, move.current_pp, move.max_pp) for move in view.moves.values())
+        boosts, effects = tuple(view.boosts.items()), tuple(view.effects.items())
+        transformed, revealed, fainted = raw.transformed, view.revealed, view.fainted
+        first_turn, status_counter = view.first_turn, view.status_counter
+        protect_counter, preparing = view.protect_counter, view.preparing
+        last_move = None if view.last_move is None else view.last_move.id
+        values = (
+            form_name,
+            base_name,
+            nature,
+            hp,
+            status,
+            item,
             ability,
-            tuple(view.boosts.items()),
+            types,
+            base_stats,
+            weight,
             moves,
+            boosts,
+            effects,
+            transformed,
+            revealed,
+            fainted,
+            first_turn,
+            status_counter,
+            protect_counter,
+            preparing,
+            last_move,
         )
-        if raw.transformed
-        else None
-    )
-    return replace(
-        initial,
-        original_species=species[normalize_showdown_id(view.base_species)].base_species,
-        current_form=form,
-        nature=view.nature or "",
-        hp_fraction=view.current_hp_fraction,
-        status=None if view.status is None else view.status.name.lower(),
-        item=view.item,
-        ability=AbilityState(ability),
-        current_types=types,
-        base_stats=base_stats,
-        weight=view.weight,
-        moves=moves,
-        boosts=tuple(view.boosts.items()),
-        effects=tuple(
-            (normalize_showdown_id(effect.name), count) for effect, count in view.effects.items()
-        ),
-        transform=transform,
-        revealed=view.revealed,
-        fainted=view.fainted,
-        active_turns=int(view.first_turn),
-        status_counter=view.status_counter,
-        protect_counter=view.protect_counter,
-        preparing="preparing" if view.preparing else None,
-        last_move=None if view.last_move is None else view.last_move.id,
-    )
+        previous = self._snapshots.get(raw)
+        if previous is not None and previous[0] == values:
+            return previous[1]
+
+        initial = self._initial[raw.base_species]
+        species = dex_indexes()[0]
+        form = species[normalize_showdown_id(form_name or initial.current_form)].species
+        type_names = tuple(value.name.title() for value in types)
+        move_states = tuple(_public_move(*move) for move in moves)
+        transform = (
+            TransformSnapshot(
+                form,
+                weight,
+                tuple((name, value) for name, value in base_stats if name != "hp"),
+                ability,
+                move_states,
+            )
+            if transformed
+            else None
+        )
+        state = ReplayPokemonState(
+            member_id=initial.member_id,
+            nickname=initial.nickname,
+            original_species=species[normalize_showdown_id(base_name)].base_species,
+            current_form=form,
+            nature=nature or "",
+            level=initial.level,
+            hp_fraction=hp,
+            status=None if status is None else status.name.lower(),
+            item=item,
+            ability=AbilityState(ability),
+            current_types=type_names,
+            base_stats=base_stats,
+            weight=weight,
+            moves=move_states,
+            boosts=boosts,
+            effects=tuple((normalize_showdown_id(effect.name), count) for effect, count in effects),
+            transform=transform,
+            revealed=revealed,
+            selected=initial.selected,
+            fainted=fainted,
+            active_turns=int(first_turn),
+            status_counter=status_counter,
+            protect_counter=protect_counter,
+            preparing="preparing" if preparing else None,
+            last_move=last_move,
+        )
+        self._snapshots[raw] = (values, state)
+        return state
 
 
 @lru_cache(maxsize=1 << 14)
 def _public_move(move_id: str, current_pp: int, max_pp: int) -> MoveState:
-    return replace(_move_state(move_id), current_pp=current_pp, max_pp=max_pp)
+    move = move_state(move_id)
+    return MoveState(
+        move.move_id, move.name, move.move_type, move.category, move.target, current_pp, max_pp
+    )

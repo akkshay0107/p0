@@ -6,9 +6,8 @@ import json
 import os
 import random
 from collections.abc import Mapping
-from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -19,8 +18,7 @@ from p0.teams.stat_points import StatPoints
 from p0.teams.team import CanonicalTeam, TeamMember, TeamRecord
 
 
-@dataclass(frozen=True, slots=True)
-class StressSpeciesPool:
+class StressSpeciesPool(NamedTuple):
     """Validated choices attached to one legal, sendable species form."""
 
     species: str
@@ -30,14 +28,9 @@ class StressSpeciesPool:
     moves: tuple[str, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class StressDexCatalog:
+class StressDexCatalog(NamedTuple):
     """Format-legal values and species-aware pools used by stress inputs."""
 
-    species: tuple[str, ...]
-    items: tuple[str, ...]
-    abilities: tuple[str, ...]
-    moves: tuple[str, ...]
     natures: tuple[str, ...]
     species_pools: tuple[StressSpeciesPool, ...]
 
@@ -119,15 +112,11 @@ def stress_dex_catalog() -> StressDexCatalog:
     species_pools = _load_species_pools()
 
     catalog = StressDexCatalog(
-        species=tuple(pool.species for pool in species_pools),
-        items=_legal_display_names(dex, "items"),
-        abilities=_legal_display_names(dex, "abilities"),
-        moves=_legal_display_names(dex, "moves"),
         natures=_legal_display_names(dex, "natures"),
         species_pools=species_pools,
     )
-    if not all((catalog.species, catalog.items, catalog.abilities, catalog.moves, catalog.natures)):
-        raise AssertionError("The active format dex has an empty legal category")
+    if not catalog.natures:
+        raise AssertionError("The active format dex has no legal natures")
     return catalog
 
 

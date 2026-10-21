@@ -572,7 +572,7 @@ class TestReconstructionState:
         assert dict(shed.member(snorlax_id).boosts)["atk"] == 0
         assert dict(shed.member(snorlax_id).effects) == {"substitute": 0}
 
-    def test_baton_pass_preserves_copyable_source_and_dynamic_metadata(self) -> None:
+    def test_baton_pass_preserves_leech_seed_and_perish_song(self) -> None:
         events = _resolved(
             "|switch|p1a: Lopunny|Lopunny, L50|100/100",
             "|switch|p2a: Audino|Audino, L50|100/100",
@@ -585,8 +585,6 @@ class TestReconstructionState:
         snorlax = final.member(ReplayMemberId(ReplaySide.P1, 1))
 
         assert dict(snorlax.effects) == {"leechseed": 0, "perishsong": 0}
-        assert dict(snorlax.effect_sources) == {"leechseed": ReplayMemberId(ReplaySide.P2, 0)}
-        assert snorlax.perish_count == 3
 
     def test_baton_pass_filters_condition_copy_set_from_pinned_source(self) -> None:
         events = _resolved(
@@ -611,7 +609,6 @@ class TestReconstructionState:
             "focusenergy": 0,
             "ingrain": 0,
         }
-        assert dict(snorlax.effect_variants) == {}
 
     def test_source_emitted_partial_trap_is_tracked_and_baton_passed(self) -> None:
         events = _resolved(
@@ -625,7 +622,6 @@ class TestReconstructionState:
         snorlax = final.member(ReplayMemberId(ReplaySide.P1, 1))
 
         assert dict(snorlax.effects) == {"firespin": 0}
-        assert dict(snorlax.effect_sources) == {"firespin": ReplayMemberId(ReplaySide.P2, 0)}
 
     def test_copyboost_critical_effects_persist_across_turns(self) -> None:
         events = _resolved(
@@ -1036,13 +1032,12 @@ class TestReconstructionState:
 
         assert copied is not None
         assert copied.species == "Audino"
-        assert dict(copied.boosts)["atk"] == 2
+        assert dict(snapshots[3].member(lopunny_id).boosts)["atk"] == 2
         assert after_target_form == copied
         assert after_move is not None
         tackle = next(move for move in after_move.moves if move.move_id == "tackle")
         assert tackle.max_pp == 5
         assert tackle.current_pp == 4
-        assert copied.source_member_id == ReplayMemberId(ReplaySide.P2, 0)
         assert snapshots[5].member(lopunny_id).base_stats[0][1] != copied.non_hp_base_stats[0][1]
         changed = snapshots[6]
         assert changed.member(lopunny_id).current_types == ("Water",)
@@ -1197,7 +1192,7 @@ class TestReconstructionState:
         assert member.ability.current == "Cute Charm"
         assert dict(member.effects) == {"gastroacid": 0}
 
-    def test_perish_countdown_updates_one_effect_and_clears_on_switch(self) -> None:
+    def test_perish_countdown_keeps_one_effect_and_clears_on_switch(self) -> None:
         events = _resolved(
             "|switch|p1a: Lopunny|Lopunny, L50|100/100",
             "|-start|p1a: Lopunny|perish3",
@@ -1210,14 +1205,10 @@ class TestReconstructionState:
         snapshots = reduce_replay_state("state-test", _complete_ots(), events).require_accepted()
         lopunny_id = ReplayMemberId(ReplaySide.P1, 0)
 
-        assert tuple(snapshot.member(lopunny_id).perish_count for snapshot in snapshots[1:5]) == (
-            3,
-            2,
-            1,
-            0,
+        assert all(
+            dict(snapshot.member(lopunny_id).effects) == {"perishsong": 0}
+            for snapshot in snapshots[1:5]
         )
-        assert dict(snapshots[4].member(lopunny_id).effects) == {"perishsong": 0}
-        assert snapshots[5].member(lopunny_id).perish_count is None
         assert dict(snapshots[5].member(lopunny_id).effects) == {}
 
     @pytest.mark.parametrize(
@@ -1241,7 +1232,7 @@ class TestReconstructionState:
         result = reduce_replay_state("state-test", _complete_ots(), events)
 
         assert result.snapshots == ()
-        assert result.diagnostics[0].reason == f"unsupported effect variant '{effect}'"
+        assert result.diagnostics[0].reason == f"unsupported effect '{effect}'"
 
     @pytest.mark.parametrize(
         ("wire_effect", "canonical", "end_effect"),
@@ -1256,7 +1247,7 @@ class TestReconstructionState:
             ("fallen5", "supremeoverlord", "fallen5"),
         ),
     )
-    def test_dynamic_effect_start_and_end_clear_metadata(
+    def test_dynamic_effect_start_and_end_use_one_canonical_effect(
         self, wire_effect: str, canonical: str, end_effect: str
     ) -> None:
         events = _resolved(
@@ -1270,40 +1261,7 @@ class TestReconstructionState:
         cleared = snapshots[2].member(ReplayMemberId(ReplaySide.P1, 0))
 
         assert dict(active.effects) == {canonical: 0}
-        assert dict(active.effect_variants) == {canonical: wire_effect}
         assert dict(cleared.effects) == {}
-        assert dict(cleared.effect_variants) == {}
-
-    def test_dynamic_effect_metadata_is_cleared_when_the_member_switches(self) -> None:
-        events = _resolved(
-            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
-            "|-start|p1a: Lopunny|stockpile2",
-            "|switch|p1a: Snorlax|Snorlax, L50|100/100",
-        )
-
-        snapshots = reduce_replay_state("state-test", _complete_ots(), events).require_accepted()
-
-        active = snapshots[1].member(ReplayMemberId(ReplaySide.P1, 0))
-        lopunny = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
-        assert dict(active.effects) == {"stockpile": 0}
-        assert dict(active.effect_variants) == {"stockpile": "stockpile2"}
-        assert dict(lopunny.effects) == {}
-        assert dict(lopunny.effect_variants) == {}
-
-    def test_repeated_stockpile_replaces_only_the_dynamic_layer_metadata(self) -> None:
-        events = _resolved(
-            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
-            "|-start|p1a: Lopunny|stockpile1",
-            "|-start|p1a: Lopunny|stockpile2",
-            "|-start|p1a: Lopunny|stockpile3",
-        )
-
-        snapshots = reduce_replay_state("state-test", _complete_ots(), events).require_accepted()
-
-        assert [
-            dict(snapshot.member(ReplayMemberId(ReplaySide.P1, 0)).effect_variants)["stockpile"]
-            for snapshot in snapshots[1:]
-        ] == ["stockpile1", "stockpile2", "stockpile3"]
 
     @pytest.mark.parametrize(
         ("guard", "guard_id"),
@@ -1404,19 +1362,21 @@ class TestReconstructionState:
         assert duplicate.diagnostics[0].reason == "side guard 'wideguard' started twice"
 
     @pytest.mark.parametrize(
-        "effect",
+        ("effect", "effect_id"),
         (
-            "Protect",
-            "Endure",
-            "Beak Blast",
-            "Focus Punch",
-            "Follow Me",
-            "Helping Hand",
-            "Roost",
-            "Rage Powder",
+            ("Protect", "protect"),
+            ("Endure", "endure"),
+            ("Beak Blast", "beakblast"),
+            ("Focus Punch", "focuspunch"),
+            ("Follow Me", "followme"),
+            ("Helping Hand", "helpinghand"),
+            ("Roost", "roost"),
+            ("Rage Powder", "ragepowder"),
         ),
     )
-    def test_other_singleturn_effects_remain_member_scoped(self, effect: str) -> None:
+    def test_other_singleturn_effects_remain_member_scoped(
+        self, effect: str, effect_id: str
+    ) -> None:
         events = _resolved(
             "|switch|p1a: Lopunny|Lopunny, L50|100/100",
             f"|-singleturn|p1a: Lopunny|{effect}",
@@ -1428,7 +1388,7 @@ class TestReconstructionState:
         final = snapshots[-1]
         member = final.member(ReplayMemberId(ReplaySide.P1, 0))
 
-        assert dict(during_effect.effects) == {effect.lower().replace(" ", ""): 0}
+        assert dict(during_effect.effects) == {effect_id: 0}
         assert dict(final.sides[0].conditions) == {}
         assert dict(member.effects) == {}
 
@@ -1477,9 +1437,7 @@ class TestReconstructionState:
         result = reduce_replay_state("state-test", _complete_ots(), events)
 
         assert result.snapshots == ()
-        assert result.diagnostics[0].reason == (
-            f"unsupported side condition effect variant '{condition}'"
-        )
+        assert result.diagnostics[0].reason == (f"unsupported side condition '{condition}'")
 
     @pytest.mark.parametrize(
         (
@@ -1784,11 +1742,9 @@ class TestReconstructionState:
         snapshots = reduce_replay_state("state-test", _complete_ots(), events).require_accepted()
         trapped = snapshots[2].member(ReplayMemberId(ReplaySide.P1, 0))
         assert dict(trapped.effects) == {"firespin": 0}
-        assert dict(trapped.effect_sources) == {"firespin": ReplayMemberId(ReplaySide.P2, 0)}
 
         ended = snapshots[3].member(ReplayMemberId(ReplaySide.P1, 0))
         assert dict(ended.effects) == {}
-        assert dict(ended.effect_sources) == {}
 
     def test_illusion_reveal_preserves_actual_state_and_causal_display_history(self) -> None:
         ots = _complete_ots(illusion_member="Snorlax")
@@ -1969,6 +1925,60 @@ class TestReconstructionState:
         assert result.diagnostics[0].reason == "side condition 'reflect' ended before it started"
         with pytest.raises(ReplayEventParseError, match="ended before it started"):
             result.require_accepted()
+
+
+class TestTransformTypes:
+    @pytest.mark.parametrize(
+        ("target_species", "expected_types"),
+        (("Noctowl", ("Normal", "Flying")), ("Rookidee", ("Flying",))),
+    )
+    def test_transform_copies_the_types_removed_by_roost(
+        self, target_species: str, expected_types: tuple[str, ...]
+    ) -> None:
+        sheets = (
+            _ots(ReplaySide.P1, _P1_SPECIES, moves=("Transform",)),
+            _ots(ReplaySide.P2, (target_species, *_P2_SPECIES[1:])),
+        )
+        raw_lines = (
+            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
+            f"|switch|p2a: {target_species}|{target_species}, L50|100/100",
+            f"|-singleturn|p2a: {target_species}|move: Roost",
+            f"|-transform|p1a: Lopunny|p2a: {target_species}",
+        )
+        lines = tuple(
+            ProtocolLine(index, raw, tuple(raw.split("|")), None)
+            for index, raw in enumerate(raw_lines)
+        )
+        parsed = parse_protocol_events("roost-transform", lines).require_accepted()
+        events = resolve_protocol_events("roost-transform", sheets, parsed).require_accepted()
+
+        snapshots = reduce_replay_state("roost-transform", sheets, events).require_accepted()
+
+        assert snapshots[-2].member(ReplayMemberId(ReplaySide.P2, 0)).current_types == ("Normal",)
+        assert (
+            snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0)).current_types == expected_types
+        )
+
+    def test_transform_keeps_changed_and_added_types_while_target_roosts(self) -> None:
+        sheets = _complete_ots()
+        raw_lines = (
+            "|switch|p1a: Lopunny|Lopunny, L50|100/100",
+            "|switch|p2a: Audino|Audino, L50|100/100",
+            "|-start|p2a: Audino|typechange|Flying",
+            "|-start|p2a: Audino|typeadd|Ghost|[from] move: Trick-or-Treat",
+            "|-singleturn|p2a: Audino|move: Roost",
+            "|-transform|p1a: Lopunny|p2a: Audino|[from] ability: Imposter",
+        )
+        lines = tuple(
+            ProtocolLine(index, raw, tuple(raw.split("|")), None)
+            for index, raw in enumerate(raw_lines)
+        )
+        parsed = parse_protocol_events("roost-transform", lines).require_accepted()
+        events = resolve_protocol_events("roost-transform", sheets, parsed).require_accepted()
+
+        final = reduce_replay_state("roost-transform", sheets, events).require_accepted()[-1]
+
+        assert final.member(ReplayMemberId(ReplaySide.P1, 0)).current_types == ("Flying", "Ghost")
 
 
 class TestReviveState:

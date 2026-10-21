@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import cache
-from math import isfinite
 from time import monotonic
 from typing import Iterable, Mapping, NamedTuple
 
@@ -75,17 +73,13 @@ class ResolvedReplayEvents:
         return self.events
 
 
-class _HistoryCandidate(NamedTuple):
-    actual_member: ReplayMemberId
-    displayed_member: ReplayMemberId
-
-
 @dataclass(slots=True)
 class _ActiveHistory:
     history_id: int
     side: ReplaySide
     entry_event: ProtocolEvent
-    candidates: tuple[_HistoryCandidate, ...]
+    displayed_member: ReplayMemberId
+    candidates: tuple[ReplayMemberId, ...]
     entry_hp: str
     last_hp: str
     end_line: int
@@ -147,19 +141,20 @@ class _HistoryScanner:
         self.references: list[tuple[int | ReplayMemberId | None, ...]] = []
         self.revives: list[_Revive] = []
         self._last_mover_id: int | None = None
+        illusion_sheets = tuple(sheet for sheet in ots if self.illusion_members[sheet.side])
         self._member_moves = {
             member.member_id: frozenset(normalize_showdown_id(move) for move in member.moves)
-            for sheet in ots
+            for sheet in illusion_sheets
             for member in sheet.members
         }
         self._member_abilities = {
             member.member_id: normalize_showdown_id(member.ability)
-            for sheet in ots
+            for sheet in illusion_sheets
             for member in sheet.members
         }
         self._member_items = {
             member.member_id: normalize_showdown_id(member.item)
-            for sheet in ots
+            for sheet in illusion_sheets
             for member in sheet.members
         }
         self._changed_abilities: set[ReplaySide] = set()
@@ -201,9 +196,9 @@ class _HistoryScanner:
                 self.team_sizes[side] = size
             elif event.tag == "replace":
                 history = self._history(event)
-                member = _revealed_member(
+                member = _matching_member(
                     event,
-                    _event_reference(event).pokemon_ref,
+                    event.pokemon_refs[0].pokemon_ref,
                     self._members[history.side],
                     self._species_bases,
                 )
@@ -219,13 +214,13 @@ class _HistoryScanner:
                 history = self._history(event)
                 history.faint_line = history.end_line = event.line_index
                 history.last_hp = "0"
-                reference = _event_reference(event)
+                reference = event.pokemon_refs[0]
                 key = (history.side, _required_active_slot(event, reference))
                 if key not in self._active:
                     raise _ResolutionError(event, "faint source has no active history")
                 self._last_occupant[key] = self._active.pop(key)
             elif event.tag == "swap":
-                reference = _event_reference(event)
+                reference = event.pokemon_refs[0]
                 source = (reference.pokemon_ref.side, _required_active_slot(event, reference))
                 target_slot = int(event.arguments[1])
                 if not 0 <= target_slot < 2:
@@ -256,20 +251,17 @@ class _HistoryScanner:
             history.candidates = tuple(
                 candidate
                 for candidate in history.candidates
-                if (
-                    history.revealed_member is None
-                    or candidate.actual_member == history.revealed_member
-                )
+                if (history.revealed_member is None or candidate == history.revealed_member)
                 and (
                     not history.check_evidence
                     or (
-                        history.own_moves <= self._member_moves[candidate.actual_member]
-                        and history.abilities <= {self._member_abilities[candidate.actual_member]}
-                        and history.items <= {self._member_items[candidate.actual_member]}
+                        history.own_moves <= self._member_moves[candidate]
+                        and history.abilities <= {self._member_abilities[candidate]}
+                        and history.items <= {self._member_items[candidate]}
                         and not (
                             history.took_hit
                             and history.revealed_member is None
-                            and candidate.actual_member != candidate.displayed_member
+                            and candidate != history.displayed_member
                         )
                     )
                 )
@@ -399,36 +391,31 @@ class _HistoryScanner:
         )
 
     def _start_history(self, event: ProtocolEvent, end_line: int) -> None:
-        reference = _event_reference(event)
+        reference = event.pokemon_refs[0]
         side = reference.pokemon_ref.side
         key = (side, _required_active_slot(event, reference))
-        candidates = _history_candidates(
+        displayed_member = _matching_member(
             event,
             reference.pokemon_ref,
             self._members[side],
-            self.illusion_members[side],
             self._species_bases,
         )
-        displayed = {candidate.displayed_member for candidate in candidates}
-        if len(displayed) > 1:
-            raise _ResolutionError(
-                event,
-                f"incoming reference {reference.pokemon_ref.displayed_name!r} "
-                f"resolved to {len(displayed)} available roster members",
-            )
-        if not candidates:
-            raise _ResolutionError(
-                event,
-                f"incoming reference {reference.pokemon_ref.displayed_name!r} "
-                "resolved to 0 available roster members",
-            )
+        candidates = tuple(sorted({displayed_member, *self.illusion_members[side]}))
         previous = self._active.get(key)
         if previous is not None:
             self.histories[previous].end_line = event.line_index
         self._last_occupant.pop(key, None)
         hp = _shown_hp(event.arguments[2])
         history = _ActiveHistory(
-            len(self.histories), side, event, candidates, hp, hp, end_line, len(candidates) > 1
+            len(self.histories),
+            side,
+            event,
+            displayed_member,
+            candidates,
+            hp,
+            hp,
+            end_line,
+            len(candidates) > 1,
         )
         self.histories.append(history)
         self._active[key] = history.history_id
@@ -448,7 +435,7 @@ class _HistoryScanner:
         if event.tag in {"-sidestart", "-sideend"}:
             return None
         name = normalize_showdown_id(ref.displayed_name)
-        matches = self._slotless.get((ref.side, name), set())
+        matches = self._slotless.get((ref.side, name), ())
         if len(matches) == 1:
             return next(iter(matches))
         if matches:
@@ -515,26 +502,12 @@ class _HistorySolver:
             for member, revive in latest_revives.items():
                 self._revives_before[history.history_id, member] = revive
 
-    def solve(self) -> tuple[tuple[_HistoryCandidate, ...], ...]:
+    def solve(self) -> tuple[tuple[ReplayMemberId, ...], ...]:
         if any(not history.candidates for history in self._histories):
             return ()
-        _check_deadline(self._histories[0].entry_event, self._deadline)
-        if all(len(history.candidates) == 1 for history in self._histories):
-            assigned: list[_HistoryCandidate] = []
-            selected = 0
-            for history in self._histories:
-                _check_deadline(history.entry_event, self._deadline)
-                candidate = history.candidates[0]
-                mask = selected | _candidate_mask(candidate)
-                if mask.bit_count() > self._team_size or not self._valid(history, candidate):
-                    return ()
-                self._latest[candidate.actual_member] = history
-                assigned.append(candidate)
-                selected = mask
-            return (tuple(assigned),) if self._valid_revives(assigned) else ()
 
-        solutions: list[tuple[_HistoryCandidate, ...]] = []
-        assigned = []
+        solutions: list[tuple[ReplayMemberId, ...]] = []
+        assigned: list[ReplayMemberId] = []
         previous: list[_ActiveHistory | None] = []
         masks = [0]
         choices = [0] * len(self._histories)
@@ -553,11 +526,11 @@ class _HistorySolver:
                 for choice in range(choices[position], len(history.candidates)):
                     choices[position] = choice + 1
                     candidate = history.candidates[choice]
-                    mask = masks[-1] | _candidate_mask(candidate)
+                    mask = masks[-1] | _candidate_mask(history, candidate)
                     if mask.bit_count() > self._team_size or not self._valid(history, candidate):
                         continue
-                    previous.append(self._latest.get(candidate.actual_member))
-                    self._latest[candidate.actual_member] = history
+                    previous.append(self._latest.get(candidate))
+                    self._latest[candidate] = history
                     assigned.append(candidate)
                     masks.append(mask)
                     position += 1
@@ -576,11 +549,11 @@ class _HistorySolver:
 
     def _undo(
         self,
-        assigned: list[_HistoryCandidate],
+        assigned: list[ReplayMemberId],
         previous: list[_ActiveHistory | None],
         masks: list[int],
     ) -> None:
-        member = assigned.pop().actual_member
+        member = assigned.pop()
         last = previous.pop()
         if last is None:
             del self._latest[member]
@@ -588,12 +561,12 @@ class _HistorySolver:
             self._latest[member] = last
         masks.pop()
 
-    def _valid(self, history: _ActiveHistory, candidate: _HistoryCandidate) -> bool:
+    def _valid(self, history: _ActiveHistory, candidate: ReplayMemberId) -> bool:
         entry = history.entry_event.line_index
-        previous = self._latest.get(candidate.actual_member)
+        previous = self._latest.get(candidate)
         if previous is not None and previous.end_line >= entry:
             return False
-        for member in {candidate.actual_member, candidate.displayed_member}:
+        for member in {candidate, history.displayed_member}:
             last = self._latest.get(member)
             revive = self._revives_before.get((history.history_id, member))
             if (
@@ -605,7 +578,7 @@ class _HistorySolver:
                 return False
         if not history.check_evidence:
             return True
-        revive = self._revives_before.get((history.history_id, candidate.actual_member))
+        revive = self._revives_before.get((history.history_id, candidate))
         if revive is not None and (
             previous is None or revive.event.line_index > previous.entry_event.line_index
         ):
@@ -614,7 +587,7 @@ class _HistorySolver:
             hp = None if previous is None else previous.last_hp
         return _is_full_hp(history.entry_hp) if hp is None else hp == history.entry_hp
 
-    def _valid_revives(self, assigned: list[_HistoryCandidate]) -> bool:
+    def _valid_revives(self, assigned: list[ReplayMemberId]) -> bool:
         # A named revival proves that this member, rather than its disguise, had fainted.
         if not self._revives:
             return True
@@ -624,7 +597,7 @@ class _HistorySolver:
         for revive in self._revives:
             line = revive.event.line_index
             while cursor < len(assigned) and self._histories[cursor].entry_event.line_index < line:
-                latest[assigned[cursor].actual_member] = self._histories[cursor]
+                latest[assigned[cursor]] = self._histories[cursor]
                 cursor += 1
             previous = latest.get(revive.member_id)
             if (
@@ -638,24 +611,8 @@ class _HistorySolver:
         return True
 
 
-def _candidate_mask(candidate: _HistoryCandidate) -> int:
-    return (1 << candidate.actual_member.roster_index) | (
-        1 << candidate.displayed_member.roster_index
-    )
-
-
-def _event_reference(event: ProtocolEvent, argument_index: int = 0) -> PokemonRefArgument:
-    try:
-        return next(
-            reference
-            for reference in event.pokemon_refs
-            if reference.argument_index == argument_index
-        )
-    except StopIteration as exc:
-        raise _ResolutionError(
-            event,
-            f"event {event.tag!r} has no Pokémon reference at argument {argument_index}",
-        ) from exc
+def _candidate_mask(history: _ActiveHistory, candidate: ReplayMemberId) -> int:
+    return (1 << candidate.roster_index) | (1 << history.displayed_member.roster_index)
 
 
 def _shown_hp(condition: str) -> str:
@@ -675,15 +632,6 @@ def _required_active_slot(event: ProtocolEvent, reference: PokemonRefArgument) -
     return slot
 
 
-@cache
-def _species_base_index() -> Mapping[str, str]:
-    """Map each dex species id to the id of its base species."""
-    return {
-        entry["id"]: normalize_showdown_id(entry["baseSpecies"])
-        for entry in default_runtime_resources().dex["species"]
-    }
-
-
 def _base_species_id(species: str, species_bases: Mapping[str, str]) -> str:
     species_id = normalize_showdown_id(species)
     return species_bases.get(species_id, species_id)
@@ -699,70 +647,39 @@ def _slotless_names(member: OTSMember, species_bases: Mapping[str, str]) -> set[
     }
 
 
-def _matching_members(
-    event: ProtocolEvent,
-    pokemon_ref: ProtocolPokemonReference,
-    members: tuple[OTSMember, ...],
-    species_bases: Mapping[str, str],
-) -> tuple[OTSMember, ...]:
-    displayed_name = normalize_showdown_id(pokemon_ref.displayed_name)
-    name_matches = tuple(
-        member
-        for member in members
-        if displayed_name
-        in {
-            normalize_showdown_id(member.nickname),
-            normalize_showdown_id(member.species),
-        }
-    )
-    details_species = _base_species_id(event.arguments[1].split(",", 1)[0], species_bases)
-    species_matches = tuple(
-        member
-        for member in members
-        if _base_species_id(member.species, species_bases) == details_species
-    )
-    if not species_matches:
-        return name_matches
-    if len(species_matches) == 1:
-        return species_matches
-    narrowed = tuple(member for member in species_matches if member in name_matches)
-    return narrowed or species_matches
-
-
-def _history_candidates(
-    event: ProtocolEvent,
-    pokemon_ref: ProtocolPokemonReference,
-    members: tuple[OTSMember, ...],
-    illusion_members: tuple[ReplayMemberId, ...],
-    species_bases: Mapping[str, str],
-) -> tuple[_HistoryCandidate, ...]:
-    displayed_members = _matching_members(event, pokemon_ref, members, species_bases)
-    choices = {
-        _HistoryCandidate(member.member_id, member.member_id) for member in displayed_members
-    }
-    choices.update(
-        _HistoryCandidate(illusion_member, displayed.member_id)
-        for illusion_member in illusion_members
-        for displayed in displayed_members
-        if illusion_member != displayed.member_id
-    )
-    return tuple(
-        sorted(choices, key=lambda choice: (choice.actual_member, choice.displayed_member))
-    )
-
-
-def _revealed_member(
+def _matching_member(
     event: ProtocolEvent,
     pokemon_ref: ProtocolPokemonReference,
     members: tuple[OTSMember, ...],
     species_bases: Mapping[str, str],
 ) -> ReplayMemberId:
-    candidates = _matching_members(event, pokemon_ref, members, species_bases)
+    details_species = _base_species_id(event.arguments[1].split(",", 1)[0], species_bases)
+    candidates = tuple(
+        member
+        for member in members
+        if _base_species_id(member.species, species_bases) == details_species
+    )
     if len(candidates) != 1:
+        displayed_name = normalize_showdown_id(pokemon_ref.displayed_name)
+        candidates = (
+            tuple(
+                member
+                for member in candidates or members
+                if displayed_name
+                in {
+                    normalize_showdown_id(member.nickname),
+                    normalize_showdown_id(member.species),
+                }
+            )
+            or candidates
+        )
+    if len(candidates) != 1:
+        description = "Illusion reveal" if event.tag == "replace" else "incoming reference"
+        qualifier = "" if event.tag == "replace" else "available "
         raise _ResolutionError(
             event,
-            f"Illusion reveal {pokemon_ref.displayed_name!r} resolved to "
-            f"{len(candidates)} roster members",
+            f"{description} {pokemon_ref.displayed_name!r} resolved to "
+            f"{len(candidates)} {qualifier}roster members",
         )
     return candidates[0].member_id
 
@@ -786,14 +703,14 @@ def resolve_protocol_events(
     Returns:
       resolved events or a diagnostic rejecting the entire replay
     """
-    if not isfinite(time_limit_seconds) or time_limit_seconds < 0:
-        raise ValueError("identity time limit must be finite and nonnegative")
     event_tuple = tuple(events)
-    diagnostics = tuple(event.diagnostic for event in event_tuple if event.diagnostic is not None)
+    diagnostics = tuple(
+        diagnostic for event in event_tuple if (diagnostic := event.diagnostic) is not None
+    )
     if diagnostics:
         return ResolvedReplayEvents(replay_id, (), diagnostics)
     deadline = monotonic() + time_limit_seconds
-    scanner = _HistoryScanner(ots, _species_base_index())
+    scanner = _HistoryScanner(ots, default_runtime_resources().species_bases)
     bindings: dict[int, ReplayMemberId] = {}
     ambiguity: ProtocolEvent | None = None
     try:
@@ -831,7 +748,7 @@ def resolve_protocol_events(
                 continue
             solution = next(iter(solutions))
             for history, candidate in zip(histories, solution, strict=True):
-                bindings[history.history_id] = candidate.actual_member
+                bindings[history.history_id] = candidate
         if ambiguity is not None:
             raise _ResolutionError(
                 ambiguity,

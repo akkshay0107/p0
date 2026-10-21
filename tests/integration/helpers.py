@@ -35,7 +35,7 @@ from p0.model.resources import default_runtime_resources
 from p0.model.structured_observation import StructuredObservation
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_action_adapter import action_to_order
-from p0.runtime.poke_env_battle_adapter import action_move_slots, battle_view
+from p0.runtime.poke_env_battle_adapter import battle_view
 from p0.runtime.poke_env_patches import locked_choice
 from tests.team_fixtures import DEFAULT_TEST_TEAM
 
@@ -113,9 +113,7 @@ def single_order_to_action(
     if battle_view(battle).decision.slots[position].forced_move:
         return np.int64(MEGA_FORCED_ACTION if order.mega else FORCED_ACTION)
 
-    move_slot = next(
-        i for i, move in enumerate(action_move_slots(battle, position)) if move.id == order.order.id
-    )
+    move_slot = next(i for i, move in enumerate(active.moves.values()) if move.id == order.order.id)
     return np.int64(
         encode_action(
             SlotAction(

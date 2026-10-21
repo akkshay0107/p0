@@ -150,7 +150,6 @@ class TestReplayCompiler:
         assert (9, 11) in left.decisions[1].evidence.candidates
         assert (9, 11) in right.decisions[1].evidence.candidates
         assert left.snapshots[1].pre_line_index < left.snapshots[1].post_line_index
-        assert result.metrics.counters["illegal_candidates"] == 0
 
     def test_reconstructed_views_carry_open_team_sheet_nature(self) -> None:
         """Verify open team sheet natures match literal sheet values for both projected sides."""

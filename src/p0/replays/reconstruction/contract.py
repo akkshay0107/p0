@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
+import orjson
+
+from p0.model.resources import default_runtime_resources
 from p0.paths import DEFAULT_PATHS
 from p0.replays.identity import normalize_showdown_id
 
 
 def _load(filename: str) -> dict[str, Any]:
-    with (DEFAULT_PATHS.data_root / filename).open(encoding="utf-8") as handle:
-        return json.load(handle)
+    return orjson.loads((DEFAULT_PATHS.data_root / filename).read_bytes())
 
 
-_DEX = _load("champions_dex.json")
+_DEX = default_runtime_resources().dex
 _INVENTORY = _load("showdown_raw_emission_inventory.json")
 _LITERAL_ARGUMENT = re.compile(r"['\"]([A-Za-z][A-Za-z0-9 .'_-]*)['\"]")
 
@@ -66,22 +67,22 @@ ALLOWED_CAUSE_NAMESPACES = frozenset(
 )
 
 
-def _witnessed_effects(tag: str) -> set[str]:
-    """Return the effect names that the simulator source passes to one protocol tag."""
-    effects: set[str] = set()
+def _witnessed_effects() -> dict[str, frozenset[str]]:
+    """Collect source-backed effect names in one pass over the generated contract."""
+    effects = {"-activate": set(KNOWN_ACTIVATION_EFFECTS), "-singlemove": set()}
     for witness in _load("replay_protocol_contract.json")["raw_witnesses"]:
-        if tag != (witness["tag"] or (witness["resolved_tags"] or [None])[0]):
+        tag = witness["tag"] or (witness["resolved_tags"] or [None])[0]
+        if tag not in effects:
             continue
-        effects.update(normalize_showdown_id(effect) for effect in witness["normalized_effects"])
-        effects.update(
+        effects[tag].update(
+            normalize_showdown_id(effect) for effect in witness["normalized_effects"]
+        )
+        effects[tag].update(
             normalize_showdown_id(literal.group(1))
             for argument in witness["arguments"]
             if (literal := _LITERAL_ARGUMENT.fullmatch(argument))
         )
-    return effects
+    return {tag: frozenset(names) for tag, names in effects.items()}
 
 
-ALLOWED_EFFECTS_BY_TAG = {
-    "-activate": frozenset(_witnessed_effects("-activate") | KNOWN_ACTIVATION_EFFECTS),
-    "-singlemove": frozenset(_witnessed_effects("-singlemove")),
-}
+ALLOWED_EFFECTS_BY_TAG = _witnessed_effects()

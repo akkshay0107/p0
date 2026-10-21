@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from typing import NamedTuple
 
 from p0.replays.identity import ReplayMemberId, ReplaySide
 
 
-@dataclass(frozen=True, slots=True)
-class ProtocolPokemonReference:
+class ProtocolPokemonReference(NamedTuple):
     """An unresolved side or active-slot Pokémon reference from a protocol argument."""
 
     side: ReplaySide

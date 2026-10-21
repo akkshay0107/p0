@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import StrEnum
+from typing import NamedTuple
 
 
 class ReplayRejectionCategory(StrEnum):
@@ -16,8 +16,7 @@ class ReplayRejectionCategory(StrEnum):
     INVALID_INPUT_CONTRACT = "INVALID_INPUT_CONTRACT"
 
 
-@dataclass(frozen=True, slots=True)
-class ReplayEventDiagnostic:
+class ReplayEventDiagnostic(NamedTuple):
     """Evidence explaining why one protocol line rejects a replay."""
 
     replay_id: str

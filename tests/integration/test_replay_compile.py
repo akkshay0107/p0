@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 
+from p0.model.resources import default_runtime_resources
+from p0.model.structured_observation import CAT_IDX_STAT_PROVENANCE, StatProvenance
 from p0.replays.compile import compile_payloads, write_tensor_shards
 from tests.stress._helpers import (
     stress_count,
@@ -13,6 +16,11 @@ from tests.stress._helpers import (
     stress_random_replay_payloads,
     stress_rng,
     stress_series_id,
+)
+from tests.unit.replay_fixtures import decision_payload
+
+_GOLDEN_REPLAY_DIRECTORY = (
+    Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
 )
 
 
@@ -112,6 +120,39 @@ class TestReplayCompile:
         assert owners == Counter(
             {stress_series_id(f"series-{index}"): 1 for index in range(series_count)}
         )
+
+
+@pytest.mark.heavy
+@pytest.mark.integration
+class TestReplayProjectionArtifacts:
+    def test_shards_preserve_explicit_unknown_stat_provenance(self, tmp_path: Path) -> None:
+        result = compile_payloads((decision_payload(),))
+        built = write_tensor_shards(
+            result,
+            tmp_path,
+            resources=default_runtime_resources(),
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        artifact = torch.load(
+            built.manifest_path.parent / built.manifest.shards[0].filename,
+            map_location="cpu",
+            weights_only=True,
+        )
+        provenance = artifact["tensors"]["categorical"][:, :12, CAT_IDX_STAT_PROVENANCE]
+        assert torch.all(provenance == int(StatProvenance.UNKNOWN))
+
+    @pytest.mark.skipif(
+        not tuple(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")),
+        reason="local golden replay corpus is not present",
+    )
+    def test_local_golden_replays_are_all_accepted(self) -> None:
+        paths = tuple(sorted(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")))
+
+        result = compile_payloads(path.read_bytes() for path in paths)
+
+        assert result.metrics.counters["rejected_games"] == 0
+        assert result.metrics.counters["accepted_games"] == len(paths)
 
 
 def _summaries(build, filename: str) -> list[dict[str, Any]]:

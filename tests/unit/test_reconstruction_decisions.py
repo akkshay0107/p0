@@ -12,16 +12,14 @@ from p0.replays.compile import compile_payloads
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.decisions import (
-    build_decision_view,
     infer_decision_windows,
 )
 from p0.replays.reconstruction.resolution import resolve_replay_events
-from p0.replays.reconstruction.state import reduce_replay_state
 from p0.replays.schema import DecisionType, LabelKind
 from tests.unit.replay_fixtures import decision_payload, sample_replay_payload
 
 
-def _decision_view_with_ots(
+def _payload_with_ots(
     *,
     p1_species: str = "Pikachu",
     p1_moves: list[str] | None = None,
@@ -49,22 +47,7 @@ def _decision_view_with_ots(
     payload["log"] = "\n".join(lines)
     if p1_species != "Pikachu":
         payload["log"] = str(payload["log"]).replace("Pikachu", p1_species)
-    document = parse_replay_payload(payload)
-    events = resolve_replay_events(document).require_accepted()
-    snapshots = reduce_replay_state(
-        document.metadata.replay_id, document.ots, events
-    ).require_accepted()
-    turn_index = next(index for index, line in enumerate(lines) if line.startswith("|turn|"))
-    separator_index = next(
-        index for index in range(turn_index + 1, len(events)) if events[index].event.tag == ""
-    )
-    return build_decision_view(
-        snapshots[turn_index - 1],
-        document.ots[0],
-        0,
-        events[turn_index:separator_index],
-        preview=False,
-    )
+    return payload
 
 
 class TestReconstructionDecisions:
@@ -162,12 +145,14 @@ class TestDecisionTargets:
         move_idx: int,
         expected_targets: tuple[int, ...],
     ) -> None:
-        view = _decision_view_with_ots(
+        payload = _payload_with_ots(
             p1_species=p1_species,
             p1_moves=p1_moves,
             p1_b_moves=p1_b_moves,
             extra_lines=extra_lines,
         )
+        game = compile_payloads((payload,)).accepted_series[0].games[0]
+        view = game.perspectives[0].snapshots[1].view.decision
         assert view.slots[slot_idx].move_targets[move_idx] == expected_targets
 
     def test_observed_self_target_label_matches_the_live_self_slot_order(self) -> None:
@@ -202,7 +187,9 @@ class TestDecisionTargets:
         extra_lines: tuple[str, ...],
         expected_can_mega: bool,
     ) -> None:
-        view = _decision_view_with_ots(p1_species=species, p1_item=item, extra_lines=extra_lines)
+        payload = _payload_with_ots(p1_species=species, p1_item=item, extra_lines=extra_lines)
+        game = compile_payloads((payload,)).accepted_series[0].games[0]
+        view = game.perspectives[0].snapshots[1].view.decision
         assert view.slots[0].can_mega is expected_can_mega
         assert any(27 <= action < 48 for action in legal_actions(view, 0)) is expected_can_mega
 
@@ -218,11 +205,13 @@ class TestDecisionTargets:
         extra_lines: tuple[str, ...],
         expected_can_mega: bool,
     ) -> None:
-        view = _decision_view_with_ots(
+        payload = _payload_with_ots(
             p1_species="Zygarde",
             p1_item="Zygardite",
             extra_lines=extra_lines,
         )
+        game = compile_payloads((payload,)).accepted_series[0].games[0]
+        view = game.perspectives[0].snapshots[1].view.decision
         assert view.slots[0].can_mega is expected_can_mega
         assert any(27 <= action < 48 for action in legal_actions(view, 0)) is expected_can_mega
 

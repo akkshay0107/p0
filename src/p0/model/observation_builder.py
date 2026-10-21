@@ -59,13 +59,7 @@ FORMAT_LEVEL = 50
 
 _DEFAULT_RESOURCES = default_runtime_resources()
 _MEGA_FORMS = _DEFAULT_RESOURCES.mega_forms
-_MEGA_SPECIES_BY_ITEM = {
-    PokemonTokenizer.normalize_id(item["id"]): frozenset(
-        PokemonTokenizer.normalize_id(species) for species in item["megaStone"]
-    )
-    for item in _DEFAULT_RESOURCES.dex["items"]
-    if item.get("megaStone")
-}
+_MEGA_SPECIES_BY_ITEM = _DEFAULT_RESOURCES.mega_species_by_item
 
 # Named after the poke-env protocol enums the adapters hand over; matching on
 # member names keeps this module free of the poke-env dependency itself.

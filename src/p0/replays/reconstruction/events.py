@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
@@ -33,8 +33,7 @@ from p0.replays.reconstruction.identity import (
 from p0.replays.schema import ProtocolLine
 
 
-@dataclass(frozen=True, slots=True)
-class EffectReference:
+class EffectReference(NamedTuple):
     """A normalized protocol effect such as a move, item, or ability."""
 
     namespace: str
@@ -42,8 +41,7 @@ class EffectReference:
     normalized: str
 
 
-@dataclass(frozen=True, slots=True)
-class PokemonRefArgument:
+class PokemonRefArgument(NamedTuple):
     """A Pokémon reference together with its position in the event arguments."""
 
     argument_index: int
@@ -172,10 +170,10 @@ def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
             int(arguments[2])
         except ValueError:
             return f"{tag} amount must be an integer"
-    if tag in {"poke", "showteam"} and (not arguments or arguments[0] not in {"p1", "p2"}):
+    if tag in {"poke", "showteam", "player"} and (
+        not arguments or arguments[0] not in {"p1", "p2"}
+    ):
         return f"{tag} requires a p1/p2 side"
-    if tag == "player" and (not arguments or arguments[0] not in {"p1", "p2"}):
-        return "player requires a p1/p2 side"
     effect = _effect_reference(arguments[1]) if tag == "-activate" and len(arguments) > 1 else None
     if effect is not None:
         catalog_kind = {"item": "items", "ability": "abilities"}.get(effect.namespace)
@@ -223,44 +221,28 @@ def _parse_pokemon_refs(
     rule: EventRule,
     arguments: tuple[str, ...],
 ) -> tuple[tuple[PokemonRefArgument, ...], str]:
-    parsed: dict[int, PokemonRefArgument] = {}
-    for index in rule.pokemon_refs:
-        try:
-            pokemon_ref = parse_protocol_pokemon_reference(arguments[index])
-        except (IndexError, ValueError) as exc:
-            return (), f"argument {index} is not a valid required Pokémon reference: {exc}"
-        parsed[index] = PokemonRefArgument(index, pokemon_ref)
-
-    for index in rule.optional_pokemon_refs:
-        if index >= len(arguments) or not arguments[index]:
-            continue
-        try:
-            pokemon_ref = parse_protocol_pokemon_reference(arguments[index])
-        except ValueError as exc:
-            return (), f"argument {index} is not a valid optional Pokémon reference: {exc}"
-        parsed[index] = PokemonRefArgument(index, pokemon_ref)
-
+    parsed: list[PokemonRefArgument] = []
     for index, argument in enumerate(arguments):
-        if index not in parsed and looks_like_protocol_pokemon_reference(argument):
-            try:
-                parsed[index] = PokemonRefArgument(
-                    index, parse_protocol_pokemon_reference(argument)
-                )
-            except ValueError as exc:
-                return (), f"argument {index} resembles a malformed Pokémon reference: {exc}"
-        candidate = _annotated_pokemon_ref(argument)
-        if candidate is not None:
-            try:
-                parsed[index] = PokemonRefArgument(
-                    index, parse_protocol_pokemon_reference(candidate)
-                )
-            except ValueError as exc:
-                return (
-                    (),
-                    f"argument {index} contains a malformed annotated Pokémon reference: {exc}",
-                )
+        candidate = argument
+        if index in rule.pokemon_refs:
+            context = "is not a valid required"
+        elif index in rule.optional_pokemon_refs:
+            if not argument:
+                continue
+            context = "is not a valid optional"
+        elif looks_like_protocol_pokemon_reference(argument):
+            context = "resembles a malformed"
+        else:
+            candidate = _annotated_pokemon_ref(argument)
+            if candidate is None:
+                continue
+            context = "contains a malformed annotated"
+        try:
+            parsed.append(PokemonRefArgument(index, parse_protocol_pokemon_reference(candidate)))
+        except ValueError as exc:
+            return (), f"argument {index} {context} Pokémon reference: {exc}"
 
-    return tuple(parsed[index] for index in sorted(parsed)), ""
+    return tuple(parsed), ""
 
 
 def _unsupported_effect(arguments: tuple[str, ...]) -> EffectReference | None:
