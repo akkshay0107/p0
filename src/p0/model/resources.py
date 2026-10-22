@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from functools import cache, lru_cache, wraps
+from functools import lru_cache
 from typing import Any
 
 import orjson
@@ -20,6 +19,10 @@ class RuntimeResources:
     tokenizer: PokemonTokenizer
     mega_items: frozenset[str]
     mega_forms: frozenset[str]
+    # Species id to the id of its base species (Vivillon-Sandstorm to vivillon).
+    species_bases: dict[str, str]
+    # Mega Stone id to the ids of the species that can use it.
+    mega_species_by_item: dict[str, frozenset[str]]
 
     @classmethod
     def from_data(
@@ -49,12 +52,25 @@ class RuntimeResources:
             for entry in transformations
             if entry.get("isMega")
         )
+        species_bases = {
+            entry["id"]: PokemonTokenizer.normalize_id(entry["baseSpecies"])
+            for entry in dex["species"]
+        }
+        mega_species_by_item = {
+            PokemonTokenizer.normalize_id(item["id"]): frozenset(
+                PokemonTokenizer.normalize_id(species) for species in item["megaStone"]
+            )
+            for item in dex["items"]
+            if item.get("megaStone")
+        }
         return cls(
             vocab=vocab,
             dex=dex,
             tokenizer=shared_tokenizer or PokemonTokenizer(vocab),
             mega_items=mega_items,
             mega_forms=mega_forms,
+            species_bases=species_bases,
+            mega_species_by_item=mega_species_by_item,
         )
 
 
@@ -63,22 +79,3 @@ def default_runtime_resources() -> RuntimeResources:
     dex_path = DEFAULT_PATHS.data_root / "champions_dex.json"
     dex = orjson.loads(dex_path.read_bytes())
     return RuntimeResources.from_data(tokenizer.vocab, dex, shared_tokenizer=tokenizer)
-
-
-def cache_default_dex[T](
-    build: Callable[[Mapping[str, Any]], T],
-) -> Callable[[Mapping[str, Any]], T]:
-    """Reuse default-dex tables per process; build them read-only, since callers share them."""
-    default = cache(lambda: build(default_runtime_resources().dex))
-
-    @wraps(build)
-    def lookup(dex: Mapping[str, Any]) -> T:
-        # Custom data must not load default resources or reuse their tables.
-        if (
-            default_runtime_resources.cache_info().currsize
-            and dex is default_runtime_resources().dex
-        ):
-            return default()
-        return build(dex)
-
-    return lookup

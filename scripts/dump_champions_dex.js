@@ -281,6 +281,16 @@ for (const species of legalSpecies) {
     reachableAbilityIds.add(toID(ability));
 }
 const legalMoves = allowedMoves.filter((move) => reachableMoveIds.has(move.id));
+// A move can give its target a fixed ability that no legal species has, such as
+// Simple Beam giving Simple. Read the ability from the move's own handlers.
+const SET_ABILITY_RE = /setAbility\(\s*['"]([a-z0-9]+)['"]/gi;
+for (const move of legalMoves) {
+  for (const handler of Object.values(move)) {
+    if (typeof handler !== "function") continue;
+    for (const match of handler.toString().matchAll(SET_ABILITY_RE))
+      reachableAbilityIds.add(toID(match[1]));
+  }
+}
 const legalAbilities = allowedAbilities.filter((ability) =>
   reachableAbilityIds.has(ability.id),
 );
@@ -367,6 +377,11 @@ function collectEffectRefs(value, seen = new Set()) {
     const source = Function.prototype.toString.call(fn);
     const patterns = [
       ["effect", /addVolatile\(['"]([^'"]+)/g],
+      // A move can announce a one-turn or one-move effect without adding a volatile (Instruct).
+      [
+        "effect",
+        /add\(\s*['"]-(?:singleturn|singlemove)['"],\s*\w+,\s*['"](?:move: )?([^'"]+)/g,
+      ],
       ["side_condition", /addSideCondition\(['"]([^'"]+)/g],
       ["weather", /setWeather\(['"]([^'"]+)/g],
       ["field", /(?:setTerrain|addPseudoWeather)\(['"]([^'"]+)/g],

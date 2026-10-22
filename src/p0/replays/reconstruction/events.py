@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import ReplayDocument
 from p0.replays.reconstruction.classification import (
     CLASSIFICATION_REGISTRY,
-    UNSUPPORTED_PREDICATES,
-    UNSUPPORTED_TAGS,
     EventClassification,
     EventRule,
 )
@@ -18,6 +16,7 @@ from p0.replays.reconstruction.contract import (
     ALL_LEGAL_EFFECT_NAMES,
     ALLOWED_CAUSE_NAMESPACES,
     ALLOWED_EFFECTS_BY_TAG,
+    DELAYED_MOVES,
     KNOWN_ACTIVATION_EFFECTS,
     LEGAL_EFFECT_IDS,
 )
@@ -34,29 +33,19 @@ from p0.replays.reconstruction.identity import (
 from p0.replays.schema import ProtocolLine
 
 
-@dataclass(frozen=True, slots=True)
-class EffectReference:
+class EffectReference(NamedTuple):
     """A normalized protocol effect such as a move, item, or ability."""
 
     namespace: str
     name: str
     normalized: str
 
-    def __post_init__(self) -> None:
-        if not self.name or not self.normalized:
-            raise ValueError("EffectReference requires a nonempty name")
 
-
-@dataclass(frozen=True, slots=True)
-class PokemonRefArgument:
+class PokemonRefArgument(NamedTuple):
     """A Pokémon reference together with its position in the event arguments."""
 
     argument_index: int
     pokemon_ref: ProtocolPokemonReference
-
-    def __post_init__(self) -> None:
-        if type(self.argument_index) is not int or self.argument_index < 0:
-            raise ValueError("PokemonRefArgument.argument_index must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,18 +63,6 @@ class ProtocolEvent:
     effect: EffectReference | None = None
     cause: EffectReference | None = None
     rejection_reason: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.replay_id:
-            raise ValueError("ProtocolEvent.replay_id must not be empty")
-        if type(self.line_index) is not int or self.line_index < 0:
-            raise ValueError("ProtocolEvent.line_index must be nonnegative")
-        if not self.raw_line.startswith("|"):
-            raise ValueError("ProtocolEvent.raw_line must be a protocol line")
-        if not isinstance(self.classification, EventClassification):
-            raise TypeError("ProtocolEvent.classification must be an EventClassification")
-        if self.classification.rejects_replay != bool(self.rejection_reason):
-            raise ValueError("Rejecting events require a reason and accepted events forbid one")
 
     @property
     def diagnostic(self) -> ReplayEventDiagnostic | None:
@@ -124,17 +101,6 @@ class ParsedReplayEvents:
     replay_id: str
     events: tuple[ProtocolEvent, ...]
     diagnostics: tuple[ReplayEventDiagnostic, ...]
-
-    def __post_init__(self) -> None:
-        if not self.replay_id:
-            raise ValueError("ParsedReplayEvents.replay_id must not be empty")
-        if any(event.replay_id != self.replay_id for event in self.events):
-            raise ValueError("ParsedReplayEvents cannot contain events from another replay")
-        expected_diagnostics = tuple(
-            diagnostic for event in self.events if (diagnostic := event.diagnostic) is not None
-        )
-        if self.diagnostics != expected_diagnostics:
-            raise ValueError("ParsedReplayEvents.diagnostics must match its rejecting events")
 
     def require_accepted(self) -> tuple[ProtocolEvent, ...]:
         """Return events or reject the whole replay with all parsing diagnostics."""
@@ -176,7 +142,7 @@ def _shape_error(rule: EventRule, arguments: tuple[str, ...]) -> str:
         return f"expected at least {rule.minimum_arguments} arguments, received {count}"
     if rule.maximum_arguments is not None and count > rule.maximum_arguments:
         return f"expected at most {rule.maximum_arguments} arguments, received {count}"
-    for index in rule.required_nonempty:
+    for index in rule.required:
         if index >= count or not arguments[index]:
             return f"argument {index} must be present and nonempty"
     return ""
@@ -186,7 +152,7 @@ def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
     if (
         tag == "move"
         and len(arguments) == 2
-        and normalize_showdown_id(arguments[1]) in {"doomdesire", "futuresight"}
+        and normalize_showdown_id(arguments[1]) in DELAYED_MOVES
     ):
         return "delayed move requires an explicit target"
     if tag in {"turn", "gen"} and not arguments[0].isdigit():
@@ -204,10 +170,10 @@ def _semantic_shape_error(tag: str, arguments: tuple[str, ...]) -> str:
             int(arguments[2])
         except ValueError:
             return f"{tag} amount must be an integer"
-    if tag in {"poke", "showteam"} and (not arguments or arguments[0] not in {"p1", "p2"}):
+    if tag in {"poke", "showteam", "player"} and (
+        not arguments or arguments[0] not in {"p1", "p2"}
+    ):
         return f"{tag} requires a p1/p2 side"
-    if tag == "player" and (not arguments or arguments[0] not in {"p1", "p2"}):
-        return "player requires a p1/p2 side"
     effect = _effect_reference(arguments[1]) if tag == "-activate" and len(arguments) > 1 else None
     if effect is not None:
         catalog_kind = {"item": "items", "ability": "abilities"}.get(effect.namespace)
@@ -255,44 +221,28 @@ def _parse_pokemon_refs(
     rule: EventRule,
     arguments: tuple[str, ...],
 ) -> tuple[tuple[PokemonRefArgument, ...], str]:
-    parsed: dict[int, PokemonRefArgument] = {}
-    for index in rule.required_pokemon_refs:
-        try:
-            pokemon_ref = parse_protocol_pokemon_reference(arguments[index])
-        except (IndexError, ValueError) as exc:
-            return (), f"argument {index} is not a valid required Pokémon reference: {exc}"
-        parsed[index] = PokemonRefArgument(index, pokemon_ref)
-
-    for index in rule.optional_pokemon_refs:
-        if index >= len(arguments) or not arguments[index]:
-            continue
-        try:
-            pokemon_ref = parse_protocol_pokemon_reference(arguments[index])
-        except ValueError as exc:
-            return (), f"argument {index} is not a valid optional Pokémon reference: {exc}"
-        parsed[index] = PokemonRefArgument(index, pokemon_ref)
-
+    parsed: list[PokemonRefArgument] = []
     for index, argument in enumerate(arguments):
-        if index not in parsed and looks_like_protocol_pokemon_reference(argument):
-            try:
-                parsed[index] = PokemonRefArgument(
-                    index, parse_protocol_pokemon_reference(argument)
-                )
-            except ValueError as exc:
-                return (), f"argument {index} resembles a malformed Pokémon reference: {exc}"
-        candidate = _annotated_pokemon_ref(argument)
-        if candidate is not None:
-            try:
-                parsed[index] = PokemonRefArgument(
-                    index, parse_protocol_pokemon_reference(candidate)
-                )
-            except ValueError as exc:
-                return (
-                    (),
-                    f"argument {index} contains a malformed annotated Pokémon reference: {exc}",
-                )
+        candidate = argument
+        if index in rule.pokemon_refs:
+            context = "is not a valid required"
+        elif index in rule.optional_pokemon_refs:
+            if not argument:
+                continue
+            context = "is not a valid optional"
+        elif looks_like_protocol_pokemon_reference(argument):
+            context = "resembles a malformed"
+        else:
+            candidate = _annotated_pokemon_ref(argument)
+            if candidate is None:
+                continue
+            context = "contains a malformed annotated"
+        try:
+            parsed.append(PokemonRefArgument(index, parse_protocol_pokemon_reference(candidate)))
+        except ValueError as exc:
+            return (), f"argument {index} {context} Pokémon reference: {exc}"
 
-    return tuple(parsed[index] for index in sorted(parsed)), ""
+    return tuple(parsed), ""
 
 
 def _unsupported_effect(arguments: tuple[str, ...]) -> EffectReference | None:
@@ -312,7 +262,7 @@ def _event_effect(
     rule: EventRule,
     arguments: tuple[str, ...],
 ) -> EffectReference | None:
-    index = rule.effect_argument
+    index = rule.effect
     if index is None or not arguments:
         return None
     if tag == "-activate" and looks_like_protocol_pokemon_reference(arguments[0]):
@@ -331,6 +281,10 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
     if tag == "move" and len(arguments) >= 3 and arguments[2] == "null":
         arguments = (*arguments[:2], "", *arguments[3:])
     cause = _cause(arguments)
+    if tag == "move" and cause is not None and cause.normalized == "round":
+        # Round moves every later Round user up and names itself as the cause, but each
+        # still uses its own chosen Round.
+        cause = None
 
     if line.raw == "|":
         return ProtocolEvent(
@@ -384,16 +338,11 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
 
     effect = _event_effect(tag, rule, arguments)
 
-    if effect is not None and tag in {"-activate", "-singlemove"}:
-        allowed = ALLOWED_EFFECTS_BY_TAG.get(tag, frozenset())
-        allowed_for_tag = (effect.namespace, effect.normalized) in allowed or (
-            "",
-            effect.normalized,
-        ) in allowed
+    if effect is not None and tag in ALLOWED_EFFECTS_BY_TAG:
         globally_legal_activation = (
             tag == "-activate" and effect.normalized in ALL_LEGAL_EFFECT_NAMES
         )
-        if not allowed_for_tag and not globally_legal_activation:
+        if effect.normalized not in ALLOWED_EFFECTS_BY_TAG[tag] and not globally_legal_activation:
             reason = f"unsupported {tag} effect {effect.normalized!r}"
     if cause is not None and cause.namespace and cause.namespace not in ALLOWED_CAUSE_NAMESPACES:
         reason = f"unsupported cause namespace {cause.namespace!r}"
@@ -406,29 +355,13 @@ def parse_protocol_event(replay_id: str, line: ProtocolLine) -> ProtocolEvent:
         elif not cause.namespace and cause.normalized not in ALL_LEGAL_EFFECT_NAMES:
             reason = f"unsupported cause {cause.normalized!r}"
 
-    predicate = next(
-        (
-            candidate
-            for candidate in (effect, cause)
-            if candidate and (tag, candidate.normalized) in UNSUPPORTED_PREDICATES
-        ),
-        None,
+    classification = (
+        EventClassification.UNSUPPORTED_STATE
+        if reason.startswith("unsupported ")
+        else rule.classification
+        if not reason
+        else EventClassification.MALFORMED
     )
-
-    if not reason and tag in UNSUPPORTED_TAGS:
-        reason = f"protocol tag {tag!r} is unsupported by the reconstruction contract"
-        classification = EventClassification.UNSUPPORTED_STATE
-    elif not reason and predicate is not None:
-        reason = f"protocol effect {predicate.normalized!r} on {tag!r} requires unsupported stored-stat state"
-        classification = EventClassification.UNSUPPORTED_STATE
-    else:
-        classification = (
-            EventClassification.UNSUPPORTED_STATE
-            if reason.startswith("unsupported ")
-            else rule.classification
-            if not reason
-            else EventClassification.MALFORMED
-        )
     return ProtocolEvent(
         replay_id,
         line.index,

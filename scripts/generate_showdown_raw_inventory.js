@@ -202,7 +202,10 @@ function volatileTable() {
 function main() {
   const files = sourceFiles().map(scan);
   const entries = files.flatMap(file => file.entries);
-  const impossible = new Set(['debug', '-candynamax', '-center', '-terastallize', '-zpower', '-primal', '-burst', '-swapsideconditions', '-combine', '-waiting', '-notarget', '-nothing', '-eat']);
+  // Tags with no owning move, item or ability that the format still cannot emit.
+  // A tag with an owner needs no entry: its sites are excluded when the owner is illegal.
+  const impossible = new Set(Object.keys(JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'impossible_protocol_tags.json'), 'utf8'))));
   const legal = new Map(['moves', 'items', 'abilities'].map(kind => [kind, new Set(catalog.legality?.[kind] || [])]));
   const dex = Dex.mod(catalog.source.mod);
   const dynamicActivationEffects = [];
@@ -230,7 +233,8 @@ function main() {
       (entry.enclosing === 'addSplit' || entry.enclosing === 'add');
     const templateTag = entry.template_prefix?.replace(/^\|/, '').split('|', 1)[0];
     const dynamicTags = entry.dynamic_tag_expression === "isDrag ? 'drag' : 'switch'" ? ['drag', 'switch']
-      : entry.dynamic_tag_expression === "this.battle.gen >= 5 ? '-fail' : '-notarget'" ? ['-fail', '-notarget']
+      : entry.dynamic_tag_expression === "this.battle.gen >= 5 ? '-fail' : '-notarget'"
+      ? [catalog.source.generation >= 5 ? '-fail' : '-notarget']
       : entry.split_tag ? [entry.split_tag]
       : templateTag ? [templateTag]
       : entry.path.endsWith('/rulesets.ts') && entry.dynamic_tag_expression === '${buf}' ? ['clearpoke', 'poke', 'rule']
@@ -253,7 +257,7 @@ function main() {
       : entry.inactive_rule_guard ? 'guarded by a rule absent from both supported rule tables'
       : serverOnly ? 'server display or forwarding code, outside simulator replay output'
       : genericSplit ? 'generic addSplit forwarding helper, covered at its call sites'
-      : impossible.has(entry.tag) || (entry.split_tag && impossible.has(entry.split_tag)) ? 'impossible top-level tag under supported format contract'
+      : impossible.has(entry.tag) || (entry.split_tag && impossible.has(entry.split_tag)) ? 'tag is listed in scripts/impossible_protocol_tags.json'
       : entry.reachability === 'unresolved' ? 'dynamic source expression needs classification'
       : dynamicTags.length ? 'source expression expanded from structural call-site values'
       : 'source emission retained for exact format and effect review';

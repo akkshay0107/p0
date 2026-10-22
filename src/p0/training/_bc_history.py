@@ -2,26 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 from torch import Tensor
-from torch.nn.utils.rnn import pad_sequence
 
 from p0.battle.series import SeriesPerspectiveKey
-from p0.model.architecture_contract import (
-    MAX_PRIOR_GAMES,
-    SERIES_SLOTS,
-    SERIES_TOKENS_PER_GAME,
-)
+from p0.model.architecture_contract import MAX_PRIOR_GAMES
 from p0.training._bc_batch import BCGameWindow
 from p0.training.series_history import (
     SeriesHistoryStore,
+    SeriesResampler,
     SeriesStateSnapshot,
     advance_series_state,
+    pack_series_context,
 )
 
-SeriesResampler = Callable[[Tensor, Tensor], Tensor]
 # Game number and detached CPU fragments of each unfinished game, kept for one
 # training update or evaluation pass; completed games move to the store.
 ActiveGames = dict[SeriesPerspectiveKey, tuple[int, tuple[Tensor, ...]]]
@@ -56,9 +50,9 @@ def prepare_series_context(
 ) -> tuple[Tensor, Tensor]:
     """Prepare prior-game series tokens and mask for the target rows of a batch of windows."""
     working_states: dict[SeriesPerspectiveKey, SeriesStateSnapshot] = {}
-    histories: list[Tensor] = []
-    history_rows: dict[int, int] = {}
-    window_history_rows: list[tuple[int, ...]] = []
+    # Stored games are on the CPU; each is moved to the target device once.
+    moved: dict[int, Tensor] = {}
+    prior_games: list[list[Tensor]] = []
 
     for window, chunk in zip(windows, window_tokens, strict=True):
         state = working_states.get(window.series_key)
@@ -76,21 +70,15 @@ def prepare_series_context(
             )
             working_states[window.series_key] = state
 
-        prior_rows: list[int] = []
+        window_games: list[Tensor] = []
         for _, prior_tokens in state[0][-MAX_PRIOR_GAMES:]:
             identity = id(prior_tokens)
-            row = history_rows.get(identity)
-            if row is None:
-                row = len(histories)
-                history_rows[identity] = row
-                histories.append(
-                    prior_tokens.to(
-                        device=target_tokens.device,
-                        dtype=target_tokens.dtype,
-                    )
+            if identity not in moved:
+                moved[identity] = prior_tokens.to(
+                    device=target_tokens.device, dtype=target_tokens.dtype
                 )
-            prior_rows.append(row)
-        window_history_rows.append(tuple(prior_rows))
+            window_games.append(moved[identity])
+        prior_games.append(window_games)
 
         working_states[window.series_key] = advance_series_state(
             state,
@@ -101,8 +89,12 @@ def prepare_series_context(
             max_games=store.max_games,
         )
 
-    summaries = _resample_histories(histories, target_tokens, resample_game)
-    return _pack_series_context(windows, window_history_rows, summaries, target_tokens)
+    window_lengths = torch.tensor(
+        [window.batch_stop - window.batch_start for window in windows],
+        dtype=torch.long,
+        device=target_tokens.device,
+    )
+    return pack_series_context(prior_games, window_lengths, resample_game, target_tokens)
 
 
 def commit_history_updates(
@@ -124,71 +116,3 @@ def commit_history_updates(
             )
         else:
             active[window.series_key] = window.game_number, (*fragments, retained)
-
-
-def _resample_histories(
-    histories: list[Tensor],
-    reference: Tensor,
-    resample_game: SeriesResampler,
-) -> Tensor:
-    if not histories:
-        return reference.new_empty((0, SERIES_TOKENS_PER_GAME, reference.size(-1)))
-
-    lengths = torch.tensor(
-        [history.size(0) for history in histories],
-        device=reference.device,
-        dtype=torch.long,
-    )
-    padded = pad_sequence(histories, batch_first=True)
-    positions = torch.arange(padded.size(1), device=reference.device)
-    history_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
-    return resample_game(padded, history_mask)
-
-
-def _pack_series_context(
-    windows: tuple[BCGameWindow, ...],
-    window_history_rows: list[tuple[int, ...]],
-    summaries: Tensor,
-    reference: Tensor,
-) -> tuple[Tensor, Tensor]:
-    if summaries.numel():
-        row_indices = torch.full(
-            (len(windows), MAX_PRIOR_GAMES),
-            -1,
-            dtype=torch.long,
-            device=reference.device,
-        )
-        for index, rows in enumerate(window_history_rows):
-            if rows:
-                row_indices[index, : len(rows)] = torch.tensor(
-                    rows,
-                    dtype=torch.long,
-                    device=reference.device,
-                )
-        valid = row_indices >= 0
-        selected = summaries[row_indices.clamp_min(0)]
-        selected = selected.masked_fill(~valid[:, :, None, None], 0.0)
-        window_tokens = selected.flatten(1, 2)
-    else:
-        window_tokens = reference.new_zeros((len(windows), SERIES_SLOTS, reference.size(-1)))
-
-    used_games = torch.tensor(
-        [len(rows) for rows in window_history_rows],
-        dtype=torch.long,
-        device=reference.device,
-    )
-    series_mask = (
-        torch.arange(SERIES_SLOTS, device=reference.device).unsqueeze(0)
-        < used_games.unsqueeze(1) * SERIES_TOKENS_PER_GAME
-    )
-    window_lengths = torch.tensor(
-        [window.batch_stop - window.batch_start for window in windows],
-        dtype=torch.long,
-        device=reference.device,
-    )
-    return (
-        torch.repeat_interleave(
-            window_tokens, window_lengths, dim=0, output_size=reference.size(0)
-        ),
-        torch.repeat_interleave(series_mask, window_lengths, dim=0, output_size=reference.size(0)),
-    )

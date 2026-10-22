@@ -122,4 +122,3 @@ class TestPpoSimulation:
         finally:
             if vector_env is not None:
                 vector_env.shutdown()
-            poke_env_patches.uninstall_for_tests()

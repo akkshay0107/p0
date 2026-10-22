@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, NamedTuple
 
 
 class EventClassification(StrEnum):
@@ -14,7 +13,6 @@ class EventClassification(StrEnum):
 
     NO_STATE_CHANGE = "no_state_change"
     PUBLIC_STATE = "public_state"
-    ACTION_EXECUTION = "action_execution"
     BOUNDARY_SIGNAL = "boundary_signal"
     UNSUPPORTED_STATE = "unsupported_state"
     MALFORMED = "malformed"
@@ -25,55 +23,24 @@ class EventClassification(StrEnum):
         return self in {self.UNSUPPORTED_STATE, self.MALFORMED}
 
 
-@dataclass(frozen=True, slots=True)
-class EventRule:
-    """Classification and structural requirements for one protocol tag."""
+class EventRule(NamedTuple):
+    """Classification and argument shape for one protocol tag."""
 
     classification: EventClassification
     minimum_arguments: int
     maximum_arguments: int | None = None
-    required_nonempty: tuple[int, ...] = ()
-    required_pokemon_refs: tuple[int, ...] = ()
+    # Indices of arguments that must be present and nonempty.
+    required: tuple[int, ...] = ()
+    # Indices of arguments that must be Pokemon references.
+    pokemon_refs: tuple[int, ...] = ()
     optional_pokemon_refs: tuple[int, ...] = ()
-    effect_argument: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.minimum_arguments < 0:
-            raise ValueError("EventRule.minimum_arguments must be nonnegative")
-        if self.maximum_arguments is not None and self.maximum_arguments < self.minimum_arguments:
-            raise ValueError("EventRule.maximum_arguments cannot be below the minimum")
-        indices = self.required_nonempty + self.required_pokemon_refs + self.optional_pokemon_refs
-        if any(index < 0 for index in indices):
-            raise ValueError("EventRule argument indices must be nonnegative")
-        if self.effect_argument is not None and self.effect_argument < -1:
-            raise ValueError("EventRule.effect_argument must be -1 or nonnegative when present")
+    # Index of the argument that names the effect; -1 is the last argument.
+    effect: int | None = None
 
 
-def _rule(
-    classification: EventClassification,
-    minimum: int,
-    maximum: int | None = None,
-    *,
-    required: tuple[int, ...] = (),
-    pokemon_refs: tuple[int, ...] = (),
-    optional_pokemon_refs: tuple[int, ...] = (),
-    effect: int | None = None,
-) -> EventRule:
-    return EventRule(
-        classification,
-        minimum,
-        maximum,
-        required_nonempty=required,
-        required_pokemon_refs=pokemon_refs,
-        optional_pokemon_refs=optional_pokemon_refs,
-        effect_argument=effect,
-    )
-
-
-_no_state_change = partial(_rule, EventClassification.NO_STATE_CHANGE)
-_boundary = partial(_rule, EventClassification.BOUNDARY_SIGNAL)
-_state = partial(_rule, EventClassification.PUBLIC_STATE)
-_action = partial(_rule, EventClassification.ACTION_EXECUTION)
+# A tag is _state exactly when the reducer has a handler for it; state.py checks this on import.
+_no_state_change = partial(EventRule, EventClassification.NO_STATE_CHANGE)
+_state = partial(EventRule, EventClassification.PUBLIC_STATE)
 
 
 _RULES = {
@@ -103,41 +70,39 @@ _RULES = {
     # OHKO is emitted as a bare informational marker after the target is
     # reduced to zero HP; the target is intentionally not repeated.
     "-ohko": _no_state_change(0, 0),
-    "-hint": _no_state_change(1, 1),
-    "-center": _state(0, 0),
+    # A hint can report that a delayed move missed, which clears its pending state.
+    "-hint": _state(1, 1),
     "-crit": _no_state_change(1, 2, required=(0,)),
     "-supereffective": _no_state_change(1, 2, required=(0,)),
     "-resisted": _no_state_change(1, 2, required=(0,)),
     # Scheduling and phase evidence. A bare separator is handled separately.
-    "teampreview": _boundary(0, 1),
-    "turn": _boundary(1, 1, required=(0,)),
-    "upkeep": _boundary(0, 0),
-    "win": _boundary(1, 1, required=(0,)),
-    "tie": _boundary(0, 0),
-    "forfeit": _boundary(1, 1, required=(0,)),
-    # Public initialization and roster facts.
-    "player": _state(2, 4, required=(0,)),
-    "clearpoke": _state(0, 0),
-    "poke": _state(2, 3, required=(0, 1)),
-    "showteam": _state(2, None, required=(0, 1)),
+    "teampreview": _no_state_change(0, 1),
+    "turn": _state(1, 1, required=(0,)),
+    "upkeep": _state(0, 0),
+    "win": _no_state_change(1, 1, required=(0,)),
+    "tie": _no_state_change(0, 0),
+    "forfeit": _no_state_change(1, 1, required=(0,)),
+    # Public initialization and roster facts. The roster comes from the open team sheets.
+    "player": _no_state_change(2, 4, required=(0,)),
+    "clearpoke": _no_state_change(0, 0),
+    "poke": _no_state_change(2, 3, required=(0, 1)),
+    "showteam": _no_state_change(2, None, required=(0, 1)),
     "teamsize": _state(2, 2, required=(0, 1)),
-    "start": _state(0, 0),
+    "start": _no_state_change(0, 0),
     # Executions and action metadata. Choice inference happens in a later stage.
     # A missing target is valid protocol for some moves and is retained as
     # partial evidence by the decision stage.
-    "move": _action(2, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)),
-    "switch": _action(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
-    "drag": _action(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
-    "replace": _action(2, 2, required=(0, 1), pokemon_refs=(0,)),
-    "cant": _action(2, None, required=(0, 1), pokemon_refs=(0,), effect=1),
-    "-anim": _action(3, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)),
-    "-prepare": _action(2, None, required=(0, 1), pokemon_refs=(0,), effect=1),
-    "-combine": _action(0, None),
-    "-waiting": _action(2, None, pokemon_refs=(0, 1)),
-    "-miss": _action(1, 2, pokemon_refs=(0,), optional_pokemon_refs=(1,)),
-    "-fail": _action(1, None, pokemon_refs=(0,), effect=1),
-    "-notarget": _action(0, 1, optional_pokemon_refs=(0,)),
-    "-nothing": _action(0, 0),
+    "move": _state(2, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)),
+    "switch": _state(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
+    "drag": _state(3, None, required=(0, 1, 2), pokemon_refs=(0,)),
+    "replace": _state(2, 2, required=(0, 1), pokemon_refs=(0,)),
+    "cant": _state(2, None, required=(0, 1), pokemon_refs=(0,), effect=1),
+    "-anim": _no_state_change(
+        3, None, required=(0, 1), pokemon_refs=(0,), optional_pokemon_refs=(2,)
+    ),
+    "-prepare": _state(2, None, required=(0, 1), pokemon_refs=(0,), effect=1),
+    "-miss": _no_state_change(1, 2, pokemon_refs=(0,), optional_pokemon_refs=(1,)),
+    "-fail": _state(1, None, pokemon_refs=(0,), effect=1),
     # Deterministic public battle-state transitions.
     "faint": _state(1, 1, pokemon_refs=(0,)),
     "detailschange": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
@@ -148,15 +113,13 @@ _RULES = {
     "-sethp": _state(2, None, required=(1,), pokemon_refs=(0,)),
     "-status": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-curestatus": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
-    "-cureteam": _state(1, None, pokemon_refs=(0,)),
     "-boost": _state(3, None, required=(1, 2), pokemon_refs=(0,), effect=1),
     "-unboost": _state(3, None, required=(1, 2), pokemon_refs=(0,), effect=1),
     "-setboost": _state(3, None, required=(1, 2), pokemon_refs=(0,), effect=1),
-    "-swapboost": _state(2, None, pokemon_refs=(0, 1)),
+    "-swapboost": _state(3, None, required=(2,), pokemon_refs=(0, 1)),
     "-copyboost": _state(2, None, pokemon_refs=(0, 1)),
     "-clearboost": _state(1, None, pokemon_refs=(0,)),
     "-clearallboost": _state(0, None),
-    "-clearpositiveboost": _state(3, None, pokemon_refs=(0, 1), effect=2),
     "-clearnegativeboost": _state(1, None, pokemon_refs=(0,)),
     "-invertboost": _state(1, None, pokemon_refs=(0,)),
     "-item": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
@@ -165,14 +128,8 @@ _RULES = {
     "-endability": _state(1, None, pokemon_refs=(0,), effect=1),
     "-formechange": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-mega": _state(2, None, required=(1,), pokemon_refs=(0,), effect=-1),
-    "-primal": _state(1, None, pokemon_refs=(0,)),
-    "-burst": _state(3, None, required=(1, 2), pokemon_refs=(0,), effect=2),
-    "-zpower": _state(1, None, pokemon_refs=(0,)),
-    "-zbroken": _state(1, None, pokemon_refs=(0,)),
-    "-terastallize": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
-    "-transform": _state(2, None, required=(1,), pokemon_refs=(0,)),
-    "-typechange": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
-    "-typeadd": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
+    "-zbroken": _no_state_change(1, None, pokemon_refs=(0,)),
+    "-transform": _state(2, None, required=(1,), pokemon_refs=(0, 1)),
     "-start": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-end": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-singleturn": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
@@ -180,57 +137,22 @@ _RULES = {
     "-weather": _state(1, None, required=(0,), effect=0),
     "-fieldstart": _state(1, None, required=(0,), effect=0),
     "-fieldend": _state(1, None, required=(0,), effect=0),
-    "-fieldactivate": _state(1, None, required=(0,), effect=0),
+    "-fieldactivate": _no_state_change(1, None, required=(0,), effect=0),
     "-sidestart": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-sideend": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
     "-swapsideconditions": _state(0, None),
     "-activate": _state(1, None, required=(0,), effect=0),
-    "-block": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
-    "-immune": _state(1, None, pokemon_refs=(0,)),
-    "-eat": _state(2, None, required=(1,), pokemon_refs=(0,), effect=1),
-    "-hitcount": _state(2, None, required=(1,), pokemon_refs=(0,)),
+    "-block": _no_state_change(2, None, required=(1,), pokemon_refs=(0,), effect=1),
+    "-immune": _no_state_change(1, None, pokemon_refs=(0,)),
+    "-hitcount": _no_state_change(2, None, required=(1,), pokemon_refs=(0,)),
     "-mustrecharge": _state(1, None, pokemon_refs=(0,)),
 }
 
 CLASSIFICATION_REGISTRY: Mapping[str, EventRule] = MappingProxyType(_RULES)
-
-# These tags cannot be produced by either supported Champions format at the
-# pinned simulator revision. Keeping the list explicit makes additions fail
-# closed rather than silently becoming state-neutral.
-UNSUPPORTED_TAGS = frozenset(
-    {
-        "debug",
-        "-candynamax",
-        "-center",
-        "-terastallize",
-        "-zpower",
-        "-primal",
-        "-burst",
-        "-swapsideconditions",
-        "-combine",
-        "-waiting",
-        "-notarget",
-        "-nothing",
-        "-eat",
-    }
-)
-
-# Reachable events whose semantics depend on Showdown's storedStats model.
-# They are rejected before reduction until that state is represented exactly.
-UNSUPPORTED_PREDICATES = frozenset(
-    {
-        ("-activate", "powersplit"),
-        ("-activate", "guardsplit"),
-        ("-activate", "speedswap"),
-        ("-start", "powertrick"),
-    }
-)
 
 
 __all__ = [
     "CLASSIFICATION_REGISTRY",
     "EventClassification",
     "EventRule",
-    "UNSUPPORTED_PREDICATES",
-    "UNSUPPORTED_TAGS",
 ]

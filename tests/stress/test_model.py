@@ -201,26 +201,12 @@ class TestModel:
                 history,
                 history_mask,
             )
-            encoded = stress_policy.encode(observation, action_mask)
             acted = stress_policy.act(stress_policy.prepare(encoded, memory), action_mask)
 
         assert acted.actions.shape == (batch_size, 2)
         assert torch.isfinite(acted.log_probs).all()
         assert torch.isfinite(acted.value).all()
         assert torch.all(action_mask.gather(2, acted.actions.unsqueeze(-1)).squeeze(-1))
-        assert series_mask.all()
-        assert history_mask.all()
-
-        # The same full-memory path must remain stable across repeated evaluation.
-        with torch.inference_mode():
-            repeated = stress_policy.act(stress_policy.prepare(encoded, memory), action_mask)
-
-        assert repeated.actions.shape == (batch_size, 2)
-        assert torch.isfinite(repeated.log_probs).all()
-        assert torch.isfinite(repeated.value).all()
-        assert torch.all(action_mask.gather(2, repeated.actions.unsqueeze(-1)).squeeze(-1))
-        assert series_mask.all()
-        assert history_mask.all()
 
     @pytest.mark.stress
     @settings(

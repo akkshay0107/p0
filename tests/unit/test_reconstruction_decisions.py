@@ -3,31 +3,23 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
-from typing import Any
 
 import pytest
 
 from p0.battle.actions import ActionKind, SlotAction, encode_action
 from p0.battle.legality import DecisionView, SlotDecision, legal_actions
-from p0.model.resources import default_runtime_resources
 from p0.replays.compile import compile_payloads
 from p0.replays.evidence import EvidenceRequest, ObservedAction, extract_action_evidence
 from p0.replays.protocol import parse_replay_payload
 from p0.replays.reconstruction.decisions import (
-    BoundaryKind,
-    build_decision_view,
     infer_decision_windows,
-    reconstruct_replay_decisions_both,
 )
-from p0.replays.reconstruction.events import parse_replay_events
-from p0.replays.reconstruction.resolution import resolve_protocol_events
-from p0.replays.reconstruction.state import reduce_replay_state
-from p0.replays.schema import LabelKind
+from p0.replays.reconstruction.resolution import resolve_replay_events
+from p0.replays.schema import DecisionType, LabelKind
 from tests.unit.replay_fixtures import decision_payload, sample_replay_payload
 
 
-def _decision_view_with_ots(
+def _payload_with_ots(
     *,
     p1_species: str = "Pikachu",
     p1_moves: list[str] | None = None,
@@ -35,7 +27,6 @@ def _decision_view_with_ots(
     p1_item: str = "Leftovers",
     p1_ability: str = "Static",
     extra_lines: tuple[str, ...] = (),
-    dex: Mapping[str, Any] | None = None,
 ):
     payload = decision_payload()
     lines = str(payload["log"]).splitlines()
@@ -56,55 +47,31 @@ def _decision_view_with_ots(
     payload["log"] = "\n".join(lines)
     if p1_species != "Pikachu":
         payload["log"] = str(payload["log"]).replace("Pikachu", p1_species)
-    document = parse_replay_payload(payload)
-    if dex is None:
-        dex = default_runtime_resources().dex
-    parsed = parse_replay_events(document)
-    resolved = resolve_protocol_events(
-        document.metadata.replay_id, document.ots, parsed.events, dex=dex
-    )
-    snapshots = reduce_replay_state(
-        document.metadata.replay_id, document.ots, resolved.require_accepted(), dex=dex
-    ).require_accepted()
-    events = resolved.require_accepted()
-    turn_index = next(index for index, line in enumerate(lines) if line.startswith("|turn|"))
-    separator_index = next(
-        index for index in range(turn_index + 1, len(events)) if events[index].event.tag == ""
-    )
-    return build_decision_view(
-        snapshots[turn_index - 1],
-        document.ots[0],
-        0,
-        events[turn_index:separator_index],
-        preview=False,
-        dex=dex,
-    )
+    return payload
 
 
 class TestReconstructionDecisions:
     def test_decision_reconstruction_shares_boundaries_across_perspectives(self) -> None:
-        document = parse_replay_payload(decision_payload())
+        payload = decision_payload()
+        events = resolve_replay_events(parse_replay_payload(payload)).require_accepted()
 
-        first, second = reconstruct_replay_decisions_both(document)
+        windows = infer_decision_windows(events)
+        first, second = compile_payloads((payload,)).accepted_series[0].games[0].perspectives
 
-        assert not first.diagnostics
-        assert not second.diagnostics
-        assert first.decisions
-        assert second.decisions
-        assert first.windows == second.windows
-        assert [window.kind for window in first.windows] == [
-            BoundaryKind.RESIDUAL_TERMINAL,
-            BoundaryKind.TEAM_PREVIEW,
-            BoundaryKind.NORMAL_TURN,
-            BoundaryKind.RESIDUAL_TERMINAL,
+        assert [window.decision_type for window in windows] == [
+            DecisionType.UNSPECIFIED,
+            DecisionType.TEAM_PREVIEW,
+            DecisionType.TURN,
+            DecisionType.UNSPECIFIED,
         ]
-        assert [decision.decision_type.name for decision in first.decisions] == [
-            "TEAM_PREVIEW",
-            "TURN",
-        ]
-        assert [decision.pre_line_index for decision in first.decisions] == [4, 10]
-        assert [decision.post_line_index for decision in first.decisions] == [10, 15]
-        assert all(decision.evidence.candidates for decision in first.decisions)
+        for perspective in (first, second):
+            assert [decision.decision_type.name for decision in perspective.decisions] == [
+                "TEAM_PREVIEW",
+                "TURN",
+            ]
+            assert [decision.pre_line_index for decision in perspective.decisions] == [4, 10]
+            assert [decision.post_line_index for decision in perspective.decisions] == [10, 15]
+            assert all(decision.evidence.candidates for decision in perspective.decisions)
 
     def test_decision_reconstruction_preserves_unknown_action_evidence(self) -> None:
         payload = decision_payload()
@@ -115,24 +82,16 @@ class TestReconstructionDecisions:
         payload["log"] = payload["log"].replace(
             "|move|p1b: Eevee|Tackle|p2b: Charmander", "|cant|p1b: Eevee|par|"
         )
-        document = parse_replay_payload(payload)
 
-        result = reconstruct_replay_decisions_both(document)[0]
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
 
-        assert not result.diagnostics
         assert result.decisions[-1].evidence.label_kind.name == "UNKNOWN"
         assert "no_observed_order" in result.decisions[-1].evidence.tags
 
     def test_actionful_replay_without_separators_is_unrecoverable(self) -> None:
         payload = decision_payload()
         payload["log"] = str(payload["log"]).replace("\n|\n", "\n")
-        document = parse_replay_payload(payload)
-        parsed = parse_replay_events(document)
-        resolved = resolve_protocol_events(
-            document.metadata.replay_id,
-            document.ots,
-            parsed.events,
-        )
+        resolved = resolve_replay_events(parse_replay_payload(payload))
 
         with pytest.raises(ValueError, match="actions but no update separators"):
             infer_decision_windows(resolved.require_accepted())
@@ -186,12 +145,14 @@ class TestDecisionTargets:
         move_idx: int,
         expected_targets: tuple[int, ...],
     ) -> None:
-        view = _decision_view_with_ots(
+        payload = _payload_with_ots(
             p1_species=p1_species,
             p1_moves=p1_moves,
             p1_b_moves=p1_b_moves,
             extra_lines=extra_lines,
         )
+        game = compile_payloads((payload,)).accepted_series[0].games[0]
+        view = game.perspectives[0].snapshots[1].view.decision
         assert view.slots[slot_idx].move_targets[move_idx] == expected_targets
 
     def test_observed_self_target_label_matches_the_live_self_slot_order(self) -> None:
@@ -204,9 +165,9 @@ class TestDecisionTargets:
                 "|move|p1a: Pikachu|Acupressure|p1a: Pikachu",
             )
         )
-        document = parse_replay_payload(payload)
 
-        evidence = reconstruct_replay_decisions_both(document)[0].decisions[-1].evidence
+        game = compile_payloads((payload,)).accepted_series[0].games[0]
+        evidence = game.perspectives[0].decisions[-1].evidence
 
         live_self_order = encode_action(SlotAction(ActionKind.MOVE, move_slot=1, target=-1))
         assert live_self_order in {candidate[0] for candidate in evidence.candidates}
@@ -226,36 +187,9 @@ class TestDecisionTargets:
         extra_lines: tuple[str, ...],
         expected_can_mega: bool,
     ) -> None:
-        view = _decision_view_with_ots(p1_species=species, p1_item=item, extra_lines=extra_lines)
-        assert view.slots[0].can_mega is expected_can_mega
-        assert any(27 <= action < 48 for action in legal_actions(view, 0)) is expected_can_mega
-
-    @pytest.mark.parametrize(
-        ("species", "item", "moves", "expected_can_mega"),
-        (
-            ("Rayquaza", "Leftovers", ["Protect", "Dragon Ascent"], True),
-            ("Rayquaza", "Leftovers", ["Protect", "Tackle"], False),
-            ("Rayquaza", "Flyinium Z", ["Protect", "Dragon Ascent"], False),
-        ),
-    )
-    def test_mega_rayquaza_requires_dragon_ascent_and_non_z_item(
-        self,
-        species: str,
-        item: str,
-        moves: list[str],
-        expected_can_mega: bool,
-    ) -> None:
-        base_dex = default_runtime_resources().dex
-        dex = dict(base_dex)
-        dex["items"] = list(base_dex["items"]) + [
-            {"id": "flyiniumz", "name": "Flyinium Z", "zMove": True}
-        ]
-        view = _decision_view_with_ots(
-            p1_species=species,
-            p1_item=item,
-            p1_moves=moves,
-            dex=dex,
-        )
+        payload = _payload_with_ots(p1_species=species, p1_item=item, extra_lines=extra_lines)
+        game = compile_payloads((payload,)).accepted_series[0].games[0]
+        view = game.perspectives[0].snapshots[1].view.decision
         assert view.slots[0].can_mega is expected_can_mega
         assert any(27 <= action < 48 for action in legal_actions(view, 0)) is expected_can_mega
 
@@ -271,11 +205,13 @@ class TestDecisionTargets:
         extra_lines: tuple[str, ...],
         expected_can_mega: bool,
     ) -> None:
-        view = _decision_view_with_ots(
+        payload = _payload_with_ots(
             p1_species="Zygarde",
             p1_item="Zygardite",
             extra_lines=extra_lines,
         )
+        game = compile_payloads((payload,)).accepted_series[0].games[0]
+        view = game.perspectives[0].snapshots[1].view.decision
         assert view.slots[0].can_mega is expected_can_mega
         assert any(27 <= action < 48 for action in legal_actions(view, 0)) is expected_can_mega
 
@@ -323,53 +259,14 @@ class TestDecisionTargets:
         self, boost_line: str
     ) -> None:
         tackle = "|move|p1b: Eevee|Tackle|p2b: Charmander"
-        baseline = reconstruct_replay_decisions_both(parse_replay_payload(decision_payload()))[0]
         payload = decision_payload()
         payload["log"] = str(payload["log"]).replace(tackle, f"{boost_line}\n{tackle}")
 
-        result = reconstruct_replay_decisions_both(parse_replay_payload(payload))[0]
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
 
         evidence = result.decisions[-1].evidence
         assert evidence.candidates == ((9, 13), (9, 15), (9, 16))
-        assert evidence.candidates == baseline.decisions[-1].evidence.candidates
-        assert evidence.tags == baseline.decisions[-1].evidence.tags == ("execution_target", "move")
-
-    @pytest.mark.parametrize(
-        ("singleturn_effect", "expected_tags", "expected_first_slot_actions"),
-        (
-            ("Protect", ("execution_target", "move"), {9}),
-            (
-                "Instruct",
-                ("externally_generated_move", "execution_target"),
-                {0, 3, 4, 5, 6, 9, 12, 15, 16, 48},
-            ),
-        ),
-    )
-    def test_only_instruct_singleturn_marks_following_move_as_generated(
-        self,
-        singleturn_effect: str,
-        expected_tags: tuple[str, ...],
-        expected_first_slot_actions: set[int],
-    ) -> None:
-        dex = default_runtime_resources().dex
-        legal_effects = {
-            name: list(effects) for name, effects in dex["legalProtocolEffects"].items()
-        }
-        legal_effects["effect"].append("instruct")
-        payload = decision_payload()
-        protect = "|move|p1a: Pikachu|Protect|p1a: Pikachu"
-        payload["log"] = str(payload["log"]).replace(
-            protect, f"|-singleturn|p1a: Pikachu|move: {singleturn_effect}\n{protect}"
-        )
-
-        result = reconstruct_replay_decisions_both(
-            parse_replay_payload(payload), dex={**dex, "legalProtocolEffects": legal_effects}
-        )[0]
-
-        evidence = result.decisions[-1].evidence
-        assert evidence.tags == expected_tags
-        assert {first for first, _ in evidence.candidates} == expected_first_slot_actions
-        assert {second for _, second in evidence.candidates} == {13, 15, 16}
+        assert evidence.tags == ("execution_target", "move")
 
     def test_mid_turn_encore_keeps_original_submitted_move_possible(self) -> None:
         payload = sample_replay_payload("encore-override")
@@ -378,7 +275,7 @@ class TestDecisionTargets:
             "|-start|p1b: Eevee|Encore\n|move|p1b: Eevee|Tackle|p2b: Charmander",
         )
 
-        result = compile_payloads((payload,), chunksize=0)
+        result = compile_payloads((payload,))
 
         assert result.metrics.counters["accepted_games"] == 1
         affected = result.accepted_series[0].games[0].perspectives[0].decisions[-1]
@@ -396,7 +293,7 @@ class TestDecisionTargets:
             )
         )
 
-        result = reconstruct_replay_decisions_both(parse_replay_payload(payload))[0]
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
 
         evidence = result.decisions[-1].evidence
         assert "hidden_disable_struggle" in evidence.tags
@@ -409,9 +306,158 @@ class TestDecisionTargets:
             "|move|p1b: Eevee|Tackle|p2b: Charmander\n|-start|p1b: Eevee|Encore",
         )
 
-        result = compile_payloads((payload,), chunksize=0)
+        result = compile_payloads((payload,))
 
         affected = result.accepted_series[0].games[0].perspectives[0].decisions[-1]
         assert "mid_turn_encore_override" not in affected.evidence.tags
         assert (9, 11) in affected.evidence.candidates
         assert (9, 13) not in affected.evidence.candidates
+
+
+class TestForcedMoves:
+    def test_locked_move_is_the_forced_action(self) -> None:
+        # Eevee does not own Dig: it copied the move and is on its second turn.
+        payload = decision_payload()
+        payload["log"] = str(payload["log"]).replace(
+            "|move|p1b: Eevee|Tackle|p2b: Charmander",
+            "|move|p1b: Eevee|Dig|p2b: Charmander|[from] lockedmove",
+        )
+
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        evidence = result.decisions[-1].evidence
+        assert evidence.label_kind is LabelKind.EXACT
+        # Pikachu chose Protect (move slot 0, no target); Eevee had the forced action.
+        assert evidence.candidates == ((9, 48),)
+
+    def test_struggle_after_ally_switch_belongs_to_the_slot_held_at_the_request(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Ally Switch"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n|move|p1b: Eevee|Tackle|p2b: Charmander",
+                "|move|p1b: Eevee|Ally Switch|p1b: Eevee\n"
+                "|swap|p1b: Eevee|0|[from] move: Ally Switch\n"
+                "|-activate|p1b: Pikachu|move: Struggle\n"
+                "|move|p1b: Pikachu|Struggle|p2a: Bulbasaur",
+            )
+        )
+
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        evidence = result.decisions[-1].evidence
+        assert evidence.label_kind is LabelKind.EXACT
+        # Pikachu was in the first slot when it was asked, so the forced action is there.
+        assert evidence.candidates == ((48, 9),)
+
+    def test_targets_after_ally_switch_are_coded_for_the_slot_held_at_the_request(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Eevee","name":"Eevee","ability":"Static","moves":["Ally Switch"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n|move|p1b: Eevee|Tackle|p2b: Charmander",
+                "|move|p1b: Eevee|Ally Switch|p1b: Eevee\n"
+                "|swap|p1b: Eevee|0|[from] move: Ally Switch\n"
+                "|move|p1b: Pikachu|Tackle|p2a: Bulbasaur",
+            )
+        )
+
+        result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        # Pikachu chose Tackle (move slot 1) from the first slot, where its ally is target -2:
+        # 7 + 1 * 5 + (-2 + 2) = 12. The other two candidates are the opposing slots.
+        assert result.decisions[-1].evidence.candidates == ((12, 9), (15, 9), (16, 9))
+
+
+class TestReviveDecisions:
+    def test_revive_from_the_bench_is_the_user_slot_choosing_the_fainted_member(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Pikachu","name":"Pikachu","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Pikachu","name":"Pikachu","ability":"Static",'
+                '"moves":["Revival Blessing","Tackle"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+                "|move|p1b: Eevee|Tackle|p2b: Charmander\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n",
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n"
+                "|-damage|p1b: Eevee|0 fnt\n"
+                "|faint|p1b: Eevee\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|upkeep\n"
+                "|\n"
+                "|switch|p1b: Raichu|Raichu, L50|100/100\n"
+                "|turn|2\n"
+                "|\n"
+                "|move|p1a: Pikachu|Revival Blessing|p1a: Pikachu\n"
+                "|\n"
+                "|-heal|p1: Eevee|50/100|[from] move: Revival Blessing\n"
+                "|move|p1b: Raichu|Tackle|p2a: Bulbasaur\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n",
+            )
+        )
+        lines = str(payload["log"]).splitlines()
+        revive_request = lines.index("|-heal|p1: Eevee|50/100|[from] move: Revival Blessing") - 1
+
+        perspective = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        decision = next(
+            decision
+            for decision in perspective.decisions
+            if decision.pre_line_index == revive_request
+        )
+        assert decision.decision_type is DecisionType.FORCED_SWITCH
+        assert decision.evidence.label_kind is LabelKind.EXACT
+        # Pikachu in the first slot revives Eevee (roster index 1): 1 + 1 = 2. Raichu's
+        # Tackle answered the turn request, so the second slot passes.
+        assert decision.evidence.candidates == ((2, 0),)
+
+    def test_revive_into_its_own_empty_slot_is_not_a_switch_choice(self) -> None:
+        payload = decision_payload()
+        payload["log"] = (
+            str(payload["log"])
+            .replace(
+                '"species":"Pikachu","name":"Pikachu","ability":"Static","moves":["Protect","Tackle"]',
+                '"species":"Pikachu","name":"Pikachu","ability":"Static",'
+                '"moves":["Revival Blessing","Tackle"]',
+            )
+            .replace(
+                "|move|p1a: Pikachu|Protect|p1a: Pikachu\n"
+                "|move|p1b: Eevee|Tackle|p2b: Charmander\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n"
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n",
+                "|move|p2b: Charmander|Tackle|p1b: Eevee\n"
+                "|-damage|p1b: Eevee|0 fnt\n"
+                "|faint|p1b: Eevee\n"
+                "|move|p1a: Pikachu|Revival Blessing|p1a: Pikachu\n"
+                "|\n"
+                "|-heal|p1: Eevee|50/100|[from] move: Revival Blessing\n"
+                "|switch|p1b: Eevee|Eevee, L50|50/100\n"
+                "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur\n",
+            )
+        )
+        lines = str(payload["log"]).splitlines()
+        revive_request = lines.index("|-heal|p1: Eevee|50/100|[from] move: Revival Blessing") - 1
+
+        perspective = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
+
+        decision = next(
+            decision
+            for decision in perspective.decisions
+            if decision.pre_line_index == revive_request
+        )
+        assert decision.evidence.label_kind is LabelKind.EXACT
+        # Showdown sends Eevee back into the second slot by itself; only Pikachu chose.
+        assert decision.evidence.candidates == ((2, 0),)

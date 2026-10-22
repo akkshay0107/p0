@@ -59,13 +59,7 @@ FORMAT_LEVEL = 50
 
 _DEFAULT_RESOURCES = default_runtime_resources()
 _MEGA_FORMS = _DEFAULT_RESOURCES.mega_forms
-_MEGA_SPECIES_BY_ITEM = {
-    PokemonTokenizer.normalize_id(item["id"]): frozenset(
-        PokemonTokenizer.normalize_id(species) for species in item["megaStone"]
-    )
-    for item in _DEFAULT_RESOURCES.dex["items"]
-    if item.get("megaStone")
-}
+_MEGA_SPECIES_BY_ITEM = _DEFAULT_RESOURCES.mega_species_by_item
 
 # Named after the poke-env protocol enums the adapters hand over; matching on
 # member names keeps this module free of the poke-env dependency itself.
@@ -140,8 +134,11 @@ def _pad_team(
         # only happens when an active slot placeholder pushes a 6-mon team list
         # (opponent with open team sheet) over the row budget. Eviction must stay
         # decidable from public state, so it never consults team selection.
+        # The placeholder is a second display of one species, which proves the
+        # Illusion user is active, so its bench row goes first.
         actives, rest = res[:2], res[2:]
         for predicate in (
+            lambda mon: PokemonTokenizer.normalize_id(mon.ability or "") == "illusion",
             lambda mon: mon.fainted,
             lambda mon: not mon.revealed,
         ):
@@ -203,21 +200,6 @@ def _get_ordered_pokemon(
         else:
             res.append((mon, orig_idx_map.get(mon, -1), None if is_opponent else active_idx))
             assigned.add(mon)
-
-            # A replay keeps a previously seen disguise target in the team map
-            # with its own public state. While Illusion is active, that target
-            # occupies the active row, so it must not take a second bench row.
-            if is_opponent and getattr(mon, "identity_uncertain", False):
-                target = next(
-                    (
-                        member
-                        for member in team.values()
-                        if member not in assigned and member.species == mon.species
-                    ),
-                    None,
-                )
-                if target is not None:
-                    assigned.add(target)
 
     # Row order must not depend on team selection: a public replay cannot know it
     # until a reserve appears, and an order that drifts would break replay parity.
@@ -564,17 +546,12 @@ def _pokemon_numeric_into(
     row[27] = pokemon.fainted
     row[28] = cond == 1
     row[29] = cond == 2
-    identity_uncertain = bool(getattr(pokemon, "identity_uncertain", False))
     row[NUM_IDX_CAN_MEGA] = (
         float(battle.can_mega_evolve[active_idx])
-        if active_idx is not None
-        and not identity_uncertain
-        and battle.decision.slots[active_idx].legality_known
+        if active_idx is not None and battle.decision.slots[active_idx].legality_known
         else 0.0
     )
     row[31] = _is_mega_form(pokemon)
-    if identity_uncertain:
-        row[NUM_IDX_LEGALITY_UNKNOWN] = 1.0
 
     last_move_id = None
     custom_last_move = battle.last_move(pokemon)

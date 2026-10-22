@@ -76,8 +76,6 @@ class ObservationMove:
     category: Any
     current_pp: int
     max_pp: int
-    non_ghost_target: bool = True
-    deduced_target: Any = None
 
 
 @dataclass(eq=False, slots=True)
@@ -108,9 +106,6 @@ class ObservationPokemon:
     preparing: Any = False
     last_move: ObservationMove | None = None
     level: int | None = 50
-    is_dynamaxed: bool = False
-    is_terastallized: bool = False
-    tera_type: Any = None
     types: tuple[Any, ...] = ()
 
 
@@ -122,12 +117,8 @@ class FixtureBattleView:
     opponent_team: Mapping[str, Any]
     active_pokemon: Sequence[Any | None]
     opponent_active_pokemon: Sequence[Any | None]
-    available_moves: Sequence[Sequence[Any]]
     available_switches: Sequence[Sequence[Any]]
     can_mega_evolve: Sequence[bool]
-    force_switch: Sequence[bool]
-    trapped: Sequence[bool]
-    maybe_trapped: Sequence[bool]
     teampreview: bool
     player_role: str | None
     wait: bool
@@ -139,12 +130,8 @@ class FixtureBattleView:
     used_mega_evolve: bool
     opponent_used_mega_evolve: bool
     decision: DecisionView
-    identifiers: Mapping[str, Any] = field(default_factory=dict)
     spatial_events: Sequence[EventRecord] = ()
     stat_cache: dict[Any, Any] = field(default_factory=dict)
-
-    def get_pokemon(self, identifier: str) -> Any:
-        return self.identifiers[identifier]
 
     def last_move(self, pokemon: Any) -> str | None:
         move = pokemon.last_move
@@ -183,8 +170,6 @@ def make_pokemon_view(
             category=source_move.category,
             current_pp=move_pp,
             max_pp=source_move.max_pp or move_pp,
-            non_ghost_target=source_move.non_ghost_target,
-            deduced_target=source_move.deduced_target,
         )
 
     base_stats = dict(source.base_stats)
@@ -253,14 +238,8 @@ def make_battle_view(
         opponent_team={f"p2:{index}": pokemon for index, pokemon in enumerate(opponents)},
         active_pokemon=active,
         opponent_active_pokemon=opponent_active,
-        available_moves=tuple(
-            tuple(pokemon.moves.values()) if pokemon is not None else () for pokemon in active
-        ),
         available_switches=available_switches or [[], []],
         can_mega_evolve=can_mega_evolve or [False, False],
-        force_switch=(False, False),
-        trapped=(False, False),
-        maybe_trapped=(False, False),
         teampreview=teampreview,
         player_role="p1",
         wait=False,
@@ -276,11 +255,6 @@ def make_battle_view(
 
 
 _OBSERVATION_BUILDER = ObservationBuilder(default_runtime_resources())
-
-
-def from_battle(battle, tok=tokenizer, stat_overrides=None):
-    assert tok is _OBSERVATION_BUILDER.tokenizer
-    return _OBSERVATION_BUILDER.build(battle, stat_overrides)
 
 
 class TestObservationBuilder:
@@ -425,6 +399,31 @@ class TestObservationBuilder:
         assert obs.numerical[TOKEN_IDX_ALLY_SIDE, 4] == 1.0  # Ally mega available
         assert obs.token_type_ids[TOKEN_IDX_OPPONENT_SIDE] == TokenType.FIELD
         assert obs.numerical[TOKEN_IDX_OPPONENT_SIDE, 4] == 0.0
+
+    def test_second_display_of_a_species_evicts_the_illusion_bench_row(self) -> None:
+        """Two active Clefable beside a one-Clefable sheet prove Zoroark is active, so its bench row is dropped."""
+        clefable = make_pokemon_view(species="clefable", ability="magicguard")
+        display = make_pokemon_view(species="clefable", ability="magicguard")
+        zoroark = make_pokemon_view(species="zoroark", ability="illusion")
+        bench = [
+            make_pokemon_view(species=species, ability=ability)
+            for species, ability in (
+                ("goodrahisui", "shellarmor"),
+                ("greninja", "protean"),
+                ("sceptile", "overgrow"),
+                ("rillaboom", "grassysurge"),
+            )
+        ]
+        battle = make_battle_view(
+            opponent_active_pokemon=[clefable, display],
+            opponent_team=[clefable, zoroark, *bench],
+        )
+
+        obs = _OBSERVATION_BUILDER.build(battle)
+
+        assert obs.categorical[6:12, 0].tolist() == [
+            tokenizer.species_id(pokemon) for pokemon in (clefable, display, *bench)
+        ]
 
     def test_opponent_mega_stone_does_not_claim_move_legality(self) -> None:
         """An opponent's stone does not provide a request-backed Mega option."""
@@ -705,7 +704,7 @@ class TestObservationBuilderLegalityAndState:
         from tests.unit.replay_fixtures import golden_replay_payload
 
         document = parse_replay_payload(golden_replay_payload("buffer-reuse"))
-        result = compile_documents((document,), chunksize=0)
+        result = compile_documents((document,))
         perspective = result.accepted_series[0].games[0].perspectives[0]
         assert len(perspective.snapshots) >= 2
         builder = ObservationBuilder(default_runtime_resources())

@@ -9,11 +9,7 @@ from poke_env.battle import DoubleBattle
 
 from p0.battle.legality import GAME_END_DECISION, DecisionView, SlotDecision
 from p0.battle.views import TransformedPokemonView
-from p0.runtime.live_event_capture import (
-    captured_protocol_lines,
-    last_move,
-    pending_events,
-)
+from p0.runtime.live_event_capture import last_move, pending_events
 
 
 class PokeEnvBattleView:
@@ -54,28 +50,12 @@ class PokeEnvBattleView:
         return _transformed_active_pokemon(self._battle, opponent=True)
 
     @property
-    def available_moves(self):
-        return self._battle.available_moves
-
-    @property
     def available_switches(self):
         return self._battle.available_switches
 
     @property
     def can_mega_evolve(self):
         return self._battle.can_mega_evolve
-
-    @property
-    def force_switch(self):
-        return self._battle.force_switch
-
-    @property
-    def trapped(self):
-        return self._battle.trapped
-
-    @property
-    def maybe_trapped(self):
-        return self._battle.maybe_trapped
 
     @property
     def teampreview(self):
@@ -89,15 +69,6 @@ class PokeEnvBattleView:
     def wait(self):
         # poke-env 0.15.0 exposes this request flag only as _wait.
         return self._battle._wait
-
-    @property
-    def protocol_lines(self) -> tuple[str, ...]:
-        """Return raw battle protocol lines when runtime capture is enabled."""
-        return captured_protocol_lines(self._battle)
-
-    def replay_events(self) -> tuple[str, ...]:
-        """Return poke-env's public replay serialization for this battle."""
-        return tuple(self._battle._build_replay_events())
 
     @property
     def weather(self):
@@ -139,9 +110,6 @@ class PokeEnvBattleView:
     def spatial_events(self):
         return pending_events(self._battle)
 
-    def get_pokemon(self, identifier: str):
-        return self._battle.get_pokemon(identifier)
-
     def last_move(self, pokemon):
         return last_move(pokemon)
 
@@ -150,7 +118,7 @@ _VIEWS: WeakKeyDictionary[DoubleBattle, PokeEnvBattleView] = WeakKeyDictionary()
 
 
 class _CalledMoveView:
-    """Show a sole called continuation in the action move slot for this request."""
+    """Show a sole called move as the Pokemon's only move for this request."""
 
     __slots__ = ("_pokemon", "moves", "is_transformed")
 
@@ -169,15 +137,17 @@ class _CalledMoveView:
         return self._pokemon == getattr(other, "_pokemon", other)
 
 
-def action_move_slots(battle: DoubleBattle, position: int) -> tuple[Any, ...]:
-    """Return move slots used by the current action request."""
-    active = battle.active_pokemon[position]
-    if active is None:
-        return ()
-    available = battle.available_moves[position]
-    if len(available) == 1 and available[0].id not in active.moves:
-        return (available[0],)
-    return tuple(active.moves.values())
+def locked_slots(battle: DoubleBattle) -> tuple[bool, ...]:
+    """
+    Mark each active slot whose Pokemon is locked into its move.
+
+    Showdown lists a locked Pokemon's one move without a target (Outrage, a charging
+    Dig, recharge). Struggle keeps its target, so it is not marked.
+    """
+    return tuple(
+        len(moves := active.get("moves", ())) == 1 and "target" not in moves[0]
+        for active in battle.last_request.get("active", ())
+    )
 
 
 def battle_view(battle: DoubleBattle) -> PokeEnvBattleView:
@@ -231,6 +201,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
     maybe_trapped = battle.maybe_trapped
     force_switch = battle.force_switch
     can_mega_evolve = battle.can_mega_evolve
+    locked = locked_slots(battle) or (False, False)
     slots: list[SlotDecision] = []
 
     for position in (0, 1):
@@ -253,11 +224,7 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
         switches = {id(pokemon) for pokemon in available_switches[position]}
         switch_slots = tuple(index for index, pokemon in enumerate(team) if id(pokemon) in switches)
 
-        forced_move = (
-            not any(move_targets)
-            and len(position_moves) == 1
-            and position_moves[0].id in {"struggle", "recharge"}
-        )
+        forced_move = locked[position] or [move.id for move in position_moves] == ["struggle"]
 
         slots.append(
             SlotDecision(

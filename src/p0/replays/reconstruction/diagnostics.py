@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import StrEnum
+from typing import NamedTuple
 
 
 class ReplayRejectionCategory(StrEnum):
@@ -11,11 +11,12 @@ class ReplayRejectionCategory(StrEnum):
 
     UNSUPPORTED_EVENT = "UNSUPPORTED_EVENT"
     AMBIGUOUS_IDENTITY = "AMBIGUOUS_IDENTITY"
+    INCONSISTENT_IDENTITY = "INCONSISTENT_IDENTITY"
+    TIME_LIMIT_EXCEEDED = "TIME_LIMIT_EXCEEDED"
     INVALID_INPUT_CONTRACT = "INVALID_INPUT_CONTRACT"
 
 
-@dataclass(frozen=True, slots=True)
-class ReplayEventDiagnostic:
+class ReplayEventDiagnostic(NamedTuple):
     """Evidence explaining why one protocol line rejects a replay."""
 
     replay_id: str
@@ -26,16 +27,6 @@ class ReplayEventDiagnostic:
     raw_line: str
     reason: str
     category: ReplayRejectionCategory = ReplayRejectionCategory.INVALID_INPUT_CONTRACT
-
-    def __post_init__(self) -> None:
-        if not self.replay_id:
-            raise ValueError("ReplayEventDiagnostic.replay_id must not be empty")
-        if type(self.line_index) is not int or self.line_index < 0:
-            raise ValueError("ReplayEventDiagnostic.line_index must be nonnegative")
-        if not self.raw_line.startswith("|"):
-            raise ValueError("ReplayEventDiagnostic.raw_line must be a protocol line")
-        if not self.reason:
-            raise ValueError("ReplayEventDiagnostic.reason must not be empty")
 
 
 class ReplayEventParseError(ValueError):

@@ -27,30 +27,23 @@ from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
 
 from p0.model.resources import default_runtime_resources
 from p0.replays.reconstruction.contract import COPYABLE_VOLATILES
-from p0.runtime.live_event_capture import capture_message, transform_target_reference
+from p0.runtime.live_event_capture import capture_message
+from p0.runtime.poke_env_battle_adapter import locked_slots
 
-_ORIGINAL_WAIT_FOR_LOGIN = PSClient.wait_for_login
 _ORIGINAL_STOP_LISTENING = PSClient.stop_listening
 _ORIGINAL_HANDLE_MESSAGE = PSClient._handle_message
 _ORIGINAL_SEND_MESSAGE = PSClient.send_message
 _ORIGINAL_PARSE_MESSAGE = DoubleBattle.parse_message
 _ORIGINAL_GET_POKEMON = DoubleBattle.get_pokemon
 _ORIGINAL_PARSE_REQUEST = DoubleBattle.parse_request
-_ORIGINAL_FORME_CHANGE = Pokemon.forme_change
 _ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
 _ORIGINAL_START_EFFECT = Pokemon.start_effect
-_ORIGINAL_COPY_BOOSTS = Pokemon.copy_boosts
-_installed = False
-_capture_protocol_lines = False
-_filtered_loggers: set[logging.Logger] = set()
-_original_gen_data: dict[str, dict[str, Any]] = {}
 
 
 def _install_champions_data() -> None:
     """Synchronize poke-env's read-only mechanics with the active Champions dex."""
     dex = default_runtime_resources().dex
     gen_data = GenData.from_gen(9)
-    _original_gen_data.update(pokedex=gen_data.pokedex, moves=gen_data.moves)
     gen_data.pokedex = {
         **gen_data.pokedex,
         **{
@@ -80,18 +73,11 @@ def _install_champions_data() -> None:
     Move.should_be_stored.cache_clear()
 
 
-_CRITICAL_COPY_EFFECTS = (
-    Effect.DRAGON_CHEER,
-    Effect.FOCUS_ENERGY,
-    Effect.G_MAX_CHI_STRIKE,
-    Effect.LASER_FOCUS,
-)
-_MAX_G_MAX_CHI_STRIKE_LAYERS = 3
+_CRITICAL_COPY_EFFECTS = (Effect.DRAGON_CHEER, Effect.FOCUS_ENERGY)
 _LEPPA_PP_RECOVERY = 10
 _RIPEN_LEPPA_PP_RECOVERY = 20
 # Showdown emits these through -singleturn, but they protect the whole side until the turn ends.
 _SIDE_GUARDS = {
-    "craftyshield": SideCondition.CRAFTY_SHIELD,
     "quickguard": SideCondition.QUICK_GUARD,
     "wideguard": SideCondition.WIDE_GUARD,
 }
@@ -204,16 +190,10 @@ async def _wait_for_login(self: PSClient, checking_interval: float = 0.1, wait_f
 
 
 def _start_effect(self: Pokemon, effect_str: str, details: Any = None) -> None:
-    """Track the counters and metadata needed by Showdown's copied volatiles."""
+    """Record whether Dragon Cheer reached a Dragon type, which a copy must keep."""
     _ORIGINAL_START_EFFECT(self, effect_str, details)
-    effect = Effect.from_showdown_message(effect_str)
-    if effect == Effect.G_MAX_CHI_STRIKE:
-        self.effects[effect] = min(
-            self.effects.get(effect, 0) + 1,
-            _MAX_G_MAX_CHI_STRIKE_LAYERS,
-        )
-    elif effect == Effect.DRAGON_CHEER:
-        self.effects[effect] = int(PokemonType.DRAGON in self.types)
+    if Effect.from_showdown_message(effect_str) == Effect.DRAGON_CHEER:
+        self.effects[Effect.DRAGON_CHEER] = int(PokemonType.DRAGON in self.types)
 
 
 def _copy_boosts(self: Pokemon, mon: Pokemon) -> None:
@@ -241,16 +221,39 @@ def _restore_leppa_pp(battle: DoubleBattle, event: list[str]) -> None:
 def _promote_duplicate_partner(battle: DoubleBattle, slot: str, leaving: Pokemon) -> None:
     """Make the still-active display the team entry when its same-species twin leaves."""
     role = slot[:2]
-    partner = getattr(battle, "_p0_duplicate_active", {}).get(
-        f"{role}{'b' if slot[2] == 'a' else 'a'}"
+    active = (
+        battle._active_pokemon if role == battle.player_role else battle._opponent_active_pokemon
     )
-    if partner is None or partner.species != leaving.species:
+    partner = active.get(f"{role}{'b' if slot[2] == 'a' else 'a'}")
+    # One display may have changed form since entering (Morpeko's Hunger Switch).
+    if partner is None or partner.base_species != leaving.base_species:
         return
 
+    _replace_team_entry(battle, role, leaving, partner)
+    # Keep the real Pokemon: it returns to its team entry when the display is revealed
+    # as the Illusion user, when it comes back beside the display, or, once it has
+    # fainted, when the Illusion user is revealed or switches in as itself.
+    _battle_state(battle, "_p0_hidden_twins")[partner] = leaving
+
+
+def _restore_real_twins(battle: DoubleBattle, role: str, revealed: Pokemon) -> None:
+    """When the Illusion user shows itself, give disguise copies' team entries back."""
+    twins = _battle_state(battle, "_p0_hidden_twins")
     team = battle._team if role == battle.player_role else battle._opponent_team
     for key, member in team.items():
-        if member is leaving:
-            team[key] = partner
+        twin = twins.get(member)
+        # The revealed display was the disguise. A twin that fainted is real as well,
+        # because the Illusion user is alive at its reveal.
+        if twin is not None and (member is revealed or twin.fainted):
+            del twins[member]
+            team[key] = twin
+
+
+def _replace_team_entry(battle: DoubleBattle, role: str, old: Pokemon, new: Pokemon) -> None:
+    team = battle._team if role == battle.player_role else battle._opponent_team
+    for key, member in team.items():
+        if member is old:
+            team[key] = new
             return
 
 
@@ -269,14 +272,19 @@ def _start_roost(battle: DoubleBattle, mon: Pokemon) -> None:
         return
 
     previous = mon._temporary_types
-    roosted = [type_ for type_ in mon.types if type_ is not PokemonType.FLYING]
+    original_types = list(mon.types)
+    roosted = [type_ for type_ in original_types if type_ is not PokemonType.FLYING]
     mon._temporary_types = roosted or [PokemonType.NORMAL]
-    _battle_state(battle, "_p0_roosting")[mon] = (previous, mon._temporary_types)
+    _battle_state(battle, "_p0_roosting")[mon] = (
+        previous,
+        mon._temporary_types,
+        original_types,
+    )
 
 
 def _end_roost(battle: DoubleBattle) -> None:
-    roosting = getattr(battle, "_p0_roosting", {})
-    for mon, (previous, roosted) in roosting.items():
+    roosting = _battle_state(battle, "_p0_roosting")
+    for mon, (previous, roosted, _) in roosting.items():
         mon.effects.pop(Effect.ROOST, None)
         # A later type change or switch-out replaced the Roost types; keep that result.
         if mon._temporary_types is roosted:
@@ -284,14 +292,17 @@ def _end_roost(battle: DoubleBattle) -> None:
     roosting.clear()
 
 
+def _types_before_roost(battle: DoubleBattle, mon: Pokemon) -> list[PokemonType]:
+    """Return the types with any Flying that an active Roost removed put back."""
+    roosting = _battle_state(battle, "_p0_roosting").get(mon)
+    if roosting is not None and mon._temporary_types is roosting[1]:
+        return list(roosting[2])
+    return list(mon.types)
+
+
 def _battle_state(battle: DoubleBattle, name: str) -> dict[Any, Any]:
     """Return a patch-owned mapping stored on the battle, creating it on first use."""
     return vars(battle).setdefault(name, {})
-
-
-def _form_baselines(battle: DoubleBattle) -> dict[Pokemon, str]:
-    """Track Showdown's baseSpecies, which poke-env does not retain across forms."""
-    return _battle_state(battle, "_p0_form_baselines")
 
 
 def _parse_message(self: DoubleBattle, split_message: list[str]):
@@ -313,7 +324,7 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     outgoing = None
     fainted = None
     original_size = None
-    baselines = _form_baselines(self)
+    baselines: dict[Pokemon, str] = _battle_state(self, "_p0_form_baselines")
     if event_type in {"switch", "drag", "replace"} and len(split_message) >= 3:
         identifier = split_message[2]
         role = identifier[:2]
@@ -332,39 +343,52 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
                 else active[0 if slot == "a" else 1]
             )
             if outgoing is not None:
-                captured = getattr(self, "_p0_transform_targets", {}).get(id(outgoing))
+                captured = _battle_state(self, "_p0_transform_targets").get(id(outgoing))
                 if captured is not None:
                     original_size = (captured.original_height, captured.original_weight)
             if event_type in {"switch", "drag"}:
                 incoming = _ORIGINAL_GET_POKEMON(self, identifier, details=split_message[3])
                 if incoming.fainted:
-                    # A fainted Pokemon cannot return, so a disguised Illusion user fainted.
+                    # A fainted Pokemon returns only after a revive heal clears its faint,
+                    # so a disguised Illusion user fainted.
                     _faint_illusion_user(self, role)
                 other_slot = f"{role}{'b' if slot == 'a' else 'a'}"
-                if active_by_slot.get(other_slot) is incoming:
+                hidden_twin = _battle_state(self, "_p0_hidden_twins").get(incoming)
+                if active_by_slot.get(other_slot) is incoming and hidden_twin is not None:
+                    # The display holding this team entry stays; the real Pokemon it took
+                    # the entry from comes back to it.
+                    del _battle_state(self, "_p0_hidden_twins")[incoming]
+                    _replace_team_entry(self, role, incoming, hidden_twin)
+                elif active_by_slot.get(other_slot) is incoming:
                     # In Illusion, two active slots may show the same species. poke-env
                     # would assign the same Pokemon object to both slots; clone it for the partner.
                     duplicate = deepcopy(incoming)
                     active_by_slot[other_slot] = duplicate
+                    targets = _battle_state(self, "_p0_transform_targets")
+                    shown_types = incoming._temporary_types
                     # The partner keeps the shown volatile state; the incoming Pokemon enters fresh.
                     incoming.switch_out(self.fields)
-                    _battle_state(self, "_p0_duplicate_active")[other_slot] = duplicate
+                    added_types = _battle_state(self, "_p0_added_types")
+                    if incoming in added_types:
+                        added_types[duplicate] = added_types.pop(incoming)
+                    if id(incoming) in targets:
+                        # A disguise copies the transformed look, so both displays show it.
+                        targets[id(duplicate)] = targets[id(incoming)]
+                        incoming._temporary_types = shown_types
     elif event_type == "faint" and len(split_message) >= 3:
         fainted = self.get_pokemon(split_message[2])
-        captured = getattr(self, "_p0_transform_targets", {}).get(id(fainted))
+        captured = _battle_state(self, "_p0_transform_targets").get(id(fainted))
         if captured is not None:
             original_size = (captured.original_height, captured.original_weight)
-    capture_message(
-        self,
-        split_message,
-        capture_protocol_line=_capture_protocol_lines,
-    )
+    capture_message(self, split_message)
     transferred_boosts: dict[str, int] | None = None
     transferred_effects: dict[Effect, int] = {}
     revealed_status = None
     if event_type == "replace" and outgoing is not None:
-        transferred_boosts = dict(outgoing.boosts)
-        transferred_effects = dict(outgoing.effects)
+        revealed = self.get_pokemon(split_message[2], details=split_message[3])
+        if revealed is not outgoing:
+            # poke-env clears the display when it reveals, so its state moves first.
+            _move_active_state(outgoing, revealed, _battle_state(self, "_p0_added_types"))
         revealed_status = outgoing.status
     if event_type == "switch" and len(split_message) >= 6:
         causes = tuple(to_id_str(part.removeprefix("[from]")) for part in split_message[5:])
@@ -402,23 +426,22 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
         self._replay_data.append(split_message[:])
         _restore_leppa_pp(self, split_message)
         return None
-    if event_type == "-transform" and len(split_message) >= 4:
-        try:
-            base = self.get_pokemon(split_message[2])
-            target_reference = transform_target_reference(self, base, split_message[3])
-        except (AssertionError, IndexError, KeyError, ValueError):
-            target_reference = split_message[3]
-        if target_reference != split_message[3]:
-            split_message = [*split_message[:3], target_reference, *split_message[4:]]
     if event_type == "-formechange" and len(split_message) >= 4:
         current = self.get_pokemon(split_message[2])
         baselines.setdefault(current, current.species)
+    round_user = None
+    if event_type == "move" and split_message[-1] == "[from] move: Round":
+        # Round moves later Round users up and names itself as the cause. poke-env reads
+        # that as a move Round called, so it neither reveals nor spends the user's Round.
+        round_user = self.get_pokemon(split_message[2])
+        round_user._add_move("round")
     result = _ORIGINAL_PARSE_MESSAGE(self, split_message)
+    if round_user is not None:
+        round_user.moves["round"].use()
     if event_type == "-transform" and len(split_message) >= 4:
-        # poke-env copies the target's species types; Showdown copies its current types.
+        # Transform copies changed types, retaining Flying when the target is using Roost.
         target = self.get_pokemon(split_message[3])
-        copied_types = [target.type_1] if target.is_terastallized else list(target.types)
-        self.get_pokemon(split_message[2])._temporary_types = copied_types
+        self.get_pokemon(split_message[2])._temporary_types = _types_before_roost(self, target)
     if event_type == "-singleturn" and len(split_message) >= 4:
         if to_id_str(split_message[3].removeprefix("move: ")) == "roost":
             _start_roost(self, self.get_pokemon(split_message[2]))
@@ -428,24 +451,40 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
         for guard in _SIDE_GUARDS.values():
             self.side_conditions.pop(guard, None)
             self.opponent_side_conditions.pop(guard, None)
-    if event_type in {"switch", "drag", "replace"} and len(split_message) >= 3:
-        getattr(self, "_p0_duplicate_active", {}).pop(split_message[2][:3], None)
     leaving = fainted if outgoing is None else outgoing
     if leaving is not None:
         _promote_duplicate_partner(self, split_message[2][:3], leaving)
+    if event_type == "replace" and outgoing is not None:
+        _restore_real_twins(self, split_message[2][:2], outgoing)
+    elif event_type in {"switch", "drag"} and len(split_message) >= 3:
+        shown = self.get_pokemon(split_message[2])
+        if shown.ability == "illusion":
+            # The Illusion user shows itself, so it is alive and no fainted twin was it.
+            _restore_real_twins(self, split_message[2][:2], shown)
     if fainted is not None:
         # Showdown clears volatiles on faint; poke-env only clears a subset.
         fainted.switch_out(self.fields)
     if event_type == "-start" and len(split_message) >= 5 and split_message[3] == "typeadd":
         target = self.get_pokemon(split_message[2])
         added_type = PokemonType.from_name(split_message[4])
-        current_types = target.types
+        current_types = _types_before_roost(self, target)
         if added_type not in current_types:
             target._temporary_types = [*current_types, added_type]
+            if Effect.ROOST in target.effects:
+                _start_roost(self, target)
+        # Kept apart from the types: a disguise can already show the added type.
+        _battle_state(self, "_p0_added_types")[target] = added_type
+    if event_type == "-start" and len(split_message) >= 4 and split_message[3] == "typechange":
+        # A type change replaces an added type too.
+        target = self.get_pokemon(split_message[2])
+        _battle_state(self, "_p0_added_types").pop(target, None)
+        if Effect.ROOST in target.effects:
+            _start_roost(self, target)
     cleared = fainted
     if cleared is None and event_type in {"switch", "drag"}:
         cleared = outgoing
     if cleared is not None:
+        _battle_state(self, "_p0_added_types").pop(cleared, None)
         if original_size is not None:
             cleared._heightm, cleared._weightkg = original_size
         base_form = baselines.get(cleared)
@@ -455,15 +494,27 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
     # outgoing and incoming Pokemon share one object.
     if event_type in {"switch", "drag", "replace", "detailschange"} and len(split_message) >= 4:
         current = self.get_pokemon(split_message[2])
+        shown_species = split_message[3].split(",", 1)[0]
+        shown_id = to_id_str(shown_species)
+        species_bases = default_runtime_resources().species_bases
+        if (
+            event_type in {"switch", "drag"}
+            and current.species != shown_id
+            and species_bases.get(shown_id, shown_id) == current.base_species
+        ):
+            # poke-env applies switch details only to a new Pokemon. A team entry that
+            # passed to a disguise's copy can hold a stale form (Mimikyu before Busted).
+            # Another species here is a disguise of a transformed Pokemon, not a form.
+            current.forme_change(shown_species)
         baselines[current] = current.species
     if transferred_boosts is not None or transferred_effects:
         incoming = self.get_pokemon(split_message[2])
         if transferred_boosts is not None:
             incoming.boosts = transferred_boosts
         incoming.effects.update(transferred_effects)
-        if event_type == "replace":
-            # poke-env copies the status to the revealed Pokemon, then clears it when copying HP.
-            incoming.status = revealed_status
+    if event_type == "replace" and outgoing is not None:
+        # poke-env copies the status to the revealed Pokemon, then clears it when copying HP.
+        self.get_pokemon(split_message[2]).status = revealed_status
     return result
 
 
@@ -474,11 +525,23 @@ def _get_pokemon(
     details: str = "",
     request: dict[str, Any] | None = None,
 ) -> Pokemon:
-    """Resolve a duplicated Illusion display by its active slot."""
-    if not force_self_team and len(identifier) >= 5 and identifier[3:5] == ": ":
-        alias = getattr(self, "_p0_duplicate_active", {}).get(identifier[:3])
-        if alias is not None and alias.identifies_as(identifier[5:]):
-            return alias
+    """Resolve active protocol references by slot, and off-field references by nickname."""
+    if not force_self_team and identifier[3:5] == ": " and not details and request is None:
+        # The owner's request already names its disguised Illusion user. Later
+        # public lines still use the copied name, but always mean this active slot.
+        active = (
+            self._active_pokemon
+            if identifier[:2] == self.player_role
+            else self._opponent_active_pokemon
+        )
+        member = active.get(identifier[:3])
+        if member is not None:
+            return member
+    if not details and identifier[2:4] == ": ":
+        # An off-field Pokemon is named without a slot and with no details. Its default
+        # nickname is the base species, while the team sheet keys it by the full species.
+        # An Illusion user that never showed itself has had no switch line to link the two.
+        details = identifier[4:]
     return _ORIGINAL_GET_POKEMON(self, identifier, force_self_team, details, request)
 
 
@@ -487,7 +550,9 @@ def _place_requested_actives(battle: DoubleBattle, side_pokemon: list[dict[str, 
     Put the request's active Pokemon in their slots.
 
     poke-env detects a disguised own Illusion user from the request but leaves the
-    disguise display in its slot, which then reads as empty.
+    disguise display in its slot, which then reads as empty. Until the request, the
+    display was the team entry of the benched Pokemon it copies, so the state the
+    disguise gained moves to the Illusion user and the benched Pokemon is reset.
     """
     # Showdown lists the active Pokemon first, in slot order.
     for position, pokemon in zip("ab", side_pokemon):
@@ -496,22 +561,70 @@ def _place_requested_actives(battle: DoubleBattle, side_pokemon: list[dict[str, 
         member = battle._team.get(pokemon["ident"])
         if not pokemon["active"] or shown is None or member is None or shown is member:
             continue
-        if shown.species == member.species:
+        if shown.base_species == member.base_species:
             # The clone made for two same-species displays holds this member's state.
             battle._team[pokemon["ident"]] = shown
             continue
 
-        member.boosts = dict(shown.boosts)
-        member.effects.update(shown.effects)
+        _move_active_state(shown, member, _battle_state(battle, "_p0_added_types"))
+        # The request that follows sets the benched Pokemon's HP and status.
+        shown.switch_out(battle.fields)
         battle._active_pokemon[slot] = member
+
+
+def _move_active_state(
+    shown: Pokemon, member: Pokemon, added_types: dict[Pokemon, PokemonType]
+) -> None:
+    """Give the Illusion user the battle state its disguise display gained on the field."""
+    member.boosts = dict(shown.boosts)
+    member.effects.update(shown.effects)
+    member._active_turns = shown._active_turns
+    member._protect_counter = shown._protect_counter
+    member._must_recharge = shown._must_recharge
+    member._preparing_move = shown._preparing_move
+    member._preparing_target = shown._preparing_target
+    if Effect.TYPECHANGE in shown.effects:
+        # A type change replaces the types, so the display's types are the user's.
+        member._temporary_types = list(shown._temporary_types)
+    added = added_types.pop(shown, None)
+    if added is not None:
+        # An added type (Forest's Curse, Trick-or-Treat) joins the user's own types.
+        added_types[member] = added
+        if added not in member.types:
+            member._temporary_types = [*member.types, added]
 
 
 def _parse_request(
     self: DoubleBattle, request: dict[str, Any], strict_battle_tracking: bool = False
 ) -> None:
-    if not request.get("teamPreview", False):
+    preview = request.get("teamPreview", False)
+    if not preview:
         _place_requested_actives(self, request["side"]["pokemon"])
     _ORIGINAL_PARSE_REQUEST(self, request, strict_battle_tracking)
+    if not preview:
+        # poke-env takes Showdown's active flag (the first two party positions) as true
+        # even in the team preview request. A disguised Illusion user that leads from
+        # one of them is then never switched in, so it would never count as seen.
+        for pokemon in request["side"]["pokemon"]:
+            if pokemon["active"]:
+                self._team[pokemon["ident"]]._revealed = True
+
+
+def locked_choice(battle: DoubleBattle, message: str) -> str:
+    """
+    Send each locked slot's move as "move 1" in a choice command.
+
+    Showdown reads a move named by id in a locked request as single-target and rejects
+    it without one, then ignores the target it was given. poke-env names moves by id
+    and only works around this for recharge.
+    """
+    if not message.startswith("/choose "):
+        return message
+    choices = message.removeprefix("/choose ").split(", ")
+    for position, locked in enumerate(locked_slots(battle)[: len(choices)]):
+        if locked and choices[position].startswith("move "):
+            choices[position] = "move 1"
+    return "/choose " + ", ".join(choices)
 
 
 async def _handle_message(self: PSClient, message: str):
@@ -533,13 +646,18 @@ async def _handle_message(self: PSClient, message: str):
 
 async def _send_message(self: PSClient, message: str, room: str = "", message_2=None):
     # A Bo3 format with Force Open Team Sheets has no accept/reject negotiation.
-    # The pinned client unconditionally sends one of those commands for every VGC
-    # battle, which Showdown rejects before the first request is processed.
+    # The pinned client sends one of those commands for every VGC battle. Showdown
+    # answers with an error line, which poke-env logs at CRITICAL once per game.
     if getattr(self, "_p0_force_open_team_sheet", False) and message in {
         "/acceptopenteamsheets",
         "/rejectopenteamsheets",
     }:
         return None
+    # The client holds its player's bound battle callback, which leads to the room's battle.
+    player = getattr(self._on_battle_message, "__self__", None)
+    battle = getattr(player, "_battles", {}).get(room)
+    if battle is not None:
+        message = locked_choice(battle, message)
     return await _ORIGINAL_SEND_MESSAGE(self, message, room, message_2)
 
 
@@ -579,71 +697,31 @@ async def _stop_listening_cleanly(self: PSClient) -> None:
         )
 
 
-# Every patched attribute with its original and its replacement. install sets the
-# replacements and uninstall_for_tests restores the originals.
+# Every patched attribute with its replacement.
 _PATCHES = (
-    (PSClient, "wait_for_login", _ORIGINAL_WAIT_FOR_LOGIN, _wait_for_login),
-    (PSClient, "stop_listening", _ORIGINAL_STOP_LISTENING, _stop_listening_cleanly),
-    (PSClient, "_handle_message", _ORIGINAL_HANDLE_MESSAGE, _handle_message),
-    (PSClient, "send_message", _ORIGINAL_SEND_MESSAGE, _send_message),
-    (DoubleBattle, "parse_message", _ORIGINAL_PARSE_MESSAGE, _parse_message),
-    (DoubleBattle, "get_pokemon", _ORIGINAL_GET_POKEMON, _get_pokemon),
-    (DoubleBattle, "parse_request", _ORIGINAL_PARSE_REQUEST, _parse_request),
-    (Pokemon, "forme_change", _ORIGINAL_FORME_CHANGE, _forme_change),
-    (
-        Pokemon,
-        "_update_from_teambuilder",
-        _ORIGINAL_UPDATE_FROM_TEAMBUILDER,
-        _update_from_teambuilder,
-    ),
-    (Pokemon, "start_effect", _ORIGINAL_START_EFFECT, _start_effect),
-    (Pokemon, "copy_boosts", _ORIGINAL_COPY_BOOSTS, _copy_boosts),
+    (PSClient, "wait_for_login", _wait_for_login),
+    (PSClient, "stop_listening", _stop_listening_cleanly),
+    (PSClient, "_handle_message", _handle_message),
+    (PSClient, "send_message", _send_message),
+    (DoubleBattle, "parse_message", _parse_message),
+    (DoubleBattle, "get_pokemon", _get_pokemon),
+    (DoubleBattle, "parse_request", _parse_request),
+    (Pokemon, "forme_change", _forme_change),
+    (Pokemon, "_update_from_teambuilder", _update_from_teambuilder),
+    (Pokemon, "start_effect", _start_effect),
+    (Pokemon, "copy_boosts", _copy_boosts),
 )
 
 
-def install(
-    logger: logging.Logger | None = None,
-    *,
-    capture_protocol_lines: bool = False,
-) -> None:
+def install(logger: logging.Logger | None = None) -> None:
     """Install compatibility patches for the pinned poke-env release."""
-    global _capture_protocol_lines, _installed
     target = logger if logger is not None else logging.getLogger("poke_env")
+    # addFilter ignores a filter the logger already has.
+    target.addFilter(_INACTIVE_POKEMON_FILTER)
 
-    if target not in _filtered_loggers:
-        target.addFilter(_INACTIVE_POKEMON_FILTER)
-        _filtered_loggers.add(target)
-
-    if _installed:
-        _capture_protocol_lines = _capture_protocol_lines or capture_protocol_lines
+    if PSClient.wait_for_login is _wait_for_login:
         return
 
-    _capture_protocol_lines = capture_protocol_lines
     _install_champions_data()
-    for owner, name, _, patched in _PATCHES:
+    for owner, name, patched in _PATCHES:
         setattr(owner, name, patched)
-    _installed = True
-
-
-def uninstall_for_tests() -> None:
-    """Uninstall monkey patches for unit test isolation."""
-    global _capture_protocol_lines, _installed
-    _capture_protocol_lines = False
-    for logger in _filtered_loggers:
-        logger.removeFilter(_INACTIVE_POKEMON_FILTER)
-
-    _filtered_loggers.clear()
-    if _installed:
-        for owner, name, original, _ in _PATCHES:
-            setattr(owner, name, original)
-        _installed = False
-        gen_data = GenData.from_gen(9)
-        gen_data.pokedex = _original_gen_data["pokedex"]
-        gen_data.moves = _original_gen_data["moves"]
-        _original_gen_data.clear()
-        Move.should_be_stored.cache_clear()
-
-
-def is_installed() -> bool:
-    """Return whether poke-env monkey patches are active."""
-    return _installed

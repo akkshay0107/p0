@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
-import textwrap
 from dataclasses import replace
 from pathlib import Path
 
@@ -60,7 +56,7 @@ class TestReplayCompiler:
         third = sample_replay_payload("game-3", parent="missing-first", game_number=3)
         complete = sample_replay_payload("game-1", parent="complete", game_number=1)
 
-        compiled = compile_payloads((third, second, complete), chunksize=0)
+        compiled = compile_payloads((third, second, complete))
         built = write_tensor_shards(compiled, tmp_path, created_at="2026-01-01T00:00:00Z")
 
         assert compiled.metrics.counters["accepted_games"] == 1
@@ -76,7 +72,7 @@ class TestReplayCompiler:
     def test_compiled_series_rejects_missing_or_reordered_members(self) -> None:
         first = sample_replay_payload("member-1", parent="members", game_number=1)
         second = sample_replay_payload("member-2", parent="members", game_number=2)
-        accepted = compile_payloads((second, first), chunksize=0).accepted_series[0]
+        accepted = compile_payloads((second, first)).accepted_series[0]
 
         with pytest.raises(ValueError, match="every source game"):
             replace(accepted, games=accepted.games[:1])
@@ -87,7 +83,7 @@ class TestReplayCompiler:
         single = sample_replay_payload("single-1", parent="single", game_number=1)
         first = sample_replay_payload("valid-1", parent="valid", game_number=1)
         second = sample_replay_payload("valid-2", parent="valid", game_number=2)
-        result = compile_payloads((first, second, single), chunksize=0)
+        result = compile_payloads((first, second, single))
 
         built = write_tensor_shards(
             result,
@@ -154,49 +150,6 @@ class TestReplayCompiler:
         assert (9, 11) in left.decisions[1].evidence.candidates
         assert (9, 11) in right.decisions[1].evidence.candidates
         assert left.snapshots[1].pre_line_index < left.snapshots[1].post_line_index
-        assert result.metrics.counters["illegal_candidates"] == 0
-
-    def test_compiler_matches_serial_results_with_two_workers(self, tmp_path: Path) -> None:
-        script = tmp_path / "compare_compilers.py"
-        script.write_text(
-            textwrap.dedent("""            import os
-            from p0.replays.compile import compile_payloads
-            from tests.unit.replay_fixtures import golden_replay_payload
-
-            if __name__ == "__main__":
-                assert os.cpu_count() == 2
-                payloads = tuple(
-                    golden_replay_payload(f"game-{i}", series_id=f"series-{i}")
-                    for i in range(3)
-                )
-                serial = compile_payloads(payloads, chunksize=0)
-                assert len(serial.accepted_series) == 3
-                # Three jobs exceed the two CPUs, so positive chunks use the process pool.
-                for chunksize in (1, 2):
-                    parallel = compile_payloads(payloads, chunksize=chunksize)
-                    assert parallel.to_dict() == serial.to_dict()
-            """),
-            encoding="utf-8",
-        )
-        root = Path(__file__).resolve().parents[2]
-        environment = {
-            **os.environ,
-            "PYTHON_CPU_COUNT": "2",
-            "PYTHONPATH": os.pathsep.join((str(root), str(root / "src"))),
-            "OMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-        }
-
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=root,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-        assert result.returncode == 0, result.stdout + result.stderr
 
     def test_reconstructed_views_carry_open_team_sheet_nature(self) -> None:
         """Verify open team sheet natures match literal sheet values for both projected sides."""
@@ -237,7 +190,7 @@ class TestReplayCompiler:
         tmp_path: Path,
     ) -> None:
         payload = golden_replay_payload("accepted", series_id="accepted-series")
-        result = compile_payloads((payload,), chunksize=0)
+        result = compile_payloads((payload,))
         built = write_tensor_shards(
             result,
             tmp_path,
@@ -258,7 +211,7 @@ class TestReplayCompiler:
 
     def test_cached_dataset_reuses_tensors_and_force_reconstructs(self, tmp_path: Path) -> None:
         payload = golden_replay_payload("legacy-report", series_id="legacy-series")
-        result = compile_payloads((payload,), chunksize=0)
+        result = compile_payloads((payload,))
         first = write_tensor_shards(
             result,
             tmp_path,
@@ -278,7 +231,7 @@ class TestReplayCompiler:
         invalid = replace(document, outcome=replace(document.outcome, terminal_line_index=None))
         with pytest.raises(ReplayInputContractError, match="terminal"):
             compile_to_shards((invalid,), tmp_path)
-        forced = compile_to_shards((document,), tmp_path, force_reconstruct=True, chunksize=0)
+        forced = compile_to_shards((document,), tmp_path, force_reconstruct=True)
         assert forced.manifest.dataset_id != first.manifest.dataset_id
         assert forced.manifest.shards[0].shard_id != first.manifest.shards[0].shard_id
         assert len(list(LazyReplayDataset(first.manifest_path))) == 2
@@ -289,7 +242,7 @@ class TestReplayCompiler:
     ) -> None:
         """A manifest with another field set must not stop build-shards from rebuilding."""
         payload = golden_replay_payload("older-layout", series_id="older-layout-series")
-        result = compile_payloads((payload,), chunksize=0)
+        result = compile_payloads((payload,))
         first = write_tensor_shards(result, tmp_path, created_at="2026-01-01T00:00:00Z")
         older = json.loads(first.manifest_path.read_text(encoding="utf-8"))
         older["artifact_schema"] = "p0.replay_shard.v2"
@@ -351,12 +304,10 @@ class TestCompilationCache:
             sample_replay_payload("b1", parent="b", game_number=1)
         )
         second_game = parse_replay_payload(sample_replay_payload("a2", parent="a", game_number=2))
-        first = compile_to_shards((first_game,), tmp_path, chunksize=0)
-        expanded = compile_to_shards((first_game, unrelated_game), tmp_path, chunksize=0)
+        first = compile_to_shards((first_game,), tmp_path)
+        expanded = compile_to_shards((first_game, unrelated_game), tmp_path)
         assert first.manifest.shards[0] in expanded.manifest.shards
-        changed = compile_to_shards(
-            (first_game, second_game, unrelated_game), tmp_path, chunksize=0
-        )
+        changed = compile_to_shards((first_game, second_game, unrelated_game), tmp_path)
         existing = {entry.replay_ids: entry.shard_id for entry in expanded.manifest.shards}
         updated = {entry.replay_ids: entry.shard_id for entry in changed.manifest.shards}
         assert updated[("b1",)] == existing[("b1",)]

@@ -57,7 +57,6 @@ class TestLiveBo3:
         finally:
             await rl_player.ps_client.stop_listening()
             await random_player.ps_client.stop_listening()
-            poke_env_patches.uninstall_for_tests()
 
         assert 2 <= random_player.n_finished_battles <= 3
         assert rl_player.current_team_packed is not None

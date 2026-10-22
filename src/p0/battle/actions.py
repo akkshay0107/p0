@@ -129,23 +129,3 @@ def team_selection(
     selected: list[int] = list(dict.fromkeys((*leads, *backs)))
     selected.extend(index for index in range(team_size) if index not in selected)
     return tuple(selected)
-
-
-def canonical_team_actions(
-    selection: tuple[int, ...], team_size: int = TEAM_SIZE
-) -> tuple[int, int]:
-    """Derive ordered lead and back pair preview actions from a team order."""
-    defaults = tuple(range(team_size))
-    values = tuple(index for index in selection if 0 <= index < team_size)
-    values += tuple(index for index in defaults if index not in values)
-
-    lead = values[:2]
-    back = values[2:4]
-
-    if len(set((*lead, *back))) != 4:
-        raise ValueError("Team preview must select four distinct members")
-
-    return (
-        encode_team_pair(lead[0], lead[1], team_size),
-        encode_team_pair(back[0], back[1], team_size),
-    )

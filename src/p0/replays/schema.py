@@ -512,36 +512,6 @@ class DecisionRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class ReplayDiagnostics:
-    """Parser and reconstruction counters stored with derived records."""
-
-    counters: Mapping[str, int]
-    parse_errors: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        for key, count in self.counters.items():
-            if not isinstance(key, str) or type(count) is not int or count < 0:
-                raise ValueError("Diagnostics counters must map strings to nonnegative integers")
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "counters": {key: self.counters[key] for key in sorted(self.counters)},
-            "parse_errors": list(self.parse_errors),
-        }
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> ReplayDiagnostics:
-        require_dataclass_fields(value, cls)
-        counters = value["counters"]
-        if not isinstance(counters, Mapping):
-            raise ValueError("ReplayDiagnostics.counters must be a JSON object")
-        return cls(
-            counters={str(key): int(count) for key, count in counters.items()},
-            parse_errors=tuple(str(item) for item in value["parse_errors"]),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class ReplayOutcome:
     """Terminal facts separated from the state reconstruction timeline."""
 

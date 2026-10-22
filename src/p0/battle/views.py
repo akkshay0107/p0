@@ -32,12 +32,6 @@ class MoveView(Protocol):
     @property
     def max_pp(self) -> int | None: ...
 
-    @property
-    def non_ghost_target(self) -> bool: ...
-
-    @property
-    def deduced_target(self) -> Any: ...
-
 
 class PokemonView(Protocol):
     @property
@@ -113,60 +107,13 @@ class PokemonView(Protocol):
     def level(self) -> int | None: ...
 
     @property
-    def is_dynamaxed(self) -> bool: ...
-
-    @property
-    def is_terastallized(self) -> bool: ...
-
-    @property
-    def tera_type(self) -> Any: ...
-
-    @property
     def types(self) -> Sequence[Any]: ...
-
-
-class TransformedMoveView:
-    """Move view for a transformed Pokemon with its own five-PP move pool."""
-
-    __slots__ = ("_base",)
-
-    def __init__(self, base_move: MoveView) -> None:
-        self._base = base_move
-
-    @property
-    def id(self) -> str:
-        return self._base.id
-
-    @property
-    def type(self) -> Any:
-        return self._base.type
-
-    @property
-    def category(self) -> Any:
-        return self._base.category
-
-    @property
-    def current_pp(self) -> int | None:
-        pp = self._base.current_pp
-        return None if pp is None else min(pp, 5)
-
-    @property
-    def max_pp(self) -> int | None:
-        return 5
-
-    @property
-    def non_ghost_target(self) -> bool:
-        return self._base.non_ghost_target
-
-    @property
-    def deduced_target(self) -> Any:
-        return self._base.deduced_target
 
 
 class TransformedPokemonView:
     """Pokemon view overlay representing the target species while retaining user identity."""
 
-    __slots__ = ("_base", "_target", "_transformed_moves", "_original_base_hp")
+    __slots__ = ("_base", "_target", "_original_base_hp")
 
     def __init__(
         self,
@@ -176,7 +123,6 @@ class TransformedPokemonView:
     ) -> None:
         self._base = base
         self._target = target
-        self._transformed_moves = {k: TransformedMoveView(v) for k, v in base.moves.items()}
         self._original_base_hp = (
             base.base_stats["hp"] if original_base_hp is None else original_base_hp
         )
@@ -201,7 +147,7 @@ class TransformedPokemonView:
 
     @property
     def ability(self) -> str | None:
-        return self._target.ability
+        return self._base.ability
 
     @property
     def item(self) -> str | None:
@@ -213,7 +159,7 @@ class TransformedPokemonView:
 
     @property
     def moves(self) -> Mapping[str, Any]:
-        return self._transformed_moves
+        return self._base.moves
 
     @property
     def type_1(self) -> Any:
@@ -291,19 +237,11 @@ class TransformedPokemonView:
     def level(self) -> int | None:
         return self._base.level
 
-    @property
-    def is_dynamaxed(self) -> bool:
-        """Dynamax belongs to the actual active Pokémon, not its copied target."""
-        return self._base.is_dynamaxed
-
-    @property
-    def is_terastallized(self) -> bool:
-        """Terastallization belongs to the actual active Pokémon."""
-        return self._base.is_terastallized
-
-    @property
-    def tera_type(self) -> Any:
-        return self._base.tera_type
+    # poke-env reads the next three members when it lists move targets. The format
+    # has no Dynamax and no Terastallization.
+    is_dynamaxed = False
+    is_terastallized = False
+    tera_type = None
 
     @property
     def types(self) -> Sequence[Any]:
@@ -348,22 +286,10 @@ class BattleView(FieldView, Protocol):
     def opponent_active_pokemon(self) -> Sequence[Any | None]: ...
 
     @property
-    def available_moves(self) -> Sequence[Sequence[Any]]: ...
-
-    @property
     def available_switches(self) -> Sequence[Sequence[Any]]: ...
 
     @property
     def can_mega_evolve(self) -> Sequence[bool]: ...
-
-    @property
-    def force_switch(self) -> Sequence[bool]: ...
-
-    @property
-    def trapped(self) -> Sequence[bool]: ...
-
-    @property
-    def maybe_trapped(self) -> Sequence[bool]: ...
 
     @property
     def teampreview(self) -> bool: ...
@@ -382,7 +308,5 @@ class BattleView(FieldView, Protocol):
 
     @property
     def spatial_events(self) -> Sequence[EventRecord]: ...
-
-    def get_pokemon(self, identifier: str) -> Any: ...
 
     def last_move(self, pokemon: Any) -> str | None: ...

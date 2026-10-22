@@ -151,13 +151,25 @@ class TestReplayInputContract:
         for suffix in ("|win|Bob", "|tie", "|win|Alice", "|turn|99"):
             invalid = {**payload, "log": f"{payload['log']}\n{suffix}"}
             with pytest.raises(ReplayInputContractError, match="after terminal result"):
-                compile_payloads((invalid,), chunksize=0)
+                compile_payloads((invalid,))
 
         trailing_display = {
             **payload,
             "log": f"{payload['log']}\n|t:|1700000000\n|message|Battle ended.",
         }
-        assert len(compile_payloads((trailing_display,), chunksize=0).accepted_series[0].games) == 1
+        assert len(compile_payloads((trailing_display,)).accepted_series[0].games) == 1
+
+    def test_terminal_result_accepts_the_rest_of_the_action_that_ended_the_battle(self) -> None:
+        payload = sample_replay_payload("input-trailing-action")
+        # Showdown ends Attract on the winner once its source fainted, after the win line.
+        trailing_action = {
+            **payload,
+            "log": f"{payload['log']}\n|-end|p2a: Bulbasaur|Attract|[silent]",
+        }
+
+        document = parse_replay_payload(trailing_action)
+
+        assert document.outcome == parse_replay_payload(payload).outcome
 
     def test_player_names_that_normalize_to_same_identity_are_rejected(self) -> None:
         invalid = sample_replay_payload("input-colliding-players", players=("Alice", "A lice"))
@@ -315,24 +327,8 @@ class TestReplayInputContract:
         )
         document = parse_replay_payload(payload)
         assert document.ots[0].members[0].moves == ("protect", "tackle")
-        dex = {
-            "species": [
-                {
-                    "id": "pikachu",
-                    "baseStats": {"hp": 35, "atk": 55, "def": 40, "spa": 50, "spd": 50, "spe": 90},
-                },
-                {
-                    "id": "bulbasaur",
-                    "baseStats": {"hp": 45, "atk": 49, "def": 49, "spa": 65, "spd": 65, "spe": 45},
-                },
-            ],
-            "moves": [
-                {"id": "protect", "category": "Status"},
-                {"id": "tackle", "category": "Physical"},
-            ],
-        }
-        first = impute_replay_stats(document, dex=dex)
-        second = impute_replay_stats(document, dex=dex)
+        first = impute_replay_stats(document)
+        second = impute_replay_stats(document)
         assert first == second
 
         # Pikachu is covered by the usage priors; Bulbasaur is not, and its sheet reveals

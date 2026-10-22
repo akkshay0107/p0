@@ -88,8 +88,7 @@ class TestBCRunner:
         for series in compiled.accepted_series:
             game = series.games[0]
             perspectives = tuple(
-                replace(
-                    perspective,
+                perspective._replace(
                     decisions=tuple(
                         replace(
                             decision,

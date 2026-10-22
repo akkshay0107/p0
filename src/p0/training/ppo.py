@@ -13,15 +13,12 @@ from torch.amp import GradScaler
 
 from p0.model.architecture_contract import (
     HISTORY_WINDOW,
-    MAX_PRIOR_GAMES,
-    SERIES_SLOTS,
-    SERIES_TOKENS_PER_GAME,
 )
 from p0.model.policy import EncodedObs, MemoryInputs, PolicyNet
 from p0.model.structured_observation import StructuredObservation
 from p0.training.config import PPOConfig
 from p0.training.magnet import Magnet
-from p0.training.series_history import SeriesHistorySnapshot
+from p0.training.series_history import pack_series_context
 from p0.training.trajectory import PreparedTrajectory
 from p0.training.utils import OptimizationPrecision, select_optimization_precision
 
@@ -91,7 +88,6 @@ def _build_memory_inputs(
     device: torch.device,
 ) -> MemoryInputs:
     """Build current-game and prior-game history memory inputs."""
-    dtype = encoded.tokens.dtype
     # Use local summaries as history inputs for subsequent decisions.
     # Do not reuse the memory-aware readout to avoid leaking prior context into itself.
     local_tokens = encoded.local_history_token
@@ -104,48 +100,17 @@ def _build_memory_inputs(
     history_mask = history_indices >= episode_starts[:, None]
     history_indices = history_indices.clamp_min(0)
     history_tokens = local_tokens[history_indices] * history_mask.unsqueeze(-1)
-    decision_count = encoded.tokens.size(0)
-    histories: list[Tensor] = []
-    history_rows: dict[int, int] = {}
-    episode_history_rows_data = [[-1] * MAX_PRIOR_GAMES for _ in episodes]
-    for episode_index, episode in enumerate(episodes):
-        snapshot: SeriesHistorySnapshot = episode.series_history
-        if len(snapshot) > MAX_PRIOR_GAMES:
-            raise ValueError(f"A trajectory cannot expose more than {MAX_PRIOR_GAMES} prior games")
-        for game_index, history in enumerate(snapshot):
-            identity = id(history)
-            row = history_rows.get(identity)
-            if row is None:
-                row = len(histories)
-                history_rows[identity] = row
-                histories.append(history.detach().to(device="cpu", dtype=torch.float32))
-            episode_history_rows_data[episode_index][game_index] = row
-
-    if histories:
-        history_lengths = torch.tensor([history.size(0) for history in histories], dtype=torch.long)
-        padded_cpu = torch.nn.utils.rnn.pad_sequence(histories, batch_first=True)
-        mask_cpu = torch.arange(padded_cpu.size(1)).unsqueeze(0) < history_lengths.unsqueeze(1)
-        padded = padded_cpu.to(device=device, dtype=dtype)
-        mask = mask_cpu.to(device=device)
-        summaries = policy.series(padded, mask)
-
-        episode_history_rows = torch.tensor(
-            episode_history_rows_data, dtype=torch.long, device=device
-        )
-        valid = episode_history_rows >= 0
-        selected = summaries[episode_history_rows.clamp_min(0)]
-        selected = selected.masked_fill(~valid[:, :, None, None], 0.0)
-        per_episode_tokens = selected.flatten(1, 2)
-        per_episode_mask = torch.arange(SERIES_SLOTS, device=device).unsqueeze(0) < (
-            valid.sum(dim=1, keepdim=True) * SERIES_TOKENS_PER_GAME
-        )
-        series_tokens = torch.repeat_interleave(per_episode_tokens, lengths, dim=0)
-        series_mask = torch.repeat_interleave(per_episode_mask, lengths, dim=0)
-    else:
-        series_tokens = torch.zeros(
-            (decision_count, SERIES_SLOTS, policy.d_model), device=device, dtype=dtype
-        )
-        series_mask = torch.zeros((decision_count, SERIES_SLOTS), device=device, dtype=torch.bool)
+    # PPO trains the resampler, not the stored histories. One detached tensor per
+    # stored game keeps a game shared by several episodes summarized once.
+    detached = {
+        id(history): history.detach() for episode in episodes for history in episode.series_history
+    }
+    series_tokens, series_mask = pack_series_context(
+        [[detached[id(history)] for history in episode.series_history] for episode in episodes],
+        lengths,
+        policy.series,
+        encoded.tokens,
+    )
     return MemoryInputs(
         series_tokens=series_tokens,
         series_mask=series_mask,

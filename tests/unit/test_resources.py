@@ -5,24 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from p0.model.resources import cache_default_dex, default_runtime_resources
 from p0.model.tokenizer import PokemonTokenizer
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestRuntimeResources:
-    def test_only_default_dex_tables_are_singletons(self) -> None:
-        lookup = cache_default_dex(dict)
-        dex = default_runtime_resources().dex
-        assert lookup(dex) is lookup(dex)
-        custom = {"species": "original"}
-        original = lookup(custom)
-        custom["species"] = "changed"
-        assert lookup(custom)["species"] == "changed"
-        assert original["species"] == "original"
-        assert lookup(dex) is lookup(dex)
-
     def test_every_legal_content_key_resolves(self) -> None:
         """Verify all legal species, items, abilities, and moves in champions_dex resolve to known tokenizer IDs."""
         vocab = json.loads((ROOT / "data/vocab.json").read_text())
