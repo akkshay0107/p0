@@ -132,13 +132,15 @@ def train_bc(
         )
         if files.source is not None:
             source_metadata = store.load_metadata(files.source)
+            selection_state = dict(source_metadata.get("selection_state", {}))
             for name in ("dataset_id", "split_id"):
                 if source_metadata.get(name) != metadata[name]:
                     LOGGER.warning(
                         "BC resume checkpoint was trained with a different %s; "
-                        "its best validation score is not comparable with this run",
+                        "starting a new best-policy selection",
                         name,
                     )
+                    selection_state = {}
 
             completed_epoch = store.load_training(
                 files.source,
@@ -148,7 +150,6 @@ def train_bc(
                 scaler=trainer.scaler,
             )
 
-            selection_state = dict(source_metadata.get("selection_state", {}))
             if not best_path.is_file():
                 LOGGER.warning(
                     "No best policy exists at %s; the next epoch starts a new selection",
@@ -232,7 +233,7 @@ def train_bc(
             "final_training": ({} if last_training_update is None else last_training_update),
             "final_validation": (None if final_validation is None else final_validation.to_dict()),
             "latest_training_checkpoint": _reported_path(latest_artifact),
-            "best_policy_checkpoint": _reported_path(best_path),
+            "best_policy_checkpoint": _reported_path(best_path) if selection_state else None,
             "metrics_path": _reported_path(files.metrics_path),
         }
         atomic_json_save(dataset_output / "bc-result.json", result)

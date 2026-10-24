@@ -114,7 +114,8 @@ dex/resource data used to build observations. After any such change, run
 and a new dataset snapshot while preserving previous snapshots.
 The next BC run uses the new dataset, because it is now the newest. Resuming BC
 on a different dataset or split logs a warning, because the saved best validation
-score is no longer comparable. No replay or tensor checksums are computed.
+score is no longer comparable, and starts a new best-policy selection. No replay
+or tensor checksums are computed.
 
 Checkpoints contain one runtime compatibility record: vocabulary mappings and
 `MODEL_ENCODING_VERSION` define the major identity; dex data defines the minor
@@ -197,6 +198,10 @@ heavy, stress, network, and GPU tests. Keep the heavy replay workload at 50 game
 fewer per run. GPU checks are deferred; CPU passes do not validate CUDA execution.
 On a memory-limited machine, run heavy files separately and reduce the
 `P0_STRESS_*` workload settings.
+
+With training and servers stopped, `bash scripts/cleanup.sh --dry-run` previews
+cache, bytecode, and server-log cleanup; omit `--dry-run` to remove them. Runs,
+checkpoints, data, configuration, dependencies, and scratch research data are preserved.
 
 ## About
 

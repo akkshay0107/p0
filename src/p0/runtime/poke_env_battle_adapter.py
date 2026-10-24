@@ -198,7 +198,6 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
     available_switches = battle.available_switches
     team = tuple(battle.team.values())
     trapped = battle.trapped
-    maybe_trapped = battle.maybe_trapped
     force_switch = battle.force_switch
     can_mega_evolve = battle.can_mega_evolve
     locked = locked_slots(battle) or (False, False)
@@ -231,8 +230,8 @@ def decision_view(battle: DoubleBattle) -> DecisionView:
                 switch_slots=switch_slots,
                 move_targets=move_targets,
                 active=active is not None and not active.fainted,
-                # With open sheets, maybe-trapped still means switching will fail.
-                trapped=trapped[position] or maybe_trapped[position],
+                # maybeTrapped can reflect a species ability the foe does not currently have.
+                trapped=trapped[position],
                 force_switch=force_switch[position],
                 can_mega=can_mega_evolve[position],
                 forced_move=forced_move,

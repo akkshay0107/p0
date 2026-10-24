@@ -70,6 +70,12 @@ class ShowdownServer:
         if not (self.showdown_root / "dist" / "sim" / "index.js").is_file():
             raise FileNotFoundError("Showdown assets are missing. Run bash scripts/init-data.sh.")
 
+        with socket.socket() as listener:
+            try:
+                listener.bind((LOOPBACK_HOST, self.port))
+            except OSError as exc:
+                raise RuntimeError(f"Showdown port {self.port} is already occupied") from exc
+
         command = [
             "node",
             "--max-old-space-size=1536",

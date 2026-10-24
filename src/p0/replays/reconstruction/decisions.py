@@ -518,6 +518,19 @@ def build_decision_view(
     *,
     preview: bool,
 ) -> DecisionView:
+    """
+    Build the action choices visible before a replay decision.
+
+    Arguments:
+      state: Public battle state before the request.
+      ots: Open team sheet for the acting player.
+      perspective: Acting side index.
+      window_events: Events resolving this request.
+      preview: Whether the request chooses a team.
+
+    Returns:
+      The two slots' moves, switches, and forced actions.
+    """
     roster_size = len(ots.members)
     if preview:
         return DecisionView(
@@ -563,6 +576,14 @@ def build_decision_view(
             if member.member_id.side.side_index == perspective and member.fainted
         )
     )
+    pivot_slots = frozenset(
+        slot
+        for event in window_events
+        if _is_pivot(event)
+        and (reference := _reference(event, 0)) is not None
+        and reference.pokemon_ref.side.side_index == perspective
+        and (slot := reference.pokemon_ref.active_slot) is not None
+    )
     # Struggle is hidden from the request while an opposing Imprison disables moves.
     struggle_is_forced = not _opponent_imprison_active(state, perspective)
     forced_slots = frozenset(
@@ -591,15 +612,17 @@ def build_decision_view(
             )
         )
         can_mega = member is not None and _can_mega(member, own_side.used_mega)
+        force_switch = member is None and bool(switches)
+        if revive_slot is not None:
+            force_switch = slot == revive_slot
+        elif pivot_slots:
+            force_switch = slot in pivot_slots
         slots.append(
             SlotDecision(
                 switch_slots=fainted if slot == revive_slot else switches,
                 move_targets=moves,
                 active=member is not None,
-                # A revive request asks only the user's slot to choose.
-                force_switch=slot == revive_slot
-                if revive_slot is not None
-                else member is None and bool(switches),
+                force_switch=force_switch,
                 can_mega=can_mega,
                 forced_move=slot in forced_slots,
                 legality_known=False,
@@ -622,6 +645,9 @@ def _decision_for_window(
     decision_index: int,
 ) -> tuple[DecisionRecord, DecisionView] | None:
     window_events = events[window.start_line_index : window.end_line_index]
+    # Queued moves resume after a pivot switch; they answer the earlier turn request.
+    if window.decision_type is DecisionType.PIVOT_SWITCH:
+        window_events = tuple(event for event in window_events if _is_pivot(event))
     if window.decision_type in {
         DecisionType.FORCED_SWITCH,
         DecisionType.PIVOT_SWITCH,

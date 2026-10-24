@@ -20,6 +20,20 @@ def _log_is_open(path: Path) -> bool:
 
 
 class TestShowdown:
+    def test_occupied_port_is_rejected_before_launch(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "occupied.log"
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            port = int(listener.getsockname()[1])
+            server = showdown.ShowdownServer(port, log_path=log_path)
+
+            with pytest.raises(RuntimeError, match="already occupied"):
+                server.start()
+
+            assert server.process is None
+            assert not log_path.exists()
+
     def test_showdown_server_group_rejects_duplicate_ports(self) -> None:
         """Reject duplicate ports before launching a process."""
         with pytest.raises(ValueError, match="unique"):

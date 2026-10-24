@@ -149,7 +149,9 @@ class CheckpointStore:
             state = artifact["training_state"]
             load_canonical_policy_state_dict(policy, artifact["model_state_dict"])
             optimizer.load_state_dict(state["optimizer_state_dict"])
-            scaler.load_state_dict(state["scaler_state_dict"])
+            # Disabled scalers save no history; keep the new scaler's initial scale.
+            if saved_scaler_state := state["scaler_state_dict"]:
+                scaler.load_state_dict(saved_scaler_state)
 
             if magnet is not None:
                 # A checkpoint without a magnet restarts it from the restored policy.

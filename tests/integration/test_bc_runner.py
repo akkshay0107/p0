@@ -257,6 +257,73 @@ class TestBCRunner:
         ]
         assert [record["step"] for record in moved_history] == [3]
 
+    @pytest.mark.parametrize("changed_identity", ("dataset_id", "split_id"))
+    def test_changed_validation_data_replaces_an_incomparable_best_policy(
+        self, tmp_path: Path, changed_identity: str
+    ) -> None:
+        compiled = compile_payloads(
+            (
+                sample_replay_payload("train", parent="train-series"),
+                sample_replay_payload("validation", parent="validation-series"),
+            )
+        )
+        built = write_tensor_shards(
+            compiled, tmp_path / "shards", created_at="2026-01-01T00:00:00Z"
+        )
+        write_split_manifest(
+            SeriesSplitManifest(
+                0,
+                dict(zip(built.manifest.source_series, ("train", "validation"), strict=True)),
+                dataset_id=built.manifest.dataset_id,
+                split_id="current-split",
+            ),
+            built.manifest_path.parent / "splits.json",
+        )
+        output = tmp_path / "output"
+        latest_path = output / "bc_latest_training.pt"
+        best_path = output / "bc_best_policy.pt"
+        metadata = {
+            "dataset_id": built.manifest.dataset_id,
+            "split_id": "current-split",
+            "selection_state": {"best_validation_nll": 0.0, "selected_epoch": 1},
+        }
+        metadata[changed_identity] = "previous-data"
+        policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
+        store = CheckpointStore()
+        store.save_policy(best_path, policy, metadata=metadata)
+        store.save_training(
+            latest_path,
+            1,
+            policy,
+            trainer_kind="bc",
+            optimizer=torch.optim.AdamW(policy.parameters()),
+            scaler=torch.amp.GradScaler("cpu", enabled=False),
+            metadata=metadata,
+        )
+        config = BCConfig(
+            dataset_dir=built.manifest_path.parent,
+            output_dir=output,
+            resume_checkpoint=latest_path,
+            epochs=1,
+            batch_decisions=8,
+            max_chunk_size=8,
+            num_workers=0,
+            enable_optim=False,
+        )
+
+        without_validation = train_bc(config, device="cpu")
+        assert without_validation["best_policy_checkpoint"] is None
+        assert best_path.is_file()
+
+        resumed = train_bc(replace(config, epochs=2), device="cpu")
+
+        # The previous dataset's perfect NLL must not block selection on new data.
+        assert resumed["final_validation"]["overall_nll"] > 0.0
+        selected = store.load_metadata(best_path)
+        assert selected["dataset_id"] == built.manifest.dataset_id
+        assert selected["split_id"] == "current-split"
+        assert selected["selected_epoch"] == 2
+
     def test_bc_evaluation_and_cli_parity(self, tmp_path: Path) -> None:
         result = compile_payloads(
             (

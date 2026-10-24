@@ -461,3 +461,36 @@ class TestReviveDecisions:
         assert decision.evidence.label_kind is LabelKind.EXACT
         # Showdown sends Eevee back into the second slot by itself; only Pikachu chose.
         assert decision.evidence.candidates == ((2, 0),)
+
+
+class TestPivotDecisions:
+    def test_pivot_request_labels_only_the_switching_slot(self) -> None:
+        payload = _payload_with_ots(
+            p1_species="Scyther", p1_ability="Technician", p1_moves=["U-turn", "Protect"]
+        )
+        prefix, _, _ = str(payload["log"]).partition("|turn|1")
+        # U-turn requests [switch, pass], then resumes the already submitted moves.
+        payload["log"] = f"""{prefix}|turn|1
+|
+|move|p1a: Scyther|U-turn|p2a: Bulbasaur
+|-damage|p2a: Bulbasaur|71/100
+|
+|switch|p1a: Raichu|Raichu, L50|100/100|[from] U-turn
+|move|p1b: Eevee|Tackle|p2a: Bulbasaur
+|move|p2b: Charmander|Tackle|p1a: Raichu
+|move|p2a: Bulbasaur|Tackle|p1a: Raichu
+|
+|win|Alice"""
+
+        first, second = compile_payloads((payload,)).accepted_series[0].games[0].perspectives
+
+        pivot = first.decisions[-1]
+        assert pivot.decision_type is DecisionType.PIVOT_SWITCH
+        assert pivot.evidence.label_kind is LabelKind.EXACT
+        assert pivot.evidence.candidates == ((3, 0),)
+        assert first.snapshots[-1].view.decision.slots[0].force_switch
+        assert legal_actions(first.snapshots[-1].view.decision, 1) == (0,)
+        assert [decision.decision_type for decision in second.decisions] == [
+            DecisionType.TEAM_PREVIEW,
+            DecisionType.TURN,
+        ]
