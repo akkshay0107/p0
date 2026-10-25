@@ -570,22 +570,25 @@ class TestPolicy:
         assert torch.isfinite(scores[[0, 2, 4]]).all()
         assert torch.isneginf(scores[[1, 3, 5]]).all()
 
-    def test_greedy_inference_selects_actions_autoregressively(self, policy: PolicyNet) -> None:
+    @pytest.mark.parametrize("first_choices", ((7, 9), (1,), (27,), (47,), (0,)))
+    def test_greedy_inference_selects_actions_autoregressively(
+        self, policy: PolicyNet, first_choices: tuple[int, ...]
+    ) -> None:
         """Verify greedy action selection takes each slot's best legal action given the first slot."""
         encoded, _, memory = _inputs(policy, batch_size=2)
         action_mask = torch.zeros((2, 2, FORMAT.action_size), dtype=torch.bool)
-        action_mask[:, 0, 7] = True
-        action_mask[:, 0, 9] = True
-        action_mask[:, 1, 8] = True
-        action_mask[:, 1, 10] = True
+        action_mask[:, 0, list(first_choices)] = True
+        action_mask[:, 1, [0, 1, 2, 8, 28, 47, 48]] = True
 
         prepared = policy.prepare(encoded, memory)
         with torch.inference_mode():
-            chosen = policy.act(prepared, action_mask, deterministic=True).actions
-            logits = policy.evaluate(prepared, action_mask, chosen).logits
+            acted = policy.act(prepared, action_mask, deterministic=True)
+            evaluated = policy.evaluate(prepared, action_mask, acted.actions)
 
-        assert chosen.shape == (2, 2)
-        torch.testing.assert_close(chosen, logits.argmax(dim=-1))
+        assert acted.actions.shape == (2, 2)
+        torch.testing.assert_close(acted.actions, evaluated.logits.argmax(dim=-1))
+        torch.testing.assert_close(acted.log_probs, evaluated.log_probs)
+        torch.testing.assert_close(acted.value, evaluated.value)
 
     def test_top_p_sampling_stays_inside_the_nucleus(self, policy: PolicyNet) -> None:
         """Verify top_p sampling only picks first-slot actions inside the smallest mass-p set."""

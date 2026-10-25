@@ -99,6 +99,7 @@ class DecisionWindow:
     start_line_index: int
     end_line_index: int
     decision_type: DecisionType
+    between_turns: bool
 
     @property
     def is_policy_request(self) -> bool:
@@ -158,7 +159,7 @@ def _has_policy_action(event: ResolvedProtocolEvent) -> bool:
     if parsed.tag == "cant" or _is_revive(event):
         return True
     if parsed.tag == "move":
-        return parsed.cause is None
+        return parsed.cause is None or _is_locked_move(event)
     if parsed.tag == "switch":
         return parsed.cause is None or parsed.cause.normalized in PIVOT_MOVES
     return False
@@ -239,6 +240,7 @@ def infer_decision_windows(
     has_preview = any(event.event.tag == "teampreview" for event in event_tuple)
     turn_seen_since_request = False
     policy_request_count = 0
+    between_turns = True
     windows: list[DecisionWindow] = []
     for start, end in _update_blocks(event_tuple):
         block = event_tuple[start:end]
@@ -248,7 +250,11 @@ def infer_decision_windows(
             has_preview=has_preview,
             policy_request_count=policy_request_count,
         )
-        windows.append(DecisionWindow(start, end, decision_type))
+        windows.append(DecisionWindow(start, end, decision_type, between_turns))
+        for event in reversed(block):
+            if event.event.tag in {"turn", "upkeep"}:
+                between_turns = event.event.tag == "upkeep"
+                break
         if decision_type is not DecisionType.UNSPECIFIED:
             policy_request_count += 1
     return tuple(windows)
@@ -517,6 +523,8 @@ def build_decision_view(
     window_events: tuple[ResolvedProtocolEvent, ...],
     *,
     preview: bool,
+    replacement: bool = False,
+    between_turns: bool = True,
 ) -> DecisionView:
     """
     Build the action choices visible before a replay decision.
@@ -527,6 +535,8 @@ def build_decision_view(
       perspective: Acting side index.
       window_events: Events resolving this request.
       preview: Whether the request chooses a team.
+      replacement: Whether the request replaces active Pokemon instead of choosing moves.
+      between_turns: Whether upkeep has completed and the next turn has not started.
 
     Returns:
       The two slots' moves, switches, and forced actions.
@@ -576,10 +586,10 @@ def build_decision_view(
             if member.member_id.side.side_index == perspective and member.fainted
         )
     )
-    pivot_slots = frozenset(
+    replacement_slots = frozenset(
         slot
-        for event in window_events
-        if _is_pivot(event)
+        for event in (window_events if replacement else ())
+        if event.event.tag == "switch"
         and (reference := _reference(event, 0)) is not None
         and reference.pokemon_ref.side.side_index == perspective
         and (slot := reference.pokemon_ref.active_slot) is not None
@@ -615,8 +625,9 @@ def build_decision_view(
         force_switch = member is None and bool(switches)
         if revive_slot is not None:
             force_switch = slot == revive_slot
-        elif pivot_slots:
-            force_switch = slot in pivot_slots
+        elif replacement:
+            # Mid-turn replacements leave other fainted slots until upkeep finishes.
+            force_switch = slot in replacement_slots or (between_turns and force_switch)
         slots.append(
             SlotDecision(
                 switch_slots=fainted if slot == revive_slot else switches,
@@ -645,14 +656,17 @@ def _decision_for_window(
     decision_index: int,
 ) -> tuple[DecisionRecord, DecisionView] | None:
     window_events = events[window.start_line_index : window.end_line_index]
-    # Queued moves resume after a pivot switch; they answer the earlier turn request.
-    if window.decision_type is DecisionType.PIVOT_SWITCH:
-        window_events = tuple(event for event in window_events if _is_pivot(event))
-    if window.decision_type in {
+    replacement = window.decision_type in {
         DecisionType.FORCED_SWITCH,
         DecisionType.PIVOT_SWITCH,
-    } and not _has_player_policy_action(window_events, perspective):
-        return None
+    }
+    if replacement:
+        # Queued moves resume after a replacement; they answer the earlier turn request.
+        window_events = tuple(
+            event for event in window_events if event.event.tag == "switch" or _is_revive(event)
+        )
+        if not _has_player_policy_action(window_events, perspective):
+            return None
     if window.decision_type is DecisionType.TEAM_PREVIEW:
         final_state = snapshots[len(events) - 1]
         observed = _preview_actions(
@@ -674,6 +688,8 @@ def _decision_for_window(
             perspective,
             window_events,
             preview=False,
+            replacement=replacement,
+            between_turns=window.between_turns,
         )
         if window.decision_type is DecisionType.FORCED_SWITCH and any(
             action is not None for action in observed[:2]

@@ -188,6 +188,7 @@ uv run ruff format --check src scripts tests
 uv run pyright
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run pytest -q --basetemp scratch/pytest
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 P0_STRESS_GAME_COUNT=50 P0_STRESS_CONCURRENCY=1 uv run pytest -q -m heavy --basetemp scratch/pytest
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run pytest -q -m stress
 git diff --check
 uv build
 ```

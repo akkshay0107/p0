@@ -33,6 +33,8 @@ _ABILITIES = {
     "Maushold": "Friend Guard",
     "Ditto": "Limber",
     "Pikachu": "Static",
+    "Vaporeon": "Hydration",
+    "Bellibolt": "Electromorphosis",
 }
 
 
@@ -911,17 +913,22 @@ class TestReconstructionState:
         )
 
         snapshots = reduce_replay_state("state-test", _complete_ots(), events).require_accepted()
-        before_reentry = snapshots[0].member(ReplayMemberId(ReplaySide.P1, 0))
+        before_reentry = snapshots[1].member(ReplayMemberId(ReplaySide.P1, 0))
         lopunny = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
 
         assert before_reentry.status == "tox"
+        assert before_reentry.status_counter == 1
         assert lopunny.status == "tox"
         assert lopunny.status_counter == 0
 
-    def test_faint_cleanup_clears_status_counter(self) -> None:
+    @pytest.mark.parametrize(
+        ("status", "age_event"),
+        (("tox", "|turn|1"), ("slp", "|cant|p1a: Lopunny|slp")),
+    )
+    def test_faint_cleanup_clears_status_counter(self, status: str, age_event: str) -> None:
         events = _resolved(
-            "|switch|p1a: Lopunny|Lopunny, L50|100/100 tox",
-            "|turn|1",
+            f"|switch|p1a: Lopunny|Lopunny, L50|100/100 {status}",
+            age_event,
             "|-damage|p1a: Lopunny|0 fnt",
             "|faint|p1a: Lopunny",
         )
@@ -930,7 +937,8 @@ class TestReconstructionState:
         before_faint = snapshots[-2].member(ReplayMemberId(ReplaySide.P1, 0))
         lopunny = snapshots[-1].member(ReplayMemberId(ReplaySide.P1, 0))
 
-        assert before_faint.status == "tox"
+        assert before_faint.status == status
+        assert before_faint.status_counter == 1
         assert lopunny.status is None
         assert lopunny.status_counter == 0
 
@@ -957,22 +965,42 @@ class TestReconstructionState:
         assert snapshots[-1].member(snorlax_id).hp_fraction == 1.0
         assert snapshots[-1].member(snorlax_id).status == "brn"
 
-    def test_wish_survives_a_failed_effect_on_its_user(self) -> None:
+    @pytest.mark.parametrize(
+        ("move", "failure_suffix"),
+        (("Toxic", "|tox"), ("Soak", "")),
+    )
+    def test_wish_survives_a_failed_effect_on_its_user(
+        self, move: str, failure_suffix: str
+    ) -> None:
+        sheets = (
+            _ots(
+                ReplaySide.P1,
+                ("Vaporeon", *_P1_SPECIES[1:]),
+                moves=("Protect", "Wish"),
+            ),
+            _ots(
+                ReplaySide.P2,
+                ("Bellibolt", *_P2_SPECIES[1:]),
+                moves=("Protect", "Toxic", "Soak"),
+            ),
+        )
         events = _resolved(
-            "|switch|p1a: Lopunny|Lopunny, L50|50/100 tox",
+            "|switch|p1a: Vaporeon|Vaporeon, L50|50/100 tox",
+            "|switch|p2a: Bellibolt|Bellibolt, L50|100/100",
             "|turn|1",
-            "|move|p1a: Lopunny|Wish|p1a: Lopunny",
-            "|-fail|p1a: Lopunny|tox",
+            "|move|p1a: Vaporeon|Wish|p1a: Vaporeon",
+            f"|move|p2a: Bellibolt|{move}|p1a: Vaporeon",
+            f"|-fail|p1a: Vaporeon{failure_suffix}",
             "|upkeep",
             "|turn|2",
-            "|-heal|p1a: Lopunny|100/100 tox|[from] move: Wish|[wisher] Lopunny",
+            "|-heal|p1a: Vaporeon|100/100 tox|[from] move: Wish|[wisher] Vaporeon",
+            ots=sheets,
         )
 
-        snapshots = reduce_replay_state(
-            "state-test", _complete_wish_ots(), events
-        ).require_accepted()
+        snapshots = reduce_replay_state("state-test", sheets, events).require_accepted()
 
         assert snapshots[3].slot_conditions[0].move_id == "wish"
+        assert snapshots[5].slot_conditions == snapshots[3].slot_conditions
         assert snapshots[-1].slot_conditions == ()
 
     def test_wish_expires_at_the_resolution_upkeep_without_healing(self) -> None:
@@ -1392,25 +1420,82 @@ class TestReconstructionState:
         assert dict(final.sides[0].conditions) == {}
         assert dict(member.effects) == {}
 
-    def test_protection_counter_resets_on_failure_and_switch(self) -> None:
+    @pytest.mark.parametrize(
+        ("move", "target"),
+        (
+            ("Helping Hand", "p1b: Snorlax"),
+            ("Future Sight", "p2a: Audino"),
+            ("Wish", "p1a: Lopunny"),
+        ),
+    )
+    def test_non_protection_move_resets_protection_counter(self, move: str, target: str) -> None:
+        sheets = (
+            _ots(
+                ReplaySide.P1,
+                _P1_SPECIES,
+                moves=("Protect", "Helping Hand", "Future Sight", "Wish"),
+            ),
+            _ots(ReplaySide.P2, _P2_SPECIES),
+        )
         events = _resolved(
             "|switch|p1a: Lopunny|Lopunny, L50|100/100",
+            "|switch|p1b: Snorlax|Snorlax, L50|100/100",
+            "|switch|p2a: Audino|Audino, L50|100/100",
             "|turn|1",
+            "|move|p1a: Lopunny|Protect|p1a: Lopunny",
             "|-singleturn|p1a: Lopunny|Protect",
-            "|-fail|p1a: Lopunny|move: Protect",
-            "|-singleturn|p1a: Lopunny|Protect",
-            "|switch|p1a: Snorlax|Snorlax, L50|100/100",
+            "|upkeep",
+            "|turn|2",
+            f"|move|p1a: Lopunny|{move}|{target}",
+            ots=sheets,
         )
 
-        snapshots = reduce_replay_state("state-test", _complete_ots(), events).require_accepted()
+        snapshots = reduce_replay_state("state-test", sheets, events).require_accepted()
         lopunny_id = ReplayMemberId(ReplaySide.P1, 0)
+
+        assert snapshots[-2].member(lopunny_id).protect_counter == 1
+        assert snapshots[-1].member(lopunny_id).protect_counter == 0
+
+    def test_protection_counter_ignores_target_failure_and_resets_on_own_failure_and_switch(
+        self,
+    ) -> None:
+        sheets = (
+            _ots(ReplaySide.P1, ("Vaporeon", *_P1_SPECIES[1:])),
+            _ots(ReplaySide.P2, ("Bellibolt", *_P2_SPECIES[1:]), moves=("Soak",)),
+        )
+        events = _resolved(
+            "|switch|p1a: Vaporeon|Vaporeon, L50|100/100",
+            "|switch|p2a: Bellibolt|Bellibolt, L50|100/100",
+            "|turn|1",
+            "|move|p1a: Vaporeon|Protect|p1a: Vaporeon",
+            "|-singleturn|p1a: Vaporeon|Protect",
+            # Life Dew fails on a full-HP ally without breaking its Protect streak.
+            "|-fail|p1a: Vaporeon|heal",
+            "|upkeep",
+            "|turn|2",
+            "|move|p2a: Bellibolt|Soak|p1a: Vaporeon",
+            "|-fail|p1a: Vaporeon",
+            "|move|p1a: Vaporeon|Protect||[still]",
+            "|-fail|p1a: Vaporeon",
+            "|upkeep",
+            "|turn|3",
+            "|move|p1a: Vaporeon|Protect|p1a: Vaporeon",
+            "|-singleturn|p1a: Vaporeon|Protect",
+            "|switch|p1a: Snorlax|Snorlax, L50|100/100",
+            ots=sheets,
+        )
+
+        snapshots = reduce_replay_state("state-test", sheets, events).require_accepted()
+        vaporeon_id = ReplayMemberId(ReplaySide.P1, 0)
         snorlax_id = ReplayMemberId(ReplaySide.P1, 1)
 
-        assert snapshots[2].member(lopunny_id).protect_counter == 1
-        assert snapshots[3].member(lopunny_id).protect_counter == 0
-        assert snapshots[4].member(lopunny_id).protect_counter == 1
-        assert snapshots[5].member(snorlax_id).protect_counter == 0
-        assert snapshots[5].member(lopunny_id).protect_counter == 0
+        assert snapshots[4].member(vaporeon_id).protect_counter == 1
+        assert snapshots[5].member(vaporeon_id).protect_counter == 1
+        assert snapshots[9].member(vaporeon_id).protect_counter == 1
+        assert snapshots[11].member(vaporeon_id).protect_counter == 0
+        assert snapshots[15].member(vaporeon_id).protect_counter == 1
+        assert snapshots[16].member(snorlax_id).protect_counter == 0
+        assert snapshots[16].member(vaporeon_id).protect_counter == 0
 
     @pytest.mark.parametrize(
         "condition",

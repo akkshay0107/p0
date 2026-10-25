@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from p0.format_config import FORMAT
+from p0.model.architecture_contract import SERIES_SLOTS
 from p0.model.config import ModelConfig
 from p0.model.factory import build_policy, canonical_policy_state_dict, compile_policy
 from p0.model.policy import MemoryInputs
@@ -83,10 +84,19 @@ class TestCudaTraining:
         observations = StructuredObservation.empty_batch(2).to(cuda_device)
         mask = torch.ones((2, 2, eager.act_size), device=cuda_device, dtype=torch.bool)
         actions = torch.tensor([[1, 2], [1, 2]], device=cuda_device)
+        histories = torch.randn(4, 3, MODEL_CONFIG.d_model, device=cuda_device)
+        history_mask = torch.ones(4, 3, dtype=torch.bool, device=cuda_device)
 
         def _step(mod):
             enc = mod.encode(observations, mask)
             mem = MemoryInputs.empty(2, mod.d_model, cuda_device, enc.tokens.dtype)
+            mem = replace(
+                mem,
+                series_tokens=mod.series(histories, history_mask).reshape(
+                    2, SERIES_SLOTS, mod.d_model
+                ),
+                series_mask=torch.ones(2, SERIES_SLOTS, dtype=torch.bool, device=cuda_device),
+            )
             res = mod.evaluate(mod.prepare(enc, mem), mask, actions)
             (-res.log_probs.float().mean() + res.value.float().square().mean()).backward()
             return res

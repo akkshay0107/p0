@@ -5,6 +5,7 @@ import torch
 
 from p0.battle.series import SeriesPerspectiveKey
 from p0.model.architecture_contract import SERIES_TOKENS_PER_GAME
+from p0.model.series_context import DynamicSeriesResampler
 from p0.training.series_history import (
     SeriesHistoryStore,
     advance_series_state,
@@ -88,34 +89,33 @@ class TestAdvanceSeriesState:
 
 
 class TestPackSeriesContext:
-    def test_shared_game_is_summarized_once_and_repeated_over_each_group(self) -> None:
-        short = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        long = torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 5.0]])
-        resampled_games: list[int] = []
-
-        def sum_real_rows(padded: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-            resampled_games.append(padded.size(0))
-            total = (padded * mask.unsqueeze(-1)).sum(dim=1, keepdim=True)
-            return total.expand(-1, SERIES_TOKENS_PER_GAME, -1)
+    def test_shared_game_summaries_preserve_history_order_and_repeat_over_each_group(self) -> None:
+        torch.manual_seed(13)
+        resampler = DynamicSeriesResampler(d_model=8, nhead=2, dim_feedforward=32)
+        short = torch.randn(5, 8)
+        long = torch.randn(9, 8)
 
         # Three groups of 2, 1 and 1 rows: two prior games, one shared game, none.
         tokens, mask = pack_series_context(
             [(short, long), (short,), ()],
             torch.tensor([2, 1, 1]),
-            sum_real_rows,
-            torch.zeros(4, 2),
+            resampler,
+            torch.zeros(4, 8),
         )
 
-        assert resampled_games == [2]
-        assert tokens.shape == (4, 2 * SERIES_TOKENS_PER_GAME, 2)
-        short_sum, long_sum = torch.tensor([4.0, 6.0]), torch.tensor([3.0, 5.0])
-        for row in (0, 1):
-            assert mask[row].all()
-            assert (tokens[row, :SERIES_TOKENS_PER_GAME] == short_sum).all()
-            assert (tokens[row, SERIES_TOKENS_PER_GAME:] == long_sum).all()
+        short_summary = resampler(short.unsqueeze(0), torch.ones(1, 5, dtype=torch.bool))[0]
+        long_summary = resampler(long.unsqueeze(0), torch.ones(1, 9, dtype=torch.bool))[0]
+        assert tokens.shape == (4, 2 * SERIES_TOKENS_PER_GAME, 8)
+        assert mask[:2].all()
+        torch.testing.assert_close(
+            tokens[:2, :SERIES_TOKENS_PER_GAME], short_summary.expand(2, -1, -1)
+        )
+        torch.testing.assert_close(
+            tokens[:2, SERIES_TOKENS_PER_GAME:], long_summary.expand(2, -1, -1)
+        )
         assert (
             mask[2].tolist() == [True] * SERIES_TOKENS_PER_GAME + [False] * SERIES_TOKENS_PER_GAME
         )
-        assert (tokens[2, :SERIES_TOKENS_PER_GAME] == short_sum).all()
+        torch.testing.assert_close(tokens[2, :SERIES_TOKENS_PER_GAME], short_summary)
         assert not tokens[2, SERIES_TOKENS_PER_GAME:].any()
         assert not mask[3].any() and not tokens[3].any()

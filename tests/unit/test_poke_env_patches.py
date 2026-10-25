@@ -8,7 +8,7 @@ import weakref
 from pathlib import Path
 
 import pytest
-from poke_env.battle import DoubleBattle, Effect, Pokemon, PokemonType, SideCondition, Status
+from poke_env.battle import DoubleBattle, Effect, Move, Pokemon, PokemonType, SideCondition, Status
 from poke_env.player.battle_order import DoubleBattleOrder
 from poke_env.teambuilder import TeambuilderPokemon
 from poke_env.teambuilder.teambuilder import Teambuilder
@@ -16,12 +16,151 @@ from poke_env.teambuilder.teambuilder import Teambuilder
 from p0.battle.views import TransformedPokemonView
 from p0.model.observation_builder import ObservationBuilder
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import NUM_IDX_EFFECT_COUNT
+from p0.model.structured_observation import NUM_IDX_EFFECT_COUNT, NUM_IDX_MOVE_PP
 from p0.runtime import poke_env_patches
 from p0.runtime.poke_env_battle_adapter import battle_view
 
 
 class TestPokeEnvPatches:
+    @pytest.mark.parametrize(
+        "move_id,generation,expected_pp",
+        (
+            ("protect", 9, 8),
+            ("heatwave", 9, 12),
+            ("thunderbolt", 9, 16),
+            ("tackle", 9, 20),
+            ("revivalblessing", 9, 1),
+            ("thunderbolt", 8, 24),
+        ),
+    )
+    def test_move_pp_matches_generation_limits(
+        self, move_id: str, generation: int, expected_pp: int
+    ) -> None:
+        poke_env_patches.install()
+
+        move = Move(move_id, gen=generation)
+
+        assert move.current_pp == move.max_pp == expected_pp
+
+    def test_public_pp_and_authoritative_own_requests_reach_observations(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("own-pp", "Alice", logging.getLogger("test"), gen=9)
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", "p1a: Pikachu", "Pikachu, L50", "100/100"],
+            ["", "switch", "p1b: Charizard", "Charizard, L50", "100/100"],
+            ["", "switch", "p2a: Raichu", "Raichu, L50", "100/100"],
+        ):
+            battle.parse_message(event)
+        pikachu = _request_pokemon("p1: Pikachu", "Pikachu, L50", "100/100", True)
+        pikachu["moves"] = ["thunderbolt"]
+        charizard = _request_pokemon("p1: Charizard", "Charizard, L50", "100/100", True)
+        thunderbolt = {**_request_move("Thunderbolt", "normal"), "pp": 16, "maxpp": 16}
+        request = {
+            "active": [
+                {"moves": [thunderbolt]},
+                {"moves": [_request_move("Protect", "self")]},
+            ],
+            "side": {"name": "Alice", "id": "p1", "pokemon": [pikachu, charizard]},
+        }
+        battle.parse_request(request)
+        battle.parse_request(request, strict_battle_tracking=True)
+        assert battle.available_moves[0][0].current_pp == 16
+
+        battle.parse_message(["", "move", "p1a: Pikachu", "Thunderbolt", "p2a: Raichu"])
+        battle.parse_message(["", "move", "p2a: Raichu", "Thunderbolt", "p1a: Pikachu"])
+        thunderbolt["pp"] = 15
+        battle.parse_request(request, strict_battle_tracking=True)
+        observation = ObservationBuilder(default_runtime_resources()).build(battle_view(battle))
+
+        assert battle.available_moves[0][0].current_pp == 15
+        assert observation.numerical[0, NUM_IDX_MOVE_PP].item() == pytest.approx(15 / 16)
+        assert observation.numerical[6, NUM_IDX_MOVE_PP].item() == pytest.approx(15 / 16)
+        opponent = battle.opponent_active_pokemon[0]
+        assert opponent is not None and opponent.moves["thunderbolt"].current_pp == 15
+
+        # A later authoritative request also repairs deductions absent from public events.
+        thunderbolt["pp"] = 12
+        battle.parse_request(request)
+        assert battle.available_moves[0][0].current_pp == 12
+        assert opponent.moves["thunderbolt"].current_pp == 15
+
+        for _ in range(15):
+            battle.parse_message(["", "move", "p2a: Raichu", "Thunderbolt", "p1a: Pikachu"])
+        assert opponent.moves["thunderbolt"].current_pp == 0
+
+    @pytest.mark.parametrize(
+        "move_name,ally_species,ally_ability,second_foe_ability,suppressed,expected_pp",
+        (
+            ("Rock Slide", "Pikachu", "static", "pressure", None, 9),
+            ("Rock Slide", "Corviknight", "pressure", "frisk", None, 10),
+            ("Perish Song", "Pikachu", "static", "pressure", None, 5),
+            ("Thunderbolt", "Pikachu", "static", "pressure", None, 14),
+            ("Rock Slide", "Weezing", "neutralizinggas", "pressure", None, 11),
+            ("Rock Slide", "Weezing", "neutralizinggas", "pressure", "p1b: Weezing", 9),
+        ),
+    )
+    def test_pressure_counts_each_opponent_and_excludes_allies_and_gas(
+        self,
+        move_name: str,
+        ally_species: str,
+        ally_ability: str,
+        second_foe_ability: str,
+        suppressed: str | None,
+        expected_pp: int,
+    ) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("pressure-pp", "Alice", logging.getLogger("test"), gen=9)
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", "p1a: Politoed", "Politoed, L50", "100/100"],
+            ["", "switch", f"p1b: {ally_species}", f"{ally_species}, L50", "100/100"],
+            ["", "switch", "p2a: Corviknight", "Corviknight, L50", "100/100"],
+            ["", "switch", "p2b: Dusknoir", "Dusknoir, L50", "100/100"],
+            ["", "-ability", f"p1b: {ally_species}", ally_ability],
+            ["", "-ability", "p2a: Corviknight", "Pressure"],
+            ["", "-ability", "p2b: Dusknoir", second_foe_ability],
+        ):
+            battle.parse_message(event)
+        if suppressed is not None:
+            battle.parse_message(["", "-endability", suppressed])
+        battle.parse_message(["", "move", "p1a: Politoed", move_name, "p2a: Corviknight"])
+
+        user = battle.active_pokemon[0]
+        assert user is not None
+        assert user.moves[move_name.replace(" ", "").lower()].current_pp == expected_pp
+
+    def test_gastro_acid_suppresses_pressure_until_switching(self) -> None:
+        poke_env_patches.install()
+        battle = DoubleBattle("gastro-pressure", "Bob", logging.getLogger("test"), gen=9)
+        for event in (
+            ["", "player", "p1", "Alice", "", ""],
+            ["", "player", "p2", "Bob", "", ""],
+            ["", "switch", "p1a: Tyranitar", "Tyranitar, L50", "100/100"],
+            ["", "switch", "p2a: Corviknight", "Corviknight, L50", "100/100"],
+            ["", "switch", "p2b: Dusknoir", "Dusknoir, L50", "100/100"],
+            ["", "-ability", "p2a: Corviknight", "Pressure"],
+            ["", "-ability", "p2b: Dusknoir", "Pressure"],
+            ["", "-endability", "p2a: Corviknight"],
+            ["", "move", "p1a: Tyranitar", "Rock Slide", "p2a: Corviknight"],
+        ):
+            battle.parse_message(event)
+        corviknight = battle.active_pokemon[0]
+        tyranitar = battle.opponent_active_pokemon[0]
+        assert corviknight is not None and tyranitar is not None
+        assert Effect.GASTRO_ACID in corviknight.effects
+        assert corviknight.ability == "pressure"
+        assert tyranitar.moves["rockslide"].current_pp == 10
+
+        battle.parse_message(["", "switch", "p2a: Raichu", "Raichu, L50", "100/100"])
+        battle.parse_message(["", "switch", "p2a: Corviknight", "Corviknight, L50", "100/100"])
+        battle.parse_message(["", "move", "p1a: Tyranitar", "Rock Slide", "p2a: Corviknight"])
+
+        assert Effect.GASTRO_ACID not in corviknight.effects
+        assert tyranitar.moves["rockslide"].current_pp == 7
+
     @pytest.mark.parametrize("role", ("p1", "p2"))
     def test_illusion_duplicate_display_keeps_both_slots_active(self, role: str) -> None:
         poke_env_patches.install()
@@ -637,7 +776,7 @@ class TestPokeEnvPatches:
             battle.parse_message(["", "move", "p1a: Receiver", "Tackle", "p2a: Donor"])
 
         move = battle.get_pokemon("p1a: Receiver").moves["tackle"]
-        assert move.current_pp == 12
+        assert move.current_pp == 0
         battle.parse_message(
             ["", "-activate", "p1a: Receiver", "item: Leppa Berry", "Tackle", "[consumed]"]
         )
@@ -660,7 +799,7 @@ class TestPokeEnvPatches:
         battle.parse_message(
             ["", "-activate", "p1a: Receiver", "item: Leppa Berry", "Tackle", "[consumed]"]
         )
-        assert move.current_pp == 22
+        assert move.current_pp == 10
 
     def test_leppa_berry_rejects_unknown_move(self) -> None:
         poke_env_patches.install()

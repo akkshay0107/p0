@@ -1,6 +1,8 @@
 import json
 
 import pytest
+from poke_env.data import to_id_str
+from poke_env.teambuilder import Teambuilder
 
 from p0.format_config import FORMAT
 from p0.teams.validation import (
@@ -15,19 +17,20 @@ from tests.team_fixtures import team_variant
 class TestTeams:
     @pytest.mark.integration
     @pytest.mark.heavy
-    def test_pinned_showdown_admits_and_packs_legal_variant(self) -> None:
-        """
-        Verify that Showdown's native validator accepts a legal team variant and generates packed output.
-
-        Ensures that our fixture legal team complies with Showdown's format rules (moves, abilities,
-        item clauses, EV limits) and that team validation produces a valid packed wire representation
-        with matching team key.
-        """
-        variant = team_variant()
+    @pytest.mark.parametrize(("move", "valid"), (("Fake Out", True), ("Spore", False)))
+    def test_pinned_showdown_admits_legal_moves_and_rejects_unlearnable_moves(
+        self, move: str, valid: bool
+    ) -> None:
+        variant = team_variant(move=move)
         result = validate_variant(variant)
-        assert result.valid, result.problems
+        assert result.valid is valid, result.problems
         assert result.team_key == variant.team.team_key
-        assert result.packed_team
+        if valid:
+            assert result.packed_team
+            assert result.problems == ()
+        else:
+            assert result.packed_team is None
+            assert any("Pikachu can't learn Spore" in problem for problem in result.problems)
 
 
 @pytest.mark.integration
@@ -56,6 +59,24 @@ class TestTeamScale:
         ]
         assert all(result.valid for result in results)
         assert all(result.packed_team for result in results)
+        for variant, result in zip(variants, results, strict=True):
+            assert result.packed_team is not None
+            packed_members = Teambuilder.parse_packed_team(result.packed_team)
+            expected_members = {
+                to_id_str(member.species): (member, spread)
+                for member, spread in zip(variant.team.members, variant.spreads, strict=True)
+            }
+            assert len(packed_members) == 6
+            for packed in packed_members:
+                species = packed.species or packed.nickname
+                assert species is not None
+                member, spread = expected_members.pop(to_id_str(species))
+                assert to_id_str(packed.item or "") == to_id_str(member.item)
+                assert to_id_str(packed.ability or "") == to_id_str(member.ability)
+                assert sorted(packed.moves) == sorted(to_id_str(move) for move in member.moves)
+                assert to_id_str(packed.nature or "") == to_id_str(member.nature)
+                assert packed.evs == list(spread.as_tuple())
+            assert not expected_members
 
         payload = json.loads(showdown_payload(variants[0], format_id=FORMAT.bo3_format))
         assert payload["format"] == FORMAT.bo3_format

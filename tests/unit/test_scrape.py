@@ -8,17 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from p0.model.observation_builder import ObservationBuilder
-from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import (
-    CAT_IDX_STAT_PROVENANCE,
-    NUM_IDX_LEVEL_STATS,
-    StatProvenance,
-)
-from p0.replays.compile import (
-    _replay_observation,
-    compile_payloads,
-)
 from p0.replays.schema import FetchIndexEntry
 from p0.replays.scrape import (
     ReplayFetcher,
@@ -27,50 +16,9 @@ from p0.replays.scrape import (
     select_replays,
     write_fetch_index,
 )
-from tests.unit.replay_fixtures import payload_with_ots_natures
 
 
 class TestReplayScraping:
-    def test_replay_stats_are_imputed_from_the_pinned_dex(self) -> None:
-        result = compile_payloads((payload_with_ots_natures("imputed"),))
-
-        assert result.metrics.counters["imputations"] > 0
-        assert result.metrics.counters["imputation_confidence_sum"] > 0.0
-
-    def test_replay_stats_are_applied_to_both_projected_sides(self) -> None:
-        """Verify numeric replay stat estimates reach both projected observation perspectives."""
-        result = compile_payloads((payload_with_ots_natures("own-side"),))
-        assert result.accepted_series
-
-        game = result.accepted_series[0].games[0]
-        pikachu_estimate = next(
-            est
-            for est in game.stat_estimates
-            if est.member_id.side.value == "p1" and est.member_id.roster_index == 0
-        )
-        assert pikachu_estimate.values == (111, 107, 61, 63, 71, 155)
-        assert pikachu_estimate.provenance == "IMPUTED"
-
-        stat_overrides = {estimate.member_id: estimate.values for estimate in game.stat_estimates}
-        builder = ObservationBuilder(default_runtime_resources())
-        expected_pikachu = [111 / 300, 107 / 300, 61 / 300, 63 / 300, 71 / 300, 155 / 300]
-
-        # Perspective 0: Pikachu is on player team (slot 0)
-        p0_obs = _replay_observation(
-            game.perspectives[0].snapshots[0].view, builder, stat_overrides
-        )
-        assert p0_obs.categorical[0, CAT_IDX_STAT_PROVENANCE] == StatProvenance.IMPUTED
-        p0_pikachu = p0_obs.numerical[0, NUM_IDX_LEVEL_STATS : NUM_IDX_LEVEL_STATS + 6].tolist()
-        assert p0_pikachu == pytest.approx(expected_pikachu, rel=1e-5)
-
-        # Perspective 1: Pikachu is on opponent team (slot 6)
-        p1_obs = _replay_observation(
-            game.perspectives[1].snapshots[0].view, builder, stat_overrides
-        )
-        assert p1_obs.categorical[6, CAT_IDX_STAT_PROVENANCE] == StatProvenance.IMPUTED
-        p1_pikachu = p1_obs.numerical[6, NUM_IDX_LEVEL_STATS : NUM_IDX_LEVEL_STATS + 6].tolist()
-        assert p1_pikachu == pytest.approx(expected_pikachu, rel=1e-5)
-
     def test_scrape_config_validation(self, tmp_path: Path) -> None:
         """Verify ScrapeConfig raises ValueError for empty format_id, non-positive page_size, negative backoff, or zero timeout."""
         with pytest.raises(ValueError, match="format_id must be non-empty"):

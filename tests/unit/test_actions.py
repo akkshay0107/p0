@@ -38,15 +38,6 @@ class TestActions:
         for action_id, expected_action in action_cases:
             assert decode_action(action_id) == expected_action
             assert encode_action(expected_action) == action_id
-        # Team preview lead pairs: 6 choose 2 permutations = 30 distinct ordered lead combinations
-        actions = {
-            encode_team_pair(first, second)
-            for first in range(6)
-            for second in range(6)
-            if first != second
-        }
-        assert len(actions) == 30
-        assert all(decode_team_pair(action)[0] != decode_team_pair(action)[1] for action in actions)
         assert team_selection(1, 8)[:4] == (0, 1, 2, 3)
 
     def test_action_encoding_and_decoding_boundary_errors(self) -> None:

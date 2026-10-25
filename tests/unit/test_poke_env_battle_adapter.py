@@ -15,7 +15,13 @@ LOGGER = logging.getLogger(__name__)
 
 class TestPokeEnvBattleAdapter:
     @pytest.mark.parametrize(
-        ("trapping", "can_switch"), (({"maybeTrapped": True}, True), ({"trapped": True}, False))
+        ("trapping", "can_switch"),
+        (
+            ({}, True),
+            ({"maybeTrapped": True}, True),
+            ({"trapped": True}, False),
+            ({"maybeTrapped": True, "trapped": True}, False),
+        ),
     )
     def test_only_confirmed_trapping_blocks_switches(
         self, trapping: dict[str, bool], can_switch: bool

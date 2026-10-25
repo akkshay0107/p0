@@ -8,48 +8,36 @@ from p0.model.token_store import SeriesTokenStore
 
 
 class TestSeriesTokenStore:
-    def test_reused_source_storage_preserves_each_perspective_snapshot(self) -> None:
-        store = SeriesTokenStore(d_model=2)
-        first_player = SeriesPerspectiveKey("match", 0)
-        second_player = SeriesPerspectiveKey("match", 1)
-        source = torch.ones(4, 2)
-
-        store.append(first_player, source)
+    def test_append_keeps_independent_game_and_perspective_snapshots(self) -> None:
+        store = SeriesTokenStore(d_model=2, max_games=2)
+        keys = (SeriesPerspectiveKey("match", 0), SeriesPerspectiveKey("match", 1))
+        source = torch.ones(SERIES_TOKENS_PER_GAME, 2)
+        store.append(keys[0], source)
         source.fill_(2.0)
-        store.append(second_player, source)
+        store.append(keys[1], source)
         source.fill_(3.0)
-        tokens, mask = store.get_tokens([first_player, second_player], torch.device("cpu"))
 
-        torch.testing.assert_close(tokens[0, :4], torch.ones(4, 2))
-        torch.testing.assert_close(tokens[1, :4], torch.full((4, 2), 2.0))
-        assert mask[:, :4].all()
-        assert not mask[:, 4:].any()
+        tokens, mask = store.get_tokens(keys, torch.device("cpu"))
 
-    def test_token_store_append_and_get(self) -> None:
-        """Verify SeriesTokenStore appends tokens, pads remaining slots with zeros, and computes active boolean masks."""
-        store = SeriesTokenStore(d_model=16, max_games=2)
+        assert tokens.shape == (2, SERIES_SLOTS, 2)
+        assert mask.shape == (2, SERIES_SLOTS)
+        torch.testing.assert_close(tokens[0, :SERIES_TOKENS_PER_GAME], torch.ones_like(source))
+        torch.testing.assert_close(tokens[1, :SERIES_TOKENS_PER_GAME], torch.full_like(source, 2.0))
+        assert not tokens[:, SERIES_TOKENS_PER_GAME:].any()
+        assert mask[:, :SERIES_TOKENS_PER_GAME].all()
+        assert not mask[:, SERIES_TOKENS_PER_GAME:].any()
 
-        tokens1 = torch.randn(SERIES_TOKENS_PER_GAME, 16)
-        store.append("series-A", tokens1)
+        store.append(keys[0], source)
+        source.fill_(4.0)
+        tokens, mask = store.get_tokens(keys, torch.device("cpu"))
 
-        out_tokens, out_mask = store.get_tokens(["series-A"], device=torch.device("cpu"))
-        assert out_tokens.shape == (1, SERIES_SLOTS, 16)
-        assert out_mask.shape == (1, SERIES_SLOTS)
-
-        assert torch.allclose(out_tokens[0, :SERIES_TOKENS_PER_GAME], tokens1)
-        assert torch.all(out_tokens[0, SERIES_TOKENS_PER_GAME:] == 0)
-        assert torch.all(out_mask[0, :SERIES_TOKENS_PER_GAME])
-        assert not torch.any(out_mask[0, SERIES_TOKENS_PER_GAME:])
-
-        tokens2 = torch.randn(SERIES_TOKENS_PER_GAME, 16)
-        store.append("series-A", tokens2)
-
-        out_tokens, out_mask = store.get_tokens(["series-A"], device=torch.device("cpu"))
-        assert torch.allclose(out_tokens[0, :SERIES_TOKENS_PER_GAME], tokens1)
-        assert torch.allclose(
-            out_tokens[0, SERIES_TOKENS_PER_GAME : 2 * SERIES_TOKENS_PER_GAME], tokens2
-        )
-        assert torch.all(out_mask[0, : 2 * SERIES_TOKENS_PER_GAME])
+        torch.testing.assert_close(tokens[0, :SERIES_TOKENS_PER_GAME], torch.ones_like(source))
+        torch.testing.assert_close(tokens[0, SERIES_TOKENS_PER_GAME:], torch.full_like(source, 3.0))
+        torch.testing.assert_close(tokens[1, :SERIES_TOKENS_PER_GAME], torch.full_like(source, 2.0))
+        assert not tokens[1, SERIES_TOKENS_PER_GAME:].any()
+        assert mask[0].all()
+        assert mask[1, :SERIES_TOKENS_PER_GAME].all()
+        assert not mask[1, SERIES_TOKENS_PER_GAME:].any()
 
     def test_token_store_max_games_truncation(self) -> None:
         """Verify SeriesTokenStore retains only the most recent max_games=2 entries using FIFO eviction."""

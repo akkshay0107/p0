@@ -315,20 +315,38 @@ class TestDecisionTargets:
 
 
 class TestForcedMoves:
-    def test_locked_move_is_the_forced_action(self) -> None:
+    @pytest.mark.parametrize("all_locked", (False, True))
+    def test_locked_move_is_the_forced_action(self, all_locked: bool) -> None:
         # Eevee does not own Dig: it copied the move and is on its second turn.
         payload = decision_payload()
         payload["log"] = str(payload["log"]).replace(
             "|move|p1b: Eevee|Tackle|p2b: Charmander",
             "|move|p1b: Eevee|Dig|p2b: Charmander|[from] lockedmove",
         )
+        if all_locked:
+            payload["log"] = (
+                str(payload["log"])
+                .replace(
+                    "|move|p1a: Pikachu|Protect|p1a: Pikachu",
+                    "|move|p1a: Pikachu|Dig|p2a: Bulbasaur|[from] lockedmove",
+                )
+                .replace(
+                    "|move|p2a: Bulbasaur|Protect|p2a: Bulbasaur",
+                    "|move|p2a: Bulbasaur|Dig|p1a: Pikachu|[from] lockedmove",
+                )
+                .replace(
+                    "|move|p2b: Charmander|Tackle|p1b: Eevee",
+                    "|move|p2b: Charmander|Dig|p1b: Eevee|[from] lockedmove",
+                )
+            )
 
         result = compile_payloads((payload,)).accepted_series[0].games[0].perspectives[0]
 
         evidence = result.decisions[-1].evidence
+        assert result.decisions[-1].decision_type is DecisionType.TURN
         assert evidence.label_kind is LabelKind.EXACT
-        # Pikachu chose Protect (move slot 0, no target); Eevee had the forced action.
-        assert evidence.candidates == ((9, 48),)
+        # Protect is slot 0 with no target; locked slots submit the forced action.
+        assert evidence.candidates == ((48 if all_locked else 9, 48),)
 
     def test_struggle_after_ally_switch_belongs_to_the_slot_held_at_the_request(self) -> None:
         payload = decision_payload()
@@ -464,20 +482,22 @@ class TestReviveDecisions:
 
 
 class TestPivotDecisions:
-    def test_pivot_request_labels_only_the_switching_slot(self) -> None:
+    @pytest.mark.parametrize("ally_fainted", (False, True))
+    def test_pivot_request_labels_only_the_switching_slot(self, ally_fainted: bool) -> None:
         payload = _payload_with_ots(
             p1_species="Scyther", p1_ability="Technician", p1_moves=["U-turn", "Protect"]
         )
         prefix, _, _ = str(payload["log"]).partition("|turn|1")
+        faint = "|-damage|p1b: Eevee|0 fnt\n|faint|p1b: Eevee\n" if ally_fainted else ""
+        partner_move = "" if ally_fainted else "|move|p1b: Eevee|Tackle|p2a: Bulbasaur\n"
         # U-turn requests [switch, pass], then resumes the already submitted moves.
         payload["log"] = f"""{prefix}|turn|1
 |
-|move|p1a: Scyther|U-turn|p2a: Bulbasaur
+{faint}|move|p1a: Scyther|U-turn|p2a: Bulbasaur
 |-damage|p2a: Bulbasaur|71/100
 |
 |switch|p1a: Raichu|Raichu, L50|100/100|[from] U-turn
-|move|p1b: Eevee|Tackle|p2a: Bulbasaur
-|move|p2b: Charmander|Tackle|p1a: Raichu
+{partner_move}|move|p2b: Charmander|Tackle|p1a: Raichu
 |move|p2a: Bulbasaur|Tackle|p1a: Raichu
 |
 |win|Alice"""
@@ -489,6 +509,7 @@ class TestPivotDecisions:
         assert pivot.evidence.label_kind is LabelKind.EXACT
         assert pivot.evidence.candidates == ((3, 0),)
         assert first.snapshots[-1].view.decision.slots[0].force_switch
+        assert not first.snapshots[-1].view.decision.slots[1].force_switch
         assert legal_actions(first.snapshots[-1].view.decision, 1) == (0,)
         assert [decision.decision_type for decision in second.decisions] == [
             DecisionType.TEAM_PREVIEW,

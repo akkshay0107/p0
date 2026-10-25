@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from p0.battle.actions import (
     ACT_SIZE,
@@ -131,18 +132,26 @@ class TestLegality:
         mask = list(legal_actions(mega_view, 0))
         assert 48 in mask and 47 in mask
 
-    def test_unknown_legality_masks_are_supersets_of_the_proven_mask(self) -> None:
-        """Verify unknown legality generates superset action mask."""
+    @pytest.mark.parametrize(
+        ("can_mega", "known_actions", "unknown_actions"),
+        (
+            (False, [3, 4, 7, 10, 11], [0, 3, 4, 7, 10, 11, 48]),
+            (True, [3, 4, 7, 10, 11, 27, 30, 31], [0, 3, 4, 7, 10, 11, 27, 30, 31, 47, 48]),
+        ),
+    )
+    def test_unknown_legality_preserves_proven_actions_and_allows_hidden_forced_moves(
+        self, can_mega: bool, known_actions: list[int], unknown_actions: list[int]
+    ) -> None:
         known_decision = SlotDecision(
             switch_slots=(2, 3),
             move_targets=((-2, 1, 2), (), (), ()),
-            can_mega=False,
+            can_mega=can_mega,
             legality_known=True,
         )
         unknown_decision = SlotDecision(
             switch_slots=(2, 3),
             move_targets=((-2, 1, 2), (), (), ()),
-            can_mega=False,
+            can_mega=can_mega,
             legality_known=False,
         )
         view_known = DecisionView(slots=(known_decision, SlotDecision()))
@@ -151,8 +160,8 @@ class TestLegality:
         mask_known = action_mask(view_known)[0]
         mask_unknown = action_mask(view_unknown)[0]
 
-        assert mask_unknown.sum() >= mask_known.sum()
-        assert (mask_known & ~mask_unknown).sum() == 0
+        assert np.flatnonzero(mask_known).tolist() == known_actions
+        assert np.flatnonzero(mask_unknown).tolist() == unknown_actions
 
     def test_trapped_and_inactive_slot_legality(self) -> None:
         """Verify that trapped slots cannot switch and inactive slots only switch or pass."""

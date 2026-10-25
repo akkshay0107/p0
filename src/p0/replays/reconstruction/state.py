@@ -325,6 +325,7 @@ class _StateReducer:
         self._unheld_item_ends: dict[ReplayMemberId, str] = {}
         self.slot_conditions: dict[tuple[ReplaySide, int, str], SlotConditionState] = {}
         self.hp_before: dict[int, float | None] = {}
+        self._move_actor: ReplayMemberId | None = None
         # Most members do not change between snapshots. Projection reuses a member's
         # view while its snapshot is the same object.
         self._member_snapshots: dict[ReplayMemberId, ReplayPokemonState] = {}
@@ -364,6 +365,10 @@ class _StateReducer:
             raise _StateTransitionError(f"species {name!r} is absent from the pinned dex") from exc
 
     def apply(self, resolved: ResolvedProtocolEvent) -> None:
+        if resolved.event.tag in {"turn", "upkeep", "switch", "drag", "cant"} or (
+            resolved.event.classification is EventClassification.BOUNDARY_SIGNAL
+        ):
+            self._move_actor = None
         handler = _HANDLERS.get(resolved.event.tag)
         if handler is not None:
             handler(self, resolved)
@@ -525,6 +530,7 @@ class _StateReducer:
 
     def _handle_move(self, resolved: ResolvedProtocolEvent) -> None:
         member = self._member_for(resolved, 0)
+        self._move_actor = member.member_id
         move_id = normalize_showdown_id(resolved.event.arguments[1])
         move_states = member.move_snapshots()
         if (
@@ -541,7 +547,7 @@ class _StateReducer:
                 self._schedule_delayed_move(resolved, member, move_id)
         elif move_id in SLOT_CONDITION_MOVES:
             self._schedule_slot_condition(resolved, member, move_id)
-        elif move_id not in _PROTECT_COUNTER_MOVES:
+        if move_id not in _PROTECT_COUNTER_MOVES:
             member.protect_counter = 0
         cause = resolved.event.cause
         pp_owner: str | None = move_id
@@ -1164,12 +1170,15 @@ class _StateReducer:
         self._set_temporary_ability(target, source_ability)
 
     def _handle_minus_fail(self, resolved: ResolvedProtocolEvent) -> None:
-        member = self._member_for(resolved, 0)
-        member.protect_counter = 0
         if len(resolved.event.arguments) > 1:
             # With an effect argument the line names the target on which something
             # failed, not a user whose own move failed.
             return
+        member = self._member_for(resolved, 0)
+        # Soak can fail with a bare target reference instead of the move's actor.
+        if member.member_id != self._move_actor:
+            return
+        member.protect_counter = 0
         self._discard_failed_slot_condition(member)
         for key, delayed in tuple(self.delayed_moves.items()):
             if delayed.source_member_id == member.member_id and not delayed.announced:

@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from poke_env import AccountConfiguration, ServerConfiguration
-from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 
 from p0.format_config import FORMAT
@@ -40,21 +39,6 @@ def wilson_score_interval(wins: int, total: int) -> tuple[float, float]:
     return max(0.0, lower), min(1.0, upper)
 
 
-@dataclass(slots=True)
-class _EvaluationSeriesState:
-    """Track child game results for one Bo3 series."""
-
-    games_played: int = 0
-    wins: int = 0
-    losses: int = 0
-    ties: int = 0
-
-    @property
-    def complete(self) -> bool:
-        threshold = (3 - self.ties) // 2 + 1
-        return self.wins >= threshold or self.losses >= threshold or self.games_played >= 3
-
-
 class EvalPlayerMixin:
     """Track results per completed Bo3 series during evaluation."""
 
@@ -63,37 +47,8 @@ class EvalPlayerMixin:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.history = []
-        self._evaluation_series: dict[str, _EvaluationSeriesState] = {}
-        self._evaluation_resample_team = True
         if getattr(self, "current_team_packed", None) is None:
             raise ValueError("EvalPlayer requires either team_source or a team in kwargs")
-
-    def _should_resample_team_after_battle(self, battle: AbstractBattle) -> bool:
-        del battle
-        return self._evaluation_resample_team
-
-    def _battle_finished_callback(self, battle: AbstractBattle) -> None:
-        if not isinstance(battle, DoubleBattle):
-            raise TypeError(f"Evaluation requires DoubleBattle, got {type(battle).__name__}")
-
-        opponent = battle.opponent_username
-        if not opponent or not opponent.strip():
-            raise ValueError("Evaluation battle has no opponent identity")
-        opponent_id = opponent.strip().casefold()
-        state = self._evaluation_series.setdefault(opponent_id, _EvaluationSeriesState())
-        state.games_played += 1
-        if battle.won:
-            state.wins += 1
-        elif battle.lost:
-            state.losses += 1
-        else:
-            state.ties += 1
-
-        self._evaluation_resample_team = state.complete
-        if state.complete:
-            self._evaluation_series.pop(opponent_id, None)
-
-        super()._battle_finished_callback(battle)  # type: ignore
 
 
 class EvalPlayer(EvalPlayerMixin, RLPlayer):

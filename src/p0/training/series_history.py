@@ -172,11 +172,7 @@ class SeriesHistoryStore:
 
         retained = values
         if not is_series_end:
-            retained = (
-                values.detach().clone()
-                if (values.device.type == "cpu" and values.dtype == torch.float32)
-                else values.detach().to(device="cpu", dtype=torch.float32).clone()
-            )
+            retained = values.detach().to(device="cpu", dtype=torch.float32, copy=True)
         completed, ended = self.planning_state(key)
         completed, _, _, ended = advance_series_state(
             (completed, None, (), ended),

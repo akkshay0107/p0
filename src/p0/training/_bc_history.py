@@ -34,7 +34,7 @@ def window_history_tokens(
                 context_tokens[window.final_index : window.final_index + 1],
             )
         )
-        if window.is_game_end
+        if window.is_game_end and not window.is_series_end
         else target_tokens[window.batch_start : window.batch_stop]
         for window in windows
     )
@@ -83,7 +83,7 @@ def prepare_series_context(
         working_states[window.series_key] = advance_series_state(
             state,
             window.game_number,
-            chunk,
+            chunk.detach(),
             is_game_end=window.is_game_end,
             is_series_end=window.is_series_end,
             max_games=store.max_games,
@@ -106,13 +106,16 @@ def commit_history_updates(
     """Keep unfinished window tokens in active, and append completed games to the store."""
     for window, chunk in zip(windows, window_tokens, strict=True):
         _, fragments = active.pop(window.series_key, (window.game_number, ()))
-        retained = chunk.detach().to(device="cpu", dtype=torch.float32, copy=True)
-        if window.is_game_end:
-            store.append(
-                window.series_key,
-                window.game_number,
-                torch.cat((*fragments, retained)) if fragments else retained,
-                is_series_end=window.is_series_end,
-            )
-        else:
+        if not window.is_game_end:
+            retained = chunk.detach().to(device="cpu", dtype=torch.float32, copy=True)
             active[window.series_key] = window.game_number, (*fragments, retained)
+            continue
+
+        if fragments and not window.is_series_end:
+            chunk = torch.cat((*fragments, chunk.detach().to(device="cpu", dtype=torch.float32)))
+        store.append(
+            window.series_key,
+            window.game_number,
+            chunk,
+            is_series_end=window.is_series_end,
+        )

@@ -8,7 +8,7 @@ from poke_env.ps_client.ps_client import PSClient
 from p0.paths import DEFAULT_PATHS
 
 # The poke-env classes that p0.runtime.poke_env_patches changes.
-_PATCHED_CLASSES = (PSClient, DoubleBattle, Pokemon)
+_PATCHED_CLASSES = (PSClient, DoubleBattle, Pokemon, Move)
 
 
 @pytest.fixture(autouse=True)

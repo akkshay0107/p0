@@ -257,9 +257,12 @@ class TestBCRunner:
         ]
         assert [record["step"] for record in moved_history] == [3]
 
-    @pytest.mark.parametrize("changed_identity", ("dataset_id", "split_id"))
-    def test_changed_validation_data_replaces_an_incomparable_best_policy(
-        self, tmp_path: Path, changed_identity: str
+    @pytest.mark.parametrize(
+        ("changed_identity", "selected_epoch"),
+        ((None, 1), ("dataset_id", 2), ("split_id", 2)),
+    )
+    def test_resume_compares_best_policies_only_with_matching_validation_data(
+        self, tmp_path: Path, changed_identity: str | None, selected_epoch: int
     ) -> None:
         compiled = compile_payloads(
             (
@@ -287,10 +290,12 @@ class TestBCRunner:
             "split_id": "current-split",
             "selection_state": {"best_validation_nll": 0.0, "selected_epoch": 1},
         }
-        metadata[changed_identity] = "previous-data"
+        if changed_identity is not None:
+            metadata[changed_identity] = "previous-data"
         policy = build_policy(ModelConfig(32, 4, 1, 64), default_runtime_resources())
         store = CheckpointStore()
-        store.save_policy(best_path, policy, metadata=metadata)
+        store.save_policy(best_path, policy, metadata={**metadata, "selected_epoch": 1})
+        previous_best = best_path.read_bytes()
         store.save_training(
             latest_path,
             1,
@@ -312,17 +317,21 @@ class TestBCRunner:
         )
 
         without_validation = train_bc(config, device="cpu")
-        assert without_validation["best_policy_checkpoint"] is None
-        assert best_path.is_file()
+        assert without_validation["best_policy_checkpoint"] == (
+            str(best_path) if changed_identity is None else None
+        )
+        assert best_path.read_bytes() == previous_best
 
         resumed = train_bc(replace(config, epochs=2), device="cpu")
 
-        # The previous dataset's perfect NLL must not block selection on new data.
+        # A perfect prior score blocks replacement only when validation data matches.
         assert resumed["final_validation"]["overall_nll"] > 0.0
         selected = store.load_metadata(best_path)
         assert selected["dataset_id"] == built.manifest.dataset_id
         assert selected["split_id"] == "current-split"
-        assert selected["selected_epoch"] == 2
+        assert selected["selected_epoch"] == selected_epoch
+        if changed_identity is None:
+            assert best_path.read_bytes() == previous_best
 
     def test_bc_evaluation_and_cli_parity(self, tmp_path: Path) -> None:
         result = compile_payloads(

@@ -95,17 +95,23 @@ class TestLivePolicyBattle:
         assert torch.isfinite(evaluated.log_probs).all()
         assert torch.isfinite(evaluated.entropy).all()
         assert torch.isfinite(evaluated.value).all()
+        torch.testing.assert_close(acted.log_probs, evaluated.log_probs)
+        torch.testing.assert_close(acted.value, evaluated.value)
         # Confirm sampled joint action tuples are valid double battle combinations
         for index, decision in enumerate(selected):
             actions = tuple(int(value) for value in acted.actions[index].tolist())
             assert actions in decision.legal_joint_actions
 
-        # Check that chosen action logits are finite and masked logits are either finite or -inf
-        selected_logits = evaluated.logits.gather(2, acted.actions.unsqueeze(-1)).squeeze(-1)
-        assert torch.isfinite(selected_logits).all()
-        assert torch.logical_or(
-            torch.isfinite(evaluated.logits), torch.isneginf(evaluated.logits)
-        ).all()
+        expected_mask = torch.zeros_like(action_mask)
+        for index, decision in enumerate(selected):
+            expected_mask[index, 0, list(decision.legal_actions[0])] = True
+            first = int(acted.actions[index, 0])
+            allowed_second = {
+                right for left, right in decision.legal_joint_actions if left == first
+            }
+            expected_mask[index, 1, list(allowed_second)] = True
+        assert torch.equal(torch.isfinite(evaluated.logits), expected_mask)
+        assert torch.isneginf(evaluated.logits[~expected_mask]).all()
 
     @pytest.mark.integration
     @pytest.mark.asyncio

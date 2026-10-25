@@ -5,7 +5,14 @@ import torch
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from p0.battle.actions import FORCED_ACTION, MOVE_START
+from p0.battle.actions import (
+    FORCED_ACTION,
+    MEGA_FORCED_ACTION,
+    MEGA_MOVE_START,
+    MOVE_START,
+    PASS_ACTION,
+    SWITCH_START,
+)
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import (
     HISTORY_WINDOW,
@@ -27,6 +34,14 @@ from tests.stress._helpers import (
 )
 
 ACT_SIZE = FORMAT.action_size
+ACTION_CHOICES = (
+    PASS_ACTION,
+    SWITCH_START,
+    MOVE_START,
+    MEGA_MOVE_START,
+    MEGA_FORCED_ACTION,
+    FORCED_ACTION,
+)
 
 
 def _empty_memory(policy, batch_size: int) -> MemoryInputs:
@@ -36,14 +51,6 @@ def _empty_memory(policy, batch_size: int) -> MemoryInputs:
         policy.device,
         next(policy.parameters()).dtype,
     )
-
-
-def _minimal_model_action_mask(batch_size: int, device: torch.device) -> torch.Tensor:
-    mask = torch.zeros((batch_size, 2, ACT_SIZE), dtype=torch.bool, device=device)
-    mask[:, :, 0] = True
-    mask[:, :, MOVE_START] = True
-    mask[:, :, FORCED_ACTION] = True
-    return mask
 
 
 def _random_ids(
@@ -73,24 +80,35 @@ class TestModel:
         deadline=None,
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
-    @given(seed=st.integers(min_value=0, max_value=2**31 - 1))
+    @given(
+        seed=st.integers(min_value=0, max_value=2**31 - 1),
+        first_action=st.sampled_from(ACTION_CHOICES),
+    )
     def test_policy_handles_empty_and_maximum_memory_inputs(
         self,
         stress_policy,
         stress_device: torch.device,
         batch_size: int,
         seed: int,
+        first_action: int,
     ) -> None:
         """
-        Stress test policy forward pass across empty memory and maximum Best-of-3 / turn history contexts.
+        Check joint action selection with empty and maximum history inputs.
 
-        Verifies that:
-        1. Categorical features across all embedding tables (species, moves, items, status, etc.) are handled without index errors.
-        2. Zero-memory baseline inference produces valid, masked, finite action decisions.
-        3. Full recurrent memory (prior Bo3 games + intra-game history window) produces valid decisions.
-        4. Action mask constraints are strictly respected under both zero-memory and full-memory conditions.
+        Arguments:
+            stress_policy: Policy shared by generated inputs.
+            stress_device: Device receiving observations and masks.
+            batch_size: Number of simultaneous decisions.
+            seed: Seed for observation, history, and sampling inputs.
+            first_action: Only action allowed in the first slot.
+
+        Returns:
+            None.
         """
-        action_mask = _minimal_model_action_mask(batch_size, stress_device)
+        torch.manual_seed(seed)
+        action_mask = torch.zeros((batch_size, 2, ACT_SIZE), dtype=torch.bool, device=stress_device)
+        action_mask[:, 0, first_action] = True
+        action_mask[:, 1, list(ACTION_CHOICES)] = True
 
         generator = torch.Generator().manual_seed(seed)
         observation = StructuredObservation.empty_batch(batch_size).to(stress_device)
@@ -168,13 +186,11 @@ class TestModel:
         empty_memory = _empty_memory(stress_policy, batch_size)
         with torch.inference_mode():
             encoded = stress_policy.encode(observation, action_mask)
-            empty_acted = stress_policy.act(
-                stress_policy.prepare(encoded, empty_memory), action_mask
+            empty_prepared = stress_policy.prepare(encoded, empty_memory)
+            empty_acted = stress_policy.act(empty_prepared, action_mask)
+            empty_evaluated = stress_policy.evaluate(
+                empty_prepared, action_mask, empty_acted.actions
             )
-        assert torch.isfinite(empty_acted.log_probs).all()
-        assert torch.isfinite(empty_acted.value).all()
-        # Verify gathered boolean mask is True at all chosen action positions
-        assert torch.all(action_mask.gather(2, empty_acted.actions.unsqueeze(-1)).squeeze(-1))
 
         # Construct maximum capacity recurrent memory: intra-game turn history + inter-game Bo3 tokens
         history = torch.randn(
@@ -201,12 +217,24 @@ class TestModel:
                 history,
                 history_mask,
             )
-            acted = stress_policy.act(stress_policy.prepare(encoded, memory), action_mask)
+            prepared = stress_policy.prepare(encoded, memory)
+            acted = stress_policy.act(prepared, action_mask)
+            evaluated = stress_policy.evaluate(prepared, action_mask, acted.actions)
 
-        assert acted.actions.shape == (batch_size, 2)
-        assert torch.isfinite(acted.log_probs).all()
-        assert torch.isfinite(acted.value).all()
-        assert torch.all(action_mask.gather(2, acted.actions.unsqueeze(-1)).squeeze(-1))
+        for sampled, scored in ((empty_acted, empty_evaluated), (acted, evaluated)):
+            assert sampled.actions.shape == (batch_size, 2)
+            assert torch.isfinite(sampled.log_probs).all()
+            assert torch.isfinite(sampled.value).all()
+            assert action_mask.gather(2, sampled.actions.unsqueeze(-1)).all()
+            torch.testing.assert_close(sampled.log_probs, scored.log_probs)
+            torch.testing.assert_close(sampled.value, scored.value)
+            second = sampled.actions[:, 1]
+            if first_action == SWITCH_START:
+                assert (second != SWITCH_START).all()
+            elif first_action in {MEGA_MOVE_START, MEGA_FORCED_ACTION}:
+                assert ((second != MEGA_MOVE_START) & (second != MEGA_FORCED_ACTION)).all()
+            elif first_action == PASS_ACTION:
+                assert (second != PASS_ACTION).all()
 
     @pytest.mark.stress
     @settings(

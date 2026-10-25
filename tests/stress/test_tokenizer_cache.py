@@ -27,10 +27,13 @@ class TestSeriesTokenStore:
         """Distinct per-key values survive reordered retrieval and deletion of another key."""
         store = SeriesTokenStore(d_model=1, max_games=2)
         keys = tuple(
-            SeriesPerspectiveKey(f"series-{index}", index % 2) for index in range(key_count)
+            SeriesPerspectiveKey(f"series-{index // 2}", index % 2) for index in range(key_count)
         )
+        source = torch.empty((SERIES_TOKENS_PER_GAME, 1))
         for index, key in enumerate(keys):
-            store.append(key, torch.full((SERIES_TOKENS_PER_GAME, 1), float(index + 1)))
+            source.fill_(float(index + 1))
+            store.append(key, source)
+        source.zero_()
         selected = tuple(reversed(keys)) if reverse else keys
         expected_values = torch.arange(1, key_count + 1, dtype=torch.float32)
         if reverse:

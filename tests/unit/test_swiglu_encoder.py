@@ -20,8 +20,10 @@ class TestAttentionPool:
         pooled.square().mean().backward()
         assert source.grad is not None
         assert torch.isfinite(source.grad).all()
+        assert torch.count_nonzero(source.grad) > 0
         assert pool.query.grad is not None
         assert torch.isfinite(pool.query.grad).all()
+        assert torch.count_nonzero(pool.query.grad) > 0
 
     @pytest.mark.parametrize(
         "source",

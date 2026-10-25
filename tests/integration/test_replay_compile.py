@@ -8,8 +8,13 @@ import pytest
 import torch
 
 from p0.model.resources import default_runtime_resources
-from p0.model.structured_observation import CAT_IDX_STAT_PROVENANCE, StatProvenance
+from p0.model.structured_observation import (
+    CAT_IDX_STAT_PROVENANCE,
+    NUM_IDX_LEVEL_STATS,
+    StatProvenance,
+)
 from p0.replays.compile import compile_payloads, write_tensor_shards
+from p0.replays.dataset import LazyReplayDataset
 from tests.stress._helpers import (
     stress_count,
     stress_random_bo3_payloads,
@@ -17,7 +22,7 @@ from tests.stress._helpers import (
     stress_rng,
     stress_series_id,
 )
-from tests.unit.replay_fixtures import decision_payload
+from tests.unit.replay_fixtures import decision_payload, payload_with_ots_natures
 
 _GOLDEN_REPLAY_DIRECTORY = (
     Path(__file__).parents[2] / "src/p0/replays/reconstruction/golden_replays"
@@ -125,8 +130,12 @@ class TestReplayCompile:
 @pytest.mark.heavy
 @pytest.mark.integration
 class TestReplayProjectionArtifacts:
-    def test_shards_preserve_explicit_unknown_stat_provenance(self, tmp_path: Path) -> None:
-        result = compile_payloads((decision_payload(),))
+    @pytest.mark.parametrize("with_natures", (False, True), ids=("unknown", "imputed"))
+    def test_shards_preserve_stat_estimates_for_both_perspectives_and_final_boards(
+        self, tmp_path: Path, with_natures: bool
+    ) -> None:
+        payload = payload_with_ots_natures("imputed") if with_natures else decision_payload()
+        result = compile_payloads((payload,))
         built = write_tensor_shards(
             result,
             tmp_path,
@@ -134,13 +143,32 @@ class TestReplayProjectionArtifacts:
             created_at="2026-01-01T00:00:00Z",
         )
 
-        artifact = torch.load(
-            built.manifest_path.parent / built.manifest.shards[0].filename,
-            map_location="cpu",
-            weights_only=True,
+        chunks = tuple(LazyReplayDataset(built.manifest_path))
+        assert {chunk.player for chunk in chunks} == {0, 1}
+        expected_stats = (
+            [111 / 300, 107 / 300, 61 / 300, 63 / 300, 71 / 300, 155 / 300]
+            if with_natures
+            else [0.0] * 6
         )
-        provenance = artifact["tensors"]["categorical"][:, :12, CAT_IDX_STAT_PROVENANCE]
-        assert torch.all(provenance == int(StatProvenance.UNKNOWN))
+        expected_kind = StatProvenance.IMPUTED if with_natures else StatProvenance.UNKNOWN
+        if with_natures:
+            assert result.metrics.counters["imputations"] > 0
+            assert result.metrics.counters["imputation_confidence_sum"] > 0.0
+        for chunk in chunks:
+            row = 0 if chunk.player == 0 else 6
+            for observation in (chunk.observations, chunk.final_observation):
+                assert (
+                    observation.categorical[:, row, CAT_IDX_STAT_PROVENANCE] == expected_kind
+                ).all()
+                stats = observation.numerical[:, row, NUM_IDX_LEVEL_STATS : NUM_IDX_LEVEL_STATS + 6]
+                torch.testing.assert_close(
+                    stats, stats.new_tensor(expected_stats).expand_as(stats), rtol=1e-5, atol=1e-6
+                )
+                if not with_natures:
+                    assert (
+                        observation.categorical[:, :12, CAT_IDX_STAT_PROVENANCE]
+                        == StatProvenance.UNKNOWN
+                    ).all()
 
     @pytest.mark.skipif(
         not tuple(_GOLDEN_REPLAY_DIRECTORY.glob("*.json")),

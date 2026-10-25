@@ -175,7 +175,7 @@ class TestCheckpoints:
     @pytest.mark.heavy
     @pytest.mark.parametrize(
         ("saved_scaler_enabled", "restored_scaler_enabled", "expected_scale"),
-        ((False, False, 1.0), (False, True, 16.0), (True, True, 32.0)),
+        ((False, False, 1.0), (False, True, 16.0), (True, False, 1.0), (True, True, 32.0)),
     )
     def test_training_checkpoint_round_trip_restores_optimizer_magnet_and_provenance(
         self,
@@ -190,16 +190,20 @@ class TestCheckpoints:
         policy = build_policy(ModelConfig(16, 2, 1, 64), default_runtime_resources())
         optimizer = torch.optim.Adam(policy.parameters(), lr=0.001)
         magnet = Magnet(policy)
-        saved_scaler = torch.amp.GradScaler("cpu", enabled=saved_scaler_enabled, init_scale=32.0)
+        saved_scaler = torch.amp.GradScaler(
+            "cpu", enabled=saved_scaler_enabled, init_scale=32.0, growth_interval=2
+        )
         restored_scaler = torch.amp.GradScaler(
             "cpu", enabled=restored_scaler_enabled, init_scale=16.0
         )
-        # Perform a dummy training step to populate Adam momentum and variance state buffers
+        initial_scaler_state = restored_scaler.state_dict()
+        # Populate optimizer moments and advance the scaler's growth tracker.
         loss = torch.stack(
             tuple(parameter.square().mean() for parameter in policy.parameters())
         ).sum()
-        loss.backward()
-        optimizer.step()
+        saved_scaler.scale(loss).backward()
+        saved_scaler.step(optimizer)
+        saved_scaler.update()
         optimizer.zero_grad(set_to_none=True)
         saved_optimizer_state = optimizer.state_dict()
         with torch.no_grad():
@@ -229,6 +233,11 @@ class TestCheckpoints:
         )
         assert episode == 17
         assert restored_scaler.get_scale() == expected_scale
+        assert restored_scaler.state_dict() == (
+            saved_scaler.state_dict()
+            if saved_scaler_enabled and restored_scaler_enabled
+            else initial_scaler_state
+        )
         # Confirm learning rate and Adam moment tensors were restored from checkpoint
         torch.testing.assert_close(restored_optimizer.state_dict(), saved_optimizer_state)
         assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(0.001)

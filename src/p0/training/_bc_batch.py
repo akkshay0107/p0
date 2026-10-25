@@ -28,7 +28,7 @@ class BCGameWindow(NamedTuple):
     batch_stop: int
     is_game_end: bool
     is_series_end: bool
-    # Context row of the game's final observation; read only when is_game_end.
+    # Context row of the final observation; read only when the game ends before the series.
     final_index: int
 
 
@@ -158,7 +158,7 @@ def _collate_bc_window(
         history_indices.append(torch.where(local_mask, context_base + local_history, 0))
         history_masks.append(local_mask)
 
-        if is_game_end:
+        if is_game_end and not game.is_series_end:
             # The final board follows every target, so no target row reads it as history.
             observations.append(game.final_observation)
             context_action_masks.append(_GAME_END_MASK)

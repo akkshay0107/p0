@@ -1,11 +1,10 @@
 """
 Compare live observations with replay reconstruction and disk shards.
 
-The important assertion in this test is deliberately made before tensor fusion:
-the observation captured at a live request must be the same observation that the
-replay reconstructs.  The test also keeps the action selected by the live bot so
-that PARTIAL and UNKNOWN labels are checked against the thing that actually
-happened in the battle, rather than only against their tensor schema.
+Capture live requests, chosen orders, and observations before tensor fusion.
+Match reconstructed decisions to those requests, check full joint-action labels
+and request flags, and compare public observation fields at shared boundaries.
+Event values are compared when both ends of the captured intervals match.
 
 For the pinned champions Showdown mod, a missing action can be represented by
 cant.  The current engine emits that outcome for paralysis, sleep, freeze,
@@ -22,6 +21,7 @@ import logging
 import os
 import random
 import sys
+from bisect import bisect_left
 from collections import Counter
 from concurrent.futures import Future
 from functools import partial
@@ -63,7 +63,7 @@ from p0.replays.compile import compile_documents, write_tensor_shards
 from p0.replays.identity import normalize_showdown_id
 from p0.replays.protocol import ReplayDocument, parse_replay_payload
 from p0.replays.reconstruction.projection import ProjectedPerspective, ProjectedSnapshot
-from p0.replays.schema import LabelKind
+from p0.replays.schema import DecisionType, LabelKind
 from p0.replays.shards import validate_shard_tensors
 from p0.rl_player import TeamPlayerMixin
 from p0.runtime import poke_env_patches
@@ -122,7 +122,6 @@ _REPLAY_AMBIGUITY_TAGS = frozenset(
     }
 )
 
-_OBSERVATION_EVENT_FIELDS = ("spatial_cat",)
 _PUBLIC_CATEGORICAL_INDICES = (0, 3, 4)
 # Public HP is rounded to percent; the owner's live request has exact HP totals.
 _PUBLIC_HP_TOLERANCE = 0.011
@@ -157,8 +156,13 @@ def _install_patches_and_record_lines() -> None:
     parse_message = DoubleBattle.parse_message
 
     def record_and_parse(battle: DoubleBattle, split_message: list[str]):
-        if len(split_message) < 2 or split_message[1] not in _ROOM_NOTICES:
-            _PROTOCOL_LINES.setdefault(battle, []).append("|".join(split_message))
+        tag = split_message[1] if len(split_message) > 1 else ""
+        if tag not in _ROOM_NOTICES and tag != "showteam":
+            lines = _PROTOCOL_LINES.get(battle)
+            if lines is not None:
+                lines.append("|".join(split_message))
+            elif tag in {"start", "teampreview"}:
+                _PROTOCOL_LINES[battle] = ["|".join(split_message)]
         return parse_message(battle, split_message)
 
     setattr(DoubleBattle, "parse_message", record_and_parse)
@@ -166,16 +170,15 @@ def _install_patches_and_record_lines() -> None:
 
 def _battle_log_lines(lines: tuple[str, ...]) -> tuple[str, ...]:
     """Keep the battle event stream and its optional team-preview boundary."""
-    event_starts = [
-        index for index, line in enumerate(lines) if _message_tag(line) in {"start", "teampreview"}
-    ]
-    start = min(event_starts, default=0)
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if _message_tag(line) in {"start", "teampreview"}
+        ),
+        0,
+    )
     return lines[start:]
-
-
-def _endpoint_role(endpoint: str) -> str:
-    """Extract player role prefix from an entity string (e.g. 'p1a: Pikachu' -> 'p1')."""
-    return endpoint.split("a", 1)[0].strip()
 
 
 def _cant_reasons(snapshot: ProjectedSnapshot, role: int) -> tuple[str, ...]:
@@ -185,7 +188,7 @@ def _cant_reasons(snapshot: ProjectedSnapshot, role: int) -> tuple[str, ...]:
         parts = raw_line.split("|")
         if len(parts) < 4 or parts[1] != "cant":
             continue
-        if _endpoint_role(parts[2]) != f"p{role + 1}":
+        if parts[2][:2] != f"p{role + 1}":
             continue
         reasons.append(parts[3].casefold().strip())
     return tuple(dict.fromkeys(reasons))
@@ -233,8 +236,6 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
     ) -> None:
         self.observation_builder = observation_builder
         self.observation_dir = observation_dir
-        self.observation_paths: list[Path] = []
-        self.teams_seen: list[str] = []
         self.showteam_lines: dict[str, list[str]] = {}
         # The team mixin forgets a battle when it ends; the public replay needs both captures.
         self.finished_battles: dict[str, DoubleBattle] = {}
@@ -286,36 +287,15 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
         forced_switch_slots = tuple(
             index for index, forced in enumerate(battle.force_switch) if forced
         )
-        if battle.teampreview:
-            request_type = "teampreview"
-        elif forced_switch_slots:
-            request_type = "forced_switch"
-        elif view.wait:
-            request_type = "wait"
-        else:
-            request_type = "turn"
-        active_members = tuple(
-            None if pokemon is None else str(pokemon.species) for pokemon in battle.active_pokemon
-        )
         records = self._live_records.setdefault(battle.battle_tag, [])
-        replay_cursor = len(
-            tuple(
-                line
-                for line in _battle_log_lines(tuple(_PROTOCOL_LINES.get(battle, ())))
-                if _message_tag(line) != "showteam"
-            )
-        )
+        replay_cursor = len(_PROTOCOL_LINES.get(battle, ()))
         # Like RLPlayer, submitting this order closes the event interval it observed.
         consume_events(battle)
         records.append(
             {
-                "turn": int(battle.turn),
                 "teampreview": bool(battle.teampreview),
-                "player_role": str(battle.player_role),
-                "request_type": request_type,
                 "wait": bool(view.wait),
                 "forced_switch_slots": list(forced_switch_slots),
-                "active_members": list(active_members),
                 "action": list(action),
                 # The count of replay-visible lines consumed before this request is the
                 # shared boundary: reconstruction reaches the same line index when it
@@ -332,8 +312,6 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
     def _battle_finished_callback(self, battle: AbstractBattle) -> None:
         self._write_observation_tensors(battle)
         self.finished_battles[battle.battle_tag] = cast(DoubleBattle, battle)
-        if self.current_team_packed is not None:
-            self.teams_seen.append(self.current_team_packed)
         super()._battle_finished_callback(battle)
 
     def _write_observation_tensors(self, battle: AbstractBattle) -> None:
@@ -344,16 +322,11 @@ class JsonCapturingRandomPlayer(TeamPlayerMixin, RandomPlayer):
             "records": self._live_records.pop(battle.battle_tag, []),
             # This side's own copy of the protocol stream, which the line-stream check
             # compares with the public replay.
-            "lines": [
-                line
-                for line in _battle_log_lines(tuple(_PROTOCOL_LINES.get(double_battle, ())))
-                if _message_tag(line) != "showteam"
-            ],
+            "lines": _PROTOCOL_LINES.get(double_battle, []),
         }
         self.observation_dir.mkdir(parents=True, exist_ok=True)
         path = self.observation_dir / f"{replay_id}-{role}.pt"
         torch.save(payload, path)
-        self.observation_paths.append(path)
 
 
 def _stress_game_count() -> int:
@@ -425,26 +398,11 @@ def _load_live_artifact(path: Path) -> dict[str, Any]:
 
 
 def _live_tensors(record: dict[str, Any]) -> StructuredObservation:
-    tensors = record.get("tensors")
-    empty_observation = StructuredObservation.empty_batch(1)[0]
-    if not isinstance(tensors, list) or len(tensors) != len(empty_observation.tensors()):
-        raise AssertionError("Live record does not contain all pre-fusion observation fields")
-    observation = StructuredObservation.empty_batch(1)[0]
-    for destination, source in zip(
-        observation.tensors(),
-        (cast(torch.Tensor, tensor) for tensor in tensors),
-        strict=True,
-    ):
-        destination.copy_(source)
-    return observation
+    return StructuredObservation(*record["tensors"])
 
 
-def _live_action(record: dict[str, Any]) -> tuple[int, int] | None:
-    value = record.get("action")
-    if value is None:
-        return None
-    if not isinstance(value, list) or len(value) != 2:
-        raise AssertionError(f"Malformed live action: {value!r}")
+def _live_action(record: dict[str, Any]) -> tuple[int, int]:
+    value = record["action"]
     return int(value[0]), int(value[1])
 
 
@@ -452,9 +410,7 @@ def _assert_expected_observation_fields(
     live: StructuredObservation,
     reconstructed: StructuredObservation,
     *,
-    compare_event_fields: bool = True,
     compare_event_values: bool = False,
-    compare_dynamic_fields: bool = True,
 ) -> None:
     """Compare every field a public replay can reproduce at a shared boundary."""
     fields = (
@@ -464,28 +420,16 @@ def _assert_expected_observation_fields(
     )
     for name in fields:
         torch.testing.assert_close(getattr(live, name), getattr(reconstructed, name))
-    if compare_dynamic_fields:
-        # Species and types can change between a live callback and the next
-        # replay decision boundary, especially after multiple faint events.
-        for index in _PUBLIC_CATEGORICAL_INDICES:
-            torch.testing.assert_close(
-                live.categorical[..., index], reconstructed.categorical[..., index]
-            )
-    if compare_event_fields:
-        for name in _OBSERVATION_EVENT_FIELDS:
-            # Event tensors are populated from parser callbacks. Their shape is
-            # part of the observation ABI, but their exact values can differ
-            # when a callback lands inside a websocket message batch.
-            assert getattr(live, name).shape == getattr(reconstructed, name).shape
+    for index in _PUBLIC_CATEGORICAL_INDICES:
+        torch.testing.assert_close(
+            live.categorical[..., index], reconstructed.categorical[..., index]
+        )
     if compare_event_values:
         # Both sides read the same protocol lines between the same two decisions, so the
         # categorical record columns (kind, source, target, move, detail) must agree.
         # Amounts are excluded: live pre-event HP comes from poke-env, replay HP from
         # public damage text.
         torch.testing.assert_close(live.spatial_cat, reconstructed.spatial_cat)
-
-    if not compare_dynamic_fields:
-        return
 
     # Replays store HP from public damage messages, while the live callback can
     # run before the same message batch has fully settled. Spatial and HP values
@@ -563,72 +507,6 @@ def _assert_legality_provenance(
     )
 
 
-def _assert_reconstruction_labels(
-    document: ReplayDocument, *, max_candidates: int
-) -> tuple[ProjectedPerspective, ...]:
-    compilation = compile_documents(
-        (document,),
-        max_candidates=max_candidates,
-    )
-    if not compilation.accepted_series:
-        rejected = {
-            name
-            for name, count in compilation.metrics.counters.items()
-            if name.startswith("rejected_reconstruction_") and count == 1
-        }
-        assert compilation.metrics.counters["rejected_games"] == 1
-        assert len(rejected) == 1
-        assert rejected <= {
-            "rejected_reconstruction_AMBIGUOUS_IDENTITY",
-            "rejected_reconstruction_INCONSISTENT_IDENTITY",
-            "rejected_reconstruction_TIME_LIMIT_EXCEEDED",
-            "rejected_reconstruction_INVALID_INPUT_CONTRACT",
-            "rejected_reconstruction_UNSUPPORTED_EVENT",
-        }
-        return ()
-    assert len(compilation.accepted_series) == 1
-    perspectives = compilation.accepted_series[0].games[0].perspectives
-    for perspective in perspectives:
-        assert perspective.decisions
-        assert len(perspective.snapshots) == len(perspective.decisions)
-        for decision in perspective.decisions:
-            evidence = decision.evidence
-            if evidence.label_kind is LabelKind.EXACT:
-                assert len(evidence.candidates) == 1
-            elif evidence.label_kind is LabelKind.PARTIAL:
-                assert len(evidence.candidates) >= 2
-            elif evidence.label_kind is LabelKind.UNKNOWN:
-                assert not evidence.candidates
-            else:
-                pytest.fail(f"Unsupported reconstructed label kind: {evidence.label_kind!r}")
-    return perspectives
-
-
-def _assert_live_action_is_observable(
-    live_action: tuple[int, int],
-    evidence: Any,
-) -> None:
-    """
-    Check only the live action components that a public replay can expose.
-
-    Showdown does not emit a protocol line for a slot that submitted pass.
-    A replacement request can therefore produce a live pair such as
-    (switch, pass) while the replay only provides candidates for the switch
-    slot. Treating that invisible component as a required joint-action match
-    manufactures a reconstruction failure at an otherwise shared boundary.
-    """
-    assert evidence.candidates
-    assert any(
-        all(
-            action == PASS_ACTION or candidate[slot] == action
-            for slot, action in enumerate(live_action)
-        )
-        for candidate in evidence.candidates
-    ), (
-        f"Observable components of live action {live_action} are absent from joint candidates {evidence.candidates}"
-    )
-
-
 def _match_live_records(
     perspective: ProjectedPerspective,
     live_records: tuple[dict[str, Any], ...],
@@ -637,54 +515,34 @@ def _match_live_records(
     """
     Pair requests with decisions at the boundary both sides can name.
 
-    Reconstruction is not required to reproduce the live request schedule, so waits and
-    requests answered with no order, and orders that never produce a replay-visible event
-    before the battle ends, are dropped. Ordered requests use exact boundaries when available;
-    a later boundary is retained only for state and tensor checks when a callback landed inside
-    a websocket message batch.
+    Orders that never produce a replay-visible event before the battle ends are dropped.
+    Retries retain only the final submitted order.
+    Ordered requests use exact boundaries when available; a later boundary handles callbacks
+    before trailing animation lines have been parsed.
     """
     splice_index, splice_count = _showteam_offset(document)
-    boundaries = {snapshot.pre_line_index: snapshot for snapshot in perspective.snapshots}
-    live_boundaries = tuple(
-        _live_boundary(record, splice_index, splice_count)
-        for record in live_records
-        if _live_action(record) is not None
-    )
-    boundary_counts = Counter(live_boundaries)
+    boundaries = tuple(snapshot.pre_line_index for snapshot in perspective.snapshots)
+    final_records = {
+        _live_boundary(record, splice_index, splice_count): record for record in live_records
+    }
 
     matched: list[tuple[ProjectedSnapshot, dict[str, Any], bool]] = []
-    previous_boundary = -1
-    for record in live_records:
-        if _live_action(record) is None:
+    previous_index = -1
+    for boundary, record in final_records.items():
+        index = bisect_left(boundaries, boundary)
+        if index < len(boundaries) and boundaries[index] != boundary:
+            index = max(index, previous_index + 1)
+        if index == len(boundaries):
             continue
-        boundary = _live_boundary(record, splice_index, splice_count)
-        snapshot = boundaries.get(boundary)
-        if snapshot is None:
-            # poke-env may invoke the order callback in the middle of one websocket
-            # message batch, before trailing animation lines from the prior request
-            # have been parsed. The replay boundary is therefore the first later
-            # decision boundary, provided records remain ordered.
-            snapshot = next(
-                (
-                    candidate
-                    for candidate in perspective.snapshots
-                    if previous_boundary < candidate.pre_line_index >= boundary
-                ),
-                None,
-            )
-            if snapshot is None:
-                # A live request can arrive just before the opposing side's already
-                # submitted move ends the battle. With no protocol event for the
-                # request, reconstruction has no decision boundary to compare.
-                continue
+        snapshot = perspective.snapshots[index]
         matched.append(
             (
                 snapshot,
                 record,
-                snapshot.pre_line_index == boundary and boundary_counts[boundary] == 1,
+                snapshot.pre_line_index == boundary,
             )
         )
-        previous_boundary = snapshot.pre_line_index
+        previous_index = index
     return tuple(matched)
 
 
@@ -693,20 +551,32 @@ def _assert_live_truth(
     live_records: tuple[dict[str, Any], ...],
     document: ReplayDocument,
     builder: ObservationBuilder,
-) -> tuple[int, int]:
-    """Return the counts of matching event intervals and observable action comparisons."""
+) -> tuple[int, Counter[DecisionType]]:
+    """
+    Check reconstructed requests and count full action comparisons by decision type.
+
+    Arguments:
+        perspective: Reconstructed decisions and observations for one player.
+        live_records: Orders and observations captured from that player's callbacks.
+        document: Public replay corresponding to the live captures.
+        builder: Observation builder shared by live and reconstructed views.
+
+    Returns:
+        Matching event interval count and full action comparison counts by decision type.
+    """
     # A rejected order is retried before any new battle line arrives, so every
     # retry of one request observes the events its first attempt observed.
     first_events: dict[int, torch.Tensor] = {}
     for record in live_records:
         events = _live_tensors(record).spatial_cat
-        torch.testing.assert_close(
-            events, first_events.setdefault(int(record["replay_cursor"]), events)
-        )
+        cursor = int(record["replay_cursor"])
+        if cursor in first_events:
+            torch.testing.assert_close(events, first_events[cursor])
+        else:
+            first_events[cursor] = events
 
     compared_intervals = 0
-    compared_actions = 0
-    seen_replay_cursors: set[int] = set()
+    compared_actions: Counter[DecisionType] = Counter()
     splice_index, splice_count = _showteam_offset(document)
     starts = tuple(snapshot.pre_line_index for snapshot in perspective.snapshots)
     replay_interval_starts = dict(zip(starts, (0, *starts[:-1]), strict=True))
@@ -714,35 +584,46 @@ def _assert_live_truth(
         normalize_showdown_id(member.ability) == "illusion"
         for member in document.ots[1 - perspective.player].members
     )
-    for snapshot, record, exact_boundary in _match_live_records(
-        perspective, live_records, document
-    ):
+    matched = _match_live_records(perspective, live_records, document)
+    assert matched, "No live requests matched this accepted perspective"
+    matched_indices = {snapshot.decision_index for snapshot, _, _ in matched}
+    assert len(matched_indices) == len(matched), "Different live requests matched the same decision"
+    assert matched_indices == set(range(len(perspective.decisions))), (
+        f"Reconstructed decisions without a live request: "
+        f"{set(range(len(perspective.decisions))) - matched_indices}"
+    )
+    for snapshot, record, exact_boundary in matched:
         decision = perspective.decisions[snapshot.decision_index]
         evidence = decision.evidence
         live_action = _live_action(record)
-        assert live_action is not None
+        request = snapshot.view.decision
+        assert request.team_preview == record["teampreview"]
+        assert request.wait == record["wait"]
+        assert [i for i, slot in enumerate(request.slots) if slot.force_switch] == record[
+            "forced_switch_slots"
+        ]
 
-        # The line cursor can coincide with the separator immediately after a
-        # callback that arrived while the websocket batch was still settling.
-        # A submission-state transition explicitly marks that action as
-        # non-attributable to this replay decision, even when the numeric cursors
-        # happen to agree.
-        action_boundary_exact = exact_boundary and "submission_state_changed" not in evidence.tags
-        if action_boundary_exact:
-            if evidence.label_kind in (LabelKind.EXACT, LabelKind.PARTIAL):
-                _assert_live_action_is_observable(live_action, evidence)
-                compared_actions += int(any(action != PASS_ACTION for action in live_action))
+        if evidence.label_kind in (LabelKind.EXACT, LabelKind.PARTIAL):
+            assert live_action in evidence.candidates, (
+                f"Live action {live_action} is absent from joint candidates {evidence.candidates}"
+            )
+            compared_actions[decision.decision_type] += int(
+                any(action != PASS_ACTION for action in live_action)
+            )
+        else:
+            reasons = _cant_reasons(snapshot, perspective.player)
+            if reasons:
+                assert set(reasons) <= _CANT_REASONS, (
+                    f"Unknown cant reason was not in the researched taxonomy: {reasons}"
+                )
             else:
-                reasons = _cant_reasons(snapshot, perspective.player)
-                if reasons:
-                    assert set(reasons) <= _CANT_REASONS, (
-                        f"Unknown cant reason was not in the researched taxonomy: {reasons}"
-                    )
-                else:
-                    assert set(evidence.tags) & _REPLAY_AMBIGUITY_TAGS, (
-                        f"Selected live action {live_action} became UNKNOWN without a known "
-                        f"reconstruction reason: tags={evidence.tags!r}"
-                    )
+                assert set(evidence.tags) & _REPLAY_AMBIGUITY_TAGS, (
+                    f"Selected live action {live_action} became UNKNOWN without a known "
+                    f"reconstruction reason: tags={evidence.tags!r}"
+                )
+
+        if not exact_boundary:
+            continue
 
         reconstructed = builder.build(snapshot.view, {}).cpu()
         replay_cursor = int(record["replay_cursor"])
@@ -751,21 +632,15 @@ def _assert_live_truth(
         live_interval_start = _live_boundary(
             {"replay_cursor": record["interval_start_cursor"]}, splice_index, splice_count
         )
-        same_interval = (
-            exact_boundary
-            and replay_cursor not in seen_replay_cursors
-            and live_interval_start == replay_interval_starts[snapshot.pre_line_index]
-        )
+        same_interval = live_interval_start == replay_interval_starts[snapshot.pre_line_index]
         try:
             live = _live_tensors(record)
             _assert_expected_observation_fields(
                 live,
                 reconstructed,
-                compare_event_fields=exact_boundary and replay_cursor not in seen_replay_cursors,
                 compare_event_values=same_interval,
-                compare_dynamic_fields=exact_boundary,
             )
-            if exact_boundary and opponent_has_illusion:
+            if opponent_has_illusion:
                 # These are public opponent fields, compared with the actual live
                 # capture at the same cursor. Private stat estimates differ by source.
                 torch.testing.assert_close(
@@ -790,9 +665,7 @@ def _assert_live_truth(
                 f"decision {snapshot.decision_index}, line {snapshot.pre_line_index}, "
                 f"live cursor {replay_cursor}: {exc}"
             ) from exc
-        seen_replay_cursors.add(replay_cursor)
         compared_intervals += same_interval
-    assert seen_replay_cursors, "No live requests matched this accepted perspective"
     return compared_intervals, compared_actions
 
 
@@ -1094,18 +967,15 @@ class TestRandomReplayReconstruction:
         self, showdown_server, tmp_path: Path, request: pytest.FixtureRequest
     ) -> None:
         """
-        Compare live Showdown battles with replay JSON, reconstructed observations and disk shards.
+        Compare real battles with reconstructed decisions, observations, and disk shards.
 
-        Verifies that:
-        1. A seeded workload of real live battles completes against local Showdown.
-        2. Public replay documents, merged from both players' captures, cover all turns
-           with valid terminal line indices.
-        3. Reconstructed observations match ground truth live captured tensors at exact line boundaries.
-        4. Offline reconstructed state machines perfectly agree with poke-env active pokemon/field state.
-        5. Reconstructed action candidates encapsulate the actual live chosen actions.
-        6. Shard compilation produces valid training tensors with correct loss mask semantics:
-           - UNKNOWN label kinds have loss_mask == 0 (excluded from policy gradient / imitation loss)
-           - EXACT and PARTIAL label kinds have loss_mask > 0 (included in loss calculation).
+        Arguments:
+            showdown_server: Local Showdown server configuration.
+            tmp_path: Directory for teams, live captures, replay JSON, and shards.
+            request: Pytest request used to restore the random state after the workload.
+
+        Returns:
+            None.
         """
         seed = int(os.getenv("P0_STRESS_SEED", "20260802"))
         game_count = _stress_game_count()
@@ -1209,18 +1079,26 @@ class TestRandomReplayReconstruction:
             _shows_exact_hp(line.raw) for document in documents for line in document.protocol_lines
         )
 
-        # Verify accepted games against live observations. Unsupported or
-        # ambiguous traces must be rejected as whole games.
-        rejected_ids: set[str] = set()
+        compilation = compile_documents(
+            documents,
+            format_id=FORMAT.battle_format,
+            max_candidates=max_candidates,
+        )
+        accepted_games = {
+            game.replay_id: game for series in compilation.accepted_series for game in series.games
+        }
+        rejected_ids = {
+            document.metadata.replay_id for document in documents
+        } - accepted_games.keys()
         compared_intervals = 0
-        compared_actions = 0
+        compared_actions: Counter[DecisionType] = Counter()
         compared_perspectives = 0
         for document in documents:
             replay_id = document.metadata.replay_id
-            perspectives = _assert_reconstruction_labels(document, max_candidates=max_candidates)
-            if not perspectives:
-                rejected_ids.add(replay_id)
-            for perspective in perspectives:
+            game = accepted_games.get(replay_id)
+            if game is None:
+                continue
+            for perspective in game.perspectives:
                 role = f"p{perspective.player + 1}"
                 path = observation_dir / f"{replay_id}-{role}.pt"
                 assert path.is_file(), f"Missing live observation capture: {path}"
@@ -1236,26 +1114,27 @@ class TestRandomReplayReconstruction:
                     perspective, artifact["records"], document, builder
                 )
                 compared_intervals += intervals
-                compared_actions += actions
+                compared_actions.update(actions)
                 compared_perspectives += 1
         assert compared_intervals > 0
-        assert compared_actions > 0
-
-        # Compile replay documents into training dataset representation
-        compilation = compile_documents(
-            documents,
-            format_id=FORMAT.battle_format,
-            max_candidates=max_candidates,
+        assert all(
+            compared_actions[decision_type] > 0
+            for decision_type in (
+                DecisionType.TEAM_PREVIEW,
+                DecisionType.TURN,
+                DecisionType.FORCED_SWITCH,
+                DecisionType.PIVOT_SWITCH,
+            )
+        ), (
+            f"Workload must compare every request type; increase P0_STRESS_GAME_COUNT: {compared_actions}"
         )
-        accepted_count = sum(len(series.games) for series in compilation.accepted_series)
+
+        accepted_count = len(accepted_games)
         assert accepted_count > 0
         assert compared_perspectives == 2 * accepted_count
         assert accepted_count + len(rejected_ids) == game_count
         assert compilation.metrics.counters["accepted_games"] == accepted_count
         assert compilation.metrics.counters["rejected_games"] == len(rejected_ids)
-        assert {
-            game.replay_id for series in compilation.accepted_series for game in series.games
-        }.isdisjoint(rejected_ids)
 
         # Write out serialized PyTorch tensor shards
         build = write_tensor_shards(

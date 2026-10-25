@@ -40,12 +40,20 @@ class TestDeepSetEncoder:
 
         encoded = encoder(members, mask)
         permuted = encoder(members[:, permutation], mask[:, permutation])
+        changed = members.detach().clone()
+        changed[mask] += 1.0
+        changed_padding = members.detach().clone()
+        changed_padding[~mask] = 1000.0
 
         assert encoded.shape == (3, 16)
         torch.testing.assert_close(encoded, permuted)
+        assert not torch.allclose(encoded, encoder(changed, mask))
+        torch.testing.assert_close(encoded, encoder(changed_padding, mask))
         encoded.square().mean().backward()
         assert members.grad is not None
         assert torch.isfinite(members.grad).all()
+        assert torch.count_nonzero(members.grad[mask]) > 0
+        assert torch.count_nonzero(members.grad[~mask]) == 0
 
     def test_encoding_preserves_cardinality_and_handles_empty_sets(self) -> None:
         torch.manual_seed(29)

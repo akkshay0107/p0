@@ -103,26 +103,6 @@ def _two_game_series(final_board: float) -> tuple[ReplayGameChunk, ReplayGameChu
     return first, second
 
 
-def _train_series_parameters(
-    games: tuple[ReplayGameChunk, ...], max_chunk_size: int
-) -> dict[str, torch.Tensor]:
-    """Helper training one epoch from a fixed seed and returning the series-memory weights."""
-    torch.manual_seed(0)
-    policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
-    BCTrainer(
-        policy,
-        games,
-        BCConfig(
-            batch_decisions=8,
-            max_chunk_size=max_chunk_size,
-            learning_rate=1e-3,
-            enable_optim=False,
-        ),
-        device="cpu",
-    ).train_epoch()
-    return {name: value.detach() for name, value in policy.series.named_parameters()}
-
-
 class TestBCTrainer:
     def test_complete_game_reaches_optimizer_before_next_game_is_requested(self) -> None:
         first = _chunk(
@@ -292,22 +272,44 @@ class TestBCTrainer:
             for name, parameter in policy.series.named_parameters()
         )
 
-    def test_split_game_trains_like_the_unsplit_game(self) -> None:
+    def test_prior_game_context_preserves_content_and_gradients_across_chunk_sizes(self) -> None:
         games = _two_game_series(final_board=5.0)
+        species_id = next(iter(default_runtime_resources().vocab["species"].values()))
+        games[0].final_observation.categorical[:, 0, 0] = species_id
+        summaries = []
+        species_weights = []
+        for chunks, max_chunk_size in (
+            (games, 64),
+            (games, 2),
+            (games, 3),
+            (_two_game_series(final_board=0.0), 64),
+        ):
+            torch.manual_seed(0)
+            policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
+            BCTrainer(
+                policy,
+                chunks,
+                BCConfig(
+                    batch_decisions=8,
+                    max_chunk_size=max_chunk_size,
+                    learning_rate=1e-3,
+                    enable_optim=False,
+                ),
+                device="cpu",
+            ).train_epoch()
+            summaries.append(
+                {name: value.detach() for name, value in policy.series.named_parameters()}
+            )
+            species_weights.append(policy.encoder.species_emb.weight[species_id].detach().clone())
 
-        unsplit = _train_series_parameters(games, max_chunk_size=64)
-        split = _train_series_parameters(games, max_chunk_size=2)
-
-        for name, value in unsplit.items():
-            torch.testing.assert_close(split[name], value, rtol=0.0, atol=1e-6)
-
-    def test_final_board_of_a_prior_game_reaches_the_next_game_context(self) -> None:
-        empty_board = _train_series_parameters(_two_game_series(final_board=0.0), max_chunk_size=64)
-        full_board = _train_series_parameters(_two_game_series(final_board=5.0), max_chunk_size=64)
-
+        for split, species_weight in zip(summaries[1:3], species_weights[1:3], strict=True):
+            torch.testing.assert_close(split, summaries[0], rtol=0.0, atol=1e-6)
+            # Only the final board uses this species. Prior-game context must not
+            # backpropagate into its encoder, regardless of chunk placement.
+            torch.testing.assert_close(species_weight, species_weights[0], rtol=0.0, atol=0.0)
         assert any(
-            not torch.allclose(empty_board[name], value, rtol=0.0, atol=1e-6)
-            for name, value in full_board.items()
+            not torch.allclose(summaries[-1][name], value, rtol=0.0, atol=1e-6)
+            for name, value in summaries[0].items()
         )
 
     def test_unknown_decision_is_excluded_without_breaking_game_context(self) -> None:
@@ -517,13 +519,15 @@ class TestBCTrainer:
             [int(LabelKind.EXACT), int(LabelKind.EXACT)],
             [(7, 8), (7, 8)],
             [0, 1, 2],
+            is_series_end=True,
         )
         second = replace(second, series_id="series-2")
 
         batch = next(collate_bc_batches((first, second), 4))
 
         assert all(isinstance(window, BCGameWindow) for window in batch.windows)
-        # Each finished game's final board follows its targets: context rows 2 and 5.
+        # Only the first game needs a final board for its successor's series context.
+        assert batch.observations.categorical.size(0) == 5
         assert batch.target_indices.tolist() == [0, 1, 3, 4]
         assert [window.final_index for window in batch.windows] == [2, 5]
         # Decision 2 (start of second game) must not attend to history from first game

@@ -47,7 +47,9 @@ from p0.model.structured_observation import (
     NUM_IDX_EFFECT_OVERFLOW,
     NUM_IDX_FAINTED,
     NUM_IDX_LEGALITY_UNKNOWN,
+    NUM_IDX_MOVE_LAST,
     NUM_IDX_MOVE_LEGAL,
+    NUM_IDX_ORIG_IDX_RATIO,
     NUM_IDX_PREPARING,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
     NUM_IDX_STAT_PROVENANCE,
@@ -286,6 +288,7 @@ class TestObservationBuilder:
             weightkg=75.0,
             status_counter=3,
             preparing_move="closecombat",
+            last_move_id="protect",
         )
         mon.nature = "Jolly"
         battle = make_battle_view(
@@ -316,6 +319,7 @@ class TestObservationBuilder:
         assert num[13] == -1.0 / 6.0  # Def Boost (-1 / 6)
         assert num[19] == 4.0 / 8.0  # Move 1 PP ratio (4 / 8 max PP)
         assert num[20] == 8.0 / 16.0  # Move 2 PP ratio (8 / 16 max PP)
+        assert num[NUM_IDX_MOVE_LAST : NUM_IDX_MOVE_LAST + 4].tolist() == [0.0, 1.0, 0.0, 0.0]
         assert num[23] == 2.0 / 4.0  # Protect counter normalized by 4
         assert num[24] == 1.0  # First turn active
         assert num[25] == pytest.approx(0.6)  # Low kick weight bracket for 75kg
@@ -342,15 +346,18 @@ class TestObservationBuilder:
 
         # Regular battle ordering (active slots first, then bench)
         battle_reg = make_battle_view(
-            active_pokemon=[p1, p2],
+            active_pokemon=[p4, p2],
             team=team,
             teampreview=False,
-            available_switches=[[p3, p4], [p3, p4]],
+            available_switches=[[p1, p3, p6], [p1, p3, p6]],
         )
         regular = _OBSERVATION_BUILDER.build(battle_reg)
         assert regular.categorical[:6, 0].tolist() == [
-            tokenizer.species_id(pokemon) for pokemon in (p1, p2, p3, p4, p5, p6)
+            tokenizer.species_id(pokemon) for pokemon in (p4, p2, p1, p3, p5, p6)
         ]
+        assert regular.numerical[:6, NUM_IDX_ORIG_IDX_RATIO].tolist() == pytest.approx(
+            [4 / 6, 2 / 6, 1 / 6, 3 / 6, 5 / 6, 1.0]
+        )
 
         # Empty left active slot placeholder
         battle_left_empty = make_battle_view(

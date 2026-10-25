@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from poke_env.battle import AbstractBattle, DoubleBattle
 from poke_env.player import DefaultBattleOrder, Player
+from poke_env.ps_client.ps_client import PSClient
 
 from p0.battle.legality import action_mask
 from p0.format_config import FORMAT
@@ -40,36 +41,18 @@ LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
-class _LiveBattleHistory:
-    """Track decision tokens for a live battle."""
-
-    tokens: list[torch.Tensor] = field(default_factory=list)
-
-    def append(self, token: torch.Tensor, device: torch.device) -> None:
-        self.tokens.append(token.detach().to(device=device, dtype=torch.float32))
-
-    def recent_values(self, empty: torch.Tensor) -> torch.Tensor:
-        if not self.tokens:
-            return empty
-        return torch.stack(self.tokens[-HISTORY_WINDOW:]).unsqueeze(0)
-
-    def complete_values(self, device: torch.device) -> torch.Tensor:
-        return torch.stack(self.tokens).to(device).unsqueeze(0)
-
-
-@dataclass(slots=True)
 class _LiveSeriesState:
     """Track games and score for one Best-of-3 series."""
 
     key: str
-    opponent_id: str
     games_played: int = 0
     wins: int = 0
     losses: int = 0
+    parent_complete: bool = False
 
     @property
     def complete(self) -> bool:
-        return self.wins >= 2 or self.losses >= 2 or self.games_played >= 3
+        return self.parent_complete or self.wins >= 2 or self.losses >= 2 or self.games_played >= 3
 
 
 class TeamPlayerMixin:
@@ -78,6 +61,8 @@ class TeamPlayerMixin:
     team_source: TeamCorpus | None
     team_rng: random.Random
     current_team_packed: str | None
+    ps_client: PSClient
+    _battles: dict[str, AbstractBattle]
 
     def __init__(
         self,
@@ -111,23 +96,23 @@ class TeamPlayerMixin:
         """Finish the underlying battle and optionally prepare the next team."""
         super()._battle_finished_callback(battle)  # pyright: ignore[reportAttributeAccessIssue]
 
-        if resample_team and self.team_source is not None:
+        if (
+            resample_team
+            and self.team_source is not None
+            and poke_env_patches.parent_room_for_battle(self.ps_client, battle.battle_tag) is None
+        ):
             self.update_team(self.team_source.sample(self.team_rng))
 
-        battle_id = getattr(battle, "battle_tag", None)
-        battles = getattr(self, "_battles", None)
-        if battle_id and battles is not None:
-            battles.pop(battle_id, None)
+        self._battles.pop(battle.battle_tag, None)
 
-    def _should_resample_team_after_battle(self, battle: AbstractBattle) -> bool:
-        del battle
-        return True
+    def _series_finished_callback(self, parent_room: str) -> None:
+        """Prepare the next team when the server ends a parent series."""
+        del parent_room
+        if self.team_source is not None:
+            self.update_team(self.team_source.sample(self.team_rng))
 
     def _battle_finished_callback(self, battle: AbstractBattle):
-        self._finish_team_battle(
-            battle,
-            resample_team=self._should_resample_team_after_battle(battle),
-        )
+        self._finish_team_battle(battle, resample_team=True)
 
 
 class RLPlayer(TeamPlayerMixin, Player):
@@ -166,18 +151,17 @@ class RLPlayer(TeamPlayerMixin, Player):
             raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
 
         self.top_p = top_p
-        self._battle_histories: dict[str, _LiveBattleHistory] = {}
+        self._battle_histories: dict[str, list[torch.Tensor]] = {}
         self.invalidate_memory_for_model_reload()
-        self._series_by_opponent: dict[str, _LiveSeriesState] = {}
+        self._series: dict[str, _LiveSeriesState] = {}
         self._series_by_battle: dict[str, _LiveSeriesState] = {}
-        self._series_sequence = 0
 
     @staticmethod
     def _battle_key(battle: DoubleBattle) -> str:
-        key = getattr(battle, "battle_tag", None)
+        key = battle.battle_tag
         if not key:
             raise ValueError("Live battle has no stable battle identifier")
-        return str(key)
+        return key
 
     @staticmethod
     def _opponent_id(battle: DoubleBattle) -> str:
@@ -193,24 +177,29 @@ class RLPlayer(TeamPlayerMixin, Player):
         if state is not None:
             return state
 
-        opponent_id = self._opponent_id(battle)
-        state = self._series_by_opponent.get(opponent_id)
+        parent_room = poke_env_patches.parent_room_for_battle(self.ps_client, battle_key)
+        series_key = parent_room or self._opponent_id(battle)
+        state = self._series.get(series_key)
         if state is None:
-            self._series_sequence += 1
-            state = _LiveSeriesState(
-                key=f"bo3:{opponent_id}:{self._series_sequence}",
-                opponent_id=opponent_id,
-            )
-            self._series_by_opponent[opponent_id] = state
+            state = _LiveSeriesState(key=series_key)
+            self._series[series_key] = state
 
         self._series_by_battle[battle_key] = state
         return state
 
     def _drop_series(self, state: _LiveSeriesState) -> None:
         self._series_store.drop(state.key)
-        current = self._series_by_opponent.get(state.opponent_id)
+        current = self._series.get(state.key)
         if current is state:
-            self._series_by_opponent.pop(state.opponent_id, None)
+            self._series.pop(state.key, None)
+
+    def _series_finished_callback(self, parent_room: str) -> None:
+        """Drop completed parent memory even when no final child game is played."""
+        state = self._series.get(parent_room)
+        if state is not None:
+            state.parent_complete = True
+            self._drop_series(state)
+        super()._series_finished_callback(parent_room)
 
     def invalidate_memory_for_model_reload(self) -> None:
         """Drop model-dependent tokens while preserving the current series score."""
@@ -235,9 +224,9 @@ class RLPlayer(TeamPlayerMixin, Player):
         key = self._battle_key(battle)
         history = self._battle_histories.get(key)
         values = (
-            self._empty_history_tensor
-            if history is None
-            else history.recent_values(self._empty_history_tensor)
+            torch.stack(history[-HISTORY_WINDOW:]).unsqueeze(0)
+            if history
+            else self._empty_history_tensor
         )
 
         history_tokens, history_mask = pack_history_tokens(values)
@@ -258,17 +247,17 @@ class RLPlayer(TeamPlayerMixin, Player):
         key = self._battle_key(battle)
         history = self._battle_histories.get(key)
         if history is None:
-            history = _LiveBattleHistory()
+            history = []
             self._battle_histories[key] = history
-        history.append(token, self.policy.device)
+        history.append(token.detach().to(device=self.policy.device, dtype=torch.float32))
 
     def _get_action(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
         history = self._battle_histories.get(self._battle_key(battle))
-        if history is not None and history.tokens and is_retry(battle):
+        if history and is_retry(battle):
             # A rejected choice is decided again from the same observation, so the
             # retry replaces that decision's history entry instead of adding one.
-            history.tokens.pop()
+            history.pop()
 
         view = battle_view(battle)
         obs = self.observation_builder.build(view)
@@ -320,8 +309,15 @@ class RLPlayer(TeamPlayerMixin, Player):
         if not battle.finished:
             raise RuntimeError(f"Bo3 callback received unfinished battle {battle_key!r}")
 
+        state.games_played += 1
+        if battle.won:
+            state.wins += 1
+        elif battle.lost:
+            state.losses += 1
+        series_complete = state.complete
+
         history = self._battle_histories.pop(battle_key, None)
-        if history is not None:
+        if history is not None and not series_complete:
             # The final exchange arrives after the last request; summarize the
             # finished board so the series memory keeps it, with no action taken.
             view = battle_view(battle)
@@ -331,21 +327,14 @@ class RLPlayer(TeamPlayerMixin, Player):
                     self.observation_builder.build(view).unsqueeze(0).to(self.policy.device),
                     mask.to(self.policy.device),
                 )
-                history.append(encoded.local_history_token[0], self.policy.device)
-                values = history.complete_values(self.policy.device)
+                history.append(encoded.local_history_token[0].float())
+                values = torch.stack(history).unsqueeze(0)
                 values_mask = torch.ones(values.shape[:2], dtype=torch.bool, device=values.device)
                 new_tokens = self.policy.series(values, values_mask)[0]
             # SeriesTokenStore synchronously detaches the completed summary to
             # CPU, establishing a strict device-memory boundary between games.
             self._series_store.append(state.key, new_tokens)
 
-        state.games_played += 1
-        if battle.won:
-            state.wins += 1
-        elif battle.lost:
-            state.losses += 1
-
-        series_complete = state.complete
         if series_complete:
             self._drop_series(state)
 

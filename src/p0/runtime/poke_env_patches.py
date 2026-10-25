@@ -38,6 +38,7 @@ _ORIGINAL_GET_POKEMON = DoubleBattle.get_pokemon
 _ORIGINAL_PARSE_REQUEST = DoubleBattle.parse_request
 _ORIGINAL_UPDATE_FROM_TEAMBUILDER = Pokemon._update_from_teambuilder
 _ORIGINAL_START_EFFECT = Pokemon.start_effect
+_ORIGINAL_MAX_PP = Move.max_pp
 
 
 def _install_champions_data() -> None:
@@ -73,6 +74,63 @@ def _install_champions_data() -> None:
     Move.should_be_stored.cache_clear()
 
 
+def _max_pp(self: Move) -> int:
+    """Use Champions PP limits, including moves copied by Transform."""
+    if self.gen != 9:
+        return _ORIGINAL_MAX_PP.__get__(self, Move)
+
+    base_pp = self.entry["pp"]
+    maximum = base_pp if self.entry.get("noPPBoosts") else (base_pp // 5 + 1) * 4
+    return min(5, maximum) if self._from_transform else maximum
+
+
+def _pressure_on(self: DoubleBattle, pokemon: str, move: str, target: str | None) -> int:
+    """Count each opposing Pressure target for moves that hit both opponents."""
+    data = GenData.from_gen(self.gen).moves.get(Move.retrieve_id(move))
+    if data is None:
+        return 0
+
+    if data["target"] in {"all", "allAdjacent", "allAdjacentFoes"} or data["flags"].get(
+        "mustpressure"
+    ):
+        targets = (
+            self.opponent_active_pokemon if pokemon[:2] == self.player_role else self.active_pokemon
+        )
+    elif data["target"] in {"any", "normal", "randomNormal", "scripted"}:
+        targets = [self._get_target_mon(pokemon, data["target"], target)]
+    else:
+        return 0
+
+    pressure_targets = [
+        mon
+        for mon in targets
+        if mon is not None
+        and mon.ability == "pressure"
+        and not mon.fainted
+        and Effect.GASTRO_ACID not in mon.effects
+    ]
+    if not pressure_targets:
+        return 0
+
+    gas_active = any(
+        mon is not None
+        and mon.ability == "neutralizinggas"
+        and not mon.transformed
+        and Effect.GASTRO_ACID not in mon.effects
+        for mon in (*self.active_pokemon, *self.opponent_active_pokemon)
+    )
+    return (
+        sum(mon.item == "abilityshield" for mon in pressure_targets)
+        if gas_active
+        else len(pressure_targets)
+    )
+
+
+def _use_move(self: Move, pressure: bool | int = False, overridden: bool = False) -> None:
+    """Spend one PP plus the count supplied by the battle's Pressure check."""
+    self._current_pp = max(self._current_pp - 1 - pressure + overridden, 0)
+
+
 _CRITICAL_COPY_EFFECTS = (Effect.DRAGON_CHEER, Effect.FOCUS_ENERGY)
 _LEPPA_PP_RECOVERY = 10
 _RIPEN_LEPPA_PP_RECOVERY = 20
@@ -88,6 +146,7 @@ _PARENT_RESULTS_CREATION_LOCK = threading.Lock()
 class _ParentResults:
     lock: threading.Lock = field(default_factory=threading.Lock)
     completed_rooms: dict[str, str | None] = field(default_factory=dict)
+    child_parents: dict[str, str] = field(default_factory=dict)
     waiters: list[tuple[int, Future[None]]] = field(default_factory=list)
 
     def record(self, room: str, winner: str | None) -> None:
@@ -98,6 +157,18 @@ class _ParentResults:
                     if len(self.completed_rooms) >= expected and not waiter.done():
                         waiter.set_result(None)
                 self.waiters[:] = [w for w in self.waiters if len(self.completed_rooms) < w[0]]
+
+    def link_child(self, child: str, parent: str) -> None:
+        with self.lock:
+            self.child_parents[child] = parent
+
+    def parent_for(self, child: str) -> str | None:
+        with self.lock:
+            return self.child_parents.get(child)
+
+    def finished(self, room: str) -> bool:
+        with self.lock:
+            return room in self.completed_rooms
 
     def wait_for(self, expected: int) -> Future[None]:
         waiter: Future[None] = Future()
@@ -122,6 +193,11 @@ def _parent_results(client: PSClient) -> _ParentResults:
         if not hasattr(client, "_p0_parent_results"):
             client._p0_parent_results = _ParentResults()  # type: ignore[attr-defined]
         return client._p0_parent_results  # type: ignore[attr-defined]
+
+
+def parent_room_for_battle(client: PSClient, battle_tag: str) -> str | None:
+    """Return the parent room named by the server for a child battle, when present."""
+    return _parent_results(client).parent_for(battle_tag)
 
 
 async def wait_for_parent_results(client: PSClient, expected: int) -> None:
@@ -436,6 +512,10 @@ def _parse_message(self: DoubleBattle, split_message: list[str]):
         round_user = self.get_pokemon(split_message[2])
         round_user._add_move("round")
     result = _ORIGINAL_PARSE_MESSAGE(self, split_message)
+    if event_type == "-endability" and len(split_message) >= 3:
+        # The pinned Champions protocol emits this for the gastroacid volatile,
+        # shared by Gastro Acid and Core Enforcer. The named ability is retained.
+        self.get_pokemon(split_message[2]).start_effect("Gastro Acid")
     if round_user is not None:
         round_user.moves["round"].use()
     if event_type == "-transform" and len(split_message) >= 4:
@@ -602,6 +682,16 @@ def _parse_request(
         _place_requested_actives(self, request["side"]["pokemon"])
     _ORIGINAL_PARSE_REQUEST(self, request, strict_battle_tracking)
     if not preview:
+        # Normal requests carry authoritative PP, including copied and disabled moves.
+        # Locked, recharge and Struggle entries omit PP and retain event-tracked values.
+        active_requests: list[dict[str, Any]] = request.get("active", [])
+        for pokemon, active in zip(self.active_pokemon, active_requests):
+            if pokemon is None:
+                continue
+            for move_request in active["moves"]:
+                move = pokemon.moves.get(move_request["id"])
+                if move is not None and "pp" in move_request:
+                    move._current_pp = move_request["pp"]
         # poke-env takes Showdown's active flag (the first two party positions) as true
         # even in the team preview request. A disguised Illusion user that leads from
         # one of them is then never switched in, so it would never count as seen.
@@ -633,14 +723,34 @@ async def _handle_message(self: PSClient, message: str):
     if message.startswith(">game-"):
         parent_room, _, body = message.partition("\n")
         parent_room = parent_room[1:]
-        if "I'm ready!</button>" in message:
-            await self.send_message(f"/msgroom {parent_room},/confirmready")
+        tracker = _parent_results(self)
+        player = getattr(self._on_battle_message, "__self__", None)
+        on_result = getattr(player, "_series_finished_callback", None)
         for line in body.splitlines():
+            if line.startswith(("|uhtml|game", "|uhtmlchange|game")):
+                child = line.partition('href="/')[2].partition('"')[0]
+                if child.startswith("battle-"):
+                    tracker.link_child(child, parent_room)
             if line.startswith("|win|"):
-                _parent_results(self).record(parent_room, line.removeprefix("|win|"))
+                winner = line.removeprefix("|win|")
             elif line == "|tie":
-                _parent_results(self).record(parent_room, None)
+                winner = None
+            else:
+                continue
+            if not tracker.finished(parent_room):
+                if on_result is not None:
+                    on_result(parent_room)
+                tracker.record(parent_room, winner)
+        if "I'm ready!</button>" in message and not tracker.finished(parent_room):
+            await self.send_message(f"/msgroom {parent_room},/confirmready")
         return None
+    if message.startswith(">battle-") and "|bestof|" in message:
+        battle_room, _, body = message.partition("\n")
+        for line in body.splitlines():
+            if line.startswith(("|uhtml|bestof|", "|uhtmlchange|bestof|")):
+                parent = line.partition('href="/')[2].partition('"')[0]
+                if parent.startswith("game-"):
+                    _parent_results(self).link_child(battle_room[1:], parent)
     return await _ORIGINAL_HANDLE_MESSAGE(self, message)
 
 
@@ -699,6 +809,9 @@ async def _stop_listening_cleanly(self: PSClient) -> None:
 
 # Every patched attribute with its replacement.
 _PATCHES = (
+    (Move, "max_pp", property(_max_pp)),
+    (Move, "use", _use_move),
+    (DoubleBattle, "_pressure_on", _pressure_on),
     (PSClient, "wait_for_login", _wait_for_login),
     (PSClient, "stop_listening", _stop_listening_cleanly),
     (PSClient, "_handle_message", _handle_message),
