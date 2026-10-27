@@ -56,20 +56,37 @@ class TestTrainingResume:
             magnet_refresh_interval=1,
         )
 
-        run_training(config, teams_root=teams_root)
+        metrics_path = config.output_dir / "metrics.jsonl"
+
+        def cancelled() -> bool:
+            if not metrics_path.is_file():
+                return False
+            lines = metrics_path.read_text().splitlines()
+            return bool(lines) and json.loads(lines[-1])["step"] >= 2
+
+        run_training(config, cancel_requested=cancelled, teams_root=teams_root)
 
         saved = store.read(config.checkpoint_path)
-        assert store.load_episode(saved) == 3
-        metrics_path = config.output_dir / "metrics.jsonl"
+        assert store.load_episode(saved) == 2
         metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
-        assert [record["step"] for record in metrics] == [1, 2, 3]
+        assert [record["step"] for record in metrics] == [1, 2]
         assert all(record["trajectory_count"] > 0 for record in metrics)
+        assert all(record["optimizer_updates"] > 0 for record in metrics)
 
         resumed = replace(
             config, initial_policy_checkpoint=None, resume_checkpoint=config.checkpoint_path
         )
         run_training(resumed, teams_root=teams_root)
         assert store.load_episode(config.checkpoint_path) == 3
+        resumed_metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
+        assert [record["step"] for record in resumed_metrics] == [1, 2, 3]
+        assert resumed_metrics[:2] == metrics
+        assert resumed_metrics[-1]["optimizer_updates"] > 0
+
+        run_training(resumed, teams_root=teams_root)
+        assert [
+            json.loads(line) for line in metrics_path.read_text().splitlines()
+        ] == resumed_metrics
 
     @pytest.mark.integration
     def test_ppo_resume_continues_training_and_metrics(self, tmp_path: Path) -> None:

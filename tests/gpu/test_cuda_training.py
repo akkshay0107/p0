@@ -397,17 +397,18 @@ class TestCudaTrainingLoops:
             magnet_refresh_interval=1,
         )
 
-        run_training(
-            config,
-            cancel_requested=lambda: (
-                config.checkpoint_path.is_file() and store.load_episode(config.checkpoint_path) >= 3
-            ),
-            teams_root=teams_root,
-        )
+        metrics_path = config.output_dir / "metrics.jsonl"
+
+        def cancelled() -> bool:
+            if not metrics_path.is_file():
+                return False
+            lines = metrics_path.read_text().splitlines()
+            return bool(lines) and json.loads(lines[-1])["step"] >= 3
+
+        run_training(config, cancel_requested=cancelled, teams_root=teams_root)
 
         saved = store.read(config.checkpoint_path)
         assert store.load_episode(saved) == 3
-        metrics_path = config.output_dir / "metrics.jsonl"
         metrics = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         assert [record["step"] for record in metrics] == [1, 2, 3]
         assert all(record["trajectory_count"] > 0 for record in metrics)

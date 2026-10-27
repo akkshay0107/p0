@@ -29,6 +29,7 @@ PPO_BOARD_METRICS = (
     "explained_variance",
     "magnet_kl",
     "grad_norm",
+    "optimizer_updates",
     "mean_game_length",
     "timeout_or_truncation_rate",
 )
