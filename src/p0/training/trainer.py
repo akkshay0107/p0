@@ -84,6 +84,8 @@ class PPOTrainer:
             alpha = self.scheduler.alpha(episode)
             self.collector.reset_completed()
             self.policy.eval()
+            if episode > start_episode:
+                self.collector.refresh_memory()
             while True:
                 self.collector.collect(self.cancel_requested)
                 if self.cancel_requested():

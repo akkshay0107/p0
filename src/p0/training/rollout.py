@@ -23,6 +23,7 @@ from p0.training.vector_env import FinishedGame, ThreadVecEnv
 
 ACT_SIZE = FORMAT.action_size
 MAX_TRAJECTORY_STEPS = 200
+HISTORY_REFRESH_BATCH_SIZE = 64
 
 __all__ = ["RolloutCollector"]
 
@@ -73,6 +74,50 @@ class RolloutCollector:
             )
             for _ in range(2)
         )
+
+    @torch.inference_mode()
+    def refresh_memory(self) -> None:
+        """Refresh active history and re-summarize saved prior-game local tokens."""
+        infos = self.vector_env.last_infos
+        if infos is None:
+            raise RuntimeError("The vector environment must be reset before refreshing memory")
+
+        policy = self.policy
+        device = policy.device
+        precision = select_optimization_precision(self.config.enable_optim, device)
+        positions = torch.arange(self._seats[0].trajectories.actions.size(1))
+        # Completion archives the full prefix for the series, beyond the history window.
+        for seat in self._seats:
+            storage = seat.trajectories
+            env_ids, steps = (positions < storage.step_counts[:, None]).nonzero(as_tuple=True)
+            for start in range(0, env_ids.numel(), HISTORY_REFRESH_BATCH_SIZE):
+                env_batch = env_ids[start : start + HISTORY_REFRESH_BATCH_SIZE]
+                step_batch = steps[start : start + HISTORY_REFRESH_BATCH_SIZE]
+                observations = storage.observations[env_batch, step_batch].to(device)
+                masks = storage.action_masks[env_batch, step_batch].to(device)
+                with precision.autocast_context(device):
+                    tokens = policy.encode(observations, masks).local_history_token
+                storage.history_tokens[env_batch.to(device), step_batch.to(device)] = tokens.to(
+                    storage.history_tokens
+                )
+
+        series_ids = [str(info["series_id"]) for info in infos]
+        games = [
+            (seat.series_tokens, series_id, history)
+            for seat in self._seats
+            for series_id in series_ids
+            for history in seat.series_history.snapshot(series_id)
+        ]
+        if not games:
+            return
+        histories, mask = pad_game_histories([history for _, _, history in games])
+        with precision.autocast_context(device):
+            summaries = policy.series(histories.to(device), mask.to(device))
+        summaries = summaries.to(device="cpu", dtype=torch.float32)
+        for seat in self._seats:
+            seat.series_tokens.clear()
+        for (store, series_id, _), summary in zip(games, summaries, strict=True):
+            store.append(series_id, summary)
 
     @torch.inference_mode()
     def collect(self, cancel_requested: Callable[[], bool] = lambda: False) -> None:
