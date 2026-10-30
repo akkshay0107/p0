@@ -1,7 +1,6 @@
 'use strict';
 
 const fs = require('fs');
-const readline = require('readline');
 const {Dex, Teams, TeamValidator} = require('../pokemon-showdown/dist/sim');
 
 Dex.includeFormats();
@@ -34,43 +33,8 @@ function validateItem(item) {
   }
 }
 
-function processBatch(batch) {
-  if (!Array.isArray(batch)) {
-    throw new Error('Expected JSON array of team validation payloads');
-  }
-  return batch.map(validateItem);
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+if (!Array.isArray(input)) {
+  throw new Error('Expected JSON array of team validation payloads');
 }
-
-const isPersistent = process.argv.includes('--persistent');
-
-if (isPersistent) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: false,
-  });
-
-  rl.on('line', (line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    try {
-      const payload = JSON.parse(trimmed);
-      if (payload.command === 'stop') {
-        rl.close();
-        process.exit(0);
-      }
-      const results = processBatch(payload.batch || []);
-      process.stdout.write(JSON.stringify({status: 'ok', results}) + '\n');
-    } catch (err) {
-      process.stdout.write(JSON.stringify({
-        status: 'error',
-        message: String(err.message || err),
-        results: [],
-      }) + '\n');
-    }
-  });
-} else {
-  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-  const results = processBatch(input);
-  process.stdout.write(JSON.stringify(results));
-}
+process.stdout.write(JSON.stringify(input.map(validateItem)));
