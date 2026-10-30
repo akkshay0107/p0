@@ -19,6 +19,7 @@ from poke_env.player import DefaultBattleOrder, Player
 from poke_env.ps_client.ps_client import PSClient
 
 from p0.battle.legality import action_mask
+from p0.battle.views import BattleView
 from p0.format_config import FORMAT
 from p0.model.architecture_contract import HISTORY_WINDOW
 from p0.model.cls_reducer import pack_history_tokens
@@ -251,15 +252,13 @@ class RLPlayer(TeamPlayerMixin, Player):
             self._battle_histories[key] = history
         history.append(token.detach().to(device=self.policy.device, dtype=torch.float32))
 
-    def _get_action(self, battle: AbstractBattle):
-        assert isinstance(battle, DoubleBattle)
+    def _get_action(self, battle: DoubleBattle, view: BattleView):
         history = self._battle_histories.get(self._battle_key(battle))
         if history and is_retry(battle):
             # A rejected choice is decided again from the same observation, so the
             # retry replaces that decision's history entry instead of adding one.
             history.pop()
 
-        view = battle_view(battle)
         obs = self.observation_builder.build(view)
         mask = torch.from_numpy(action_mask(view.decision))
 
@@ -269,14 +268,16 @@ class RLPlayer(TeamPlayerMixin, Player):
         with torch.no_grad():
             encoded = self.policy.encode(obs, mask)
             prepared = self.policy.prepare(encoded, self.memory_inputs(battle))
-            out = self.policy.act(prepared, mask, top_p=self.top_p)
+            actions, _, _, history_token = self.policy.actor.sample_reduced(
+                prepared.reduced, prepared.encoded, mask, top_p=self.top_p
+            )
 
         # Waiting requests return before action selection; every token appended here
         # therefore corresponds to an actual policy decision, which also closes the
         # event interval that this observation read.
-        self._append_history(battle, out.history_token[0])
+        self._append_history(battle, history_token[0])
         consume_events(battle)
-        return out.actions[0].cpu().numpy()
+        return actions[0].cpu().numpy()
 
     def choose_move(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
@@ -286,7 +287,7 @@ class RLPlayer(TeamPlayerMixin, Player):
         # that intermediate callback.
         if view.wait or (not battle.teampreview and not any(battle.active_pokemon)):
             return DefaultBattleOrder()
-        return action_to_order(self._get_action(battle), battle)
+        return action_to_order(self._get_action(battle, view), battle)
 
     def get_observation(self, battle: AbstractBattle):
         assert isinstance(battle, DoubleBattle)
@@ -295,7 +296,7 @@ class RLPlayer(TeamPlayerMixin, Player):
     def teampreview(self, battle: AbstractBattle) -> str:
         assert isinstance(battle, DoubleBattle)
         self._battle_histories.pop(self._battle_key(battle), None)
-        return action_to_order(self._get_action(battle), battle).message
+        return action_to_order(self._get_action(battle, battle_view(battle)), battle).message
 
     def _battle_finished_callback(self, battle: AbstractBattle):
         if not isinstance(battle, DoubleBattle):

@@ -280,10 +280,8 @@ class RolloutCollector:
                 torch.tensor([env_id], dtype=torch.long), [series_id], device
             )
             with precision.autocast_context(device):
-                values = policy.act(
-                    policy.prepare(terminal_encoded, memory),
-                    terminal_mask,
-                ).value
+                prepared = policy.prepare(terminal_encoded, memory)
+                values = policy.critic(prepared.reduced.cls)
             bootstrap_values = float(values[0].item()), float(values[1].item())
 
         histories = tuple(seat.trajectories.full_history(env_id) for seat in self._seats)

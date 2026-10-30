@@ -35,6 +35,7 @@ from p0.training._bc_metrics import (
     _ragged_logsumexp,
     _swap_preview_pair,
     label_masks,
+    slot_legality_unknown,
 )
 from p0.training.config import BCConfig
 from p0.training.series_history import SeriesHistoryStore
@@ -404,21 +405,30 @@ class BCTrainer:
                     validated=True,
                 ).float()
                 value_predictions = self.policy.critic(prepared.reduced.cls).float()
-                accumulator.add_legality(
-                    self.policy.unmasked_first_slot_logits(prepared),
-                    action_mask,
-                    prepared.encoded.numerical,
-                )
+                # Skip the diagnostic forward when CPU source rows prove no legality.
+                # Device-backed sources keep the existing path without a new GPU sync.
+                numerical = batch.observations.numerical
+                if (
+                    numerical.device.type != "cpu"
+                    or not slot_legality_unknown(numerical)[batch.target_indices].all()
+                ):
+                    accumulator.add_legality(
+                        self.policy.unmasked_first_slot_logits(prepared),
+                        action_mask,
+                        prepared.encoded.numerical,
+                    )
                 value_targets, value_mask = _prepare_value_targets(batch, self.device, self._gamma)
                 masks = tuple(mask.to(self.device) for mask in label_masks(batch.label_kind))
                 marginal_nll = -_ragged_logsumexp(candidate_log_probs, candidate_offsets)
-                greedy = self.policy.act(prepared, action_mask, deterministic=True)
+                actions, log_probs, _, _ = self.policy.actor.greedy_reduced(
+                    prepared.reduced, prepared.encoded, action_mask
+                )
                 accumulator.add(
                     exact_actions=batch.exact_action.to(self.device),
                     masks=masks,  # pyright: ignore[reportArgumentType]
                     marginal_nll=marginal_nll,
-                    predicted=greedy.actions,
-                    best_scores=greedy.log_probs,
+                    predicted=actions,
+                    best_scores=log_probs,
                     team_preview=prepared.encoded.phase,
                 )
                 accumulator.add_value(value_predictions, value_targets, value_mask)
