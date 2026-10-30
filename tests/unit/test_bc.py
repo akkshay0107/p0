@@ -556,9 +556,13 @@ class TestBCTrainer:
 
     def test_multi_epoch_training_rejects_one_shot_dataset(self) -> None:
         chunk = _chunk([int(LabelKind.EXACT)], [(7, 8)], [0, 1])
-        trainer = _trainer(chunk)
-        trainer.dataset = iter((chunk,))
-        trainer.config = BCConfig(epochs=2, enable_optim=False)
+        policy = build_policy(ModelConfig(64, 4, 1, 128), default_runtime_resources())
+        trainer = BCTrainer(
+            policy,
+            iter((chunk,)),
+            BCConfig(epochs=2, enable_optim=False),
+            device="cpu",
+        )
 
         with pytest.raises(ValueError, match="re-iterable"):
             trainer.train()

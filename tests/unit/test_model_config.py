@@ -11,10 +11,6 @@ class TestModelConfig:
     def test_serialization_pins_architecture_and_rejects_invalid_configs(self) -> None:
         """Pin serialized fields, defaults, and invalid architecture inputs."""
         config = ModelConfig.baseline()
-        assert config.d_model == 384
-        assert config.nhead == 8
-        assert config.reducer_layers == 8
-        assert config.dim_feedforward == 1536
         baseline_fields = {
             "d_model": 384,
             "nhead": 8,

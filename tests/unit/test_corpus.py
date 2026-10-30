@@ -102,24 +102,21 @@ class TestCorpusFromTeamFiles:
 
 
 class TestLoadTeamCorpus:
-    def _write(self, directory: Path, value: object) -> None:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "corpus_manifest.json").write_bytes(orjson.dumps(value))
-
     def test_loads_manifest_from_pool_directory(self, tmp_path: Path) -> None:
         corpus = TeamCorpus(format_id=FORMAT.battle_format, teams=(("a", "b"), ("c",)))
-        self._write(tmp_path, corpus.to_dict())
+        (tmp_path / "corpus_manifest.json").write_bytes(orjson.dumps(corpus.to_dict()))
 
         assert load_team_corpus(tmp_path, FORMAT.battle_format) == corpus
 
     def test_accepts_regular_corpus_for_bo3(self, tmp_path: Path) -> None:
         corpus = TeamCorpus(format_id=FORMAT.battle_format, teams=(("a",),))
-        self._write(tmp_path, corpus.to_dict())
+        (tmp_path / "corpus_manifest.json").write_bytes(orjson.dumps(corpus.to_dict()))
 
         assert load_team_corpus(tmp_path, FORMAT.bo3_format) == corpus
 
     def test_rejects_incompatible_format(self, tmp_path: Path) -> None:
-        self._write(tmp_path, TeamCorpus(format_id="gen9ou", teams=(("a",),)).to_dict())
+        value = TeamCorpus(format_id="gen9ou", teams=(("a",),)).to_dict()
+        (tmp_path / "corpus_manifest.json").write_bytes(orjson.dumps(value))
 
         with pytest.raises(ValueError, match="Corpus format mismatch"):
             load_team_corpus(tmp_path, FORMAT.bo3_format)
@@ -133,16 +130,14 @@ class TestLoadTeamCorpus:
             load_team_corpus(tmp_path, FORMAT.bo3_format)
 
     def test_rejects_invalid_manifest(self, tmp_path: Path) -> None:
-        self._write(tmp_path, [])
+        (tmp_path / "corpus_manifest.json").write_bytes(orjson.dumps([]))
 
         with pytest.raises(ValueError, match="Invalid corpus manifest"):
             load_team_corpus(tmp_path, FORMAT.bo3_format)
 
     def test_manifest_with_older_fields_names_the_build_command(self, tmp_path: Path) -> None:
-        self._write(
-            tmp_path,
-            {"artifact_schema": "p0.team_corpus.v2", "format_id": "f", "entries": []},
-        )
+        value = {"artifact_schema": "p0.team_corpus.v2", "format_id": "f", "entries": []}
+        (tmp_path / "corpus_manifest.json").write_bytes(orjson.dumps(value))
 
         with pytest.raises(ValueError, match="rebuild it with `p0-corpus build"):
             load_team_corpus(tmp_path, FORMAT.bo3_format)

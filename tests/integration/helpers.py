@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -80,15 +79,19 @@ def order_to_action(order: BattleOrder, battle: DoubleBattle) -> npt.NDArray[np.
 
     return np.array(
         [
-            single_order_to_action(order.first_order, battle, False, 0),
-            single_order_to_action(order.second_order, battle, False, 1),
+            single_order_to_action(order.first_order, battle, position=0),
+            single_order_to_action(order.second_order, battle, position=1),
         ],
         dtype=np.int64,
     )
 
 
 def single_order_to_action(
-    order: SingleBattleOrder, battle: DoubleBattle, fake: bool, position: int
+    order: SingleBattleOrder,
+    battle: DoubleBattle,
+    *,
+    position: int,
+    validate: bool = True,
 ) -> np.int64:
     """Encode a SingleBattleOrder into a single slot action integer."""
     if isinstance(order.order, str):
@@ -98,9 +101,8 @@ def single_order_to_action(
             raise ValueError(f"Unsupported string order {order}")
         return np.int64(0)
 
-    if not fake:
-        if str(order) not in map(str, battle.valid_orders[position]):
-            raise ValueError(f"Order {order} is not valid for position {position}")
+    if validate and str(order) not in map(str, battle.valid_orders[position]):
+        raise ValueError(f"Order {order} is not valid for position {position}")
 
     if isinstance(order.order, Pokemon):
         species = tuple(pokemon.base_species for pokemon in battle.team.values())
@@ -123,20 +125,17 @@ def single_order_to_action(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class GroundTruthDecision:
+class GroundTruthDecision(NamedTuple):
     """
     One observation and order set captured from a live Showdown request.
 
-    Contains both the high-level featurized StructuredObservation and the low-level
-    valid/chosen Showdown protocol order strings alongside their mapped discrete action indices.
+    Contains the observation, legal action indices, and chosen and regenerated
+    Showdown commands.
     """
 
     observation: StructuredObservation
     # Tuple of valid discrete action IDs per position slot: (slot_0_actions, slot_1_actions)
     legal_actions: tuple[tuple[int, ...], tuple[int, ...]]
-    # Tuple of valid Showdown command strings per position slot: (slot_0_orders, slot_1_orders)
-    legal_orders: tuple[tuple[str, ...], tuple[str, ...]]
     # Valid pairwise combinations of (slot_0_action, slot_1_action) for double battles
     legal_joint_actions: tuple[tuple[int, int], ...]
     chosen_action: tuple[int, int]
@@ -159,13 +158,12 @@ class _GroundTruthPlayer(RandomPlayer):
             tuple(battle.valid_orders[0]),
             tuple(battle.valid_orders[1]),
         )
-        # Convert each single order to its corresponding discrete model action integer for each slot.
-        # fake=True enables hypothetical action mapping without altering internal battle state.
+        # These orders came from valid_orders, so do not check membership again.
         legal_actions = (
             tuple(
                 sorted(
                     {
-                        int(single_order_to_action(order, battle, fake=True, position=0))
+                        int(single_order_to_action(order, battle, position=0, validate=False))
                         for order in legal_orders[0]
                     }
                 )
@@ -173,7 +171,7 @@ class _GroundTruthPlayer(RandomPlayer):
             tuple(
                 sorted(
                     {
-                        int(single_order_to_action(order, battle, fake=True, position=1))
+                        int(single_order_to_action(order, battle, position=1, validate=False))
                         for order in legal_orders[1]
                     }
                 )
@@ -183,8 +181,8 @@ class _GroundTruthPlayer(RandomPlayer):
         # compatible with Double Battle rules (e.g. avoiding invalid double target conflicts).
         legal_joint_actions = tuple(
             (
-                int(single_order_to_action(order.first_order, battle, fake=True, position=0)),
-                int(single_order_to_action(order.second_order, battle, fake=True, position=1)),
+                int(single_order_to_action(order.first_order, battle, position=0, validate=False)),
+                int(single_order_to_action(order.second_order, battle, position=1, validate=False)),
             )
             for order in DoubleBattleOrder.join_orders(list(legal_orders[0]), list(legal_orders[1]))
         )
@@ -195,10 +193,6 @@ class _GroundTruthPlayer(RandomPlayer):
                 # Snapshot the observation on CPU so it is safe across devices and threads
                 observation=self.observation_builder.build(battle_view(battle)).cpu(),
                 legal_actions=legal_actions,
-                legal_orders=(
-                    tuple(sorted(str(order) for order in legal_orders[0])),
-                    tuple(sorted(str(order) for order in legal_orders[1])),
-                ),
                 legal_joint_actions=legal_joint_actions,
                 chosen_action=(int(action[0]), int(action[1])),
                 # A locked slot is sent by position, so compare the commands as sent.
@@ -216,8 +210,8 @@ async def capture_showdown_decisions(
     """
     Capture live requests, observations, valid orders, and chosen orders from a Showdown server.
 
-    Installs necessary poke-env runtime patches during the battle session and ensures
-    websockets and monkey patches are cleanly uninstalled/cleaned up on completion or error.
+    Install the runtime patches and close both clients on completion or error.
+    The test suite's restore_poke_env fixture restores the patches afterward.
     """
     builder = ObservationBuilder(default_runtime_resources())
     player_a = _GroundTruthPlayer(

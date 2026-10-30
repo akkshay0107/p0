@@ -51,7 +51,6 @@ from p0.model.structured_observation import (
     StructuredObservation,
     TokenType,
 )
-from p0.training.magnet import Magnet
 
 ACT_SIZE = FORMAT.action_size
 
@@ -90,37 +89,6 @@ def _inputs(policy: PolicyNet, batch_size: int = 2) -> tuple[Any, torch.Tensor, 
     action_mask = torch.ones((batch_size, 2, ACT_SIZE), dtype=torch.bool)
     encoded = policy.encode(observations, action_mask)
     return encoded, action_mask, _empty_memory(policy, batch_size)
-
-
-def _tiny_policy() -> PolicyNet:
-    return build_policy(ModelConfig(64, 2, 1, 256), default_runtime_resources())
-
-
-def _batch(
-    policy: PolicyNet, batch_size: int = 3
-) -> tuple[StructuredObservation, torch.Tensor, torch.Tensor]:
-    obs = StructuredObservation.empty_batch(batch_size)
-    masks = torch.ones((batch_size, 2, policy.act_size), dtype=torch.bool)
-    actions = torch.zeros((batch_size, 2), dtype=torch.long)
-    return obs, masks, actions
-
-
-def _live_and_magnet_logits(
-    policy: PolicyNet,
-    magnet: Magnet,
-    obs: StructuredObservation,
-    masks: torch.Tensor,
-    actions: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    live_encoded = policy.encode(obs, masks)
-    live_memory = _empty_memory(policy, obs.numerical.size(0))
-    live = policy.evaluate(policy.prepare(live_encoded, live_memory), masks, actions).logits
-    magnet_encoded = magnet.policy.encode(obs, masks)
-    magnet_memory = _empty_memory(magnet.policy, obs.numerical.size(0))
-    mag = magnet.policy.evaluate(
-        magnet.policy.prepare(magnet_encoded, magnet_memory), masks, actions
-    )
-    return live, mag.logits
 
 
 @pytest.fixture
@@ -407,8 +375,6 @@ class TestPolicy:
         out = policy.act(policy.prepare(encoded, _empty_memory(policy, 2)), action_mask)
         loss = out.value.mean() - out.log_probs.mean()
 
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
-        optimizer.zero_grad()
         loss.backward()
 
         missing_grads: list[str] = []

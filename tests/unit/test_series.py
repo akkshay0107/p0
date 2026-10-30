@@ -9,7 +9,7 @@ from p0.battle.series import SeriesPerspectiveKey
 
 class TestSeries:
     def test_series_perspective_key_validation(self) -> None:
-        """Verify format string serialization and parsing of SeriesPerspectiveKey."""
+        """Verify series IDs and player slots are validated."""
         key = SeriesPerspectiveKey(
             series_id="test-series-123",
             canonical_player=0,

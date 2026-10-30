@@ -37,7 +37,7 @@ def player():
         account_configuration=AccountConfiguration("StressRandomB", None),
         start_listening=False,
     )
-    yield rl_player
+    return rl_player
 
 
 def _battle(tag: str, *, with_request: bool) -> DoubleBattle:

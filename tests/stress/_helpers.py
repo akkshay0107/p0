@@ -124,8 +124,7 @@ def _random_stat_points(rng: random.Random) -> StatPoints:
     """
     Sample random EV point allocations respecting the maximum total EV budget constraint.
 
-    Generates 6 stat points in [0, 32] such that their sum does not exceed 66 total points
-    (representing the 508 EV cap in Showdown VGC / Singles).
+    Generates 6 stat points in [0, 32] that stay within this format's 66-point cap.
     """
     while True:
         values = [rng.randrange(33) for _ in range(6)]
@@ -211,7 +210,7 @@ def _random_team_members(rng: random.Random) -> tuple[TeamMember, ...]:
     )
 
 
-def stress_random_team_record(rng: random.Random, *, label: str = "stress") -> TeamRecord:
+def stress_random_team_record(rng: random.Random) -> TeamRecord:
     """Build a six-member team admitted by the active format's species-aware dex pools."""
     members = _random_team_members(rng)
     return TeamRecord(
@@ -232,7 +231,7 @@ def stress_random_replay_teams(
     return teams[0], teams[1]
 
 
-def stress_series_id(parent: str, players: tuple[str, str] = ("Alice", "Bob")) -> str:
+def stress_series_id(parent: str) -> str:
     """Expected source reference for the generated parent and two named players."""
     return json.dumps([FORMAT.bo3_format, parent, ["alice", "bob"]], separators=(",", ":"))
 
@@ -372,35 +371,31 @@ def stress_random_bo3_payloads(
     return tuple(payloads)
 
 
-def stress_int(
+def stress_count(
     name: str,
     default: int,
     *,
     minimum: int = 1,
-    raw_value: str | None = None,
 ) -> int:
     """Read a positive integer stress-test control from the environment."""
-    configured_value = os.getenv(name, str(default)) if raw_value is None else raw_value
-    value = int(configured_value)
+    value = int(os.getenv(name, str(default)))
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}, got {value}")
     return value
 
 
-def stress_batch_sizes(raw_value: str | None = None) -> tuple[int, ...]:
+def stress_batch_sizes() -> tuple[int, ...]:
     """Return configured model batch sizes, preserving declaration order."""
-    configured_value = os.getenv("P0_STRESS_BATCHES", "1,8,32") if raw_value is None else raw_value
+    configured_value = os.getenv("P0_STRESS_BATCHES", "1,8,32")
     values = tuple(int(value.strip()) for value in configured_value.split(",") if value.strip())
     if not values or any(value < 1 for value in values):
         raise ValueError("P0_STRESS_BATCHES must contain positive integers")
     return tuple(dict.fromkeys(values))
 
 
-def stress_devices(raw_value: str | None = None) -> tuple[torch.device, ...]:
+def stress_devices() -> tuple[torch.device, ...]:
     """Return requested stress-test devices, filtering unavailable CUDA and duplicates."""
-    configured_value = (
-        os.getenv("P0_STRESS_DEVICES", "cpu,cuda") if raw_value is None else raw_value
-    )
+    configured_value = os.getenv("P0_STRESS_DEVICES", "cpu,cuda")
     requested = tuple(
         value.strip().lower() for value in configured_value.split(",") if value.strip()
     )
@@ -417,16 +412,6 @@ def stress_devices(raw_value: str | None = None) -> tuple[torch.device, ...]:
     return tuple(dict.fromkeys(devices))
 
 
-def stress_repetitions(default: int = 32) -> int:
-    """Return the number of repeated operations for lifecycle tests."""
-    return stress_int("P0_STRESS_REPETITIONS", default)
-
-
-def stress_count(name: str, default: int) -> int:
-    """Return a configurable workload count."""
-    return stress_int(name, default)
-
-
-def stress_rng(name: str = "P0_STRESS_SEED", default: int = 20260805) -> random.Random:
+def stress_rng() -> random.Random:
     """Return a deterministic RNG for randomized stress inputs."""
-    return random.Random(stress_int(name, default, minimum=0))
+    return random.Random(stress_count("P0_STRESS_SEED", 20260805, minimum=0))

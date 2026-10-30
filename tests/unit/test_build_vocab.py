@@ -1,7 +1,6 @@
 """Tests for vocabulary generation from the pinned dex."""
 
 import json
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -32,7 +31,7 @@ class TestBuildVocab:
 
     def test_unknown_legal_effect_namespace_fails_generation(self, tmp_path: Path) -> None:
         """Verify build_vocab fails with ValueError if an unknown effect namespace is introduced into legal effects."""
-        dex = deepcopy(json.loads((ROOT / "data/champions_dex.json").read_text()))
+        dex = json.loads((ROOT / "data/champions_dex.json").read_text())
         dex["legalProtocolEffects"]["unmapped_family"] = ["reachableeffect"]
         dex_path = tmp_path / "dex.json"
         dex_path.write_text(json.dumps(dex), encoding="utf-8")

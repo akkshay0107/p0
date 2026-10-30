@@ -123,7 +123,7 @@ class TestLegality:
         assert slot1_mask[0]
         assert not slot1_mask[3]
 
-    def test_struggle_env_roundtrip(self) -> None:
+    def test_forced_move_actions_cover_standard_and_mega_variants(self) -> None:
         """Verify forced moves map to action 48 (standard forced move) or 47 (mega-forced move)."""
         view = _struggle_battle(can_mega=False)
         assert list(legal_actions(view, 0)) == [48]

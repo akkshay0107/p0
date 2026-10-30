@@ -21,7 +21,6 @@ def default_test_corpus() -> TeamCorpus:
 def team_variant(
     species: str = "Pikachu",
     item: str = "Light Ball",
-    source_series: tuple[str, ...] = ("series-1",),
     move: str = "Fake Out",
     members: Sequence[TeamMember] | None = None,
     spreads: tuple[StatPoints, ...] | None = None,
@@ -73,10 +72,9 @@ def team_variant(
             ),
         )
 
-    return TeamRecord(
-        team=CanonicalTeam(tuple(members)),
-        spreads=spreads or tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members),
-    )
+    if spreads is None:
+        spreads = tuple(StatPoints(hp=2, spa=32, spe=32) for _ in members)
+    return TeamRecord(team=CanonicalTeam(tuple(members)), spreads=spreads)
 
 
 def sample_vocabulary() -> dict[str, dict[str, int]]:

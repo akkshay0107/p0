@@ -14,7 +14,7 @@ from p0.battle.events import (
     SpatialEventRecorder,
 )
 from p0.model.tokenizer import tokenizer
-from tests.stress._helpers import stress_repetitions
+from tests.stress._helpers import stress_count
 
 _ACTORS = st.sampled_from(("p1a", "p1b", "p2a", "p2b"))
 _TURN_LINES = st.tuples(_ACTORS, _ACTORS, st.booleans(), st.booleans(), st.booleans())
@@ -29,7 +29,11 @@ _POSITIONS = {
 class TestSpatialEventRecorder:
     @pytest.mark.stress
     @settings(max_examples=32, deadline=None)
-    @given(turns=st.lists(_TURN_LINES, min_size=1, max_size=stress_repetitions(default=1000)))
+    @given(
+        turns=st.lists(
+            _TURN_LINES, min_size=1, max_size=stress_count("P0_STRESS_REPETITIONS", 1000)
+        )
+    )
     def test_generated_streams_stay_bounded_and_valid(
         self, turns: list[tuple[str, str, bool, bool, bool]]
     ) -> None:

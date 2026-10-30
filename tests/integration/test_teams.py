@@ -43,10 +43,7 @@ class TestTeamScale:
         del showdown_assets
         count = stress_count("P0_STRESS_TEAM_VARIANTS", 1024)
         rng = stress_rng()
-        variants = tuple(
-            stress_random_team_record(rng, label=f"batched-stress-{index}")
-            for index in range(count)
-        )
+        variants = tuple(stress_random_team_record(rng) for _ in range(count))
         batch_size = stress_count("P0_STRESS_TEAM_BATCH_SIZE", 64)
         results = validate_many_batched(
             variants,

@@ -376,7 +376,7 @@ def _random_team_source(directory: Path, *, seed: int, count: int) -> TeamCorpus
     directory.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     for index in range(count):
-        record = stress_random_team_record(rng, label=f"live-random-{index}")
+        record = stress_random_team_record(rng)
         (directory / f"random-{index:04d}.txt").write_text(
             _showdown_team_text(record.team.members, record.spreads), encoding="utf-8"
         )

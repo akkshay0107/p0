@@ -79,8 +79,6 @@ class TestTrajectory:
             rtol=0,
             atol=1e-6,
         )
-        assert result.advantages.mean().item() == pytest.approx(0.0, abs=1e-6)
-        assert result.advantages.var(unbiased=False).item() == pytest.approx(1.0, abs=1e-6)
 
     def test_completed_batch_only_retains_ppo_inputs_on_target_device(self) -> None:
         """Verify preparation drops collection-only tensors and moves PPO inputs."""

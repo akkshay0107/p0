@@ -17,7 +17,6 @@ class TestStatPoints:
     def test_default_values(self) -> None:
         points = StatPoints()
         assert points.as_tuple() == (0, 0, 0, 0, 0, 0)
-        assert sum(points.as_tuple()) == 0
 
     def test_valid_spread_at_limits(self) -> None:
         points = StatPoints(hp=32, atk=32, spe=2)
