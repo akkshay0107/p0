@@ -149,14 +149,19 @@ class EvalOutput(NamedTuple):
     logits: Tensor
 
 
-class PointerOutputs(NamedTuple):
-    """Logits and concrete key groups produced by one pointer head."""
+class SharedPointerKeys(NamedTuple):
+    """Query-independent entity keys shared by both action slots."""
 
-    logits: Tensor
-    switch_keys: Tensor
+    ally_keys: Tensor
+    orig_ids: Tensor
+    tp_pair_keys: Tensor
+
+
+class MovePointerKeys(NamedTuple):
+    """Move-target keys for one action slot."""
+
     move_keys: Tensor
     mega_move_keys: Tensor
-    tp_pair_keys: Tensor
 
 
 def _require_matching_batch(reduced: ReducerOutput, enc: EncodedObs) -> None:
@@ -284,87 +289,59 @@ class ActorPolicy(nn.Module):
     def _first_pointer(
         self,
         z: Tensor,
-        k_entity_extended: Tensor,
-        aux_moves: Tensor,
-        numerical: Tensor,
-        phase: Tensor,
-    ) -> PointerOutputs:
-        """Score the first action slot from the readout and its entity keys."""
-        return self._compute_pointer_logits(
-            self._compute_first_pointer_query(z, k_entity_extended, phase),
-            k_entity_extended,
-            aux_moves,
-            numerical,
-            phase,
-        )
-
-    def _compute_first_pointer_query(
-        self,
-        z: Tensor,
-        k_entity_extended: Tensor,
+        shared: SharedPointerKeys,
+        moves: MovePointerKeys,
         phase: Tensor,
     ) -> Tensor:
-        """Build the first-slot phase-aware query."""
-        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
+        """Build and score the first-slot phase-aware query."""
         decision_owner = torch.where(
             phase.unsqueeze(-1),
             self.tp_lead_role.unsqueeze(0),
-            k_ally[:, 0],
+            shared.ally_keys[:, 0],
         )
-        return self.q_proj1(torch.cat([z, decision_owner], dim=-1))
+        query = self.q_proj1(torch.cat([z, decision_owner], dim=-1))
+        return self._compute_pointer_logits(query, shared, moves, phase)
 
     def _compute_second_pointer_query(
         self,
         z: Tensor,
-        k_entity_extended: Tensor,
+        ally_keys: Tensor,
         phase: Tensor,
         ctx_a1: Tensor,
     ) -> Tensor:
         """Build the second-slot query conditioned on the selected first action."""
-        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
         decision_owner = torch.where(
             phase.unsqueeze(-1),
             self.tp_back_role.unsqueeze(0),
-            k_ally[:, 1],
+            ally_keys[:, 1],
         )
         return self.q_proj2(torch.cat([z, decision_owner, ctx_a1], dim=-1))
 
-    def _compute_pointer_logits(
+    def _compute_shared_pointer_keys(
         self,
-        q_all: Tensor,
+        k_entity_extended: Tensor,
+        numerical: Tensor,
+    ) -> SharedPointerKeys:
+        """Build switch indices and preview keys once for an observation batch."""
+        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
+        orig_ids = torch.round(
+            numerical[:, self.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] * TEAM_SIZE
+        ).long()
+        orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
+        tp_pair_keys_grid = (k_ally.unsqueeze(2) + k_ally.unsqueeze(1)) / math.sqrt(2.0)
+        tp_pair_keys = self.tp_pair_proj(
+            tp_pair_keys_grid.reshape(k_ally.size(0), TP_END, self.d_k)
+        )
+        return SharedPointerKeys(k_ally, orig_ids, tp_pair_keys)
+
+    def _compute_move_pointer_keys(
+        self,
         k_entity_extended: Tensor,
         aux_moves: Tensor,
-        numerical: Tensor,
-        phase: Tensor,
-    ) -> PointerOutputs:
-        """Score one pointer query against all action candidates."""
-        B = q_all.size(0)
-        device = q_all.device
-        pointer_scale = math.sqrt(self.d_k)
-
+    ) -> MovePointerKeys:
+        """Project one slot's move-target keys before expanding BC candidates."""
+        B = k_entity_extended.size(0)
         k_moves = self.w_k_move(aux_moves)
-        k_ally = k_entity_extended[:, self.ally_poke_entities, :]
-
-        q_switch, q_move, q_pass, q_tp = torch.split(q_all, self.d_k, dim=-1)
-
-        # One scratch column past the action count absorbs switch scatter for empty
-        # ally rows (orig ratio 0), which would otherwise land on the pass slot.
-        logits = torch.zeros((B, self.act_size + 1), device=device)
-
-        logits[:, PASS_ACTION] = ((q_pass * self.pass_key).sum(dim=-1) / pointer_scale).to(
-            logits.dtype
-        )
-
-        switch_scores = torch.einsum("bd,bnd->bn", q_switch, k_ally) / pointer_scale
-        orig_ids = torch.round(numerical[:, self.ally_token_pos, NUM_IDX_ORIG_IDX_RATIO] * 6).long()
-        orig_ids = torch.where(orig_ids > 0, orig_ids, self.act_size)
-        logits.scatter_(1, orig_ids, switch_scores.to(logits.dtype))
-        # Switching uses roster IDs even though entity rows put active Pokemon first.
-        switch_indices = (orig_ids - SWITCH_START).clamp_max(TEAM_SIZE)
-        switch_keys = k_ally.new_zeros((B, TEAM_SIZE + 1, self.d_k)).scatter(
-            1, switch_indices.unsqueeze(-1).expand_as(k_ally), k_ally
-        )
-
         k_targets = k_entity_extended[:, self.target_entity_indices, :]
         # Broadcast grids remain views until concatenation materializes
         # each combined move-target record once.
@@ -374,15 +351,36 @@ class ActorPolicy(nn.Module):
         move_action_keys = self.move_target_proj(
             torch.cat([k_moves_grid, k_targets_grid], dim=-1).reshape(B, 20, 2 * self.d_k)
         )
-        move_scores = torch.einsum("bd,bnd->bn", q_move, move_action_keys) / pointer_scale
-
-        logits[:, MOVE_START:MOVE_END] = move_scores.to(logits.dtype)
-
         k_mega_moves_grid = (k_moves + self.mega_emb).unsqueeze(2).expand(-1, -1, 5, -1)
         mega_action_keys = self.move_target_proj(
             torch.cat([k_mega_moves_grid, k_targets_grid], dim=-1).reshape(B, 20, 2 * self.d_k)
         )
-        mega_scores = torch.einsum("bd,bnd->bn", q_move, mega_action_keys) / pointer_scale
+        return MovePointerKeys(move_action_keys, mega_action_keys)
+
+    def _compute_pointer_logits(
+        self,
+        q_all: Tensor,
+        shared: SharedPointerKeys,
+        moves: MovePointerKeys,
+        phase: Tensor,
+    ) -> Tensor:
+        """Score a query against already-projected action keys."""
+        pointer_scale = math.sqrt(self.d_k)
+        q_switch, q_move, q_pass, q_tp = torch.split(q_all, self.d_k, dim=-1)
+
+        # One scratch column past the action count absorbs switch scatter for empty
+        # ally rows (orig ratio 0), which would otherwise land on the pass slot.
+        logits = torch.zeros((q_all.size(0), self.act_size + 1), device=q_all.device)
+        logits[:, PASS_ACTION] = ((q_pass * self.pass_key).sum(dim=-1) / pointer_scale).to(
+            logits.dtype
+        )
+        switch_scores = torch.einsum("bd,bnd->bn", q_switch, shared.ally_keys) / pointer_scale
+        logits.scatter_(1, shared.orig_ids, switch_scores.to(logits.dtype))
+
+        move_scores = torch.einsum("bd,bnd->bn", q_move, moves.move_keys) / pointer_scale
+        logits[:, MOVE_START:MOVE_END] = move_scores.to(logits.dtype)
+
+        mega_scores = torch.einsum("bd,bnd->bn", q_move, moves.mega_move_keys) / pointer_scale
 
         logits[:, MEGA_MOVE_START:MEGA_MOVE_END] = mega_scores.to(logits.dtype)
 
@@ -395,26 +393,16 @@ class ActorPolicy(nn.Module):
             logits.dtype
         )
 
-        is_tp_column = phase.unsqueeze(-1)
-
-        tp_pair_keys_grid = (k_ally.unsqueeze(2) + k_ally.unsqueeze(1)) / math.sqrt(2.0)
-        tp_pair_keys = self.tp_pair_proj(tp_pair_keys_grid.reshape(B, TP_END, self.d_k))
-        tp_scores = torch.einsum("bd,bnd->bn", q_tp, tp_pair_keys) / pointer_scale
-
+        tp_scores = torch.einsum("bd,bnd->bn", q_tp, shared.tp_pair_keys) / pointer_scale
         logits[:, TP_START:TP_END] = torch.where(
-            is_tp_column, tp_scores, logits[:, TP_START:TP_END]
+            phase.unsqueeze(-1), tp_scores, logits[:, TP_START:TP_END]
         ).to(logits.dtype)
-        return PointerOutputs(
-            logits=logits[:, : self.act_size],
-            switch_keys=switch_keys[:, :TEAM_SIZE],
-            move_keys=move_action_keys,
-            mega_move_keys=mega_action_keys,
-            tp_pair_keys=tp_pair_keys,
-        )
+        return logits[:, : self.act_size]
 
     def _select_action_keys(
         self,
-        outputs: PointerOutputs,
+        shared: SharedPointerKeys,
+        moves: MovePointerKeys,
         actions: Tensor,
         phase: Tensor,
         batch_indices: Tensor,
@@ -423,10 +411,16 @@ class ActorPolicy(nn.Module):
         batch_size = actions.size(0)
         key = self.pass_key.unsqueeze(0).expand(batch_size, -1)
 
+        # Switching uses roster IDs even though entity rows put active Pokemon first.
+        switch_indices = (shared.orig_ids - SWITCH_START).clamp_max(TEAM_SIZE)
+        switch_keys = shared.ally_keys.new_zeros(
+            (shared.ally_keys.size(0), TEAM_SIZE + 1, self.d_k)
+        ).scatter(1, switch_indices.unsqueeze(-1).expand_as(shared.ally_keys), shared.ally_keys)
+
         for start, end, keys in (
-            (SWITCH_START, MOVE_START, outputs.switch_keys),
-            (MOVE_START, MOVE_END, outputs.move_keys),
-            (MEGA_MOVE_START, MEGA_MOVE_END, outputs.mega_move_keys),
+            (SWITCH_START, MOVE_START, switch_keys[:, :TEAM_SIZE]),
+            (MOVE_START, MOVE_END, moves.move_keys),
+            (MEGA_MOVE_START, MEGA_MOVE_END, moves.mega_move_keys),
         ):
             selected = (actions >= start) & (actions < end)
             index = (actions - start).clamp(0, end - start - 1)
@@ -434,7 +428,7 @@ class ActorPolicy(nn.Module):
 
         tp = phase & (actions < TP_END)
         tp_index = actions.clamp(0, TP_END - 1)
-        tp_key = outputs.tp_pair_keys[batch_indices, tp_index]
+        tp_key = shared.tp_pair_keys[batch_indices, tp_index]
         key = torch.where(tp[:, None], tp_key, key)
 
         mega_struggle = actions == MEGA_FORCED_ACTION
@@ -492,21 +486,22 @@ class ActorPolicy(nn.Module):
         _require_matching_batch(reduced, enc)
         z = reduced.cls
         keys = self._compute_keys(reduced.pokemon)
-        first = self._first_pointer(z, keys, enc.aux[:, 0], enc.numerical, enc.phase)
-        logits1 = first.logits.masked_fill(action_mask[:, 0] == 0, float("-inf"))
+        shared = self._compute_shared_pointer_keys(keys, enc.numerical)
+        first_moves = self._compute_move_pointer_keys(keys, enc.aux[:, 0])
+        first = self._first_pointer(z, shared, first_moves, enc.phase)
+        logits1 = first.masked_fill(action_mask[:, 0] == 0, float("-inf"))
         a1, log_prob1 = self._choose_action(logits1, top_p=top_p, greedy=greedy)
         context = self._select_action_keys(
-            first, a1, enc.phase, torch.arange(a1.size(0), device=a1.device)
+            shared, first_moves, a1, enc.phase, torch.arange(a1.size(0), device=a1.device)
         )
         second = self._compute_pointer_logits(
-            self._compute_second_pointer_query(z, keys, enc.phase, context),
-            keys,
-            enc.aux[:, 1],
-            enc.numerical,
+            self._compute_second_pointer_query(z, shared.ally_keys, enc.phase, context),
+            shared,
+            self._compute_move_pointer_keys(keys, enc.aux[:, 1]),
             enc.phase,
         )
         logits = self._apply_sequential_masks(
-            torch.stack([logits1, second.logits], dim=1), a1, action_mask, enc.phase
+            torch.stack([logits1, second], dim=1), a1, action_mask, enc.phase
         )
         a2, log_prob2 = self._choose_action(logits[:, 1], top_p=top_p, greedy=greedy)
         return torch.stack([a1, a2], dim=-1), log_prob1 + log_prob2, z, reduced.local_history_token
@@ -535,20 +530,21 @@ class ActorPolicy(nn.Module):
     ) -> Tensor:
         """Build masked logits for a known joint action's sequential context."""
         k_entity_extended = self._compute_keys(pokemon)
-        first = self._first_pointer(z, k_entity_extended, aux[:, 0], numerical, phase)
+        shared = self._compute_shared_pointer_keys(k_entity_extended, numerical)
+        first_moves = self._compute_move_pointer_keys(k_entity_extended, aux[:, 0])
+        first = self._first_pointer(z, shared, first_moves, phase)
         a1 = actions[:, 0]
         ctx_a1 = self._select_action_keys(
-            first, a1, phase, torch.arange(a1.size(0), device=a1.device)
+            shared, first_moves, a1, phase, torch.arange(a1.size(0), device=a1.device)
         )
         second = self._compute_pointer_logits(
-            self._compute_second_pointer_query(z, k_entity_extended, phase, ctx_a1),
-            k_entity_extended,
-            aux[:, 1],
-            numerical,
+            self._compute_second_pointer_query(z, shared.ally_keys, phase, ctx_a1),
+            shared,
+            self._compute_move_pointer_keys(k_entity_extended, aux[:, 1]),
             phase,
         )
         return self._apply_sequential_masks(
-            torch.stack([first.logits, second.logits], dim=1), a1, action_mask, phase
+            torch.stack([first, second], dim=1), a1, action_mask, phase
         )
 
     def forward(
@@ -643,31 +639,50 @@ class ActorPolicy(nn.Module):
             return candidate_values.new_empty((0,), dtype=enc.tokens.dtype)
         z = reduced.cls
         k_entity_extended = self._compute_keys(reduced.pokemon)
-        first = self._first_pointer(z, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase)
+        shared = self._compute_shared_pointer_keys(k_entity_extended, enc.numerical)
+        first_moves = self._compute_move_pointer_keys(k_entity_extended, enc.aux[:, 0])
+        first = self._first_pointer(z, shared, first_moves, enc.phase)
         counts = offsets[1:] - offsets[:-1]
         candidate_batch = torch.repeat_interleave(
             torch.arange(batch_size, device=enc.tokens.device), counts
         )
         first_actions = candidate_values[:, 0]
         candidate_ctx = self._select_action_keys(
-            first,
+            shared,
+            first_moves,
             first_actions,
             enc.phase[candidate_batch],
             candidate_batch,
         )
+        # Sparse labels can have fewer candidates than observations. Project the
+        # smaller batch without reading tensor values or synchronizing the device.
+        if candidate_values.size(0) < batch_size:
+            second_moves = self._compute_move_pointer_keys(
+                k_entity_extended[candidate_batch], enc.aux[candidate_batch, 1]
+            )
+        else:
+            second_moves = self._compute_move_pointer_keys(k_entity_extended, enc.aux[:, 1])
+            second_moves = MovePointerKeys(
+                second_moves.move_keys[candidate_batch],
+                second_moves.mega_move_keys[candidate_batch],
+            )
+        candidate_shared = SharedPointerKeys(
+            shared.ally_keys[candidate_batch],
+            shared.orig_ids[candidate_batch],
+            shared.tp_pair_keys[candidate_batch],
+        )
         second = self._compute_pointer_logits(
             self._compute_second_pointer_query(
                 z[candidate_batch],
-                k_entity_extended[candidate_batch],
+                candidate_shared.ally_keys,
                 enc.phase[candidate_batch],
                 candidate_ctx,
             ),
-            k_entity_extended[candidate_batch],
-            enc.aux[candidate_batch, 1],
-            enc.numerical[candidate_batch],
+            candidate_shared,
+            second_moves,
             enc.phase[candidate_batch],
         )
-        candidate_logits = torch.stack((first.logits[candidate_batch], second.logits), dim=1)
+        candidate_logits = torch.stack((first[candidate_batch], second), dim=1)
         candidate_logits = self._apply_sequential_masks(
             candidate_logits,
             first_actions,
@@ -684,9 +699,13 @@ class ActorPolicy(nn.Module):
     def unmasked_first_slot_logits(self, reduced: ReducerOutput, enc: EncodedObs) -> Tensor:
         """First-slot unmasked logits for diagnostics, reusing an already-reduced batch."""
         k_entity_extended = self._compute_keys(reduced.pokemon)
+        shared = self._compute_shared_pointer_keys(k_entity_extended, enc.numerical)
         return self._first_pointer(
-            reduced.cls, k_entity_extended, enc.aux[:, 0], enc.numerical, enc.phase
-        ).logits
+            reduced.cls,
+            shared,
+            self._compute_move_pointer_keys(k_entity_extended, enc.aux[:, 0]),
+            enc.phase,
+        )
 
     def _apply_sequential_masks(
         self,
