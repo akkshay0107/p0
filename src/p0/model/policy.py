@@ -799,7 +799,7 @@ class PolicyNet(nn.Module):
             tokens=tokens,
             aux=aux,
             numerical=obs.numerical,
-            phase=is_teampreview(obs.numerical).detach().clone(),
+            phase=is_teampreview(obs.numerical),
             local_history_token=self.actor.reducer.local_summary(tokens),
         )
 

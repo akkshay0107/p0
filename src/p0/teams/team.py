@@ -98,7 +98,8 @@ class CanonicalTeam:
         return encoded.decode("utf-8")
 
     def to_dict(self) -> dict[str, object]:
-        return {"members": [member.to_dict() for member in self.canonical().members]}
+        members = sorted(self.members, key=lambda member: normalize_id(member.species))
+        return {"members": [member.to_dict() for member in members]}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> CanonicalTeam:

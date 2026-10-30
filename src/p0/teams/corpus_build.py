@@ -33,7 +33,7 @@ def audit_corpus(
             if not part:
                 continue
             fields = part.split("|")
-            if not fields or not fields[0]:
+            if not fields[0]:
                 continue
             species = fields[1] if len(fields) > 1 and fields[1] else fields[0]
             species_set.add(PokemonTokenizer.normalize_id(species))

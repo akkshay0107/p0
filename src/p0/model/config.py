@@ -4,17 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from p0.contracts import require_dataclass_fields
 from p0.model.architecture_contract import EVENT_RAW_WIDTH
 
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    """
-    Architecture choices for constructing a new policy.
-
-    This checkpoint intentionally contains architecture only. Compatibility
-    fingerprints and resource-bundle identity remain deferred.
-    """
+    """Architecture choices stored with each policy checkpoint."""
 
     d_model: int
     nhead: int
@@ -44,7 +40,7 @@ class ModelConfig:
             dim_feedforward=1536,
         )
 
-    def to_dict(self) -> dict[str, int | bool]:
+    def to_dict(self) -> dict[str, int]:
         return {
             "d_model": self.d_model,
             "nhead": self.nhead,
@@ -56,14 +52,5 @@ class ModelConfig:
     def from_dict(cls, value: object) -> ModelConfig:
         if not isinstance(value, dict):
             raise ValueError("ModelConfig must be an object")
-        expected = {
-            "d_model",
-            "nhead",
-            "reducer_layers",
-            "dim_feedforward",
-        }
-        unknown = sorted(set(value) - expected)
-        missing = sorted(expected - set(value))
-        if unknown or missing:
-            raise ValueError(f"Invalid ModelConfig fields: missing={missing}, unknown={unknown}")
+        require_dataclass_fields(value, cls)
         return cls(**value)  # type: ignore[arg-type]

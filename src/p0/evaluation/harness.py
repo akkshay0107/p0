@@ -238,9 +238,8 @@ class EvaluationHarness:
 
         Returns:
             MatchupResult with series counts, ties, player A's win rate and
-            Wilson confidence interval, and win counts keyed by the first 8 hex
-            characters of each packed team's SHA-256, for team pairs and for
-            each side's teams.
+            Wilson confidence interval, and win counts keyed by packed team
+            strings for team pairs and for each side's teams.
         """
         logger.info(
             "Starting matchup: %s vs %s (%d episodes)",
@@ -296,11 +295,9 @@ class EvaluationHarness:
             player_a.history, player_b.history, strict=True
         ):
             if team_a and team_b:
-                ha = team_a
-                hb = team_b
-                _record(per_team, f"{ha}:{hb}", won_a)
-                _record(per_team_a, ha, won_a)
-                _record(per_team_b, hb, won_b)
+                _record(per_team, f"{team_a}:{team_b}", won_a)
+                _record(per_team_a, team_a, won_a)
+                _record(per_team_b, team_b, won_b)
 
         return MatchupResult(
             policy_a=name_a,

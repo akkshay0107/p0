@@ -363,8 +363,6 @@ def _write_effects(
     if not entries:
         return
     entries.sort(key=lambda entry: (int(entry[0]), entry[1]))
-    if numerical.shape[0] <= NUM_IDX_EFFECT_OVERFLOW:
-        return
     numerical[NUM_IDX_EFFECT_COUNT] = float(len(entries))
     numerical[NUM_IDX_EFFECT_OVERFLOW] = float(max(0, len(entries) - MAX_EFFECTS))
     for index, (namespace, effect_id, kind, value, stacks, remaining_known, remaining) in enumerate(
@@ -422,10 +420,6 @@ def _pokemon_categorical_into(
     stat_provenance: StatProvenance = StatProvenance.PAD,
 ) -> None:
     if pokemon is None:
-        row[CAT_IDX_IDENTITY_KNOWNNESS] = IdentityKnownness.PAD
-        row[CAT_IDX_STAT_PROVENANCE] = StatProvenance.PAD
-        row[CAT_IDX_PRESENCE_STATUS] = PresenceStatus.PAD
-        row[CAT_IDX_MECHANIC_STATE] = MechanicState.NORMAL
         return
 
     row[0] = tok.species_id(pokemon)
@@ -529,7 +523,8 @@ def _pokemon_numeric_into(
 
     row[NUM_IDX_HP_FRACTION] = float(pokemon.current_hp_fraction)
 
-    row[6:12] = [pokemon.base_stats[s] / 160.0 for s in ("hp", "atk", "def", "spa", "spd", "spe")]
+    base_stats = pokemon.base_stats
+    row[6:12] = [base_stats[stat] / 160.0 for stat in _STAT_KEYS]
     row[12:19] = [
         pokemon.boosts[s] / 6.0 for s in ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
     ]

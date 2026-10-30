@@ -164,8 +164,6 @@ class MemoryReducer(nn.Module):
             ],
             dim=1,
         )
-        if sequence.size(1) != REDUCER_MAX_LENGTH:
-            raise RuntimeError(f"Reducer layout drifted to {sequence.size(1)} tokens")
         # Only the readout and Pokemon outputs are used; other rows still supply keys/values.
         current_start = SERIES_SLOTS + HISTORY_WINDOW
         encoded = self.encoder(

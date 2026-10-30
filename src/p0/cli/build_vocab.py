@@ -125,10 +125,9 @@ def build(
         if missing:
             missing_content[table] = missing
 
-    known_protocol_ids = set().union(*(enum_keys(enum) for _, enum in EFFECT_FAMILIES.values()))
-    known_protocol_ids.update(
-        normalize(identifier) for table in effect_tables.values() for identifier in vocab[table]
-    )
+    known_protocol_ids = {
+        identifier for table in effect_tables.values() for identifier in vocab[table]
+    }
 
     protocol_ids = {normalize(value) for value in dex.get("protocolEffects", [])}
     coverage = {

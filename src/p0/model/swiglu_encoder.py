@@ -103,8 +103,6 @@ class SwiGLUEncoderLayer(nn.Module):
         swiglu_hidden = (2 * dim_feedforward) // 3
         swiglu_hidden = (swiglu_hidden + 7) & ~7  # round up to nearest 8
 
-        self.swiglu_hidden = swiglu_hidden
-
         self.w13 = nn.Linear(d_model, 2 * swiglu_hidden, bias=bias)
         self.w2 = nn.Linear(swiglu_hidden, d_model, bias=bias)
 

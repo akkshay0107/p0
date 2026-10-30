@@ -23,8 +23,6 @@ class DynamicSeriesResampler(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = d_model
-        self.num_summary_tokens = num_summary_tokens
-
         self.summary_queries = nn.Parameter(torch.empty(1, num_summary_tokens, d_model))
         self.position_proj = nn.Linear(1, d_model)
         self.norm_q = nn.RMSNorm(d_model)

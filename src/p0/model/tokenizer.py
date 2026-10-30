@@ -63,7 +63,7 @@ class PokemonTokenizer:
 
         # all neutral natures map to serious
         # just present here in case showdown still has it
-        self.natures_list = [
+        natures = [
             "serious",  # default to serious
             "adamant",
             "bashful",
@@ -90,7 +90,7 @@ class PokemonTokenizer:
             "sassy",
             "timid",
         ]
-        self.natures = {nature: idx for idx, nature in enumerate(self.natures_list)}
+        self.natures = {nature: idx for idx, nature in enumerate(natures)}
         for nature in ("serious", "bashful", "docile", "hardy", "quirky"):
             self.natures[nature] = 0
 

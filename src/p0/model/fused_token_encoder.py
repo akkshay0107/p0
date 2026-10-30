@@ -67,7 +67,6 @@ from p0.model.swiglu_encoder import (
 )
 
 ACT_SIZE = FORMAT.action_size
-NUM_COMPONENTS = 14
 POKEMON_TYPE_START = 3
 POKEMON_TYPE_SLOTS = 2
 
@@ -483,7 +482,7 @@ class FusedTokenEncoder(nn.Module):
             )
         )
 
-        # combine all components into (N, NUM_COMPONENTS, d_model)
+        # Combine components into (N, component count, d_model).
         # Note: move_embs is (..., 4, d_model), others are (..., d_model)
         components = torch.cat(
             [

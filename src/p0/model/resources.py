@@ -17,7 +17,6 @@ class RuntimeResources:
     vocab: dict[str, dict[str, int]]
     dex: dict[str, Any]
     tokenizer: PokemonTokenizer
-    mega_items: frozenset[str]
     mega_forms: frozenset[str]
     # Species id to the id of its base species (Vivillon-Sandstorm to vivillon).
     species_bases: dict[str, str]
@@ -41,12 +40,6 @@ class RuntimeResources:
                 f"Incomplete runtime resources: vocab={missing_vocab}, dex={missing_dex}"
             )
         transformations = dex["transformations"]
-        mega_items = frozenset(
-            PokemonTokenizer.normalize_id(item)
-            for entry in transformations
-            if entry.get("isMega")
-            for item in entry.get("requiredItems", ())
-        )
         mega_forms = frozenset(
             PokemonTokenizer.normalize_id(entry["id"])
             for entry in transformations
@@ -67,7 +60,6 @@ class RuntimeResources:
             vocab=vocab,
             dex=dex,
             tokenizer=shared_tokenizer or PokemonTokenizer(vocab),
-            mega_items=mega_items,
             mega_forms=mega_forms,
             species_bases=species_bases,
             mega_species_by_item=mega_species_by_item,
