@@ -31,11 +31,12 @@ from p0.model.structured_observation import (
     NUM_IDX_HP_FRACTION,
     NUM_IDX_LEGALITY_UNKNOWN,
     NUM_IDX_LEVEL_STATS,
+    NUM_IDX_MEGA_FORM,
+    NUM_IDX_MOVE_LAST,
     NUM_IDX_MOVE_LEGAL,
     NUM_IDX_PREPARING,
     NUM_IDX_REVEALED,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
-    NUM_IDX_STAT_PROVENANCE,
     NUM_IDX_STATUS_COUNTER,
     SEQUENCE_LENGTH,
     TEAM_SIZE,
@@ -43,10 +44,8 @@ from p0.model.structured_observation import (
     IdentityKnownness,
     MechanicState,
     PresenceStatus,
-    SideId,
     StatProvenance,
     StructuredObservation,
-    TokenType,
     effect_cat_slice,
     effect_num_slice,
 )
@@ -66,35 +65,6 @@ _MEGA_SPECIES_BY_ITEM = _DEFAULT_RESOURCES.mega_species_by_item
 _STACKABLE_SIDE_CONDITION_NAMES = frozenset({"SPIKES", "TOXIC_SPIKES"})
 _KNOWN_DURATION_FIELD_NAMES = frozenset({"TRICK_ROOM", "MAGIC_ROOM", "WONDER_ROOM"})
 _EMPTY_MOVE_SLOTS: tuple[None, ...] = (None,) * MOVE_SLOTS
-
-_TOKEN_TYPE_LAYOUT = np.asarray(
-    (
-        *(TokenType.POKEMON for _ in range(TEAM_SIZE * 2)),
-        TokenType.FIELD,
-        TokenType.FIELD,
-        TokenType.FIELD,
-    ),
-    dtype=np.int64,
-)
-_SIDE_LAYOUT = np.asarray(
-    (
-        *(SideId.ALLY for _ in range(TEAM_SIZE)),
-        *(SideId.OPPONENT for _ in range(TEAM_SIZE)),
-        SideId.NONE,
-        SideId.ALLY,
-        SideId.OPPONENT,
-    ),
-    dtype=np.int64,
-)
-_SLOT_LAYOUT = np.asarray(
-    (
-        *(slot for _ in range(2) for slot in range(1, TEAM_SIZE + 1)),
-        0,
-        0,
-        0,
-    ),
-    dtype=np.int64,
-)
 
 
 def _status_counter_kind(status: object | None) -> CounterKind:
@@ -512,7 +482,6 @@ def _pokemon_numeric_into(
     move_slots: tuple[MoveView | None, ...],
     row: np.ndarray,
     level_stats: tuple[float, ...],
-    stat_provenance: StatProvenance,
     active_idx: int | None = None,
     is_opponent: bool = False,
 ) -> None:
@@ -539,14 +508,12 @@ def _pokemon_numeric_into(
 
     row[26] = 0.0 if orig_idx < 0 else (orig_idx + 1) / float(TEAM_SIZE)
     row[27] = pokemon.fainted
-    row[28] = cond == 1
-    row[29] = cond == 2
     row[NUM_IDX_CAN_MEGA] = (
         float(battle.can_mega_evolve[active_idx])
         if active_idx is not None and battle.decision.slots[active_idx].legality_known
         else 0.0
     )
-    row[31] = _is_mega_form(pokemon)
+    row[NUM_IDX_MEGA_FORM] = _is_mega_form(pokemon)
 
     last_move_id = None
     custom_last_move = battle.last_move(pokemon)
@@ -558,7 +525,7 @@ def _pokemon_numeric_into(
     if cond == 1 and last_move_id:
         for move_idx, move in enumerate(move_slots):
             if move is not None and move.id == last_move_id:
-                row[32 + move_idx] = 1.0
+                row[NUM_IDX_MOVE_LAST + move_idx] = 1.0
                 break
 
     row[NUM_IDX_STATUS_COUNTER] = min(pokemon.status_counter, 5) / 5.0
@@ -566,7 +533,6 @@ def _pokemon_numeric_into(
     row[NUM_IDX_PREPARING] = pokemon.preparing
 
     row[NUM_IDX_LEVEL_STATS : NUM_IDX_LEVEL_STATS + 6] = [stat / 300.0 for stat in level_stats]
-    row[NUM_IDX_STAT_PROVENANCE] = float(stat_provenance == StatProvenance.KNOWN)
 
     # action legality (allies only, the action mask is otherwise invisible to the
     # network, hiding choice lock / disable / trapping / force switches)
@@ -682,15 +648,9 @@ def _write_observation(
     Returns:
       None; writes directly into the out buffers
     """
-    token_types = out.token_type_ids.numpy()
-    sides = out.side_ids.numpy()
-    slots = out.slot_ids.numpy()
     categorical = out.categorical.numpy()
     numerical = out.numerical.numpy()
 
-    token_types[:] = _TOKEN_TYPE_LAYOUT
-    sides[:] = _SIDE_LAYOUT
-    slots[:] = _SLOT_LAYOUT
     categorical.fill(0)
     numerical.fill(0)
 
@@ -731,7 +691,6 @@ def _write_observation(
                 move_slots,
                 numerical[idx],
                 level_stats=level_stats,
-                stat_provenance=stat_prov,
                 active_idx=active_idx,
                 is_opponent=is_opponent,
             )

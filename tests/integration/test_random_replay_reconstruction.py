@@ -413,13 +413,6 @@ def _assert_expected_observation_fields(
     compare_event_values: bool = False,
 ) -> None:
     """Compare every field a public replay can reproduce at a shared boundary."""
-    fields = (
-        "token_type_ids",
-        "side_ids",
-        "slot_ids",
-    )
-    for name in fields:
-        torch.testing.assert_close(getattr(live, name), getattr(reconstructed, name))
     for index in _PUBLIC_CATEGORICAL_INDICES:
         torch.testing.assert_close(
             live.categorical[..., index], reconstructed.categorical[..., index]

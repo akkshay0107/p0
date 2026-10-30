@@ -54,6 +54,7 @@ from p0.replays.shards import (
     ShardIndexEntry,
     ShardManifest,
     observation_field_specs,
+    validate_shard_layout,
     validate_shard_summaries,
     validate_shard_tensors,
 )
@@ -808,6 +809,19 @@ def compile_to_shards(
                 and row["max_candidates"] == max_candidates
                 and exists
             ):
+                if entry is not None:
+                    cached = torch.load(
+                        root / "tensors" / entry["filename"],
+                        weights_only=True,
+                        map_location="cpu",
+                        mmap=True,
+                    )
+                    try:
+                        validate_shard_layout(cached["tensors"])
+                    except ValueError as exc:
+                        raise ValueError(
+                            "Cached observation layout is incompatible; use --force-reconstruct"
+                        ) from exc
                 continue
         pending.append(group)
     if pending:

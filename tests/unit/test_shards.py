@@ -115,6 +115,23 @@ class TestValidateShardTensors:
     def test_valid_tensors_pass(self) -> None:
         tensors = _valid_tensors()
         validate_shard_tensors(tensors)
+        assert tensors["numerical"].shape[1:] == (15, 113)
+
+    def test_legacy_observation_field_names_are_rejected(self) -> None:
+        tensors = _valid_tensors()
+        for name in ("token_type_ids", "side_ids", "slot_ids"):
+            tensors[name] = torch.zeros((2, 15), dtype=torch.long)
+
+        with pytest.raises(ValueError, match="Shard tensor fields mismatch"):
+            validate_shard_tensors(tensors)
+
+    def test_legacy_numerical_width_is_rejected(self) -> None:
+        tensors = _valid_tensors()
+        tensors["numerical"] = torch.zeros((2, 15, 116), dtype=torch.float32)
+        tensors["final_numerical"] = torch.zeros((1, 15, 116), dtype=torch.float32)
+
+        with pytest.raises(ValueError, match="numerical.*expected"):
+            validate_shard_tensors(tensors)
 
     def test_missing_field_raises(self) -> None:
         tensors = _valid_tensors()

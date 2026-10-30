@@ -445,6 +445,35 @@ class TestLoadedCheckpoint:
 
 
 class TestRuntimeCompatibility:
+    @pytest.mark.parametrize(
+        ("parameter_name", "new_shape", "old_shape"),
+        (
+            ("encoder.owner_scalar_proj.weight", (32, 51), (32, 54)),
+            ("encoder.pokemon_scalar_proj.weight", (32, 38), (32, 41)),
+        ),
+    )
+    def test_checkpoint_rejects_projection_weights_from_old_observation_layout(
+        self,
+        tmp_path: Path,
+        parameter_name: str,
+        new_shape: tuple[int, int],
+        old_shape: tuple[int, int],
+    ) -> None:
+        path = tmp_path / "policy.pt"
+        store = CheckpointStore()
+        policy = _small_policy()
+        store.save_policy(path, policy)
+        artifact = dict(store.read(path).artifact)
+        state = dict(artifact["model_state_dict"])
+
+        assert tuple(state[parameter_name].shape) == new_shape
+        state[parameter_name] = torch.zeros(old_shape, dtype=state[parameter_name].dtype)
+        artifact["model_state_dict"] = state
+        torch.save(artifact, path)
+
+        with pytest.raises(ValueError, match="Invalid policy state"):
+            store.load_policy(path, "cpu")
+
     def test_dex_only_change_warns_and_loads_weights(self, tmp_path: Path, caplog) -> None:
         from copy import deepcopy
 

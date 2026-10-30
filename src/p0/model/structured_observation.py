@@ -41,7 +41,7 @@ CAT_EFFECT_START = 24
 EFFECT_CATEGORICAL_WIDTH = 3
 CATEGORICAL_WIDTH = CAT_EFFECT_START + MAX_EFFECTS * EFFECT_CATEGORICAL_WIDTH
 
-NUM_BASE_WIDTH = 54
+NUM_BASE_WIDTH = 51
 NUM_EFFECT_START = NUM_BASE_WIDTH
 EFFECT_NUMERICAL_WIDTH = 5
 NUM_IDX_EFFECT_COUNT = NUM_EFFECT_START + MAX_EFFECTS * EFFECT_NUMERICAL_WIDTH
@@ -62,19 +62,19 @@ NUM_IDX_HP_FRACTION = 5
 NUM_IDX_MOVE_PP = 19  # 19-22: per-move-slot pp fraction (MoveRecord dynamic)
 NUM_IDX_ORIG_IDX_RATIO = 26
 NUM_IDX_FAINTED = 27
-NUM_IDX_CAN_MEGA = 30  # active allies only, request-derived like the legality columns
-NUM_IDX_MOVE_LAST = 32  # 32-35: per-move-slot was the last move used (MoveRecord dynamic)
-NUM_IDX_STATUS_COUNTER = 36  # StatusRecord dynamic (turns asleep / toxic stage)
-NUM_IDX_PREPARING = 37
-NUM_IDX_LEVEL_STATS = 38  # 38-43: level-50 derived stats
-NUM_IDX_STAT_PROVENANCE = 44
-NUM_IDX_MOVE_LEGAL = 45  # 45-48: per-move-slot legal this step (MoveRecord dynamic)
-NUM_IDX_CAN_SWITCH_OUT = 49  # active allies only
-NUM_IDX_REVEALED = 50  # has appeared on the field this battle
+NUM_IDX_CAN_MEGA = 28  # active allies only, request-derived like the legality columns
+NUM_IDX_MEGA_FORM = 29
+NUM_IDX_MOVE_LAST = 30  # 30-33: per-move-slot was the last move used (MoveRecord dynamic)
+NUM_IDX_STATUS_COUNTER = 34  # StatusRecord dynamic (turns asleep / toxic stage)
+NUM_IDX_PREPARING = 35
+NUM_IDX_LEVEL_STATS = 36  # 36-41: level-50 derived stats
+NUM_IDX_MOVE_LEGAL = 42  # 42-45: per-move-slot legal this step (MoveRecord dynamic)
+NUM_IDX_CAN_SWITCH_OUT = 46  # active allies only
+NUM_IDX_REVEALED = 47  # has appeared on the field this battle
 # Legality flags. When a data source cannot determine legality (such as a public
 # replay without requests), it sets these flags to distinguish unknown actions from illegal actions.
-NUM_IDX_LEGALITY_UNKNOWN = 51  # this row's move-legal / can-switch-out / can-mega are unproven
-NUM_IDX_SLOT_LEGALITY_UNKNOWN = 52  # 52-53: per-active-slot gate, ally side token only
+NUM_IDX_LEGALITY_UNKNOWN = 48  # this row's move-legal / can-switch-out / can-mega are unproven
+NUM_IDX_SLOT_LEGALITY_UNKNOWN = 49  # 49-50: per-active-slot gate, ally side token only
 
 
 ALLY_POKE_TOKENS = (0, 1, 2, 3, 4, 5)
@@ -82,18 +82,6 @@ OPPONENT_POKE_TOKENS = (6, 7, 8, 9, 10, 11)
 POKEMON_TOKENS = ALLY_POKE_TOKENS + OPPONENT_POKE_TOKENS
 OWNER_TOKENS = (TOKEN_IDX_GLOBAL_FIELD, TOKEN_IDX_ALLY_SIDE, TOKEN_IDX_OPPONENT_SIDE)
 TARGET_SEQ_INDICES = (1, 0, SELF_TARGET_SENTINEL, 6, 7)
-
-
-class TokenType(IntEnum):
-    POKEMON = 0
-    FIELD = 1
-    EVENT = 2
-
-
-class SideId(IntEnum):
-    NONE = 0
-    ALLY = 1
-    OPPONENT = 2
 
 
 class IdentityKnownness(IntEnum):
@@ -150,18 +138,12 @@ def effect_num_slice(index: int) -> slice:
 class StructuredObservation:
     """Fixed battle token structure consumed by the learned encoder."""
 
-    token_type_ids: torch.Tensor
-    side_ids: torch.Tensor
-    slot_ids: torch.Tensor
     categorical: torch.Tensor
     numerical: torch.Tensor
     spatial_cat: torch.Tensor
     spatial_num: torch.Tensor
 
     _FIELD_SPECS: ClassVar[tuple[tuple[str, tuple[int, ...], torch.dtype], ...]] = (
-        ("token_type_ids", (SEQUENCE_LENGTH,), torch.long),
-        ("side_ids", (SEQUENCE_LENGTH,), torch.long),
-        ("slot_ids", (SEQUENCE_LENGTH,), torch.long),
         ("categorical", (SEQUENCE_LENGTH, CATEGORICAL_WIDTH), torch.long),
         ("numerical", (SEQUENCE_LENGTH, NUMERICAL_WIDTH), torch.float32),
         ("spatial_cat", (MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH), torch.long),
@@ -178,9 +160,6 @@ class StructuredObservation:
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         return (
-            self.token_type_ids,
-            self.side_ids,
-            self.slot_ids,
             self.categorical,
             self.numerical,
             self.spatial_cat,
@@ -251,21 +230,12 @@ class StructuredObservation:
     def empty_batch(batch_size: int, pin_memory: bool = False) -> StructuredObservation:
         if type(batch_size) is not int or batch_size < 0:
             raise ValueError("batch_size must be a non-negative integer")
-        observation = StructuredObservation._from_values(
+        return StructuredObservation._from_values(
             [
                 torch.zeros((batch_size, *shape), dtype=dtype, pin_memory=pin_memory)
                 for _, shape, dtype in StructuredObservation._FIELD_SPECS
             ]
         )
-        observation.token_type_ids[:, TOKEN_IDX_GLOBAL_FIELD:] = TokenType.FIELD
-        observation.side_ids[:, :TEAM_SIZE] = SideId.ALLY
-        observation.side_ids[:, TEAM_SIZE : 2 * TEAM_SIZE] = SideId.OPPONENT
-        observation.side_ids[:, TOKEN_IDX_ALLY_SIDE] = SideId.ALLY
-        observation.side_ids[:, TOKEN_IDX_OPPONENT_SIDE] = SideId.OPPONENT
-        slots = torch.arange(1, TEAM_SIZE + 1, dtype=torch.long)
-        observation.slot_ids[:, :TEAM_SIZE] = slots
-        observation.slot_ids[:, TEAM_SIZE : 2 * TEAM_SIZE] = slots
-        return observation
 
     def validate(self, *, batch_rank: int | None = None) -> None:
         for (name, trailing_shape, dtype), tensor in zip(

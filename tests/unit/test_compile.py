@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import torch
 
 from p0.replays.compile import (
     compile_payloads,
@@ -294,6 +295,51 @@ class TestReplayCompiler:
 
 
 class TestCompilationCache:
+    def test_cached_legacy_observation_layout_requires_reconstruction(self, tmp_path: Path) -> None:
+        from p0.replays.protocol import parse_replay_payload
+
+        document = parse_replay_payload(sample_replay_payload("cached-legacy-layout"))
+        first = compile_to_shards((document,), tmp_path)
+        entry = first.manifest.shards[0]
+        cached_path = tmp_path / "tensors" / entry.filename
+        cached = torch.load(cached_path, weights_only=True, map_location="cpu")
+        tensors = cached["tensors"]
+        tensors["numerical"] = torch.cat(
+            (tensors["numerical"], torch.zeros((*tensors["numerical"].shape[:-1], 3))),
+            dim=-1,
+        )
+        tensors["final_numerical"] = torch.cat(
+            (
+                tensors["final_numerical"],
+                torch.zeros((*tensors["final_numerical"].shape[:-1], 3)),
+            ),
+            dim=-1,
+        )
+        tensors["token_type_ids"] = torch.zeros((tensors["loss_mask"].shape[0], 15))
+        torch.save(cached, cached_path)
+        stale_bytes = cached_path.read_bytes()
+        manifest_bytes = first.manifest_path.read_bytes()
+
+        with pytest.raises(ValueError, match="Cached observation layout.*--force-reconstruct"):
+            compile_to_shards((document,), tmp_path)
+
+        assert cached_path.read_bytes() == stale_bytes
+        assert first.manifest_path.read_bytes() == manifest_bytes
+        assert (
+            torch.load(cached_path, weights_only=True)["runtime_major"]
+            == first.manifest.runtime_major
+        )
+
+        rebuilt = compile_to_shards((document,), tmp_path, force_reconstruct=True)
+
+        assert rebuilt.manifest.runtime_major == first.manifest.runtime_major
+        assert rebuilt.manifest.shards[0].shard_id != entry.shard_id
+        chunks = tuple(LazyReplayDataset(rebuilt.manifest_path))
+        assert len(chunks) == 2
+        for chunk in chunks:
+            chunk.observations.validate(batch_rank=1)
+            assert chunk.observations.numerical.shape[1:] == (15, 113)
+
     def test_new_series_reuses_existing_tensor_and_membership_change_rebuilds_only_that_series(
         self, tmp_path: Path
     ) -> None:

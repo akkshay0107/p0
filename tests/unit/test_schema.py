@@ -25,7 +25,6 @@ from p0.model.structured_observation import (
     NUMERICAL_WIDTH,
     SEQUENCE_LENGTH,
     StructuredObservation,
-    TokenType,
 )
 from p0.replays.schema import (
     ActionEvidence,
@@ -148,9 +147,6 @@ class TestReplaySchemas:
         """Verify public observation and shard specs expose the runtime tensor contract."""
         specs = observation_field_specs()
         assert [spec[0] for spec in specs] == [
-            "token_type_ids",
-            "side_ids",
-            "slot_ids",
             "categorical",
             "numerical",
             "spatial_cat",
@@ -180,9 +176,8 @@ class TestReplaySchemas:
     def test_fixed_memory_and_observation_contract(self) -> None:
         """Verify the persisted architecture dimensions and the serialized observation layout."""
         assert SEQUENCE_LENGTH == 15
-        assert (CATEGORICAL_WIDTH, NUMERICAL_WIDTH) == (60, 116)
+        assert (CATEGORICAL_WIDTH, NUMERICAL_WIDTH) == (60, 113)
         assert (SPATIAL_SLOT_COUNT, MAX_EVENT_RECORDS) == (4, 32)
-        assert set(TokenType) == {TokenType.POKEMON, TokenType.FIELD, TokenType.EVENT}
         assert (CURRENT_TOKEN_COUNT, CURRENT_REDUCER_TOKEN_COUNT, REDUCER_MAX_LENGTH) == (
             20,
             21,
@@ -191,7 +186,7 @@ class TestReplaySchemas:
         assert (HISTORY_WINDOW, SERIES_SLOTS, POOLED_EVENT_COUNT) == (48, 8, 4)
 
         observation = StructuredObservation.empty_batch(2)
-        assert observation.token_type_ids.shape == (2, SEQUENCE_LENGTH)
+        assert observation.categorical.shape == (2, SEQUENCE_LENGTH, CATEGORICAL_WIDTH)
         assert observation.spatial_cat.shape == (2, MAX_EVENT_RECORDS, EVENT_CATEGORICAL_WIDTH)
         assert observation.spatial_num.shape == (2, MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
         for (_, shape, _), tensor in zip(

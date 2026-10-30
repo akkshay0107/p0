@@ -200,7 +200,7 @@ class ReplayGameChunk:
 
     @property
     def length(self) -> int:
-        return self.observations.token_type_ids.shape[0]
+        return self.observations.categorical.shape[0]
 
     @property
     def series_key(self) -> SeriesPerspectiveKey:

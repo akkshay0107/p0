@@ -52,7 +52,7 @@ from p0.model.structured_observation import (
     NUM_IDX_ORIG_IDX_RATIO,
     NUM_IDX_PREPARING,
     NUM_IDX_SLOT_LEGALITY_UNKNOWN,
-    NUM_IDX_STAT_PROVENANCE,
+    NUM_IDX_STATUS_COUNTER,
     NUM_IDX_TEAM_PREVIEW,
     SEQUENCE_LENGTH,
     TOKEN_IDX_ALLY_SIDE,
@@ -61,10 +61,8 @@ from p0.model.structured_observation import (
     IdentityKnownness,
     MechanicState,
     PresenceStatus,
-    SideId,
     StatProvenance,
     StructuredObservation,
-    TokenType,
 )
 from p0.model.tokenizer import tokenizer
 
@@ -323,7 +321,7 @@ class TestObservationBuilder:
         assert num[23] == 2.0 / 4.0  # Protect counter normalized by 4
         assert num[24] == 1.0  # First turn active
         assert num[25] == pytest.approx(0.6)  # Low kick weight bracket for 75kg
-        assert num[36] == 3.0 / 5.0  # Status counter normalized by 5
+        assert num[NUM_IDX_STATUS_COUNTER] == 3.0 / 5.0  # Status counter normalized by 5
         assert num[NUM_IDX_PREPARING] == 1.0  # Preparing move flag
         assert num[NUM_IDX_CAN_MEGA] == 1.0  # Can mega evolve flag
 
@@ -396,15 +394,12 @@ class TestObservationBuilder:
         obs = _OBSERVATION_BUILDER.build(battle)
 
         # Global Field Token (index 12)
-        assert obs.token_type_ids[TOKEN_IDX_GLOBAL_FIELD] == TokenType.FIELD
         assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, 3] == pytest.approx(expected_turn_fraction)
         assert obs.numerical[TOKEN_IDX_GLOBAL_FIELD, NUM_IDX_TEAM_PREVIEW] == 0.0
         assert all(torch.isfinite(t).all() for t in obs.tensors())
 
         # Ally Side Token (index 13)
-        assert obs.token_type_ids[TOKEN_IDX_ALLY_SIDE] == TokenType.FIELD
         assert obs.numerical[TOKEN_IDX_ALLY_SIDE, 4] == 1.0  # Ally mega available
-        assert obs.token_type_ids[TOKEN_IDX_OPPONENT_SIDE] == TokenType.FIELD
         assert obs.numerical[TOKEN_IDX_OPPONENT_SIDE, 4] == 0.0
 
     def test_second_display_of_a_species_evicts_the_illusion_bench_row(self) -> None:
@@ -631,14 +626,12 @@ class TestObservationBuilder:
         assert obs.categorical[0, CAT_IDX_STAT_PROVENANCE] == StatProvenance.KNOWN
         assert obs.categorical[0, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
         assert obs.categorical[0, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
-        assert obs.numerical[0, NUM_IDX_STAT_PROVENANCE] == 1.0
 
         # Token 1: Ally with OOV species -> OOV identity, UNKNOWN stats, ACTIVE presence
         assert obs.categorical[1, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.OOV
         assert obs.categorical[1, CAT_IDX_STAT_PROVENANCE] == StatProvenance.UNKNOWN
         assert obs.categorical[1, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
         assert obs.categorical[1, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
-        assert obs.numerical[1, NUM_IDX_STAT_PROVENANCE] == 0.0
 
         # Token 2..5: Empty ally slots -> PAD
         for i in range(2, 6):
@@ -646,21 +639,18 @@ class TestObservationBuilder:
             assert obs.categorical[i, CAT_IDX_STAT_PROVENANCE] == StatProvenance.PAD
             assert obs.categorical[i, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.PAD
             assert obs.categorical[i, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
-            assert obs.numerical[i, NUM_IDX_STAT_PROVENANCE] == 0.0
 
         # Token 6: Opponent Pikachu -> KNOWN identity, IMPUTED stats, ACTIVE presence
         assert obs.categorical[6, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.KNOWN
         assert obs.categorical[6, CAT_IDX_STAT_PROVENANCE] == StatProvenance.IMPUTED
         assert obs.categorical[6, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
         assert obs.categorical[6, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
-        assert obs.numerical[6, NUM_IDX_STAT_PROVENANCE] == 0.0
 
         # Token 7: Opponent with missing species -> UNKNOWN identity, UNKNOWN stats, ACTIVE presence
         assert obs.categorical[7, CAT_IDX_IDENTITY_KNOWNNESS] == IdentityKnownness.UNKNOWN
         assert obs.categorical[7, CAT_IDX_STAT_PROVENANCE] == StatProvenance.UNKNOWN
         assert obs.categorical[7, CAT_IDX_PRESENCE_STATUS] == PresenceStatus.ACTIVE
         assert obs.categorical[7, CAT_IDX_MECHANIC_STATE] == MechanicState.NORMAL
-        assert obs.numerical[7, NUM_IDX_STAT_PROVENANCE] == 0.0
 
 
 def _legality_fixture_view(decision: DecisionView) -> FixtureBattleView:
@@ -717,7 +707,6 @@ class TestObservationBuilderLegalityAndState:
         builder = ObservationBuilder(default_runtime_resources())
         output = StructuredObservation.empty_batch(1)[0]
         for snapshot in perspective.snapshots:
-            output.token_type_ids.fill_(99)
             output.categorical.fill_(99)
             output.numerical.fill_(99.0)
             output.spatial_cat.fill_(99)
@@ -730,10 +719,6 @@ class TestObservationBuilderLegalityAndState:
             assert output.spatial_num.shape == (MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH)
             assert not torch.any(output.spatial_cat == 99)
             assert not torch.any(output.spatial_num == 99.0)
-            assert output.token_type_ids[0].item() == int(TokenType.POKEMON)
-            assert output.side_ids[0].item() == int(SideId.ALLY)
-            assert tuple(output.slot_ids[:6].tolist()) == (1, 2, 3, 4, 5, 6)
-            assert tuple(output.slot_ids[6:12].tolist()) == (1, 2, 3, 4, 5, 6)
             assert output.numerical[12, NUM_IDX_TEAM_PREVIEW].item() == float(
                 snapshot.view.teampreview
             )
@@ -756,7 +741,6 @@ class TestObservationBuilderLegalityAndState:
 
         # The remaining ally rows are empty and store no species or stats.
         for slot_idx in (1, 3, 4, 5):
-            assert obs.token_type_ids[slot_idx] == TokenType.POKEMON
             assert obs.categorical[slot_idx, 0].item() == 0
             assert obs.numerical[slot_idx, 1].item() == 1.0
             assert not obs.numerical[slot_idx, 5:].any()

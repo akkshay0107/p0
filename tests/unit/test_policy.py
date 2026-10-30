@@ -47,9 +47,7 @@ from p0.model.structured_observation import (
     POKEMON_TOKENS,
     SEQUENCE_LENGTH,
     TOKEN_IDX_GLOBAL_FIELD,
-    SideId,
     StructuredObservation,
-    TokenType,
 )
 
 ACT_SIZE = FORMAT.action_size
@@ -94,22 +92,6 @@ def _inputs(policy: PolicyNet, batch_size: int = 2) -> tuple[Any, torch.Tensor, 
 @pytest.fixture
 def dummy_obs() -> StructuredObservation:
     B = 2
-    token_type_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
-    token_type_ids[:, 0:12] = TokenType.POKEMON
-    token_type_ids[:, 12:15] = TokenType.FIELD
-
-    side_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
-    side_ids[:, 0:6] = SideId.ALLY
-    side_ids[:, 6:12] = SideId.OPPONENT
-    side_ids[:, 12] = SideId.NONE
-    side_ids[:, 13] = SideId.ALLY
-    side_ids[:, 14] = SideId.OPPONENT
-
-    slot_ids = torch.zeros((B, SEQUENCE_LENGTH), dtype=torch.long)
-    for i in range(6):
-        slot_ids[:, i] = i + 1
-        slot_ids[:, 6 + i] = i + 1
-
     categorical = torch.zeros((B, SEQUENCE_LENGTH, CATEGORICAL_WIDTH), dtype=torch.long)
     categorical[:, 0:12, 0] = torch.randint(1, 35, (B, 12))
     categorical[:, 0:12, 1] = torch.randint(1, 24, (B, 12))
@@ -152,9 +134,6 @@ def dummy_obs() -> StructuredObservation:
     spatial_num = torch.randn((B, MAX_EVENT_RECORDS, EVENT_NUMERICAL_WIDTH))
 
     return StructuredObservation(
-        token_type_ids=token_type_ids,
-        side_ids=side_ids,
-        slot_ids=slot_ids,
         categorical=categorical,
         numerical=numerical,
         spatial_cat=spatial_cat,
@@ -313,19 +292,6 @@ class TestPolicy:
         """Verify fainted bench Pokémon tokens remain visible to the transformer encoder and affect policy output distributions."""
         B = 1
         obs = StructuredObservation.empty_batch(B)
-
-        for i in range(0, 6):
-            obs.token_type_ids[0, i] = 1
-            obs.side_ids[0, i] = 1
-            obs.slot_ids[0, i] = i + 1
-        for i in range(6, 12):
-            obs.token_type_ids[0, i] = 1
-            obs.side_ids[0, i] = 2
-            obs.slot_ids[0, i] = i - 5
-
-        obs.token_type_ids[0, 12:15] = 2
-        obs.side_ids[0, 13] = 1
-        obs.side_ids[0, 14] = 2
 
         for i, idx in enumerate(range(0, 6)):
             obs.numerical[:, idx, 26] = (i + 1) / 6.0
