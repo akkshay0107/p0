@@ -14,18 +14,22 @@ MODEL_INIT_STD = 0.02
 
 @torch.no_grad()
 def initialize_module(module: nn.Module, *, std: float = MODEL_INIT_STD) -> None:
-    """Apply the same small-normal initialization to learned projections and embeddings."""
-    for child in module.modules():
-        if isinstance(child, nn.MultiheadAttention):
-            nn.init.normal_(child.in_proj_weight, std=std)
-            if child.in_proj_bias is not None:
-                nn.init.zeros_(child.in_proj_bias)
-        elif isinstance(child, nn.Linear):
-            nn.init.normal_(child.weight, std=std)
-            if child.bias is not None:
-                nn.init.zeros_(child.bias)
-        elif isinstance(child, nn.Embedding):
-            nn.init.normal_(child.weight, std=std)
+    """Initialize owned layers; child model components initialize themselves."""
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, std=std)
+    elif isinstance(module, nn.MultiheadAttention):
+        nn.init.normal_(module.in_proj_weight, std=std)
+        if module.in_proj_bias is not None:
+            nn.init.zeros_(module.in_proj_bias)
+        initialize_module(module.out_proj, std=std)
+    else:
+        for child in module.children():
+            if isinstance(child, (nn.Linear, nn.Embedding, nn.MultiheadAttention, nn.Sequential)):
+                initialize_module(child, std=std)
 
 
 class AttentionPool(nn.Module):
@@ -200,12 +204,13 @@ class SwiGLUTransformerEncoder(nn.Module):
     @torch.no_grad()
     def reset_parameters(self) -> None:
         """Initialize projections normally and scale residual outputs with depth."""
-        initialize_module(self)
         residual_std = MODEL_INIT_STD / math.sqrt(2 * len(self.layers))
         for item in self.layers:
             layer = cast(SwiGLUEncoderLayer, item)
-            nn.init.normal_(layer.out_proj.weight, std=residual_std)
-            nn.init.normal_(layer.w2.weight, std=residual_std)
+            initialize_module(layer.qkv_proj)
+            initialize_module(layer.w13)
+            initialize_module(layer.out_proj, std=residual_std)
+            initialize_module(layer.w2, std=residual_std)
 
     def forward(
         self,

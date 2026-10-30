@@ -40,7 +40,6 @@ class DynamicSeriesResampler(nn.Module):
     def _init_weights(self) -> None:
         initialize_module(self)
         nn.init.normal_(self.summary_queries, std=MODEL_INIT_STD)
-        self.self_attn.reset_parameters()
 
     def forward(self, history: Tensor, history_mask: Tensor) -> Tensor:
         """Compress (games, time, d_model) histories into (games, 4, d_model)."""

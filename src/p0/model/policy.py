@@ -275,7 +275,6 @@ class ActorPolicy(nn.Module):
             self.tp_back_role,
         ):
             nn.init.normal_(key, std=MODEL_INIT_STD)
-        self.reducer.encoder.reset_parameters()
 
     def _compute_keys(self, tokens_ctx: Tensor) -> Tensor:
         k_entity = self.entity_key_norm(self.w_k_entity(tokens_ctx[:, :N_KEY_ENTITIES]))

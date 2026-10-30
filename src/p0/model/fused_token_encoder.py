@@ -399,8 +399,6 @@ class FusedTokenEncoder(nn.Module):
         nn.init.normal_(self.action_mask_token, std=MODEL_INIT_STD)
         nn.init.normal_(self.unknown_legality_emb, std=MODEL_INIT_STD)
         nn.init.normal_(self.event_type_token, std=MODEL_INIT_STD)
-        self.pokemon_pool.reset_parameters()
-        self.event_encoder.reset_parameters()
 
     def _embed_pokemon_components(
         self, categorical: torch.Tensor, numerical: torch.Tensor

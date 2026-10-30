@@ -75,13 +75,7 @@ class MemoryReducer(nn.Module):
             dim_feedforward=dim_feedforward,
             num_layers=nlayer,
         )
-        self._init_weights()
-
-    @torch.no_grad()
-    def _init_weights(self) -> None:
-        initialize_module(self)
-        self.local_summary_pool.reset_parameters()
-        self.encoder.reset_parameters()
+        initialize_module(self.memory_position_emb)
 
     def _validate_inputs(
         self,
