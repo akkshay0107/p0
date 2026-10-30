@@ -209,7 +209,6 @@ def _save_shard(
         root / filename,
         {
             "runtime_major": runtime_major,
-            "shard_id": shard_id,
             "tensors": tensors,
             SHARD_SUMMARY_KEY: summaries,
         },
@@ -648,6 +647,8 @@ def compile_documents(
     Returns:
         CompilationResult with all source groups, accepted series, and metrics.
     """
+    if max_candidates < 1:
+        raise ValueError("max_candidates must be positive")
     return _compile_groups(_group_documents(documents, format_id), max_candidates)
 
 
@@ -693,8 +694,6 @@ def _compile_groups(grouping: GroupingResult, max_candidates: int) -> Compilatio
     Returns:
         Source groups, accepted series, and compilation metrics.
     """
-    if max_candidates < 1:
-        raise ValueError("max_candidates must be positive")
     counters = _initial_compilation_counters(grouping)
     rejection_counters: dict[str, Counter[str]] = {
         group.record.series_id: Counter() for group in grouping.series
@@ -767,7 +766,7 @@ def compile_payloads(
     max_candidates: int = 256,
 ) -> CompilationResult:
     """Parse raw replay payloads and compile them through the replay pipeline."""
-    documents = tuple(parse_replay_payload(payload, format_id=format_id) for payload in payloads)
+    documents = (parse_replay_payload(payload, format_id=format_id) for payload in payloads)
     return compile_documents(documents, format_id=format_id, max_candidates=max_candidates)
 
 
